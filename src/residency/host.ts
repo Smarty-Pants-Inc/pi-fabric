@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
+import { lockFile, FileLockBusy } from "./file-lock.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -15,6 +16,7 @@ import {
 import { ActorDirectory } from "../actors/directory.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
+import type { AgentRunRecord } from "../agents/types.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
@@ -40,10 +42,82 @@ import {
   type ResidentHostOwner,
 } from "./protocol.js";
 import { deliveryRoot, projectOf } from "../topology/project-identity.js";
+import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import { canRemoveTerminalRun } from "../storage/retention.js";
+import { ownedStat } from "../storage/scratch.js";
+
+export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+
+/** A worker can finish after its host dies, leaving status.json as the only completion copy. */
+const hasPreservedResidentResult = (runsRoot: string, id: string): boolean => {
+  const residencyRoot = path.dirname(runsRoot);
+  const metadataPath = path.join(residencyRoot, "agents", `${id}.json`);
+  // Only proven absence permits ordinary actor/untracked collection. Unreadable or unsafe
+  // metadata may still describe a public task, so uncertainty keeps its run directory.
+  try { fs.lstatSync(metadataPath); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+  const readOwnedJson = <T>(file: string): T | undefined => {
+    const stat = ownedStat(file);
+    if (!stat?.isFile() || stat.size > 1024 * 1024) return undefined;
+    return readJson<T>(file);
+  };
+  const time = (value: unknown): value is number =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0;
+  const metadata = readOwnedJson<ResidentAgentMetadata>(metadataPath);
+  if (metadata?.format !== RESIDENT_HOST_FORMAT || metadata.id !== id ||
+      typeof metadata.rootId !== "string" || metadata.handle?.id !== id ||
+      metadata.handle.residency !== "durable" || metadata.handle.actorId !== undefined ||
+      typeof metadata.handle.name !== "string" || typeof metadata.handle.cwd !== "string" ||
+      !["pi", "claude", "veda"].includes(metadata.handle.runner) ||
+      !["process", "tmux", "screen", "localterm", "herdr"].includes(metadata.handle.transport) ||
+      !["queued", "running", "completed", "failed", "stopped", "timed_out"].includes(metadata.handle.status) ||
+      !time(metadata.createdAt) || !time(metadata.updatedAt) ||
+      typeof metadata.runDirectory !== "string" ||
+      path.resolve(metadata.runDirectory) !== path.resolve(runsRoot, id)) return false;
+  const saved = readOwnedJson<AgentRunRecord>(residentResultPath(residencyRoot, id));
+  // Validate the terminal record, not just a matching id/status stub: deleting the run must
+  // leave a usable result (including its text) for client status/wait across restarts.
+  return !!saved && saved.id === id && saved.actorId === undefined &&
+    ["completed", "failed", "stopped", "timed_out"].includes(saved.status) &&
+    typeof saved.name === "string" && typeof saved.task === "string" &&
+    typeof saved.cwd === "string" && typeof saved.text === "string" &&
+    ["pi", "claude", "veda"].includes(saved.runner) &&
+    ["process", "tmux", "screen", "localterm", "herdr"].includes(saved.transport) &&
+    time(saved.startedAt) && time(saved.updatedAt) &&
+    (saved.finishedAt === undefined || time(saved.finishedAt)) &&
+    time(saved.turns) && time(saved.toolCalls) &&
+    (saved.error === undefined || typeof saved.error === "string") &&
+    !!saved.usage && [saved.usage.input, saved.usage.output, saved.usage.cacheRead,
+      saved.usage.cacheWrite, saved.usage.cost].every(time);
+};
+
+/** Called under the host fence, before constructing the manager: every existing run is untracked. */
+export const sweepResidentRuns = (runsRoot: string, now = Date.now(), budgetMs = 100): string[] => {
+  const removed: string[] = [];
+  if (!ownedStat(runsRoot)?.isDirectory()) return removed;
+  const started = performance.now();
+  const expired = () => performance.now() - started >= budgetMs;
+  let directory: fs.Dir;
+  try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
+  try {
+    let entry: fs.Dirent | null;
+    while (!expired() && (entry = directory.readSync())) {
+      if (!entry.isDirectory()) continue;
+      const run = path.join(runsRoot, entry.name);
+      const stat = ownedStat(run);
+      if (!stat?.isDirectory() || now - stat.mtimeMs <= RESIDENT_RUN_RETENTION_MS) continue;
+      if (!canRemoveTerminalRun(run, expired) ||
+          !hasPreservedResidentResult(runsRoot, entry.name) || expired()) continue;
+      try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
+    }
+  } finally { directory.closeSync(); }
+  return removed;
+};
 
 const REQUEST_POLL_MS = 50;
 const IDLE_EXIT_MS = 30_000;
 const COMPLETION_MAX_CHARS = 8_000;
+const HOST_CLOSING_RETRY = "Fabric resident host is closing; retry";
 
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -63,19 +137,7 @@ const readJson = <T>(filePath: string): T | undefined => {
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
-const processAlive = (pid: number): boolean => {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // On Windows, EPERM means the process exists but cannot be opened for
-    // signaling; only ESRCH (or other errors) mean it is gone.
-    return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-};
-
-class ResidentHostAlreadyRunning extends Error {}
+export class ResidentHostAlreadyRunning extends Error {}
 
 const parseResidentHostConfigPath = (argv: readonly string[]): string => {
   const index = argv.indexOf("--config");
@@ -123,15 +185,17 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
   return config as ResidentHostConfig;
 };
 
-class ResidentHost {
+export class ResidentHost {
   readonly hostId: string;
   readonly identity: MeshIdentity;
-  readonly mesh: MeshStore;
-  readonly participants: ParticipantDirectory;
-  readonly control: FabricControlPlane;
-  readonly agents: AgentManager;
-  readonly actors: ActorDirectory;
-  readonly lifecycle: LifecycleBroker;
+  mesh!: MeshStore;
+  participants!: ParticipantDirectory;
+  control!: FabricControlPlane;
+  agents!: AgentManager;
+  actors!: ActorDirectory;
+  lifecycle!: LifecycleBroker;
+  #lockFd: number | undefined;
+  #fallbackLock = false;
   readonly #ownerPath: string;
   readonly #lockPath: string;
   readonly #errorPath: string;
@@ -147,11 +211,12 @@ class ResidentHost {
   #closed = false;
   #started = false;
   #idleSince = Date.now();
+  #admissions = 0;
 
   constructor(
     readonly config: ResidentHostConfig,
     readonly onIdle: () => void = () => {},
-    modelRegistry?: PiModelRegistryView,
+    private readonly modelRegistry?: PiModelRegistryView,
   ) {
     this.hostId = residentHostId(config.rootId);
     this.identity = { id: this.hostId, name: "Fabric resident host", kind: "agent" };
@@ -164,6 +229,10 @@ class ResidentHost {
     this.#agentsPath = path.join(config.residencyRoot, "agents");
     this.#removalsPath = residentRemovalsPath(config.residencyRoot);
     this.#deliveryPrefix = residentDeliveryPrefix(config.rootId);
+  }
+
+  #initialize(): void {
+    const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
     this.participants = new ParticipantDirectory(this.mesh, {
@@ -335,75 +404,86 @@ class ResidentHost {
 
   async start(): Promise<void> {
     if (this.#started) return;
-    this.#acquireLock();
+    await this.#acquireLock();
     this.#started = true;
-    fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });
-    this.#recoverInterruptedRequests();
-    const firstSeenAgents = new Map<string, number>();
-    this.participants.registerSource(() =>
-      agentParticipantRecords(
-        this.agents.listForUi(),
-        this.config.rootId,
-        this.hostId,
-        this.identity.id,
-        this.config.rootId,
-        firstSeenAgents,
-      ),
-    );
-    this.participants.registerSource(() =>
-      this.actors.listOwned().map((actor) =>
-        actorParticipantRecord(
-          actor,
+    try {
+      if (!this.config.agents.retainRuns) sweepResidentRuns(path.join(this.config.residencyRoot, "runs"));
+      this.#initialize();
+      fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });
+      this.#recoverInterruptedRequests();
+      const firstSeenAgents = new Map<string, number>();
+      this.participants.registerSource(() =>
+        agentParticipantRecords(
+          this.agents.listForUi(),
           this.config.rootId,
           this.hostId,
           this.identity.id,
           this.config.rootId,
+          firstSeenAgents,
         ),
-      ),
-    );
-    this.agents.subscribeUi(() => this.participants.scheduleRefresh());
-    this.actors.subscribe(() => this.participants.scheduleRefresh());
-    this.control.start((command, from, signal) =>
-      this.#acceptControl(command, from, signal));
-    await this.participants.start().catch(() => undefined);
-    this.lifecycle.start();
-    this.#requestTimer = setInterval(
-      () => void this.#pollRequests().catch(() => undefined),
-      REQUEST_POLL_MS,
-    );
-    const now = Date.now();
-    const owner: ResidentHostOwner = {
-      format: RESIDENT_HOST_FORMAT,
-      hostId: this.hostId,
-      pid: process.pid,
-      token: this.#token,
-      startedAt: now,
-      readyAt: now,
-    };
-    atomicWrite(this.#ownerPath, owner);
-    fs.rmSync(this.#errorPath, { force: true });
-    // Removals a previous host accepted: their runs ended with it.
-    void this.actors.finishPendingRemovals().finally(() => this.#writeRemovals());
-    await this.#pollRequests();
+      );
+      this.participants.registerSource(() =>
+        this.actors.listOwned().map((actor) =>
+          actorParticipantRecord(
+            actor,
+            this.config.rootId,
+            this.hostId,
+            this.identity.id,
+            this.config.rootId,
+          ),
+        ),
+      );
+      this.agents.subscribeUi(() => this.participants.scheduleRefresh());
+      this.actors.subscribe(() => this.participants.scheduleRefresh());
+      this.control.start((command, from, signal) =>
+        this.#acceptControl(command, from, signal));
+      await this.participants.start().catch(() => undefined);
+      this.lifecycle.start();
+      this.#requestTimer = setInterval(
+        () => void this.#pollRequests().catch(() => undefined),
+        REQUEST_POLL_MS,
+      );
+      const now = Date.now();
+      const owner: ResidentHostOwner = {
+        format: RESIDENT_HOST_FORMAT,
+        hostId: this.hostId,
+        pid: process.pid,
+        processStartTime: processStartTime(process.pid),
+        token: this.#token,
+        startedAt: now,
+        readyAt: now,
+      };
+      atomicWrite(this.#ownerPath, owner);
+      fs.rmSync(this.#errorPath, { force: true });
+      // Removals a previous host accepted: their runs ended with it.
+      void this.actors.finishPendingRemovals().finally(() => this.#writeRemovals());
+      await this.#pollRequests();
+    } catch (error) {
+      await this.close();
+      throw error;
+    }
   }
 
   async close(): Promise<void> {
-    if (this.#closed) return;
+    if (this.#closed || !this.#started) return;
     this.#closed = true;
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
-    while (this.#pollingRequests) await delay(10);
-    await this.participants.quiesce().catch(() => undefined);
-    await this.lifecycle.close().catch(() => undefined);
+    // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
+    const actorsClosed = this.actors?.close();
+    while (this.#pollingRequests || this.#admissions) await delay(10);
+    await this.participants?.quiesce().catch(() => undefined);
+    await this.lifecycle?.close().catch(() => undefined);
     try {
-      await closeWithActors(this.actors, () => this.control.close().catch(() => undefined));
+      await closeWithActors({ close: () => actorsClosed }, () => this.control?.close().catch(() => undefined));
     } finally {
-      await this.agents.close();
-      await this.participants.close().catch(() => undefined);
-      this.#releaseLock();
+      try {
+        await this.agents?.close();
+        await this.participants?.close().catch(() => undefined);
+      } finally { this.#releaseLock(); }
     }
   }
 
@@ -412,6 +492,15 @@ class ResidentHost {
     from: MeshIdentity,
     signal?: AbortSignal,
   ): Promise<FabricControlAcceptance> {
+    if (this.#closed) {
+      return { accepted: false, error: HOST_CLOSING_RETRY };
+    }
+    this.#admissions++;
+    try { return await this.#handleControl(command, from, signal); }
+    finally { this.#admissions--; }
+  }
+
+  async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal): Promise<FabricControlAcceptance> {
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
     }
@@ -426,6 +515,7 @@ class ResidentHost {
         }
       }
       try {
+        if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
         if (!this.actors.owns(command.targetId)) {
           return { accepted: false, error: `Resident host does not own ${command.targetId}` };
         }
@@ -475,6 +565,7 @@ class ResidentHost {
         this.participants.get(from.id)?.rootId);
       // Validate now without turning the resolved owner defaults into per-call overrides.
       await this.actors.resolveActivationBinding(command.targetId, options);
+      if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
       const result = this.actors.tell(command.targetId, message, command.data, options);
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
@@ -486,6 +577,13 @@ class ResidentHost {
     subscription: FabricLifecycleSubscription,
     event: FabricLifecycleEvent,
   ): Promise<void> {
+    if (this.#closed) throw new Error(HOST_CLOSING_RETRY);
+    this.#admissions++;
+    try { await this.#handleLifecycle(subscription, event); }
+    finally { this.#admissions--; }
+  }
+
+  async #handleLifecycle(subscription: FabricLifecycleSubscription, event: FabricLifecycleEvent): Promise<void> {
     const message = `Fabric lifecycle ${event.event} from ${event.source.name} (${event.source.id})${event.status ? ` with status ${event.status}` : ""}.`;
     if (subscription.to === this.config.rootId) {
       await this.#queueDelivery(
@@ -596,19 +694,17 @@ class ResidentHost {
   }
 
   #checkIdle(): void {
-    const activeActor = this.actors
-      .listOwned()
-      .some((actor) => actor.residency === "durable" && actor.status !== "stopped");
+    if (this.#closed) return;
+    const ownedActors = this.actors.listOwned();
+    const activeActor = ownedActors.some((actor) => actor.residency === "durable" && actor.status !== "stopped");
     const activeAgent = this.agents
       .listForUi()
       .some((agent) => agent.status === "queued" || agent.status === "running");
-    let pendingRequest = false;
-    try {
-      pendingRequest = fs.readdirSync(this.#requestsPath).some((entry) => entry.endsWith(".json"));
-    } catch {
-      // Missing request directory is empty.
-    }
-    if (activeActor || activeAgent || pendingRequest) {
+    const pendingRequest = [this.#requestsPath, this.#processingPath].some((directory) => {
+      try { return fs.readdirSync(directory).some((entry) => entry.endsWith(".json")); }
+      catch { return false; }
+    });
+    if (activeActor || activeAgent || pendingRequest || this.#admissions) {
       this.#idleSince = Date.now();
       return;
     }
@@ -812,37 +908,54 @@ class ResidentHost {
     }
   }
 
-  #acquireLock(): void {
+  async #acquireLock(): Promise<void> {
     fs.mkdirSync(this.config.residencyRoot, { recursive: true, mode: 0o700 });
-    const existing = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (existing && processAlive(existing.pid)) {
-      throw new ResidentHostAlreadyRunning(`Fabric resident host is already running (${existing.pid})`);
-    }
-    try {
-      const descriptor = fs.openSync(this.#lockPath, "wx", 0o600);
-      fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid }));
-      fs.closeSync(descriptor);
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-        const locked = readJson<{ pid?: unknown }>(this.#lockPath);
-        if (typeof locked?.pid === "number" && processAlive(locked.pid)) {
-          throw new ResidentHostAlreadyRunning(`Fabric resident host is starting (${locked.pid})`);
-        }
-        fs.rmSync(this.#lockPath, { force: true });
-        const descriptor = fs.openSync(this.#lockPath, "wx", 0o600);
-        fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid }));
-        fs.closeSync(descriptor);
-      } else {
+    if (process.platform === "linux") {
+      try { this.#lockFd = await lockFile(this.#lockPath, 0, true); }
+      catch (error) {
+        if (error instanceof FileLockBusy) throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
+        throw error; // Never weaken Linux ownership when util-linux is missing/broken.
+      }
+    } else {
+      // ponytail: without Linux flock/setpriv, retain PID + start-time staleness.
+      // Windows durable residency is unsupported; non-Linux identity is #2566.
+      const existing = readJson<ResidentHostOwner>(this.#ownerPath);
+      const locked = readJson<ResidentHostOwner>(this.#lockPath);
+      if ((existing && residentProcessAlive(existing.pid, existing.processStartTime)) ||
+          (locked && residentProcessAlive(locked.pid, locked.processStartTime))) {
+        throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
+      }
+      fs.rmSync(this.#lockPath, { force: true });
+      try { this.#lockFd = fs.openSync(this.#lockPath, "wx", 0o600); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new ResidentHostAlreadyRunning("Fabric resident host is starting");
         throw error;
       }
+      this.#fallbackLock = true;
     }
+    // A pre-flock host may own these diagnostic records without holding our fence.
+    // Read BEFORE overwriting; unknown birth identity is not authority to displace it.
+    const records = [readJson<ResidentHostOwner>(this.#lockPath), readJson<ResidentHostOwner>(this.#ownerPath)];
+    if (records.some((owner) => owner && owner.pid !== process.pid && residentProcessAlive(owner.pid, owner.processStartTime))) {
+      this.#releaseLock();
+      throw new ResidentHostAlreadyRunning("Fabric resident host is already running (legacy owner)");
+    }
+    try {
+      fs.ftruncateSync(this.#lockFd, 0);
+      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
+    } catch (error) { this.#releaseLock(); throw error; }
   }
 
   #releaseLock(): void {
-    const lock = readJson<{ token?: unknown }>(this.#lockPath);
-    if (lock?.token === this.#token) fs.rmSync(this.#lockPath, { force: true });
+    if (this.#lockFd === undefined) return;
+    // Remove our publication while still holding the fence; never unlink the Linux inode.
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
     if (owner?.token === this.#token) fs.rmSync(this.#ownerPath, { force: true });
+    if (this.#fallbackLock && readJson<{ token?: string }>(this.#lockPath)?.token === this.#token) {
+      fs.rmSync(this.#lockPath, { force: true });
+    }
+    fs.closeSync(this.#lockFd);
+    this.#lockFd = undefined;
   }
 }
 

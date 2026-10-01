@@ -21,6 +21,9 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
+import { ResidentHost, RESIDENT_RUN_RETENTION_MS } from "../src/residency/host.js";
+import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { processStartTime } from "../src/residency/process-identity.js";
 import { projectOf } from "../src/topology/project-identity.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import {
@@ -1105,6 +1108,39 @@ describe("durable completion receipts", () => {
     }
   });
 
+  it("F1 preserves original completion through recovery sweep and a second host restart without a saved result", async () => {
+    const state = await rootHarness("f1-recovery-completion");
+    const seeded = await seedCompletion(state);
+    const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8"));
+    // The host died while the spawn handle still said running; only the worker's record advanced.
+    fs.writeFileSync(seeded.metadataPath, JSON.stringify({ ...metadata, handle: { ...metadata.handle, status: "running", text: "", residency: "durable" } }));
+    await state.mesh.delete({ key: seeded.key });
+    const expiredAt = Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000;
+    fs.utimesSync(seeded.runDirectory, expiredAt / 1_000, expiredAt / 1_000);
+    const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
+    const expected = { id: seeded.id, status: "completed", text: seeded.result.text, residency: "durable" };
+    let host: ResidentHost | undefined;
+    let client: ResidencyClient | undefined;
+    try {
+      expect(fs.existsSync(resultPath)).toBe(false);
+      for (let restart = 1; restart <= 2; restart++) {
+        host = new ResidentHost(state.config);
+        await host.start(); // The real fenced startup sweep runs before manager construction.
+        client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+        expect(client.statusAgent(seeded.id), `restart ${restart}`).toMatchObject(expected);
+        expect(await client.waitAgent(seeded.id, AbortSignal.timeout(2_000))).toMatchObject(expected);
+        expect(fs.existsSync(seeded.runDirectory)).toBe(true);
+        expect(fs.existsSync(resultPath)).toBe(false);
+        await client.close();
+        await host.close();
+      }
+    } finally {
+      await client?.close();
+      await host?.close();
+      await state.participants.close();
+    }
+  });
+
   // smarty-dev#1882: an idle resident host removes runs/; status must not fall back to the spawn handle.
   it("reads the saved terminal record after the host removed the run directory", async () => {
     const state = await rootHarness("saved-terminal-record");
@@ -1186,6 +1222,260 @@ describe("durable completion receipts", () => {
 });
 
 describe.skipIf(!hasResidentHost || process.platform === "win32")("durable participant residency", () => {
+  it.skipIf(process.platform !== "linux")("F1 preserves original completion when the compiled resident host's result save fails through graceful close and two restarts", { timeout: 60_000 }, async () => {
+    // Real compiled launcher -> real Pi -> compiled resident host; only model inference is fake.
+    // STREAM_PREVIEW supplies its own running/terminal records and full text, without fixture edits.
+    const state = await rootHarness("f1-compiled-save-failure");
+    const launches = launchLog(state.root);
+    for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
+    const options = { config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath };
+    const client = new ResidencyClient(options);
+    let reconnect: ResidencyClient | undefined;
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    const closeHost = async () => {
+      const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+      const owned = launches.owned().find((entry) => entry.pid === owner.pid)!;
+      expect(owned).toBeDefined();
+      expect(owned.argv).toContain(path.resolve("dist/residency/pi-entry.js"));
+      expect(same(owned)).toBe(true);
+      process.kill(owner.pid, "SIGTERM"); // Exercise graceful tracked-run cleanup, not crash recovery.
+      await waitFor(() => !same(owned), 20_000);
+      expect(fs.existsSync(ownerPath)).toBe(false);
+    };
+    try {
+      expect(state.config.agents.retainRuns).toBe(false); // Keep the public default.
+      const handle = await client.spawnAgent({ task: "STREAM_PREVIEW", transport: "process", residency: "durable" });
+      expect(launches.owned().some(({ argv }) => argv[0] === hostPath)).toBe(true);
+      const run = path.join(state.config.residencyRoot, "runs", handle.id);
+      const statusPath = path.join(run, "status.json");
+      const resultPath = residentResultPath(state.config.residencyRoot, handle.id);
+      const record = () => JSON.parse(fs.readFileSync(statusPath, "utf8"));
+      // Inject a genuine filesystem fault after spawn but before the worker finishes:
+      // atomic result publication cannot rename a regular file over this directory.
+      fs.mkdirSync(resultPath, { recursive: true });
+      await waitFor(() => fs.existsSync(statusPath));
+      expect(record().status).toBe("running");
+      const worker = launches.owned().find(({ argv }) => argv[0] === fakeWorker && argv[argv.indexOf("--id") + 1] === handle.id)!;
+      expect(worker).toBeDefined();
+      await waitFor(() => record().status === "completed" && !same(worker), 10_000);
+      const original = record();
+      expect(original.text).toBe("stream preview complete");
+      // Host completion publication follows onSettled, proving the failed save was attempted.
+      // Do not start the client drainer: the envelope must not become an alternate result store.
+      await waitFor(() => state.mesh.listAll(residentDeliveryPrefix(state.identity.id))
+        .some((entry) => (entry.value as { agentCompletionId?: string }).agentCompletionId === handle.id));
+      expect(fs.statSync(resultPath).isDirectory()).toBe(true);
+      const metadataPath = path.join(state.config.residencyRoot, "agents", `${handle.id}.json`);
+      expect(JSON.parse(fs.readFileSync(metadataPath, "utf8")).handle.status).toBe("running");
+      await client.close();
+      await closeHost();
+      // Remove the notification too: recovery must use the worker record, not a queued summary.
+      for (const entry of state.mesh.listAll(residentDeliveryPrefix(state.identity.id))) {
+        await state.mesh.delete({ key: entry.key });
+      }
+      expect(fs.existsSync(statusPath), "failed save must veto tracked close deleting the last result").toBe(true);
+      const expected = { id: handle.id, status: original.status, text: original.text, residency: "durable" };
+      for (let restart = 1; restart <= 2; restart++) {
+        reconnect = new ResidencyClient(options);
+        await reconnect.ensureHost();
+        expect(reconnect.statusAgent(handle.id), `restart ${restart}`).toMatchObject(expected);
+        expect(await reconnect.waitAgent(handle.id, AbortSignal.timeout(2_000))).toMatchObject(expected);
+        expect(record()).toEqual(original);
+        expect(fs.statSync(resultPath).isDirectory()).toBe(true);
+        await reconnect.close();
+        await closeHost();
+      }
+      // Counterexample: a fully valid saved copy permits the expired run's startup collection.
+      // This is a test-owned authoritative copy, not a claim that host save retries succeeded.
+      fs.rmdirSync(resultPath);
+      fs.writeFileSync(resultPath, JSON.stringify(original));
+      const expiredAt = Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000;
+      fs.utimesSync(run, expiredAt / 1_000, expiredAt / 1_000);
+      reconnect = new ResidencyClient(options);
+      await reconnect.ensureHost();
+      expect(fs.existsSync(run)).toBe(false);
+      expect(reconnect.statusAgent(handle.id)).toMatchObject(expected);
+      expect(await reconnect.waitAgent(handle.id, AbortSignal.timeout(2_000))).toMatchObject(expected);
+      await reconnect.close();
+      await closeHost();
+    } finally {
+      await reconnect?.close();
+      await client.close();
+      await stopResident(state.config);
+      for (const owned of launches.owned()) if (same(owned)) {
+        try { process.kill(owned.pid, "SIGKILL"); } catch { /* already exited */ }
+      }
+      await waitFor(() => launches.owned().every((owned) => !same(owned)), 10_000);
+      await state.participants.close();
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("F1 retains a detached worker completion after SIGKILL, expiry, recovery and a second restart", { timeout: 60_000 }, async () => {
+    const state = await rootHarness("f1-detached-completion");
+    const launches = launchLog(state.root);
+    for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
+    const options = { config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath };
+    const client = new ResidencyClient(options);
+    let reconnect: ResidencyClient | undefined;
+    const killOwner = async () => {
+      const owner = JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "owner.json"), "utf8")) as ResidentHostOwner;
+      const owned = launches.owned().find((entry) => entry.pid === owner.pid)!;
+      expect(owned).toBeDefined();
+      expect(same(owned)).toBe(true);
+      process.kill(owner.pid, "SIGKILL"); // Kill only the host, not its detached process worker.
+      await waitFor(() => !same(owned), 20_000);
+    };
+    try {
+      const handle = await client.spawnAgent({ task: "STREAM_PREVIEW", transport: "process", residency: "durable" });
+      const run = path.join(state.config.residencyRoot, "runs", handle.id);
+      const statusPath = path.join(run, "status.json");
+      const resultPath = residentResultPath(state.config.residencyRoot, handle.id);
+      const record = () => JSON.parse(fs.readFileSync(statusPath, "utf8"));
+      await waitFor(() => fs.existsSync(statusPath));
+      expect(record().status).toBe("running");
+      const worker = launches.owned().find(({ argv }) => argv[0] === fakeWorker && argv[argv.indexOf("--id") + 1] === handle.id)!;
+      expect(worker).toBeDefined();
+      await killOwner();
+      expect(same(worker)).toBe(true);
+      await waitFor(() => record().status === "completed" && !same(worker), 10_000);
+      const original = record();
+      expect(original.text).toBe("stream preview complete");
+      expect(fs.existsSync(resultPath)).toBe(false);
+      const metadataPath = path.join(state.config.residencyRoot, "agents", `${handle.id}.json`);
+      expect(JSON.parse(fs.readFileSync(metadataPath, "utf8")).handle.status).toBe("running");
+      // Only advance retention age, never rewrite the worker's terminal record.
+      const expiredAt = Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000;
+      fs.utimesSync(run, expiredAt / 1_000, expiredAt / 1_000);
+      await client.close();
+      for (let restart = 1; restart <= 2; restart++) {
+        reconnect = new ResidencyClient(options);
+        await reconnect.ensureHost();
+        const expected = { id: handle.id, status: original.status, text: original.text, residency: "durable" };
+        expect(reconnect.statusAgent(handle.id), `restart ${restart}`).toMatchObject(expected);
+        expect(await reconnect.waitAgent(handle.id, AbortSignal.timeout(2_000))).toMatchObject(expected);
+        expect(record()).toEqual(original);
+        expect(fs.existsSync(resultPath)).toBe(false);
+        await reconnect.close();
+        await killOwner();
+      }
+    } finally {
+      await reconnect?.close();
+      await client.close();
+      await stopResident(state.config);
+      // Reap only processes recorded by this fixture if a pre-completion assertion failed.
+      for (const owned of launches.owned()) if (same(owned)) {
+        try { process.kill(owned.pid, "SIGKILL"); } catch { /* already exited */ }
+      }
+      await waitFor(() => launches.owned().every((owned) => !same(owned)), 10_000);
+      await state.participants.close();
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("replaces owner and host lock whose live PID has a different start time", { timeout: 45_000 }, async () => {
+    const state = await rootHarness("resident-reused-pid");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh,
+      participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    const stale = { format: RESIDENT_HOST_FORMAT, hostId: client.hostId, pid: process.pid,
+      processStartTime: "0", token: "stale", startedAt: 0, readyAt: 0 };
+    for (const file of ["owner.json", "host.lock"]) fs.writeFileSync(path.join(state.config.residencyRoot, file), JSON.stringify(stale));
+    try {
+      const actor = await client.createActor({ name: "PID survivor", instructions: "Keep mailbox.", residency: "durable" });
+      const owner = await client.ensureHost();
+      expect(owner.pid).not.toBe(process.pid);
+      expect(owner.processStartTime).toBe(processStartTime(owner.pid));
+      await client.removeActor(actor.id);
+    } finally {
+      await client.close();
+      // The fail-on-base probe leaves the planted owner in place; never signal it.
+      const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+      if (JSON.parse(fs.readFileSync(ownerPath, "utf8")).pid === process.pid) fs.rmSync(ownerPath);
+      await stopResident(state.config); await state.participants.close();
+    }
+  });
+
+  it.each([
+    ["SIGTERM", false], ["SIGKILL", false], ["SIGKILL", true],
+  ] as const)("relaunches a dead durable host on ordinary tell after %s (fresh dead mesh lock: %s)", { timeout: 100_000 }, async (signal, deadMeshLock) => {
+    const state = await rootHarness(`resident-relaunch-${signal}`);
+    const launches = launchLog(state.root);
+    for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
+    const agents = new AgentManager(repo, state.config.agents, {
+      workerPath: fakeWorker, runRoot: path.join(state.root, "parent-runs"),
+      mainAgentId: state.identity.id, meshRoot: state.config.meshRoot,
+      projectRoot: repo, hostId: state.identity.id, identityId: state.identity.id,
+    });
+    const actors = new ActorManager(state.config.sessionId, state.identity, state.mesh,
+      state.meshConfig, agents, () => {}, {
+        actorRoot: state.config.actorRoot, persistent: true, claimResidency: "session", rootId: state.identity.id,
+        canManageActor: (id) => state.participants.get(id)?.ownerHostId === state.identity.id,
+      });
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh,
+      participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    // Deliberately do not start the watchdog: this is the ordinary message path.
+    const control = new FabricControlPlane(state.mesh, state.identity, {
+      enabled: true, hostId: state.identity.id, pollMs: 20, acknowledgementTimeoutMs: 3_000,
+    });
+    control.start(() => ({ accepted: false }));
+    const router = new AgentMessageRouter(agents, actors, state.mainAgent, state.participants,
+      control, (binding) => binding, client);
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    const owner = () => JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+    const registry = () => JSON.parse(fs.readFileSync(path.join(state.config.actorRoot, "actors.json"), "utf8")) as
+      { actors: Array<{ id: string; messages: Array<{ text?: string; data?: { message?: string } }>; queue: unknown[] }> };
+    let senderRestart: Promise<void> | undefined;
+    try {
+      const actor = await client.createActor({ name: "restart survivor", instructions: "Keep id and mailbox.", residency: "durable", coalesce: false });
+      await router.routeMessage(actor.id, "before death", undefined, "followUp");
+      await waitFor(() => (registry().actors.find((item) => item.id === actor.id)?.messages.length ?? 0) >= 2);
+      const before = registry().actors.find((item) => item.id === actor.id)!;
+      const killed = owner();
+      // Never signal a PID that outlived our launch identity.
+      const recorded = launches.owned().find((entry) => entry.pid === killed.pid)!;
+      expect(recorded).toBeDefined();
+      expect(same(recorded)).toBe(true);
+      if (killed.processStartTime) expect(killed.processStartTime).toBe(recorded.started);
+      process.kill(killed.pid, signal);
+      await waitFor(() => !same(recorded), 20_000);
+      // Send immediately: a dead holder is still unreclaimable during MeshStore's 30 s stale
+      // window. Recovery keeps the tell pending; latency is bounded by that window plus boot/delivery.
+      if (deadMeshLock) {
+        // Deterministically model SIGKILL inside a mesh write, without changing MeshStore's fence.
+        // Pause our own mesh publishers so they cannot race this owner-file publication.
+        await state.participants.close();
+        await control.close();
+        const meshLock = path.join(state.config.meshRoot, ".lock");
+        await waitFor(() => !fs.existsSync(meshLock), 35_000);
+        fs.mkdirSync(meshLock);
+        fs.writeFileSync(path.join(meshLock, "owner"), `dead-host\n${killed.pid}\n${Date.now()}\n`);
+        // Resume the sender after publishing the complete dead identity.
+        senderRestart = state.participants.start().catch(() => undefined);
+        control.start(() => ({ accepted: false }));
+      }
+      const started = Date.now();
+      const result = await router.routeMessage(actor.id, `after ${signal}`, undefined, "followUp");
+      expect(result.queued).toBe(true);
+      expect(Date.now() - started).toBeLessThan(30_000 + 15_000);
+      await senderRestart;
+      expect(owner().pid).not.toBe(killed.pid);
+      await router.routeMessage(actor.id, "queued successor", undefined, "followUp");
+      await waitFor(() => (registry().actors.find((item) => item.id === actor.id)?.messages.length ?? 0) >= before.messages.length + 4);
+      const after = registry().actors.find((item) => item.id === actor.id)!;
+      expect(after.id).toBe(actor.id);
+      expect(after.messages.slice(0, before.messages.length)).toEqual(before.messages);
+      expect(after.messages.map((item) => item.data?.message)).toEqual(expect.arrayContaining([`after ${signal}`, "queued successor"]));
+      await client.removeActor(actor.id);
+    } finally {
+      await senderRestart;
+      await client.close();
+      await stopResident(state.config);
+      await control.close();
+      await actors.close();
+      await agents.close();
+      await state.participants.close();
+    }
+  });
+
   it.each([false, true])("preserves a resident-host ASK activation at the Main ceiling (queued=%s)", { timeout: 45_000 }, async queued => {
     const state = await rootHarness(`resident-main-ceiling-${queued}`);
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath });

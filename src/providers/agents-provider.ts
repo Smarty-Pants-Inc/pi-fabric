@@ -388,6 +388,7 @@ export class AgentsProvider implements FabricProvider {
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
       (binding, runner, context) => this.#resolvePiRunBinding(binding, runner, context),
+      residency,
     );
     this.#lifecycleScheduler = new LifecycleDeliveryScheduler(
       DEFAULT_LIFECYCLE_COALESCE_MS,
@@ -1006,7 +1007,7 @@ export class AgentsProvider implements FabricProvider {
         const id = String(args.id);
         const message = String(args.message);
         this.actorManager.validateDirectMessage(message, args.data);
-        const { actor, participant } = this.#resolveActorTarget(id);
+        const { actor, participant } = await this.#router.resolveActorMessageTarget(id);
         const ownsActor = actor ? this.actorManager.owns(actor.id) : false;
         const requestedOverrides = actorRunBinding(args);
         const overrides = ownsActor

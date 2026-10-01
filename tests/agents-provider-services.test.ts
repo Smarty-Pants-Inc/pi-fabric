@@ -1,3 +1,7 @@
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { MainAgentController } from "../src/main-agent.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -233,6 +237,17 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.routeMessage("gone", "hi", undefined, "steer")).rejects.toThrow(stalled.message);
   });
 
+  it.each(["steer", "followUp"] as const)("names a peers-listed but not yet mirrored target as retryable (%s)", async (kind) => {
+    const { router, participants, control } = routing();
+    const id = "session:waiting";
+    Object.assign(participants, { peers: () => [{ id, host: "forge" }] });
+    await expect(router.routeMessage(id, "hello", undefined, kind)).rejects.toMatchObject({
+      name: "FabricParticipantNotYetMirroredError", code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: true,
+      message: expect.stringContaining("not yet mirrored"),
+    });
+    expect(control.request).not.toHaveBeenCalled();
+  });
+
   // smarty-dev#447: a sender whose lease just lapsed may still be live; its owner host gets
   // the reply. A long lapse or no record at all fails with the reason.
   it("replies to a peer root whose lease lapsed moments ago through its owner host", async () => {
@@ -268,6 +283,20 @@ describe("agents provider message routing service boundaries", () => {
       .rejects.toMatchObject({ name: "FabricRouteAuthorityError", code: "FABRIC_ROUTE_AUTHORITY_CHANGED" });
     expect(control.request).not.toHaveBeenCalled();
     expect(actors.steerRemote).not.toHaveBeenCalled();
+  });
+
+  it.each(["absent", "rootId", "ownerHostId", "ownerIdentityId", "remoteHost"] as const)("refuses a remote Main alias when fresh authority changes (%s)", async (change) => {
+    const { router, participants, control, actors, main } = routing();
+    main.local = false;
+    main.id = "session:main-root";
+    const native = { ...participant(), id: main.id, rootId: main.id };
+    const fresh = change === "absent" ? undefined : { ...native, [change]: "replacement" };
+    participants.get.mockImplementation((_id, _now, options) => options?.fresh ? fresh : native);
+    await expect(router.routeMessage("main", "private", { secret: true }, "followUp"))
+      .rejects.toMatchObject({ name: "FabricRouteAuthorityError", code: "FABRIC_ROUTE_AUTHORITY_CHANGED" });
+    expect(control.request).not.toHaveBeenCalled();
+    expect(actors.steerRemote).not.toHaveBeenCalled();
+    expect(main.deliverAgent).not.toHaveBeenCalled();
   });
 
   it("names why a remote Main cannot be resolved", async () => {
@@ -320,6 +349,78 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.routeMessage("session:never", "reply", undefined, "followUp"))
       .rejects.toThrow("Unknown Fabric participant: session:never (no record on this mesh root");
     expect(control.request).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("refuses direct and incoming control delivery to a local non-interactive Main (fresh-only=%s)", async (freshOnly) => {
+    const { router, participants, main } = routing();
+    const root: FabricParticipantInfo = { ...participant(), id: main.id, interactive: false, capabilities: ["fabric"] };
+    participants.get.mockImplementation((_id, _now, options) => !freshOnly || options?.fresh ? root : undefined);
+    await expect(router.routeMessage(main.id, "audit must not answer", undefined, "followUp"))
+      .rejects.toMatchObject({ name: "FabricParticipantNonInteractiveError" });
+    await expect(router.acceptControl({ ...command("steer"), targetId: main.id }, { id: "sender", name: "Sender", kind: "main" }))
+      .resolves.toMatchObject({ accepted: false, error: expect.stringContaining("non-interactive") });
+    expect(main.deliverAgent).not.toHaveBeenCalled();
+  });
+
+  const failedInitialPresence = async (mode: ExtensionContext["mode"]) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-main-failed-presence-"));
+    const ports = routing();
+    const pi = { sendMessage: vi.fn(), sendUserMessage: vi.fn(), getThinkingLevel: () => "off" };
+    const main = new MainAgentController(pi as unknown as ExtensionAPI, "session:audit", true, root, "audit",
+      mode !== "print" && mode !== "json");
+    const context = { mode, isIdle: () => true, hasPendingMessages: () => false } as ExtensionContext;
+    main.attachFollowUpDrain(context, 0, path.join(root, "followups.json"));
+    const deliverAgent = vi.spyOn(main, "deliverAgent");
+    const identity = { id: main.id, name: "Main", kind: "main" as const };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000);
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: main.id, rootId: main.id, identity, heartbeatMs: 60_000, leaseMs: 120_000,
+    });
+    directory.registerSource(() => [directory.root(main.info(context), mode !== "print" && mode !== "json")]);
+    const failure = Object.assign(new Error("Initial label write timed out"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    const put = vi.spyOn(mesh, "put").mockRejectedValue(failure);
+    const router = new AgentMessageRouter(ports.agents, { ...ports.actors, identity }, main, directory, ports.control, (binding) => binding);
+    const close = async () => {
+      main.closeFollowUpDrain();
+      await directory.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    };
+    try {
+      await expect(directory.start()).rejects.toBe(failure);
+      expect(put).toHaveBeenCalledWith(expect.objectContaining({ key: "topology/peer-seq" }));
+      expect(directory.get(main.id)).toBeUndefined();
+      expect(directory.get(main.id, undefined, { fresh: true })).toBeUndefined();
+      return { router, main, pi, deliverAgent, close };
+    } catch (error) { await close(); throw error; }
+  };
+
+  it.each([
+    ["print", "steer"], ["print", "followUp"], ["json", "steer"], ["json", "followUp"],
+  ] as const)("rejects direct and incoming control to %s Main after failed initial presence (%s)", async (mode, kind) => {
+    const state = await failedInitialPresence(mode);
+    try {
+      const direct = await state.router.routeMessage("main", "audit must not answer", undefined, kind)
+        .catch((error: unknown) => error);
+      const incoming = await state.router.acceptControl({ ...command(kind), targetId: state.main.id },
+        { id: "sender", name: "Sender", kind: "main" }, undefined, "bridge");
+      expect.soft(state.deliverAgent).not.toHaveBeenCalled();
+      expect.soft(state.pi.sendMessage).not.toHaveBeenCalled();
+      expect.soft(state.pi.sendUserMessage).not.toHaveBeenCalled();
+      expect(direct).toMatchObject({ name: "FabricParticipantNonInteractiveError", code: "FABRIC_PARTICIPANT_NON_INTERACTIVE" });
+      expect(incoming).toMatchObject({ accepted: false, error: expect.stringContaining("non-interactive") });
+    } finally { await state.close(); }
+  });
+
+  it.each(["steer", "followUp"] as const)("delivers interactive Main direct and control messages despite failed initial presence (%s)", async (kind) => {
+    const state = await failedInitialPresence("tui");
+    try {
+      await expect(state.router.routeMessage("main", "direct", undefined, kind)).resolves.toMatchObject({ queued: true, routed: "main" });
+      await expect(state.router.acceptControl({ ...command(kind), targetId: state.main.id },
+        { id: "sender", name: "Sender", kind: "main" }, undefined, "bridge")).resolves.toMatchObject({ accepted: true });
+      expect(state.deliverAgent).toHaveBeenCalledTimes(2);
+      expect(state.pi.sendMessage).toHaveBeenCalledTimes(2);
+      expect(state.pi.sendUserMessage).not.toHaveBeenCalled();
+    } finally { await state.close(); }
   });
 
   it("preserves passive Main delivery and caller identity without actor validation", async () => {

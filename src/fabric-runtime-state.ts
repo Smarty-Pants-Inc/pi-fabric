@@ -557,6 +557,7 @@ export class FabricRuntimeState {
       identity.kind === "main" && identity.id === mainAgentId,
       context.cwd,
       identity.kind === "main" ? sessionId : undefined,
+      context.mode !== "print" && context.mode !== "json",
     );
     this.#mainAgent = mainAgent;
     const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
@@ -909,7 +910,7 @@ export class FabricRuntimeState {
     const firstSeenAgents = new Map<string, number>();
     if (mainAgent.local) {
       this.#participants.registerSource(() => [
-        this.#participants!.root(mainAgent.info(context)),
+        this.#participants!.root(mainAgent.info(context), mainAgent.interactive),
       ]);
     }
     this.#participants.registerSource(() =>

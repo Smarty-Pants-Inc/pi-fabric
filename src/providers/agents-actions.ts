@@ -286,7 +286,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "projectAgent",
-    description: "Return the live project agent for this session's project: the root whose role is project-agent and whose project (the checkout that owns the git common directory) is this session's. A worktree agent reports to it. Throws with the reason when none is live.",
+    description: "Return this session's interactive project lead by normalized repository origin, using the lead id recorded at launch (SMARTY_LEAD_SESSION or .local/lead) to resolve ambiguity and moved lanes. Unrecorded bridge mirrors cannot claim leadership. Throws a named error when unresolved or ambiguous.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     risk: "read",
   },

@@ -230,6 +230,70 @@ describe("resident creation idempotency", () => {
   }
 });
 
+describe("loaded resident creation capability", () => {
+  for (const kind of ["main create", "nested create", "main spawn"] as const) {
+    const create = (state: Awaited<ReturnType<typeof harness>>, name: string, idempotencyKey?: string) => {
+      const request = { name, model: state.model, residency: "durable" as const,
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }) };
+      return kind === "main spawn"
+        ? state.client.spawnAgent({ ...request, task: "work", transport: "process" })
+        : (kind === "main create" ? state.client : state.nested).createActor({ ...request, instructions: "work" });
+    };
+
+    it(`${kind}: refuses same-key attempts on a running pre-key owner before any publication`, async () => {
+      const state = await harness(false, undefined, 5_000);
+      try {
+        const ownerPath = path.join(state.residencyRoot, "owner.json");
+        const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+        expect(owner).toMatchObject({ requestFence: 1, creationIdempotency: 1 });
+        // Precisely the reachable old-owner handshake: operations and the
+        // abandonment fence exist, but keyed dedup is not implemented.
+        delete owner.creationIdempotency;
+        fs.writeFileSync(ownerPath, JSON.stringify(owner));
+        const before = fs.readFileSync(ownerPath, "utf8");
+        for (const name of ["first-attempt", "retry-attempt"]) {
+          const error = await create(state, name, "old-host-retry").catch(error => error);
+          expect(error).toMatchObject({ name: "ResidentCommandUnsupportedError", code: "RESIDENT_COMMAND_UNSUPPORTED" });
+          expect(error.message).toMatch(/loaded resident host lacks creation idempotency-key support.*No request was dispatched/);
+        }
+        expect(fs.readFileSync(ownerPath, "utf8")).toBe(before);
+        for (const directory of ["requests", "processing", "responses", "decisions", "agents"]) {
+          expect(entries(state.residencyRoot, directory), directory).toEqual([]);
+        }
+        expect(new ActorRegistryStore(state.config.actorRoot).records()).toEqual([]);
+        expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toEqual([]);
+      } finally { await state.close(); }
+    });
+
+    it(`${kind}: omitted keys still dispatch independent unkeyed requests to a pre-key owner`, { timeout: 20_000 }, async () => {
+      const state = await harness(false, undefined, 5_000);
+      const write = fs.renameSync;
+      const envelopes: Array<{ operation: string; idempotencyKey?: string; request: { idempotencyKey?: string } }> = [];
+      try {
+        const ownerPath = path.join(state.residencyRoot, "owner.json");
+        const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+        delete owner.creationIdempotency;
+        fs.writeFileSync(ownerPath, JSON.stringify(owner));
+        vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+          write(source, target);
+          if (path.dirname(String(target)) === path.join(state.residencyRoot, "requests")) {
+            envelopes.push(JSON.parse(fs.readFileSync(target, "utf8")));
+          }
+        });
+        const first = await create(state, "unkeyed-first");
+        const second = await create(state, "unkeyed-second");
+        expect(first.id).not.toBe(second.id);
+        expect(envelopes).toHaveLength(2);
+        for (const envelope of envelopes) {
+          expect(envelope.operation).toBe(kind === "main spawn" ? "spawn" : "createActor");
+          expect(envelope.idempotencyKey).toBeUndefined();
+          expect(envelope.request.idempotencyKey).toBeUndefined();
+        }
+      } finally { vi.restoreAllMocks(); await state.close(); }
+    });
+  }
+});
+
 describe("resident creation cache boundaries", () => {
   const actorRequest = (name: string, idempotencyKey: string) => ({
     name, idempotencyKey, instructions: "Work", scope: "session" as const, residency: "durable" as const, model: "test/visible",

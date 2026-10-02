@@ -527,6 +527,7 @@ export class ResidentHost {
         readyAt: now,
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
+        creationIdempotency: 1,
         ...(this.launch ? { releaseRoot: this.launch.spec.releaseRoot, configDigest: this.launch.spec.digest,
           handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
           ...(this.launch.attempt ? { attempt: this.launch.attempt } : {}) } : {}),

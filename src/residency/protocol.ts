@@ -320,6 +320,8 @@ export interface ResidentHostOwner {
   commands?: readonly string[];
   /** New clients must not dispatch mutations to an already-running pre-fence host. */
   requestFence?: 1;
+  /** Operation-scoped retry keys implemented by this loaded host, not desired config. */
+  creationIdempotency?: 1;
   /** Attestation from the loaded host, never desired config.json. */
   releaseRoot?: string;
   configDigest?: string;
@@ -470,6 +472,22 @@ export const assertResidentCommandSupported = (owner: ResidentHostOwner, operati
       !(supported as readonly string[]).includes(operation)) {
     throw new ResidentCommandUnsupportedError();
   }
+};
+
+/** Fence explicit retry keys before publication; keep unkeyed calls compatible with older hosts. */
+export const prepareResidentCreationCommand = (owner: ResidentHostOwner, command: ResidentCommand): ResidentCommand => {
+  if (command.operation !== "spawn" && command.operation !== "createActor") return command;
+  if (owner.creationIdempotency !== 1) {
+    if (command.idempotencyKey !== undefined) {
+      throw new ResidentCommandUnsupportedError(
+        "The loaded resident host lacks creation idempotency-key support; activate a compatible resident host before retrying with the same key. No request was dispatched.",
+      );
+    }
+    return command;
+  }
+  // One key per call, held in the envelope for any transport replay. Generate it
+  // only after negotiation, so an unkeyed call can still use a pre-key host.
+  return { ...command, idempotencyKey: command.idempotencyKey ?? randomUUID() };
 };
 
 export interface ResidentCommandResponse {

@@ -16,7 +16,7 @@ import { ActorManager } from "../src/actors/manager.js";
 import type { AgentManager } from "../src/agents/manager.js";
 import { buildActorContext } from "../src/actors/context.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, type FabricAgentRunner } from "../src/config.js";
 import { ActionRegistry, type FabricCallAudit } from "../src/core/action-registry.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { CapturedToolsProvider } from "../src/providers/captured-tools-provider.js";
@@ -222,7 +222,16 @@ describe("nested tool_result structured redaction", () => {
     // No worker or agent is started: transferred subscribers receive the
     // normal durable host-event relay, with a trap on accidental execution.
     const run = vi.fn(async () => { throw new Error("must not start an agent"); });
-    const agents = { config: DEFAULT_FABRIC_CONFIG.agents, resolveKernel: () => undefined, run } as unknown as AgentManager;
+    const agents = {
+      config: DEFAULT_FABRIC_CONFIG.agents,
+      // Match AgentManager's configured default selection without starting a worker.
+      defaultModel(this: Pick<AgentManager, "config">, runner: FabricAgentRunner = this.config.runner): string | undefined {
+        return runner === "claude" ? this.config.claude.model
+          : runner === "veda" ? this.config.veda.model : this.config.model;
+      },
+      resolveKernel: () => undefined,
+      run,
+    } as unknown as AgentManager;
     const actors = new ActorManager("redaction", { id: "main", name: "Main", kind: "agent" }, mesh,
       { ...DEFAULT_FABRIC_CONFIG.mesh, enabled: true }, agents, () => {},
       { actorRoot: path.join(root, "actors"), actorScope: "session", canManageActor: () => owned });

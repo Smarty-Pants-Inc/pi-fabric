@@ -21,22 +21,28 @@ afterEach(() => {
 });
 
 describe("startup mesh lock selector", () => {
-  it.each([undefined, 1] as const)("%s uses exact B68 canonical acquisition and token-prefix release", async (lockProtocol) => {
+  it.each([undefined, 1] as const)("%s keeps the B68 v1 wire with exclusive publication and detached release", async (lockProtocol) => {
     const mesh = store(lockProtocol === undefined ? {} : { lockProtocol });
     const lock = path.join(mesh.root, ".lock");
     const mkdir = vi.spyOn(fs, "mkdirSync");
     const rename = vi.spyOn(fs, "renameSync");
     const remove = vi.spyOn(fs, "rmSync");
+    const write = vi.spyOn(fs, "writeFileSync");
+    let token = "";
     await mesh.exclusive(() => {
       const owner = fs.readFileSync(path.join(lock, "owner"), "utf8");
       expect(owner).toMatch(new RegExp(`^[^\\n]+\\n${process.pid}\\n[0-9]+\\n$`));
       expect(mkdir).toHaveBeenCalledWith(lock, { mode: 0o700 });
-      // B68 release checks only the token prefix, not the complete owner record.
-      fs.writeFileSync(path.join(lock, "owner"), owner.split("\n")[0] + "\nchanged\n");
+      token = owner.split("\n")[0]!;
+      expect(write).toHaveBeenCalledWith(path.join(lock, "owner"), owner, {
+        encoding: "utf8", flag: "wx", mode: 0o600,
+      });
     });
     expect(mesh.lockProtocol).toBe(1);
-    expect(rename).not.toHaveBeenCalled();
-    expect(remove).toHaveBeenCalledWith(lock, { recursive: true, force: true });
+    const released = `${lock}.released.${token}`;
+    expect(rename).toHaveBeenCalledWith(lock, released);
+    expect(remove).toHaveBeenCalledWith(released, { recursive: true, force: true });
+    expect(remove).not.toHaveBeenCalledWith(lock, { recursive: true, force: true });
     expect(fs.existsSync(lock)).toBe(false);
   });
 
@@ -64,8 +70,8 @@ describe("startup mesh lock selector", () => {
     expect(fs.readdirSync(lock)).toEqual([]);
   });
 
-  it("v2 release fences on the entire complete owner record", async () => {
-    const mesh = store({ lockProtocol: 2 });
+  it.each([undefined, 1, 2] as const)("protocol %s release fences on the entire complete owner record", async (lockProtocol) => {
+    const mesh = store(lockProtocol === undefined ? {} : { lockProtocol });
     const lock = path.join(mesh.root, ".lock");
     let changed = "";
     await mesh.exclusive(() => {

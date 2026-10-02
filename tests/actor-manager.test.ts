@@ -134,6 +134,34 @@ describe("ActorManager prune revocation (#2184 F7)", () => {
 });
 
 describe("ActorManager fleet model policy (#2490)", () => {
+  it("F6 #3115 registers the actual ID synchronously before local creation effects", async () => {
+    const { actors, root, mesh } = setup(true);
+    let committedId: string | undefined;
+    const actor = await actors.create({ name: "boundary", instructions: "Review." }, {
+      onCommit(id) {
+        committedId = id;
+        expect(actors.list()).toEqual([]);
+        expect(fs.existsSync(path.join(root, "actors", id))).toBe(false);
+        expect(mesh.listAll("actors/test/")).toEqual([]);
+      },
+    });
+    expect(committedId).toBe(actor.id);
+    expect(actors.owns(actor.id)).toBe(true);
+    expect(mesh.listAll("actors/test/").map(entry => entry.value)).toEqual([expect.objectContaining({ id: actor.id })]);
+  });
+
+  it("F6 #3115 fails closed when synchronous commit registration refuses creation", async () => {
+    const { actors, root, mesh } = setup(true);
+    let committedId: string | undefined;
+    await expect(actors.create({ name: "boundary", instructions: "Review." }, {
+      onCommit(id) { committedId = id; throw new Error("receipt registration refused"); },
+    })).rejects.toThrow("receipt registration refused");
+    expect(committedId).toBeTruthy();
+    expect(fs.existsSync(path.join(root, "actors", committedId!))).toBe(false);
+    expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+    expect(fs.existsSync(path.join(root, "actors", "actors.json"))).toBe(false);
+  });
+
   it.each(["hook", "predecessor"] as const)("round 3 F4 rechecks the synchronous invocation fence after %s wait", async wait => {
     const { actors, root, mesh } = setup(true);
     const abort = new AbortController();
@@ -147,12 +175,14 @@ describe("ActorManager fleet model policy (#2490)", () => {
       remove = vi.spyOn(actors, "remove").mockImplementation(async (...args) => { const result = await original(...args); enter(); await held; return result; });
     }
     const check = () => abort.signal.throwIfAborted();
+    const onCommit = vi.fn();
     const pending = actors.create({ name: "fenced", instructions: "Never publish after cancellation.", topics: ["round3.work"] }, {
-      async beforeCommit() { check(); if (wait === "hook") { enter(); await held; } }, checkActive: check,
+      async beforeCommit() { check(); if (wait === "hook") { enter(); await held; } }, checkActive: check, onCommit,
     }).catch(error => error);
     try {
       await entered; abort.abort(new Error("cancelled admission")); release();
       expect(await pending).toMatchObject({ message: "cancelled admission" });
+      expect(onCommit).not.toHaveBeenCalled();
       expect(actors.list().filter(actor => actor.name === "fenced")).toEqual([]);
       const actorRoot = path.join(root, "actors");
       expect(fs.existsSync(actorRoot) ? fs.readdirSync(actorRoot, { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== "bindings") : []).toEqual([]);

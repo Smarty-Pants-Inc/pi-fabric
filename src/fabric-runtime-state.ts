@@ -805,7 +805,8 @@ export class FabricRuntimeState {
     try {
       if (mainAgent.local) {
         this.#participants.registerSource(() => [
-          this.#participants!.root(mainAgent.info(context), mainAgent.interactive),
+          // The existing presence heartbeat rereads the Pi name, including renames and clearing.
+          this.#participants!.root(mainAgent.info(context), mainAgent.interactive, this.pi.getSessionName?.()),
         ]);
       }
       // An initial publication failure must not leave unfenced loaded actors behind.

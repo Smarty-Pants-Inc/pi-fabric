@@ -10,6 +10,9 @@ const ownerPath = path.join(lock, "owner");
 const ready = path.join(root, "paused.ready");
 const go = path.join(root, "paused.go");
 const resumed = path.join(root, "paused.resumed");
+const entered = path.join(root, "paused.entered");
+const release = path.join(root, "paused.release");
+const windowsOpened = process.platform === "win32" && phase === "opened";
 const write = fs.writeFileSync.bind(fs);
 const rename = fs.renameSync.bind(fs);
 let armed = true;
@@ -30,7 +33,9 @@ const pause = (resume) => {
   try { resume(); }
   catch (error) { refused = true; throw error; }
   finally {
-    const changed = fs.readFileSync(ownerPath, "utf8") !== owner || fs.statSync(lock).ino !== inode || ran;
+    // Windows keeps the opened owner canonical: resuming publishes its own receipt,
+    // not a successor overwrite. The parent separately verifies live exclusion.
+    const changed = (!windowsOpened && fs.readFileSync(ownerPath, "utf8") !== owner) || fs.statSync(lock).ino !== inode || ran;
     write(resumed, "");
     if (changed) throw new Error("Paused writer overwrote or entered a live successor");
   }
@@ -39,8 +44,9 @@ if (phase === "write" || phase === "opened") {
   fs.writeFileSync = (file, data, options) => {
     if (!armed || path.basename(String(file)) !== "owner") return write(file, data, options);
     if (phase === "opened") {
-      // Pause with an empty owner already opened. Recovery detaches this directory;
-      // the resumed write lands through the original fd, not the successor's name.
+      // Pause with an empty owner already opened. The POSIX adversarial fixture
+      // detaches this directory, so the resumed write uses the original fd, not
+      // the successor's name. Windows keeps the open owner canonical instead.
       const fd = fs.openSync(file, options?.flag ?? "w", options?.mode);
       try { return pause(() => write(fd, data, options)); }
       finally { fs.closeSync(fd); }
@@ -54,6 +60,15 @@ if (phase === "write" || phase === "opened") {
   };
 }
 const store = new MeshStore(root, 65536, 100, { lockTimeoutMs: 5000, ...(lockProtocol === 2 ? { lockProtocol } : {}) });
-const result = await store.exclusive(() => { ran = true; }).catch(error => error);
+const result = await store.exclusive(() => {
+  ran = true;
+  if (windowsOpened) {
+    const directory = fs.lstatSync(lock);
+    write(entered, JSON.stringify({ owner: fs.readFileSync(ownerPath, "utf8"), dev: directory.dev, ino: directory.ino }));
+    const deadline = Date.now() + 10_000;
+    while (!fs.existsSync(release) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    if (!fs.existsSync(release)) throw new Error("Timed out awaiting owned fixture release");
+  }
+}).catch(error => error);
 console.log(JSON.stringify({ ran, refused, timeout: result?.code === "FABRIC_MESH_LOCK_TIMEOUT",
   ownershipLost: result?.code === "FABRIC_MESH_LOCK_OWNERSHIP_LOST" }));

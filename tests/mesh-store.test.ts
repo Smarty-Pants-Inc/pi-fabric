@@ -664,13 +664,16 @@ describe("MeshStore lock recovery", () => {
     expect(fs.existsSync(lock)).toBe(false);
   }, 30_000);
 
-  it.each([["write", 1], ["opened", 1], ["write", 2], ["rename", 2]] as const)("a paused native %s publication (protocol %s) cannot overwrite or enter a live successor", async (phase, lockProtocol) => {
+  it.each([["write", 1], ["opened", 1], ["write", 2], ["rename", 2]] as const)("a paused native %s publication (protocol %s) preserves exclusion against live owners or successors", async (phase, lockProtocol) => {
     const store = createStore({ lockTimeoutMs: 1_000, ...(lockProtocol === 2 ? { lockProtocol } : {}) });
     const lock = path.join(store.root, ".lock");
     const ownerPath = path.join(lock, "owner");
     const ready = path.join(store.root, "paused.ready");
     const go = path.join(store.root, "paused.go");
     const resumed = path.join(store.root, "paused.resumed");
+    const entered = path.join(store.root, "paused.entered");
+    const release = path.join(store.root, "paused.release");
+    const windowsOpened = process.platform === "win32" && phase === "opened";
     const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-paused-publication.mjs"), store.root, phase, String(lockProtocol)], {
       cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
     });
@@ -691,31 +694,64 @@ describe("MeshStore lock recovery", () => {
         await expect(store.exclusive(() => { throw new Error("must not recover an unrecorded initializer"); }))
           .rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
         expect(fs.existsSync(lock)).toBe(true);
-        // Preserve round 4's opposite-order namespace-replacement defense as an
-        // adversarial fixture action, NOT a production ownerless-recovery policy.
-        fs.renameSync(lock, `${lock}.test-detached`);
+        if (windowsOpened) {
+          // Windows cannot replace a directory while this native child's owner fd
+          // is open. Only this exact rename's EPERM/EBUSY is the expected outcome.
+          const directory = fs.lstatSync(lock);
+          expect(fs.readFileSync(ownerPath, "utf8")).toBe("");
+          let renameError: unknown;
+          try { fs.renameSync(lock, `${lock}.test-detached`); }
+          catch (error) { renameError = error; }
+          expect(renameError).toBeDefined();
+          expect(["EPERM", "EBUSY"]).toContain((renameError as NodeJS.ErrnoException).code);
+          expect(fs.existsSync(`${lock}.test-detached`)).toBe(false);
+          expect(fs.readFileSync(ownerPath, "utf8")).toBe("");
+          expect([fs.lstatSync(lock).dev, fs.lstatSync(lock).ino]).toEqual([directory.dev, directory.ino]);
+        } else {
+          // Preserve round 4's opposite-order namespace-replacement defense as an
+          // adversarial fixture action, NOT a production ownerless-recovery policy.
+          fs.renameSync(lock, `${lock}.test-detached`);
+        }
       }
-      await store.exclusive(() => {
-        const owner = fs.readFileSync(ownerPath, "utf8");
-        const inode = fs.statSync(lock).ino;
+      if (windowsOpened) {
         fs.writeFileSync(go, "");
-        const deadline = Date.now() + 5_000;
-        // Only this fixture's child can advance the paused syscall. Keep the actual
-        // successor's synchronous critical section live until that resume settles.
-        while (!fs.existsSync(resumed) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-        expect(fs.existsSync(resumed)).toBe(true);
-        expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
-        expect(fs.statSync(lock).ino).toBe(inode);
-      });
+        await vi.waitFor(() => expect(fs.existsSync(entered)).toBe(true), { timeout: 10_000, interval: 20 });
+        const held = JSON.parse(fs.readFileSync(entered, "utf8")) as { owner: string; ino: number; dev: number };
+        expect(held.owner.trim().split("\n")).toHaveLength(3);
+        expect(held.owner.split("\n")[1]).toBe(String(child.pid));
+        const operation = vi.fn();
+        await expect(store.exclusive(operation)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+        expect(operation).not.toHaveBeenCalled();
+        expect(fs.readFileSync(ownerPath, "utf8")).toBe(held.owner);
+        expect([fs.lstatSync(lock).dev, fs.lstatSync(lock).ino]).toEqual([held.dev, held.ino]);
+        expect(fs.existsSync(`${lock}.test-detached`)).toBe(false);
+      } else {
+        await store.exclusive(() => {
+          const owner = fs.readFileSync(ownerPath, "utf8");
+          const inode = fs.statSync(lock).ino;
+          fs.writeFileSync(go, "");
+          const deadline = Date.now() + 5_000;
+          // Only this fixture's child can advance the paused syscall. Keep the actual
+          // successor's synchronous critical section live until that resume settles.
+          while (!fs.existsSync(resumed) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          expect(fs.existsSync(resumed)).toBe(true);
+          expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+          expect(fs.statSync(lock).ino).toBe(inode);
+        });
+      }
     } finally {
       fs.writeFileSync(go, "");
+      fs.writeFileSync(release, "");
       expect(await closed, stderr).toBe(0); // real close, before root teardown
     }
-    expect(JSON.parse(stdout.trim())).toMatchObject(lockProtocol === 1
-      ? { ran: false, refused: phase === "write", timeout: false, ownershipLost: true }
-      : phase === "write"
-        ? { ran: true, refused: false, timeout: false, ownershipLost: false }
-        : { ran: false, refused: true, timeout: true, ownershipLost: false });
+    expect(JSON.parse(stdout.trim())).toMatchObject(windowsOpened
+      ? { ran: true, refused: false, timeout: false, ownershipLost: false }
+      : lockProtocol === 1
+        ? { ran: false, refused: phase === "write", timeout: false, ownershipLost: true }
+        : phase === "write"
+          ? { ran: true, refused: false, timeout: false, ownershipLost: false }
+          : { ran: false, refused: true, timeout: true, ownershipLost: false });
+    if (windowsOpened) expect(fs.existsSync(lock)).toBe(false);
     const fences = fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."));
     expect(fences).toHaveLength(0);
     expect(fs.readdirSync(store.root).some(name => name.startsWith(".lock.pending."))).toBe(false);

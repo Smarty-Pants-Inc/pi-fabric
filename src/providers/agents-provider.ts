@@ -1625,7 +1625,7 @@ export class AgentsProvider implements FabricProvider {
     const live = this.participants.get(actor.id, undefined, { fresh: true });
     // Strip passive counts and runs even when an older owner omits its live counters.
     // In particular, an idle owner without actorRun must clear a registry's stale run.
-    const { queued: _queued, messages: _messages, inFlightRun: _run, ...definition } = actor;
+    const { queued: _queued, messages: _messages, preparing: _preparing, inFlightRun: _run, ...definition } = actor;
     if (!live || live.stale || live.kind !== "actor") return { ...definition, status: "unknown" };
     const now = Date.now();
     const removal = live.actorRemoval ?? actor.removal;
@@ -1633,12 +1633,16 @@ export class AgentsProvider implements FabricProvider {
     const runId = removal?.runId ?? run?.id;
     const runAge = formatAge(now - (removal?.runStartedAt ?? run?.startedAt ?? removal?.requestedAt ?? now));
     const status = live.status === "idle" || live.status === "queued" ||
+      live.status === "preparing" || live.status === "waiting" ||
       live.status === "running" || live.status === "stopped" ? live.status : "unknown";
     return {
       ...definition,
       status,
       ...(live.actorQueued !== undefined ? { queued: live.actorQueued } : {}),
       ...(live.actorMessages !== undefined ? { messages: live.actorMessages } : {}),
+      ...(live.actorPreparing
+        ? { preparing: { ...live.actorPreparing, ageS: Math.max(0, Math.round((now - live.actorPreparing.startedAt) / 1_000)) } }
+        : {}),
       ...(run ? { inFlightRun: { ...run, ageS: Math.max(0, Math.round((now - run.startedAt) / 1_000)) } } : {}),
       ...(removal
         ? {

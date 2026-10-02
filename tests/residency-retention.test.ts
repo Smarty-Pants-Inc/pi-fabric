@@ -96,6 +96,144 @@ describe("resident terminal event retention", () => {
     expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
   });
 
+  it.each(["startup", "streaming"])("compacts with a valid registry above 1 MiB at %s, preserving its latest run", (phase) => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest", instructions: "normal actor",
+      messages: Array.from({ length: 100 }, () => ({ text: "x".repeat(12_000) })) }] });
+    const registry = fs.readFileSync(path.join(actorRoot, "actors.json"));
+    expect(registry.length).toBeGreaterThan(1024 * 1024);
+    const old = make(dir, "old", "completed"); const latest = make(dir, "latest", "failed");
+    if (phase === "startup") {
+      sweepResidentRuns(path.join(dir, "runs"), now, 10000, { actorRoots: [actorRoot], retainRuns: true });
+    } else {
+      const collector = new ResidentRequestRetention(dir, [actorRoot]);
+      try { collector.sweep(now, new Set(), 10000); } finally { collector.close(); }
+    }
+    expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+    expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
+    expect(fs.readFileSync(path.join(actorRoot, "actors.json")).equals(registry)).toBe(true);
+  });
+
+  it.each(["slow references", "slow safety walk"])("makes progress with the production 5-ms budget despite %s", (slow) => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
+    const old = make(dir, "old", "completed");
+    const latest = make(dir, "latest", "failed"); const live = make(dir, "live", "completed");
+    const worker = make(dir, "worker", "completed");
+    write(worker, ".", "status", { status: "completed", finishedAt: day, transport: "process", sessionId: String(process.pid) });
+    if (slow === "slow safety walk") {
+      for (let i = 0; i < 20; i++) {
+        const child = path.join(old, "nested", String(i));
+        write(child, ".", "status", { status: "completed", finishedAt: day, transport: "process", sessionId: "2147483647" });
+      }
+    }
+    let elapsed = 0; let registryReads = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      const file = String(args[0]);
+      if (file === path.join(actorRoot, "actors.json")) { registryReads++; if (slow === "slow references") elapsed += 6; }
+      if (slow === "slow safety walk" && file.startsWith(old) && file.endsWith("status.json")) elapsed += 1;
+      return read(...args);
+    });
+    const collector = new ResidentRequestRetention(dir, [actorRoot]);
+    try {
+      for (let slice = 0; slice < 100 && collector.due(now); slice++) collector.sweep(now, new Set(["live"]), 5);
+      expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+      for (const run of [latest, live, worker]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+      expect(registryReads).toBeGreaterThan(0);
+    } finally { collector.close(); }
+  });
+
+  it.each(["new latest", "live set", "live worker", "unreadable registry"])("refreshes the %s veto between over-budget reference preparation and compaction", (change) => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
+    const old = make(dir, "old", "completed"); const latest = make(dir, "latest", "failed");
+    let elapsed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      if (String(args[0]) === path.join(actorRoot, "actors.json")) elapsed += 6;
+      return read(...args);
+    });
+    const collector = new ResidentRequestRetention(dir, [actorRoot]);
+    try {
+      collector.sweep(now, new Set(), 5);
+      expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
+      if (change === "new latest") {
+        write(actorRoot, ".", "actors-next", { actors: [{ id: "actor", lastRunId: "old" }, { id: "other", lastRunId: "latest" }] });
+        fs.renameSync(path.join(actorRoot, "actors-next.json"), path.join(actorRoot, "actors.json"));
+      } else if (change === "unreadable registry") {
+        fs.writeFileSync(path.join(actorRoot, "actors.json"), "{");
+      } else if (change === "live worker") {
+        write(old, ".", "status", { status: "completed", finishedAt: day, transport: "process", sessionId: String(process.pid) });
+      }
+      for (let slice = 0; slice < 100 && collector.due(now); slice++) collector.sweep(now, new Set(change === "live set" ? ["old"] : []), 5);
+      for (const run of [old, latest]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+    } finally { collector.close(); }
+  });
+
+  it("vetoes a new latest-run reference published during a long compaction safety walk", () => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [] });
+    const old = make(dir, "old", "completed");
+    vi.spyOn(performance, "now").mockReturnValue(0);
+    const read = fs.readFileSync; let changed = false;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      if (!changed && String(args[0]) === path.join(old, "status.json")) {
+        changed = true;
+        write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "old" }] });
+      }
+      return read(...args);
+    });
+    const collector = new ResidentRequestRetention(dir, [actorRoot]);
+    try {
+      collector.sweep(now, new Set(), 5);
+      expect(changed).toBe(true);
+      expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
+    } finally { collector.close(); }
+  });
+
+  it("eventually compacts via ResidentHost's actual 5-ms polling path after an over-budget registry read", async () => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    const old = make(dir, "old", "completed"); const latest = make(dir, "latest", "failed");
+    const held = make(dir, "held", "completed"); const worker = make(dir, "worker", "completed");
+    write(worker, ".", "status", { status: "completed", finishedAt: day, transport: "process", sessionId: String(process.pid) });
+    // Protect fixtures from startup, so only the production poll can compact old.
+    write(actorRoot, ".", "actors", { actors: ["old", "latest", "held"].map(id => ({ id, lastRunId: id })) });
+    const config: ResidentHostConfig = {
+      format: 1, rootId: "session:retention", sessionId: "retention", cwd: dir, projectRoot: dir,
+      meshRoot: path.join(dir, "mesh"), actorRoot, residencyRoot: dir,
+      fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
+      mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorScope: "project" }, retention: DEFAULT_FABRIC_CONFIG.retention,
+      workerPath: "unused", fabricExtensionPath: "unused", piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
+    };
+    let elapsed = 0; let registryReads = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      if (String(args[0]) === path.join(actorRoot, "actors.json")) { elapsed += 6; registryReads++; }
+      return read(...args);
+    });
+    const slices = vi.spyOn(ResidentRequestRetention.prototype, "sweep");
+    const host = new ResidentHost(config);
+    try {
+      await host.start();
+      expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
+      vi.spyOn(host.agents, "retentionReferences").mockReturnValue(new Set(["held"]));
+      write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
+      const deadline = Date.now() + 2000;
+      while (fs.statSync(path.join(old, "events.jsonl")).size > 256 * 1024 && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+      for (const run of [latest, held, worker]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+      expect(registryReads).toBeGreaterThan(0);
+      expect(slices.mock.calls.length).toBeGreaterThan(1);
+      expect(slices.mock.calls.every(call => call[2] === 5)).toBe(true);
+    } finally { await host.close(); }
+  });
+
   it("fails closed for unreadable actor lastRunId references, and honors custom age", () => {
     const dir = root(); const actorRoot = path.join(dir, "actor-registry");
     write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: 123 }] });

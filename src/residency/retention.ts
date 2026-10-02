@@ -19,6 +19,24 @@ const readOwned = <T>(file: string): T | undefined => {
   if (!stat?.isFile() || stat.size > 1024 * 1024) throw new Error("Unsafe residency retention entry");
   return JSON.parse(fs.readFileSync(file, "utf8")) as T;
 };
+// Cache only a stable, owned registry generation. Include roots and missing files
+// so creation, removal, atomic replacement and in-place writes invalidate it.
+// "unsafe" is a wildcard veto, not an empty set of references.
+const actorReferenceFingerprint = (roots: readonly string[]): string => {
+  const identities: unknown[] = [];
+  try {
+    for (const root of roots) {
+      for (const [file, directory] of [[root, true], [path.join(root, "actors.json"), false]] as const) {
+        if (absent(file)) { identities.push([file, null]); continue; }
+        const stat = ownedStat(file);
+        if (!stat || (directory ? !stat.isDirectory() : !stat.isFile())) return "unsafe";
+        identities.push([file, stat.dev, stat.ino, stat.mode, stat.uid, stat.size, stat.mtimeMs, stat.ctimeMs]);
+      }
+    }
+    return JSON.stringify(identities);
+  } catch { return "unsafe"; }
+};
+
 const validAck = (value: ResidentResponseAcknowledgement | undefined, id: string): value is ResidentResponseAcknowledgement =>
   value?.format === 1 && value.requestFormat === 3 && value.requestId === id && time(value.completedAt) && time(value.acknowledgedAt) &&
   value.completedAt >= residentRequestGeneration(id)! &&
@@ -31,6 +49,9 @@ const validResponse = (value: ResidentCommandResponse | undefined, id: string): 
  * A streaming scan on the host's existing request poll. No new timer, no restart
  * of a truncated scan: a large directory cannot starve its later entries.
  * Unknown, legacy, orphan temporary, live and unacknowledged records are retained.
+ * The run phase budgets between complete safety-check/atomic-replacement units:
+ * at most the in-progress run can overrun a slice. Registry preparation is kept
+ * across slices, but its generation and the live set are checked afresh each call.
  */
 export class ResidentRequestRetention {
   #directory: fs.Dir | undefined;
@@ -39,6 +60,7 @@ export class ResidentRequestRetention {
   #scanning = false;
   #expiredBefore = 0;
   #now = 0;
+  #runReferences: { fingerprint: string; ids: Set<string> } | undefined;
   #health = { entries: 0, bytes: 0, unknown: 0, legacy: 0, collected: 0, sampledAt: 0, error: "" };
   constructor(
     readonly root: string,
@@ -49,6 +71,7 @@ export class ResidentRequestRetention {
   due(now = Date.now()): boolean { return this.#scanning || now >= this.#nextSample; }
 
   close(): void {
+    this.#runReferences = undefined;
     const directory = this.#directory; this.#directory = undefined;
     try { directory?.closeSync(); } catch { this.#health.unknown++; }
   }
@@ -63,7 +86,6 @@ export class ResidentRequestRetention {
     }
     const started = performance.now();
     const expired = () => performance.now() - started >= budgetMs;
-    let retainedRuns: Set<string> | undefined;
     while (!expired()) {
       const kind = directories[this.#index];
       if (kind === undefined) {
@@ -78,6 +100,17 @@ export class ResidentRequestRetention {
         try { this.#directory = fs.opendirSync(directory); }
         catch { this.#health.unknown++; this.#index++; continue; }
       }
+      if (kind === "runs") {
+        const fingerprint = actorReferenceFingerprint(this.actorRoots);
+        if (this.#runReferences?.fingerprint !== fingerprint) {
+          const ids = fingerprint === "unsafe" ? new Set(["*"]) : retainedActorRunIds(this.actorRoots);
+          // Do not publish a snapshot if a registry changed during the read.
+          // Crucially, no run-directory cursor has advanced yet.
+          if (actorReferenceFingerprint(this.actorRoots) !== fingerprint) { this.#runReferences = undefined; return; }
+          this.#runReferences = { fingerprint, ids };
+          if (expired()) return;
+        }
+      }
       let entry: fs.Dirent | null;
       try { entry = this.#directory.readSync(); }
       catch { this.#health.unknown++; this.close(); this.#index++; continue; }
@@ -85,12 +118,19 @@ export class ResidentRequestRetention {
       const file = path.join(directory, entry.name);
       if (kind === "runs") {
         // The request-proof wildcard is not an exit receipt for any particular run.
-        // Inspect each run with the shared ownership/terminal/tree-exit veto instead;
-        // a budget-truncated reference scan must not starve compaction of a large fleet.
-        retainedRuns ??= retainedActorRunIds(this.actorRoots);
+        const retainedRuns = this.#runReferences!.ids;
         if (entry.isDirectory() && !liveIds.has(entry.name) &&
             !retainedRuns.has("*") && !retainedRuns.has(entry.name)) {
-          compactTerminalRunEvents(file, { ...this.retention, now, expired });
+          // One complete safety-check + atomic replacement is the progress unit.
+          // The poll's budget is soft at this boundary, like a synchronous file
+          // read: stop BETWEEN runs, not midway through every retry of a large
+          // tree. Never cache worker-exit proofs or skip either fresh safety walk.
+          const fingerprint = this.#runReferences!.fingerprint;
+          compactTerminalRunEvents(file, { ...this.retention, now,
+            // Another owner can publish a new latest run during a long safety
+            // walk. Recheck the registry generation immediately before replace.
+            isRetained: () => actorReferenceFingerprint(this.actorRoots) !== fingerprint,
+          });
         }
         continue;
       }

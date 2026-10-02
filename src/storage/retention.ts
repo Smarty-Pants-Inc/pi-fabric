@@ -27,10 +27,10 @@ export interface RetentionSweepResult {
   removedRuns: string[];
 }
 const ownerPath = (root: string): string => path.join(root, RUN_ROOT_OWNER_FILE);
-const readJson = <T>(file: string): T | undefined => {
+const readJson = <T>(file: string, maxBytes = 1024 * 1024): T | undefined => {
   try {
     const stat = ownedStat(file);
-    if (!stat?.isFile() || stat.size > 1024 * 1024) return;
+    if (!stat?.isFile() || stat.size > maxBytes) return;
     return JSON.parse(fs.readFileSync(file, "utf8")) as T;
   } catch { return; }
 };
@@ -338,7 +338,12 @@ export const retainedActorRunIds = (actorRoots: readonly string[]): Set<string> 
       const file = path.join(root, "actors.json");
       try { fs.lstatSync(file); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
-      const registry = readJson<{ actors?: Array<{ id?: unknown; lastRunId?: unknown }> }>(file);
+      // ActorRegistryStore's writer/reader has no byte-size protocol limit: every
+      // actor includes instructions and up to 100 message bodies, so even one
+      // ordinary actor can exceed the 1-MiB summary-file guard. Match that existing
+      // JSON contract rather than inventing a fleet-size limit that disables all
+      // retention. Ownership, JSON/schema errors and unsafe references still veto.
+      const registry = readJson<{ actors?: Array<{ id?: unknown; lastRunId?: unknown }> }>(file, Number.MAX_SAFE_INTEGER);
       if (!Array.isArray(registry?.actors)) throw new Error("Unreadable actor registry");
       for (const actor of registry.actors) {
         if (!actor || typeof actor.id !== "string" ||
@@ -364,14 +369,14 @@ const EVENT_TAIL_MARKER = Buffer.from('{"fabricTruncated":true,"reason":"termina
  * Callers retain their ownership/latest-run vetoes before entering this shared predicate. */
 export const compactTerminalRunEvents = (
   directory: string,
-  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline } = {},
+  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean } = {},
 ): boolean => {
   const now = options.now ?? Date.now();
   const ageMs = options.terminalRunEventsAgeMs ?? 24 * 60 * 60 * 1_000;
   const maxBytes = options.terminalRunEventsMaxBytes ?? 256 * 1024;
   const expired = options.expired ?? noDeadline;
   if (!Number.isSafeInteger(ageMs) || ageMs < 0 || !Number.isSafeInteger(maxBytes) ||
-      maxBytes < EVENT_TAIL_MARKER.length || expired() || !ownedStat(directory)?.isDirectory()) return false;
+      maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !ownedStat(directory)?.isDirectory()) return false;
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
   if (!record?.status || !TERMINAL_STATUSES.has(record.status) ||
       now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
@@ -401,7 +406,7 @@ export const compactTerminalRunEvents = (
     const checked = ownedStat(file);
     if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
         checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
-        !canRemoveTerminalRun(directory, expired) || expired()) return false;
+        !canRemoveTerminalRun(directory, expired) || expired() || options.isRetained?.()) return false;
     writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained]));
     return true;
   } catch { return false; }

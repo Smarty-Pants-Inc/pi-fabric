@@ -45,7 +45,7 @@ process.stdin.on("data", chunk => {
       reply(model);
       if (behavior === "reswitch") model = wrong;
     } else if (frame.type === "set_thinking_level") {
-      thinkingLevel = frame.level;
+      thinkingLevel = behavior === "effort-lower" ? "low" : behavior === "effort-off" ? "off" : behavior === "effort-missing" ? undefined : behavior === "effort-malformed" ? "invalid" : frame.level;
       reply();
     } else if (frame.type === "get_state") {
       reply(behavior === "malformed" ? {} : {

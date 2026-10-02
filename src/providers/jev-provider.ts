@@ -91,5 +91,5 @@ export class JevProvider implements FabricProvider {
       case "stop": return this.manager.stop(args.id as string);
     }
   }
-  async close(): Promise<void> { await this.manager.close(); this.client.close(); }
+  async close(): Promise<void> { await this.manager.close(); await this.client.drainCredentials(); this.client.close(); }
 }

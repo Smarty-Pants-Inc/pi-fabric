@@ -1070,6 +1070,38 @@ describe("mesh bridge", () => {
     expect(on(hub, "fabric.control.command")).toHaveLength(1);
   });
 
+  it("delivers a full HANDOFF then short correction in source order, including commands and return ACKs (#754)", async () => {
+    const { hub, far, bridge, logs } = setup();
+    const lead = await addRoot(hub, "lead");
+    const lane = await addRoot(far, "lane");
+    await bridge.start();
+    const texts = [`HANDOFF proof ${"x".repeat(3000)}`, "checksum correction"];
+    const sent: MeshEvent[] = [];
+    for (const [index, text] of texts.entries()) {
+      sent.push(await far.publish({ topic: "fleet.work.test.754", kind: "handoff", from: lane.identity,
+        to: lead.identity.id, text, data: { key: `packet-${index}` } }));
+      sent.push(await far.publish({ topic: "fabric.control.command", kind: "followUp", from: lane.identity,
+        to: lead.identity.id, data: { ...command(lead.identity.id, lane.identity.id),
+          commandId: `packet-${index}`, destinationRemoteHost: "dev1", message: text } }));
+    }
+    expect(await bridge.step()).toMatchObject({ toLocal: 4, dropped: 0 });
+    const arrived = hub.read({ after: 0, limit: 100 });
+    expect(arrived.map((event) => (event.data as { bridge: { id: string } }).bridge.id))
+      .toEqual(sent.map((event) => event.id));
+    expect(on(hub, "fabric.control.command").map((event) => (event.data as { message: string }).message))
+      .toEqual(texts);
+    for (let index = 0; index < texts.length; index++) {
+      await hub.publish({ topic: "fabric.control.ack", kind: "accepted", from: lead.identity, to: lane.identity.id,
+        data: { version: 1, targetId: lead.identity.id, commandId: `packet-${index}`, accepted: true } });
+    }
+    expect(await bridge.step()).toMatchObject({ toRemote: 2, toLocal: 0, dropped: 0 });
+    expect(on(far, "fabric.control.ack").map((event) => (event.data as { commandId: string }).commandId))
+      .toEqual(["packet-0", "packet-1"]);
+    expect(await bridge.step()).toMatchObject({ toRemote: 0, toLocal: 0, dropped: 0 });
+    expect(logs).toEqual([]);
+    await bridge.stop();
+  });
+
   it("carries work events and owner wakes to a remote root, and nothing off the allow-list", async () => {
     const { hub, far, bridge } = setup();
     const factory: MeshIdentity = { id: "factory-host:owner", name: "factory-owner", kind: "main" };

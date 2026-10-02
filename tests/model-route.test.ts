@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import os from "node:os";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { WorktreeManager } from "../src/agents/worktree-manager.js";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +12,22 @@ import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { normalizeFabricConfig, DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { JevResponse } from "../src/jev/types.js";
 
+// Keep native spawn, but own its exact child/close event before launch returns.
+// Transport liveness can report exit before Windows releases the cwd handle.
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+const ownedChildren: Array<{ child: ChildProcess; closed: Promise<void> }> = [];
+const removeFixtureRoots = async () => {
+  await Promise.all(ownedChildren.splice(0).map(async ({ child, closed }) => {
+    // Also release a worker if an assertion prevented normal manager shutdown.
+    // The owned native instance is the identity, never a possibly reused PID.
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    await closed;
+  }));
+  for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+};
 const pin = { model: "test/sol", effort: "high" as const };
 const cheap = { model: "test/luna", effort: "medium" as const };
 const input = { routeClass: "bounded-lookup", protected: false, pin, candidates: [cheap], parentSessionId: "parent" };
@@ -22,13 +38,55 @@ const roots: string[] = [];
 const managers: AgentManager[] = [];
 const root = () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-")); roots.push(dir); return dir; };
 const ledgerFile = () => path.join(process.env.PI_CODING_AGENT_DIR!, "fabric/model-routing.jsonl");
-beforeEach(() => { vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root(), "agent")); });
+beforeEach(async () => {
+  vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root(), "agent"));
+  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  vi.mocked(spawn).mockImplementation((...args: Parameters<typeof spawn>) => {
+    const child = actual.spawn(...args);
+    const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
+    ownedChildren.push({ child, closed });
+    return child;
+  });
+});
 afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(managers.splice(0).map(manager => manager.close()));
+  await removeFixtureRoots();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
-  for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+describe("routing fixture process lifetime", () => {
+  it("keeps roots until native close even after the worker has exited", async () => {
+    const dir = root();
+    const child = spawn(process.execPath, ["-e", "process.exit(0)"], { cwd: dir, stdio: "ignore" });
+    const emit = child.emit.bind(child);
+    let releaseClose: (() => void) | undefined;
+    const closeObserved = new Promise<void>(resolve => {
+      vi.spyOn(child, "emit").mockImplementation((event, ...args) => {
+        if (event === "close") {
+          releaseClose = () => { releaseClose = undefined; emit(event, ...args); };
+          resolve();
+          return true;
+        }
+        return emit(event, ...args);
+      });
+    });
+    let teardown: Promise<void> | undefined;
+    try {
+      await closeObserved;
+      expect(child.exitCode).toBe(0);
+      teardown = removeFixtureRoots();
+      await Promise.resolve();
+      expect(fs.existsSync(dir)).toBe(true);
+      releaseClose!();
+      await teardown;
+      expect(fs.existsSync(dir)).toBe(false);
+    } finally {
+      releaseClose?.();
+      await teardown;
+    }
+  });
 });
 
 describe("shadow model routing", () => {

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { pathToFileURL } from "node:url";
-import { prepareRetryProfile, PI_TASK_RETRY_SETTINGS, taskRetrySettings, resolveRetrySdk } from "../src/worker/retry-profile.js";
+import { applyTaskRetryDefaults, prepareRetryProfile, PI_TASK_RETRY_SETTINGS, taskRetrySettings, resolveRetrySdk } from "../src/worker/retry-profile.js";
 import { retryableProviderError } from "../src/worker/provider-error.js";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -23,12 +23,12 @@ describe("native task retry profile", () => {
     expect(prepareRetryProfile(s.cwd, s.target, s.env)).toBe(s.original);
     const binary = path.resolve(process.env.FABRIC_OVERLOAD_TEST_PI_BINARY ?? "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
     const sdkDirectory = resolveRetrySdk(binary)!;
-    expect(sdkDirectory).toBe(path.dirname(binary));
+    expect(sdkDirectory).toBe(path.dirname(fs.realpathSync(binary)));
     const { SettingsManager } = await import(pathToFileURL(path.join(sdkDirectory, "index.js")).href);
     const main = SettingsManager.create(s.cwd, s.original);
     const child = SettingsManager.create(s.cwd, s.original);
     const mainRetry = main.getRetrySettings();
-    child.applyOverrides({ retry: taskRetrySettings() });
+    applyTaskRetryDefaults(child);
     expect(child.getRetrySettings()).toEqual({ enabled: true, ...PI_TASK_RETRY_SETTINGS });
     expect(main.getRetrySettings()).toEqual(mainRetry);
     expect(taskRetrySettings(0.05)).toEqual({ maxRetries: 6, baseDelayMs: 250, maxAgentDelayMs: 8000 });
@@ -46,6 +46,44 @@ describe("native task retry profile", () => {
     expect(prepareRetryProfile(s.cwd, s.target, s.env)).toBeUndefined();
     expect(fs.readFileSync(file, "utf8")).toBe(before);
     expect(fs.existsSync(s.target)).toBe(false);
+  });
+  it("keeps task defaults across native setters and reload without changing Main or persisting retry", async () => {
+    const s = setup();
+    const binary = path.resolve(process.env.FABRIC_OVERLOAD_TEST_PI_BINARY ?? "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+    const { SettingsManager } = await import(pathToFileURL(path.join(path.dirname(binary), "index.js")).href);
+    const main = SettingsManager.create(s.cwd, s.original);
+    const child = SettingsManager.create(s.cwd, s.original);
+    const mainRetry = main.getRetrySettings();
+    applyTaskRetryDefaults(child);
+    for (const mutate of [() => child.setSteeringMode("all"), () => child.setFollowUpMode("all"), () => child.reload()]) {
+      await mutate();
+      await child.flush();
+      expect(child.getRetrySettings()).toEqual({ enabled: true, ...PI_TASK_RETRY_SETTINGS });
+      expect(main.getRetrySettings()).toEqual(mainRetry);
+      expect(child.getGlobalSettings()).not.toHaveProperty("retry");
+      expect(JSON.parse(fs.readFileSync(s.settings, "utf8"))).not.toHaveProperty("retry");
+    }
+    // A native explicit retry control must also supersede the fallback immediately.
+    child.setRetryEnabled(false);
+    expect(child.getRetrySettings()).toEqual({ ...mainRetry, enabled: false });
+    await child.flush();
+  });
+  it.each(["global", "project"])("honors explicit %s retry settings introduced after task admission and reloaded", async scope => {
+    const s = setup();
+    const binary = path.resolve(process.env.FABRIC_OVERLOAD_TEST_PI_BINARY ?? "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+    const { SettingsManager } = await import(pathToFileURL(path.join(path.dirname(binary), "index.js")).href);
+    const child = SettingsManager.create(s.cwd, s.original, { projectTrusted: true });
+    applyTaskRetryDefaults(child);
+    expect(child.getRetrySettings()).toEqual({ enabled: true, ...PI_TASK_RETRY_SETTINGS });
+    const file = scope === "global" ? s.settings : path.join(s.cwd, ".pi", "settings.json");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const retry = { enabled: false, maxRetries: 1, baseDelayMs: 77, maxAgentDelayMs: 99 };
+    fs.writeFileSync(file, JSON.stringify({ retry }));
+    await child.reload();
+    child.setSteeringMode("all"); child.setFollowUpMode("all");
+    await child.flush();
+    expect(child.getRetrySettings()).toEqual(retry);
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).retry).toEqual(retry);
   });
   it("serializes Main and task refresh updates through the installed FileAuthStorageBackend", async () => {
     const s = setup();

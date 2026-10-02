@@ -5,7 +5,7 @@
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { CreateAgentSessionRuntimeFactory } from "@earendil-works/pi-coding-agent";
-import { taskRetrySettings } from "./retry-profile.js";
+import { applyTaskRetryDefaults } from "./retry-profile.js";
 
 const [sdkDirectory, scale, ...args] = process.argv.slice(2);
 if (!sdkDirectory) throw new Error("Native Pi SDK directory is required");
@@ -56,12 +56,10 @@ const factory: CreateAgentSessionRuntimeFactory = async ({ cwd, agentDir, sessio
       },
     } } : {}),
   });
-  // Resource reload resolves trust and reloads settings. Apply only afterwards;
-  // explicit user retry settings win, and no setting/auth file is rewritten.
-  if (!Object.hasOwn(settingsManager.getGlobalSettings(), "retry") &&
-      !Object.hasOwn(settingsManager.getProjectSettings(), "retry")) {
-    settingsManager.applyOverrides({ retry: taskRetrySettings(Number(scale)) });
-  }
+  // Resource reload resolves trust. Keep task defaults at the retry read boundary:
+  // native queue-mode setters save/rebuild settings and discard applyOverrides.
+  // Explicit settings still win; the fallback never enters the shared profile.
+  applyTaskRetryDefaults(settingsManager, Number(scale));
   const model = sdk.resolveCliModel({ ...(parsed.model ? { cliModel: parsed.model } : {}), ...(parsed.thinking ? { cliThinking: parsed.thinking } : {}), modelRuntime: services.modelRuntime });
   if (model.error) throw new Error(model.error);
   const patterns = settingsManager.getEnabledModels();

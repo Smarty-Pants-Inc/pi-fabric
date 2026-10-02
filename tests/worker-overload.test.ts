@@ -38,17 +38,21 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
-const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "disconnect" | "controls", retry?: Record<string, unknown>) => {
+const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "disconnect" | "controls" | "queue-modes", retry?: Record<string, unknown>) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-overload-")); roots.push(dir);
   let firstRequestAt = 0;
+  let releaseOverload!: () => void;
+  const overloadReady = new Promise<void>(resolve => { releaseOverload = resolve; });
   const requests: Array<Record<string, any>> = [];
   const server = http.createServer((request, response) => {
     let body = "";
     request.on("data", chunk => { body += chunk; });
-    request.on("end", () => {
+    request.on("end", async () => {
       requests.push(JSON.parse(body)); firstRequestAt ||= Date.now();
+      // Hold the first response until public queue-mode controls have reached native Pi.
+      if (mode === "queue-modes" && requests.length === 1) await overloadReady;
       if (mode === "disconnect" && requests.length === 1) { response.destroy(); return; }
-      const overloaded = mode === "forever" ||
+      const overloaded = mode === "forever" || (mode === "queue-modes" && requests.length <= 5) ||
         (mode === "burst" && Date.now() - firstRequestAt < 90_000 * SCALE) ||
         ((mode === "resume" || mode === "controls") && requests.length === 1);
       if (overloaded || mode === "400" || (mode === "429" && requests.length === 1)) {
@@ -93,7 +97,7 @@ const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "dis
   });
   managers.push(manager);
   const spawn = () => manager.spawn({ task: "Finish ORIGINAL_TASK, preserving completed work.", model: "overload-test/offline", tools: [], extensions: false, transport: "process" });
-  return { dir, manager, requests, settingsFile, settings, spawn };
+  return { dir, manager, requests, settingsFile, settings, spawn, releaseOverload };
 };
 
 describe("real Pi process provider recovery (offline localhost)", () => {
@@ -109,6 +113,57 @@ describe("real Pi process provider recovery (offline localhost)", () => {
     expect(journal.filter(entry => entry.type === "session")).toHaveLength(1);
     expect(journal[0]!.id).toBe(result.runnerSessionId);
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
+  }, 120_000);
+
+  it.each(["steering", "follow-up", "both"] as const)("preserves task-local retry defaults after %s queue-mode setters in a native process", async controls => {
+    const s = await setup("queue-modes"); const handle = await s.spawn();
+    try {
+      await until(() => s.requests.length === 1);
+      if (controls !== "follow-up") expect(s.manager.setSteeringMode(handle.id, "all").queued).toBe(true);
+      if (controls !== "steering") expect(s.manager.setFollowUpMode(handle.id, "all").queued).toBe(true);
+      // Observe the native setters' persisted modes, not just enqueueing the RPC.
+      await until(() => {
+        const saved = JSON.parse(fs.readFileSync(s.settingsFile, "utf8"));
+        return (controls === "follow-up" || saved.steeringMode === "all") &&
+          (controls === "steering" || saved.followUpMode === "all");
+      });
+    } finally { s.releaseOverload(); }
+    const result = await s.manager.wait(handle.id); evidence("queue-modes-" + controls, result);
+    const saved = JSON.parse(fs.readFileSync(s.settingsFile, "utf8"));
+    const directory = process.env.FABRIC_OVERLOAD_TEST_EVIDENCE_DIR;
+    if (directory) fs.copyFileSync(s.settingsFile, path.join(directory, "queue-modes-" + controls + "-settings.json"));
+    expect(saved).not.toHaveProperty("retry");
+    expect(saved).toEqual({ ...JSON.parse(s.settings),
+      ...(controls !== "follow-up" ? { steeringMode: "all" } : {}),
+      ...(controls !== "steering" ? { followUpMode: "all" } : {}),
+    });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "survived overload" });
+    const log = events(result);
+    expect(log.filter(event => event.type === "auto_retry_start").map(event => event.delayMs)).toEqual([250, 500, 1000, 2000, 4000]);
+    expect(log.some(event => event.type === "fabric_provider_resume" || event.type === "fabric_recovery_error")).toBe(false);
+    expect(result.runnerSessionIds).toHaveLength(1);
+    const journal = entries(path.join(path.dirname(result.logFile!), "session.jsonl"));
+    expect(journal.filter(entry => entry.type === "session")).toHaveLength(1);
+  }, 120_000);
+
+  it("keeps explicit user retries after both public queue-mode setters in a native process", async () => {
+    const retry = { maxRetries: 6, baseDelayMs: 11, maxAgentDelayMs: 176 };
+    const s = await setup("queue-modes", retry); const handle = await s.spawn();
+    try {
+      await until(() => s.requests.length === 1);
+      expect(s.manager.setSteeringMode(handle.id, "all").queued).toBe(true);
+      expect(s.manager.setFollowUpMode(handle.id, "all").queued).toBe(true);
+      await until(() => {
+        const saved = JSON.parse(fs.readFileSync(s.settingsFile, "utf8"));
+        return saved.steeringMode === "all" && saved.followUpMode === "all";
+      });
+    } finally { s.releaseOverload(); }
+    const result = await s.manager.wait(handle.id); evidence("queue-modes-explicit", result);
+    expect(JSON.parse(fs.readFileSync(s.settingsFile, "utf8"))).toEqual({ ...JSON.parse(s.settings), steeringMode: "all", followUpMode: "all", retry });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "survived overload" });
+    expect(events(result).filter(event => event.type === "auto_retry_start").map(event => event.delayMs)).toEqual([11, 22, 44, 88, 176]);
+    expect(events(result).some(event => event.type === "fabric_provider_resume")).toBe(false);
+    expect(result.runnerSessionIds).toHaveLength(1);
   }, 120_000);
 
   it("fails at the same ten-minute recovery bound across relaunches, retaining the session", async () => {

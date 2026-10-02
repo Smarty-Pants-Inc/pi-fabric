@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { SettingsManager } from "@earendil-works/pi-coding-agent";
 
 export const PI_TASK_RETRY_SETTINGS = { maxRetries: 6, baseDelayMs: 5_000, maxAgentDelayMs: 160_000 } as const;
 export const taskRetrySettings = (scale = 1) => ({
@@ -8,6 +9,23 @@ export const taskRetrySettings = (scale = 1) => ({
   baseDelayMs: Math.max(1, Math.round(PI_TASK_RETRY_SETTINGS.baseDelayMs * scale)),
   maxAgentDelayMs: Math.max(1, Math.round(PI_TASK_RETRY_SETTINGS.maxAgentDelayMs * scale)),
 });
+
+/** Supply task defaults at the native retry read boundary, not in persisted settings.
+ * Pi's setters/save/reload rebuild its effective settings and drop applyOverrides.
+ * Decorating this instance's public getter survives those rebuilds, while checking
+ * the live profile on every read lets explicit settings (even added later) win.
+ */
+export const applyTaskRetryDefaults = (settingsManager: Pick<SettingsManager,
+  "getRetrySettings" | "getGlobalSettings" | "getProjectSettings">, scale = 1): void => {
+  const getRetrySettings = settingsManager.getRetrySettings.bind(settingsManager);
+  const defaults = taskRetrySettings(scale);
+  settingsManager.getRetrySettings = () => {
+    const retry = getRetrySettings();
+    return Object.hasOwn(settingsManager.getGlobalSettings(), "retry") ||
+      Object.hasOwn(settingsManager.getProjectSettings(), "retry")
+      ? retry : { ...retry, ...defaults };
+  };
+};
 
 /** Select the canonical profile; never alias auth.json (Pi locks with realpath:false).
  * Retry defaults are applied in memory by the native SDK task entry, not saved.

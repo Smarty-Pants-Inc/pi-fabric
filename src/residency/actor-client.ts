@@ -20,6 +20,7 @@ import {
   ResidentOutcomeUnknownError,
   readResidentRequestDecision,
   registerResidentCancellation,
+  residentRequestExpiredOutcome,
   RESIDENT_HOST_FORMAT,
   RESIDENT_ACTOR_COMMAND_FORMAT,
   residentHostStateNote,
@@ -175,12 +176,12 @@ export class ResidentActorClient {
       const note = residentHostStateNote(this.#residencyDir);
       throw new Error(`Timed out waiting for resident host actor response (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
-      if (error instanceof ResidentRequestExpiredError) throw error;
+      if (error instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.#residencyDir, command, signal);
       let decision;
       try {
         decision = abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId, command.format);
       } catch (fenceError) {
-        if (fenceError instanceof ResidentRequestExpiredError) throw fenceError;
+        if (fenceError instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.#residencyDir, command, signal);
         let known;
         try { known = readResidentRequestDecision(this.#residencyDir, command.requestId); } catch { /* unreadable fence */ }
         throw new ResidentOutcomeUnknownError(command, known, fenceError, signal);

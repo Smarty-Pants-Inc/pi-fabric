@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { recordResidentOutcome } from "../async-settlement.js";
+import type { FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -16,9 +18,14 @@ export const residentRequestGeneration = (requestId: string): number | undefined
 
 export class ResidentRequestExpiredError extends Error {
   readonly code = "RESIDENT_REQUEST_EXPIRED" as const;
-  constructor(requestId: string) {
-    super(`Fabric residency request ${requestId} expired; do not replay or reassign its work. Reconcile the original entity through agents.status / agents.actorStatus.`);
+  readonly residentOutcome: FabricResidentOutcomeReceipt | undefined;
+  constructor(readonly requestId: string, receipt?: FabricResidentOutcomeReceipt, signal?: AbortSignal) {
+    super(`ResidentRequestExpiredError: Fabric residency request ${requestId} expired; do not replay or reassign its work. ` +
+      `Reconcile the original entity through agents.status / agents.actorStatus / agents.list.` +
+      (receipt ? ` ${receipt.entityKind}Id=${receipt.id ?? "not yet known"}, ownerHostId=${receipt.ownerHostId ?? "not yet known"}, state=${receipt.state}.` : ""));
     this.name = "ResidentRequestExpiredError";
+    this.residentOutcome = receipt ? Object.freeze({ ...receipt }) : undefined;
+    if (this.residentOutcome) recordResidentOutcome(signal, this.residentOutcome);
   }
 }
 

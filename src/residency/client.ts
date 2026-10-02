@@ -38,6 +38,7 @@ import {
   ResidentOutcomeUnknownError,
   readResidentRequestDecision,
   registerResidentCancellation,
+  residentRequestExpiredOutcome,
   commitResidentRequest,
   RESIDENT_HOST_FORMAT,
   RESIDENT_ACTOR_COMMAND_FORMAT,
@@ -708,12 +709,12 @@ export class ResidencyClient {
       throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}` +
         ` (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
-      if (error instanceof ResidentRequestExpiredError) throw error;
+      if (error instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.options.config.residencyRoot, command, signal);
       let decision;
       try {
         decision = abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId, command.format);
       } catch (fenceError) {
-        if (fenceError instanceof ResidentRequestExpiredError) throw fenceError;
+        if (fenceError instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.options.config.residencyRoot, command, signal);
         // No proven abandonment: never report a safe-to-retry rejection.
         let known;
         try { known = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unreadable fence */ }

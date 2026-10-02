@@ -191,6 +191,25 @@ export class ResidentOutcomeUnknownError extends Error {
   }
 }
 
+/** Expiry forbids replay but never proves rejection. Read retained live fences
+ * even below the watermark; collection eligibility and outcome are independent.
+ * A collected (or unreadable) fence preserves expiry without inventing an ID. */
+export const residentRequestExpiredOutcome = (
+  residencyRoot: string, command: ResidentCommand, signal?: AbortSignal,
+): ResidentRequestExpiredError => {
+  let decision: ResidentRequestDecision | undefined;
+  try { decision = readResidentRequestDecision(residencyRoot, command.requestId); } catch { /* unknown fence */ }
+  const committed = decision?.state === "committed" ? decision : undefined;
+  const operation = committed?.operation ?? command.operation;
+  return new ResidentRequestExpiredError(command.requestId, {
+    requestId: command.requestId, state: committed ? "committed" : "expired", expired: true,
+    operation,
+    entityKind: ["spawn", "foreground", "cleanup"].includes(operation) ? "agent" : "actor",
+    ...(committed?.id ? { id: committed.id } : {}),
+    ...(committed?.ownerHostId ? { ownerHostId: committed.ownerHostId } : {}),
+  }, signal);
+};
+
 /** Install before request publication; outer abort races can now settle the same fence. */
 export const registerResidentCancellation = (
   signal: AbortSignal | undefined,
@@ -199,14 +218,14 @@ export const registerResidentCancellation = (
 ): void => {
   // A committed receipt is immutable. Reuse its first error instead of nesting
   // already-formatted uncertainty again at each enclosing cancellation gate.
-  let committedOutcome: ResidentOutcomeUnknownError | undefined;
+  let committedOutcome: ResidentOutcomeUnknownError | ResidentRequestExpiredError | undefined;
   registerCancellationEffect(signal, (reason) => {
     if (committedOutcome) return committedOutcome;
     let decision: ResidentRequestDecision | undefined;
     try {
       decision = abandonResidentRequest(path.join(residencyRoot, "requests"), path.join(residencyRoot, "responses"), command.requestId, command.format);
     } catch (error) {
-      if (error instanceof ResidentRequestExpiredError) return error;
+      if (error instanceof ResidentRequestExpiredError) return committedOutcome = residentRequestExpiredOutcome(residencyRoot, command, signal);
       try { decision = readResidentRequestDecision(residencyRoot, command.requestId); } catch { /* unreadable fence */ }
       return new ResidentOutcomeUnknownError(command, decision, error, signal);
     }

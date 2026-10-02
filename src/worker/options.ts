@@ -157,7 +157,12 @@ export const parseWorkerOptions = (
   }
   // Old launchers had no flag and always used TypeScript, regardless of ambient env.
   const kernel = runner === "pi" && extensions ? selectedKernel ?? "typescript" : undefined;
+  const residentStartupProbe = optional(args, "resident-startup-probe") === "true";
+  if (residentStartupProbe && (runner !== "pi" || !extensions || actorId || sessionFile || schemaFile || replyTool)) {
+    throw new Error("Resident startup probe must be an isolated Pi worker");
+  }
   return {
+    ...(residentStartupProbe ? { residentStartupProbe: true } : {}),
     id: required(args, "id"),
     runner,
     ...(kernel ? { kernel, pythonRuntime } : {}),

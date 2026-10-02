@@ -353,8 +353,14 @@ const main = async (): Promise<void> => {
   if (options.sessionFile) piArguments.push("--session", options.sessionFile);
   else piArguments.push("--no-session");
   if (!options.extensions) piArguments.push("--no-extensions");
+  if (options.residentStartupProbe) {
+    // Explicit Fabric -e still loads. Do not execute unrelated profile hooks,
+    // skills, prompts, context files or compaction merely to decide on rollback.
+    piArguments.push("--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files");
+  }
   const activationWindow = options.inferenceContext === "activation";
   const activationNonce = activationWindow ? randomUUID() : undefined;
+  const residentProbeNonce = options.residentStartupProbe ? randomUUID() : undefined;
   let activationHookPath: string | undefined;
   if (activationWindow) {
     const hookPath = fileURLToPath(new URL(
@@ -481,6 +487,8 @@ const main = async (): Promise<void> => {
       // Preserve the selected launcher for Fabric loaded inside this child.
       // Herdr's server environment need not contain the owner's binary pin.
       ...(options.runner === "pi" ? { PI_FABRIC_PI_BINARY: options.piBinary } : {}),
+      PI_FABRIC_RESIDENT_PROBE_WORKER_PID: residentProbeNonce ? String(process.pid) : "",
+      PI_FABRIC_RESIDENT_PROBE_NONCE: residentProbeNonce ?? "",
       PI_FABRIC_ACTIVATION_WORKER_PID: activationWindow ? String(process.pid) : "",
       PI_FABRIC_ACTIVATION_NONCE: activationNonce ?? "",
       PI_FABRIC_ACTIVATION_HOOK: activationHookPath ?? "",
@@ -597,6 +605,7 @@ const main = async (): Promise<void> => {
     child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n");
   };
   let activationWindowReady = false;
+  let residentProbeReady = false;
   const modelControl = new PiModelControl(options.id, options.model, thinking, {
     send(frame) {
       if (terminalStatus) return;
@@ -618,6 +627,20 @@ const main = async (): Promise<void> => {
         record.thinking = effectiveThinking as NonNullable<AgentRunRecord["thinking"]>;
       }
       update();
+      // The launcher authorizes this harmless isolated startup test. Exercise
+      // the real worker/Pi/model/extension path, but never prompt a business actor
+      // (or invoke inference/tools) merely to decide whether rollback is safe.
+      if (options.residentStartupProbe) {
+        if (!residentProbeReady) {
+          modelControl.fail("resident Fabric extension did not acknowledge loaded-generation readiness");
+          return;
+        }
+        terminalStatus = "completed";
+        record.text = "resident worker startup verified";
+        appendLog(`${JSON.stringify({ type: "fabric_resident_worker_ready", workerPath: fileURLToPath(import.meta.url), fabricExtensionPath: options.fabricExtensionPath })}\n`);
+        closeChild();
+        return;
+      }
       if (taskProvenance?.principal) sendPiDelivery(task, taskProvenance, "steer", images);
       else child.stdin?.write(`${JSON.stringify({ type: "prompt", message: task, ...(images.length > 0 ? { images } : {}) })}\n`);
     },
@@ -630,7 +653,7 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
-  }, activationWindow);
+  }, activationWindow, options.residentStartupProbe === true);
 
   // Attributed token telemetry. Every usage-bearing child event emits one
   // tokens.usage lifecycle entry identified by this run/actor/runner/depth.
@@ -1040,6 +1063,13 @@ const main = async (): Promise<void> => {
           event.policy === "activation" && event.protocol === 1 && event.hook === activationHookPath && !activationWindowReady) {
         activationWindowReady = true;
       } else modelControl.fail("activation window readiness does not match the selected run/policy/hook");
+      return;
+    }
+    if (residentProbeNonce && event.type === "fabric_resident_extension_ready") {
+      if (event.runId === options.id && event.nonce === residentProbeNonce &&
+          event.protocol === 1 && event.extension === options.fabricExtensionPath && !residentProbeReady) {
+        residentProbeReady = true;
+      } else modelControl.fail("resident readiness does not match the selected run/extension/nonce");
       return;
     }
     if (modelControl.observe(event)) return;

@@ -89,7 +89,17 @@ const decideResidentRequest = (residencyRoot: string, decision: ResidentRequestD
       syncPathNamespace(file); // Fence is durable before either side may mutate/acknowledge.
       return true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        // The winner may have linked its record but failed (or still be awaiting)
+        // namespace confirmation. Confirm that exact inode, not mere existence.
+        const winner = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
+        try {
+          const inode = fs.fstatSync(winner);
+          fs.fsyncSync(winner);
+          syncPathNamespace(file, inode);
+        } finally { fs.closeSync(winner); }
+        return false;
+      }
       throw error; // Fail closed if the filesystem cannot provide the fence.
     }
   } finally {

@@ -222,6 +222,8 @@ export class ResidentHost {
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
+  /** Renamed by this host, but not yet safe to execute. Never replay already executing work. */
+  readonly #unconfirmedPickups = new Set<string>();
   #closed = false;
   #started = false;
   #idleSince = Date.now();
@@ -693,6 +695,17 @@ export class ResidentHost {
     if (this.#pollingRequests || this.#closed) return;
     this.#pollingRequests = true;
     try {
+      // Retry only pickups this running host renamed but never executed. Startup
+      // recovery handles older processing entries conservatively as indeterminate.
+      for (const entry of [...this.#unconfirmedPickups].slice(0, 32)) {
+        const processing = path.join(this.#processingPath, entry);
+        try {
+          syncPathNamespace(processing);
+          syncPathNamespace(this.#requestsPath);
+        } catch { continue; }
+        this.#unconfirmedPickups.delete(entry);
+        await this.#processRequest(processing);
+      }
       let entries: string[];
       try {
         entries = fs.readdirSync(this.#requestsPath).filter((entry) => entry.endsWith(".json"));
@@ -704,11 +717,13 @@ export class ResidentHost {
         const processing = path.join(this.#processingPath, entry);
         try {
           fs.renameSync(source, processing);
+          this.#unconfirmedPickups.add(entry);
           syncPathNamespace(processing);
           syncPathNamespace(path.dirname(source));
         } catch {
           continue;
         }
+        this.#unconfirmedPickups.delete(entry);
         await this.#processRequest(processing);
       }
     } finally {

@@ -404,18 +404,60 @@ const queueFiles = (root: string, actorId: string): Array<{ name: string; text: 
 };
 
 describe("ActorManager across a session reload", () => {
-  const reloadable = (root: string, mesh: MeshStore, agents: AgentManager, replayAgeMs = 10 * 60_000, actorQueueLimit?: number) => {
+  const reloadable = (root: string, mesh: MeshStore, agents: AgentManager, replayAgeMs = 10 * 60_000, actorQueueLimit?: number, closeGraceMs?: number) => {
     const manager = new ActorManager(
       "reload", { id: "session:reload", name: "main", kind: "main", sessionId: "reload" }, mesh,
       { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, ...(actorQueueLimit ? { actorQueueLimit } : {}) }, agents, () => {},
       {
         actorRoot: path.join(root, "actors"), persistent: true,
-        meshCursorPath: path.join(root, "actors", "mesh-cursor.json"), meshReplayAgeMs: replayAgeMs,
+        meshCursorPath: path.join(root, "actors", "mesh-cursor.json"), meshReplayAgeMs: replayAgeMs, ...(closeGraceMs === undefined ? {} : { closeGraceMs }),
       },
     );
     actorManagers.push(manager);
     return manager;
   };
+
+  it.each([false, true])("#2479 R3 F2 failed queue fsync keeps a replayable boundary through restart (coalesced: %s)", async (coalesced) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queue-failure-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs") }); agentManagers.push(agents);
+    const before = reloadable(root, mesh, agents, undefined, undefined, 100), from = { id: "peer", name: "peer", kind: "actor" as const };
+    const actor = await before.create({ name: "durable queue", instructions: "Work", topics: ["team.pulls"], responseMode: "text", coalesce: false, ...(coalesced ? { coalesceKey: "payload.number" } : {}) });
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS running" });
+    await waitFor(() => before.status(actor.id).status === "running", 10_000);
+    if (coalesced) {
+      await mesh.publish({ topic: "team.pulls", from, text: "old activation", data: { payload: { number: 1 } } });
+      await waitFor(() => before.status(actor.id).queued === 1, 10_000);
+    }
+    const cursor = path.join(root, "actors", "mesh-cursor.json");
+    let safe = JSON.parse(fs.readFileSync(cursor, "utf8")).last.sequence;
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), descriptors = new Map<number, string>();
+    let failures = 0, cursorSyncs = 0;
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = descriptors.get(fd) ?? "";
+      if (file.includes(`${path.sep}queue-`) && file.endsWith(".tmp")) { failures++; throw new Error("queue-only fsync failure"); }
+      if (file.startsWith(`${cursor}.`)) cursorSyncs++;
+      sync(fd);
+    });
+    try {
+      // Ignored-only progress is batched by the monitor. Its safe prefix must
+      // checkpoint successfully AFTER the queue failure, but not beyond it.
+      const prefix = await mesh.publish({ topic: "unobserved-prefix", from, text: "safe ignored prefix" });
+      safe = prefix.sequence;
+      const failed = await mesh.publish({ topic: "team.pulls", from, text: "retry after reboot", data: { payload: { number: 1 } } });
+      await waitFor(() => failures > 0, 10_000);
+      await before.close(); // healthy cursor storage must still not checkpoint the failed delivery
+      expect(cursorSyncs).toBeGreaterThan(0);
+      expect(JSON.parse(fs.readFileSync(cursor, "utf8")).last.sequence).toBe(safe);
+      expect(JSON.parse(fs.readFileSync(cursor, "utf8")).last.sequence).toBeLessThan(failed.sequence);
+    } finally { synced.mockRestore(); opened.mockRestore(); }
+    const restartedAgents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "restarted-runs") }); agentManagers.push(restartedAgents);
+    const runs = recordRuns(restartedAgents);
+    reloadable(root, mesh, restartedAgents);
+    await waitFor(() => runs.some(run => run.task.includes("retry after reboot") && run.finishedAt !== undefined), 15_000);
+    expect(runs.filter(run => run.task.includes("retry after reboot"))).toHaveLength(1);
+  }, 30_000);
 
   it.each(["owner-defaults", "resolved"] as const)("keeps originating principal and %s binding mode through an actor queue reload and task launch", async (bindingMode) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-principal-actor-")); roots.push(root);
@@ -3310,19 +3352,21 @@ describe("ActorManager", () => {
     });
 
     const inFlight = actors.ask(actor.id, "HANG");
+    const inFlightSettled = inFlight.catch(() => undefined);
     await waitFor(() => actors.status(actor.id).status === "running");
     const queued = actors.ask(actor.id, "queued behind the hanging run");
+    const queuedRejection = expect(queued).rejects.toThrow(
+      `Fabric actor snapshotter (${actor.id}) was stopped while messages were queued`,
+    );
     expect(actors.status(actor.id).queued).toBe(1);
 
     await actors.stop(actor.id);
 
     // The queued ask names the actor and that it was stopped externally; the
     // rejected promise settles synchronously out of stop()'s queue drain.
-    await expect(queued).rejects.toThrow(
-      `Fabric actor snapshotter (${actor.id}) was stopped while messages were queued`,
-    );
+    await queuedRejection;
     // The in-flight run instead settles with the runner's abort error.
-    await inFlight.catch(() => undefined);
+    await inFlightSettled;
     expect(actors.status(actor.id)).toMatchObject({ status: "stopped" });
   });
 
@@ -4302,11 +4346,11 @@ describe("#169 round 2 removal coordination", () => {
     const fast = (firstWait ? second : first).then((result) => { fastResult = result; });
     const waiting = (firstWait ? first : second).then((result) => { waitingResult = result; });
     try {
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await waitFor(() => entered, 10_000);
       expect(fastResult).toBeUndefined();
       expect(waitingResult).toBeUndefined();
       releaseSave();
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await waitFor(() => fastResult !== undefined, 10_000);
       expect(fastResult).toMatchObject({ removed: true, pending: expect.stringContaining(run.runId) });
       expect(entered).toBe(true);
       expect(waitingResult).toBeUndefined();

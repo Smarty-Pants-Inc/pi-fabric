@@ -37,6 +37,37 @@ const fixture = () => {
 
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 describe("resident tracked result preservation", () => {
+  it.each(["processing", "requests"] as const)("#2479 R3 F4 retries the failed %s pickup barrier in the same live host before mutation or ack", async (failedDirectory) => {
+    const { root, config, host } = fixture();
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    const requestId = "pickup-retry", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    let unavailable = true, failures = 0;
+    const actualNamespace = atomic.syncPathNamespace;
+    const barrier = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+      if (file === (failedDirectory === "processing" ? processing : path.join(config.residencyRoot, "requests"))) {
+        if (unavailable) { failures++; throw new Error("pickup barrier unavailable"); }
+      }
+      actualNamespace(file, inode);
+    });
+    let create: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await host.start();
+      create = vi.spyOn(host.actors, "create");
+      fs.writeFileSync(path.join(config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({ format: 1, requestId, operation: "createActor", rootId: config.rootId, createdAt: Date.now(), request: { name: "pickup retry", instructions: "Work", residency: "durable" } }));
+      for (let n = 0; failures === 0 && n < 100; n++) await delay(10);
+      expect(failures).toBeGreaterThan(0);
+      expect(fs.existsSync(processing)).toBe(true);
+      await delay(120);
+      expect(create).not.toHaveBeenCalled();
+      expect(fs.existsSync(response)).toBe(false);
+      unavailable = false;
+      for (let n = 0; !fs.existsSync(response) && n < 400; n++) await delay(10);
+      expect(fs.existsSync(response)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(response, "utf8"))).toMatchObject({ ok: true, requestId });
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(processing)).toBe(false);
+    } finally { barrier.mockRestore(); create?.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+  }, 15_000);
   it("#2479 requests durable config, requests, metadata, responses, saved results and consumption receipts", async () => {
     const { root, config } = fixture();
     config.residencyRoot = residentRoot(config.meshRoot, config.rootId);

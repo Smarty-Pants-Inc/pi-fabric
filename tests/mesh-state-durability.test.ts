@@ -48,6 +48,53 @@ const pauseBarriers = () => {
 };
 
 describe("#2479 mesh group durability barrier", () => {
+  it.skipIf(process.platform === "win32").each([false, true])("#2479 R3 F3 reconfirms ancestor changes during the leaf directory barrier (reconfirmation fails: %s)", (fail) => {
+    const parent = root(), directory = path.join(parent, "mesh"); fs.mkdirSync(directory);
+    const receipt = new DurableDirectory(directory); receipt.prepare();
+    const descriptors = new Map<number, string>(), barriers: string[] = [];
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let changed = false;
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = descriptors.get(fd)!; barriers.push(file);
+      if (changed && fail && file === parent) throw new Error("ABA reconfirmation unavailable");
+      sync(fd);
+      if (!changed && file === directory) {
+        changed = true;
+        fs.renameSync(directory, path.join(parent, "away")); fs.renameSync(path.join(parent, "away"), directory);
+      }
+    });
+    if (fail) expect(() => receipt.sync(directory)).toThrow("ABA reconfirmation unavailable");
+    else expect(() => receipt.sync(directory)).not.toThrow();
+    expect(barriers).toContain(parent);
+  });
+  it.skipIf(process.platform === "win32")("#2479 R3 F3 reconfirms same-inode namespace ABA during the asynchronous file barrier before ack", async () => {
+    const parent = root(), directory = path.join(parent, "mesh");
+    const mesh = new MeshStore(directory, 65536, 100);
+    await mesh.put({ key: "test/key", value: 0, identity });
+    const events: Array<{ kind: string; file: string; locked: boolean }> = [], descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { events.push({ kind: "sync", file: descriptors.get(fd)!, locked: fs.existsSync(path.join(directory, ".lock", "owner")) }); sync(fd); });
+    const pending = pauseBarriers();
+    const receipt = mesh.put({ key: "test/key", value: 1, identity });
+    // Attach a rejection handler immediately: a failed reconfirmation must fail closed.
+    const settled = receipt.then(value => ({ value }), error => ({ error }));
+    await until(() => pending.length === 1);
+    const before = fs.statSync(directory), ancestor = fs.statSync(parent);
+    await tick(); // make the ctime evidence unambiguous even on low-resolution filesystems
+    const away = path.join(parent, "away");
+    fs.renameSync(directory, away); fs.renameSync(away, directory);
+    expect([fs.statSync(directory).dev, fs.statSync(directory).ino]).toEqual([before.dev, before.ino]);
+    expect([fs.statSync(parent).dev, fs.statSync(parent).ino]).toEqual([ancestor.dev, ancestor.ino]);
+    expect(fs.statSync(parent).ctimeMs).not.toBe(ancestor.ctimeMs);
+    const changedAt = events.length;
+    pending.shift()!();
+    const result = await settled;
+    expect(result).not.toHaveProperty("error");
+    expect(events.slice(changedAt).some(event => event.kind === "sync" && event.file === parent && !event.locked)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "state.durability-completion.json"), "utf8"))).not.toHaveProperty("error");
+  });
   it.each(["put", "delete", "batch"])("uses <=2 fsyncs outside the lock per steady-state %s barrier", async (kind) => {
     const directory = root(), mesh = new MeshStore(directory, 65536, 100);
     await mesh.put({ key: "test/key", value: 1, identity });

@@ -747,7 +747,8 @@ export class SchemaController {
   #syncWorkspacePath(file: string): void {
     const resolved = resolveWorkspaceFile(this.cwd, file, { allowAbsent: true });
     if (resolved.exists) {
-      const fd = fs.openSync(resolved.absolute, "r");
+      // FlushFileBuffers requires write access on Windows; r+ never creates/truncates.
+      const fd = fs.openSync(resolved.absolute, process.platform === "win32" ? "r+" : "r");
       try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
       syncPathNamespace(resolved.absolute);
     } else syncPathNamespace(path.dirname(resolved.absolute));

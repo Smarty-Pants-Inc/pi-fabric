@@ -42,6 +42,39 @@ const expectPublished = (events: string[], file: string, kind = "rename") => {
 };
 
 describe("#2479 durable caller classes", () => {
+  it.each(["native", "win32"] as const)("#2479 R3 F5 confirms the winning abandoned inode after a failed link barrier (%s)", (platformMode) => {
+    const directory = root(), requests = path.join(directory, "requests"), responses = path.join(directory, "responses");
+    fs.mkdirSync(requests); fs.mkdirSync(responses);
+    const exchange = path.join(requests, "request.json"), decision = path.join(directory, "decisions", "request.json");
+    fs.writeFileSync(exchange, "retained until confirmed");
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const actualNamespace = atomic.syncPathNamespace;
+    let unavailable = true, confirmations = 0;
+    const confirmation = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+      if (file === decision) { confirmations++; if (unavailable) throw new Error("decision barrier unavailable"); }
+      actualNamespace(file, inode);
+    });
+    const opened = vi.spyOn(fs, "openSync"), synced = vi.spyOn(fs, "fsyncSync");
+    try {
+      if (platformMode === "win32") Object.defineProperty(process, "platform", { value: "win32" });
+      expect(() => abandonResidentRequest(requests, responses, "request")).toThrow("decision barrier unavailable");
+      expect(fs.existsSync(decision)).toBe(true);
+      expect(fs.existsSync(exchange)).toBe(true);
+      // Existence alone is not a receipt, including while another publisher is confirming.
+      expect(() => abandonResidentRequest(requests, responses, "request")).toThrow("decision barrier unavailable");
+      expect(fs.existsSync(exchange)).toBe(true);
+      unavailable = false;
+      opened.mockClear(); synced.mockClear();
+      expect(abandonResidentRequest(requests, responses, "request").state).toBe("abandoned");
+      expect(confirmations).toBe(3);
+      const handle = opened.mock.calls.findIndex(([file]) => String(file) === decision);
+      expect(handle).toBeGreaterThanOrEqual(0);
+      expect(opened.mock.calls[handle]![1]).toBe(process.platform === "win32" ? "r+" : "r");
+      expect(synced.mock.calls.some(([fd]) => fd === opened.mock.results[handle]!.value)).toBe(true);
+      expect(fs.existsSync(exchange)).toBe(false);
+      expect(fs.readdirSync(path.join(directory, "decisions"))).toEqual(["request.json"]);
+    } finally { Object.defineProperty(process, "platform", platform); opened.mockRestore(); synced.mockRestore(); confirmation.mockRestore(); }
+  });
   it("persists ordinary actor definitions and lineage claims", () => {
     const directory = root(), events = observe();
     const store = new ActorRegistryStore(directory);

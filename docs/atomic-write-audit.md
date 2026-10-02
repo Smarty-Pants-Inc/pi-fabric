@@ -23,7 +23,7 @@ Audited `src/` at **3f6a2963**, after pi-fabric#180 / 87c5dd6d. All locations be
 | actors/binding-store.ts:170 | Session-specific model/thinking overrides | must-be-durable | No | Request durable |
 | actors/manager.ts:1054 | Native session header; archive rename precedes new header | ordering-dependent | Persistent actors only | Keep conditional durable header; add archive namespace barrier before replacement |
 | actors/manager.ts:1942 | Cleanup obligation marker before registry revocation | ordering-dependent | Yes | Retain durable |
-| actors/manager.ts:3338 (persist calls at 2062,2107,2174,2482,3293,3353,3464,3784,3887,3922) | Activation queue and validity revisions before mesh cursor advance / predecessor-source unlink | ordering-dependent | Only explicit security fence call (2482) | Default persistent queue writes to durable; sync empty-queue and predecessor unlink namespaces |
+| actors/manager.ts:3338 (persist calls at 2062,2107,2174,2482,3293,3353,3464,3784,3887,3922) | Activation queue and validity revisions before mesh cursor advance / predecessor-source unlink | ordering-dependent | Only explicit security fence call (2482) | Default persistent queue writes to durable; require success for new/coalesced callerless ingress before delivery/cursor acceptance; sync empty-queue and predecessor unlink namespaces |
 | actors/mesh-monitor.ts:284 | Restart cursor after activation queues are saved | ordering-dependent | No | Request durable checkpoint; retain ten-second batching and best-effort replay semantics |
 | agents/manager.ts:502 (1600,2118,2189,2211,2229) | Host-produced stopped/failed/timed-out terminal status before settlement | ordering-dependent | No | Request durable |
 | main-agent.ts:578 | Consumed IDs / halted state before source acknowledgement | ordering-dependent | Yes | Retain durable |
@@ -76,10 +76,10 @@ Audited `src/` at **3f6a2963**, after pi-fabric#180 / 87c5dd6d. All locations be
 | worker/run-record.ts:56,86 (running/progress) | Replaceable progress display | harmless | No | Keep non-terminal writes unsynced |
 | worker/reply-tool.ts:41-42 | Structured reply before terminal status / delivered response | ordering-dependent | No | File fsync before rename + parent ancestry after, without importing host APIs |
 | worker/run-log.ts:373 | Bounded terminal log compaction | harmless | Temp file synced, no parent sync | Keep: old/new log both valid; status/receipts do not use compaction as authority |
-| actors/manager.ts:996 | Session -> rotation backup before new session header/pruning | ordering-dependent | No | Sync archive namespace before dependent writes |
-| actors/manager.ts:1052 | Malformed session -> preserved orphan before repaired header | ordering-dependent | No | Sync archive namespace before replacement |
+| actors/manager.ts:996 | Session -> rotation backup before new session header/pruning | ordering-dependent | No | Fsync complete source inode, then rename and confirm archive namespace before dependent writes |
+| actors/manager.ts:1052 | Malformed session -> preserved orphan before repaired header | ordering-dependent | No | Fsync complete source inode, then rename and confirm archive namespace before replacement |
 | residency/host.ts:706 | Request -> processing pickup before decision/mutation | ordering-dependent | No | Sync both destination and source namespaces after cross-directory rename |
-| residency/protocol.ts:84-86 | Immutable committed/abandoned decision hard-link CAS before mutation/exchange deletion | ordering-dependent | No | Fsync opened temp before link; sync published namespace before returning winner |
+| residency/protocol.ts:84-86 | Immutable committed/abandoned decision hard-link CAS before mutation/exchange deletion | ordering-dependent | No | Fsync opened temp before link; sync published namespace before returning winner; on EEXIST confirm the actual winning inode's file and bound namespace barriers before accepting the decision |
 | mesh/store.ts:1683-1684 | Compacted retained event-log bytes before new cursor generation | ordering-dependent | No | Fsync temp file -> rename -> namespace barrier -> durable generation |
 | mesh/store.ts:676-685 | Recovered live archive lines before durable BOOT marker | ordering-dependent | File fdatasync, missing namespace barrier | Sync live-log namespace before BOOT can publish |
 | mesh/archive.ts:140 | Durable BOOT identity distinguishing process crash from power loss | ordering-dependent | Yes: file sync -> rename -> parent sync | Retain; recovered live names now explicitly precede it |
@@ -157,7 +157,7 @@ a failed parent barrier is not an acknowledgment; a later barrier must complete.
 
 Namespace receipts still require a successful full physical/lexical ancestry and
 symlink barrier, lazily prepared/revalidated **outside** the mutation lock. Setup
-and namespace recovery may owe additional fsyncs; the <=2 budget is per prepared
+and namespace recovery/reconfirmation may owe additional fsyncs; the <=2 budget is per prepared
 steady-state barrier, not per new process or changed namespace. All other audited
 durable classes and the general atomic-write defaults are unchanged. Directory
 fsync is unsupported/skipped on Windows as before; physical power-cut guarantees
@@ -182,7 +182,13 @@ Owned-child SIGKILL probes combine actual process crash with deterministic loss
 of the volatile canonical namespace (missing/torn/older). They are contract tests,
 **not physical power-cut certification**.
 
-### Fresh group-commit performance gate on ryzen2
+### Historical group-commit performance sample on ryzen2
+
+This is the earlier passing sample, not unconditional owner approval. Round 2's
+later nice-19 comparison recorded a 1,195 ms candidate maximum hold (limit <1 s),
+so the owner performance gate remains on hold pending final-head measurement and
+owner verification. Native Windows CI and the named Astra enrollment nonce/token
+security pass are separate before-merge gates.
 
 Three fresh 300-second runs, same 2,301,068-byte fixture and SHA256, five nice-0
 writers, 300 mutations/min, 24 volatile publications/min. Each completed 1,500
@@ -237,7 +243,47 @@ required file/parent barrier. Final targeted durability/cold/idle/first-use chec
 typecheck, fresh build, and lazy graph pass; retained artifacts include per-write
 records, lock samples, strace, setup accounting, and exploratory runs.
 
-## Verification on ryzen2 (nice 19)
+## Round 3 confirmation and recovery fixes
+
+- **Windows Schema:** workspace effect/rollback/recovery file barriers use `r+`
+  (write-capable, noncreating, nontruncating); POSIX retains `r`. No barrier is skipped.
+- **Queue admission:** durable persistence is part of new/coalesced callerless
+  acceptance, not merely a requested option. Healthy cursor writes cannot advance
+  beyond a failed queue file barrier. Replay retries after a fresh-runtime restart.
+- **Prepared namespace receipts:** ancestor ctime evidence is checked both before
+  and after completion, including after an asynchronous mesh file fsync. Same-inode
+  detach/reattach or benign sibling churn requires changed-ancestor reconfirmation before
+  acknowledgment. Reconfirmation retries are bounded (four attempts), identity
+  replacement/barrier errors still fail closed, and failure invalidates the receipt.
+- **Resident pickup:** renamed-but-unconfirmed requests remain in a same-host retry
+  set. Both pickup namespaces must confirm before mutation/response. Already executing
+  work is never added to this retry path; startup recovery remains indeterminate.
+- **Existing decision:** a losing decision publisher confirms the actual winning
+  inode's file and inode-bound namespace barriers before returning its decision.
+  Existence after another publisher's failed/in-flight link barrier is not a receipt.
+- **Session preservation:** persistent reset and malformed-header repair fsync the
+  complete source inode before rename, then confirm the archive namespace bound to
+  that inode before replacement header publication or dependent backup pruning.
+
+### Incremental barrier cost
+
+No unconditional mesh-commit fsync was added: unchanged prepared ancestry still
+costs one asynchronous file fsync plus one POSIX leaf-directory fsync, outside the
+mutation lock. F3 adds barriers only for ancestors whose evidence changes
+before acknowledgment (including during the barrier); those required recovery
+barriers are charged separately/inclusively in workload evidence. Queue ingress
+and successful pickup use their existing barriers; pickup failure retries owed
+barriers. F5 adds a winning-record file and namespace confirmation on `EEXIST`.
+F6 adds one source-file fsync per persistent reset/repair, not per session append.
+F1 changes handle access only. No expiring presence, ordinary publication, read
+signal, startup lifecycle or graph budget was promoted into a new fsync hot path.
+
+Final-head platform/performance results and exact artifact paths belong to the
+round-3 task report. This audit does not grant owner performance acceptance or the
+named Astra security pass; retain the before-merge hold until both are recorded.
+Tests establish barrier contracts, not physical power-cut certification.
+
+## Earlier verification on ryzen2 (nice 19)
 
 The mechanical inventory covers **72 direct helper/raw-publication sites in 34 source files**, including the shared helper implementation sites, with zero missing audit references. Wrapper expansions are separately listed above. Search evidence and the machine-readable coverage manifest are retained in the task artifacts.
 
@@ -267,5 +313,5 @@ Three interleaved write probes (median wall ms; actual fsync counts invariant ac
 | Authoritative mesh put | 40 | 15.11 | 144.54 | 0 -> 240 |
 | Ordinary authoritative actor registry replacement | 40 | 3.24 | 189.31 | 0 -> 242 |
 
-The registry/authoritative-state cost is deliberate and needs owner acceptance. It cannot honestly be described as 'all mesh/registry writes unchanged'. Queue checkpoint writes retain their pre-existing best-effort failure handling except the explicitly checked launch/security fence; making all disk-error paths transactional/fail-closed is distinct from requesting and ordering successful durability barriers and remains an owner review gate.
+The registry/authoritative-state cost is deliberate and needs owner acceptance. It cannot honestly be described as 'all mesh/registry writes unchanged'. Persistent callerless activation ingress now requires successful queue persistence, including coalesced replacements. A failure restores the prior in-memory queue/activation sequence and throws before a new drain or delivery-memory acknowledgment; mesh dispatch propagates that error so the monitor retains the retryable consumed-prefix boundary for **all** topics. Cursor storage can succeed without passing that failed event. This is not a whole-filesystem transaction: a failed post-rename barrier can leave an unacknowledged queue image visible, and completed-work retirement remains an at-least-once replay boundary, not an exactly-once guarantee.
 

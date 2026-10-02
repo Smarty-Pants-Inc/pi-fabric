@@ -78,7 +78,7 @@ describe("actor queue overflow", () => {
       await waitFor(() => actors.status(actor.id).status === "running");
       await w.mesh.publish({ topic: "team.events", from, text: "ev-1" });
       await waitFor(() => actors.status(actor.id).queued === 1);
-      const calls = write.mock.calls.filter(([file]) => file.includes("queue"));
+      const calls = write.mock.calls.filter(([file]) => /^queue-.+.json$/.test(path.basename(file)));
       expect(calls.length).toBeGreaterThan(0);
       for (const [, , options] of calls) expect(options?.durable).toBe(true);
     } finally { w.release(); await actors.close(); }

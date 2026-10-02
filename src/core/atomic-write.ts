@@ -219,24 +219,38 @@ export class DurableDirectory {
     try {
       // Walk the actual writer path too: lexical normalization alone is unsafe
       // when a symlink is followed by dot-dot.
-      const before = walkPathNamespace(directory);
-      // Sibling entry updates can change ancestor ctime during a commit without
-      // changing our namespace. Recheck identities here; prepare() conservatively
-      // re-establishes any changed ancestor receipt before the next lock.
-      if (this.#prepared === undefined || JSON.stringify(before.entries) !== this.#identities) {
-        throw new Error("Durability receipt namespace changed or unprepared");
+      // Identity alone misses same-inode detach/reattach during an awaited file
+      // barrier, or even during the namespace barrier itself. Reconfirm changed
+      // evidence before ack; bounded retries tolerate benign sibling churn.
+      let confirmed = this.#prepared;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const before = walkPathNamespace(directory);
+        if (confirmed === undefined || JSON.stringify(before.entries) !== this.#identities) {
+          throw new Error("Durability receipt namespace changed or unprepared");
+        }
+        const previousTimes = new Map<string, number>((JSON.parse(confirmed) as [string[], Array<[string, number]>])[1]);
+        // Unchanged ancestors already have receipts. Only changed containing
+        // directories owe reconfirmation, including a same-inode ABA's parent.
+        // Do not charge another full-chain sweep for unrelated /tmp sibling churn.
+        const owed = [before.endpoint, ...[...before.directories]
+          .filter(([parent, stat]) => parent !== before.endpoint && previousTimes.get(parent) !== stat.ctimeMs)
+          .map(([parent]) => parent)];
+        if (process.platform !== "win32") {
+          for (const parent of owed) {
+            const fd = fs.openSync(parent, fs.constants.O_RDONLY);
+            try {
+              const opened = fs.fstatSync(fd), expected = before.directories.get(parent)!;
+              if (!opened.isDirectory() || !sameInode(opened, expected)) throw new Error("Namespace directory changed before barrier");
+              fs.fsyncSync(fd);
+            } finally { fs.closeSync(fd); }
+          }
+        }
+        confirmed = directoryReceiptOf(before);
+        const after = walkPathNamespace(directory);
+        if (JSON.stringify(after.entries) !== this.#identities) throw new Error("Namespace changed during durability barriers");
+        if (directoryReceiptOf(after) === confirmed) { this.#prepared = confirmed; return; }
       }
-      if (process.platform !== "win32") {
-        const fd = fs.openSync(before.endpoint, fs.constants.O_RDONLY);
-        try {
-          const opened = fs.fstatSync(fd);
-          if (!opened.isDirectory() || !sameInode(opened, before.stat)) throw new Error("Namespace directory changed before barrier");
-          fs.fsyncSync(fd);
-        } finally { fs.closeSync(fd); }
-      }
-      if (JSON.stringify(walkPathNamespace(directory).entries) !== this.#identities) {
-        throw new Error("Namespace changed during durability barriers");
-      }
+      throw new Error("Namespace changed during durability barriers");
     } catch (error) {
       this.#prepared = undefined;
       throw error;

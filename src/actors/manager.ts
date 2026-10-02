@@ -299,6 +299,13 @@ export class ActorRegistryOwnershipError extends Error {
   }
 }
 
+class ActorQueueDurabilityError extends Error {
+  constructor(actorId: string) {
+    super(`Fabric actor queue durability failed for ${actorId}; retry`);
+    this.name = "ActorQueueDurabilityError";
+  }
+}
+
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
   readonly #failureStreaks = new Map<string, { count: number; notified: boolean }>();
@@ -986,17 +993,21 @@ export class ActorManager {
       .filter((name) => name.startsWith(prefix) && name.endsWith(".bak") && !name.includes(".orphan-noheader"));
     let bytes = 0;
     let archived: string | null = null;
+    let sourceFound = false;
     try {
       bytes = fs.statSync(file).size;
+      sourceFound = true;
       const stamp = new Date().toISOString().replace(/[-:.]/g, "");
       // A same-millisecond archive takes a suffix above every one kept for its stamp. A gap
       // that pruning left must not be reused: the new name would sort oldest and be pruned.
       const taken = listBackups().map(order).filter(([other]) => other === stamp).map(([, n]) => n);
       archived = taken.length === 0 ? `${file}.${stamp}.bak` : `${file}.${stamp}-${Math.max(...taken) + 1}.bak`;
-      fs.renameSync(file, archived);
-      if (this.#persistent) syncPathNamespace(archived);
+      this.#preserveSession(file, archived);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // Only an absent source at the initial stat means there is nothing to
+      // preserve. Namespace ENOENT after rename is a failed confirmation, not
+      // permission to publish a replacement or prune dependent history.
+      if (sourceFound || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       archived = null;
     }
     const backups = listBackups()
@@ -1025,6 +1036,18 @@ export class ActorManager {
     });
   }
 
+  /** Preserve the complete native append inode before replacement/pruning can depend on it. */
+  #preserveSession(file: string, archived: string): void {
+    if (!this.#persistent) { fs.renameSync(file, archived); return; }
+    const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
+    try {
+      const inode = fs.fstatSync(fd);
+      fs.fsyncSync(fd);
+      fs.renameSync(file, archived);
+      syncPathNamespace(archived, inode);
+    } finally { fs.closeSync(fd); }
+  }
+
   // A native Pi header is tiny; never read the multi-megabyte transcript just to validate it.
   #hasSessionHeader(file: string): boolean {
     const fd = fs.openSync(file, "r");
@@ -1050,8 +1073,7 @@ export class ActorManager {
         if (this.#hasSessionHeader(actor.sessionFile)) return;
         const stamp = new Date().toISOString().replace(/[-:.]/g, "");
         archived = `${actor.sessionFile}.${stamp}.${randomUUID()}.orphan-noheader.bak`;
-        fs.renameSync(actor.sessionFile, archived);
-        if (this.#persistent) syncPathNamespace(archived);
+        this.#preserveSession(actor.sessionFile, archived);
       }
       writeJsonAtomic(actor.sessionFile, {
         type: "session", version: 3, id: randomUUID(),
@@ -2043,12 +2065,14 @@ export class ActorManager {
     const resolving = this.#resolvedRunBinding(actor, unresolved);
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const createdAt = Date.now();
+    const previousSequence = actor.latestActivationSequence;
     const sequence = ++actor.latestActivationSequence;
     if (options.coalesceKey) {
       // Parked work (waiting for ownership, or restored after a restart) coalesces too (smarty-dev#1065).
       const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
         .find((item) => item.coalesceKey === options.coalesceKey);
       if (existing) {
+        const previous = { ...existing };
         existing.payload = structuredClone(payload);
         existing.provenance = options.provenance ? structuredClone(options.provenance) : undefined;
         if (options.images && options.images.length > 0) {
@@ -2061,7 +2085,13 @@ export class ActorManager {
         existing.binding = binding;
         existing.bindingMode = bindingMode;
         existing.bindingVersion = 2;
-        this.#persistQueue(actor.id);
+        const persisted = this.#persistQueue(actor.id);
+        if (this.#persistent && !existing.resolve && !existing.reject && !persisted) {
+          Object.assign(existing, previous);
+          if (!previous.images) delete existing.images;
+          actor.latestActivationSequence = previousSequence;
+          throw new ActorQueueDurabilityError(actor.id);
+        }
         this.#ensureDrain(actor);
         return existing;
       }
@@ -2106,7 +2136,15 @@ export class ActorManager {
     } else {
       actor.queue.push(item);
     }
-    this.#persistQueue(actor.id);
+    const persisted = this.#persistQueue(actor.id);
+    if (this.#persistent && callerless && !persisted) {
+      // No drain or delivery-memory entry can consume a failed admission. Restore
+      // the in-memory queue too, so replay does not manufacture a duplicate item.
+      const waiting = actor.queue.includes(item) ? actor.queue : this.#overflow.get(actor.id)!;
+      waiting.splice(waiting.indexOf(item), 1);
+      actor.latestActivationSequence = previousSequence;
+      throw new ActorQueueDurabilityError(actor.id);
+    }
     actor.status = "queued";
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
@@ -2824,6 +2862,9 @@ export class ActorManager {
           this.#delivered.delete(this.#delivered.values().next().value!);
         }
       } catch (error) {
+        // Persistence failures hold the replay boundary for ALL topics, not just fleet work.
+        // The monitor restores the consumed prefix on a throwing dispatch.
+        if (error instanceof ActorQueueDurabilityError) throw error;
         // A stopped actor or other failure skips the event, as before; a full queue defers it.
         if (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached")) full = true;
       }
@@ -3346,7 +3387,7 @@ export class ActorManager {
         }, { durable });
       }
     } catch {
-      return false;                                         // best-effort; memory still runs the work
+      return false;                                         // ingress must not acknowledge this work
     }
     try {
       for (const source of this.#takenOver.get(actorId) ?? []) if (source !== file) {

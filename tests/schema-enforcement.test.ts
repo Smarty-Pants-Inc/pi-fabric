@@ -91,6 +91,45 @@ afterEach(() => {
 });
 
 describe("Schema transactions", () => {
+  it.each(["edit", "write", "rollback", "recovery"] as const)("#2479 R3 F1 Windows %s confirms workspace contents with a writable nontruncating handle", async (kind) => {
+    const setup = fixture(), target = path.join(setup.cwd, "a.txt");
+    fs.writeFileSync(target, "alpha\n");
+    const artifacts = kind === "recovery" ? undefined : await hypothesisAndCertificate(setup, [{ kind: "file_contains", path: "a.txt", literal: "alpha" }]);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const descriptors = new Map<number, { file: string; flags: string | number }>();
+    const barriers: Array<string | number> = [];
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode); descriptors.set(fd, { file: String(file), flags }); return fd;
+    });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const descriptor = descriptors.get(fd);
+      if (descriptor?.file === target) {
+        barriers.push(descriptor.flags);
+        if (descriptor.flags === "r") throw Object.assign(new Error("Windows FlushFileBuffers requires write access"), { code: "EPERM" });
+      }
+      sync(fd);
+    });
+    try {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      if (kind === "recovery") {
+        fs.writeFileSync(target, "mutated\n");
+        const journal = path.join(setup.mesh.root, "schema-transactions", "crashed.json");
+        fs.writeFileSync(journal, JSON.stringify({ format: 1, id: "crashed", status: "applying", before: [{ path: "a.txt", absolute: target, existed: true, content: Buffer.from("alpha\n").toString("base64"), mode: 0o644 }], createdAt: Date.now() }));
+        new SchemaController(setup.cwd, setup.config, setup.mesh, identity, setup.state);
+        expect(JSON.parse(fs.readFileSync(journal, "utf8")).status).toBe("rolled_back");
+      } else {
+        const result = await setup.controller.commit({ hypothesisId: artifacts!.hypothesisId, certificate: artifacts!.certificate,
+          operations: kind === "write" ? [{ kind: "write", path: "a.txt", content: "beta\n", expected: { sha256: sha("alpha\n") } }] : [{ kind: "edit", path: "a.txt", oldText: "alpha", newText: "beta", expectedSha256: sha("alpha\n") }],
+          postconditions: [{ kind: "file_contains", path: "a.txt", literal: kind === "rollback" ? "missing" : "beta" }],
+        }, artifacts!.context);
+        expect(result.outcome).toBe(kind === "rollback" ? "rolled_back" : "committed");
+      }
+      expect(barriers.length).toBeGreaterThanOrEqual(kind === "rollback" ? 2 : 1);
+      expect(barriers.every(flags => flags === "r+")).toBe(true);
+      expect(fs.readFileSync(target, "utf8")).toBe(kind === "rollback" || kind === "recovery" ? "alpha\n" : "beta\n");
+    } finally { Object.defineProperty(process, "platform", platform); synced.mockRestore(); opened.mockRestore(); }
+  });
   it.each([true, false])("#2479 persists journal and workspace effects before committed/rollback receipt (commit: %s)", async (commit) => {
     const setup = fixture(), file = path.join(setup.cwd, "a.txt");
     fs.writeFileSync(file, "alpha\n");

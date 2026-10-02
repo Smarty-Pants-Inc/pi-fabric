@@ -331,6 +331,7 @@ export interface ResidentHostOwner {
 interface ResidentSpawnCommand {
   format: typeof RESIDENT_HOST_FORMAT;
   operation: "spawn";
+  idempotencyKey?: string;
   requestId: string;
   rootId: string;
   request: AgentRunRequest;
@@ -368,6 +369,7 @@ interface ResidentRemoveActorCommand {
 interface ResidentCreateActorCommand {
   format: typeof RESIDENT_HOST_FORMAT;
   operation: "createActor";
+  idempotencyKey?: string;
   requestId: string;
   rootId: string;
   request: FabricActorRequest;

@@ -95,9 +95,16 @@ const actorInvocationProperties = {
   thinking: runProperties.thinking,
 };
 
+const residentIdempotencyKeySchema = {
+  type: "string",
+  minLength: 1,
+  maxLength: 256,
+  description: "Optional durable create/spawn retry key. Same operation and key on the same resident host returns the first result (last 256 completed requests, up to 10 minutes). Different or omitted keys create independently; no deduplication across host restarts or for session/global creation.",
+};
+
 const spawnSchema = {
   ...runSchema,
-  properties: { ...runProperties, residency: residencySchema },
+  properties: { ...runProperties, residency: residencySchema, idempotencyKey: residentIdempotencyKeySchema },
 };
 
 const handoffCompactionSchema = {
@@ -398,6 +405,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         coalesceKey: { type: "string", description: "Dotted path into a mesh event's data (such as payload.number). A queued event of the same topic with the same value there is replaced by the newer one." },
         activationFilter: activationFilterSchema,
         residency: residencySchema,
+        idempotencyKey: residentIdempotencyKeySchema,
         runner: runProperties.runner,
         kernel: runProperties.kernel,
         model: runProperties.model,

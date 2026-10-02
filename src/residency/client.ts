@@ -371,13 +371,15 @@ export class ResidencyClient {
   }
 
   async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+    const { idempotencyKey = randomUUID(), ...creationRequest } = request;
     await this.ensureHost();
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
+      idempotencyKey,
       requestId: randomUUID(),
       rootId: this.options.config.rootId,
-      request,
+      request: creationRequest,
       createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Fabric resident host returned no actor");
@@ -431,9 +433,11 @@ export class ResidencyClient {
   }
 
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
-    const resolvedRequest = request.cwd === undefined
-      ? request
-      : { ...request, cwd: await awaitAgentCwd(this.options.config.cwd, request.cwd, signal) };
+    // One key per call, held in the envelope for any transport replay.
+    const { idempotencyKey = randomUUID(), ...spawnRequest } = request;
+    const resolvedRequest = spawnRequest.cwd === undefined
+      ? spawnRequest
+      : { ...spawnRequest, cwd: await awaitAgentCwd(this.options.config.cwd, spawnRequest.cwd, signal) };
     // Freeze inherited optional-tool authority before transferring to an existing host.
     const allowedTools = this.#inheritedToolAllowlist;
     const tools = allowedTools === undefined ? undefined
@@ -443,6 +447,7 @@ export class ResidencyClient {
       {
         format: RESIDENT_HOST_FORMAT,
         operation: "spawn",
+        idempotencyKey,
         requestId: randomUUID(),
         rootId: this.options.config.rootId,
         request: { ...resolvedRequest, ...(tools ? { tools } : {}), residency: "durable" },

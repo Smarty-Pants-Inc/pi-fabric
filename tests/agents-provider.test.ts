@@ -131,8 +131,9 @@ describe("fleet model policy (#2490)", () => {
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     const catalog = vi.spyOn(state.agents, "claudeModels");
     try {
-      await expect(state.provider.invoke("spawn", { task: "legacy alias", runner, model: "backend-shortcut", residency: "durable" }, context)).resolves.toMatchObject({ model: "backend-shortcut" });
+      await expect(state.provider.invoke("spawn", { task: "legacy alias", runner, model: "backend-shortcut", residency: "durable", idempotencyKey: "durable-spawn-retry" }, context)).resolves.toMatchObject({ model: "backend-shortcut" });
       expect(spawnAgent).toHaveBeenCalledOnce(); expect(catalog).not.toHaveBeenCalled();
+      expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ idempotencyKey: "durable-spawn-retry" }), undefined);
     } finally { catalog.mockRestore(); }
   });
 
@@ -1592,6 +1593,9 @@ describe("AgentsProvider runner support", () => {
     expect(spawnProperties.residency?.enum).toEqual(["session", "durable"]);
     expect(createProperties.residency?.enum).toEqual(["session", "durable"]);
     expect(runProperties).not.toHaveProperty("residency");
+    expect(spawnProperties.idempotencyKey).toMatchObject({ type: "string", minLength: 1, maxLength: 256 });
+    expect(createProperties.idempotencyKey).toEqual(spawnProperties.idempotencyKey);
+    expect(runProperties).not.toHaveProperty("idempotencyKey");
   });
 
   it("exposes actor activation overrides and scoped binding setters", async () => {
@@ -1744,6 +1748,7 @@ describe("AgentsProvider runner support", () => {
         name: "second-durable",
         instructions: "Created via the resident host.",
         residency: "durable",
+        idempotencyKey: "durable-create-retry",
       },
       invocationContext,
     )) as FabricActorInfo;
@@ -1762,7 +1767,7 @@ describe("AgentsProvider runner support", () => {
     expect(imported).toMatchObject({ id: "resident-actor-2", name: "durable-template" });
     expect(createActor).toHaveBeenNthCalledWith(
       1,
-      expect.objectContaining({ name: "second-durable", residency: "durable" }),
+      expect.objectContaining({ name: "second-durable", residency: "durable", idempotencyKey: "durable-create-retry" }),
       invocationContext.signal,
     );
     expect(createActor).toHaveBeenNthCalledWith(

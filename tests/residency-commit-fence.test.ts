@@ -128,6 +128,171 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
   };
 };
 
+describe("resident creation idempotency", () => {
+  for (const kind of ["main create", "nested create", "main spawn"] as const) {
+    let sequence = 0;
+    const create = (state: Awaited<ReturnType<typeof harness>>, idempotencyKey?: string) => {
+      // Unique names avoid actor name admission masking request deduplication.
+      const request = { name: `idempotent-${++sequence}`, residency: "durable" as const, model: state.model,
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }) };
+      return kind === "main spawn"
+        ? state.client.spawnAgent({ ...request, task: "create exactly once", transport: "process" })
+        : (kind === "main create" ? state.client : state.nested).createActor({ ...request, instructions: "create exactly once" });
+    };
+    const count = (state: Awaited<ReturnType<typeof harness>>) => kind === "main spawn"
+      ? state.client.listAgents().length
+      : new ActorRegistryStore(state.config.actorRoot).records().length +
+        new ActorRegistryStore(state.config.sessionActorRoot!).records().length;
+    const holdCreation = (state: Awaited<ReturnType<typeof harness>>) => {
+      let calls = 0;
+      let id = "";
+      if (kind === "main spawn") {
+        const original = AgentManager.prototype.spawn;
+        vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(async function (this: AgentManager, ...args) {
+          const handle = await original.apply(this, args);
+          calls++; id = handle.id; state.entered.resolve(); await state.release.promise;
+          return handle;
+        });
+      } else {
+        const original = ActorDirectory.prototype.create;
+        vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+          const actor = await original.apply(this, args);
+          calls++; id = actor.id; state.entered.resolve(); await state.release.promise;
+          return actor;
+        });
+      }
+      return { calls: () => calls, id: () => id };
+    };
+
+    it(`${kind}: timeout then same-key retry returns the first ID and one registry entry`, { timeout: 20_000 }, async () => {
+      const state = await harness(false);
+      const held = holdCreation(state);
+      try {
+        const first = create(state, "timeout-key").catch((error: Error) => error);
+        await state.entered.promise;
+        const firstId = held.id();
+        await expect(first).resolves.toMatchObject({ name: "ResidentOutcomeUnknownError", id: firstId });
+        state.release.resolve();
+        await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        const retry = await create(state, "timeout-key");
+        expect(retry.id).toBe(firstId);
+        expect(held.calls()).toBe(1);
+        expect(count(state)).toBe(1);
+      } finally { await state.close(); }
+    });
+
+    it(`${kind}: concurrent same-key requests create once`, { timeout: 20_000 }, async () => {
+      const state = await harness(false, undefined, 5_000);
+      const held = holdCreation(state);
+      try {
+        const first = create(state, "concurrent-key");
+        await state.entered.promise;
+        const second = create(state, "concurrent-key");
+        // The actual poller serializes pickup; both callers overlap while mutation is pending.
+        await waitFor(() => entries(state.residencyRoot, "requests").length === 1);
+        const queuedFile = entries(state.residencyRoot, "requests")[0]!;
+        const queued = fs.readFileSync(path.join(state.residencyRoot, "requests", queuedFile), "utf8");
+        expect(JSON.parse(queued)).toMatchObject({ idempotencyKey: "concurrent-key" });
+        expect(JSON.parse(queued).request.idempotencyKey).toBeUndefined();
+        state.release.resolve();
+        const [a, b] = await Promise.all([first, second]);
+        expect(a.id).toBe(b.id);
+        // Replay the retry's own envelope, whose requestId differs from the first.
+        fs.writeFileSync(path.join(state.residencyRoot, "requests", queuedFile), queued);
+        const responsePath = path.join(state.residencyRoot, "responses", queuedFile);
+        await waitFor(() => fs.existsSync(responsePath));
+        expect(JSON.parse(fs.readFileSync(responsePath, "utf8"))).toMatchObject({ ok: true,
+          ...(kind === "main spawn" ? { handle: { id: a.id } } : { actor: { id: a.id } }) });
+        expect(held.calls()).toBe(1);
+        expect(count(state)).toBe(1);
+      } finally { await state.close(); }
+    });
+
+    it(`${kind}: different keys create two`, { timeout: 20_000 }, async () => {
+      const state = await harness(false, undefined, 5_000);
+      try {
+        const a = await create(state, "first-key");
+        const b = await create(state, "second-key");
+        expect(a.id).not.toBe(b.id);
+        expect(count(state)).toBe(2);
+      } finally { await state.close(); }
+    });
+
+    it(`${kind}: omitted keys remain independent calls`, { timeout: 20_000 }, async () => {
+      const state = await harness(false, undefined, 5_000);
+      try {
+        const a = await create(state);
+        const b = await create(state);
+        expect(a.id).not.toBe(b.id);
+        expect(count(state)).toBe(2);
+      } finally { await state.close(); }
+    });
+  }
+});
+
+describe("resident creation cache boundaries", () => {
+  const actorRequest = (name: string, idempotencyKey: string) => ({
+    name, idempotencyKey, instructions: "Work", scope: "session" as const, residency: "durable" as const, model: "test/visible",
+  });
+
+  it("expires completed results after ten minutes", { timeout: 20_000 }, async () => {
+    const state = await harness(false, undefined, 5_000);
+    const realNow = Date.now;
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const first = await state.client.createActor(actorRequest("before-expiry", "expiring"));
+      clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 10 * 60_000 + 1);
+      const next = await state.client.createActor(actorRequest("after-expiry", "expiring"));
+      expect(next.id).not.toBe(first.id);
+      expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(2);
+    } finally { clock?.mockRestore(); await state.close(); }
+  });
+
+  it("retains only the last 256 completed results", { timeout: 20_000 }, async () => {
+    const state = await harness(false, undefined, 10_000);
+    try {
+      const first = await state.client.createActor(actorRequest("before-eviction", "oldest"));
+      // Real client/host exchanges with fail-fast requests avoid 256 extra actors/workers.
+      const rejected = await Promise.all(Array.from({ length: 256 }, (_, i) =>
+        state.client.createActor(actorRequest("", `bounded-${i}`)).catch((error: Error) => error)));
+      for (const error of rejected) expect(error).toMatchObject({ message: expect.stringContaining("Invalid Fabric actor name") });
+      const next = await state.client.createActor(actorRequest("after-eviction", "oldest"));
+      expect(next.id).not.toBe(first.id);
+      expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(2);
+    } finally { await state.close(); }
+  });
+
+  it("scopes the same key to create versus spawn", { timeout: 20_000 }, async () => {
+    const state = await harness(false, undefined, 5_000);
+    try {
+      const actor = await state.client.createActor(actorRequest("operation-scope", "shared-key"));
+      const agent = await state.client.spawnAgent({ task: "work", residency: "durable", transport: "process", idempotencyKey: "shared-key" });
+      expect(agent.id).not.toBe(actor.id);
+      expect(state.client.listAgents()).toHaveLength(1);
+      expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(1);
+    } finally { await state.close(); }
+  });
+
+  it("replays a post-commit failure with the same committed ID and no second create", { timeout: 20_000 }, async () => {
+    const state = await harness(false, undefined, 5_000);
+    const original = ActorDirectory.prototype.create;
+    let id = "";
+    const create = vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+      const actor = await original.apply(this, args);
+      id = actor.id;
+      throw new Error("fixture response lost after commit");
+    });
+    try {
+      await expect(state.client.createActor(actorRequest("first-failure", "failed-commit")))
+        .rejects.toMatchObject({ name: "ResidentOutcomeUnknownError" });
+      await expect(state.client.createActor(actorRequest("retry-failure", "failed-commit")))
+        .rejects.toMatchObject({ name: "ResidentOutcomeUnknownError", id });
+      expect(create).toHaveBeenCalledOnce();
+      expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(1);
+    } finally { create.mockRestore(); await state.close(); }
+  });
+});
+
 describe("resident fence harness teardown", () => {
   it("retries a transient Windows EBUSY after the resident host has closed", async () => {
     const state = await harness(false);
@@ -246,11 +411,15 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
           .toMatchObject({ state: "committed", id: knownId });
         const responsePath = path.join(state.residencyRoot, "responses", `${requestId}.json`);
         expect(JSON.parse(fs.readFileSync(responsePath, "utf8"))).toMatchObject({ ok: true, requestId });
-        // Replay the actual exchange envelope: the immutable commit fence rejects a second mutation.
+        // Replay the actual keyed envelope: return the first result without a second mutation.
+        const envelope = JSON.parse(originalCommand);
+        expect(envelope.idempotencyKey).toEqual(expect.any(String));
+        expect(envelope.request.idempotencyKey).toBeUndefined();
         fs.rmSync(responsePath);
         fs.writeFileSync(path.join(state.residencyRoot, "requests", `${requestId}.json`), originalCommand);
         await waitFor(() => fs.existsSync(responsePath));
-        expect(JSON.parse(fs.readFileSync(responsePath, "utf8"))).toMatchObject({ ok: false, requestId });
+        expect(JSON.parse(fs.readFileSync(responsePath, "utf8"))).toMatchObject({ ok: true, requestId,
+          ...(kind === "main spawn" ? { handle: { id: knownId } } : { actor: { id: knownId } }) });
         expect(creations).toBe(1);
         if (kind === "main spawn") expect(state.client.listAgents()).toHaveLength(1);
         else expect(new ActorRegistryStore(state.config.actorRoot).records().length +

@@ -106,12 +106,14 @@ export class ResidentActorClient {
   }
 
   async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+    const { idempotencyKey = randomUUID(), ...creationRequest } = request;
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
+      idempotencyKey,
       requestId: randomUUID(),
       rootId: this.#rootId,
-      request,
+      request: creationRequest,
       createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Resident host returned no actor from createActor");

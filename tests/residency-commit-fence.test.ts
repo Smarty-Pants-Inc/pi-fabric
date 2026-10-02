@@ -1066,6 +1066,33 @@ describe("round 4 public cleanup-obligation retry cancellation", { timeout: 25_0
   }
 });
 
+describe("durable systemPrompt public contract (#2985)", { timeout: 25_000 }, () => {
+  it.each(["typed", "described"] as const)("%s spawn carries its public prompt to the durable worker", async (surface) => {
+    const state = await harness(false, undefined, 10_000);
+    const main = mainProvider(state);
+    try {
+      const run = publicExecution(state, main, "quickjs", 5_000);
+      const described = await run('return await tools.describe({ref:"agents.spawn"});');
+      expect(described.success, described.error).toBe(true);
+      expect(described.value).toMatchObject({ inputSchema: { properties: { systemPrompt: { type: "string" } } } });
+      const systemPrompt = "Audit only; report evidence without changing source.";
+      const args = { ...requestArgs(state, "spawn"), systemPrompt };
+      const code = surface === "typed" ? `return await agents.spawn(${JSON.stringify(args)});`
+        : `return await tools.call({ref:"agents.spawn",args:${JSON.stringify(args)}});`;
+      const result = await run(code);
+      expect(result.success, result.error).toBe(true);
+      expect(result.residentOutcomes).toBeUndefined();
+      const handle = result.value as { id: string; residency: string };
+      expect(handle.residency).toBe("durable");
+      const completed = await state.client.waitAgent(handle.id);
+      // The real host launches the fixture worker through ProcessTransport.
+      // Its status echoes the actual --system-prompt argument it received.
+      expect(completed).toMatchObject({ status: "completed", systemPrompt });
+      expect(decisionsFor(state)).toEqual([expect.objectContaining({ state: "committed", operation: "spawn", id: handle.id })]);
+    } finally { await main.close(); await state.close(); }
+  });
+});
+
 describe("invocation-local spawn receipts (#2947)", { timeout: 25_000 }, () => {
   for (const engine of ["quickjs", "node"] as const) for (const interactiveMain of [false, true]) {
     it(`${engine} completed followUp does not downgrade earlier spawns or poison later calls (Main=${interactiveMain})`, async () => {

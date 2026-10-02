@@ -72,6 +72,8 @@ interface FabricAgentRequest {
   cwd?: string;
   worktree?: boolean;
   schema?: Record<string, unknown>;
+  /** Extra child system instructions; supported by session and durable runs. */
+  systemPrompt?: string;
   prompt?: string;
   instructions?: string;
   timeout_ms?: number;

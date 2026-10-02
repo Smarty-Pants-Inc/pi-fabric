@@ -771,6 +771,7 @@ const main = async (): Promise<void> => {
       cost: number;
     },
     attribution?: { model?: string | undefined; provider?: string | undefined },
+    journalMessage?: unknown,
   ): void => {
     const snapshot = record.usage;
     if (
@@ -810,6 +811,14 @@ const main = async (): Promise<void> => {
       },
       attribution?.model ?? record.model ?? options.model,
       attribution?.provider,
+      undefined,
+      // Only actor journals are a durable accounting source. Ordinary task
+      // sessions live in the disposable run directory, so their exports must
+      // remain countable. Activation turns are retained under sessionFile, not
+      // the isolated child session that retain() removes at settlement.
+      options.actorId && options.sessionFile && journalMessage
+        ? sessionExportHelpers.journalTurnId(options.sessionFile, journalMessage)
+        : undefined,
     );
     lastEmittedUsage.input = snapshot.input;
     lastEmittedUsage.output = snapshot.output;
@@ -1319,7 +1328,7 @@ const main = async (): Promise<void> => {
       emitTokenUsage(usageDelta, {
         model: stringField(messageRecord.model),
         provider: stringField(messageRecord.provider),
-      });
+      }, messageRecord);
       modelControl.observeAssistant(messageRecord);
       enforceTokenLimit();
       if ((messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") && !terminalStatus) {

@@ -546,6 +546,9 @@ const main = async (): Promise<void> => {
   let terminalError: string | undefined;
   let sawAgentError = false;
   let retryPending = false;
+  let piSettledSuccessfully = false;
+  let hasFinalText = false;
+  let hasFinalResult = false;
 
   const update = (): void => updateRunRecord(options.statusFile, record);
   let killTimer: NodeJS.Timeout | undefined;
@@ -587,9 +590,28 @@ const main = async (): Promise<void> => {
     recoveryWatchdog.clear();
     if (closeTimer || killTimer) return;
     // RPC EOF requests disposal, but a stuck extension can prevent process exit.
-    closeTimer = setTimeout(() => failStalledChild(
-      `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`,
-    ), KILL_GRACE_MS);
+    closeTimer = setTimeout(() => {
+      const error = `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`;
+      // fabric_reply writes after assistant message_end; inspect the durable
+      // reply now too. Post-drain reply/schema validation remains authoritative.
+      hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
+      if (piSettledSuccessfully && hasFinalResult && modelControl.ready && !terminalStatus &&
+          !terminalError && !sawAgentError && !lostResult) {
+        const warning = `${error}; preserving final result and terminating child`;
+        record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+        appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
+        process.stderr.write(`[pi-fabric] ${warning}\n`);
+        // Persist the result and warning BEFORE signalling the owned group.
+        // Keep the public record running until close drains the streams and
+        // reply/schema validation finishes; terminal records can be collected
+        // immediately by the manager. Forced exit must not erase this result.
+        update();
+        terminalStatus = "completed";
+        killChild();
+      } else {
+        failStalledChild(error);
+      }
+    }, KILL_GRACE_MS);
     closeTimer.unref();
   };
 
@@ -1090,6 +1112,9 @@ const main = async (): Promise<void> => {
         ...(record.fabricSessionId ? { fabricSessionId: record.fabricSessionId } : {}),
       });
       retryPending = false;
+      piSettledSuccessfully = false;
+      hasFinalText = false;
+      hasFinalResult = false;
       // Starting a retry is not proof of acceptance: preserve the error and timer
       // until the provider starts a new assistant response.
       return;
@@ -1172,6 +1197,7 @@ const main = async (): Promise<void> => {
       if (messageRecord.role !== "assistant") return;
       lostResult = undefined;
       const text = extractText(messageRecord);
+      hasFinalText = Boolean(text);
       if (text) {
         record.text = latestRunText(text);
         process.stdout.write(`\n${text}\n`);
@@ -1208,6 +1234,12 @@ const main = async (): Promise<void> => {
     if (event.type === "agent_settled") {
       emitLifecycle("pi.agent_settled");
       if (!retryPending) {
+        // Settlement ends automatic work, not necessarily successfully: native
+        // compaction failures/aborts need not emit an assistant error message.
+        // Older Pi frames omit outcome; retain their existing result checks.
+        piSettledSuccessfully = event.outcome !== "error" && event.outcome !== "aborted";
+        // Tool-only assistant events precede the tool's durable reply write.
+        hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
         // Pull controls that landed with the final stream events before deciding
         // whether this one-shot child can close. A queued compact keeps stdin
         // open until its correlated response and compaction_end are observed.

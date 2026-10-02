@@ -50,6 +50,14 @@ describe("resolvePiBinary", () => {
     })).toBe(expected);
   });
 
+  it.each(["configured", "environment"])("resolves a bare %s launcher on the owner's PATH", source => {
+    const expected = path.resolve("/owner/bin", process.platform === "win32" ? "pi.cmd" : "pi");
+    expect(resolvePiBinary(source === "configured" ? "pi" : undefined, {
+      env: {PATH: path.resolve("/owner/bin"), ...(source === "environment" ? {PI_FABRIC_PI_BINARY: "pi"} : {})},
+      isExecutable: candidate => candidate === expected,
+    })).toBe(expected);
+  });
+
   it("falls back to the literal name when PATH has no launcher", () => {
     const isExecutable = vi.fn(() => true);
     expect(resolvePiBinary(undefined, { env: {}, isExecutable })).toBe("pi");

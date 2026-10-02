@@ -55,6 +55,11 @@ Evidence exposed only by the opaque quote/escape scan uses a separate reason:
 **“Opaque command refused: a protected signal/delete token is visible after
 removing quotes or escapes; use a supported literal command.”** It does not ask
 for a recorded PID when an opaque deletion spelling triggered the guard.
+Before that scan, ANSI-C `$'...'` segments are decoded as Bash decodes them
+(`\t \n \v \f \r \a \b \e \E \\ \' \" \?`, `\xHH`, `\NNN`, `\uHHHH`,
+`\UHHHHHHHH`, `\cX`), so `bash -c $'pkill\tworker'` exposes `pkill`. An
+undecoded escape or an unterminated `$'` beside an opaque receiver (`bash`/`sh`,
+`eval`, `env`, `xargs`, `ssh` and similar wrappers) refuses with the opaque reason.
 Protected lexical basenames are detected by a **forward token scan**, not a
 backtracking path-prefix regex.
 No execution-boundary denylist exists: `trap`, `complete`, `compgen`, unknown

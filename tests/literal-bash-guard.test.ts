@@ -134,6 +134,26 @@ describe("literal-only signal and recursive-delete guard", () => {
   it("refuses fragmented shell -c receivers with the opaque reason", () => {
     expect(bashGuardRefusal("bash -c 'k\\ill 123'", tmpdir)).toBe(OPAQUE_REASON);
   });
+  // Astra F1: Bash decodes ANSI-C escapes into separators before the inner shell splits words.
+  // Scanner-only DATA strings; never executed.
+  it.each([
+    "bash -c $'pkill\\tworker'", "bash -c $'rm\\t-rf /outside'", "bash -c $'pkill\\nworker'",
+    "bash -c $'pkill\\x20worker'", "bash -c $'pkill\\040worker'", "bash -c $'pkill\\u0020worker'",
+    "bash -c $'rm\\U00000020-rf /outside'", "sh -c $'kill\\v123'", "bash -c $'kill\\t-0 999999999'",
+    "eval $'pkill\\fworker'", "bash -c $'p\\x6bill worker'", "bash -c $'\\162m -rf /outside'",
+  ])("refuses ANSI-C decoded separators/letters in opaque receivers: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBe(OPAQUE_REASON);
+  });
+  it.each([
+    "bash -c $'echo\\qx'", "bash -c $'echo unterminated", "sh -c $'\\xZZ'", "eval $'\\k'",
+  ])("refuses undecodable or unterminated ANSI-C quoting in an opaque receiver: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBe(OPAQUE_REASON);
+  });
+  it.each([
+    "printf %s $'restored\\tSessions\\n'", "bash -c $'echo\\tok'", "printf %s $'\\x41\\101\\u0041\\cA'",
+  ])("still allows decoded ANSI-C text without a protected token: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBeUndefined();
+  });
   it.each([
     "grep -E 'kill|pkill' f | head -n 5", "grep -A2 'pkill' f", "sed -n '/kill 123/p' f",
     "cat > f.md <<'EOF'\nDon't kill the session.\nEOF",

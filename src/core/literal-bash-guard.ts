@@ -214,6 +214,66 @@ function literalRm(words: Word[], tmpdir: string | undefined): boolean {
   return recursive && index < words.length && words.slice(index).every(word => ownPath(word.text, tmpdir));
 }
 
+const ANSI_SIMPLE: Record<string, string> = {
+  t: "\t", n: "\n", v: "\v", f: "\f", r: "\r", a: "\x07", b: "\b", e: "\x1b", E: "\x1b",
+  "\\": "\\", "'": "'", '"': '"', "?": "?",
+};
+const ANSI_RUNS: Record<string, RegExp> = { x: /^[0-9A-Fa-f]{1,2}/, u: /^[0-9A-Fa-f]{1,4}/, U: /^[0-9A-Fa-f]{1,8}/ };
+// Wrapper heads whose argv can become another command; an undecodable $'...' refuses there.
+const OPAQUE_RECEIVERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "mksh", "busybox", "eval", "exec", "env",
+  "xargs", "sudo", "doas", "su", "ssh", "nohup", "setsid", "timeout", "nice", "stdbuf", "command", "builtin",
+  "watch", "source", ".", "parallel", "script"]);
+
+/**
+ * Rewrites each ANSI-C quoted $'...' segment to the bytes Bash decodes, so `$'pkill\tworker'`
+ * scans as `pkill<TAB>worker`. Lexical only: other quoting is copied verbatim. `ok` is false for
+ * an escape this decoder does not model or an unterminated segment.
+ */
+function decodeAnsiC(source: string): { text: string; ok: boolean } {
+  let out = "", ok = true, quote = "";
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i]!;
+    if (quote) {
+      out += c;
+      if (quote === '"' && c === "\\" && i + 1 < source.length) out += source[++i];
+      else if (c === quote) quote = "";
+      continue;
+    }
+    if (c === "\\") { out += c + (source[++i] ?? ""); continue; }
+    if (c === "'" || c === '"') { quote = c; out += c; continue; }
+    if (c !== "$" || source[i + 1] !== "'") { out += c; continue; }
+    let closed = false;
+    for (i += 2; i < source.length; i++) {
+      const d = source[i]!;
+      if (d === "'") { closed = true; break; }
+      if (d !== "\\") { out += d; continue; }
+      const e = source[++i];
+      if (e === undefined) break;
+      if (Object.hasOwn(ANSI_SIMPLE, e)) { out += ANSI_SIMPLE[e]; continue; }
+      const run = Object.hasOwn(ANSI_RUNS, e) ? ANSI_RUNS[e]!.exec(source.slice(i + 1)) : null;
+      if (run) {
+        const code = Number.parseInt(run[0], 16);
+        if (code > 0x10ffff) { ok = false; continue; }
+        out += String.fromCodePoint(code); i += run[0].length; continue;
+      }
+      const octal = /^[0-7]{1,3}/.exec(source.slice(i));
+      if (octal) { out += String.fromCharCode(Number.parseInt(octal[0], 8) & 0xff); i += octal[0].length - 1; continue; }
+      if (e === "c" && i + 1 < source.length) {
+        const x = source[++i]!;
+        if (x === "\\" && source[i + 1] === "\\") i++; // Bash spells control-backslash as \c\\.
+        out += String.fromCharCode(x.toUpperCase().charCodeAt(0) & 0x1f); continue;
+      }
+      ok = false; out += `\\${e}`; // Bash keeps unknown escapes literally; refusal decides below.
+    }
+    if (!closed) ok = false;
+  }
+  return { text: out, ok };
+}
+
+function opaqueReceiver(words: Word[]): boolean {
+  return words.some(word => OPAQUE_RECEIVERS.has(word.text.slice(word.text.lastIndexOf("/") + 1)));
+}
+
 /**
  * Scope cut from PR166: only one literal kill or recursive rm command can receive an allowance.
  * Outside the fixed inert-head grant, visible protected tokens refuse, including fragmented
@@ -238,9 +298,13 @@ export function bashGuardRefusal(command: string, tmpdir: string | undefined): s
   const execution = /\$\(|`|[<>]\(|\$['"]|\\\r?\n|<</.test(command);
   const unprovedQuoting = words.some(word => /['"\\]/.test(word.text));
   if (execution || unprovedQuoting) {
+    // Decode ANSI-C $'...' first: Bash turns \t, \x20, \040, \u0020 ... into separators, so a
+    // stripped-backslash scan would join `pkill\tworker` into an unprotected token.
+    const ansi = decodeAnsiC(command);
+    if (!ansi.ok && opaqueReceiver(words)) return OPAQUE_REASON;
     // Scan the whole de-quoted text, including substitution bodies. This is lexical evidence,
     // not execution/expansion interpretation; remove continuations so pki\\\nll stays visible.
-    const dequoted = protectedTokens(command.replace(/\$(['"])/g, "$1").replace(/\\\r?\n|['"\\]/g, ""), readOnlyFind);
+    const dequoted = protectedTokens(ansi.text.replace(/\$(['"])/g, "$1").replace(/\\\r?\n|['"\\]/g, ""), readOnlyFind);
     if (dequoted.signal || dequoted.deletion) return OPAQUE_REASON;
   }
   // Ponytail: variable-assembled receivers ($a$b) remain an accepted limit of this mistake guard.

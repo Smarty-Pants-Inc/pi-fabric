@@ -1623,6 +1623,28 @@ export const loadFabricConfig = (options: {
 // The global configuration plus environment overrides, readable at extension load before a
 // session context exists (smarty-dev#459). Project configuration needs the trust decision
 // that only bootstrap has, so it is left out here.
+/**
+ * Host-only Landlock kill switch, read from the global fabric.json on every
+ * call so already-running lanes observe a fleet-wide flip without a reload.
+ * Unreadable/malformed host files keep the session's loaded value.
+ */
+export const readHostLandlockDisabled = (agentDir: string): boolean | undefined => {
+  try {
+    const document: unknown = JSON.parse(fs.readFileSync(path.join(agentDir, "fabric.json"), "utf8"));
+    const disabled = objectValue(objectValue(objectValue(document).executor).landlock).disabled;
+    return typeof disabled === "boolean" ? disabled : false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? false : undefined;
+  }
+};
+
+/** Session settings with the live host kill switch applied (F2: no cached value). */
+export const liveLandlockSettings = (settings: LandlockSettings, agentDir: string): LandlockSettings => {
+  if (settings.mode !== "enforce") return settings;
+  const disabled = readHostLandlockDisabled(agentDir);
+  return disabled === undefined ? settings : { mode: settings.mode, disabled };
+};
+
 export const loadGlobalFabricConfig = (agentDir: string): FabricConfig =>
   resolveFabricConfig({ cwd: agentDir, agentDir }, false, true);
 

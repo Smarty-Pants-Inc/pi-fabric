@@ -37,6 +37,23 @@ const gitCommonDir = (cwd: string): string | undefined => {
 
 interface Grant { path: string; reason: string }
 interface RolePolicy { default: Grant[]; roles: Record<string, Grant[]> }
+/** A write root bound to the directory identity approved by the trusted host. */
+export interface PinnedGrant { real: string; dev: bigint; ino: bigint }
+
+const unsafe = (value: string): boolean => /[\n\r\0]/.test(value);
+const within = (child: string, parent: string): boolean =>
+  child === parent || child.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep);
+const pinPath = (expanded: string): PinnedGrant | undefined => {
+  if (!path.isAbsolute(expanded) || unsafe(expanded)) throw new Error("Invalid Landlock write grant");
+  let real: string;
+  try { real = fs.realpathSync(expanded); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  if (unsafe(real) || real === "/") throw new Error("Unsafe Landlock write grant");
+  const stat = fs.statSync(real, { bigint: true });
+  return { real, dev: stat.dev, ino: stat.ino };
+};
+const sameGrant = (a: PinnedGrant, b: PinnedGrant): boolean =>
+  a.real === b.real && a.dev === b.dev && a.ino === b.ino;
 
 /** Loaded only for the first enforced local bash call, never at registration. */
 export class LandlockBashConfinement {
@@ -44,9 +61,16 @@ export class LandlockBashConfinement {
   readonly #policy: RolePolicy;
   readonly #role = (process.env.SMARTY_ROLE ?? "main").split("@")[0]!;
   readonly #tmpdir: string;
+  readonly #tmpPin: PinnedGrant;
   readonly #ownsTmp: boolean;
   readonly #git: string | undefined;
   readonly #agentRun = process.env.PI_FABRIC_AGENT_RUN_DIR;
+  /** S1: identities pinned by the trusted host before any confined command ran. */
+  readonly #pins = new Map<string, PinnedGrant | undefined>();
+  /** S2: confined/escaped operations whose exit is not confirmed by the operations API. */
+  #pending = 0;
+  #unresolved = false;
+  #closed = false;
 
   constructor(readonly cwd: string) {
     const root = loadedFabricRoot(import.meta.url);
@@ -61,37 +85,107 @@ export class LandlockBashConfinement {
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const privateTmp = !!stat && stat.isDirectory() && !stat.isSymbolicLink()
       && stat.uid === process.getuid!() && (stat.mode & 0o077) === 0
+      && !unsafe(supplied!) && fs.realpathSync(supplied!) === path.resolve(supplied!)
       && !["/", "/tmp", "/var/tmp", os.homedir()].includes(fs.realpathSync(supplied!));
     this.#ownsTmp = !privateTmp;
     this.#tmpdir = privateTmp ? supplied! : fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-landlock-"));
     if (this.#ownsTmp) fs.chmodSync(this.#tmpdir, 0o700);
+    this.#tmpPin = pinPath(this.#tmpdir)!;
+    // Pin every session-stable grant now, from trusted host state. Later calls
+    // never re-credit a pathname a confined command may have replaced.
+    for (const entry of this.#entries()) {
+      if (entry === "$RUN_DIR") continue;
+      const expanded = this.#expand(entry);
+      this.#pins.set(entry, expanded === undefined ? undefined : pinPath(expanded));
+    }
   }
 
+  /** Release the generated temp only after every associated shell exit is confirmed. */
   close(): void {
-    if (this.#ownsTmp) fs.rmSync(this.#tmpdir, { recursive: true, force: true });
+    this.#closed = true;
+    this.#release();
   }
 
-  #grants(runDir: string): string[] {
+  #release(): void {
+    if (!this.#closed || !this.#ownsTmp || this.#pending > 0 || this.#unresolved) return;
+    // Identity discipline for cleanup too: remove only the directory we created.
+    let stat: fs.BigIntStats;
+    try { stat = fs.lstatSync(this.#tmpdir, { bigint: true }); } catch { return; }
+    if (stat.isSymbolicLink() || stat.dev !== this.#tmpPin.dev || stat.ino !== this.#tmpPin.ino) return;
+    fs.rmSync(this.#tmpdir, { recursive: true, force: true });
+  }
+
+  /** Only a resolved operations result confirms exit; a rejection retains the temp. */
+  #custody<T>(operation: Promise<T>): Promise<T> {
+    this.#pending++;
+    return operation.then(result => {
+      this.#pending--;
+      this.#release();
+      return result;
+    }, error => {
+      this.#pending--;
+      this.#unresolved = true; // exit unknown: never delete under a possibly live child
+      throw error;
+    });
+  }
+
+  get pendingOperations(): number { return this.#pending; }
+  get tmpdir(): string { return this.#tmpdir; }
+
+  #entries(): string[] {
+    return [...this.#policy.default, ...(this.#policy.roles[this.#role] ?? [])].map(grant => grant.path);
+  }
+
+  #expand(entry: string, runDir?: string): string | undefined {
     const values: Record<string, string | undefined> = {
       $CWD: this.cwd, $TMPDIR: this.#tmpdir, $RUN_DIR: runDir,
       $AGENT_RUN_DIR: this.#agentRun, $GIT_COMMON_DIR: this.#git,
     };
-    const entries = [...this.#policy.default, ...(this.#policy.roles[this.#role] ?? [])];
-    return [...new Set(entries.flatMap(({ path: entry }) => {
-      const expanded = entry.startsWith("$") ? values[entry]
-        : entry.startsWith("~/") ? path.join(os.homedir(), entry.slice(2)) : entry;
-      // Absent optional cache/device grants are not broadened to their parent.
-      if (expanded === undefined || !fs.existsSync(expanded)) return [];
-      if (!path.isAbsolute(expanded) || /[\n\r\0]/.test(expanded)) throw new Error("Invalid Landlock write grant");
-      const real = fs.realpathSync(expanded);
-      if (/[\n\r\0]/.test(real) || real === "/") throw new Error("Unsafe Landlock write grant");
-      return [real];
-    }))];
+    return entry.startsWith("$") ? values[entry]
+      : entry.startsWith("~/") ? path.join(os.homedir(), entry.slice(2)) : entry;
+  }
+
+  #grants(runDir: string): PinnedGrant[] {
+    const grants: PinnedGrant[] = [];
+    for (const entry of this.#entries()) {
+      if (entry === "$RUN_DIR") {
+        // Fresh host-created run directory: no symlinked component, owned by us.
+        const pinned = pinPath(runDir);
+        if (!pinned) continue;
+        const stat = fs.lstatSync(runDir);
+        if (pinned.real !== path.resolve(runDir) || !stat.isDirectory() || stat.uid !== process.getuid!()) {
+          throw new Error("Landlock run directory is not an owned real directory; refusing");
+        }
+        grants.push(pinned);
+        continue;
+      }
+      const expanded = this.#expand(entry);
+      if (expanded === undefined) continue;
+      const pinned = this.#pins.get(entry);
+      const current = pinPath(expanded);
+      if (!pinned) {
+        // Absent at session start: credit only if not reachable via a writable grant.
+        if (current && !grants.some(grant => within(path.resolve(expanded), grant.real)
+          || within(current.real, grant.real))) {
+          this.#pins.set(entry, current);
+          grants.push(current);
+        }
+        continue;
+      }
+      if (!current) continue; // Removed: grant nothing (fail closed).
+      if (!sameGrant(pinned, current)) {
+        throw new Error(`Landlock write grant ${entry} changed identity since it was approved (${pinned.real}); refusing. Restore it or start a new session.`);
+      }
+      grants.push(pinned);
+    }
+    const seen = new Set<string>();
+    return grants.filter(grant => !seen.has(grant.real) && !!seen.add(grant.real));
   }
 
   operations(confined: BashOperations, unconfined: BashOperations, shell: string,
     runDir: string, escape: boolean, originalCommand: string): BashOperations {
     const grants = this.#grants(runDir);
+    const lines = grants.map(({ dev, ino, real }) => `${dev}:${ino}:${real}`);
     return { exec: async (command, cwd, options) => {
       // Escape logging is mandatory and happens before spawn. Do not log command
       // text (it may contain secrets); record a digest and nested tool correlation.
@@ -115,7 +209,7 @@ export class LandlockBashConfinement {
             at: new Date().toISOString(), event: escape ? "escape" : "enforce",
             role: this.#role, cwd, runDir,
             commandSha256: createHash("sha256").update(originalCommand).digest("hex"),
-            ...(escape ? {} : { writes: grants }),
+            ...(escape ? {} : { writes: grants.map(grant => grant.real) }),
           }) + "\n");
         } finally { fs.closeSync(auditFd); }
       } finally { fs.closeSync(directoryFd); }
@@ -125,11 +219,12 @@ export class LandlockBashConfinement {
       delete env.PI_FABRIC_LANDLOCK_WRITES;
       if (escape) {
         options.onData(Buffer.from(`[Landlock escape: unconfined command; recorded in ${auditPath}]\n`));
-        return unconfined.exec(command, cwd, { ...options, env });
+        return this.#custody(unconfined.exec(command, cwd, { ...options, env }));
       }
       env.PI_FABRIC_LANDLOCK_SHELL = shell;
-      env.PI_FABRIC_LANDLOCK_WRITES = grants.join("\n");
-      return confined.exec(command, cwd, { ...options, env });
+      // dev:ino:path — the helper binds each rule to this identity, not the name.
+      env.PI_FABRIC_LANDLOCK_WRITES = lines.join("\n");
+      return this.#custody(confined.exec(command, cwd, { ...options, env }));
     } };
   }
 }

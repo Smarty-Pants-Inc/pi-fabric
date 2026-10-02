@@ -290,7 +290,9 @@ export class PiToolsProvider implements FabricProvider {
 
   async close(): Promise<void> {
     if (this.#ownsShellJobs) await this.#shellJobs.close();
-    if (this.#ownsShellJobs || this.#shellJobs.live().length === 0) this.#landlock?.close();
+    // S2: the confinement retains its generated temp until every associated
+    // operation's exit is confirmed; a closed job store is not quiescence.
+    this.#landlock?.close();
   }
 
   async list(

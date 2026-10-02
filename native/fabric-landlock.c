@@ -8,6 +8,7 @@
 #include <linux/fcntl.h>
 #include <linux/landlock.h>
 #include <linux/prctl.h>
+#include <asm/stat.h>
 
 #ifndef LANDLOCK_ACCESS_FS_REFER
 #define LANDLOCK_ACCESS_FS_REFER (1ULL << 13)
@@ -74,6 +75,16 @@ static int equal(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return *a == *b;
 }
+/* Parse "<decimal>:" and advance; any other shape is a malformed policy. */
+static unsigned long decimal(char **cursor) {
+    unsigned long result = 0;
+    char *p = *cursor;
+    if (*p < '0' || *p > '9') fail("malformed grant identity", -22);
+    while (*p >= '0' && *p <= '9') result = result * 10 + (unsigned long)(*p++ - '0');
+    if (*p != ':') fail("malformed grant identity", -22);
+    *cursor = p + 1;
+    return result;
+}
 static __attribute__((noreturn)) void execute(char *shell, char *command, char **env) {
     char *args[] = { shell, "-c", command, 0 };
     for (char *p = shell; *p; p++) {
@@ -125,11 +136,21 @@ __attribute__((used, noreturn)) void fabric_start(long *stack) {
         char *end = entry;
         while (*end && *end != '\n') end++;
         char delimiter = *end; *end = 0;
+        /* Each grant is dev:ino:/path, approved by the trusted host. The rule is
+         * bound to the opened inode, so it must be that exact identity: a
+         * replaced, renamed or symlinked pathname is refused, never re-credited. */
+        unsigned long expected_dev = decimal(&entry);
+        unsigned long expected_ino = decimal(&entry);
         if (*entry != '/') fail("non-absolute grant", -22);
-        long parent = SYS(openat, AT_FDCWD, entry, O_PATH | O_CLOEXEC | O_DIRECTORY, 0, 0);
+        long parent = SYS(openat, AT_FDCWD, entry, O_PATH | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0, 0);
         int directory = parent >= 0;
-        if (parent == -20) parent = SYS(openat, AT_FDCWD, entry, O_PATH | O_CLOEXEC, 0, 0);
+        if (parent == -20) parent = SYS(openat, AT_FDCWD, entry, O_PATH | O_CLOEXEC | O_NOFOLLOW, 0, 0);
         if (parent < 0) fail("open grant", parent);
+        struct stat identity;
+        long checked = SYS(fstat, parent, &identity, 0, 0, 0);
+        if (checked < 0) fail("stat grant", checked);
+        if ((identity.st_mode & 0170000) == 0120000 || identity.st_dev != expected_dev
+            || identity.st_ino != expected_ino) fail("grant identity changed", -116);
         struct landlock_path_beneath_attr rule = { .parent_fd = (int)parent,
             .allowed_access = directory ? handled : LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_TRUNCATE };
         long result = SYS(landlock_add_rule, ruleset, LANDLOCK_RULE_PATH_BENEATH, &rule, 0, 0);

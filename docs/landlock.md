@@ -27,7 +27,9 @@ The authorized fallback is implemented:
 - macOS and Windows leave the wrapper **disabled**, even if `enforce` is selected.
 - Put `executor.landlock.disabled: true` in the **global agent `fabric.json`** to
   kill confinement fleet-wide. Project values for `disabled` are ignored, so a
-  lane cannot defeat that kill switch. Live settings are read at each invocation.
+  lane cannot defeat that kill switch. The host file is re-read on every
+  enforced local bash call, so already-running lanes stop confining on their
+  next call without a reload (already-spawned confined children stay confined).
   The settings UI exposes both keys; change the save scope to global for the switch.
 
 Run the 24-hour **enforce trial on one approved lane**, not a fictitious warn
@@ -71,7 +73,16 @@ list, never a wider fallback. Each entry has a one-line reason.
   the current uid with no group/other permissions. Shared `/tmp`, `/var/tmp`,
   `/` and the home directory are never granted as TMPDIR. Otherwise a private
   `0700` temporary directory is created at first enforced use and exported to
-  the child. Fabric-owned fallback temp is removed when owned jobs close.
+  the child. Fabric-owned fallback temp is removed only after session close
+  **and** confirmed exit of every operation that used it; an abort with an
+  unknown exit retains it.
+- **Grant identity.** Session-stable grants (`$CWD`, `$TMPDIR`, `$GIT_COMMON_DIR`,
+  `$AGENT_RUN_DIR`, caches, devices) are resolved and pinned (`realpath`,
+  device, inode) by the host at first enforced use, before any confined command
+  runs. Each later call re-validates them; a replaced, renamed or symlinked grant
+  is refused ("changed identity"), never re-credited. The helper receives
+  `dev:ino:/path` and checks the opened `O_PATH|O_NOFOLLOW` descriptor's
+  identity before adding the rule, closing the validate/open race.
 - `$RUN_DIR` is this command's exact shell-job directory, never its shared parent.
 - `$AGENT_RUN_DIR` is the worker's own run directory, supplied by Fabric as
   `PI_FABRIC_AGENT_RUN_DIR`, **not** the fleet/nested run root.

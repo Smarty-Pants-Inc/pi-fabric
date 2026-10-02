@@ -6,7 +6,8 @@ import { performance } from "node:perf_hooks";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createBashToolDefinition, createExtensionRuntime, ExtensionRunner, SessionManager, type Extension, type ModelRegistry, type RegisteredTool } from "@earendil-works/pi-coding-agent";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
-import { DEFAULT_FABRIC_CONFIG, loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, liveLandlockSettings, loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
+import { LandlockBashConfinement } from "../src/core/landlock.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import type { LandlockSettings } from "../src/core/landlock.js";
 import { FABRIC_BASH_MIDDLEWARE, type FabricBashMiddlewareV1 } from "../src/protocol.js";
@@ -284,6 +285,100 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     await vi.waitFor(() => expect(h.provider.shellJobs.live()).toHaveLength(0), { timeout: 3000 });
     expect(fs.readFileSync(result.details!.logPath!, "utf8")).toContain("Permission denied");
     expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+  });
+
+  it("S1: a replaced in-lane .git cannot redirect the next call's write grant", async () => {
+    const h = harness();
+    fs.mkdirSync(path.join(h.cwd, ".git"));
+    const first = await h.invoke({ command: `mv .git .git-old && ln -s ${quote(h.sibling)} .git && printf staged` });
+    expect(first.output).toBe("staged");
+    const second = await h.invoke({ command: "printf redirected > .git/victim", settle: true });
+    expect(second.ok).toBe(false);
+    expect(second.output).toMatch(/changed identity|Permission denied/);
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+    // A real directory substituted at the same name is refused too.
+    fs.rmSync(path.join(h.cwd, ".git")); fs.mkdirSync(path.join(h.cwd, ".git"));
+    expect((await h.invoke({ command: "printf x", settle: true })).output).toContain("changed identity");
+  });
+
+  it("S1: a replaced in-lane private TMPDIR cannot redirect the next call's write grant", async () => {
+    const h = harness();
+    const tmp = path.join(h.cwd, "tmp");
+    fs.mkdirSync(tmp, { mode: 0o700 });
+    vi.stubEnv("TMPDIR", tmp);
+    expect((await h.invoke({ command: `mv "$TMPDIR" "$TMPDIR.old" && ln -s ${quote(h.sibling)} "$TMPDIR" && printf staged` })).output).toBe("staged");
+    const second = await h.invoke({ command: 'printf redirected > "$TMPDIR/victim"', settle: true });
+    expect(second.ok).toBe(false);
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+  });
+
+  it("S1: the native helper binds each rule to the approved inode, never a re-resolved name", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-ident-"));
+    roots.push(root);
+    const good = path.join(root, "good"); const other = path.join(root, "other");
+    fs.mkdirSync(good); fs.mkdirSync(other);
+    const id = (p: string) => { const s = fs.statSync(p, { bigint: true }); return `${s.dev}:${s.ino}`; };
+    const run = (writes: string) => spawnSync(helper, ["-c", `printf ok > ${quote(path.join(good, "f"))}`], {
+      encoding: "utf8", env: { PATH: process.env.PATH, PI_FABRIC_LANDLOCK_SHELL: "/bin/sh", PI_FABRIC_LANDLOCK_WRITES: writes } });
+    expect(run(`${id(good)}:${good}`).status).toBe(0);
+    const swapped = run(`${id(other)}:${good}`);
+    expect(swapped.status).toBe(125); expect(swapped.stderr).toContain("grant identity changed");
+    const link = path.join(root, "link"); fs.symlinkSync(good, link);
+    expect(run(`${id(good)}:${link}`).status).toBe(125);
+    expect(run(good).status).toBe(125); // legacy name-only grants are malformed
+  });
+
+  it.each(["resolve", "reject"] as const)("S2: generated TMPDIR is retained until the operation's exit is confirmed (%s)", async outcome => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-s2-"));
+    roots.push(root);
+    vi.stubEnv("TMPDIR", "/tmp");
+    vi.spyOn(os, "tmpdir").mockReturnValue(root);
+    const confinement = new LandlockBashConfinement(root);
+    let settle!: (value: { exitCode: number | null }) => void; let fail!: (error: Error) => void;
+    const pending = new Promise<{ exitCode: number | null }>((done, reject) => { settle = done; fail = reject; });
+    const ops = { exec: () => pending };
+    const runDir = fs.mkdtempSync(path.join(root, "run-"));
+    const execution = confinement.operations(ops, ops, "/bin/sh", runDir, false, "delayed launch")
+      .exec("delayed launch", root, { onData: () => {} });
+    confinement.close(); // shell store closed / job aborted; launch still unresolved
+    expect(confinement.pendingOperations).toBe(1);
+    expect(fs.existsSync(confinement.tmpdir)).toBe(true);
+    if (outcome === "resolve") {
+      settle({ exitCode: 0 }); await execution;
+      expect(fs.existsSync(confinement.tmpdir)).toBe(false);
+    } else {
+      fail(new Error("abort acknowledged, exit unknown")); await expect(execution).rejects.toThrow();
+      expect(fs.existsSync(confinement.tmpdir)).toBe(true);
+    }
+  });
+
+  it("F2: a host kill-switch flip reaches already-active lanes on their next call; project cannot override", async () => {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-host-"));
+    roots.push(agentDir);
+    const hostFile = path.join(agentDir, "fabric.json");
+    fs.writeFileSync(hostFile, JSON.stringify({ executor: { landlock: { mode: "enforce" } } }));
+    const lanes = [0, 1].map(() => {
+      // Each provider reads through the production composition on every call.
+      const state: { loaded: LandlockSettings } = { loaded: { mode: "off", disabled: false } };
+      const live = { get mode() { return liveLandlockSettings(state.loaded, agentDir).mode; },
+        get disabled() { return liveLandlockSettings(state.loaded, agentDir).disabled; } } as LandlockSettings;
+      return { ...harness(live), state };
+    });
+    for (const lane of lanes) {
+      fs.mkdirSync(path.join(lane.cwd, ".pi"), { recursive: true });
+      fs.writeFileSync(path.join(lane.cwd, ".pi/fabric.json"), JSON.stringify({ executor: { landlock: { mode: "enforce", disabled: false } } }));
+      // Loaded once at session start, as an already-active runtime would hold it.
+      const loaded = loadFabricConfig({ cwd: lane.cwd, agentDir, projectTrusted: true }).executor.landlock;
+      expect(loaded).toEqual({ mode: "enforce", disabled: false });
+      lane.state.loaded = loaded;
+      const denied = await lane.invoke({ command: `printf confined > ${quote(path.join(lane.sibling, "victim"))}`, settle: true });
+      expect(denied.ok).toBe(false);
+    }
+    fs.writeFileSync(hostFile, JSON.stringify({ executor: { landlock: { mode: "enforce", disabled: true } } }));
+    for (const lane of lanes) {
+      expect((await lane.invoke({ command: `printf released > ${quote(path.join(lane.sibling, "victim"))}` })).ok).toBe(true);
+      expect(fs.readFileSync(path.join(lane.sibling, "victim"), "utf8")).toBe("released");
+    }
   });
 
   it.runIf(process.env.LANDLOCK_BENCH === "1")("measures interleaved real per-call overhead", async () => {

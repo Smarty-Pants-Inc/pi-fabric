@@ -102,6 +102,39 @@ describe.each(["sync", "async"] as const)("shared %s file-lock recovery", mode =
     expect(fs.readdirSync(options.directory).filter(name => name.includes(".reap-"))).toEqual([]);
   });
 
+  it("retains cleanup ownership when completion publication and every immediate handoff fail", async () => {
+    const { lock, options } = fixture();
+    fs.mkdirSync(lock);
+    fs.writeFileSync(path.join(lock, "owner"), `stale\n999999999\n${Date.now() - 60_000}\n`);
+    const kill = process.kill;
+    vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid === 999999999) throw Object.assign(new Error("synthetic dead PID"), { code: "ESRCH" });
+      return kill(pid, signal);
+    });
+    const write = fs.writeFileSync;
+    let publicationFailed = false;
+    vi.spyOn(fs, "writeFileSync").mockImplementation((...args) => {
+      if (!publicationFailed && String(args[0]).endsWith(`${path.sep}done`)) {
+        publicationFailed = true;
+        throw Object.assign(new Error("completion receipt denied"), { code: "EACCES" });
+      }
+      write(...args);
+    });
+    const rename = fs.renameSync;
+    let handoffFailures = 0;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (handoffFailures < 9 && String(target).includes(".reap-done-")) {
+        handoffFailures++;
+        throw Object.assign(new Error("handoff denied"), { code: "EACCES" });
+      }
+      rename(source, target);
+    });
+    await expect(run(options, () => "admitted")).resolves.toBe("admitted");
+    expect(publicationFailed).toBe(true);
+    expect(handoffFailures).toBe(9);
+    expect(fs.readdirSync(options.directory).filter(name => name.includes(".reap-"))).toEqual([]);
+  });
+
   it("recovers an aged empty owner obstructing a dead reaper's claim", async () => {
     const { lock, options } = fixture();
     const marker = `${lock}.reap-999999999-obstructed`;

@@ -148,14 +148,35 @@ const finishRecovery = (lock: string, marker: string): void => {
     catch { /* Permanent I/O denial remains fail-closed; no ownership is lost. */ }
   }
 };
+// Retain explicit ownership of finished-but-unpublished markers across reloads.
+// Only our completion path adds entries; no active reaper is eligible here.
+const PENDING_RECOVERIES = Symbol.for("pi-fabric.pending-lock-recoveries");
+const pendingRecoveries = (): Map<string, string> => {
+  const globals = globalThis as typeof globalThis & { [PENDING_RECOVERIES]?: Map<string, string> };
+  return globals[PENDING_RECOVERIES] ??= new Map();
+};
+const forgetRemovedRecovery = (marker: string): void => {
+  try { fs.lstatSync(marker); }
+  catch (error) { if (errorCode(error) === "ENOENT") pendingRecoveries().delete(marker); }
+};
 const sealRecovery = (lock: string, marker: string): void => {
+  pendingRecoveries().set(marker, lock);
   const done = `${lock}.reap-done-${process.pid}-${randomUUID()}`;
   // Completion is visible even if the subsequent rename fails. Nobody writes
   // another claim after this flag; other finishers only restore/remove it.
   try { fs.writeFileSync(path.join(marker, "done"), "1\n", { flag: "wx", mode: 0o600 }); }
   catch (error) {
-    if (errorCode(error) === "ENOENT") return;
-    if (errorCode(error) !== "EEXIST") { finishRecovery(lock, marker); throw error; }
+    if (errorCode(error) === "ENOENT") { pendingRecoveries().delete(marker); return; }
+    if (errorCode(error) !== "EEXIST") {
+      // Completion publication failed independently of rename. Try the bounded
+      // rename handoff anyway; if both fail, the owning process retains retry
+      // ownership and its next admission scan finishes this exact marker.
+      try { renameAtomic(marker, done); }
+      catch { finishRecovery(lock, marker); forgetRemovedRecovery(marker); throw error; }
+      pendingRecoveries().delete(marker);
+      finishRecovery(lock, done);
+      return;
+    }
   }
   try {
     // Reuse bounded transient-rename retry. One EACCES must not strand a live
@@ -163,13 +184,20 @@ const sealRecovery = (lock: string, marker: string): void => {
     renameAtomic(marker, done);
   } catch (error) {
     finishRecovery(lock, marker);
+    forgetRemovedRecovery(marker);
     throw error;
   }
+  pendingRecoveries().delete(marker);
   finishRecovery(lock, done);
 };
 
 /** Acquisition checks before publication AND after owner publication. */
 export const lockRecoveryBlocked = (lock: string): boolean => {
+  for (const [marker, ownedLock] of pendingRecoveries()) {
+    if (ownedLock !== lock) continue;
+    finishRecovery(lock, marker);
+    forgetRemovedRecovery(marker);
+  }
   const directory = path.dirname(lock);
   const prefix = recoveryPrefix(lock);
   for (const entry of fs.readdirSync(directory)) {

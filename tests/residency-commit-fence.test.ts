@@ -153,7 +153,7 @@ describe("resident fence harness teardown", () => {
     try {
       await expect(state.close()).resolves.toBeUndefined();
       expect(attempts).toBe(2);
-      expect(cleanupOptions).toMatchObject({ recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+      expect(cleanupOptions).toMatchObject({ recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       expect(fs.existsSync(state.root)).toBe(false);
     } finally {
       cleanup.mockRestore();
@@ -1367,7 +1367,7 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
         } finally {
           clearTimeout(killTimer); killGuest?.(); await trace?.waitForGuests();
           restoreCleanup?.();
-          if (holdGuestExit) rm(state.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+          if (holdGuestExit) rm(state.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         }
       }
     });

@@ -831,6 +831,14 @@ interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
 type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricMessageDelivery {
+  /** Sender-only: owner observed a running task when it admitted this followUp. Delivery is unchanged. */
+  warning?: {
+    code: "FABRIC_FOLLOW_UP_RUNNING_TASK";
+    targetId: string;
+    kind: "agent";
+    status: "running";
+    message: string;
+  };
   /** Advisory only: unverified ids in sender history; also delivered when admission permits. */
   notice?: string;
   queued: true;
@@ -854,7 +862,7 @@ interface FabricAgentsApi {
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
-  spawn(args: FabricAgentRequest): Promise<FabricAgentHandle>;
+  spawn(args: FabricAgentRequest & { routeClass?: string; pinModel?: string; pinThinking?: FabricThinking; protected?: boolean }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
   /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */

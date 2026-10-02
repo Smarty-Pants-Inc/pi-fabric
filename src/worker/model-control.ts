@@ -31,6 +31,7 @@ export class PiModelControl {
   private readonly thinking: string | undefined;
   private readonly activationWindow: boolean;
   private readonly startupFence: boolean;
+  private readonly requiredPin: boolean;
   private readonly io: {
     send(frame: Record<string, unknown>): void;
     admitted(model?: string, thinking?: string): void;
@@ -45,6 +46,7 @@ export class PiModelControl {
     io: PiModelControl["io"],
     activationWindow = false,
     startupFence = false,
+    requiredPin = false,
   ) {
     // Keep this module executable through Node's native type stripping too;
     // source workers must not rely on transform-only parameter properties.
@@ -54,6 +56,7 @@ export class PiModelControl {
     this.io = io;
     this.activationWindow = activationWindow;
     this.startupFence = startupFence;
+    this.requiredPin = requiredPin;
   }
 
   start(): void {
@@ -145,7 +148,10 @@ export class PiModelControl {
       const actual = identity(state?.model);
       if (actual) this.io.observed(key(actual));
       if (!actual || key(actual) !== key(this.#expected!)) {
-        this.fail(`requested ${key(this.#expected!)}, but child reports ${actual ? key(actual) : "no model"} after set_model; task was not sent`);
+        this.fail(`${this.requiredPin ? "MODEL_ROUTE_PIN_MISMATCH: " : ""}requested ${key(this.#expected!)}, but child reports ${actual ? key(actual) : "no model"} after set_model; task was not sent`);
+      } else if (this.requiredPin && (!this.thinking || state?.thinkingLevel !== this.thinking ||
+        !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(this.thinking))) {
+        this.fail(`MODEL_ROUTE_PIN_MISMATCH: required effort ${this.thinking ?? "missing"}, but child reports ${String(state?.thinkingLevel ?? "missing")}; task was not sent`);
       } else if (state?.isStreaming === true || state?.isCompacting === true) {
         this.fail("child started work before model admission; task was not sent");
       } else {

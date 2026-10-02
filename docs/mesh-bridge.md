@@ -26,7 +26,7 @@ existing events and mirrors root presence. There is no new store or protocol.
   `data.bridge = {from: <side>, id: <original event id>}`, and an event with a `bridge` field is
   never forwarded again.
 - Per direction the cursor records the last handled source sequence plus a generation-tagged
-  byte offset. Polls tail from that offset rather than depending on shared sequence-read hints.
+  byte offset. Polls tail from that offset without depending on shared sequence-read hints.
   Idle polls read one boundary byte per side and do not rewrite checkpoints or read routing
   authority. Offsets checkpoint only a fully handled page; each forwarded event still checkpoints
   its source sequence and destination mark. On restart the bridge skips ids already bridged after
@@ -96,7 +96,7 @@ future archive bound (not implemented) is a minimum acknowledged sequence across
 cursors, plus an outage/retention safety margin: delete only sealed segments entirely below that
 floor, and never reset event sequences or log generations. Age/size deletion alone would break
 lagging cursor recovery. A hard byte quota also needs backpressure: if pinned segments prevent
-reclamation, reject new publishes rather than deleting unread history. A permanently offline
+reclamation, reject new publishes and do not delete unread history. A permanently offline
 link requires explicit retirement, not silent cursor invalidation.
 
 ## Running it

@@ -8,7 +8,7 @@ import { closeWithActors } from "./actors/close-order.js";
 import { OutputArtifactStore } from "./output-budget.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
-import { resolvePiModel } from "./core/model-refresh.js";
+import { resolvePiModel, resolvePiRoutePin } from "./core/model-refresh.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -671,15 +671,17 @@ export class FabricRuntimeState {
       };
     };
     // Task agents and actors share one single-flight refresh per registry (smarty-dev#1830).
-    const resolveParticipantPiModel = async (selector?: string) => {
+    const resolveParticipantPiModel = async (selector?: string, requiredPin = false) => {
       const defaultModel = context.model ? `${context.model.provider}/${context.model.id}` : undefined;
-      const resolved = await resolvePiModel({
-        selector,
-        registry: context.modelRegistry,
-        aliases: modelsConfig.aliases,
-        defaultModel,
-        policy: agentConfig,
-      });
+      const resolved = requiredPin
+        ? await resolvePiRoutePin({ selector: selector!, registry: context.modelRegistry, aliases: {} })
+        : await resolvePiModel({
+            selector,
+            registry: context.modelRegistry,
+            aliases: modelsConfig.aliases,
+            defaultModel,
+            policy: agentConfig,
+          });
       const model = visiblePiModels().find(
         (candidate) =>
           String(candidate.provider).toLowerCase() === resolved.provider.toLowerCase() &&
@@ -745,8 +747,8 @@ export class FabricRuntimeState {
           keepRecentTokens: settings.keepRecentTokens,
         };
       },
-      preparePiModel: async (modelKey) => {
-        const resolved = await resolveParticipantPiModel(modelKey);
+      preparePiModel: async (modelKey, requiredPin) => {
+        const resolved = await resolveParticipantPiModel(modelKey, requiredPin);
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
@@ -947,6 +949,7 @@ export class FabricRuntimeState {
     );
     this.#agents.subscribeUi(() => this.#participants?.scheduleRefresh());
     this.#actors.subscribe(() => this.#participants?.scheduleRefresh());
+    let routeOwner: { client: import("./jev/client.js").JevClient; signal: AbortSignal; pending: Set<Promise<unknown>> } | undefined;
     const agentsProvider = new AgentsProvider(
       this.#agents,
       this.#actors,
@@ -960,6 +963,17 @@ export class FabricRuntimeState {
       false,
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
       () => this.pi.getThinkingLevel(),
+      (request, signal) => {
+        const owner = routeOwner;
+        if (!owner || owner.signal.aborted) throw new Error("Jev routing unavailable");
+        const pending = owner.client.evaluate(request, AbortSignal.any([signal, owner.signal])).catch(error => {
+          if (owner.signal.aborted && !signal.aborted) throw new Error("Jev routing owner retired");
+          throw error;
+        });
+        owner.pending.add(pending);
+        void pending.then(() => owner.pending.delete(pending), () => owner.pending.delete(pending));
+        return pending;
+      },
     );
     this.#agentsProvider = agentsProvider;
     this.#control.start((command, from, signal, verification) =>
@@ -1020,14 +1034,21 @@ export class FabricRuntimeState {
           });
           // A program may pin jev.evaluate itself. Cancel at owner retirement,
           // not only at provider.close(), which waits for those pins to drain.
+          const owner = { client: provider.client, signal: component.signal, pending: new Set<Promise<unknown>>() };
+          routeOwner = owner;
           this.#jevPrograms = provider.manager;
-          const stop = () => { observationHost?.close(); provider.manager.stopAll(); };
+          const stop = () => {
+            if (routeOwner === owner) routeOwner = undefined;
+            observationHost?.close(); provider.manager.stopAll();
+          };
           component.signal.addEventListener("abort", stop, { once: true });
           component.defer(async () => {
             component.signal.removeEventListener("abort", stop);
             observationHost?.close();
             if (this.#jevObservationHost === observationHost) this.#jevObservationHost = undefined;
             if (this.#jevPrograms === provider.manager) this.#jevPrograms = undefined;
+            await Promise.allSettled([...owner.pending]);
+            await owner.client.drainCredentials();
             await provider.manager.close();
           }, { label: "jev-program-owner", kind: "transactional", resources: ["jev:programs"], ordering: "ordered" });
           return provider;

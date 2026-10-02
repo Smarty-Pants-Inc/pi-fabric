@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import type { ModelRoutingConfig } from "./agents/model-route.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
 import { DEFAULT_RECORDS_CONFIG, normalizeRecordsConfig, type FabricRecordsConfig } from "./records/config.js";
 import { normalizeJevApprovalModel } from "./jev/model-key.js";
@@ -156,6 +157,8 @@ interface FabricPrewalkConfig {
 }
 
 export interface FabricAgentConfig {
+  /** Opt-in shadow routing pins and finite candidates, never live routing. */
+  modelRouting?: ModelRoutingConfig;
   enabled: boolean;
   runner: FabricAgentRunner;
   transport: FabricAgentTransport;
@@ -1029,6 +1032,24 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       runner: runnerValue(agents.runner, DEFAULT_FABRIC_CONFIG.agents.runner),
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
       ...(agentModel ? { model: agentModel } : {}),
+      ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
+        ? { modelRouting: (() => {
+            const routing = agents.modelRouting as Record<string, unknown>;
+            return {
+              ...(typeof routing.pinModel === "string" ? { pinModel: routing.pinModel } : {}),
+              ...(isFabricThinking(routing.pinThinking) ? { pinThinking: routing.pinThinking } : {}),
+              shadowCandidates: Array.isArray(routing.shadowCandidates)
+                ? routing.shadowCandidates.map((entry: unknown) => {
+                    if (typeof entry !== "object" || entry === null || Array.isArray(entry) ||
+                        typeof (entry as Record<string, unknown>).model !== "string" || !isFabricThinking((entry as Record<string, unknown>).effort)) {
+                      throw new Error("Invalid agents.modelRouting.shadowCandidates entry");
+                    }
+                    return { model: (entry as { model: string }).model, effort: (entry as { effort: FabricThinking }).effort };
+                  })
+                : [],
+            };
+          })() }
+        : {}),
       deniedModels: [...new Set((Array.isArray(agents.deniedModels) ? agents.deniedModels : [])
         .filter((model): model is string => typeof model === "string" && !!model.trim())
         .map((model) => model.trim().toLowerCase()))],

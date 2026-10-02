@@ -70,7 +70,12 @@ export class MeshStateDurability {
             throw new Error(previous.error);
           }
           if (previous && !previous.error && previous.generation >= wanted &&
-              this.stateCommitGeneration(this.checkpoint) >= previous.generation) return previous.generation;
+              this.stateCommitGeneration(this.checkpoint) >= previous.generation) {
+            // Preparation can precede a mutation-lock wait. A cached file barrier
+            // is not a receipt for a namespace detached/reattached during that wait.
+            this.directory.sync(path.dirname(this.statePath));
+            return previous.generation;
+          }
           // Only the elected barrier sleeps. Peers join its completed generation.
           if (previous && (this.#busy || this.#queuedAt < previous.at)) {
             await sleep(Math.min(INTERVAL_MS, Math.max(0, previous.at + INTERVAL_MS - Date.now())));

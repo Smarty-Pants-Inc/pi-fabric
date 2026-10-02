@@ -245,6 +245,10 @@ const recoverConcatenatedState = (serialized: string): MeshStateFile | undefined
 
 const emptyState = (): MeshStateFile => ({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 });
 
+// Only positively identified snapshot damage permits checkpoint recovery.
+// Policy limits and transient I/O failures are not evidence of lost state.
+class MeshStateDamageError extends Error {}
+
 const readCanonicalState = (
   filePath: string, maxBytes: number, recoverDamage = true, observed?: (serialized: string) => void,
 ): MeshStateFile => {
@@ -272,7 +276,7 @@ const readCanonicalState = (
     // startup can tolerate damage, but mutations require a repaired snapshot.
     const recovered = recoverConcatenatedState(serialized);
     if (recovered) return recovered;
-    if (!recoverDamage) throw new Error("Failed to read Fabric mesh state: invalid state format");
+    if (!recoverDamage) throw new MeshStateDamageError("Failed to read Fabric mesh state: invalid state format");
     // Preserve the original bytes at this path as a barrier to clock reset.
     return emptyState();
   }
@@ -322,7 +326,7 @@ const readState = (
   let canonicalSerialized: string | undefined;
   try { state = readCanonicalState(filePath, maxBytes, recoverDamage, (serialized) => { canonicalSerialized = serialized; }); }
   catch (error) {
-    if (covered === 0) throw error;
+    if (covered === 0 || !(error instanceof MeshStateDamageError)) throw error;
     state = emptyState();
   }
   if (covered > 0 && covered > (state.highWater ?? 0)) {

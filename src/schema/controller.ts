@@ -316,6 +316,7 @@ export class SchemaController {
     let journal: TransactionJournal | undefined;
     let consumed = false;
     let committed = false;
+    let workspaceCommitGeneration: number | undefined;
     try {
       const tokenHash = hashToken(input.certificate);
       const certificateEntry = this.mesh.get(`${CERTIFICATE_PREFIX}${tokenHash}`);
@@ -400,6 +401,7 @@ export class SchemaController {
 
       const workspaceEntry = this.#workspaceEntry();
       const nextGeneration = certificate.generation + 1;
+      workspaceCommitGeneration = nextGeneration;
       await this.mesh.put({
         key: WORKSPACE_KEY,
         value: {
@@ -478,6 +480,25 @@ export class SchemaController {
     } catch (error) {
       if (!consumed) throw error;
       if (committed) throw error;
+      if (workspaceCommitGeneration !== undefined) {
+        // Mesh rejection may follow publication (even checkpoint publication).
+        // Never undo effects while the authoritative record says committed, or
+        // when a failed read prevents us from ruling that publication out.
+        let published: boolean | undefined;
+        try {
+          const workspace = this.mesh.get(WORKSPACE_KEY, { fresh: true })?.value as SchemaWorkspaceRecord | undefined;
+          published = workspace?.lastOutcome === "committed" && workspace.lastTransactionId === transactionId;
+        } catch { /* Publication is unknown; retain the applying journal for recovery. */ }
+        if (published !== false) {
+          context.update("Schema commit published or unknown; durability unconfirmed");
+          return {
+            outcome: "commit_unconfirmed",
+            transactionId,
+            generation: workspaceCommitGeneration,
+            error: errorMessage(error),
+          };
+        }
+      }
       const rollbackError = journal ? this.#restoreBeforeImages(journal.before) : undefined;
       const outcome = rollbackError ? "quarantined" : "rolled_back";
       if (journal) {

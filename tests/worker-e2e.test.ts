@@ -93,6 +93,22 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track|still be running/);
   });
 
+  it.each(["reject", "error-only-turn", "success", "terminated-recover"])("records actual inference consumption, not startup/error-only turns (%s)", async (behavior) => {
+    const previous = process.env.FAKE_PI_BEHAVIOR;
+    process.env.FAKE_PI_BEHAVIOR = behavior;
+    try {
+      const result = await run("inference consumption evidence", 8000);
+      expect(result.inferenceStarted).toBe(behavior === "success" || behavior === "terminated-recover");
+      if (behavior === "error-only-turn") {
+        expect(result.status).toBe("failed");
+        expect(result.turns).toBe(1);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.FAKE_PI_BEHAVIOR;
+      else process.env.FAKE_PI_BEHAVIOR = previous;
+    }
+  }, 15000);
+
   // Regression for the LocalTerm shim contract: when the manager resolves the
   // child pi binary to the shim (~/.localterm/shims/pi), the shim injects the
   // wired secret env vars into pi's own process.env, and the worker must pass

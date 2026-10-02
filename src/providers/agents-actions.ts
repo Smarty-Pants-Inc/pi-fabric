@@ -216,7 +216,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "spawn",
     description:
-      "Start a child agent through Pi or Claude Code and return a handle immediately. For independent launches, await Promise.allSettled and inspect every result so one rejection does not abort pending sibling calls at program exit. Unread detached results are batched at the next safe turn boundary (or wake idle Main) when agents.notifyOnComplete is enabled. wait/join and terminal status acknowledge results and retract pending notifications. Use wait when this program needs the result; do not poll status in a loop.",
+      "Start a child agent through Pi or Claude Code and return a handle immediately. For independent launches, await Promise.allSettled and inspect every result so one rejection does not abort pending sibling calls at program exit. Unread detached results are batched for the immediate spawner at the next safe turn boundary (or wake the idle spawner) when agents.notifyOnComplete is enabled. wait/join and terminal status acknowledge results and retract pending notifications. Use wait when this program needs the result; do not poll status in a loop.",
     inputSchema: spawnSchema,
     risk: "agent",
   },
@@ -271,6 +271,12 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "self",
     description: "Return this caller's intrinsic participant identity in the unified topology",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    risk: "read",
+  },
+  {
+    name: "spawner",
+    description: "Return this child's immediate spawning participant and activation run. Use id: 'spawner' with agents.followUp/steer to reply to it. An actor spawner is NOT the lineage root returned by agents.main; no root fallback when the binding is absent.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     risk: "read",
   },

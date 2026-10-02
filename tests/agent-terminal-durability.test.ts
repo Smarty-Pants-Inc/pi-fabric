@@ -70,7 +70,7 @@ const runtimeFixture = (temp: string, entries: unknown[]) => {
 };
 
 describe("Astra F15-F22 terminal publication obligations", () => {
-  it.skipIf(process.platform === "win32")("F18 two-run runtime replacement preserves A after its monitor settles during B's slow stop", async () => {
+  it.skipIf(process.platform === "win32")("F18 two-run runtime replacement preserves answers across slow stop and older recovery waits", async () => {
     const { temp, manager: unused, exit, launch } = fixture({ retainRuns: false });
     await unused.close();
     const entries: unknown[] = [];
@@ -81,6 +81,7 @@ describe("Astra F15-F22 terminal publication obligations", () => {
     let first: ReturnType<typeof runtimeFixture> | undefined = runtimeFixture(temp, entries);
     let second: ReturnType<typeof runtimeFixture> | undefined;
     let third: ReturnType<typeof runtimeFixture> | undefined;
+    let fourth: ReturnType<typeof runtimeFixture> | undefined;
     let releaseSlowStop: (() => void) | undefined;
     let closing: Promise<void> | undefined;
     let shutdown: Promise<void> | undefined;
@@ -133,34 +134,74 @@ describe("Astra F15-F22 terminal publication obligations", () => {
       vi.mocked(fs.openSync).mockRestore();
       let recoveryUnavailable = true, recoveryBarriers = 0;
       fault = faults(target => path.basename(target).startsWith("status.json.") && target.endsWith(".tmp") && (++recoveryBarriers, recoveryUnavailable));
+      // Control only poll/inbox timeouts; runtime intervals and I/O remain real.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       second = runtimeFixture(temp, entries);
       await second.init();
       await expect(second.runtime.agents.wait(handle.id)).rejects.toThrow(/publication barrier/);
       expect(recoveryBarriers).toBeGreaterThan(0);
       expect(JSON.stringify(second.sendMessage.mock.calls)).not.toContain("A's exact completed answer");
       expect(entries.some(entry => (entry as { data?: { delivered?: string[] } }).data?.delivered?.includes(handle.id))).toBe(false);
-      recoveryUnavailable = false;
-      // The completion inbox may batch A and B, or deliver B before A's storage recovers.
-      await vi.waitFor(() => expect(JSON.stringify(second!.sendMessage.mock.calls)).toContain("A's exact completed answer"), { timeout: 4000 });
-      expect(second.runtime.agents.status(handle.id)).toMatchObject(answer);
-      expect(await second.runtime.agents.wait(handle.id)).toMatchObject(answer);
-      expect(second.runtime.agents.status(slow.id)).toMatchObject({ status: "stopped" });
-      expect(launch).toHaveBeenCalledTimes(2);
+      // Put fresh N's next monitor tick just after R=A's retry. R then sleeps
+      // until 500 ms, leaving N's 251 ms tick inside close's initial recovery wait.
+      await vi.advanceTimersByTimeAsync(1);
+      let freshAlive = true;
+      launch.mockImplementationOnce(async request => ({ ...await originalLaunch(request), isAlive: async () => freshAlive, stop: async () => { freshAlive = false; } }));
+      const fresh = await second.runtime.agents.spawn({ task: "N", transport: "process", model: "dest/old" });
+      await vi.advanceTimersByTimeAsync(249);
+      const freshFile = status(second.runtime.agents, fresh.id);
+      const freshAnswer = { ...JSON.parse(fs.readFileSync(freshFile, "utf8")), status: "completed", sessionId: "2147483647", finishedAt: Date.now(), text: "N's exact completed answer\n" + "fresh full answer ".repeat(2000), value: { fresh: [2, "retained", { result: true }] }, usage: { input: 234, output: 567, cacheRead: 890, cacheWrite: 23, cost: 0.456 }, turns: 8 };
+      fs.writeFileSync(freshFile, JSON.stringify(freshAnswer));
+      freshAlive = false;
+      let freshSettled = false, recoveryCloseDone = false;
+      const freshJoined = second.runtime.agents.join(fresh.id).then(() => { freshSettled = true; });
+      closing = second.runtime.agents.close().then(() => { recoveryCloseDone = true; });
+      await vi.advanceTimersByTimeAsync(1);
+      expect(freshSettled).toBe(true);
+      await freshJoined;
+      expect(recoveryCloseDone).toBe(false);
+      expect(JSON.stringify(second.sendMessage.mock.calls)).not.toContain("N's exact completed answer");
+      expect(entries.some(entry => (entry as { data?: { delivered?: string[] } }).data?.delivered?.includes(fresh.id))).toBe(false);
+      expect(fs.existsSync(freshFile)).toBe(true);
+      await vi.advanceTimersByTimeAsync(249);
+      await closing;
       await second.runtime.shutdown();
-      second = undefined;
+      second = undefined; // Neither answer may depend on the discarded manager.
+      vi.useRealTimers();
+      recoveryUnavailable = false;
       third = runtimeFixture(temp, entries);
       await third.init();
+      // Session-only restoration must retain full N, not its compact UI record.
+      expect(third.runtime.agents.status(fresh.id)).toMatchObject(freshAnswer);
+      expect(await third.runtime.agents.wait(fresh.id)).toMatchObject(freshAnswer);
+      // The completion inbox may batch A and B, or deliver B before A's storage recovers.
+      await vi.waitFor(() => expect(JSON.stringify(third!.sendMessage.mock.calls)).toContain("A's exact completed answer"), { timeout: 4000 });
+      expect(third.runtime.agents.status(handle.id)).toMatchObject(answer);
       expect(await third.runtime.agents.wait(handle.id)).toMatchObject(answer);
-      expect(third.sendMessage).not.toHaveBeenCalled();
-      expect(launch).toHaveBeenCalledTimes(2);
+      expect(third.runtime.agents.status(slow.id)).toMatchObject({ status: "stopped" });
+      expect(launch).toHaveBeenCalledTimes(3);
+      await third.runtime.shutdown();
+      third = undefined;
+      fourth = runtimeFixture(temp, entries);
+      await fourth.init();
+      expect(await fourth.runtime.agents.wait(handle.id)).toMatchObject(answer);
+      expect(await fourth.runtime.agents.wait(fresh.id)).toMatchObject(freshAnswer);
+      expect(fourth.sendMessage).not.toHaveBeenCalled();
+      expect(launch).toHaveBeenCalledTimes(3);
     } finally {
       fault?.mockRestore();
       releaseSlowStop?.();
+      if (vi.isFakeTimers()) {
+        await vi.advanceTimersByTimeAsync(1000);
+        vi.useRealTimers();
+      }
       await closing;
       await shutdown;
       await first?.runtime.shutdown();
       await second?.runtime.shutdown();
       await third?.runtime.shutdown();
+      await fourth?.runtime.shutdown();
+      vi.useRealTimers();
       vi.unstubAllEnvs();
     }
   }, 30_000);

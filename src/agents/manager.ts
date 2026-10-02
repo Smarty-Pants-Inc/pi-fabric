@@ -2162,14 +2162,15 @@ export class AgentManager {
   }
 
   async #close(): Promise<void> {
+    // Capture close-entry obligations before an older recovery lets a monitor settle.
+    const running = [...this.#runs.values()].filter((managed) => !managed.settled);
+    const lastEventAt = new Map(running.map((managed) => [managed.id, lastEventTime(managed)]));
     await Promise.allSettled([...this.#previousRecoveries]);
     const queuedAtClose = [...this.#queued.values()].filter((queued) => !queued.terminal);
     this.#uiListeners.clear();
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
     await this.#retentionSweep?.catch(() => undefined);
-    const running = [...this.#runs.values()].filter((managed) => !managed.settled);
-    const lastEventAt = new Map(running.map((managed) => [managed.id, lastEventTime(managed)]));
     const stopped = await Promise.allSettled([
       ...running.map(async (managed) => {
         try { return await this.stop(managed.id); } catch (error) {

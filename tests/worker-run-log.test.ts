@@ -814,7 +814,12 @@ describe("worker run log", () => {
             fs.closeSync(descriptor!);
             descriptor = undefined;
           }
-          const outcome = compactTerminalRunLog(file, "completed");
+          // This proves native replacement/page retention, not scheduler speed.
+          // Elapsed-work rejection is covered independently by the bound tests.
+          const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+          let outcome: ReturnType<typeof compactTerminalRunLog>;
+          try { outcome = compactTerminalRunLog(file, "completed"); }
+          finally { clock.mockRestore(); }
           expect(outcome.error).toBeUndefined();
           expect(outcome.compactionSkipped).toBeUndefined();
           expect(outcome.compacted).toBe(160);

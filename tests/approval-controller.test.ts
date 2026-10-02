@@ -216,6 +216,43 @@ describe("ApprovalController", () => {
     expect(custom).toHaveBeenCalledOnce();
   });
 
+  it.each(["ask", "auto"] as const)("internal %s refuses before a held queue, without TUI/RPC/classifier work or grants", async mode => {
+    const session = new FabricSessionApprovals();
+    let release!: () => void;
+    const held = session.serialize(() => new Promise<void>(resolve => { release = resolve; }));
+    await Promise.resolve();
+    const serialize = vi.spyOn(session, "serialize");
+    const custom = vi.fn(async () => "allow-session");
+    const classify = vi.fn();
+    const controller = new ApprovalController(
+      { ...policies, write: mode }, tuiContext(custom), session,
+      { classify } as unknown as FabricAutoApprovalClassifier, undefined, undefined, true,
+    );
+    try {
+      await expect(controller.approve(action)).rejects.toThrow(/approval is unsupported for internal routing/);
+      expect(serialize).not.toHaveBeenCalled(); expect(custom).not.toHaveBeenCalled(); expect(classify).not.toHaveBeenCalled();
+      expect(session.approvedRisks.size).toBe(0);
+    } finally { release(); await held; }
+    const drained = vi.fn(async () => {});
+    await session.serialize(drained);
+    expect(drained).toHaveBeenCalledOnce();
+  });
+
+  it.each(["ask", "auto"] as const)("internal %s preserves session-granted and brokered network controls without queuing", async mode => {
+    const network = { ...action, ref: "jev.evaluate", provider: "jev", risk: "network" as const };
+    const session = new FabricSessionApprovals();
+    session.approvedRisks.add("network");
+    const serialize = vi.spyOn(session, "serialize");
+    const custom = vi.fn();
+    // The execution broker may be present without granting Jev: existing session
+    // grants still count exactly as in the ordinary serialized approval path.
+    await new ApprovalController({ ...policies, network: mode }, tuiContext(custom), session, undefined, undefined, () => false, true).approve(network);
+    session.approvedRisks.clear();
+    await new ApprovalController({ ...policies, network: mode }, tuiContext(custom), session, undefined, undefined, () => true, true).approve(network);
+    expect(serialize).not.toHaveBeenCalled(); expect(custom).not.toHaveBeenCalled();
+    expect(session.approvedRisks.size).toBe(0);
+  });
+
   it("denies actions blocked by policy without prompting", async () => {
     const custom = vi.fn(async () => "allow-once");
     const controller = new ApprovalController(policies, tuiContext(custom));

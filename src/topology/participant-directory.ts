@@ -25,6 +25,7 @@ import {
   writeHostLease,
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
+import { PARTICIPANT_NAME_PATTERN } from "./participant-name.js";
 import {
   participantFilesOnly,
   readParticipantFile,
@@ -216,6 +217,10 @@ const hostFromEntry = (entry: MeshStateEntry): FabricHostRecord | undefined => {
   return value as FabricHostRecord;
 };
 
+// Explicit root names take precedence; unnamed roots keep their stable short peer labels.
+const rootPeerName = (name: string, label: string | undefined, sessionId: string): string =>
+  name !== "main" ? name : label ?? `Peer ${sessionId.slice(0, 8)}`;
+
 const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo | undefined => {
   if (
     participant.kind !== "root" ||
@@ -231,7 +236,7 @@ const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo
   const label = participant.label ? participant.label + at : undefined;
   return {
     id: participant.id,
-    name: label ?? "Peer " + participant.sessionId.slice(0, 8) + at,
+    name: rootPeerName(participant.name, participant.label, participant.sessionId) + at,
     ...(label ? { label } : {}),
     ...(typeof participant.role === "string" ? { role: participant.role } : {}),
     ...(typeof participant.project === "string" ? { project: participant.project } : {}),
@@ -898,7 +903,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
   }
 
-  root(main: FabricMainAgentInfo, interactive = true): FabricParticipantRecord {
+  root(main: FabricMainAgentInfo, interactive = true, sessionName?: string): FabricParticipantRecord {
+    const name = sessionName?.trim();
     const role = participantRole();
     const project = main.cwd ? participantProject(main.cwd) : undefined;
     const repository = project ? repositoryOf(project) : undefined;
@@ -909,7 +915,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: main.id,
       ownerHostId: this.options.hostId,
       ownerIdentityId: this.options.identity.id,
-      name: "main",
+      name: name && PARTICIPANT_NAME_PATTERN.test(name) ? name : "main",
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",
@@ -1043,7 +1049,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     } else if (root && legacySessionKey && root.cwd && root.sessionId) {
       const legacyValue = {
       id: root.id,
-      name: root.label ?? `Peer ${root.sessionId.slice(0, 8)}`,
+      name: rootPeerName(root.name, root.label, root.sessionId),
       ...(root.label ? { label: root.label } : {}),
       kind: "peer",
       status: root.status === "running" ? "running" : "idle",

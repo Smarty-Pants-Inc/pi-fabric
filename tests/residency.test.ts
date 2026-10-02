@@ -1978,7 +1978,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(registryIds()).toContain(actor.id);
       await waitFor(() => !registryIds().includes(actor.id), 30_000);
       expect(registryIds()).toContain(successor.id);
-      await waitFor(() => client.hostStateNote() === "", 5_000);
+      await waitFor(() => !client.hostStateNote().includes("removal of hung reviewer"), 5_000);
+      expect(client.hostStateNote()).toMatch(/residency retention:.*entries.*bytes/);
       await client.removeActor(successor.id);
     } finally {
       await control.close();

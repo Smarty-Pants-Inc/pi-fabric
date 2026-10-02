@@ -21,14 +21,14 @@ const deferred = () => {
 // exposing a payload to a transport. All other operations use the real store/side/cursors.
 class HeldReadSide extends StoreBridgeSide {
   hold: { entered: ReturnType<typeof deferred>; release: ReturnType<typeof deferred> } | undefined;
-  async read(after: number): Promise<BridgeRead> {
+  async tail(after: number, offset?: number): Promise<BridgeRead> {
     const hold = this.hold;
     if (hold) {
       this.hold = undefined;
       hold.entered.resolve();
       await hold.release.promise;
     }
-    return super.read(after);
+    return super.tail(after, offset);
   }
 }
 

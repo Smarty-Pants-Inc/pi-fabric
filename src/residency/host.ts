@@ -49,6 +49,7 @@ import {
   RESIDENT_COMMANDS,
   isResidentCommandOperation,
   assertResidentActorMain,
+  assertResidentTaskCaller,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
   commitResidentRequest,
@@ -1025,7 +1026,11 @@ export class ResidentHost {
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
         }
-        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit);
+        // No executor fallback: revalidate the captured caller before the mutation fence.
+        const caller = command.caller;
+        const returnAddress = assertResidentTaskCaller(caller,
+          caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
+        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, returnAddress);
         const runDirectory = this.agents.runDirectory(handle.id);
         if (!runDirectory) {
           // Durable metadata currently requires an admitted run directory. Never

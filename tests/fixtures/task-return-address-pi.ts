@@ -10,10 +10,20 @@ import { AgentsProvider } from "../../src/providers/agents-provider.js";
 
 const send = (event: unknown) => process.stdout.write(JSON.stringify(event) + "\n");
 let running = false;
+let model = { provider: "fake", id: "fake" };
+let thinkingLevel = "off";
 const input = readline.createInterface({ input: process.stdin });
 input.on("line", async line => {
   if (running || !line.trim()) return;
   const command = JSON.parse(line);
+  // Resident hosts resolve an exact model before launching; implement only its admission RPCs.
+  if (["get_state", "set_model", "set_thinking_level"].includes(command.type)) {
+    if (command.type === "set_model") model = { provider: command.provider, id: command.modelId };
+    if (command.type === "set_thinking_level") thinkingLevel = command.level;
+    send({ type: "response", id: command.id, command: command.type, success: true,
+      data: command.type === "get_state" ? { model, thinkingLevel, isStreaming: false, isCompacting: false } : {} });
+    return;
+  }
   if (command.type !== "prompt") return;
   running = true;
   send({ type: "response", command: "prompt", success: true });
@@ -54,7 +64,7 @@ input.on("line", async line => {
   } catch (error) { outcome.error = (error as Error).message; }
   finally { await control.close(); await directory.close(); main.closeFollowUpDrain(); }
   const message = { role: "assistant", content: [{ type: "text", text: JSON.stringify(outcome) }],
-    provider: "fake", model: "fake", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, stopReason: "stop" };
+    provider: model.provider, model: model.id, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, stopReason: "stop" };
   send({ type: "message_end", message }); send({ type: "turn_end", message, toolResults: [] });
   send({ type: "agent_end", messages: [message], willRetry: false }); send({ type: "agent_settled" });
 });

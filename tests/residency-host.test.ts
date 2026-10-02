@@ -8,6 +8,8 @@ import { lockFile } from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
 import { ResidencyClient } from "../src/residency/client.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -101,11 +103,24 @@ describe("resident tracked result preservation", () => {
       fs.mkdirSync(obstructed, { recursive: true });
       return launch.call(this, request);
     });
+    // A public spawn is made by a real session caller, never by the hidden resident executor.
+    const callerIdentity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+    const callerMesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    const callerParticipants = new ParticipantDirectory(callerMesh, {
+      enabled: true, hostId: config.rootId, rootId: config.rootId, identity: callerIdentity,
+    });
+    callerParticipants.registerSource(() => [{
+      format: 1, id: config.rootId, rootId: config.rootId, kind: "root", name: "Main", status: "idle",
+      ownerHostId: config.rootId, ownerIdentityId: config.rootId, sessionId: config.sessionId,
+      runner: "pi", transport: "host", capabilities: ["fabric"], controlProtocol: "v1",
+      startedAt: Date.now(), updatedAt: Date.now(),
+    }]);
     const connect = () => new ResidencyClient({
-      config, mesh: host.mesh, participants: host.participants,
+      config, mesh: callerMesh, participants: callerParticipants,
       mainAgent: { local: false } as FabricMainAgentTarget,
     });
     try {
+      await callerParticipants.start();
       await host.start();
       client = connect();
       const handle = await client.spawnAgent({ task, transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
@@ -145,6 +160,7 @@ describe("resident tracked result preservation", () => {
       fault.mockRestore();
       await client?.close();
       await host.close();
+      await callerParticipants.close();
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   }, 20_000);

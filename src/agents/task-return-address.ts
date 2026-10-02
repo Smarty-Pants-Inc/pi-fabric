@@ -30,12 +30,12 @@ export const readTaskReturnAddress = (env: NodeJS.ProcessEnv = process.env): Tas
 };
 
 /** Manager-owned flag snapshot travels through the real worker, including a remote launcher. */
-export const taskReturnAddressArguments = (
+export const snapshotTaskReturnAddress = (
   spawnerId: string | undefined,
   spawnerSessionId: string | undefined,
   mainAgentId: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
-): string[] => {
+): TaskReturnAddress => {
   const inherited = readTaskReturnAddress(env);
   const address: TaskReturnAddress = {
     spawnerId: spawnerId || mainAgentId || "",
@@ -46,8 +46,15 @@ export const taskReturnAddressArguments = (
     ].filter(Boolean))],
     escalationTargets: addresses(env.PI_FABRIC_TASK_ESCALATION_TARGETS, "PI_FABRIC_TASK_ESCALATION_TARGETS", true),
   };
-  return ["--task-return-address", JSON.stringify(address)];
+  return address;
 };
+
+export const taskReturnAddressArguments = (
+  spawnerId: string | undefined,
+  spawnerSessionId: string | undefined,
+  mainAgentId: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] => ["--task-return-address", JSON.stringify(snapshotTaskReturnAddress(spawnerId, spawnerSessionId, mainAgentId, env))];
 
 /** Apply the bound snapshot before worker exec and again before the Pi subprocess exec. */
 export const applyTaskReturnAddress = (env: NodeJS.ProcessEnv, args: readonly string[]): NodeJS.ProcessEnv => {

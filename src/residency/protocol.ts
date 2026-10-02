@@ -1,3 +1,5 @@
+import type { TaskReturnAddress } from "../agents/task-return-address.js";
+import type { FabricParticipantInfo } from "../topology/types.js";
 import type { FabricPrincipal } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { ResidentReleaseIntent, ResidentLauncherIdentity } from "./handover.js";
@@ -104,7 +106,7 @@ export const commitResidentRequest = (
 ): void => {
   if (decideResidentRequest(residencyRoot, {
     requestId: command.requestId, state: "committed", operation: command.operation, id, ownerHostId,
-    ...(("caller" in command && command.caller?.principal) ? { principal: command.caller.principal } : {}),
+    ...(("caller" in command && command.caller && "principal" in command.caller && command.caller.principal) ? { principal: command.caller.principal } : {}),
   })) return;
   const decision = readResidentRequestDecision(residencyRoot, command.requestId);
   throw new Error(decision?.state === "abandoned"
@@ -328,12 +330,46 @@ export interface ResidentHostOwner {
   attempt?: { id: string; kind: "target" | "fallback" };
 }
 
+/** Runtime caller binding on the trusted residency envelope, never AgentRunRequest. */
+export interface ResidentTaskCaller {
+  id: string;
+  rootId: string;
+  sessionId: string;
+  ownerHostId: string;
+  ownerIdentityId: string;
+  kind: FabricParticipantInfo["kind"];
+  returnAddress: TaskReturnAddress;
+}
+
+/** Verify the envelope against the same live owner directory used by native control. */
+export const assertResidentTaskCaller = (
+  caller: ResidentTaskCaller | undefined,
+  participant: FabricParticipantInfo | undefined,
+  rootId: string,
+): TaskReturnAddress => {
+  const address = caller?.returnAddress;
+  if (!caller || !participant || participant.stale || participant.remoteHost !== undefined ||
+      participant.id !== caller.id || participant.rootId !== rootId || caller.rootId !== rootId ||
+      participant.sessionId !== caller.sessionId || !caller.sessionId ||
+      participant.ownerHostId !== caller.ownerHostId || participant.ownerIdentityId !== caller.ownerIdentityId ||
+      participant.kind !== caller.kind || !address || address.spawnerId !== caller.id ||
+      address.spawnerSessionId !== caller.sessionId || !Array.isArray(address.ancestors) ||
+      !address.ancestors.includes(rootId) || address.ancestors.some(id => typeof id !== "string" || !id.trim()) ||
+      !Array.isArray(address.escalationTargets) || address.escalationTargets.some(id =>
+        typeof id !== "string" || !id.startsWith("session:") || !id.slice(8).trim())) {
+    throw new Error("Durable agents.spawn requires a trusted live caller return-address binding; absent or forged binding refused. Nothing was launched.");
+  }
+  return structuredClone(address);
+};
+
 interface ResidentSpawnCommand {
   format: typeof RESIDENT_HOST_FORMAT;
   operation: "spawn";
   requestId: string;
   rootId: string;
   request: AgentRunRequest;
+  /** Host-captured runtime binding, separate from all task-supplied run settings. */
+  caller?: ResidentTaskCaller;
   createdAt: number;
 }
 

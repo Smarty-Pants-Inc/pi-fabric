@@ -1,3 +1,4 @@
+import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
 import { randomUUID } from "node:crypto";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { throwIfAborted } from "../async-settlement.js";
@@ -29,6 +30,8 @@ import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
   ResidentActorAuthorizationError,
+  assertResidentTaskCaller,
+  type ResidentTaskCaller,
   ResidentCommandUnsupportedError,
   assertResidentCommandSupported,
   assertResidentActorMain,
@@ -150,6 +153,7 @@ export class ResidencyClient {
   readonly #responsesPath: string;
   readonly #agentsPath: string;
   readonly #inheritedToolAllowlist = readChildToolAllowlist();
+  readonly #spawnPolicy = snapshotTaskReturnAddress(undefined, undefined, undefined);
   readonly #deliveryPrefix: string;
   readonly #hostPath: string;
   #deliveryTimer: NodeJS.Timeout | undefined;
@@ -431,6 +435,19 @@ export class ResidencyClient {
   }
 
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
+    // Capture at the public call from the host-owned participant, never from request fields.
+    // Snapshot policy at runtime construction, before a task can change ambient state.
+    const self = this.options.participants.self();
+    const caller: ResidentTaskCaller = {
+      id: self.id, rootId: self.rootId, sessionId: self.sessionId ?? "",
+      ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind,
+      returnAddress: {
+        spawnerId: self.id, spawnerSessionId: self.sessionId ?? "",
+        ancestors: [...new Set([...this.#spawnPolicy.ancestors, this.options.config.rootId])],
+        escalationTargets: [...this.#spawnPolicy.escalationTargets],
+      },
+    };
+    assertResidentTaskCaller(caller, self, this.options.config.rootId);
     const resolvedRequest = request.cwd === undefined
       ? request
       : { ...request, cwd: await awaitAgentCwd(this.options.config.cwd, request.cwd, signal) };
@@ -446,6 +463,7 @@ export class ResidencyClient {
         requestId: randomUUID(),
         rootId: this.options.config.rootId,
         request: { ...resolvedRequest, ...(tools ? { tools } : {}), residency: "durable" },
+        caller,
         createdAt: Date.now(),
       },
       signal,

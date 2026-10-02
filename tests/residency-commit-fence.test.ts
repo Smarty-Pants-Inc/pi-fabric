@@ -70,12 +70,12 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
   const residencyRoot = residentRoot(meshRoot, rootId);
   const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 };
   const mesh = new MeshStore(meshRoot, meshConfig.maxEventBytes, meshConfig.maxReadEvents);
-  const identity = { id: rootId, name: "main", kind: "main" as const };
+  const identity = { id: rootId, name: "main", kind: "main" as const, sessionId: "fence" };
   const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: rootId, rootId, identity });
   participants.registerSource(() => [{
     format: 1, id: rootId, kind: "root", rootId, ownerHostId: rootId, ownerIdentityId: rootId,
     name: "main", status: "idle", residency: "session", runner: "pi", transport: "host",
-    capabilities: ["fabric"], cwd: root, startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    capabilities: ["fabric"], cwd: root, sessionId: identity.sessionId, startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
   }]);
   await participants.start();
   const config: ResidentHostConfig = {

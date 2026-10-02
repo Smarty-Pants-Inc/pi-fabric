@@ -1,3 +1,7 @@
+import { randomUUID } from "node:crypto";
+import { ResidentHost } from "../src/residency/host.js";
+import { ResidencyClient } from "../src/residency/client.js";
+import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -39,7 +43,7 @@ const fixture = async () => {
     const record: FabricParticipantRecord = { format: 1, id, rootId: kind === "root" ? id : SPAWNER,
       ownerHostId: id, ownerIdentityId: id, kind, name: identity.name, status: "idle",
       runner: "pi", transport: "host", capabilities: ["steer", "followUp"], controlProtocol: "v1",
-      cwd: root, startedAt: 1, updatedAt: Date.now() };
+      cwd: root, sessionId: kind === "root" ? id.slice(8) : `native-${id}`, startedAt: 1, updatedAt: Date.now() };
     const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: id, rootId: record.rootId, identity });
     directory.registerSource(() => [record]);
     closers.push(() => directory.close());
@@ -63,8 +67,9 @@ const fixture = async () => {
       }
       return router.acceptControl(command, from, signal);
     });
+    return { identity, directory, main, control };
   };
-  await receiver(SPAWNER); await receiver(ORG); await receiver(KATE);
+  const requester = await receiver(SPAWNER); await receiver(ORG); await receiver(KATE);
   const spawn = async (targets: unknown[], options: { identityId?: string; actorId?: string; spawnerSessionId?: string; workerPath?: string } = {}) => {
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [],
       maxDepth: 10, nice: 0, timeoutMs: 10_000 }, {
@@ -81,7 +86,7 @@ const fixture = async () => {
     expect(report.error).toBeUndefined();
     return { report, id: handle.id };
   };
-  return { mesh, root, delivered, receiver, spawn };
+  return { mesh, root, delivered, receiver, spawn, requester, fakePi };
 };
 
 const targets = (id: string, prefix: string) => ["steer", "followUp", "tell"].map(action => ({ action, id, message: `${prefix}-${action}` }));
@@ -181,6 +186,94 @@ describe("spawn-bound task return address through real process transport (#2950)
     }
     expect(f.delivered.filter(send => send.id === KATE)).toHaveLength(3);
   }, 25_000);
+});
+
+describe.skipIf(process.platform === "win32")("durable public spawn return address", () => {
+  const durableFixture = async () => {
+    const f = await fixture();
+    const config: ResidentHostConfig = {
+      format: RESIDENT_HOST_FORMAT, rootId: SPAWNER, sessionId: SPAWNER.slice(8), cwd: f.root,
+      projectRoot: f.root, meshRoot: f.mesh.root, actorRoot: path.join(f.root, "actors"),
+      residencyRoot: residentRoot(f.mesh.root, SPAWNER), fullCodeMode: true,
+      agents: { ...DEFAULT_FABRIC_CONFIG.agents, model: "", deniedModels: [], budgetUsd: 0, nice: 0, timeoutMs: 10_000 },
+      mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 10 }, retention: DEFAULT_FABRIC_CONFIG.retention,
+      workerPath: path.resolve("src/worker.ts"), fabricExtensionPath: path.resolve("dist/index.js"),
+      piBinary: f.fakePi, claudeBinary: "claude", vedaBinary: "veda",
+      piModels: { available: [{ provider: "fixture", id: "model" }], aliases: {}, defaultModel: "fixture/model" },
+    };
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+    const host = new ResidentHost(config);
+    closers.push(() => host.close());
+    await host.start();
+    const client = new ResidencyClient({ config, mesh: f.mesh, participants: f.requester.directory, mainAgent: f.requester.main });
+    closers.push(() => client.close());
+    const manager = new AgentManager(f.root, config.agents, { runRoot: path.join(f.root, "caller-runs"), mainAgentId: SPAWNER, identityId: SPAWNER });
+    closers.push(() => manager.close());
+    const provider = new AgentsProvider(manager, { identity: f.requester.identity } as any, {} as any,
+      f.requester.main, f.requester.directory, f.requester.control, {} as any, undefined, client);
+    const context = { cwd: f.root, extensionContext: { sessionManager: { getEntries: () => [], getSessionId: () => SPAWNER.slice(8) } }, update() {}, activity() {} } as any;
+    return { ...f, host, client, config, provider, context };
+  };
+
+  it("binds agents.main and all main sends to the requesting Main, not the hidden resident executor", async () => {
+    vi.stubEnv("PI_FABRIC_TASK_ESCALATION_TARGETS", JSON.stringify([ORG]));
+    const f = await durableFixture();
+    // The host already exists; neither its identity nor a later ambient edit grants a return target.
+    vi.stubEnv("PI_FABRIC_TASK_ESCALATION_TARGETS", JSON.stringify([KATE]));
+    for (let i = 0; i < 2; i++) {
+      const handle = await f.provider.invoke("spawn", {
+        task: JSON.stringify({ targets: [...targets("main", `durable-${i}`), ...targets(ORG, "allowed"), ...targets(KATE, "denied")] }),
+        residency: "durable", transport: "process", extensions: false,
+        // Unrecognized task-supplied identity fields must never become the trusted envelope.
+        caller: { id: KATE }, returnAddress: { spawnerId: KATE },
+      }, f.context) as { id: string };
+      const result = await f.client.waitAgent(handle.id);
+      expect(result.status, result.error).toBe("completed");
+      const report = JSON.parse(result.text);
+      expect(report.main).toMatchObject({ id: SPAWNER, sessionId: SPAWNER.slice(8) });
+      expect(report.main.id).not.toBe(f.host.identity.id);
+      expect(report.mainAgain.id).toBe(SPAWNER);
+      expect(report.sends.slice(0, 6).every((send: any) => send.ok)).toBe(true);
+      expect(report.sends.slice(6).every((send: any) => send.code === "FABRIC_TASK_ESCALATION_TARGET_DENIED")).toBe(true);
+    }
+    expect(f.delivered.filter(send => send.id === SPAWNER)).toHaveLength(6);
+    expect(f.delivered.filter(send => send.id === ORG)).toHaveLength(6);
+    expect(f.delivered.filter(send => send.id === KATE || send.id === f.host.identity.id)).toHaveLength(0);
+    expect(f.mesh.read({ topic: "fabric.control.command" }).filter(event => (event.data as any)?.targetId === KATE)).toHaveLength(0);
+  }, 30_000);
+
+  it("refuses absent and forged launch envelopes before commit or worker launch", async () => {
+    const f = await durableFixture();
+    const self = f.requester.directory.self();
+    const caller = { id: self.id, rootId: self.rootId, sessionId: self.sessionId,
+      ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind,
+      returnAddress: { spawnerId: self.id, spawnerSessionId: self.sessionId, ancestors: [SPAWNER], escalationTargets: [] } };
+    const forged = [undefined, { ...caller, ownerHostId: f.host.hostId }, { ...caller, sessionId: "forged" },
+      { ...caller, rootId: KATE }, { ...caller, returnAddress: { ...caller.returnAddress, spawnerId: f.host.identity.id } }];
+    for (const value of forged) {
+      const requestId = randomUUID();
+      fs.writeFileSync(path.join(f.config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({
+        format: RESIDENT_HOST_FORMAT, operation: "spawn", requestId, rootId: SPAWNER,
+        request: { task: "must not launch", residency: "durable", transport: "process" }, caller: value, createdAt: Date.now(),
+      }));
+      const responseFile = path.join(f.config.residencyRoot, "responses", `${requestId}.json`);
+      await vi.waitFor(() => expect(fs.existsSync(responseFile)).toBe(true), { timeout: 5_000, interval: 20 });
+      expect(JSON.parse(fs.readFileSync(responseFile, "utf8"))).toMatchObject({ ok: false, error: expect.stringContaining("absent or forged binding refused") });
+      expect(fs.existsSync(path.join(f.config.residencyRoot, "decisions", `${requestId}.json`))).toBe(false);
+    }
+    expect(f.host.agents.list()).toHaveLength(0);
+    expect(f.client.listAgents()).toHaveLength(0);
+  }, 30_000);
+
+  it("fails closed at public dispatch when no native caller session binding exists", async () => {
+    const f = await durableFixture();
+    const client = new ResidencyClient({ config: f.config, mesh: f.mesh, mainAgent: f.requester.main,
+      participants: { self: () => ({ ...f.requester.directory.self(), sessionId: undefined }) } as any });
+    closers.push(() => client.close());
+    await expect(client.spawnAgent({ task: "must not launch", transport: "process" })).rejects.toThrow("trusted live caller");
+    expect(f.host.agents.list()).toHaveLength(0);
+  }, 30_000);
 });
 
 describe("exact task return-address policy", () => {

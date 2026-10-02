@@ -1,6 +1,6 @@
 import { copyFabricPrincipal, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
-import { taskReturnAddressArguments } from "./task-return-address.js";
+import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
@@ -902,10 +902,11 @@ export class AgentManager {
 
   /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
+   * callerReturnAddress is a validated resident caller snapshot, never a task request field.
    */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void): Promise<AgentHandleInfo> {
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
-    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade);
+    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, callerReturnAddress && structuredClone(callerReturnAddress));
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
@@ -926,7 +927,7 @@ export class AgentManager {
     }
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -1158,7 +1159,9 @@ export class AgentManager {
           String(inheritedFullCodeMode),
           ...(this.#mainAgentId ? ["--main-agent-id", this.#mainAgentId] : []),
           ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
-          ...(adapter.kind === "process" && !request.actorId ? this.#taskReturnAddressArguments : []),
+          ...(adapter.kind === "process" && !request.actorId
+            ? callerReturnAddress ? ["--task-return-address", JSON.stringify(callerReturnAddress)] : this.#taskReturnAddressArguments
+            : []),
           "--extensions",
           String(extensions),
           "--tools",

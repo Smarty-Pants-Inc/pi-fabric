@@ -181,6 +181,20 @@ describe.skipIf(process.platform !== "linux")("owned execution snapshot", () => 
 });
 
 describe("spawnDetached", () => {
+  it("accepts a Bun-shaped IPC channel without unref while retaining custody messages", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: process.pid, unref: vi.fn(), channel: {}, connected: true,
+      send: vi.fn((_message: unknown, callback: () => void) => callback()),
+    });
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess);
+    // No native process is launched; this seam specifically models Bun's API.
+    await spawnDetached("worker.mjs", [], process.cwd(), undefined, undefined, 7_000, true);
+    expect(child.unref).toHaveBeenCalledOnce();
+    child.emit("message", { type: "fabric-execution-custody" });
+    expect(child.send).toHaveBeenCalledWith({ type: "fabric-execution-custody-ack" }, expect.any(Function));
+    child.emit("message", { type: "fabric-execution-settled" });
+    child.emit("exit", 0);
+  });
   // dev-lead review D7 on #26: after the worker exited, its numeric id may name an
   // unrelated process (group); stop and liveness must not act on it.
   it("neither signals nor reports alive a worker id after the worker exited, even if the id is reused", async () => {

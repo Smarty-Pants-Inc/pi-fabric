@@ -25,7 +25,7 @@ const custodyReady = new Promise<void>((resolve) => {
   if (process.platform === "win32" || !process.send) { resolve(); return; }
   process.on("message", (message: unknown) => {
     if (!message || typeof message !== "object" || !("type" in message)) return;
-    if (message.type === "fabric-execution-custody-ack") { process.channel?.unref(); resolve(); }
+    if (message.type === "fabric-execution-custody-ack") { process.channel?.unref?.(); resolve(); }
     else if (message.type === "fabric-stop") { externalStopRequested = true; externalStop(); }
   });
   process.send({ type: "fabric-execution-custody" }, () => undefined);

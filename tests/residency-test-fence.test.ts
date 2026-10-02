@@ -1,5 +1,6 @@
 import * as childProcess from "node:child_process";
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -51,7 +52,8 @@ describe("lockFile ownership across platforms", () => {
 });
 
 describe("lockFile safety without POSIX UIDs", () => {
-  it.each([true, false])("rejects a file without an ownership identity and closes its descriptor before invoking the fence (regular=%s)", async regular => {
+  it.each([true, false])("rejects unknown POSIX ownership and closes its descriptor before invoking the fence (regular=%s)", async regular => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-nonregular-"));
     const file = path.join(root, "host-fence-establish.lock");
     const getuid = Object.getOwnPropertyDescriptor(process, "getuid");
@@ -75,6 +77,44 @@ describe("lockFile safety without POSIX UIDs", () => {
   });
 });
 
+describe("Windows lockFile validation", () => {
+  it.each([true, false])("uses Windows file access rather than an unavailable POSIX UID, but still checks regular files (regular=%s)", async regular => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-windows-file-"));
+    const file = path.join(root, "host-fence-establish.lock");
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const getuid = Object.getOwnPropertyDescriptor(process, "getuid");
+    Object.defineProperty(process, "getuid", { configurable: true, writable: true, value: undefined });
+    const fstat = fs.fstatSync.bind(fs);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number) => {
+      const stat = fstat(fd); stat.uid = 0; stat.isFile = () => regular; return stat;
+    }) as typeof fs.fstatSync);
+    const spawn = vi.mocked(childProcess.spawn).mockImplementation(() => {
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit("exit", 0));
+      return child as childProcess.ChildProcess;
+    });
+    spawn.mockClear();
+    const close = vi.spyOn(fs, "closeSync");
+    let fd: number | undefined;
+    try {
+      if (regular) {
+        fd = await lockFile(file, 0);
+        expect(spawn).toHaveBeenCalledOnce();
+        expect(spawn.mock.calls[0]?.[0]).toBe("flock");
+        expect(close).not.toHaveBeenCalled(); // caller still owns the lock descriptor
+      } else {
+        await expect(lockFile(file, 0)).rejects.toThrow(/not a regular file owned/);
+        expect(spawn).not.toHaveBeenCalled();
+        expect(close).toHaveBeenCalledOnce();
+      }
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+      if (getuid) Object.defineProperty(process, "getuid", getuid);
+      else Reflect.deleteProperty(process, "getuid");
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 describe("unsupported native residency versus in-process test contract", () => {
   it("explicit test fence excludes a second owner until exact descriptor close and never replaces the inode", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-test-fence-"));
@@ -116,8 +156,9 @@ describe("unsupported native residency versus in-process test contract", () => {
       throw Object.assign(new Error("flock unavailable"), { code: "ENOENT" });
     });
     try {
-      await expect(host.start()).rejects.toThrow(/not a regular file owned/);
-      expect(spawn).not.toHaveBeenCalled();
+      await expect(host.start()).rejects.toThrow("flock unavailable");
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(spawn.mock.calls[0]?.[0]).toBe("flock");
       expect(host.actors).toBeUndefined();
       expect(host.agents).toBeUndefined();
       expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);

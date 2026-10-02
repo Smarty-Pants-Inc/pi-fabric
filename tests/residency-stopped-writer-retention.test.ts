@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { expect, it, vi } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { hasUnresolvedWorker, markUnresolvedWorker } from "../src/storage/retention.js";
@@ -14,6 +15,8 @@ import { RESIDENT_REQUEST_RETENTION_MS } from "../src/residency/request-expiry.j
 import { readResidentRequestDecision, registerResidentCancellation, residentRoot, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
+
+beforeEach(() => installInProcessResidentFence());
 
 const waitFor = async (predicate: () => boolean) => {
   const deadline = Date.now() + 5_000;
@@ -123,7 +126,7 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
 // relies on POSIX detached process groups. Windows durable residency is unsupported
 // (src/residency/host.ts, docs/residency-runtime.md), and there the nested child does
 // not survive the primary's exit, so this descendant-tracking claim is not made.
-it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a settled tracked activation retains reconciliation IDs while its real nested writer survives, then collects once (%s scope)", async scope => {
+it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a crashed tracked activation retains custody and reconciliation IDs while its real nested writer survives, then settles and collects once (%s scope)", async scope => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nested-writer-retention-"));
   const rootId = "session:nested-writer-retention";
   const meshRoot = path.join(root, "mesh");
@@ -175,13 +178,15 @@ it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a
     expect(processAlive(child.pid)).toBe(true);
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ id: child.id, status: "running", turns: 4 });
     expect(await control.request(client.hostId, actor.id, "stop", {}, client.hostId)).toMatchObject({ acknowledged: true });
-    // Crash only the primary. Its real monitor settles the failed tracked run and
-    // releases the actor drain, but the detached nested worker keeps writing.
+    // Crash only the primary. A dead primary is not a tree-exit receipt: the
+    // process transport retains the observed nested writer and the actor drain.
     fs.writeFileSync(crash, "crash");
-    await waitFor(() => host.agents.status(writer.id).status === "failed" && host.actors.inFlightCount() === 0);
-    expect(await client.actorStatus(actor.id)).toMatchObject({ id: actor.id, status: "stopped" });
-    expect((await client.actorStatus(actor.id)).inFlightRun).toBeUndefined();
-    expect(processAlive(Number(writer.sessionId))).toBe(false);
+    await waitFor(() => !processAlive(Number(writer.sessionId)));
+    expect(await client.actorStatus(actor.id)).toMatchObject({ id: actor.id, status: "stopped", inFlightRun: { id: writer.id } });
+    expect(host.actors.inFlightCount()).toBe(1);
+    expect(host.agents.status(writer.id).status).toBe("running");
+    let settled = false;
+    const settlement = host.agents.wait(writer.id).then(result => { settled = true; return result; });
     expect(processAlive(child.pid)).toBe(true);
     expect(host.agents.runDirectory(writer.id)).toBeDefined(); // Still tracked, disk-scan skip applies.
     expect(hasUnresolvedWorker(host.agents.runDirectory(writer.id)!)).toBe(false);
@@ -209,8 +214,12 @@ it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a
     expect(Object.isFrozen(outcome.residentOutcome)).toBe(true);
     expect(create).toHaveBeenCalledTimes(1);
 
+    expect(settled, "primary exit must not discharge a live nested writer").toBe(false);
     fs.writeFileSync(release, "finish nested");
     await waitFor(() => !processAlive(child.pid));
+    await waitFor(() => settled && host.actors.inFlightCount() === 0);
+    expect(await settlement).toMatchObject({ status: "failed" });
+    expect((await client.actorStatus(actor.id)).inFlightRun).toBeUndefined();
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ status: "completed", turns: 5 });
     expect(host.agents.retentionReferences().has(actor.id)).toBe(false);
     const before = scans;

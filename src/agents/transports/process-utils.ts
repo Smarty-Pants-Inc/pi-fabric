@@ -301,7 +301,9 @@ export const spawnDetached = async (
   let exited = false;
   child.once("exit", () => { exited = true; });
   child.unref();
-  child.channel?.unref();
+  // Bun exposes an IPC channel without Node's unref method. The child's
+  // native unref above is still valid; optional channel APIs are not custody.
+  child.channel?.unref?.();
   let executionPending = false;
   child.on("message", (message: unknown) => {
     if (!message || typeof message !== "object" || !("type" in message)) return;

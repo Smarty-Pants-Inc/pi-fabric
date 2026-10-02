@@ -28,6 +28,8 @@ export const createRunningRecord = (
   task,
   status: "running",
   runner: options.runner,
+  ...(options.mainAgentId ? { mainAgentId: options.mainAgentId } : {}),
+  ...(options.fabricSessionId ? { fabricSessionId: options.fabricSessionId } : {}),
   ...(options.kernel ? { kernel: options.kernel } : {}),
   transport: options.transport,
   cwd: options.cwd,

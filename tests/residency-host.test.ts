@@ -98,6 +98,27 @@ describe("successor retirement with resident release", () => {
   });
 });
 
+describe("resident loaded-path census metadata", () => {
+  it("publishes the startup generation rather than a later desired configuration", async () => {
+    const { root, config, host } = fixture();
+    const loaded = config.fabricExtensionPath;
+    try {
+      await host.start();
+      const ownerPath = path.join(config.residencyRoot, "owner.json");
+      const owner = fs.readFileSync(ownerPath, "utf8");
+      expect(JSON.parse(owner)).toMatchObject({ pid: process.pid, fabricExtensionPath: loaded });
+      fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify({
+        ...config, fabricExtensionPath: path.join(root, "replacement", "dist", "index.js"),
+      }));
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      expect(host.config.fabricExtensionPath).toBe(loaded);
+    } finally {
+      await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("resident tracked result preservation", () => {
   it.each(["native", "win32-injected"] as const)("releases the host fence and closes delivery/participant work even if agent close fails (%s)", async (platformCase) => {
     const { root, config, host } = fixture();

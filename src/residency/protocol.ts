@@ -321,6 +321,8 @@ export interface ResidentHostOwner {
   token: string;
   startedAt: number;
   readyAt: number;
+  /** The immutable entry path this owner actually loaded, not the mutable config selector. */
+  fabricExtensionPath?: string;
   /** Commands supported by this running binary; absent on pre-negotiation hosts. */
   commands?: readonly string[];
   /** New clients must not dispatch mutations to an already-running pre-fence host. */

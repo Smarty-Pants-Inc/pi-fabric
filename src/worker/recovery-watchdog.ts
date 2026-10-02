@@ -1,3 +1,5 @@
+import { assistantStreamEvent } from "./assistant-stream-event.js";
+
 export const PI_RECOVERY_TIMEOUT_MS = 60_000;
 
 /** Bounds stalled Pi error recovery, not healthy inference or tool execution. */
@@ -16,9 +18,53 @@ export class PiRecoveryWatchdog {
     this.#timer = setTimeout(() => {
       const error = this.#reason;
       this.dispose();
-      this.fail(`${error}; Pi made no recovery progress for ${PI_RECOVERY_TIMEOUT_MS}ms; terminating child`);
+      this.fail(`${error}; no model stream or tool event for ${PI_RECOVERY_TIMEOUT_MS}ms; terminating child`);
     }, PI_RECOVERY_TIMEOUT_MS);
     this.#timer.unref?.();
+  }
+
+  /** An accepted assistant response ends recovery; output/tools refresh it if no start was observed. */
+  observe(event: Record<string, unknown>): void {
+    if (!this.#reason || this.#disposed) return;
+    if (["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(String(event.type))) {
+      this.progress();
+      return;
+    }
+    if (event.type !== "message_start" && event.type !== "message_update") return;
+    const isRecord = (value: unknown): value is Record<string, unknown> =>
+      typeof value === "object" && value !== null && !Array.isArray(value);
+    const message = event.message;
+    if (isRecord(message) && (message.stopReason === "error" || message.stopReason === "aborted")) return;
+    if (event.type === "message_start" && isRecord(message) && message.role === "assistant") {
+      // Pi emits this when the provider starts the retried response, not when
+      // retry scheduling begins. Silent reasoning after acceptance is healthy
+      // inference, governed by the existing overall/idle deadlines instead.
+      this.clear();
+      return;
+    }
+    if (event.type === "message_update") {
+      const stream = assistantStreamEvent(event);
+      if (stream) {
+        if (["text_delta", "thinking_delta", "toolcall_delta"].includes(String(stream.type))) {
+          // Whitespace is not recovery progress. Tool argument whitespace is
+          // still counted by ToolCallStreamGuard toward its time/byte bounds.
+          if (typeof stream.delta === "string" && /\S/.test(stream.delta)) this.progress();
+        } else if (["text_start", "text_end", "thinking_start", "thinking_end", "toolcall_start", "toolcall_end"].includes(String(stream.type))) {
+          this.progress();
+        }
+        // Never let an error or empty delta reuse an old output snapshot as progress.
+        return;
+      }
+    }
+    // Some adapters publish assistant output snapshots without a stream envelope.
+    if (!isRecord(message) || message.role !== "assistant") return;
+    const content = message.content;
+    if ((typeof content === "string" && content.length > 0) ||
+        (Array.isArray(content) && content.some((block) => isRecord(block) && (
+          (block.type === "text" && typeof block.text === "string" && block.text.length > 0) ||
+          (block.type === "thinking" && typeof block.thinking === "string" && block.thinking.length > 0) ||
+          block.type === "toolCall"
+        )))) this.progress();
   }
 
   progress(): void {

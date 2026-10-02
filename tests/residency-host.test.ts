@@ -261,7 +261,7 @@ describe("resident host ownership", () => {
       expect(fs.existsSync(ownerPath)).toBe(false);
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
-  it("ignores a config release change and continues accepting actor work", async () => {
+  it("never follows mutable config alone without a Main intent and attested launcher custody", async () => {
     const { root, config, host, idle } = fixture();
     const next = path.join(root, "other-package");
     fs.mkdirSync(path.join(next, "dist/residency"), { recursive: true });

@@ -56,15 +56,13 @@ const CHANGE_REFRESH_MIN_MS = 1_000;
  * (the dashboard, agents.list/status/members of remote agents) show them up to this old.
  */
 const ACTIVITY_REFRESH_MS = 60_000;
-/** Fields a record's `changed` test ignores: timestamps and activity counters. */
+/** Ignore noisy model activity, not actor queue/mailbox state needed for live reads (#2726). */
 const QUIET_FIELDS = {
   updatedAt: undefined,
   currentTool: undefined,
   turns: undefined,
   toolCalls: undefined,
   usage: undefined,
-  actorQueued: undefined,
-  actorMessages: undefined,
 } as const;
 /** How often a host sweeps records of long-dead hosts (smarty-dev#367); the first sweep waits too. */
 const DEAD_HOST_SWEEP_MS = 15 * 60 * 1_000;

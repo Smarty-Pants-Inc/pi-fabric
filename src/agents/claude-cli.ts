@@ -31,6 +31,8 @@ const CLAUDE_TOOL_NAMES: Readonly<Record<string, string>> = {
 export interface ClaudeModelInfo {
   value: string;
   resolvedModel: string;
+  /** False when resolvedModel is only a display fallback, not a native CLI target. */
+  resolvedModelKnown?: boolean;
   displayName: string;
   description: string;
   supportsEffort?: boolean;
@@ -71,6 +73,7 @@ const asClaudeModel = (value: unknown): ClaudeModelInfo | undefined => {
   return {
     value: modelValue,
     resolvedModel,
+    ...(!nonEmptyString(record.resolvedModel) ? { resolvedModelKnown: false } : {}),
     displayName,
     description,
     ...(typeof record.supportsEffort === "boolean"

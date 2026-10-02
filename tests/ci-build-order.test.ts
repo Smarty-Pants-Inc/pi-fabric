@@ -7,6 +7,14 @@ const workflow = parse(fs.readFileSync(fileURLToPath(new URL("../.github/workflo
 const steps = workflow.jobs.check.steps as Array<{ name?: string; run?: string }>;
 
 describe("CI build prerequisites", () => {
+  it("runs the YAML guard after installing Node and its existing parser dependency", () => {
+    const guard = steps.findIndex((step) => step.run === "bash scripts/ci/no-hosted-runners.sh");
+    const node = steps.findIndex((step) => (step as { uses?: string }).uses === "actions/setup-node@v4");
+    const dependencies = steps.findIndex((step) => step.run === "bun install --frozen-lockfile");
+    expect(node).toBeGreaterThanOrEqual(0);
+    expect(dependencies).toBeGreaterThan(node);
+    expect(guard).toBeGreaterThan(dependencies);
+  });
   it("builds the published workers before every test step", () => {
     const build = steps.findIndex((step) => step.run === "bun run build");
     const tests = steps.flatMap((step, index) => /^(bunx vitest|bun run test:)/.test(step.run ?? "") ? [index] : []);

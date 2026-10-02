@@ -38,9 +38,6 @@ jobs:
           # The affected-test selection diffs the push range or the pull-request
           # base, so that base commit has to be present in history.
           fetch-depth: 0
-      - name: Reject unapproved hosted runners
-        shell: bash
-        run: bash scripts/ci/no-hosted-runners.sh
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -60,6 +57,9 @@ jobs:
           fi
       - name: Install dependencies
         run: bun install --frozen-lockfile
+      - name: Reject unapproved hosted runners
+        shell: bash
+        run: bash scripts/ci/no-hosted-runners.sh
       - name: Install pinned Bend proof compiler
         if: runner.os == 'Linux'
         shell: bash

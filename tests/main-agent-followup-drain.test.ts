@@ -77,11 +77,39 @@ describe("Main followUp drain (unit)", () => {
   it("delivers to an idle Main as before, with a sent_at header", () => {
     const { main, sent } = setup(120_000, true);
     const result = main.deliverAgent({ from: from("a"), message: "hello", delivery: "followUp" });
-    expect(result).toMatchObject({ queued: true, routed: "main", pendingFollowUps: 0, oldestAgeS: 0 });
+    expect(result).toMatchObject({ queued: true, routed: "main", triggered: true, pendingFollowUps: 0, oldestAgeS: 0 });
     expect(sent).toHaveLength(1);
     expect(sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(sent[0]!.message.content).toContain('delivery="followUp" sent_at="2026-09-27T20:00:00.000Z">');
     expect(sent[0]!.message.details).toMatchObject({ id: result.messageId, delivery: "followUp", sentAt: "2026-09-27T20:00:00.000Z" });
+  });
+
+  it.each(["passive", "halted", "aborted", "provider-error", "nextTurn"])("reports no new turn for %s admission", (mode) => {
+    const { main, state, sent, emit, ctx } = setup(120_000, true);
+    if (mode === "provider-error") emit("turn_end", { message: { stopReason: "error" } }, ctx);
+    if (mode === "halted") main.halt();
+    if (mode === "aborted") state.aborted = true;
+    const receipt = main.deliverAgent({ from: from("a"), message: "context", delivery: mode === "nextTurn" ? "nextTurn" : "followUp",
+      ...(mode === "passive" ? { triggerTurn: false } : {}) });
+    expect(receipt.triggered).toBe(false);
+    if (mode === "provider-error") {
+      expect(receipt.reason).toBe("provider-backoff until 2026-09-27T20:01:00.000Z");
+      expect(sent).toHaveLength(0);
+      vi.advanceTimersByTime(60_000);
+      expect(sent[0]!.options.triggerTurn).toBe(true);
+      return;
+    }
+    expect(sent).toHaveLength(1);
+    if (mode !== "nextTurn") expect(sent[0]!.options.triggerTurn).toBe(false);
+  });
+
+  it("reports an idle wake when admission releases a previously held queue", () => {
+    const { main, state, sent } = setup();
+    expect(main.deliverAgent({ from: from("a"), message: "held", delivery: "followUp" }).triggered).toBe(false);
+    state.idle = true;
+    expect(main.deliverAgent({ from: from("a"), message: "wake", delivery: "followUp" }).triggered).toBe(true);
+    expect(sent).toHaveLength(1);
+    expect(main.queueDepth().pendingFollowUps).toBe(0);
   });
 
   it("stamps a steer with sent_at and sends it at once, even to a busy Main", () => {
@@ -95,10 +123,10 @@ describe("Main followUp drain (unit)", () => {
   it("holds followUps for a busy Main and reports each sender its own queue depth", () => {
     const { main, sent } = setup();
     expect(main.deliverAgent({ from: from("a"), message: "one", delivery: "followUp" }))
-      .toMatchObject({ pendingFollowUps: 1, oldestAgeS: 0 });
+      .toMatchObject({ pendingFollowUps: 1, oldestAgeS: 0, triggered: false });
     vi.advanceTimersByTime(45_000);
     expect(main.deliverAgent({ from: from("b"), message: "two", delivery: "followUp" }))
-      .toMatchObject({ pendingFollowUps: 1, oldestAgeS: 0 });                  // b's own, not a's
+      .toMatchObject({ pendingFollowUps: 1, oldestAgeS: 0, triggered: false });                  // b's own, not a's
     vi.advanceTimersByTime(5_000);
     expect(main.deliverAgent({ from: from("a"), message: "three", delivery: "followUp" }))
       .toMatchObject({ pendingFollowUps: 2, oldestAgeS: 50 });
@@ -458,7 +486,11 @@ describe("Main followUp drain (unit)", () => {
       emit(event === "session_tree" ? "session_before_tree" : "session_before_compact", { reason: "manual", signal: new AbortController().signal }, ctx);
       emit(event, payload, ctx);
       vi.advanceTimersByTime(25);
-      expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
+      if ("errorMessage" in payload) {
+        expect(sent).toHaveLength(0);
+        vi.advanceTimersByTime(59_975);
+        expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: true }]);
+      } else expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
     }
   });
 
@@ -585,7 +617,11 @@ describe("Main followUp drain (unit)", () => {
       emit("turn_end", { message: { role: "assistant", stopReason: "stop" } }, ctx);
       state.idle = true;
       emit("agent_settled", outcome === undefined ? {} : { outcome }, ctx);
-      expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
+      if (outcome === "error") {
+        expect(sent).toHaveLength(0);
+        vi.advanceTimersByTime(60_000);
+        expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: true }]);
+      } else expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
     }
   });
 

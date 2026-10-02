@@ -303,7 +303,9 @@ const waitFor = async (what, predicate, ms = 60_000) => {
 const sshArgs = () => ["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
   "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", cfg.sshHost];
 // BEGIN REMOTE HELPER — inert native probe extracts this block, not the driver.
-const remoteBuffered = (command, cleanupOnly) => {
+const remoteBuffered = (command, cleanupOnly, deadline = Date.now() + 20_000) => {
+  const timeoutMs = Math.min(20_000, deadline - Date.now());
+  assert(timeoutMs > 0, "remote helper cleanup deadline exceeded");
   // execFile silently drops detached; spawn is also the regular child() mechanism.
   const transport = spawn("ssh", [...sshArgs(), command], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
   children.add(transport); // Every real child remains in the existing cleanup ledger.
@@ -388,21 +390,23 @@ const remoteBuffered = (command, cleanupOnly) => {
     transport.stdout?.on("data", onStdout); transport.stderr?.on("data", onStderr);
     transport.stdout?.on("error", onStreamError); transport.stderr?.on("error", onStreamError);
     timer = setTimeout(() => {
-      const error = new Error("remote helper deadline exceeded (20000ms)");
+      const error = new Error(`remote helper deadline exceeded (${timeoutMs}ms)`);
       error.code = "ETIMEDOUT";
       // Only this directly owned ChildProcess, for its own deadline. Group death
-      // is still verified later by the unchanged incarnation/pidfd cleanup.
+      // is still verified later by the incarnation/pidfd cleanup. Capture
+      // descendants before killing a leader whose children may retain pipes.
+      try { if (transport.owned) ownedMembers(transport.owned); } catch (ownershipError) { error.cause = ownershipError; }
       try { transport.kill("SIGKILL"); } catch (killError) { error.cause = killError; }
       latch(error);
-    }, 20_000);
+    }, timeoutMs);
   });
   // Ownership readiness can fail before remote() attaches its operation await.
   operation.catch(() => {});
   return { ready, operation };
 };
-const remote = async (command, cleanupOnly = false) => {
+const remote = async (command, cleanupOnly = false, deadline = Date.now() + 20_000) => {
   if (!cleanupOnly) gate();
-  const { ready, operation } = remoteBuffered(command, cleanupOnly);
+  const { ready, operation } = remoteBuffered(command, cleanupOnly, deadline);
   await ready;
   // remoteBuffered already registers its own cancellation after ownership. A
   // second cancelWait would replace its specific error when latch() stops peers.
@@ -472,7 +476,9 @@ const alive = (p) => {
   return current && current.state !== "Z";
 };
 // BEGIN OWNED PIDFD SIGNAL — self-contained for serialized remote lifecycle and probes.
-const signalOwned = (member, name) => {
+const signalOwned = (member, name, deadline = Date.now() + 2000) => {
+  const timeout = Math.min(2000, deadline - Date.now());
+  if (timeout <= 0) throw new Error("owned signal deadline exceeded");
   const program = `import os, signal, sys, json
 m = json.loads(sys.argv[1])
 name = sys.argv[2]
@@ -497,20 +503,24 @@ finally:
 print(json.dumps(sent))
 `;
   return JSON.parse(execFileSync("python3", ["-c", program, JSON.stringify(member), name],
-    { encoding: "utf8", timeout: 2000, killSignal: "SIGKILL", maxBuffer: 64 * 1024 }));
+    { encoding: "utf8", timeout, killSignal: "SIGKILL", maxBuffer: 64 * 1024 }));
 };
 // END OWNED PIDFD SIGNAL
-const cleanupOwned = async (owner) => {
+const cleanupOwned = async (owner, deadline = Date.now() + 5000) => {
   const receipt = { pid: owner.pid, start: owner.start, signals: [], errors: [], dead: false };
   try {
     for (const [signal, ms] of [["SIGTERM", 2000], ["SIGKILL", 2000]]) {
       const members = ownedMembers(owner);
       if (!members.length) break;
+      // Exhausting the polite phase must never skip the reserved SIGKILL phase.
+      if (signal === "SIGTERM" && Date.now() >= deadline - 2000) continue;
       for (const p of members) {
-        if (signalOwned(p, signal)) receipt.signals.push({ pid: p.pid, signal });
+        try {
+          if (signalOwned(p, signal, signal === "SIGTERM" ? deadline - 2000 : deadline)) receipt.signals.push({ pid: p.pid, signal });
+        } catch (error) { receipt.errors.push(String(error)); }
       }
-      const until = Date.now() + ms;
-      while (ownedMembers(owner).length && Date.now() < until) await cleanupSleep(50);
+      const until = Math.min(Date.now() + ms, signal === "SIGTERM" ? deadline - 2000 : deadline);
+      while (ownedMembers(owner).length && Date.now() < until) await cleanupSleep(Math.min(50, until - Date.now()));
     }
     receipt.dead = ownedMembers(owner).length === 0;
     if (!receipt.dead) throw new Error("owned process/group survived cleanup");
@@ -520,12 +530,12 @@ const cleanupOwned = async (owner) => {
 };
 // END FORGE LIFECYCLE
 const remoteLifecycle = () => `const {execFileSync}=require("node:child_process"); const signalOwned=${signalOwned.toString()}; const processIdentity=${processIdentity.toString()}; const ownedMembers=${ownedMembers.toString()}; const ownLocal=${ownLocal.toString()}; const cleanupSleep=${cleanupSleep.toString()}; const cleanupOwned=${cleanupOwned.toString()};`;
-const snapshotRemote = async (identity, tree = false, cleanupOnly = false) => {
+const snapshotRemote = async (identity, tree = false, cleanupOnly = false, deadline = Date.now() + 20_000) => {
   const previous = remoteOwners.get(identity.pid);
   const program = `const fs=require('fs'); ${remoteLifecycle()}
 const expected=${JSON.stringify(identity)}; const owner=${JSON.stringify(previous ?? null)} ?? ownLocal(expected.pid,${tree});
 if(owner.start!==expected.start)throw Error('remote owner changed'); ownedMembers(owner); console.log(JSON.stringify(owner));`;
-  const owner = JSON.parse(await remote(shell([cfg.remoteNode, "-e", program]), cleanupOnly));
+  const owner = JSON.parse(await remote(shell([cfg.remoteNode, "-e", program]), cleanupOnly, deadline));
   remoteOwners.set(owner.pid, owner); return owner;
 };
 const child = (exe, args, options, name) => {
@@ -706,19 +716,38 @@ const rpc = (p, name) => {
 };
 
 const cleanup = () => cleanupPromise ??= (async () => {
+  // One budget, below forge-ssh-bridge.sh's 30s TERM-to-KILL grace. Reserve the
+  // last 5s for locally owned SSH groups created by remote cleanup itself.
+  const deadline = Date.now() + 25_000, remoteDeadline = deadline - 5000;
   stop(); // Normal completion cancels proof waits, but is not a signal/failure.
   clearInterval(ownershipMonitor);
-  const errors = [], receipts = [];
+  const errors = [], receipts = [], reaped = new Set();
+  const reapLocal = async (until) => {
+    await Promise.all([...children].filter((p) => !reaped.has(p)).map(async (p) => {
+      if (!p.owned) { reaped.add(p); errors.push(`missing ownership: ${p.pid}`); }
+      else {
+        const receipt = await cleanupOwned(p.owned, until);
+        receipts.push({ remote: false, ...receipt }); errors.push(...receipt.errors);
+        if (receipt.dead) reaped.add(p); // Retry a surviving initial group in the final reserve.
+      }
+      // Settlement is not closure. Bound pipe/close waits by the same budget;
+      // an inherited SSH pipe must not keep cleanup past the wrapper's grace.
+      if (p.proofClosed) {
+        let timer;
+        try {
+          await Promise.race([p.proofClosed, new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`local helper close deadline: ${p.pid}`)), Math.max(1, until - Date.now()));
+          })]);
+        } catch (error) { errors.push(String(error)); }
+        finally { clearTimeout(timer); }
+      }
+      if (p.proofError) errors.push(String(p.proofError));
+    }));
+  };
   // Capture authenticated descendants BEFORE EOF can remove their leader.
   for (const p of children) {
-    if (p.proofError) errors.push(String(p.proofError));
     try { if (p.owned) ownedMembers(p.owned); else throw p.proofError ?? new Error(`missing local ownership: ${p.pid}`); }
     catch (error) { errors.push(String(error)); }
-  }
-  for (const [identity, tree] of [[remoteOwned, false], [remoteBridge, true]]) {
-    if (!identity || !cfg) continue;
-    try { await snapshotRemote(identity, tree, true); }
-    catch (error) { errors.push(`remote ownership: ${error.message}`); }
   }
   for (const pi of [piA, piB]) {
     try { if (pi?.p.stdin && !pi.p.stdin.destroyed && !pi.p.stdin.writableEnded) pi.p.stdin.end(); }
@@ -726,30 +755,23 @@ const cleanup = () => cleanupPromise ??= (async () => {
   }
   // Both Pis retain independent timeout --kill-after=10s 900s protection.
   await cleanupSleep(1500);
+  // Never await remote SSH before reaping the bridge and existing local groups.
+  await reapLocal(Math.min(remoteDeadline, Date.now() + 5000));
+  for (const [identity, tree] of [[remoteOwned, false], [remoteBridge, true]]) {
+    if (!identity || !cfg) continue;
+    try { await snapshotRemote(identity, tree, true, remoteDeadline); }
+    catch (error) { errors.push(`remote ownership: ${error.message}`); }
+  }
   for (const owner of remoteOwners.values()) {
     const script = `const fs=require('fs'); ${remoteLifecycle()}
 (async()=>{console.log(JSON.stringify(await cleanupOwned(${JSON.stringify(owner)})));})().catch(e=>{console.error(e);process.exitCode=1;});`;
     try {
-      const receipt = JSON.parse(await remote(shell([cfg.remoteNode, "-e", script]), true));
+      const receipt = JSON.parse(await remote(shell([cfg.remoteNode, "-e", script]), true, remoteDeadline));
       receipts.push({ remote: true, ...receipt }); errors.push(...receipt.errors);
       if (!receipt.dead) errors.push(`remote group not dead: ${owner.pid}`);
     } catch (error) { errors.push(`remote cleanup: ${error.message}`); }
   }
-  // Includes ordinary SSH operation groups, bridge SSH, and both local Pi wrappers.
-  for (const p of children) {
-    if (!p.owned) {
-      errors.push(`missing ownership: ${p.pid}`);
-      if (p.proofClosed) await p.proofClosed;
-      if (p.proofError) errors.push(String(p.proofError));
-      continue;
-    }
-    const receipt = await cleanupOwned(p.owned);
-    receipts.push({ remote: false, ...receipt }); errors.push(...receipt.errors);
-    // Buffered helper settlement is not closure; retain its direct-child bound
-    // even when authenticated group cleanup fails, then read any late latch.
-    if (p.proofClosed) await p.proofClosed;
-    if (p.proofError) errors.push(String(p.proofError));
-  }
+  await reapLocal(deadline);
   results.cleanup = { remoteOwned, receipts, errors }; save();
   assert(errors.length === 0, errors.join("; "));
 })();

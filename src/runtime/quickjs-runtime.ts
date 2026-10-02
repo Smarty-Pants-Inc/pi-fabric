@@ -4,6 +4,7 @@ import ts from "typescript";
 import { ExecutionDeadline } from "./execution-deadline.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
+import { FabricModelDeniedError } from "../core/model-policy.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
 import { transpileFabricCodeWithSourceMap } from "./type-checker.js";
@@ -35,6 +36,8 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
 });
 const guestFabricErrorMetadata = (error: unknown): Record<string, string | boolean> | undefined => {
   if (!(error instanceof Error)) return undefined;
+  // Preserve only the fixed policy classification, never arbitrary Error fields.
+  if (error instanceof FabricModelDeniedError) return { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
   const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
   const name = Object.getOwnPropertyDescriptor(error, "name")?.value;
   if (typeof code !== "string" || !Object.hasOwn(GUEST_FABRIC_ERROR_NAMES, code) || GUEST_FABRIC_ERROR_NAMES[code] !== name) return undefined;

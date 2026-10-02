@@ -7,6 +7,7 @@ import {
   createFindToolDefinition,
   createGrepToolDefinition,
   createLocalBashOperations,
+  getShellConfig,
   createLsToolDefinition,
   createReadToolDefinition,
   type AgentToolResult,
@@ -18,6 +19,7 @@ import { tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
 import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
 import { readFabricBashMiddleware } from "../core/shell-middleware.js";
+import type { LandlockBashConfinement, LandlockSettings } from "../core/landlock.js";
 import {
   isPiShellToolName,
   PI_CORE_TOOL_NAMES,
@@ -93,6 +95,7 @@ interface PiToolsProviderHostCapabilities {
   requireCapturedOverrides?: boolean;
   powerShellToolDefinitionFactory: ShellDefinitionFactory | undefined;
   getShellHangMs?: () => number;
+  getLandlockSettings?: (() => LandlockSettings) | undefined;
   shellJobs?: FabricShellJobStore;
 }
 
@@ -248,6 +251,8 @@ export class PiToolsProvider implements FabricProvider {
   readonly #shellJobs: FabricShellJobStore;
   readonly #ownsShellJobs: boolean;
   readonly #getShellHangMs: (() => number) | undefined;
+  readonly #getLandlockSettings: (() => LandlockSettings) | undefined;
+  #landlock: LandlockBashConfinement | undefined;
 
   constructor(
     cwd: string,
@@ -276,6 +281,7 @@ export class PiToolsProvider implements FabricProvider {
     this.#ownsShellJobs = hostCapabilities.shellJobs === undefined;
     this.#shellJobs = hostCapabilities.shellJobs ?? new FabricShellJobStore();
     this.#getShellHangMs = hostCapabilities.getShellHangMs;
+    this.#getLandlockSettings = hostCapabilities.getLandlockSettings;
   }
 
   get shellJobs(): FabricShellJobStore {
@@ -284,6 +290,7 @@ export class PiToolsProvider implements FabricProvider {
 
   async close(): Promise<void> {
     if (this.#ownsShellJobs) await this.#shellJobs.close();
+    if (this.#ownsShellJobs || this.#shellJobs.live().length === 0) this.#landlock?.close();
   }
 
   async list(
@@ -443,16 +450,32 @@ export class PiToolsProvider implements FabricProvider {
     return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : DEFAULT_SHELL_HANG_MS;
   }
 
-  #trackedShellDefinition(
+  #landlockEnabled(): boolean {
+    const settings = this.#getLandlockSettings?.();
+    return process.platform === "linux" && settings?.mode === "enforce" && !settings.disabled;
+  }
+
+  async #trackedShellDefinition(
     name: "bash" | "powershell",
     args: Record<string, unknown>,
     job: ReturnType<FabricShellJobStore["begin"]>,
     middleware: FabricBashMiddlewareV1 | undefined,
-  ): ToolDefinition<any, any, any> {
+  ): Promise<ToolDefinition<any, any, any>> {
     const cwd = typeof args[PI_BASH_CWD_KEY] === "string" ? args[PI_BASH_CWD_KEY] : this.#cwd;
     if (name === "bash") {
       const options = middleware?.options;
-      const local = createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
+      let local = createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
+      if (this.#landlockEnabled()) {
+        const { LandlockBashConfinement, landlockCommand } = await import("../core/landlock.js");
+        this.#landlock ??= new LandlockBashConfinement(this.#cwd);
+        const originalCommand = String(args.command ?? "");
+        const { escape, command } = landlockCommand(originalCommand);
+        args.command = command;
+        local = this.#landlock.operations(
+          createLocalBashOperations({ shellPath: this.#landlock.helperPath }), local,
+          getShellConfig(options?.shellPath).shell, path.dirname(job.pidPath), escape, originalCommand,
+        );
+      }
       const operations = middleware ? middleware.wrapOperations(local) : local;
       if (!operations || typeof operations.exec !== "function") {
         throw new Error("Invalid Fabric bash middleware operations; refusing to bypass shell protection");
@@ -516,7 +539,7 @@ export class PiToolsProvider implements FabricProvider {
     });
     let tool: ToolDefinition<any, any, any>;
     try {
-      tool = this.#trackedShellDefinition(name, executeArgs, job, middleware);
+      tool = await this.#trackedShellDefinition(name, executeArgs, job, middleware);
     } catch (error) {
       await job.finish(null);
       throw error;
@@ -583,7 +606,7 @@ export class PiToolsProvider implements FabricProvider {
     const name = actionName as PiCoreToolName;
     this.#assertAllowed(name);
     if (!this.#requireCapturedOverrides && !this.#tools[name]) throw new Error(`Unknown Pi tool: ${actionName}`);
-    if (name === "bash" && !this.#requireCapturedOverrides && !this.#catalog?.get(name)) {
+    if (name === "bash" && !this.#landlockEnabled() && !this.#requireCapturedOverrides && !this.#catalog?.get(name)) {
       const intercepted = await tryExecuteGitWorktreeAdd(args, this.#cwd);
       if (intercepted) {
         this.#attachPreview(name, intercepted, args, context);
@@ -592,6 +615,10 @@ export class PiToolsProvider implements FabricProvider {
     }
     // Pin the selected protection across awaited lifecycle hooks/catalog refreshes.
     const middleware = this.#bashMiddleware(name);
+    if (name === "bash" && this.#landlockEnabled()
+      && (this.#requireCapturedOverrides || (this.#catalog?.get(name) && !middleware))) {
+      throw new Error("Landlock enforce requires standard local bash or cooperative middleware; refusing an unconfined opaque/managed override");
+    }
     // A captured extension override (e.g. an extension that registered a "read"
     // tool) already replays the full event lifecycle itself via
     // CapturedToolsProvider, so delegate to it unchanged.

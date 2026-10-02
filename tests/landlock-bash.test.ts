@@ -1,0 +1,315 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { performance } from "node:perf_hooks";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { createBashToolDefinition, createExtensionRuntime, ExtensionRunner, SessionManager, type Extension, type ModelRegistry, type RegisteredTool } from "@earendil-works/pi-coding-agent";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { DEFAULT_FABRIC_CONFIG, loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import type { LandlockSettings } from "../src/core/landlock.js";
+import { FABRIC_BASH_MIDDLEWARE, type FabricBashMiddlewareV1 } from "../src/protocol.js";
+import { CapturedToolsProvider } from "../src/providers/captured-tools-provider.js";
+import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
+
+const roots: string[] = [];
+const registries: ActionRegistry[] = [];
+const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
+const helper = path.resolve("dist/native/fabric-landlock");
+
+const harness = (settings: LandlockSettings = { mode: "enforce", disabled: false },
+  opt: { opaque?: boolean; managed?: boolean; blocked?: boolean } = {}) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-test-"));
+  roots.push(root);
+  const cwd = path.join(root, "lane");
+  const sibling = path.join(root, "sibling");
+  const tmpdir = path.join(root, "private-tmp");
+  for (const directory of [cwd, sibling, tmpdir]) fs.mkdirSync(directory, { mode: 0o700 });
+  fs.writeFileSync(path.join(sibling, "victim"), "keep-me");
+  vi.stubEnv("TMPDIR", tmpdir);
+  vi.stubEnv("SMARTY_ROLE", "task-agent@reviewed-policy");
+  const middleware: FabricBashMiddlewareV1 = {
+    version: 1, options: {
+      commandPrefix: "export LANDLOCK_PREFIX=preserved",
+      spawnHook: ({ env, ...rest }) => {
+        const filtered: NodeJS.ProcessEnv = { ...env, LANDLOCK_SPAWN: "preserved" };
+        delete filtered.FABRIC_TEST_SECRET;
+        // Even a cooperative env rewrite must not widen kernel policy.
+        filtered.PI_FABRIC_LANDLOCK_WRITES = "/";
+        return { ...rest, env: filtered };
+      },
+    },
+    wrapOperations: inner => ({ exec: (command, directory, options) => inner.exec(command, directory, {
+      ...options, onData: data => options.onData(Buffer.from(data.toString().replaceAll("filter-me", "[filtered]"))),
+    }) }),
+  };
+  const fallback = vi.fn(async () => ({ content: [{ type: "text" as const, text: "opaque" }], details: undefined }));
+  const definition = { ...createBashToolDefinition(cwd), execute: fallback };
+  if (!opt.opaque) Object.assign(definition, { [FABRIC_BASH_MIDDLEWARE]: middleware });
+  const sourceInfo = { path: "/test/local-middleware.ts", source: "test", scope: "user" as const, origin: "package" as const };
+  const extension: Extension = {
+    path: sourceInfo.path, resolvedPath: sourceInfo.path, sourceInfo,
+    tools: new Map([["bash", { definition, sourceInfo } as RegisteredTool]]),
+    handlers: new Map([["tool_call", [async () => opt.blocked ? { block: true, reason: "early warning" } : undefined]]]),
+    flags: new Map(), commands: new Map(), shortcuts: new Map(), messageRenderers: new Map(),
+  };
+  const runtime = createExtensionRuntime();
+  runtime.getThinkingLevel = () => "off";
+  runtime.getActiveTools = () => ["bash"];
+  // Genuine Pi runner and in-memory session; no agent/model/auth storage is created.
+  const runner = new ExtensionRunner([extension], runtime, cwd, SessionManager.inMemory(cwd), {} as ModelRegistry);
+  vi.spyOn(runner, "emitToolCall"); vi.spyOn(runner, "emitToolResult");
+  const extensionContext = runner.createContext();
+  const catalog = new CapturedToolCatalog();
+  catalog.replace(runner.getAllRegisteredTools(), runner, DEFAULT_FABRIC_CONFIG.capture, "/fabric/index.ts");
+  const provider = new PiToolsProvider(cwd, catalog, new CapturedToolsProvider(catalog), {
+    powerShellToolDefinitionFactory: undefined, getShellHangMs: () => 0,
+    getLandlockSettings: () => settings, requireCapturedOverrides: !!opt.managed,
+  });
+  const registry = new ActionRegistry();
+  registry.register(provider);
+  registries.push(registry);
+  const context = { cwd, extensionContext, signal: new AbortController().signal,
+    parentToolCallId: "landlock-parent", nestedToolCallId: "landlock-bash",
+    update: () => {}, approve: async () => {}, audits: [], maxResultChars: 100_000,
+  };
+  const invoke = async (args: Record<string, unknown>, signal = context.signal): Promise<{
+    ok: boolean; output: string; details: { running?: boolean; logPath?: string } | null;
+  }> => {
+    const { settle, ...input } = args;
+    try { return await registry.invoke("pi.bash", input, { ...context, signal }) as {
+      ok: boolean; output: string; details: { running?: boolean; logPath?: string } | null;
+    }; } catch (error) {
+      // Match pi.bash's bridge settle option while retaining the real provider path.
+      if (settle !== true) throw error;
+      return { ok: false, output: error instanceof Error ? error.message : String(error), details: null };
+    }
+  };
+  const audit = () => fs.readFileSync(path.join(cwd, ".pi/landlock-audit.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  return { root, cwd, sibling, tmpdir, provider, registry, runner, fallback, invoke, settings, audit };
+};
+
+afterEach(async () => {
+  await Promise.all(registries.splice(0).map(registry => registry.close()));
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
+
+describe("Landlock settings", () => {
+  it("defaults off, accepts enforce and rejects fake warn data", () => {
+    expect(DEFAULT_FABRIC_CONFIG.executor.landlock).toEqual({ mode: "off", disabled: false });
+    expect(normalizeFabricConfig({ executor: { landlock: { mode: "enforce" } } }).executor.landlock.mode).toBe("enforce");
+    expect(() => normalizeFabricConfig({ executor: { landlock: { mode: "warn" } } })).toThrow("no honest warn/audit mode");
+  });
+  it("keeps the fleet kill switch host-only", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-config-"));
+    roots.push(root);
+    const agentDir = path.join(root, "profile");
+    const cwd = path.join(root, "lane");
+    fs.mkdirSync(agentDir); fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ executor: { landlock: { disabled: true } } }));
+    fs.writeFileSync(path.join(cwd, ".pi/fabric.json"), JSON.stringify({ executor: { landlock: { mode: "enforce", disabled: false } } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted: true }).executor.landlock).toEqual({ mode: "enforce", disabled: true });
+  });
+});
+
+describe.skipIf(process.platform !== "linux")("real kernel through Pi tool_call -> cooperative Fabric bash -> Landlock", () => {
+  beforeAll(() => {
+    const probe = spawnSync(helper, ["--abi"], { encoding: "utf8" });
+    expect(probe.status, probe.error?.message || probe.stderr).toBe(0);
+    expect(Number(probe.stdout)).toBeGreaterThanOrEqual(4);
+  });
+
+  it.each([
+    ["rm", (dir: string) => `rm -rf -- ${quote(dir)}`],
+    ["absolute rm", (dir: string) => `/bin/rm -rf -- ${quote(dir)}`],
+    ["variable/encoded rm", (dir: string) => `c=$(printf '\\162\\155'); "$c" -rf -- ${quote(dir)}`],
+    ["find -delete", (dir: string) => `find ${quote(dir)} -depth -delete`],
+    ["python shutil", (dir: string) => `python3 -c ${quote(`import shutil; shutil.rmtree(${JSON.stringify(dir)})`)}`],
+    ["perl unlink", (dir: string) => `perl -e ${quote('unlink($ARGV[0]) or die "errno=".(0+$!)." $!\\n";')} -- ${quote(path.join(dir, "victim"))}`],
+    ["tee redirection", (dir: string) => `printf bad | tee > ${quote(path.join(dir, "victim"))}`],
+  ])("denies outside writes/deletion with EACCES: %s", async (_name, command) => {
+    const h = harness();
+    const result = await h.invoke({ command: (command as (dir: string) => string)(h.sibling), settle: true });
+    expect(result.ok).toBe(false);
+    expect(result.output).toMatch(/Permission denied|Errno 13|errno=13/);
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+    expect(h.runner.emitToolCall).toHaveBeenCalledOnce();
+    expect(h.runner.emitToolResult).toHaveBeenCalledOnce();
+    expect(h.fallback).not.toHaveBeenCalled();
+    expect(h.audit()[0].event).toBe("enforce");
+  });
+
+  it("allows lane/private TMPDIR writes, reads anywhere, filters/env/prefix and job pid", async () => {
+    vi.stubEnv("FABRIC_TEST_SECRET", "filter-me");
+    const h = harness();
+    const result = await h.invoke({ command: `printf lane > lane-file; printf temp > "$TMPDIR/temp-file"; cat ${quote(path.join(h.sibling, "victim"))}; printf '|%s|%s|%s|filter-me' "$LANDLOCK_PREFIX" "$LANDLOCK_SPAWN" "\${FABRIC_TEST_SECRET-unset}"` });
+    expect(result.output).toBe("keep-me|preserved|preserved|unset|[filtered]");
+    expect(fs.readFileSync(path.join(h.cwd, "lane-file"), "utf8")).toBe("lane");
+    expect(fs.readFileSync(path.join(h.tmpdir, "temp-file"), "utf8")).toBe("temp");
+    const writes = h.audit()[0].writes as string[];
+    expect(writes).toContain(h.cwd); expect(writes).toContain(h.tmpdir);
+    expect(writes).not.toContain(h.root); expect(writes).not.toContain("/tmp");
+    expect(h.provider.shellJobs.list()[0]?.status).toBe("exited");
+    expect(process.env.FABRIC_TEST_SECRET).toBe("filter-me");
+  });
+
+  it("does not widen to an out-of-lane per-call cwd or symlink target", async () => {
+    const h = harness();
+    fs.symlinkSync(h.sibling, path.join(h.cwd, "outside"));
+    for (const args of [{ command: "printf bad > victim", cwd: h.sibling }, { command: "printf bad > outside/victim" }]) {
+      const result = await h.invoke({ ...args, settle: true });
+      expect(result.ok).toBe(false); expect(result.output).toContain("Permission denied");
+    }
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+  });
+
+  it("denies truncate, create and rename with EACCES; hard-link access gain with EXDEV", async () => {
+    const h = harness();
+    const script = `import os, errno
+p=${JSON.stringify(h.sibling)}
+for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (lambda: os.mkdir(p+'/new'), errno.EACCES), (lambda: os.rename(p+'/victim', 'moved'), errno.EACCES), (lambda: os.link(p+'/victim', 'linked'), errno.EXDEV)]:
+ try: action()
+ except OSError as e:
+  assert e.errno == expected, e
+  print(e.errno)
+ else: raise Exception('unexpected success')`;
+    expect((await h.invoke({ command: `python3 -c ${quote(script)}` })).output).toBe("13\n13\n13\n18\n");
+    expect((await h.invoke({ command: 'mkdir a b; echo yes > a/item; mv a/item b/item; rm -rf a; cat b/item' })).output).toBe("yes\n");
+  });
+
+  it("confines BASH_ENV startup before any shell parsing", async () => {
+    const h = harness();
+    const startup = path.join(h.cwd, "startup.sh");
+    fs.writeFileSync(startup, `printf bypass > ${quote(path.join(h.sibling, "victim"))}\n`);
+    vi.stubEnv("BASH_ENV", startup);
+    const result = await h.invoke({ command: "printf normal" });
+    expect(result.output).toContain("Permission denied"); expect(result.output).toContain("normal");
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+  });
+
+  it.each([{ mode: "off" as const, disabled: false }, { mode: "enforce" as const, disabled: true }])("leaves disabled behavior unchanged: %j", async settings => {
+    const h = harness(settings);
+    expect((await h.invoke({ command: `rm -rf -- ${quote(h.sibling)}` })).ok).toBe(true);
+    expect(fs.existsSync(h.sibling)).toBe(false);
+    expect(fs.existsSync(path.join(h.cwd, ".pi/landlock-audit.jsonl"))).toBe(false);
+  });
+
+  it("logs every per-command escape, then confines the next command; live kill switch is honored", async () => {
+    const h = harness();
+    const command = `PI_FABRIC_LANDLOCK_ESCAPE=1 printf changed > ${quote(path.join(h.sibling, "victim"))}`;
+    for (let i = 0; i < 2; i++) expect((await h.invoke({ command })).output).toContain("Landlock escape: unconfined");
+    expect(h.audit().filter(row => row.event === "escape")).toHaveLength(2);
+    expect(JSON.stringify(h.audit())).not.toContain(command);
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("changed");
+    expect((await h.invoke({ command: `printf denied > ${quote(path.join(h.sibling, "victim"))}`, settle: true })).ok).toBe(false);
+    h.settings.disabled = true;
+    expect((await h.invoke({ command: `printf disabled > ${quote(path.join(h.sibling, "victim"))}` })).ok).toBe(true);
+  });
+
+  it("does not treat a shell-body environment assignment as a kernel escape", async () => {
+    const h = harness();
+    expect((await h.invoke({ command: `export PI_FABRIC_LANDLOCK_ESCAPE=1; printf bad > ${quote(path.join(h.sibling, "victim"))}`, settle: true })).ok).toBe(false);
+  });
+
+  it.each([{ opaque: true }, { managed: true }])("fails closed for a backend it cannot confine: %j", async opt => {
+    const h = harness(undefined, opt);
+    await expect(h.invoke({ command: "printf unreachable" })).rejects.toThrow("unconfined opaque/managed override");
+    expect(h.fallback).not.toHaveBeenCalled();
+  });
+
+  it("preserves early policy refusals before starting confinement", async () => {
+    const h = harness(undefined, { blocked: true });
+    await expect(h.invoke({ command: "printf blocked" })).rejects.toThrow("early warning");
+    expect(fs.existsSync(path.join(h.cwd, ".pi/landlock-audit.jsonl"))).toBe(false);
+  });
+
+  it("never escapes if mandatory logging fails", async () => {
+    const h = harness();
+    fs.mkdirSync(path.join(h.cwd, ".pi"));
+    fs.symlinkSync(path.join(h.sibling, "victim"), path.join(h.cwd, ".pi/landlock-audit.jsonl"));
+    const result = await h.invoke({ command: `PI_FABRIC_LANDLOCK_ESCAPE=1 printf bad > ${quote(path.join(h.sibling, "victim"))}`, settle: true });
+    expect(result.ok).toBe(false);
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+  });
+
+  it("grants only its own Fabric worker run, not the fleet run parent", async () => {
+    const h = harness();
+    const own = path.join(h.root, "worker-runs/own");
+    const other = path.join(h.root, "worker-runs/other");
+    fs.mkdirSync(own, { recursive: true }); fs.mkdirSync(other);
+    vi.stubEnv("PI_FABRIC_AGENT_RUN_DIR", own);
+    expect((await h.invoke({ command: `printf ok > ${quote(path.join(own, "output"))}` })).ok).toBe(true);
+    expect((await h.invoke({ command: `printf no > ${quote(path.join(other, "output"))}`, settle: true })).ok).toBe(false);
+    expect(h.audit()[0].writes).toContain(own);
+    expect(h.audit()[0].writes).not.toContain(path.dirname(own));
+  });
+
+  it("grants the lane's git common directory for linked-worktree administration", async () => {
+    const h = harness();
+    const common = path.join(h.root, "git-admin");
+    const worktree = path.join(common, "worktrees/lane");
+    fs.mkdirSync(worktree, { recursive: true });
+    fs.writeFileSync(path.join(h.cwd, ".git"), `gitdir: ${worktree}\n`);
+    fs.writeFileSync(path.join(worktree, "commondir"), "../..\n");
+    expect((await h.invoke({ command: `printf obj > ${quote(path.join(common, "object"))}` })).ok).toBe(true);
+    expect(h.audit()[0].writes).toContain(common);
+    expect(h.audit()[0].writes).not.toContain(h.root);
+  });
+
+  it("uses a generated private TMPDIR instead of shared /tmp", async () => {
+    const h = harness();
+    vi.stubEnv("TMPDIR", "/tmp");
+    vi.spyOn(os, "tmpdir").mockReturnValue(h.root);
+    const result = await h.invoke({ command: 'printf %s "$TMPDIR"; printf ok > "$TMPDIR/new"' });
+    expect(result.output.startsWith(path.join(h.root, "pi-fabric-landlock-"))).toBe(true);
+    expect(h.audit()[0].writes).not.toContain("/tmp");
+    // Registry close removes only this generated private temp directory.
+    await h.registry.close();
+    expect(fs.existsSync(result.output)).toBe(false);
+  });
+
+  it("preserves hard timeouts and cancellation and confines background children", async () => {
+    const h = harness();
+    await expect(h.invoke({ command: "sleep 8", timeout: 0.05 })).rejects.toThrow("timed out");
+    const controller = new AbortController();
+    const run = h.invoke({ command: "sleep 8" }, controller.signal);
+    const rejected = expect(run).rejects.toThrow();
+    await vi.waitFor(() => expect(h.provider.shellJobs.live().length).toBe(1));
+    controller.abort(); await rejected;
+    const result = await h.invoke({ command: `sleep 0.1; printf bad > ${quote(path.join(h.sibling, "victim"))}`, background: true });
+    expect(result.details?.running).toBe(true);
+    await vi.waitFor(() => expect(h.provider.shellJobs.live()).toHaveLength(0), { timeout: 3000 });
+    expect(fs.readFileSync(result.details!.logPath!, "utf8")).toContain("Permission denied");
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+  });
+
+  it.runIf(process.env.LANDLOCK_BENCH === "1")("measures interleaved real per-call overhead", async () => {
+    const h = harness();
+    const samples: Record<string, number[]> = { off: [], enforce: [] };
+    for (let round = 0; round < 85; round++) {
+      for (const mode of round % 2 ? ["enforce", "off"] as const : ["off", "enforce"] as const) {
+        h.settings.mode = mode;
+        const start = performance.now(); await h.invoke({ command: ":" });
+        if (round >= 5) samples[mode]!.push(performance.now() - start);
+      }
+    }
+    const stats = Object.fromEntries(Object.entries(samples).map(([mode, values]) => {
+      const sorted = [...values].sort((a,b) => a-b);
+      return [mode, { n: values.length, meanMs: values.reduce((a,b) => a+b,0)/values.length,
+        medianMs: sorted[Math.floor(sorted.length/2)], p95Ms: sorted[Math.floor(sorted.length*0.95)], minMs: sorted[0], maxMs: sorted.at(-1) }];
+    }));
+    console.log("LANDLOCK_REAL_PATH_OVERHEAD", JSON.stringify(stats));
+    if (process.env.TASK_OUT) fs.writeFileSync(path.join(process.env.TASK_OUT, "overhead-real-path.json"), JSON.stringify({ stats, samples }, null, 2)+"\n");
+  }, 120_000);
+});
+
+describe.skipIf(process.platform === "linux")("non-Linux", () => {
+  it("leaves bash unchanged even when Linux enforcement is selected", async () => {
+    const h = harness();
+    expect((await h.invoke({ command: "printf portable" })).output).toBe("portable");
+    expect(fs.existsSync(path.join(h.cwd, ".pi/landlock-audit.jsonl"))).toBe(false);
+  });
+});

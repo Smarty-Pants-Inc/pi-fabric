@@ -1,0 +1,16 @@
+{
+  "default": [
+    { "path": "$CWD", "reason": "Session lane, not per-call cwd" },
+    { "path": "$TMPDIR", "reason": "Owned private temporary directory only" },
+    { "path": "$RUN_DIR", "reason": "This command's Fabric shell artifacts" },
+    { "path": "$AGENT_RUN_DIR", "reason": "This worker's Fabric run, when present" },
+    { "path": "$GIT_COMMON_DIR", "reason": "Lane worktree administration and objects" },
+    { "path": "~/.cache", "reason": "Shared tool cache" },
+    { "path": "~/.npm", "reason": "npm cache" },
+    { "path": "~/.bun", "reason": "Bun cache and tool installation" },
+    { "path": "/dev/null", "reason": "Discard output" },
+    { "path": "/dev/tty", "reason": "Controlling terminal" },
+    { "path": "/dev/pts", "reason": "Pseudo-terminals" }
+  ],
+  "roles": { "task-agent": [], "worktree-agent": [], "main": [] }
+}

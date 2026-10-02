@@ -530,6 +530,8 @@ const main = async (): Promise<void> => {
       PI_FABRIC_ACTIVATION_NONCE: activationNonce ?? "",
       PI_FABRIC_ACTIVATION_HOOK: activationHookPath ?? "",
       PI_FABRIC_DELIVERY_DIR: deliveryDirectory,
+      // Own run only, never the shared parent/nested run root.
+      PI_FABRIC_AGENT_RUN_DIR: path.dirname(options.statusFile),
       PI_FABRIC_DEPTH: String(options.depth),
       PI_FABRIC_PARENT_RUN: options.id,
       PI_FABRIC_AGENT_NAME: options.name,

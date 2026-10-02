@@ -519,6 +519,7 @@ export class FabricRuntimeState {
     await builtins.tools(context.cwd, this.#config, this.capturedTools, {
       jobs: this.shellJobs,
       getHangMs: () => this.#config?.executor.shellHangMs ?? DEFAULT_SHELL_HANG_MS,
+      getLandlockSettings: () => this.#config?.executor.landlock ?? { mode: "off", disabled: false },
     });
     if (!this.#managedHost && (this.#config.fullCodeMode || enforceSchema)) {
       this.#shellInbox = new ShellEventInbox(this.pi, context, this.shellJobs);

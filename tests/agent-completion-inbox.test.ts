@@ -14,7 +14,7 @@ const result = (id: string, extra: Partial<AgentRunResult> = {}): AgentRunResult
   task: "work", runner: "pi", transport: "process", cwd: ".", updatedAt: 2, turns: 1, toolCalls: 0,
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, ...extra,
 });
-const harness = (capable = false) => {
+const harness = (capable = false, commitBatch?: (ids: string[]) => void) => {
   let idle = false;
   let pending = false;
   const handlers = new Map<string, Handler>();
@@ -32,7 +32,7 @@ const harness = (capable = false) => {
       return () => handlers.delete(name);
     }, sendMessage,
   } as unknown as ExtensionAPI;
-  const inbox = new AgentCompletionInbox(pi, context);
+  const inbox = new AgentCompletionInbox(pi, context, commitBatch);
   inboxes.push(inbox);
   return {
     inbox, context, handlers, sendMessage, notify, sessionFile,
@@ -83,6 +83,50 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage.mock.calls.map(([message]) => message.details.ids)).toEqual([["a"], ["b"], ["b"]]);
     expect(receipts[1]).toHaveBeenCalledOnce();
   });
+  it("prepares all capable results before claiming any sender group", () => {
+    const commit = vi.fn();
+    const h = harness(true, commit);
+    const prepare = vi.fn().mockImplementationOnce(() => { throw new Error("archive unavailable"); });
+    h.inbox.enqueue(result("a"), undefined, vi.fn());
+    h.inbox.enqueue(result("b"), undefined, prepare);
+    h.boundary();
+    expect(commit).not.toHaveBeenCalled();
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    h.boundary();
+    expect(commit.mock.calls).toEqual([[["a"]], [["b"]]]);
+    expect(h.sendMessage.mock.calls.map(([message]) => message.details.ids)).toEqual([["a"], ["b"]]);
+  });
+
+  it("does not replay a claimed capable send or claim its unattempted siblings", () => {
+    const commit = vi.fn();
+    const h = harness(true, commit);
+    const receipts = [vi.fn(), vi.fn(), vi.fn()];
+    for (const [index, id] of ["a", "b", "c"].entries()) h.inbox.enqueue(result(id), receipts[index], vi.fn());
+    h.sendMessage.mockImplementationOnce(() => {}).mockImplementationOnce(() => { throw new Error("accepted then failed"); });
+    expect(() => h.boundary()).toThrow("accepted then failed");
+    expect(commit.mock.calls).toEqual([[["a"]], [["b"]]]);
+    expect(receipts[0]).toHaveBeenCalledOnce();
+    expect(receipts[1]).toHaveBeenCalledOnce();
+    expect(receipts[2]).not.toHaveBeenCalled();
+    h.boundary();
+    expect(commit.mock.calls).toEqual([[["a"]], [["b"]], [["c"]]]);
+    expect(h.sendMessage.mock.calls.map(([message]) => message.details.ids)).toEqual([["a"], ["b"], ["c"]]);
+    expect(receipts[2]).toHaveBeenCalledOnce();
+  });
+
+  it("retains a capable child until its durable sender-group claim succeeds", () => {
+    const commit = vi.fn().mockImplementationOnce(() => { throw new Error("claim unavailable"); });
+    const h = harness(true, commit);
+    const receipt = vi.fn();
+    h.inbox.enqueue(result("a"), receipt, vi.fn());
+    h.boundary();
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(receipt).not.toHaveBeenCalled();
+    h.boundary();
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    expect(receipt).toHaveBeenCalledOnce();
+  });
+
   it("stays inert when ExtensionAPI.on is missing or does not return unsubscribe", () => {
     const context = { hasUI: false, isIdle: () => true, hasPendingMessages: () => false } as unknown as ExtensionContext;
     const missing = new AgentCompletionInbox({ sendMessage: vi.fn() } as unknown as ExtensionAPI, context);
@@ -294,6 +338,40 @@ describe("AgentCompletionInbox", () => {
     expect(() => h.inbox.enqueue(result("a"), failedReceipt)).not.toThrow();
     h.boundary();
     expect(failedReceipt.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("retries a failed delivered receipt without sending the notice again", async () => {
+    const h = harness();
+    const receipt = vi.fn().mockImplementationOnce(() => { throw new Error("I/O unavailable"); });
+    const prepare = vi.fn();
+    h.inbox.enqueue(result("a"), receipt, prepare);
+    h.boundary();
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(receipt).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(receipt).toHaveBeenCalledTimes(2);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("does not deliver until the durable consumption claim succeeds", async () => {
+    const h = harness();
+    const prepare = vi.fn().mockImplementationOnce(() => { throw new Error("disk unavailable"); });
+    h.inbox.enqueue(result("a"), undefined, prepare);
+    h.boundary();
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    h.boundary();
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("chooses at-most-once if a claimed send has an unknown outcome", () => {
+    const h = harness();
+    const receipt = vi.fn();
+    h.sendMessage.mockImplementationOnce(() => { throw new Error("accepted then failed"); });
+    h.inbox.enqueue(result("a"), receipt, vi.fn());
+    expect(() => h.boundary()).toThrow("accepted then failed");
+    h.boundary();
+    expect(receipt).toHaveBeenCalledOnce();
     expect(h.sendMessage).toHaveBeenCalledOnce();
   });
 

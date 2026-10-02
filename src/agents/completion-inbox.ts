@@ -10,7 +10,7 @@ const BATCH_CHARS = 16_000;
 const IDLE_BATCH_MS = 40;
 
 type Completion = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "error" | "startedAt" | "finishedAt" | "completionDelivery">;
-type PendingCompletion = { result: Completion; delivered: (() => void) | undefined };
+type PendingCompletion = { result: Completion; delivered: (() => void) | undefined; prepare: (() => void) | undefined };
 type CompletionMessage = { customType: string; content: string; display: boolean; details: { ids: string[] } };
 
 const oneLine = (text: string): string => text.replace(/[\u0000-\u001f\u007f]/g, " ");
@@ -22,6 +22,7 @@ export class AgentCompletionInbox {
   readonly #pending = new Map<string, PendingCompletion>();
   readonly #acknowledged = new Set<string>();
   readonly #handed = new Map<string, (() => void) | undefined>();
+  readonly #receiptRetries = new Set<() => void>();
   readonly #unsubscribe: Array<() => void> = [];
   #context: ExtensionContext;
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -32,7 +33,7 @@ export class AgentCompletionInbox {
   #persistedIds = new Set<string>();
   #receiptFault: string | undefined;
 
-  constructor(readonly pi: ExtensionAPI, context: ExtensionContext) {
+  constructor(readonly pi: ExtensionAPI, context: ExtensionContext, readonly commitBatch?: (ids: string[]) => void) {
     this.#context = context;
     const subscribe = (event: string, handler: (...handlerArgs: any[]) => unknown): void => {
       if (typeof pi.on !== "function") return;
@@ -92,7 +93,7 @@ export class AgentCompletionInbox {
       });
   }
 
-  enqueue(result: Completion, delivered?: () => void): void {
+  enqueue(result: Completion, delivered?: () => void, prepare?: () => void): void {
     if (this.#closed) return;
     if (this.#acknowledged.has(result.id)) {
       if (this.#handed.has(result.id)) {
@@ -110,7 +111,7 @@ export class AgentCompletionInbox {
         ...(result.completionDelivery ? { completionDelivery: result.completionDelivery } : {}),
         ...(result.error !== undefined ? { error: clip(result.error, SUMMARY_CHARS) } : {}),
       },
-      delivered,
+      delivered, prepare,
     });
     if (this.#context.hasUI) {
       const failure = result.status !== "completed";
@@ -127,6 +128,7 @@ export class AgentCompletionInbox {
   }
 
   close(): void {
+    for (const receipt of this.#receiptRetries) this.#confirmDelivery(receipt);
     this.#closed = true;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
@@ -134,6 +136,7 @@ export class AgentCompletionInbox {
     this.#pending.clear();
     this.#acknowledged.clear();
     this.#handed.clear();
+    this.#receiptRetries.clear();
   }
 
   #confirmHeld(): void {
@@ -143,7 +146,10 @@ export class AgentCompletionInbox {
       // assistant message. Neither getEntries nor an uninspectable host is a durable receipt.
       const ids = this.#sessionReceipt();
       for (const [id, delivered] of this.#handed) {
-        if (ids.has(id) && this.#confirmDelivery(delivered)) this.#handed.delete(id);
+        if (ids.has(id)) {
+          this.#confirmDelivery(delivered);
+          this.#handed.delete(id);
+        }
       }
       this.#receiptFault = undefined;
     } catch (error) {
@@ -212,18 +218,22 @@ export class AgentCompletionInbox {
   }
 
   #confirmDelivery(delivered: (() => void) | undefined): boolean {
-    try { delivered?.(); return true; } catch {
-      // Keep the callback held: a failed receipt is retried at the next confirmed boundary.
+    if (!delivered) return true;
+    try { delivered(); this.#receiptRetries.delete(delivered); return true; } catch {
+      this.#receiptRetries.add(delivered);
+      this.#schedule();
       return false;
     }
   }
 
   #schedule(): void {
-    if (this.#closed || this.#timer || this.#suspended || !this.#pending.size) return;
+    if (this.#closed || this.#timer || (!this.#receiptRetries.size && (this.#suspended || !this.#pending.size))) return;
     // Never enqueue into Pi during an active tool batch. turn_end owns that path.
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
+      for (const receipt of this.#receiptRetries) this.#confirmDelivery(receipt);
       if (this.#context.isIdle() && !this.#context.hasPendingMessages()) this.#flush();
+      if (this.#receiptRetries.size) this.#schedule();
     }, IDLE_BATCH_MS);
     this.#timer.unref?.();
   }
@@ -234,8 +244,12 @@ export class AgentCompletionInbox {
     if (this.#closed || this.#suspended || this.#context.signal?.aborted || !this.#pending.size) return;
     const batch = [...this.#pending.values()].slice(0, 32);
     const perResult = Math.max(0, Math.min(SUMMARY_CHARS, Math.floor(BATCH_CHARS / batch.length) - 320));
-    // One turn has one sender: attribute each local child result separately on capable Pi.
-    // Legacy hosts retain the existing batch. Receipts are held until each send is durable.
+    // Preparation is non-consuming: a later failure leaves every outcome unread.
+    try {
+      for (const { prepare } of batch) prepare?.();
+    } catch { this.#schedule(); return; }
+    // One turn has one sender: attribute each child separately on capable Pi.
+    // Claim only the group about to be sent; unclaimed Main receipts require a durable carrier.
     const groups = fabricProvenanceSupported(this.pi) ? batch.map(item => [item]) : [batch];
     try {
       for (const group of groups) {
@@ -249,16 +263,28 @@ export class AgentCompletionInbox {
             return `Agent ${oneLine(result.name).slice(0, 80)} (${result.id}) ${result.status} after ${seconds}s${provenance}:\n${clip(summary || "no result", perResult)}`;
           }),
         ].join("\n\n");
-        deliver({
-          customType: AGENT_COMPLETION_MESSAGE_TYPE,
-          content,
-          display: false,
-          details: { ids: group.map(({ result }) => result.id) },
-        }, group[0]!.result);
-        for (const { result, delivered } of group) {
-          this.#pending.delete(result.id);
-          this.#acknowledged.add(result.id);
-          this.#handed.set(result.id, delivered);
+        try {
+          this.commitBatch?.(group.map(({ result }) => result.id));
+        } catch { this.#schedule(); return; }
+        const claimed = !!this.commitBatch || group.some(({ prepare }) => !!prepare);
+        let sent = false;
+        try {
+          deliver({
+            customType: AGENT_COMPLETION_MESSAGE_TYPE,
+            content,
+            display: false,
+            details: { ids: group.map(({ result }) => result.id) },
+          }, group[0]!.result);
+          sent = true;
+        } finally {
+          // A claimed actor send may fail after Pi accepted it: choose at-most-once.
+          // Unclaimed Main completions retain retry-on-send-failure and durable receipt barriers.
+          if (claimed || sent) for (const { result, delivered } of group) {
+            this.#pending.delete(result.id);
+            this.#acknowledged.add(result.id);
+            if (claimed) this.#confirmDelivery(delivered);
+            else this.#handed.set(result.id, delivered);
+          }
         }
       }
     } finally {

@@ -1,12 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { pathToFileURL } from "node:url";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { collectHostReleases, formatReleaseReports, main } from "../src/releases-cli.js";
 import { mainReleaseRecordDir, processStart } from "../src/lifecycle/release-process.js";
 
 const roots: string[] = [];
-afterEach(() => roots.splice(0).forEach(root => fs.rmSync(root, { recursive: true, force: true })));
+afterEach(() => {
+  roots.splice(0).forEach(root => fs.rmSync(root, { recursive: true, force: true }));
+  vi.unstubAllEnvs();
+});
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-release-census-"));
   roots.push(root);
@@ -39,6 +43,70 @@ const fixture = () => {
 };
 
 describe("read-only release report", () => {
+  it.each(["tilde", "file URL", "absolute"])("resolves an observed %s profile like the runtime", form => {
+    const f = fixture();
+    vi.stubEnv("HOME", f.root);
+    vi.stubEnv("USERPROFILE", f.root);
+    // The census's own profile must not replace the observed process's profile.
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(f.root, "observer-profile"));
+    const profile = path.dirname(f.settingsPath);
+    const observedProfile = form === "tilde" ? "~/profile"
+      : form === "file URL" ? pathToFileURL(profile).href : profile;
+    const environment = { PI_CODING_AGENT_DIR: observedProfile };
+    f.process(10, 1, ["pi"], environment);
+    f.record(10, "session-one");
+    f.process(20, 10, ["node", path.join(f.root, "releases", "old", "dist", "worker.js"),
+      "--id", "run-20", "--main-agent-id", "session:session-one"], environment);
+
+    // Do not pass settingsPath: it would override the observed environment.
+    const report = collectHostReleases({ procRoot: f.procRoot });
+    expect(report.mains).toHaveLength(1);
+    expect(report.mains[0]).toMatchObject({ pid: 10, mainId: "session:session-one",
+      loaded: "old", active: "active", evidence: "runtime-record" });
+    expect(report.mains[0]?.workers).toEqual([expect.objectContaining({
+      pid: 20, mainId: "session:session-one", loaded: "old", active: "active",
+    })]);
+  });
+  it.each(["non-Pi", "Pi"])("contains an invalid observed %s profile without losing a valid Main", kind => {
+    const f = fixture();
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(f.root, "observer-profile"));
+    f.process(10, 1, ["pi"]);
+    f.record(10, "session-one");
+    f.process(11, 1, kind === "Pi" ? ["pi"] : ["unrelated-service"],
+      { PI_CODING_AGENT_DIR: "file:///tmp/profile%" });
+
+    const report = collectHostReleases({ procRoot: f.procRoot });
+    expect(report.mains.find(main => main.pid === 10)).toMatchObject({
+      mainId: "session:session-one", loaded: "old", active: "active", evidence: "runtime-record",
+    });
+    expect(report.skippedProcesses).toBe(1);
+    if (kind === "Pi") {
+      expect(report.mains.find(main => main.pid === 11)).toMatchObject({
+        loaded: "unknown", active: "unknown", evidence: "unknown",
+      });
+      expect(report.mains).toHaveLength(2);
+    } else {
+      expect(report.mains).toHaveLength(1);
+    }
+  });
+
+  it("keeps invalid-profile workers visible without using the observer's selector", () => {
+    const f = fixture();
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.dirname(f.settingsPath));
+    f.process(10, 1, ["pi"]);
+    f.record(10, "session-one");
+    f.process(20, 10, ["node", path.join(f.root, "releases", "old", "dist", "worker.js"),
+      "--id", "run-20", "--main-agent-id", "session:session-one"],
+    { PI_CODING_AGENT_DIR: "file:///tmp/profile%" });
+
+    const report = collectHostReleases({ procRoot: f.procRoot });
+    expect(report.skippedProcesses).toBe(1);
+    expect(report.mains).toHaveLength(1);
+    expect(report.mains[0]).toMatchObject({ pid: 10, active: "active", workers: [
+      { pid: 20, loaded: "old", active: "unknown" },
+    ] });
+  });
+
   it("groups live Main and actor workers using loaded paths, not the active selector", () => {
     const f = fixture();
     f.process(10, 1, ["pi"]);

@@ -863,8 +863,15 @@ export class AgentsProvider implements FabricProvider {
         }
         try {
           const result = this.manager.status(id);
+          // Actor foreground values need main's durable consumption fence, but a worker
+          // candidate cannot consume this PR's logical-run outcome. Use the existing bounded
+          // wait path to settle that race before returning a terminal value to an actor.
+          if (terminalAgentStatuses.has(result.status) && !this.manager.isSettled(id) && this.actorManager.identity.kind === "actor") {
+            return this.invoke("wait", args, context);
+          }
           // Model-facing terminal status returns the result; UI polling must not acknowledge it.
           if (terminalAgentStatuses.has(result.status) && this.manager.isSettled(id)) {
+            this.manager.prepareForeground(id);
             if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.detachSignal(id));
             else this.manager.markForeground(id);
           }
@@ -917,6 +924,9 @@ export class AgentsProvider implements FabricProvider {
         return this.participants.self();
       case "main":
         return this.mainAgent.info(context.extensionContext);
+      case "spawner":
+        if (!this.#router.spawner) throw new Error("This worker has no bound Fabric spawner; specify an explicit reply target");
+        return structuredClone(this.#router.spawner);
       case "sessions": {
         const stalled = this.participants.writeStalled?.();
         if (stalled) throw stalled;
@@ -1625,7 +1635,7 @@ export class AgentsProvider implements FabricProvider {
     const live = this.participants.get(actor.id, undefined, { fresh: true });
     // Strip passive counts and runs even when an older owner omits its live counters.
     // In particular, an idle owner without actorRun must clear a registry's stale run.
-    const { queued: _queued, messages: _messages, inFlightRun: _run, ...definition } = actor;
+    const { queued: _queued, messages: _messages, preparing: _preparing, inFlightRun: _run, ...definition } = actor;
     if (!live || live.stale || live.kind !== "actor") return { ...definition, status: "unknown" };
     const now = Date.now();
     const removal = live.actorRemoval ?? actor.removal;
@@ -1633,12 +1643,16 @@ export class AgentsProvider implements FabricProvider {
     const runId = removal?.runId ?? run?.id;
     const runAge = formatAge(now - (removal?.runStartedAt ?? run?.startedAt ?? removal?.requestedAt ?? now));
     const status = live.status === "idle" || live.status === "queued" ||
+      live.status === "preparing" || live.status === "waiting" ||
       live.status === "running" || live.status === "stopped" ? live.status : "unknown";
     return {
       ...definition,
       status,
       ...(live.actorQueued !== undefined ? { queued: live.actorQueued } : {}),
       ...(live.actorMessages !== undefined ? { messages: live.actorMessages } : {}),
+      ...(live.actorPreparing
+        ? { preparing: { ...live.actorPreparing, ageS: Math.max(0, Math.round((now - live.actorPreparing.startedAt) / 1_000)) } }
+        : {}),
       ...(run ? { inFlightRun: { ...run, ageS: Math.max(0, Math.round((now - run.startedAt) / 1_000)) } } : {}),
       ...(removal
         ? {

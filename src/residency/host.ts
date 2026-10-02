@@ -966,7 +966,6 @@ export class ResidentHost {
           command.request.actorName ||
           command.request.meshRoot ||
           command.request.runnerSessionId ||
-          command.request.systemPrompt ||
           command.request.images
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");

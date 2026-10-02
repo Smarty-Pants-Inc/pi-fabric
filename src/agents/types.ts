@@ -43,8 +43,12 @@ export interface AgentSessionSeed {
 }
 
 export interface AgentRunRequest {
+  /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
+  idempotencyKey?: string;
   /** Host-created shadow decision; never accepted from external argument normalization. */
   routeDecision?: ModelRouteDecision;
+  /** Host-only judgment join; never normalized from public agent arguments. */
+  routeRecord?: { ledger: string; decisionRecorded: boolean };
   /** Host-only resident startup probe: model/extension admission, no prompt or tools. */
   residentStartupProbe?: boolean;
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
@@ -191,6 +195,9 @@ export interface AgentRunRecord {
 }
 
 export interface AgentRunResult extends AgentRunRecord {
+  /** Failed admission only: model/auth timed out before any transport launch was attempted.
+   * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
+  launchPreparationTimeoutMs?: number;
   status: "completed" | "failed" | "stopped" | "timed_out";
 }
 
@@ -257,6 +264,8 @@ export interface AgentWorkerOptions {
   bashTimeoutSeconds?: number;
   fabricExtensionPath?: string;
   routeHeader?: string;
+  /** Host-only bounded judge: no ambient resources, compaction or retry. */
+  judgment?: boolean;
   model?: string;
   thinking?: string;
   systemPrompt?: string;

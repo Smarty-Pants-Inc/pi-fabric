@@ -1686,6 +1686,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
 
   it.each([
     ["SIGTERM", false, false], ["SIGKILL", false, false], ["SIGKILL", true, false], ["SIGKILL", false, true],
+    ["SIGKILL", "ownerless", false],
   ] as const)("relaunches a dead durable host on ordinary tell after %s (fresh dead mesh lock: %s) (fresh dead registry lock: %s)", { timeout: 100_000 }, async (signal, deadMeshLock, deadRegistryLock) => {
     const state = await rootHarness(`resident-relaunch-${signal}`);
     const launches = launchLog(state.root);
@@ -1714,6 +1715,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     const registry = () => JSON.parse(fs.readFileSync(path.join(state.config.actorRoot, "actors.json"), "utf8")) as
       { actors: Array<{ id: string; messages: Array<{ text?: string; data?: { message?: string } }>; queue: unknown[] }> };
     let senderRestart: Promise<void> | undefined;
+    let ownerlessLockCreatedAt: number | undefined;
     try {
       const actor = await client.createActor({ name: "restart survivor", instructions: "Keep id and mailbox.", residency: "durable", coalesce: false });
       await router.routeMessage(actor.id, "before death", undefined, "followUp");
@@ -1737,8 +1739,14 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         const meshLock = path.join(state.config.meshRoot, ".lock");
         await waitFor(() => !fs.existsSync(meshLock), 35_000);
         fs.mkdirSync(meshLock);
-        fs.writeFileSync(path.join(meshLock, "owner"), `dead-host\n${killed.pid}\n${Date.now()}\n`);
-        // Resume the sender after publishing the complete dead identity.
+        // SIGKILL between mkdir and owner publication (or during legacy release) leaves no owner.
+        if (deadMeshLock !== "ownerless") {
+          fs.writeFileSync(path.join(meshLock, "owner"), `dead-host\n${killed.pid}\n${Date.now()}\n`);
+        } else {
+          expect(fs.existsSync(path.join(meshLock, "owner"))).toBe(false);
+          ownerlessLockCreatedAt = fs.statSync(meshLock).mtimeMs;
+        }
+        // Resume the sender after publishing the dead identity or fresh ownerless directory.
         senderRestart = state.participants.start().catch(() => undefined);
         control.start(() => ({ accepted: false }));
       }
@@ -1753,6 +1761,11 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       const result = await router.routeMessage(actor.id, `after ${signal}`, undefined, "followUp");
       expect(result.queued).toBe(true);
       expect(Date.now() - started).toBeLessThan(30_000 + 15_000);
+      if (ownerlessLockCreatedAt !== undefined) {
+        expect(Date.now() - ownerlessLockCreatedAt).toBeGreaterThan(30_000);
+        const fences = fs.readdirSync(state.config.meshRoot).filter(name => name.startsWith(".lock.dead."));
+        expect(fences.some(name => fs.existsSync(path.join(state.config.meshRoot, name, ".recovery-fence")))).toBe(true);
+      }
       await senderRestart;
       expect(owner().pid).not.toBe(killed.pid);
       await router.routeMessage(actor.id, "queued successor", undefined, "followUp");

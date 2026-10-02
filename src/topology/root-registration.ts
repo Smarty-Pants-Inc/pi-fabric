@@ -168,16 +168,18 @@ export class RootRegistrationGuard {
             "Use a fresh unique name and reload or close the older owner before relying on named routing.");
         }
       }
+      // Keep proof of death while that process's old participant lease is still visible.
+      // Otherwise a refresh/reload of its successor could mistake the leftover lease for a
+      // live unguarded root, particularly when the successor reused a name with a new UUID.
+      // Cleanup can fail: finish it before committing ownership so a rejected rename keeps
+      // the previous reservation in sync with the runtime's last admitted routing alias.
+      for (const item of dead) {
+        if (!roots.some(root => root.rootRegistrationOwnerId === item.ownerId)) fs.rmSync(item.file, { force: true });
+      }
       writeJsonAtomic(path.join(this.#dir, fileName(owner)), { format: 1, ...candidate, owner });
       this.#claimed = owner;
       this.#sessionId = candidate.sessionId;
       forgetRetainedRootRegistration(candidate.sessionId, `${this.mesh.root}\0${owner.id}`);
-      // Keep proof of death while that process's old participant lease is still visible.
-      // Otherwise a refresh/reload of its successor could mistake the leftover lease for a
-      // live unguarded root, particularly when the successor reused a name with a new UUID.
-      for (const item of dead) {
-        if (!roots.some(root => root.rootRegistrationOwnerId === item.ownerId)) fs.rmSync(item.file, { force: true });
-      }
     });
     for (const warning of unknownNames) {
       if (this.#reportedUnknownNames.has(warning) || this.#reportedUnknownNames.size >= 1_000) continue;

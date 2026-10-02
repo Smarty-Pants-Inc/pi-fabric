@@ -87,6 +87,76 @@ describe("runtime duplicate-root admission", () => {
     expect(inbox.names()).not.toContain("reserved-name");
   });
 
+  it("preserves the admitted rename alias when dead-registration cleanup fails, then retries safely", async () => {
+    const f = fixture();
+    const starts = vi.spyOn(RootInbox.prototype, "start");
+    const publications = vi.spyOn(ParticipantDirectory.prototype, "start");
+    await f.runtime.initialize(f.context, f.config);
+    const inbox = starts.mock.instances[0] as RootInbox;
+    const participants = publications.mock.instances[0] as ParticipantDirectory;
+    const dir = path.join(f.meshRoot, "root-registrations");
+    const claimFile = path.join(dir, fs.readdirSync(dir)[0]!);
+    const originalClaim = fs.readFileSync(claimFile, "utf8");
+    const deadOwner = { id: "synthetic-dead-cleanup", pid: 2_147_483_647, host: os.hostname(), startTime: "" };
+    const deadFile = path.join(dir, createHash("sha256").update(deadOwner.id).digest("hex") + ".json");
+    const dead = new RootRegistrationGuard(new MeshStore(f.meshRoot, 64 * 1024, 100), { owner: deadOwner });
+    await dead.claim({ sessionId: "synthetic-dead-session", rootId: "session:synthetic-dead-session", fabricSessionId: "synthetic-dead-session", name: "dead-unrelated-name" });
+    // Prove this synthetic PID dead without relying on the host's process table.
+    const kill = process.kill;
+    vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid === deadOwner.pid) throw Object.assign(new Error("synthetic owner is dead"), { code: "ESRCH" });
+      return kill(pid, signal);
+    });
+    const failure = Object.assign(new Error("injected dead-registration cleanup failure"), { code: "EACCES" });
+    const remove = fs.rmSync;
+    const cleanup = vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (file === deadFile) throw failure;
+      return remove(file, options);
+    });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    f.setName("renamed-root");
+    try {
+      // The runtime catches the failed claim, so verify its error notification as well as
+      // both sides of admission: the durable reservation and the consuming/published alias.
+      await f.handlers.get("session_info_changed")?.({}, f.context);
+      expect(errors).toHaveBeenCalledWith(expect.stringContaining(failure.message));
+      expect(f.context.ui.notify).toHaveBeenCalledWith(failure.message, "error");
+      expect(cleanup.mock.calls.filter(([file]) => file === deadFile)).toHaveLength(1);
+      expect.soft(fs.readFileSync(claimFile, "utf8")).toBe(originalClaim);
+      expect(fs.existsSync(deadFile)).toBe(true);
+      expect(inbox.names()).toContain("fixture-root");
+      expect(inbox.names()).not.toContain("renamed-root");
+      await participants.refresh();
+      expect(f.runtime.participantInfos({ kinds: ["root"], fresh: true })).toEqual([
+        expect.objectContaining({ name: "fixture-root", sessionId: "synthetic-new-session" }),
+      ]);
+    } finally {
+      // Rival rejection must come from ownership, not the same injected cleanup error.
+      cleanup.mockRestore();
+    }
+    try {
+      await expect.soft(f.incumbent.claim({ sessionId: "synthetic-rival-old", rootId: "session:synthetic-rival-old", fabricSessionId: "synthetic-rival-old", name: "fixture-root" })).rejects.toMatchObject({ code: "FABRIC_DUPLICATE_LIVE_ROOT" });
+    } finally { await f.incumbent.close(); }
+
+    await f.handlers.get("session_info_changed")?.({}, f.context);
+    expect(errors).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fs.readFileSync(claimFile, "utf8"))).toMatchObject({ name: "renamed-root", sessionId: "synthetic-new-session" });
+    expect(fs.existsSync(deadFile)).toBe(false);
+    expect(inbox.names()).toContain("renamed-root");
+    expect(inbox.names()).not.toContain("fixture-root");
+    await participants.refresh();
+    expect(f.runtime.participantInfos({ kinds: ["root"], fresh: true })).toEqual([
+      expect.objectContaining({ name: "renamed-root", sessionId: "synthetic-new-session" }),
+    ]);
+    const rival = new RootRegistrationGuard(new MeshStore(f.meshRoot, 64 * 1024, 100), {
+      owner: { id: "synthetic-rival-new", pid: process.pid, host: os.hostname(), startTime: "" },
+    });
+    try {
+      await expect(rival.claim({ sessionId: "synthetic-rival-new", rootId: "session:synthetic-rival-new", fabricSessionId: "synthetic-rival-new", name: "renamed-root" })).rejects.toMatchObject({ code: "FABRIC_DUPLICATE_LIVE_ROOT" });
+      await expect(rival.claim({ sessionId: "synthetic-rival-new", rootId: "session:synthetic-rival-new", fabricSessionId: "synthetic-rival-new", name: "fixture-root" })).resolves.toBeUndefined();
+    } finally { await rival.close(); }
+  });
+
   it("allows same-owner reinitialization and releases the claim on shutdown", async () => {
     const f = fixture();
     await f.runtime.initialize(f.context, f.config);

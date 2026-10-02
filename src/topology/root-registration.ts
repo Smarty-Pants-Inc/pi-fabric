@@ -58,6 +58,12 @@ const sameOwner = (left: RootRegistrationOwner, right: RootRegistrationOwner): b
   left.id === right.id && left.pid === right.pid && left.host === right.host && left.startTime === right.startTime;
 const fileName = (owner: RootRegistrationOwner): string =>
   createHash("sha256").update(owner.id).digest("hex") + ".json";
+// Every mailbox recipient a root consumes (canonical IDs and its admitted name). Admission
+// reserves the whole set: an alias equal to another root's ID would receive its mail.
+const recipientIds = (identity: RootRegistrationIdentity): string[] =>
+  [identity.sessionId, identity.rootId, identity.fabricSessionId];
+const aliasOverlap = (left: RootRegistrationIdentity, right: RootRegistrationIdentity): string | undefined =>
+  left.name && recipientIds(right).includes(left.name) ? left.name : undefined;
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const registrationOf = (text: string, name: string): Registration => {
@@ -143,7 +149,9 @@ export class RootRegistrationGuard {
         const conflict = current.sessionId === candidate.sessionId ? "native session ID is already live" :
           current.rootId === candidate.rootId ? "root lineage is already live" :
           current.fabricSessionId === candidate.fabricSessionId ? "actor persistence session/lineage is already live" :
-          candidate.name && current.name === candidate.name ? `name ${JSON.stringify(candidate.name)} is already live` : undefined;
+          candidate.name && current.name === candidate.name ? `name ${JSON.stringify(candidate.name)} is already live` :
+          aliasOverlap(candidate, current) ? `name ${JSON.stringify(candidate.name)} is a live root's ID` :
+          aliasOverlap(current, candidate) ? `live root name ${JSON.stringify(current.name)} is this root's ID` : undefined;
         if (conflict) throw new DuplicateLiveRootError(candidate, current, conflict);
       }
       // Existing participant leases also protect roots from before this guard's rollout.
@@ -156,7 +164,11 @@ export class RootRegistrationGuard {
           root.sessionId === candidate.fabricSessionId ? "actor persistence session/lineage has a live participant lease" :
           root.rootId === candidate.rootId ? "root lineage has a live participant lease" :
           candidate.name && root.name !== "main" && root.name === candidate.name ?
-            `name ${JSON.stringify(candidate.name)} has a live participant lease` : undefined;
+            `name ${JSON.stringify(candidate.name)} has a live participant lease` :
+          candidate.name && (candidate.name === root.rootId || candidate.name === root.sessionId) ?
+            `name ${JSON.stringify(candidate.name)} is a live participant root's ID` :
+          recipientIds(candidate).includes(root.name) ?
+            `live participant name ${JSON.stringify(root.name)} is this root's ID` : undefined;
         if (conflict) throw new DuplicateLiveRootError(candidate, {
           sessionId: root.sessionId ?? root.rootId, rootId: root.rootId,
           fabricSessionId: root.sessionId ?? root.rootId, name: root.name,

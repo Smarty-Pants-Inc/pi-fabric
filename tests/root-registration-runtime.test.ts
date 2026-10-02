@@ -157,6 +157,59 @@ describe("runtime duplicate-root admission", () => {
     } finally { await rival.close(); }
   });
 
+  it("keeps a committed rename when post-rename temporary cleanup fails, but rejects a pre-rename failure", async () => {
+    const f = fixture();
+    const starts = vi.spyOn(RootInbox.prototype, "start");
+    await f.runtime.initialize(f.context, f.config);
+    const inbox = starts.mock.instances[0] as RootInbox;
+    const dir = path.join(f.meshRoot, "root-registrations");
+    const claimFile = path.join(dir, fs.readdirSync(dir)[0]!);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const remove = fs.rmSync;
+    const rename = fs.renameSync;
+    let committedRename = false;
+    // Fault the atomic writer's temporary-file housekeeping only after its rename committed.
+    const cleanup = vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (committedRename && String(file).startsWith(claimFile) && String(file).endsWith(".tmp")) {
+        throw Object.assign(new Error("injected post-rename cleanup failure"), { code: "EACCES" });
+      }
+      return remove(file, options);
+    });
+    const renames = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (to === claimFile) committedRename = true;
+    });
+    f.setName("renamed-root");
+    await f.handlers.get("session_info_changed")?.({}, f.context);
+    cleanup.mockRestore();
+    renames.mockRestore();
+    expect(committedRename).toBe(true);
+    expect(errors).not.toHaveBeenCalled();
+    expect(JSON.parse(fs.readFileSync(claimFile, "utf8"))).toMatchObject({ name: "renamed-root", sessionId: "synthetic-new-session" });
+    expect(inbox.names()).toContain("renamed-root");
+    expect(inbox.names()).not.toContain("fixture-root");
+    const rival = new RootRegistrationGuard(new MeshStore(f.meshRoot, 64 * 1024, 100), {
+      owner: { id: "synthetic-rival-s2", pid: process.pid, host: os.hostname(), startTime: "" },
+    });
+    try {
+      await expect(rival.claim({ sessionId: "synthetic-rival-s2", rootId: "session:synthetic-rival-s2", fabricSessionId: "synthetic-rival-s2", name: "renamed-root" })).rejects.toMatchObject({ code: "FABRIC_DUPLICATE_LIVE_ROOT" });
+    } finally { await rival.close(); }
+
+    // A failure before the rename commits still rejects and keeps the admitted alias.
+    const failure = Object.assign(new Error("injected pre-rename failure"), { code: "EIO" });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === claimFile) throw failure;
+      return rename(from, to);
+    });
+    f.setName("third-name");
+    await f.handlers.get("session_info_changed")?.({}, f.context);
+    expect(errors).toHaveBeenCalledWith(expect.stringContaining(failure.message));
+    expect(JSON.parse(fs.readFileSync(claimFile, "utf8"))).toMatchObject({ name: "renamed-root" });
+    expect(inbox.names()).toContain("renamed-root");
+    expect(inbox.names()).not.toContain("third-name");
+    expect(fs.readdirSync(dir).filter(file => file.endsWith(".tmp"))).toEqual([]);
+  });
+
   it("allows same-owner reinitialization and releases the claim on shutdown", async () => {
     const f = fixture();
     await f.runtime.initialize(f.context, f.config);

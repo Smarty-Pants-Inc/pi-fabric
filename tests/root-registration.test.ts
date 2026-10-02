@@ -37,6 +37,32 @@ describe("duplicate live root registration", () => {
     await expect(guard("owner-b").claim({ ...identity("uuid-b", "two"), [field]: first[field] })).rejects.toThrow(/Duplicate live Fabric root/);
   });
 
+  // S1: a mailbox recipient is an ID or a name; the reserved sets must be disjoint across roots.
+  it.each([
+    ["new name equals live root ID", identity("uuid-a", "one"), identity("uuid-b", "session:uuid-a")],
+    ["new name equals live native session ID", identity("uuid-a", "one"), identity("uuid-b", "uuid-a")],
+    ["live name equals new root ID", identity("uuid-a", "session:uuid-b"), identity("uuid-b", "two")],
+    ["live name equals new actor persistence ID", identity("uuid-a", "uuid-b"), identity("uuid-b", "two")],
+  ])("refuses name-to-ID recipient overlap: %s", async (_label, first, second) => {
+    const { root, guard } = setup();
+    await guard("owner-a").claim(first);
+    await expect(guard("owner-b").claim(second)).rejects.toMatchObject({ code: "FABRIC_DUPLICATE_LIVE_ROOT" });
+    expect(fs.readdirSync(path.join(root, "root-registrations"))).toHaveLength(1);
+  });
+
+  it.each([
+    ["candidate name equals a published root ID", { rootId: "session:uuid-a", sessionId: "uuid-a", name: "one" }, identity("uuid-b", "session:uuid-a")],
+    ["published name equals the candidate root ID", { rootId: "session:uuid-a", sessionId: "uuid-a", name: "session:uuid-b" }, identity("uuid-b", "two")],
+  ])("refuses name-to-ID overlap with a live participant lease: %s", async (_label, published, candidate) => {
+    const { root } = setup();
+    const guard = new RootRegistrationGuard(new MeshStore(root, 64 * 1024, 100), {
+      owner: { id: "owner-b", pid: 123, host: "synthetic-host", startTime: "1" },
+      ownerAlive: () => true,
+      publishedRoots: () => [published],
+    });
+    await expect(guard.claim(candidate)).rejects.toMatchObject({ code: "FABRIC_DUPLICATE_LIVE_ROOT" });
+  });
+
   it("allows differently named, independent roots and unnamed roots", async () => {
     const { guard } = setup();
     await guard("owner-a").claim(identity("uuid-a", "one"));

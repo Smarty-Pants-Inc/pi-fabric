@@ -390,6 +390,7 @@ export const writeFileAtomic = (
     }
   }
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let committed = false;
   try {
     if (options?.durable) {
       const fd = fs.openSync(temporary, "w", options.mode ?? 0o600);
@@ -406,10 +407,12 @@ export const writeFileAtomic = (
       });
     }
     renameAtomic(temporary, filePath, options);
+    committed = true;
     if (options?.durable) syncDirectoryChain(directory);
   } finally {
-    // No-op right after a successful rename; removes the temp on failure.
-    fs.rmSync(temporary, { force: true });
+    // After a committed rename the temporary pathname is gone: housekeeping there could only
+    // fail (for example EACCES) and misreport a committed replacement as a failed write.
+    if (!committed) fs.rmSync(temporary, { force: true });
   }
 };
 
@@ -465,14 +468,16 @@ const writeFileAtomicAsync = async (
     mode: options?.dirMode ?? 0o700,
   });
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let committed = false;
   try {
     await fs.promises.writeFile(temporary, contents, {
       encoding: "utf8",
       mode: options?.mode ?? 0o600,
     });
     await renameAtomicAsync(temporary, filePath, options);
+    committed = true;
   } finally {
-    await fs.promises.rm(temporary, { force: true });
+    if (!committed) await fs.promises.rm(temporary, { force: true });
   }
 };
 

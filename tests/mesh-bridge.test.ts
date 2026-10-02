@@ -951,7 +951,8 @@ describe("mesh bridge", () => {
       },
     });
     const running = bridge.run();
-    await waitFor(() => logs.some((line) => line.includes("retrying in 800 ms")));
+    await waitFor(() => calls >= 4); // 100, 200, 400 ms backoffs; now waiting 800 ms
+    expect(logs.filter(line => line.includes("retrying"))).toHaveLength(1);
     const before = calls;
     const started = Date.now();
     await bridge.stop();

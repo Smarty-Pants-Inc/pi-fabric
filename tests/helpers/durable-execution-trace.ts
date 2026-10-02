@@ -9,7 +9,7 @@ import { ResidencyClient } from "../../src/residency/client.js";
 import { CPythonRuntime } from "../../src/runtime/cpython-runtime.js";
 
 /** Test-only observation and teardown reaping; no execution deadline changes. */
-export const captureDurableExecutionTrace = async (startupCrLf = false) => {
+export const captureDurableExecutionTrace = async (startupCrLf = false, spawnChild?: typeof childProcess.spawn) => {
   const startedAt = performance.now();
   const events: { step: string; at: string; elapsedMs: number; details?: Record<string, unknown> }[] = [];
   const guests: { closed: Promise<void>; diagnostics: {
@@ -48,7 +48,7 @@ export const captureDurableExecutionTrace = async (startupCrLf = false) => {
       }
       args[1] = argv;
     }
-    const child = actual.spawn(...args);
+    const child = (spawnChild ?? actual.spawn)(...args);
     if (python) {
       const diagnostics = { pid: child.pid ?? null, stderrTail: "", exited: false, closed: false,
         exitCode: null as number | null, signal: null as NodeJS.Signals | null };

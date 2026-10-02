@@ -32,6 +32,7 @@ import { runResidentHostFromConfigPath } from "../src/residency/host.js";
 import { abandonResidentRequest, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 import { captureDurableExecutionTrace } from "./helpers/durable-execution-trace.js";
+import { assertLinuxRootReleased, ChildProcessCloseBarrier } from "./helpers/child-process-close-barrier.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
@@ -65,6 +66,10 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.mocked(childProce
 /** No fake host/response: real pickup, managers, model refresh, worker launch and ownership. */
 const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig) => void, commandTimeoutMs = 500) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-commit-fence-"));
+  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  const children = new ChildProcessCloseBarrier();
+  const spawn = ((...args: Parameters<typeof actual.spawn>) => children.observe(actual.spawn(...args))) as typeof actual.spawn;
+  vi.mocked(childProcess.spawn).mockImplementation(spawn);
   const meshRoot = path.join(root, "mesh");
   const rootId = `session:fence:${path.basename(root)}`;
   const residencyRoot = residentRoot(meshRoot, rootId);
@@ -110,7 +115,7 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
   const nested = new ResidentActorClient(meshRoot, rootId, 500);
   const model = beforeCommit ? "test/slow" : "test/visible";
   return {
-    root, residencyRoot, config, participants, client, nested, entered, release, model,
+    root, residencyRoot, config, participants, client, nested, entered, release, model, spawn, children,
     close: async () => {
       release.resolve();
       shutdown.abort();
@@ -120,40 +125,58 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
       for (const [name, previous] of signalListeners) {
         for (const listener of process.listeners(name)) if (!previous.has(listener)) process.removeListener(name, listener);
       }
-      // Host shutdown confirms resident worker exit. Public CPython cases must
-      // separately confirm guest close: runtime settlement bounds its reap wait.
-      // After those barriers, retry only transient OS cwd/directory retention.
-      fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+      // Host/manager settlement uses bounded liveness probes, not ChildProcess.close.
+      // Windows can report a worker gone before releasing its cwd; guest settlement
+      // can also return immediately after kill. Await actual exit (IPC-only guests)
+      // or close (workers/guests with stdio), not more directory retries.
+      const beforeBarrier = children.snapshot();
+      await children.wait();
+      expect(children.snapshot().every(child => child.released && !child.connected)).toBe(true);
+      if (process.env.FABRIC_CLOSE_EVIDENCE) {
+        const linux = assertLinuxRootReleased(root, children.snapshot());
+        fs.appendFileSync(process.env.FABRIC_CLOSE_EVIDENCE, JSON.stringify({
+          root, beforeBarrier, children: children.snapshot(), linux, phase: "before rmSync",
+        }) + "\n");
+      }
+      fs.rmSync(root, { recursive: true, force: true });
     },
   };
 };
 
 describe("resident fence harness teardown", () => {
-  it("retries a transient Windows EBUSY after the resident host has closed", async () => {
+  it("awaits real child close before removing the root, without directory retries", async () => {
     const state = await harness(false);
     const rm = fs.rmSync.bind(fs);
-    let attempts = 0;
-    let cleanupOptions: fs.RmOptions | undefined;
-    const busy = Object.assign(new Error("Windows still holds the removed cwd"), { code: "EBUSY" });
+    const { EventEmitter } = await import("node:events");
+    // Model a child whose close arrives after shutdown/liveness settlement. This
+    // is event-driven: no sleep or retry can make deletion pass the barrier.
+    const child = new EventEmitter() as childProcess.ChildProcess;
+    state.children.observe(child);
+    child.removeAllListeners(); // Node guest settlement must not erase the observer.
+    const waiting = deferred();
+    const wait = state.children.wait.bind(state.children);
+    vi.spyOn(state.children, "wait").mockImplementation(() => { waiting.resolve(); return wait(); });
+    let removed = false;
     const cleanup = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
       if (String(target) !== state.root) return rm(target, options);
-      cleanupOptions = options;
+      removed = true;
       expect(fs.existsSync(path.join(state.residencyRoot, "owner.json"))).toBe(false);
-      // Model Node's documented recursive rm retry contract on Linux: the first
-      // rmdir is busy, then the OS releases it. Native Windows exercises the real
-      // implementation; maxRetries defaults to zero without the harness opt-in.
-      for (let retry = 0; ; retry++) {
-        attempts++;
-        if (attempts > 1) return rm(target, options);
-        if (retry >= (options?.maxRetries ?? 0)) throw busy;
-      }
+      expect(state.children.snapshot().every(child => child.released)).toBe(true);
+      expect(options).toEqual({ recursive: true, force: true });
+      return rm(target, options);
     });
+    const closing = state.close();
     try {
-      await expect(state.close()).resolves.toBeUndefined();
-      expect(attempts).toBe(2);
-      expect(cleanupOptions).toMatchObject({ recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+      await waiting.promise;
+      expect(removed).toBe(false);
+      expect(fs.existsSync(state.root)).toBe(true);
+      child.emit("close", 0, null);
+      await expect(closing).resolves.toBeUndefined();
+      expect(removed).toBe(true);
       expect(fs.existsSync(state.root)).toBe(false);
     } finally {
+      child.emit("close", 0, null);
+      await closing;
       cleanup.mockRestore();
       rm(state.root, { recursive: true, force: true });
     }
@@ -938,7 +961,7 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
       if (engine === "cpython") {
         const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
         vi.mocked(childProcess.spawn).mockImplementation(((...args: Parameters<typeof actual.spawn>) => {
-          const child = actual.spawn(...args);
+          const child = state.spawn(...args);
           if (Array.isArray(args[1]) && args[1].includes("-I")) {
             closed.push(new Promise<void>(resolve => child.once("close", () => resolve())));
             const kill = child.kill.bind(child);
@@ -976,7 +999,7 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
         expect(text).toContain(ending === "Main" ? "MainExecutionCeilingError" : "Execution timed out after 5000ms");
         if (ending === "ordinary") expect(text).not.toContain("MainExecutionCeilingError");
         // Stop injecting the crossed clock into later reconciliation invocations.
-        vi.restoreAllMocks(); vi.mocked(childProcess.spawn).mockReset();
+        vi.restoreAllMocks(); vi.mocked(childProcess.spawn).mockImplementation(state.spawn);
         const reconcile = await registeredExecution(state, main, 5_000, engine);
         const reconciled = await reconcile(`return {"status": await agents.actorStatus(id="${decision.id}"), "stop": await agents.stop(id="${decision.id}")}`);
         expect(reconciled.isError).not.toBe(true);
@@ -1177,7 +1200,7 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
   for (const engine of engines) for (const operation of ["spawn", "create"] as const) {
     it(`${engine} normal durable ${operation} returns its handle without false uncertainty`, async () => {
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
-      const trace = await captureDurableExecutionTrace();
+      const trace = await captureDurableExecutionTrace(false, state.spawn);
       trace.record("harness ready");
       let execution: unknown;
       const report = () => { try { trace.report(engine, operation, {
@@ -1274,7 +1297,7 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
     for (const holdGuestExit of engine === "cpython" && settlesDuringGrace ? [false, true] : [false]) {
     it(`${engine} teardown exposes a committed unawaited mutation ${settlesDuringGrace ? "that settles during grace" : "still pending after grace"} rather than false success${holdGuestExit ? " with guest exit delayed past reap grace" : ""}`, async () => {
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
-      const trace = engine === "cpython" ? await captureDurableExecutionTrace() : undefined;
+      const trace = engine === "cpython" ? await captureDurableExecutionTrace(false, state.spawn) : undefined;
       const rm = fs.rmSync.bind(fs);
       let guest: childProcess.ChildProcess | undefined;
       let killGuest: (() => void) | undefined;

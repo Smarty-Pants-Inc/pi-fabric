@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { closeScratch, createScratch } from "./storage/scratch.js";
+import { closeScratch, createScratch, ScratchScope } from "./storage/scratch.js";
 import path from "node:path";
 import { truncateMiddle } from "./util.js";
 import type { FabricResidentOutcomeReceipt } from "./runtime/kernel.js";
@@ -63,8 +63,8 @@ const boundPrioritySections = (sections: readonly string[], budget: number): str
   }).filter(Boolean);
 };
 
-const writeOutputArtifact: ArtifactWriter = async (content) => {
-  const directory = createScratch("output");
+const writeOutputArtifact = async (content: string, scope?: ScratchScope): Promise<string> => {
+  const directory = scope ? scope.create("output") : createScratch("output");
   try {
     const artifactPath = path.join(directory, "output.txt");
     await fs.writeFile(artifactPath, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -75,6 +75,27 @@ const writeOutputArtifact: ArtifactWriter = async (content) => {
     throw error;
   }
 };
+
+/** Output artifacts remain readable for the session, then exact owned roots are released. */
+export class OutputArtifactStore {
+  readonly #scratch = new ScratchScope();
+  readonly #pending = new Set<Promise<string>>();
+  #closed = false;
+  #closePromise: Promise<void> | undefined;
+
+  readonly write: ArtifactWriter = (content) => {
+    if (this.#closed) return Promise.reject(new Error("Fabric output artifact store is closed"));
+    const task = writeOutputArtifact(content, this.#scratch);
+    this.#pending.add(task);
+    task.then(() => this.#pending.delete(task), () => this.#pending.delete(task));
+    return task;
+  };
+
+  close(): Promise<void> {
+    this.#closed = true;
+    return this.#closePromise ??= Promise.allSettled([...this.#pending]).then(() => this.#scratch.close());
+  }
+}
 
 export const boundModelOutput = async (
   visible: string,

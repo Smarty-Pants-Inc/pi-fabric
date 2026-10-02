@@ -1,3 +1,4 @@
+import { ExecutionDeadline } from "./execution-deadline.js";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
@@ -6,7 +7,7 @@ import net from "node:net";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
-import { runAbortable, settleWithin } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
@@ -110,19 +111,31 @@ export class CPythonRuntime implements FabricKernelRuntime {
       return failure("runtime_error", "CPython memory limit must be a positive safe integer");
     }
     if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 1) return failure("runtime_error", "CPython timeout must be positive");
-    const startedAt = Date.now();
+    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options);
     let command: Awaited<ReturnType<typeof launch>>;
     try { command = await launch(this.binary, this.enforce, options.cwd ?? process.cwd()); }
     catch (error) { return failure("runtime_error", errorText(error)); }
     // Resolve first, then check before spawn: no orphan on cancellation during discovery.
     if (options.signal?.aborted) return failure("aborted", "Execution cancelled");
+    if (executionDeadline.reached) return executionDeadline.timeoutResult([]);
     // Windows cannot inherit a socket through stdio; the child connects back instead.
     const ipc = process.platform === "win32" ? await createIpcListener() : undefined;
+    // Binding is asynchronous too: cancellation or deadline expiry here must
+    // close the listener without starting a guest just to kill it later.
+    if (executionDeadline.reached || options.signal?.aborted) {
+      ipc?.server.close();
+      return options.signal?.aborted ? failure("aborted", "Execution cancelled") : executionDeadline.timeoutResult([]);
+    }
 
     return new Promise<FabricSandboxResult>((resolve) => {
       const hostAbort = new AbortController();
+      shareCancellationEffects(hostAbort.signal, options.signal);
       const hostTasks = new Set<Promise<void>>();
       const callIds = new Set<number>();
+      // Host-owned response ids are unique within this fresh execution. Native
+      // write callbacks cannot prove that the guest admitted an observation.
+      let nextResponseId = 0;
+      const pendingReceipts = new Map<number, { id: number; commit: () => void }>();
       const logs: string[] = [];
       const partialLogs = ["", ""];
       const decoders = [new StringDecoder("utf8"), new StringDecoder("utf8")];
@@ -131,8 +144,6 @@ export class CPythonRuntime implements FabricKernelRuntime {
       let truncated = false;
       let settled = false;
       let finishing = false;
-      let deadline: NodeJS.Timeout | undefined;
-      let deadlineAt = startedAt + options.timeoutMs;
       let buffer = Buffer.alloc(0);
       let child: ReturnType<typeof spawn>;
       try {
@@ -151,47 +162,71 @@ export class CPythonRuntime implements FabricKernelRuntime {
       }
       let channel: Duplex | net.Socket | undefined;
       let expectedToken: string | undefined = ipc?.token;
-      let childExited = child.pid === undefined;
-      child.once("exit", () => { childExited = true; });
+      let childClosed = child.pid === undefined;
+      child.once("close", () => { childClosed = true; });
+      let logsFinalized = false;
       const appendLog = (index: number, text: string): void => {
-        if (settled || truncated) return;
+        // Settlement ends IPC admission, not the drain of already-written logs.
+        if (logsFinalized || truncated) return;
         const available = Math.max(0, maxLogChars - logChars);
         const retained = text.slice(0, available);
         logChars += retained.length;
-        const lines = ((partialLogs[index] ?? "") + retained).split("\n");
+        const lines = ((partialLogs[index] ?? "") + retained).split(/\r?\n/);
         partialLogs[index] = lines.pop() ?? "";
         for (const line of lines) logs.push(line.replace(/\r$/, ""));
         if (retained.length !== text.length) truncated = true;
       };
-      const finish = async (result: Omit<FabricSandboxResult, "logs">): Promise<void> => {
+      const finish = async (result: Omit<FabricSandboxResult, "logs">, unawaitedHostCalls = false): Promise<void> => {
         if (settled) return;
-        for (let index = 0; index < decoders.length; index++) appendLog(index, decoders[index]!.end());
+        if (result.terminationReason === "completed" && executionDeadline.reached) {
+          hostAbort.abort(executionDeadline.reason);
+          result = executionDeadline.timeoutResult([]);
+        }
         settled = true;
-        if (deadline) clearTimeout(deadline);
+        pendingReceipts.clear();
+        executionDeadline.clear();
         options.signal?.removeEventListener("abort", abort);
+        const interrupted = result.terminationReason !== "completed" || hostAbort.signal.aborted || hostTasks.size > 0 || unawaitedHostCalls;
         if (!hostAbort.signal.aborted) hostAbort.abort(new Error(result.error ?? "CPython execution ended"));
+        preserveCancellationOutcome(result, hostAbort.signal, interrupted);
         channel?.destroy();
         ipc?.server.close();
-        child.stdout?.destroy();
-        child.stderr?.destroy();
         if (child.pid && process.platform !== "win32") {
           try { process.kill(-child.pid, "SIGKILL"); } catch { /* The process group may already have exited. */ }
         }
         child.kill("SIGKILL");
-        // Let the terminated child release its working directory before the
-        // caller observes the result; Windows rmdir fails with EBUSY while held.
-        if (!childExited) {
-          await new Promise<void>((done) => {
+        // TCP results and Windows stderr pipes arrive independently. "exit" is
+        // not a drain barrier: keep the readers until "close" (all stdio closed),
+        // or the existing bounded reap grace if a descendant holds a pipe open.
+        // IPC and host authority have already ended; this waits only for logs/cwd.
+        if (!childClosed) {
+          await new Promise<void>((resolveClose) => {
+            const done = (): void => {
+              clearTimeout(timer);
+              child.removeListener("close", done);
+              resolveClose();
+            };
             const timer = setTimeout(done, 250);
             timer.unref?.();
-            child.once("exit", () => { clearTimeout(timer); done(); });
+            child.once("close", done);
           });
         }
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        for (let index = 0; index < decoders.length; index++) appendLog(index, decoders[index]!.end());
+        logsFinalized = true;
         for (const text of partialLogs) if (text) logs.push(text);
         if (truncated) logs.push("[Pi Fabric log output truncated]");
+        if (result.terminationReason === "completed" && executionDeadline.reached) {
+          result = preserveCancellationOutcome(executionDeadline.timeoutResult([]), hostAbort.signal, true);
+        }
         resolve({ ...result, logs });
       };
-      const abort = (): void => void finish({ value: undefined, terminationReason: "aborted", error: "Execution cancelled" });
+      const abort = (): void => {
+        const reason = mainExecutionCeilingAbortReason(options.signal);
+        if (reason && !hostAbort.signal.aborted) hostAbort.abort(reason);
+        void finish({ value: undefined, terminationReason: "aborted", error: "Execution cancelled" });
+      };
       const fail = (message: string): void => void finish({ value: undefined, terminationReason: "runtime_error", error: message });
       // A child that dies at startup (bwrap without user namespaces) resets its
       // pipes before "close" reports its exit status and stderr. Let that
@@ -205,6 +240,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         if (settled || finishing) return;
         pipeError = message;
         finishing = true;
+        pendingReceipts.clear();
         hostAbort.abort(new Error(message));
         if (child.pid && process.platform !== "win32") {
           try { process.kill(-child.pid, "SIGKILL"); } catch { /* The process group may already have exited. */ }
@@ -212,33 +248,54 @@ export class CPythonRuntime implements FabricKernelRuntime {
         child.kill("SIGKILL");
         setTimeout(() => fail(`${message}; CPython process did not report its exit`), PIPE_DIAGNOSIS_MS).unref?.();
       };
-      const scheduleDeadline = (): void => {
-        if (deadline) clearTimeout(deadline);
+      const expireDeadline = (): void => {
+        if (settled) return;
         // A recorded pipe failure is the real cause; the deadline only ends its diagnosis wait.
-        deadline = setTimeout(() => pipeError
-          ? fail(`${pipeError}; CPython process did not report its exit`)
-          : void finish({
-            value: undefined, terminationReason: "timed_out", error: `Execution timed out after ${deadlineAt - startedAt}ms`,
-          }), Math.max(0, deadlineAt - Date.now()));
-        deadline.unref?.();
+        if (pipeError) { fail(`${pipeError}; CPython process did not report its exit`); return; }
+        hostAbort.abort(executionDeadline.reason);
+        void finish(executionDeadline.timeoutResult([]));
       };
-      const send = (message: unknown): void => {
+      const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(expireDeadline, true);
+      const send = (message: any, delivered?: () => void): void => {
         // A terminal guest result closes its reply channel while issued host
         // work may still be settling. Its late replies are no longer consumed.
         if (settled || finishing || !channel || channel.destroyed) return;
+        if (executionDeadline.reached) { expireDeadline(); return; }
         try {
+          if (delivered) {
+            const responseId = ++nextResponseId;
+            message = { ...message, responseId };
+            pendingReceipts.set(responseId, { id: message.id, commit: delivered });
+          }
           const frame = JSON.stringify(message) + "\n";
           const bytes = Buffer.byteLength(frame);
           if (bytes > MAX_FRAME_BYTES || channel.writableLength + bytes > MAX_FRAME_BYTES * 2) {
             fail("CPython IPC frame or write buffer exceeds its 16 MiB frame limit");
             return;
           }
-          channel.write(frame, (error) => { if (error) failPipe(`CPython IPC failed: ${error.message}`); });
+          if (executionDeadline.reached) { expireDeadline(); return; }
+          channel.write(frame, (error) => {
+            if (settled || finishing) return;
+            if (error) { failPipe(`CPython IPC failed: ${error.message}`); return; }
+            // A native write is not guest admission. Only a correlated ack
+            // from the receiver may commit the pending consumption receipt.
+            if (!channel || channel.destroyed || !channel.writable) return;
+            if (executionDeadline.reached) { expireDeadline(); return; }
+          });
         } catch (error) { fail(`CPython IPC serialization failed: ${errorText(error)}`); }
       };
       const handleMessage = (message: unknown): void => {
         if (settled || finishing) return;
         if (!record(message)) { fail("Invalid CPython IPC message"); return; }
+        if (executionDeadline.reached) { expireDeadline(); return; }
+        if (message.type === "response_ack") {
+          if (!channel || channel.destroyed || !channel.writable) return;
+          const receipt = pendingReceipts.get(message.responseId as number);
+          if (!receipt || receipt.id !== message.id) return;
+          pendingReceipts.delete(message.responseId as number);
+          receipt.commit();
+          return;
+        }
         if (message.type === "result") {
           const result = message.result;
           if (!record(result) || !["completed", "runtime_error"].includes(String(result.terminationReason)) ||
@@ -246,6 +303,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
             fail("Invalid CPython terminal result"); return;
           }
           finishing = true;
+          const unawaitedHostCalls = hostTasks.size > 0;
           if (result.terminationReason !== "completed") hostAbort.abort(new Error(String(result.error ?? "Python guest failed")));
           void (async () => {
             const done = await settleWithin(hostTasks, HOST_SETTLE_MS);
@@ -259,7 +317,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
               value: result.value,
               terminationReason: result.terminationReason as "completed" | "runtime_error",
               ...(typeof result.error === "string" ? { error: result.error } : {}),
-            });
+            }, unawaitedHostCalls);
           })();
           return;
         }
@@ -274,13 +332,11 @@ export class CPythonRuntime implements FabricKernelRuntime {
         callIds.add(id);
         try {
           const floor = options.minimumTimeoutMsForHostCall?.(ref, args);
-          if (typeof floor === "number" && Number.isFinite(floor) && Date.now() + floor > deadlineAt) {
-            deadlineAt = Date.now() + Math.max(1, Math.floor(floor));
-            scheduleDeadline();
-          }
+          if (executionDeadline.extend(floor)) scheduleDeadline();
         } catch (error) { fail(`CPython deadline policy failed: ${errorText(error)}`); return; }
+        if (executionDeadline.reached) { expireDeadline(); return; }
         const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal)).then(
-          (value) => send({ type: "response", id, ok: true, value }),
+          (value) => send({ type: "response", id, ok: true, value }, () => options.onHostResultDelivered?.(args)),
           (error) => send({ type: "response", id, ok: false, error: errorText(error), ...(isPiShellRef(ref) ? { bashExit: piBashExitMetadata(error) } : {}) }),
         ).finally(() => { hostTasks.delete(task); callIds.delete(id); });
         hostTasks.add(task);
@@ -322,8 +378,8 @@ export class CPythonRuntime implements FabricKernelRuntime {
         socket.on("data", onData);
         socket.on("error", (error) => failPipe(`CPython IPC failed: ${error.message}`));
       };
-      child.stdout?.on("data", (chunk: Buffer) => appendLog(0, decoders[0]!.write(chunk)));
-      child.stderr?.on("data", (chunk: Buffer) => appendLog(1, decoders[1]!.write(chunk)));
+      child.stdout?.on("data", (chunk: Buffer) => { if (!logsFinalized) appendLog(0, decoders[0]!.write(chunk)); });
+      child.stderr?.on("data", (chunk: Buffer) => { if (!logsFinalized) appendLog(1, decoders[1]!.write(chunk)); });
       child.on("error", (error) => fail(`CPython process failed: ${error.message}${this.enforce ? "; OS sandbox is required (no native fallback)" : ""}`));
       child.on("close", (exitCode, signal) => {
         if (settled || (finishing && !pipeError)) return;

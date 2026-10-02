@@ -95,6 +95,88 @@ afterEach(async () => {
 });
 
 describe("LifecycleBroker", () => {
+  it.each([false, true])("blocks release on an unconfirmed delivered cursor/once deletion without replay (once=%s)", async (once) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const deliveries = vi.fn();
+    const broker = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, deliveries);
+    brokers.push(broker);
+    const sub = await broker.subscribe({ from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false, once });
+    const storage = once ? vi.spyOn(mesh, "delete") : vi.spyOn(mesh, "put");
+    storage.mockRejectedValue(new Error("delivered receipt fsync failed"));
+    broker.start();
+    await mesh.publish({ topic: FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, kind: "pi.agent_settled", from: sourceIdentity,
+      data: { version: 1, event: "pi.agent_settled", source, occurredAt: 42 } });
+    await waitFor(() => deliveries.mock.calls.length > 0);
+    broker.pause();
+    await expect(broker.checkpointForRelease()).rejects.toThrow(/unconfirmed|receipt|fsync/i);
+    expect(deliveries).toHaveBeenCalledTimes(1);
+    broker.resume(); await new Promise(resolve => setTimeout(resolve, 80)); broker.pause();
+    expect(deliveries).toHaveBeenCalledTimes(1);
+    // Retrying persistence must not re-execute the accepted activation.
+    storage.mockRestore();
+    await broker.checkpointForRelease();
+    expect(once ? broker.list().length : broker.list()[0]?.afterSequence).toBe(once ? 0 : mesh.latestSequence());
+    await broker.close();
+    const successor = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, deliveries);
+    brokers.push(successor); successor.start();
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(deliveries).toHaveBeenCalledTimes(1);
+    if (once) expect(successor.list().find(s => s.id === sub.id)).toBeUndefined();
+    else expect(successor.list()[0]?.id).toBe(sub.id);
+  });
+
+
+  it("confirms a visible delivered cursor after its put threw without re-executing delivery", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const deliveries = vi.fn();
+    const broker = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, deliveries); brokers.push(broker);
+    await broker.subscribe({ from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false, once: false });
+    const put = mesh.put.bind(mesh);
+    const storage = vi.spyOn(mesh, "put").mockImplementation(async input => {
+      await put(input); throw Error("visible cursor has unconfirmed write receipt");
+    });
+    broker.start();
+    await mesh.publish({ topic: FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, kind: "pi.agent_settled", from: sourceIdentity,
+      data: { version: 1, event: "pi.agent_settled", source, occurredAt: 42 } });
+    await waitFor(() => deliveries.mock.calls.length === 1); broker.pause();
+    await expect(broker.checkpointForRelease()).rejects.toThrow(/unconfirmed write receipt/);
+    expect(broker.list()[0]?.afterSequence).toBe(mesh.latestSequence());
+    storage.mockRestore();
+    await broker.checkpointForRelease(); // repairs only the same exact accepted receipt
+    broker.resume(); await new Promise(resolve => setTimeout(resolve, 80)); broker.pause();
+    expect(deliveries).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains a once-delete obligation that became visible before its write failed", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const deliveries = vi.fn();
+    const broker = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, deliveries); brokers.push(broker);
+    await broker.subscribe({ from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false, once: true });
+    const remove = mesh.delete.bind(mesh);
+    const storage = vi.spyOn(mesh, "delete").mockImplementation(async input => {
+      await remove(input); throw Error("indeterminate deletion receipt");
+    });
+    broker.start();
+    await mesh.publish({ topic: FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, kind: "pi.agent_settled", from: sourceIdentity,
+      data: { version: 1, event: "pi.agent_settled", source, occurredAt: 42 } });
+    await waitFor(() => deliveries.mock.calls.length === 1); broker.pause();
+    await expect(broker.checkpointForRelease()).rejects.toThrow(/once deletion receipt.*unconfirmed/);
+    expect(broker.list()).toEqual([]); // visible absence is not a confirmed durable write
+    storage.mockRestore();
+    await expect(broker.checkpointForRelease()).rejects.toThrow(/unconfirmed/);
+    expect(deliveries).toHaveBeenCalledTimes(1);
+  });
+
   // smarty-dev#557: every host read the whole directory for every subscription on every poll,
   // about a quarter of a core per idle Pi on the fleet mesh.
   it("reads the directory only for subscriptions behind the log whose target this host publishes", async () => {

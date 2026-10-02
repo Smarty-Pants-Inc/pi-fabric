@@ -11,6 +11,7 @@ import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { CPYTHON_CHILD_SOURCE } from "../src/runtime/cpython-child-source.js";
 import { CPythonRuntime, LINUX_BWRAP_ISOLATION_ARGS } from "../src/runtime/cpython-runtime.js";
 import type { FabricHostCall, FabricSandboxOptions } from "../src/runtime/kernel.js";
+import { captureDurableExecutionTrace } from "./helpers/durable-execution-trace.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -48,10 +49,176 @@ afterEach(() => {
 });
 
 describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 }, () => {
+  it("normalizes CRLF guest stdout and stderr in product logs", async () => {
+    const result = await run('import sys\nsys.stdout.write("out one\\r\\nout two\\r\\n")\nsys.stdout.flush()\nsys.stderr.write("err one\\r\\nerr two\\r\\n")\nsys.stderr.flush()\nawait schema.status()\nreturn "delivered"');
+    expect(result).toMatchObject({ terminationReason: "completed", value: "delivered" });
+    expect(result.logs).toEqual(expect.arrayContaining(["out one", "out two", "err one", "err two"]));
+    expect(result.logs.every(line => !line.endsWith("\r"))).toBe(true);
+  });
+
+  it("keeps guest startup diagnostics opt-in", async () => {
+    expect(await run("return await schema.status()")).toMatchObject({ terminationReason: "completed", logs: [] });
+  });
+
+  it.each([["native", "LF"], ["loopback", "LF"], ["native", "CRLF"], ["loopback", "CRLF"]] as const)("captures guest startup timestamps and reaps its exit over %s IPC (%s)", async (transport, newline) => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => {});
+    const trace = await captureDurableExecutionTrace(newline === "CRLF");
+    if (transport === "loopback") vi.stubGlobal("process", new Proxy(process, {
+      get(target, key) { return key === "platform" ? "win32" : Reflect.get(target, key); },
+    }));
+    try {
+      const result = await run("await schema.status()\nreturn await schema.status()");
+      expect(result.terminationReason, result.error).toBe("completed");
+      await trace.waitForGuests();
+      expect(output).not.toHaveBeenCalled();
+      trace.report("cpython", "diagnostic-probe", result);
+      const report = JSON.parse(String(output.mock.calls[0]?.[1]));
+      const guest = report.guests[0];
+      expect(guest).toMatchObject({ exited: true, closed: true });
+      expect(guest.exitCode !== null || guest.signal !== null).toBe(true);
+      const stages = guest.stderrTail.split(/\r?\n/).filter(Boolean);
+      for (const stage of stages) expect(stage).toMatch(/^\[fabric-cpython-startup\] at=\d+\.\d+ elapsedMs=\d+\.\d+ /);
+      expect(stages.map((stage: string) => stage.replace(/^.*elapsedMs=\S+ /, ""))).toEqual([
+        "interpreter start", "imports done", "event loop starting", "event loop running",
+        expect.stringMatching(transport === "loopback" || process.platform === "win32"
+          ? /^connecting to 127\.0\.0\.1:\d+$/ : /^connecting to inherited socket fd 3$/),
+        "connected", ...(transport === "loopback" || process.platform === "win32" ? ["IPC hello written"] : []),
+        "waiting for execute request", "execute request received", "first request written",
+      ]);
+      expect(guest.stderrTail).not.toContain("token");
+    } finally {
+      await trace.waitForGuests();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each(["LF", "CRLF"])("drains delayed loopback stdout and stderr through guest close (%s)", async (newline) => {
+    // Windows delivers TCP and anonymous stderr pipes independently. Model a
+    // flushed startup record reaching the host after result/exit, before close.
+    vi.stubGlobal("process", new Proxy(process, {
+      get(target, key) { return key === "platform" ? "win32" : Reflect.get(target, key); },
+    }));
+    const marker = "[fabric-cpython-startup] at=1.000000 elapsedMs=1.000 first request written";
+    let socket: net.Socket | undefined;
+    let close!: () => void;
+    const closed = new Promise<void>(resolve => { close = resolve; });
+    const child = Object.assign(new EventEmitter(), {
+      pid: 999_999_999,
+      stdout: new PassThrough(), stderr: new PassThrough(), stdio: [],
+      kill: vi.fn(() => {
+        child.emit("exit", 0, null);
+        setTimeout(() => {
+          const eol = newline === "CRLF" ? "\r\n" : "\n";
+          child.stderr.end(marker + eol + "err one" + eol + "err two" + eol);
+          child.stdout.end("out one" + eol + "out two" + eol);
+          child.emit("close", 0, null);
+          close();
+        }, 30);
+        return true;
+      }),
+    });
+    vi.mocked(childProcess.spawn).mockImplementationOnce(((...args: Parameters<typeof childProcess.spawn>) => {
+      const env = args[2]!.env!;
+      socket = net.createConnection({ host: "127.0.0.1", port: Number(env.FABRIC_IPC_PORT) });
+      socket.on("error", () => {});
+      socket.once("connect", () => socket!.write(JSON.stringify({ type: "hello", token: env.FABRIC_IPC_TOKEN }) + "\n"));
+      let pending = "";
+      socket.on("data", chunk => {
+        pending += chunk.toString();
+        if (!pending.includes("\n")) return;
+        const request = JSON.parse(pending.slice(0, pending.indexOf("\n")));
+        expect(request.type).toBe("execute");
+        socket!.write(JSON.stringify({ type: "result", result: { terminationReason: "completed", value: 1 } }) + "\n");
+      });
+      return child as unknown as ReturnType<typeof childProcess.spawn>;
+    }) as typeof childProcess.spawn);
+    try {
+      const result = await run("return 1");
+      expect(result).toMatchObject({ terminationReason: "completed", value: 1 });
+      expect(result.logs).toEqual(expect.arrayContaining([marker, "out one", "out two", "err one", "err two"]));
+      expect(result.logs).toHaveLength(5);
+      expect(result.logs.every(line => !line.endsWith("\r"))).toBe(true);
+      expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+    } finally {
+      await closed;
+      if (socket && !socket.closed) {
+        const socketClosed = new Promise<void>(resolve => socket!.once("close", () => resolve()));
+        socket.destroy(); await socketClosed;
+      }
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("waits for guest close before cwd removal and retains only the stderr tail with exit status", async () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => {});
+    const trace = await captureDurableExecutionTrace();
+    const cwd = temp();
+    const child = childProcess.spawn(binary, ["-I", "-B", "-c",
+      'import sys, time; sys.stderr.write("x" * 5000 + "\\nlast startup marker\\n"); sys.stderr.flush(); time.sleep(0.4); sys.exit(7)',
+    ], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    try {
+      let reaped = false;
+      const reaping = trace.waitForGuests().then(() => { reaped = true; });
+      await new Promise<void>(resolve => child.once("spawn", () => resolve()));
+      expect(reaped).toBe(false);
+      await reaping;
+      expect(reaped).toBe(true);
+      fs.rmSync(cwd, { recursive: true, force: true });
+      expect(output).not.toHaveBeenCalled();
+      trace.report("cpython", "failed-startup-probe", {});
+      const report = JSON.parse(String(output.mock.calls[0]?.[1]));
+      expect(report.guests[0]).toMatchObject({ exited: true, closed: true, exitCode: 7, signal: null });
+      expect(report.guests[0].stderrTail).toHaveLength(4000);
+      expect(report.guests[0].stderrTail).toContain("last startup marker");
+    } finally {
+      child.kill("SIGKILL");
+      await trace.waitForGuests();
+    }
+  });
+
   it("routes the records primitive through the same host bridge", async () => {
     expect(await run('return await records.read(after=3, limit=2)')).toMatchObject({
       terminationReason: "completed", value: { ref: "records.read", args: { after: 3, limit: 2 } },
     });
+  });
+
+  it("commits loopback IPC receipts before guest continuation and preserves CRLF/Unicode values", async () => {
+    // Exercise Windows' real TCP bridge even on POSIX; an inherited fd 3 alone
+    // cannot cover its token handshake or response delivery path.
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const receipt = vi.fn();
+    const firstArgs = { text: "first\r\nUnicode π" };
+    try {
+      const result = await run('value = await schema.status(text="first\\r\\nUnicode π")\nreturn await memory.sessions(value=value)', async (ref, args) => {
+        if (ref === "schema.status") {
+          expect(args).toEqual(firstArgs);
+          return args.text;
+        }
+        // This call is issued only after the guest decoded the first response.
+        expect(receipt).toHaveBeenCalledExactlyOnceWith(firstArgs);
+        return args.value;
+      }, { onHostResultDelivered: receipt });
+      expect(result).toMatchObject({ terminationReason: "completed", value: firstArgs.text });
+      expect(receipt).toHaveBeenCalledTimes(2);
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
+  it("does not commit a loopback IPC receipt when encoding crosses the deadline", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const startedAt = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(startedAt);
+    const receipt = vi.fn();
+    const encode = vi.fn(() => { clock.mockReturnValue(startedAt + options.timeoutMs); return "late"; });
+    const host = vi.fn(async () => ({ get text() { return encode(); } }));
+    try {
+      const result = await run("return await schema.status()", host, { onHostResultDelivered: receipt });
+      expect(host).toHaveBeenCalledOnce();
+      expect(encode).toHaveBeenCalledOnce();
+      expect(result.terminationReason).toBe("timed_out");
+      expect(receipt).not.toHaveBeenCalled();
+    } finally { clock.mockRestore(); Object.defineProperty(process, "platform", platform); }
   });
 
   it("routes the cache primitive through the same host bridge", async () => {
@@ -224,6 +391,31 @@ describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 
     spawn.mockClear();
     expect((await run("return 1", echo, { signal: controller.signal })).terminationReason).toBe("aborted");
     expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("does not spawn after cancellation during Windows IPC listener binding", async () => {
+    const controller = new AbortController();
+    const originalListen = net.Server.prototype.listen;
+    let server: net.Server | undefined;
+    // Exercise the real asynchronous Windows pre-spawn boundary on every OS.
+    vi.stubGlobal("process", new Proxy(process, {
+      get(target, key) { return key === "platform" ? "win32" : Reflect.get(target, key); },
+    }));
+    vi.spyOn(net.Server.prototype, "listen").mockImplementation(function (this: net.Server, ...args) {
+      server = this;
+      this.once("listening", () => controller.abort());
+      return originalListen.apply(this, args);
+    });
+    const spawn = vi.mocked(childProcess.spawn); spawn.mockClear();
+    try {
+      expect(await run("return 1", echo, { signal: controller.signal })).toMatchObject({ terminationReason: "aborted" });
+      expect(spawn.mock.calls.length).toBe(0);
+      await new Promise<void>((done) => setImmediate(done));
+      expect(server?.listening).toBe(false);
+    } finally {
+      if (server?.listening) await new Promise<void>((done) => server!.close(() => done()));
+      vi.unstubAllGlobals();
+    }
   });
 
   it.skipIf(process.platform === "win32")("kills same-group subprocesses when cancelled", async () => {

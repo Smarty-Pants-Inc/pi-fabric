@@ -50,6 +50,7 @@ const setup = () => {
   };
   const residency = {
     spawnAgent: vi.fn(async (_request: AgentRunRequest) => handle),
+    createActor: vi.fn(async (request: FabricActorRequest) => ({ ...request, id: "resident-actor" })),
     ensureHost: vi.fn(async () => {}),
     ensureActor: vi.fn(async () => {}),
   };
@@ -163,9 +164,17 @@ describe("provider kernel forwarding", () => {
   });
 
   it.each(["session", "durable"])("freezes actor language at %s creation before routing", async (residency) => {
-    const { provider, actors } = setup();
+    const { provider, actors, residency: resident } = setup();
     await provider.invoke("create", { name: "actor", instructions: "task", residency, kernel: "inherit" }, context);
-    expect(actors.create).toHaveBeenCalledWith(expect.objectContaining({ kernel: "python", runner: "pi", extensions: true }));
+    const frozen = expect.objectContaining({ kernel: "python", runner: "pi", extensions: true });
+    if (residency === "durable") {
+      expect(resident.createActor).toHaveBeenCalledWith(frozen, context.signal);
+      expect(actors.create).not.toHaveBeenCalled();
+    } else {
+      // Local creation now carries the invocation commit fence (smarty-dev#2490).
+      expect(actors.create).toHaveBeenCalledWith(frozen, expect.objectContaining({ beforeCommit: expect.any(Function), checkActive: expect.any(Function) }));
+      expect(resident.createActor).not.toHaveBeenCalled();
+    }
   });
 
   it("freezes actor requests before the child-side resident client handoff", async () => {
@@ -173,18 +182,20 @@ describe("provider kernel forwarding", () => {
     const createActor = vi.fn(async (request: FabricActorRequest) => ({ ...request, id: "resident-actor" }));
     vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue({ createActor } as unknown as ResidentActorClient);
     const childProvider = new AgentsProvider(provider.manager, provider.actorManager, provider.globalActors, provider.mainAgent, provider.participants, undefined, provider.lifecycle, () => false, undefined, false);
-    await childProvider.invoke("create", { name: "actor", instructions: "task", residency: "durable" }, context);
-    expect(createActor).toHaveBeenCalledWith(expect.objectContaining({ kernel: "python", pythonRuntime: "monty" }));
+    const signal = new AbortController().signal;
+    await childProvider.invoke("create", { name: "actor", instructions: "task", residency: "durable" }, { ...context, signal });
+    expect(createActor).toHaveBeenCalledWith(expect.objectContaining({ kernel: "python", pythonRuntime: "monty" }), signal);
     expect(actors.create).not.toHaveBeenCalled();
   });
 
   it.each([undefined, "inherit"] as const)("preserves %s on global templates, then resolves on import", async (kernel) => {
-    const { provider, templates, actors } = setup();
+    const { provider, templates, actors, residency } = setup();
     await provider.invoke("create", { scope: "global", name: "actor", instructions: "task", ...(kernel ? { kernel } : {}) }, context);
     expect(templates.create.mock.calls[0]![0].kernel).toBe(kernel);
     expect(actors.create).not.toHaveBeenCalled();
     await provider.invoke("import", { name: "template" }, context);
-    expect(actors.create).toHaveBeenCalledWith(expect.objectContaining({ kernel: "python" }));
+    expect(residency.createActor).toHaveBeenCalledWith(expect.objectContaining({ kernel: "python" }), context.signal);
+    expect(actors.create).not.toHaveBeenCalled();
   });
 
   it("retains actor extensions:true defaults when ordinary agents disable extensions", async () => {
@@ -194,7 +205,7 @@ describe("provider kernel forwarding", () => {
     try {
       manager.config.extensions = false;
       await provider.invoke("create", { name: "actor", instructions: "task", kernel: "python" }, context);
-      expect(actors.create).toHaveBeenCalledWith(expect.objectContaining({ kernel: "python", extensions: true }));
+      expect(actors.create).toHaveBeenCalledWith(expect.objectContaining({ kernel: "python", extensions: true }), expect.objectContaining({ beforeCommit: expect.any(Function), checkActive: expect.any(Function) }));
     } finally { manager.config.extensions = original; }
   });
 

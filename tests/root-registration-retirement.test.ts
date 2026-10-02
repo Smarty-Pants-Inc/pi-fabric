@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { retainRootRegistration, forgetRetainedRootRegistration, releaseRetainedRootRegistrations } from "../src/main-agent.js";
+import { retainRootRegistration, forgetRetainedRootRegistration, releaseRetainedRootRegistrations } from "../src/topology/root-registration-retention.js";
 
 describe("lightweight retained root retirement", () => {
   it("releases only the exact native session, once, without engine loading", async () => {

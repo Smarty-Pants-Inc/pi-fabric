@@ -148,7 +148,7 @@ describe("runtime duplicate-root admission", () => {
   it("native reload shutdown keeps a live reservation until its same owner resumes", async () => {
     const f = fixture();
     await f.runtime.initialize(f.context, f.config);
-    await f.runtime.shutdown({ preserveRootRegistration: true });
+    await f.runtime.shutdown("reload");
     expect(fs.readdirSync(path.join(f.meshRoot, "root-registrations"))).toHaveLength(1);
     const contender = new RootRegistrationGuard(new MeshStore(f.meshRoot, 64 * 1024, 100), { owner: { id: "synthetic-competitor", pid: process.pid, host: os.hostname(), startTime: "" } });
     await expect(contender.claim({ sessionId: "synthetic-competitor", rootId: "session:synthetic-competitor", fabricSessionId: "synthetic-competitor", name: "fixture-root" })).rejects.toThrow(/Duplicate live Fabric root/);
@@ -211,7 +211,7 @@ describe("runtime duplicate-root admission", () => {
     const record = new ParticipantDirectory(mesh, { enabled: true, hostId: remoteIdentity.id, rootId: id, identity: remoteIdentity }).root({
       id, name: "Main", kind: "main", status: "idle", runner: "pi", transport: "host", sessionId,
       cwd: f.cwd, updatedAt: stamp, pendingMessages: false, local: true,
-    }, "mirrored-live-name", "synthetic-remote-process-owner");
+    }, true, "mirrored-live-name", "synthetic-remote-process-owner");
     const key = (prefix: string, value: string) => prefix + createHash("sha256").update(value).digest("hex");
     await mesh.put({ key: key("topology/hosts/", remoteIdentity.id), identity: remoteIdentity, value: {
       format: 1, id: remoteIdentity.id, rootId: id, identity: remoteIdentity, remoteHost,
@@ -237,12 +237,14 @@ describe("runtime duplicate-root admission", () => {
     const replacement = new FabricState(f.pi, new CapturedToolCatalog(), { runtimeLoader: load });
     try {
       await first.bootstrap(f.context); await first.ensure(f.context);
-      await first.shutdown({ preserveRootRegistration: true });
+      await first.shutdown("reload");
       await replacement.bootstrap(f.context);
       expect(replacement.shouldEagerlyActivate(f.context)).toBe(false);
       expect(load).not.toHaveBeenCalled();
       await replacement.shutdown();
       expect(load).not.toHaveBeenCalled();
+      const observer = new ParticipantDirectory(new MeshStore(f.meshRoot, 64 * 1024, 100), { enabled: true, hostId: "synthetic-retirement-observer", rootId: "synthetic-retirement-observer", identity: { id: "synthetic-retirement-observer", name: "observer", kind: "main" } });
+      expect(observer.list({ kinds: ["root"], fresh: true }).filter(root => root.id === "session:synthetic-new-session")).toHaveLength(0);
       await expect(f.incumbent.claim({ sessionId: "synthetic-retirement-successor", rootId: "session:synthetic-retirement-successor", fabricSessionId: "synthetic-retirement-successor", name: "fixture-root" })).resolves.toBeUndefined();
     } finally {
       await first.shutdown(); await replacement.shutdown(); await f.incumbent.close();

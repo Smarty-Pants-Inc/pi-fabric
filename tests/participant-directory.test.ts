@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { projectOf } from "../src/topology/project-identity.js";
@@ -5,8 +6,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { LIVENESS_POLICY_KEY, readHostLeases, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
+import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { actorParticipantRecord } from "../src/topology/records.js";
+import type { FabricActorInfo } from "../src/actors/types.js";
+import { LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -86,6 +91,203 @@ const createDirectory = (
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => directory.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("ParticipantDirectory.mirroredControlOwner", () => {
+  const keyFor = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
+  const setup = async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mirror-owner-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const writer = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const reader = new MeshStore(meshRoot, 64 * 1024, 1_000, { readCacheMs: 60_000 });
+    const localIdentity: MeshIdentity = { id: "local-identity", name: "main", kind: "main" };
+    const identity: MeshIdentity = { id: "remote-identity", name: "main", kind: "main" };
+    const directory = new ParticipantDirectory(reader, {
+      enabled: true, hostId: "local-host", rootId: "local-root", identity: localIdentity,
+    });
+    const participant = {
+      ...rootRecord("remote-root", "remote-host", "remote-session"),
+      ownerIdentityId: identity.id, remoteHost: "forge",
+    };
+    const host = {
+      format: 1, id: "remote-host", rootId: participant.id, identity,
+      startedAt: 1, updatedAt: 2, expiresAt: Date.now() + 15_000, remoteHost: "forge",
+    };
+    const participantKey = keyFor("topology/participants/", participant.id);
+    const hostKey = keyFor("topology/hosts/", host.id);
+    const putParticipant = (patch: Record<string, unknown> = {}, author = identity) => writer.put({
+      key: participantKey, value: { ...participant, ...patch }, identity: author,
+    });
+    const putHost = (patch: Record<string, unknown> = {}, author = identity) => writer.put({
+      key: hostKey, value: { ...host, ...patch }, identity: author,
+    });
+    await putHost();
+    await putParticipant();
+    const read = () => directory.mirroredControlOwner(host.id, identity.id, participant.id);
+    return { meshRoot, writer, reader, directory, identity, participant, host, participantKey, hostKey, putParticipant, putHost, read };
+  };
+
+  it("exposes the exact public read port and retains fresh expiry knowledge from first send through lapse", async () => {
+    const { directory, reader, host, putHost, read } = await setup();
+    expect(typeof ParticipantDirectory.prototype.mirroredControlOwner).toBe("function");
+    const port: (host: string, identity: string | undefined, target: string) =>
+      { remoteHost: string; expiresAt: number } | undefined = directory.mirroredControlOwner.bind(directory);
+    expect(port(host.id, undefined, host.rootId)).toBeUndefined();
+    const publish = vi.spyOn(reader, "publish");
+    const put = vi.spyOn(reader, "put");
+    try {
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: host.expiresAt });
+      const renewed = host.expiresAt + 30_000;
+      await putHost({ expiresAt: renewed });
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: renewed });
+      const expired = Date.now() - 1_000;
+      await putHost({ expiresAt: expired });
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: expired });
+      expect(directory.get(host.rootId, Date.now(), { fresh: true })).toBeUndefined();
+      expect(publish).not.toHaveBeenCalled();
+      expect(put).not.toHaveBeenCalled();
+    } finally {
+      publish.mockRestore();
+      put.mockRestore();
+    }
+  });
+
+  it("uses later matching file expiry, and observes file renewals and removal", async () => {
+    const { meshRoot, host, read } = await setup();
+    const lease = {
+      id: host.id, rootId: host.rootId, identityId: host.identity.id,
+      updatedAt: Date.now(), expiresAt: host.expiresAt + 30_000,
+    };
+    const leaseFile = path.join(meshRoot, "host-leases",
+      createHash("sha256").update(host.id).digest("hex").slice(0, 32) + ".json");
+    const replaceLease = (expiresAt: number) => {
+      writeHostLease(meshRoot, { ...lease, updatedAt: Date.now(), expiresAt });
+    };
+    replaceLease(lease.expiresAt);
+    expect(read()).toEqual({ remoteHost: "forge", expiresAt: lease.expiresAt });
+    replaceLease(lease.expiresAt + 100_000);
+    expect(read()?.expiresAt).toBe(lease.expiresAt + 100_000);
+    replaceLease(host.expiresAt - 1);
+    expect(read()?.expiresAt).toBe(host.expiresAt);
+    // Removal must discard a cached lease that still outranks state, not merely a shorter one.
+    replaceLease(lease.expiresAt + 100_000);
+    expect(read()?.expiresAt).toBe(lease.expiresAt + 100_000);
+    removeHostLease(meshRoot, host.id);
+    expect(fs.existsSync(leaseFile)).toBe(false);
+    expect(read()?.expiresAt).toBe(host.expiresAt);
+  });
+
+  it.each(["rootId", "identityId"])("ignores a later file lease with mismatched %s", async (field) => {
+    const { meshRoot, host, read } = await setup();
+    writeHostLease(meshRoot, {
+      id: host.id, rootId: host.rootId, identityId: host.identity.id,
+      updatedAt: Date.now(), expiresAt: host.expiresAt + 30_000, [field]: "wrong",
+    });
+    expect(read()).toEqual({ remoteHost: "forge", expiresAt: host.expiresAt });
+  });
+
+  it("requires exact caller target, owner host and identity bindings", async () => {
+    const { directory, host } = await setup();
+    expect(directory.mirroredControlOwner(host.id, "wrong", host.rootId)).toBeUndefined();
+    expect(directory.mirroredControlOwner("wrong", host.identity.id, host.rootId)).toBeUndefined();
+    expect(directory.mirroredControlOwner(host.id, host.identity.id, "wrong")).toBeUndefined();
+    directory.options.enabled = false;
+    expect(directory.mirroredControlOwner(host.id, host.identity.id, host.rootId)).toBeUndefined();
+  });
+
+  it.each([
+    { rootId: "wrong" }, { ownerHostId: "wrong" }, { ownerIdentityId: "wrong" },
+    { remoteHost: "other" }, { remoteHost: undefined }, { remoteHost: "bad/name" },
+    { remoteHost: 42 }, { kind: "agent" }, { format: 2 }, { id: "wrong" },
+    { capabilities: ["unknown"] }, { role: 42 },
+  ])("rejects invalid or conflicting participant metadata %j", async (patch) => {
+    const { putParticipant, read } = await setup();
+    await putParticipant(patch);
+    expect(read()).toBeUndefined();
+  });
+
+  it.each([
+    { rootId: "wrong" }, { identity: { id: "wrong", name: "main", kind: "main" } },
+    { remoteHost: "other" }, { remoteHost: undefined }, { remoteHost: "bad/name" },
+    { remoteHost: 42 }, { expiresAt: "wrong" }, { expiresAt: null },
+    { format: 2 }, { id: "wrong" },
+  ])("rejects invalid, native or conflicting host metadata %j", async (patch) => {
+    const { putHost, read } = await setup();
+    await putHost(patch);
+    expect(read()).toBeUndefined();
+  });
+
+  it("rejects records whose entry author does not match the claimed owner", async () => {
+    const { identity, putParticipant, putHost, read } = await setup();
+    const stranger = { ...identity, id: "stranger" };
+    await putParticipant({}, stranger);
+    expect(read()).toBeUndefined();
+    await putParticipant();
+    await putHost({}, stranger);
+    expect(read()).toBeUndefined();
+  });
+
+  it("does not attribute a missing participant or host", async () => {
+    const { writer, participantKey, hostKey, putParticipant, read } = await setup();
+    await writer.delete({ key: participantKey });
+    expect(read()).toBeUndefined();
+    await putParticipant();
+    await writer.delete({ key: hostKey });
+    expect(read()).toBeUndefined();
+  });
+
+  it("keeps a native participant file ahead of a newer state mirror", async () => {
+    const { meshRoot, writer, participantKey, participant, putParticipant, read } = await setup();
+    const entry = writer.get(participantKey, { fresh: true })!;
+    writeParticipantFile(meshRoot, {
+      ...entry, updatedAt: 0, value: { ...participant, remoteHost: undefined },
+    });
+    await putParticipant();
+    expect(read()).toBeUndefined();
+  });
+
+  it.each(["id", "rootId", "identity"])("refuses collisions with a native host's %s without publishing", async (field) => {
+    const { writer, reader, host, read } = await setup();
+    const identity: MeshIdentity = { id: field === "identity" ? host.rootId : "native-identity", name: "main", kind: "main" };
+    const nativeId = field === "id" ? host.rootId : "native-host";
+    await writer.put({
+      key: keyFor("topology/hosts/", nativeId), identity,
+      value: {
+        ...host, id: nativeId, identity, remoteHost: undefined,
+        rootId: field === "rootId" ? host.rootId : "native-root",
+      },
+    });
+    const publish = vi.spyOn(reader, "publish");
+    try {
+      expect(read()).toBeUndefined();
+      expect(publish).not.toHaveBeenCalled();
+    } finally {
+      publish.mockRestore();
+    }
+  });
+
+  it.each(["root", "identity"])("refuses a mirror colliding with this directory's %s", async (field) => {
+    const { directory, participant, read } = await setup();
+    if (field === "root") directory.options.rootId = participant.id;
+    else directory.options.identity = { ...directory.options.identity, id: participant.id };
+    expect(read()).toBeUndefined();
+  });
+
+  it("refuses a mirrored owner claiming this directory's host id", async () => {
+    const { writer, identity, participant, host, putParticipant, read } = await setup();
+    await writer.put({
+      key: keyFor("topology/hosts/", "local-host"), identity,
+      value: { ...host, id: "local-host" },
+    });
+    await putParticipant({ ownerHostId: "local-host" });
+    const directory = new ParticipantDirectory(writer, {
+      enabled: true, hostId: "local-host", rootId: "local-root",
+      identity: { id: "local-identity", name: "main", kind: "main" },
+    });
+    expect(directory.mirroredControlOwner("local-host", identity.id, participant.id)).toBeUndefined();
+    expect(read()).toBeUndefined();
+  });
 });
 
 // smarty-dev#816: heartbeats were 78% of all writes under the one mesh lock, each a rewrite of
@@ -239,7 +441,8 @@ describe("ParticipantDirectory activity counters", () => {
     const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
     await store.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: identityOf("owner") });
     const worker = { status: "running", turns: 0, toolCalls: 0, calls: 0 };
-    // Every read of the source is new activity: the counters and the current tool move.
+    // Every read of the source is new model activity: the counters and the current tool move.
+    // Actor queue/mailbox counts are operational state, covered separately below.
     const alpha = createDirectory(meshRoot, identityOf("alpha"), "session:alpha", () => {
       worker.calls += 1;
       worker.turns += 1;
@@ -253,8 +456,6 @@ describe("ParticipantDirectory activity counters", () => {
           turns: worker.turns,
           toolCalls: worker.toolCalls,
           usage: { input: worker.turns * 10, output: worker.turns, cacheRead: 0, cacheWrite: 0, cost: worker.turns / 100 },
-          actorQueued: worker.calls,
-          actorMessages: worker.calls,
           updatedAt: Date.now(),
         },
       ];
@@ -311,6 +512,69 @@ describe("ParticipantDirectory activity counters", () => {
     expect(alphaBatches()).toBe(carried);
     vi.restoreAllMocks();
     batches.mockRestore();
+  });
+});
+
+// #2726 / Astra F1: queue and mailbox counts are operational state, not model activity.
+// Both provider reads consume this fresh row; their overlay mapping is covered separately in
+// agents-provider.test.ts. Exercise the real mapper, publisher and filesystem reader here.
+describe("ParticipantDirectory actor operational counters", () => {
+  describe.each([
+    { version: 1, hostLeases: "files" },
+    { version: 1, hostLeases: "files", participants: "files" },
+  ])("policy %j", (policy) => {
+    const setup = async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-counters-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const identity: MeshIdentity = { id: "session:owner", name: "main", kind: "main", sessionId: "owner" };
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      await store.put({ key: LIVENESS_POLICY_KEY, value: policy, identity });
+      const actor: FabricActorInfo = {
+        id: "actor:running", scope: "project", name: "running", rootId: identity.id,
+        status: "running", residency: "durable", runner: "pi", events: [], topics: [],
+        delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false,
+        queued: 0, messages: 1, createdAt: 1, updatedAt: 2,
+        inFlightRun: { id: "stable-run", startedAt: 2, ageS: 0 },
+      };
+      // No clock jump, root transition, child or new run can incidentally flush counts.
+      // The heartbeat is a minute away; only the awaited ordinary refreshes publish updates.
+      const timing = { heartbeatMs: 60_000, leaseMs: 120_000 };
+      const owner = createDirectory(meshRoot, identity, identity.id, () => [
+        rootRecord(identity.id, identity.id, "owner"),
+        actorParticipantRecord(actor, identity.id, identity.id, identity.id, identity.id),
+      ], timing);
+      const readerIdentity: MeshIdentity = { id: "session:reader", name: "main", kind: "main", sessionId: "reader" };
+      // A separate store/directory, with no owner-memory shortcut or stubbed get().
+      const reader = createDirectory(meshRoot, readerIdentity, readerIdentity.id, () => [], timing);
+      await owner.start();
+      const read = () => reader.get(actor.id, undefined, { fresh: true });
+      const stable = {
+        id: actor.id, kind: "actor", status: "running", ownerHostId: identity.id,
+        local: false, stale: false, actorRun: { id: "stable-run", startedAt: 2 },
+      };
+      expect(read()).toMatchObject({ ...stable, actorQueued: 0, actorMessages: 1 });
+      // Assert that the requested policy really selected state+file vs file-only publication.
+      expect(store.listAll("topology/participants/", { fresh: true }).length)
+        .toBe(policy.participants === "files" ? 0 : 2);
+      return { actor, owner, read, stable };
+    };
+
+    it.each([
+      { change: "queue/message", counts: [[1, 2], [2, 3]] },
+      { change: "message-only", counts: [[0, 2], [0, 3]] },
+      { change: "queue-only", counts: [[1, 1], [2, 1]] },
+    ])("publishes two successive $change updates on the same running activation", async ({ counts }) => {
+      const { actor, owner, read, stable } = await setup();
+      for (const [queued, messages] of counts) {
+        actor.queued = queued!;
+        actor.messages = messages!;
+        actor.updatedAt += 1;
+        await owner.refresh();
+        // Soft assertions retain evidence for BOTH refreshes even when the first is RED.
+        expect.soft(read()).toMatchObject({ ...stable, actorQueued: queued, actorMessages: messages });
+      }
+    });
   });
 });
 
@@ -373,6 +637,25 @@ describe("ParticipantDirectory.get", () => {
 
 // smarty-dev#784: roots publish their role and project, and peers show them.
 describe("ParticipantDirectory role and project", () => {
+  it("publishes normalized origin and marks print/JSON roots as discovery-only observers", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-origin-presence-"));
+    roots.push(dir);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "ignore" });
+    git("init", "-q");
+    git("remote", "add", "origin", "git@github.com:Smarty-Pants-Inc/pi-fabric.git");
+    const identity: MeshIdentity = { id: "session:audit", name: "main", kind: "main", sessionId: "audit" };
+    let alpha: ParticipantDirectory;
+    const info = { id: identity.id, name: "Main", kind: "main", status: "idle", runner: "pi", transport: "host",
+      cwd: dir, sessionId: "audit", startedAt: 1, updatedAt: 2, pendingMessages: false, local: true } as const;
+    alpha = createDirectory(path.join(dir, "mesh"), identity, identity.id, () => [alpha.root(info, false)]);
+    await alpha.start();
+    expect(alpha.get(identity.id)).toMatchObject({ repository: "github.com/smarty-pants-inc/pi-fabric", interactive: false, capabilities: ["fabric"] });
+    expect(alpha.root(info, true)).toMatchObject({ interactive: true, capabilities: ["steer", "followUp", "fabric"] });
+    const reader = createDirectory(path.join(dir, "mesh"), { id: "session:reader", name: "main", kind: "main" }, "session:reader", () => []);
+    expect(reader.peers()).toEqual([expect.objectContaining({ id: identity.id, repository: "github.com/smarty-pants-inc/pi-fabric", interactive: false })]);
+  });
+
+
   it("publishes a root's role and project, and shows them on peers", async () => {
     const previous = process.env.SMARTY_ROLE;
     process.env.SMARTY_ROLE = "project-agent@5358e96a418f";
@@ -409,6 +692,8 @@ describe("ParticipantDirectory root project", () => {
     roots.push(root);
     const own = path.join(root, "own-project");
     fs.mkdirSync(own);
+    // A lane-local TMPDIR may sit inside another checkout: make this fixture a distinct project.
+    fs.mkdirSync(path.join(own, ".git"));
     process.env.SMARTY_ROLE = "project-agent@5358e96a418f";
     process.env.PI_FABRIC_PROJECT = own;
     try {
@@ -458,13 +743,15 @@ describe("ParticipantDirectory", () => {
       kind: "agent",
       sessionId: "recursive-session",
     };
+    // This tests live ownership and lineage, not expiry: keep all owners live across slow CI.
+    const lease = { heartbeatMs: 60_000, leaseMs: 120_000 };
     const alpha = createDirectory(meshRoot, alphaIdentity, alphaIdentity.id, () => [
       rootRecord(alphaIdentity.id, alphaIdentity.id, "alpha"),
       agentRecord("agent:alpha-child", alphaIdentity.id, alphaIdentity.id, alphaIdentity.id),
-    ]);
+    ], lease);
     const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [
       rootRecord(betaIdentity.id, betaIdentity.id, "beta"),
-    ]);
+    ], lease);
     const recursive = createDirectory(meshRoot, recursiveIdentity, alphaIdentity.id, () => [
       agentRecord(
         "agent:grandchild",
@@ -472,7 +759,7 @@ describe("ParticipantDirectory", () => {
         "runtime:recursive-session",
         recursiveIdentity.id,
       ),
-    ]);
+    ], lease);
 
     await alpha.start();
     await beta.start();
@@ -800,6 +1087,81 @@ describe("ParticipantDirectory", () => {
       expect(writes).not.toHaveBeenCalled();
     });
 
+    it("preserves backoff and one warning across unchanged refreshes until real lock recovery", async () => {
+      vi.useFakeTimers();
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-outage-"));
+      roots.push(root);
+      const identity: MeshIdentity = { id: "session:busy", name: "main", kind: "main", sessionId: "busy" };
+      const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 100 });
+      const source = vi.fn(() => [rootRecord(identity.id, identity.id, "busy")]);
+      const directory = new ParticipantDirectory(mesh, {
+        enabled: true, hostId: identity.id, rootId: identity.id, identity,
+        heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false,
+      });
+      directory.registerSource(source);
+      directories.push(directory);
+      const intervals = vi.spyOn(globalThis, "setInterval");
+      const lockPath = path.join(mesh.root, ".lock");
+      try {
+        await directory.start();
+        // Drive the real heartbeat callback without incidental ticks during backoff.
+        const heartbeat = intervals.mock.calls[0]![0] as () => void;
+        const runs = vi.spyOn(MeshBackgroundRetry.prototype, "run");
+        const writes = vi.spyOn(mesh, "writeBatch");
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        const tick = async () => {
+          heartbeat();
+          const result = runs.mock.results.at(-1)!.value;
+          await vi.advanceTimersByTimeAsync(200); // acquisition times out after 100 ms
+          return await result;
+        };
+        const hold = () => {
+          fs.mkdirSync(lockPath, { mode: 0o700 });
+          fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+        };
+        hold();
+        const holder = fs.readFileSync(path.join(lockPath, "owner"), "utf8");
+        expect(await tick()).toBe("retry");
+        expect(warn).toHaveBeenCalledOnce();
+        expect(warn.mock.calls[0]![0]).toContain(`pid ${process.pid}`);
+        const retry = runs.mock.contexts.at(-1) as MeshBackgroundRetry;
+        const recovered = vi.spyOn(retry, "success");
+        await vi.advanceTimersByTimeAsync(retry.waitMs);
+
+        const readsBefore = source.mock.calls.length;
+        directory.scheduleRefresh();
+        await Promise.resolve(); // run the queued change-only refresh
+        expect(await runs.mock.results.at(-1)!.value).toBe("done");
+        expect(source.mock.calls.length).toBeGreaterThan(readsBefore);
+        expect(writes).toHaveBeenCalledOnce(); // unchanged snapshot took no mesh lock
+        expect(recovered).not.toHaveBeenCalled();
+        expect(directory.writeStalled()).toBeDefined();
+        expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(holder);
+
+        expect(await tick()).toBe("retry");
+        expect(warn).toHaveBeenCalledOnce(); // same live holder, same continuous outage
+        expect(retry.waitMs).toBeGreaterThan(0); // second timeout retained the doubled delay
+        heartbeat();
+        expect(await runs.mock.results.at(-1)!.value).toBe("skipped");
+        expect(writes).toHaveBeenCalledTimes(2);
+
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        await vi.advanceTimersByTimeAsync(retry.waitMs);
+        expect(await tick()).toBe("done"); // a real locked write confirms recovery
+        expect(directory.writeStalled()).toBeUndefined();
+        expect(recovered).toHaveBeenCalledOnce();
+        expect(retry.waitMs).toBe(0);
+        hold();
+        expect(await tick()).toBe("retry");
+        expect(warn).toHaveBeenCalledTimes(2); // a later outage gets its own warning
+      } finally {
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        await directory.close();
+        vi.restoreAllMocks();
+        vi.useRealTimers();
+      }
+    });
+
     it("publishes a burst of changes with at most two writes, ending on the latest", async () => {
       const { directory, mesh, writes, setStatus } = await changing();
       for (let index = 0; index < 10; index++) {
@@ -984,7 +1346,7 @@ describe("ParticipantDirectory", () => {
     fs.mkdirSync(lockPath, { mode: 0o700 });
     fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
     await expect.poll(() => directory.writeStalled()?.message ?? "", { timeout: 5_000, interval: 50 })
-      .toMatch(/^Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock/);
+      .toMatch(/^Fabric mesh is write-stalled: FABRIC_MESH_LOCK_TIMEOUT: Timed out waiting for the Fabric mesh lock/);
     // Timers, the dashboard and ownership checks read these: they must never throw.
     expect(() => directory.sessions()).not.toThrow();
     expect(() => directory.peers()).not.toThrow();

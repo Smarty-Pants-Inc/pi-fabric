@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import {
@@ -28,6 +30,12 @@ const subscriptionKey = (id: string): string =>
   FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + id;
 
 export class LifecycleBroker {
+  readonly #backgroundPoll = new MeshBackgroundRetry("lifecycle cursor poll");
+  readonly #backgroundPublish = new MeshBackgroundQueue("participant lifecycle event");
+
+  publishBackground(request: FabricLifecyclePublishRequest): Promise<void> {
+    return this.#backgroundPublish.enqueue(() => this.publish(request));
+  }
   readonly #pollMs: number;
   readonly #maxReadEvents: number;
   #timer: NodeJS.Timeout | undefined;
@@ -35,8 +43,11 @@ export class LifecycleBroker {
   #publishTail: Promise<void> = Promise.resolve();
   #pollScheduled = false;
   #closed = false;
+  #paused = false;
   /** Cursors past events that matched nothing, not yet saved, by subscription id. */
   readonly #unsaved = new Map<string, number>();
+  /** Accepted delivery is never replayed to recover a storage receipt. */
+  readonly #delivered = new Map<string, { entry: MeshStateEntry; subscription: FabricLifecycleSubscription }>();
 
   constructor(
     readonly mesh: MeshStore,
@@ -163,11 +174,23 @@ export class LifecycleBroker {
     return { removed: result.deleted };
   }
 
+  pause(): void { this.#paused = true; }
+  resume(): void { this.#paused = false; this.#schedulePoll(); }
+  async checkpointForRelease(): Promise<void> {
+    if (!this.#paused) throw new Error("Lifecycle release gate is not paused");
+    await this.#backgroundPublish.checkpointForRelease();
+    await this.#publishTail;
+    await this.#polling;
+    for (const id of this.#delivered.keys()) await this.#confirmDelivered(id);
+    if (this.#delivered.size) throw new Error("Lifecycle release has unconfirmed delivery receipts");
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    await this.#backgroundPublish.close();
     await this.#publishTail;
     await this.#polling?.catch(() => undefined);
   }
@@ -182,12 +205,12 @@ export class LifecycleBroker {
     queueMicrotask(() => {
       this.#pollScheduled = false;
       if (this.#closed) return;
-      void this.#poll().catch(() => undefined);
+      void this.#backgroundPoll.run(() => this.#poll());
     });
   }
 
   async #poll(): Promise<void> {
-    if (this.#closed || !this.options.enabled) return;
+    if (this.#closed || this.#paused || !this.options.enabled) return;
     if (this.#polling) return this.#polling;
     const operation = this.#drain();
     this.#polling = operation;
@@ -206,6 +229,11 @@ export class LifecycleBroker {
       const subscription = lifecycleSubscriptionFromValue(entry.value);
       if (!subscription || entry.key !== subscriptionKey(subscription.id)) continue;
       listed.add(subscription.id);
+      if (this.#delivered.has(subscription.id)) {
+        // Retry only the cursor/delete receipt; use a fresh poll after success.
+        await this.#confirmDelivered(subscription.id).catch(rethrowMeshLockTimeout);
+        continue;
+      }
       // Only the target's host drains a subscription. Pass over other hosts' targets (from
       // memory) and caught-up subscriptions before the directory read: that read parses every
       // participant and host record, and ran for every subscription on every poll of every
@@ -241,7 +269,7 @@ export class LifecycleBroker {
   ): Promise<void> {
     let entry = initialEntry;
     let subscription = initial;
-    while (!this.#closed) {
+    while (!this.#closed && !this.#paused) {
       const latestSequence = this.mesh.latestSequence();
       const from = this.#cursor(subscription);
       if (latestSequence <= from) return;
@@ -255,7 +283,7 @@ export class LifecycleBroker {
           ...subscription,
           afterSequence: latestSequence,
           updatedAt: Date.now(),
-        }).then(() => this.#unsaved.delete(subscription.id), () => undefined);
+        }).then(() => this.#unsaved.delete(subscription.id), rethrowMeshLockTimeout);
         return;
       }
 
@@ -286,19 +314,19 @@ export class LifecycleBroker {
             updatedAt: Date.now(),
             lastError: error instanceof Error ? error.message : String(error),
           };
-          await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id), () => undefined);
+          await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id), rethrowMeshLockTimeout);
           return;
         }
         cursor = lifecycle.sequence;
         decided = true;
         lastDeliveredAt = Date.now();
         lastEventId = lifecycle.id;
-        if (subscription.once) {
-          await this.mesh
-            .delete({ key: entry.key, ifVersion: entry.version })
-            .catch(() => ({ deleted: false }));
-          return;
-        }
+        const delivered = { ...subscription, afterSequence: cursor, updatedAt: Date.now(), lastDeliveredAt, lastEventId };
+        delete delivered.lastError;
+        this.#delivered.set(subscription.id, { entry, subscription: delivered });
+        const confirmed = await this.#confirmDelivered(subscription.id).catch(rethrowMeshLockTimeout);
+        if (subscription.once || !confirmed) return;
+        entry = confirmed; subscription = delivered;
       }
 
       if (!decided && this.#keepUnsaved(subscription, cursor)) {
@@ -313,7 +341,11 @@ export class LifecycleBroker {
         ...(lastEventId !== undefined ? { lastEventId } : {}),
       };
       delete updated.lastError;
-      const next = await this.#replace(entry, updated).catch(() => undefined);
+      if (cursor === subscription.afterSequence && subscription.lastError === undefined) {
+        if (events.length < this.#maxReadEvents) return;
+        continue;
+      }
+      const next = await this.#replace(entry, updated).catch(rethrowMeshLockTimeout);
       if (!next) return;
       this.#unsaved.delete(subscription.id);
       entry = next;
@@ -358,6 +390,31 @@ export class LifecycleBroker {
           subscription.events.includes(event)
         );
       });
+  }
+
+  async #confirmDelivered(id: string): Promise<MeshStateEntry | undefined> {
+    const obligation = this.#delivered.get(id);
+    if (!obligation) return undefined;
+    const { entry, subscription } = obligation;
+    // Re-persist a visible cursor whose put threw, never invoke deliver. An
+    // absent once entry after a failed delete has no successful receipt: stay
+    // fail-closed rather than infer durability from a no-op delete.
+    const current = this.mesh.get(entry.key, { fresh: true });
+    if (subscription.once) {
+      if (!current || current.version !== entry.version) throw new Error("Lifecycle once deletion receipt is unconfirmed");
+      const result = await this.mesh.delete({ key: entry.key, ifVersion: current.version });
+      if (!result.deleted) throw new Error("Lifecycle once deletion is unconfirmed");
+      this.#delivered.delete(id); this.#unsaved.delete(id);
+      return undefined;
+    }
+    const observed = lifecycleSubscriptionFromValue(current?.value);
+    if (!current || !observed || (current.version !== entry.version &&
+        JSON.stringify(observed) !== JSON.stringify(subscription))) {
+      throw new Error("Lifecycle delivered cursor receipt ownership is unconfirmed");
+    }
+    const next = await this.#replace(current, subscription);
+    this.#delivered.delete(id); this.#unsaved.delete(id);
+    return next;
   }
 
   async #replace(

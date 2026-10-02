@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, renameAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 
 // Participant records outside the shared state (smarty-dev#2004). Each record lived in the one
@@ -161,7 +161,13 @@ const withKeyLock = async <T>(mesh: ParticipantFileMesh, file: string, operation
   try {
     return operation();
   } finally {
-    fs.rmSync(lock, { recursive: true, force: true });      // only its holder removes a live lock
+    // Unlinking the owner before rmdir leaves an empty canonical directory that a successor
+    // can replace on POSIX. Detach our whole lock first; recursive cleanup touches only it.
+    const tombstone = `${lock}.${randomUUID()}.dead`;
+    // A sibling read/scanner can briefly deny a Windows directory rename. Keep
+    // the unique target and bounded retry; never fall back to deleting the lock.
+    renameAtomic(lock, tombstone);
+    fs.rmSync(tombstone, { recursive: true, force: true });
   }
 };
 
@@ -181,9 +187,11 @@ const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string): Prom
     // the one judged dead goes back (it cannot be, while recoveries share the mesh lock).
     if (readOwner(lock) !== seen) return;
     const tombstone = `${lock}.${randomUUID()}.dead`;
-    fs.renameSync(lock, tombstone);
+    // A sibling read/scanner can briefly deny a Windows directory rename. Keep
+    // the unique target and bounded retry; never fall back to deleting the lock.
+    renameAtomic(lock, tombstone);
     if (readOwner(tombstone) === seen) fs.rmSync(tombstone, { recursive: true, force: true });
-    else fs.renameSync(tombstone, lock);
+    else renameAtomic(tombstone, lock);
   }).catch(() => undefined);                                // a busy mesh: the waiter retries
 };
 

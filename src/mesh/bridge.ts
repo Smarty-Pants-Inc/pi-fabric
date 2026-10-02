@@ -1,4 +1,6 @@
+import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
+import { isMeshLockTimeout, MESH_LOCK_TIMEOUT_CODE } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -7,7 +9,7 @@ import { hostLeaseExpiry, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS,
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
-import type { MeshEvent, MeshIdentity, MeshStateEntry, MeshStore } from "./store.js";
+import { meshCursorGeneration, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
@@ -31,6 +33,8 @@ const DEFAULT_PRESENCE_MS = 5_000;
 export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 /** stop() waits at most this long for the loop and for each remote step of the withdrawal. */
 const DEFAULT_STOP_MS = 5_000;
+const LOCK_RETRY_MIN_MS = 100;
+const LOCK_RETRY_MAX_MS = 2_000;
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 /** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
 export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
@@ -88,9 +92,14 @@ export interface BridgeRead {
   skipped?: BridgeSkip[];
   /** The last sequence read (the cursor to resume from). */
   through: number;
+  /** Generation-tagged byte offset after the whole page; absent for legacy sequence reads. */
+  offset?: number;
 }
 
+export interface BridgeHead { through: number; offset?: number }
+
 export interface BridgePublish {
+  principal?: FabricPrincipal | undefined;
   topic: string;
   kind: string;
   from: MeshIdentity;
@@ -103,11 +112,16 @@ export interface BridgePublish {
 export interface BridgeSide {
   latestSequence(): Promise<number>;
   read(after: number): Promise<BridgeRead>;
+  /** Optional v1 capability: old peers and sequence-only cursor files remain readable. */
+  latestCursor?(): Promise<BridgeHead>;
+  tail?(after: number, offset?: number): Promise<BridgeRead>;
   presence(): Promise<BridgePresence>;
   /** Publish a bridged event; with `held`, only if this link holds each of those ids at commit. */
   publish(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
   /** Whether this link holds a live mirror answering to the id (the hub side only). */
   holds?(id: string): boolean;
+  /** Whether this link has a mirror record for the id, even if its lease lapsed (hub only). */
+  mirrored?(id: string): boolean;
   /** Replace this side's mirror of the peer's presence. */
   mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void>;
   /** Original ids of events the peer bridged into this side after a sequence, one bounded page. */
@@ -141,7 +155,7 @@ const participantOf = (key: string, value: unknown): FabricParticipantRecord | u
   return value as unknown as FabricParticipantRecord;
 };
 
-/** Record fields that change on every renewal; a mirror rewrites the state only when others change. */
+/** Host lease fields that change on every renewal; participant updatedAt is source activity. */
 const settled = (value: Record<string, unknown>): string =>
   JSON.stringify({ ...value, updatedAt: undefined, expiresAt: undefined });
 
@@ -166,25 +180,66 @@ export class StoreBridgeSide implements BridgeSide {
   // pass the byte budget, and `through` stays at the last event it covers. One event that alone
   // passes the budget is skipped with evidence, never a stall of the cursor.
   async read(after: number, pageBytes = BRIDGE_PAGE_BYTES): Promise<BridgeRead> {
-    const page = this.store.read({ after, limit: this.store.maxReadEvents });
+    return this.#page(this.store.read({ after, limit: this.store.maxReadEvents }), after, pageBytes);
+  }
+
+  async latestCursor(): Promise<BridgeHead> {
+    const head = this.store.latestCursor();
+    // An unreadable last complete line is not a sequence/offset anchor. Keep sequence
+    // reconciliation until a publisher leaves a readable boundary, rather than skipping work.
+    return head.last ? { through: head.last.sequence, offset: head.cursor } : { through: this.store.latestSequence() };
+  }
+
+  async tail(after: number, offset?: number, pageBytes = BRIDGE_PAGE_BYTES): Promise<BridgeRead> {
+    if (offset !== undefined) {
+      const page = this.store.tail(offset, this.store.maxReadEvents);
+      // Compaction renames the live log before updating its separate generation file.
+      // Even a matching generation/offset can therefore hide unread archived events.
+      // Check before filtering topics or advancing through; a reserved sequence hole
+      // is harmless unless the store actually holds an event inside the gap.
+      const first = page.events.find(event => event.sequence > after);
+      const gap = first !== undefined && first.sequence > after + 1 &&
+        (this.store.nextEventAfter(after)?.sequence ?? Infinity) < first.sequence;
+      if (!gap && meshCursorGeneration(page.nextOffset) === meshCursorGeneration(offset) && page.nextOffset >= offset) {
+        return this.#page(page.events, after, pageBytes, { start: offset, cursors: page.cursors ?? [], end: page.nextOffset });
+      }
+      // A generation change, truncation or unread gap reconciles from the unchanged
+      // sequence boundary via the archive; a raw tail reset alone would lose older work.
+    }
+    // Capture the committed boundary BEFORE the sequence read. Never adopt a later head
+    // after an empty read: an append between those observations would be skipped forever.
+    const head = await this.latestCursor();
+    if (head.offset !== undefined && after >= head.through) return { events: [], through: after, offset: head.offset };
+    const page = await this.read(after, pageBytes);
+    return { ...page, ...(head.offset !== undefined && page.through >= head.through ? { offset: head.offset } : {}) };
+  }
+
+  #page(
+    page: MeshEvent[], after: number, pageBytes: number,
+    offsets?: { start: number; cursors: number[]; end: number },
+  ): BridgeRead {
     const events: MeshEvent[] = [];
     const skipped: BridgeSkip[] = [];
     let bytes = 0;
     let through = after;
-    for (const event of page) {
-      if (isBridgedTopic(event) && !hasBridgeField(event)) {
+    let offset = offsets?.start;
+    let complete = true;
+    for (const [index, event] of page.entries()) {
+      if (event.sequence > after && isBridgedTopic(event) && !hasBridgeField(event)) {
         const size = Buffer.byteLength(JSON.stringify(event), "utf8");
         if (size > pageBytes) {
           skipped.push({ id: event.id, sequence: event.sequence, topic: event.topic, bytes: size });
         } else {
-          if (bytes + size > pageBytes) break;
+          if (bytes + size > pageBytes) { complete = false; break; }
           bytes += size;
           events.push(event);
         }
       }
-      through = event.sequence;
+      through = Math.max(through, event.sequence);
+      if (offsets) offset = offsets.cursors[index] ?? offset;
     }
-    return { events, through, ...(skipped.length ? { skipped } : {}) };
+    if (offsets && complete) offset = offsets.end;
+    return { events, through, ...(offset !== undefined ? { offset } : {}), ...(skipped.length ? { skipped } : {}) };
   }
 
   async presence(): Promise<BridgePresence> {
@@ -205,7 +260,14 @@ export class StoreBridgeSide implements BridgeSide {
       reserved.add(host.id).add(host.identity.id).add(host.rootId);
       if (mark !== undefined || entry.updatedBy.id !== host.identity.id) continue;
       const expiresAt = hostLeaseExpiry(leases, host);
-      if (expiresAt > now) hosts.push({ record: host, expiresAt });
+      // File-only heartbeats leave the state record old. Carry the effective lease's
+      // renewal time too, so the peer measures its TTL rather than the state's age.
+      const lease = leases.get(host.id);
+      const record = lease && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
+        lease.expiresAt >= host.expiresAt
+        ? { ...host, updatedAt: lease.updatedAt, expiresAt }
+        : host;
+      if (expiresAt > now) hosts.push({ record, expiresAt });
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
@@ -242,6 +304,7 @@ export class StoreBridgeSide implements BridgeSide {
     const data = { ...checked.data, bridge: { from: this.peer, id: checked.data.bridge.id } };
     const published = await this.store.publish({
       ...checked,
+      from: { ...checked.from, verified: "bridge" },
       // Evaluated under the mesh lock that commits the event, so the ownership it checks is the
       // ownership at commit: a native takeover before it refuses the event (security review
       // round 3, F2). Every state writer takes the same lock. Under the participants-files policy a
@@ -280,6 +343,10 @@ export class StoreBridgeSide implements BridgeSide {
       if (!participant || participant.ownerHostId !== id || participant.ownerIdentityId !== id) return false;
     }
     return !this.#reservedNow().has(id);
+  }
+
+  mirrored(id: string): boolean {
+    return remoteHostOf(this.store.get(keyFor(HOST_PREFIX, id), { fresh: true })?.value) === this.peer;
   }
 
   // Every id this side holds that is not this link's mirror, read now.
@@ -354,8 +421,12 @@ export class StoreBridgeSide implements BridgeSide {
     const hosts = new Map<string, FabricHostRecord>();
     for (const { record, expiresAt } of presence.hosts) {
       if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
-      const until = Math.min(expiresAt, now + BRIDGE_LEASE_MS);
-      if (until <= now) continue;
+      // Mirror a still-live observation for one source TTL from this side's sync,
+      // not until the source's absolute expiry. Even a final observation just before
+      // the source expires can therefore extend a stopped host by at most one TTL.
+      const ttl = Math.min(BRIDGE_LEASE_MS, expiresAt - record.updatedAt);
+      if (expiresAt <= now || !Number.isFinite(ttl) || ttl <= 0) continue;
+      const until = now + ttl;
       hosts.set(record.id, record);
       wanted.set(keyFor(HOST_PREFIX, record.id), {
         value: { ...record, updatedAt: now, expiresAt: until, remoteHost: this.peer },
@@ -386,8 +457,9 @@ export class StoreBridgeSide implements BridgeSide {
       if (key.startsWith(PARTICIPANT_PREFIX) && participantFilePresent(this.store.root, key)) continue;
       if (
         existing && isObject(existing.value) && settled(existing.value) === settled(value) &&
-        (typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS ||
-          !key.startsWith(HOST_PREFIX))
+        (key.startsWith(HOST_PREFIX)
+          ? typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS
+          : existing.value.updatedAt === value.updatedAt)
       ) continue;
       if (halted()) return;
       await this.#put(key, value, identity, existing?.version);
@@ -426,6 +498,9 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async bridgedIds(after: number): Promise<BridgedIds> {
+    // At the saved mark there is usually no recovery work. Do not seed sequence hints
+    // by scanning a large log just to discover that its committed head is already covered.
+    if (after >= (await this.latestCursor()).through) return { ids: [], through: after, done: true };
     const ids: string[] = [];
     let cursor = after;
     while (true) {
@@ -455,6 +530,7 @@ const ignoreConflict = (error: unknown): void => {
 export const checkBridgePublish = (input: unknown): BridgePublish => {
   if (!isObject(input)) throw new Error("Bridge publish is not an object");
   const { topic, kind, from, to, text, data } = input;
+  const principal = copyFabricPrincipal(input.principal);
   if (typeof topic !== "string" || typeof kind !== "string" || !isBridgedTopic({ topic, kind })) {
     throw new Error(`Bridge topic is not allowed: ${String(topic)}`);
   }
@@ -464,6 +540,7 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
   if (!isObject(data) || !bridgeStampOf({ data })) throw new Error("Bridge publish has no bridge stamp");
   return {
     topic, kind, to,
+    ...(principal ? { principal } : {}),
     from: { id: from.id, name: from.name, kind: from.kind, ...(typeof from.sessionId === "string" ? { sessionId: from.sessionId } : {}) },
     ...(text !== undefined ? { text } : {}),
     data: data as BridgePublish["data"],
@@ -473,7 +550,7 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
 // ---------------------------------------------------------------------------------------------
 // Stdio transport: one JSON request or response per line.
 
-type RpcOp = "hello" | "latestSequence" | "read" | "presence" | "publish" | "mirror" | "bridgedIds";
+type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "presence" | "publish" | "mirror" | "bridgedIds";
 
 interface RpcRequest { id: number; op: RpcOp; args?: unknown }
 
@@ -529,7 +606,10 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
           try {
             reply({ id: request.id, ok: true, result: await dispatch(side, request) });
           } catch (error) {
-            reply({ id: request.id, ok: false, error: error instanceof Error ? error.message : String(error) });
+            reply({
+              id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
+              ...(isMeshLockTimeout(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
+            });
           }
         });
       },
@@ -561,8 +641,11 @@ const presenceArg = (args: unknown): Pick<BridgePresence, "hosts" | "participant
 
 const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unknown> => {
   switch (request.op) {
-    case "hello": return { version: BRIDGE_PROTOCOL_VERSION };
+    case "hello": return { version: BRIDGE_PROTOCOL_VERSION, tail: true };
     case "latestSequence": return side.latestSequence();
+    case "latestCursor": return side.latestCursor();
+    case "tail": return side.tail(numberArg(request.args, "after"),
+      isObject(request.args) && request.args.offset !== undefined ? numberArg(request.args, "offset") : undefined);
     case "read": return side.read(numberArg(request.args, "after"));
     case "presence": return { ...boundPresence(await side.presence()).presence, reserved: [] };
     case "publish": return side.publish(checkBridgePublish(request.args));
@@ -575,6 +658,7 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unk
 /** The hub's view of the remote side, over the transport's stdio. */
 export class RemoteBridgeSide implements BridgeSide {
   #next = 1;
+  #supportsTail = false;
   #closed: Error | undefined;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   readonly #onClosed: (error: Error) => void;
@@ -591,7 +675,7 @@ export class RemoteBridgeSide implements BridgeSide {
     lines(
       input,
       (line) => {
-        let response: { id?: unknown; ok?: unknown; result?: unknown; error?: unknown };
+        let response: { id?: unknown; ok?: unknown; result?: unknown; error?: unknown; code?: unknown };
         try {
           response = JSON.parse(line) as typeof response;
         } catch {
@@ -601,7 +685,12 @@ export class RemoteBridgeSide implements BridgeSide {
         if (!pending) return;
         this.#pending.delete(response.id as number);
         if (response.ok === true) pending.resolve(response.result);
-        else pending.reject(new Error(`Bridge agent: ${String(response.error)}`));
+        else {
+          const error = new Error(`Bridge agent: ${String(response.error)}`);
+          // The protocol carries just this safe store code, not arbitrary peer error properties.
+          if (response.code === MESH_LOCK_TIMEOUT_CODE) Object.assign(error, { code: MESH_LOCK_TIMEOUT_CODE });
+          pending.reject(error);
+        }
       },
       (error) => this.close(error ?? new Error("Bridge transport closed")),
     );
@@ -636,12 +725,19 @@ export class RemoteBridgeSide implements BridgeSide {
   }
 
   async hello(): Promise<void> {
-    const reply = await this.#call<{ version?: unknown }>("hello");
+    const reply = await this.#call<{ version?: unknown; tail?: unknown }>("hello");
     if (reply?.version !== BRIDGE_PROTOCOL_VERSION) throw new Error(`Bridge agent speaks protocol ${String(reply?.version)}`);
+    this.#supportsTail = reply.tail === true;
   }
 
   latestSequence(): Promise<number> { return this.#call("latestSequence"); }
   read(after: number): Promise<BridgeRead> { return this.#call("read", { after }); }
+  latestCursor(): Promise<BridgeHead> {
+    return this.#supportsTail ? this.#call("latestCursor") : this.latestSequence().then(through => ({ through }));
+  }
+  tail(after: number, offset?: number): Promise<BridgeRead> {
+    return this.#supportsTail ? this.#call("tail", { after, ...(offset !== undefined ? { offset } : {}) }) : this.read(after);
+  }
   presence(): Promise<BridgePresence> { return this.#call("presence"); }
   publish(event: BridgePublish): Promise<{ sequence: number }> { return this.#call("publish", event); }
   mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void> { return this.#call("mirror", presence); }
@@ -654,6 +750,8 @@ export class RemoteBridgeSide implements BridgeSide {
 interface DirectionCursor {
   /** The last source sequence handled. */
   after: number;
+  /** Source byte offset, tagged with the live-log generation; old cursor files omit it. */
+  offset?: number;
   /** The destination sequence of the last event bridged in (restart dedupe starts after it). */
   mark: number;
 }
@@ -782,6 +880,7 @@ export class MeshBridge {
   #cursor: CursorFile | undefined;
   #seen = { toRemote: new Set<string>(), toLocal: new Set<string>() };
   #presenceAt = Number.NEGATIVE_INFINITY;
+  #presenceSync: Promise<void> | undefined;
   #stopped = false;
   #wake: (() => void) | undefined;
   /** The loop's current pass, so stop() can fence it before the final withdrawal. */
@@ -812,11 +911,14 @@ export class MeshBridge {
     if (saved) {
       this.#cursor = saved;
     } else {
-      const [localHead, remoteHead] = await Promise.all([local.latestSequence(), remote.latestSequence()]);
+      const [localHead, remoteHead]: [BridgeHead, BridgeHead] = await Promise.all([
+        local.latestCursor?.() ?? local.latestSequence().then(through => ({ through })),
+        remote.latestCursor?.() ?? remote.latestSequence().then(through => ({ through })),
+      ]);
       this.#cursor = {
         format: 1, local: localName, remote: remoteName,
-        toRemote: { after: localHead, mark: remoteHead },
-        toLocal: { after: remoteHead, mark: localHead },
+        toRemote: { after: localHead.through, ...(localHead.offset !== undefined ? { offset: localHead.offset } : {}), mark: remoteHead.through },
+        toLocal: { after: remoteHead.through, ...(remoteHead.offset !== undefined ? { offset: remoteHead.offset } : {}), mark: localHead.through },
       };
       this.#save();
     }
@@ -832,8 +934,13 @@ export class MeshBridge {
     writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600 });
   }
 
-  /** Mirror each side's live roots into the other. */
-  async syncPresence(): Promise<void> {
+  /** Mirror each side's live roots into the other; concurrent callers share one pass. */
+  syncPresence(): Promise<void> {
+    return this.#presenceSync ??= this.#syncPresence().finally(() => { this.#presenceSync = undefined; });
+  }
+
+  async #syncPresence(): Promise<void> {
+    const syncedAt = Date.now();
     const [local, claimed] = await Promise.all([this.options.local.presence(), this.options.remote.presence()]);
     const remote = admitPresence(claimed, new Set(local.reserved));
     if (this.#stopped) return;
@@ -841,8 +948,12 @@ export class MeshBridge {
     if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
     // Both settle before a failure is reported, so no local write outlives this pass.
     const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote)]);
-    for (const result of results) if (result.status === "rejected") throw result.reason;
-    this.#presenceAt = Date.now();
+    // A transient failure must not hide a simultaneous permanent/transport failure.
+    const failures = results.filter((result) => result.status === "rejected");
+    const failure = failures.find((result) => !isMeshLockTimeout(result.reason)) ?? failures[0];
+    if (failure) throw failure.reason;
+    // A lock-delayed write must not make an old snapshot look freshly observed.
+    this.#presenceAt = syncedAt;
   }
 
   /**
@@ -850,9 +961,13 @@ export class MeshBridge {
    * page: only the peer's records this side holds now, still clear of every reserved hub id. A
    * claim refused or lost in this pass is never trusted (security review round 2, F1/F2).
    */
-  async #authority(): Promise<{ local: BridgePresence; remote: Pick<BridgePresence, "hosts" | "participants"> }> {
+  async #authority(refreshIfStale = true): Promise<{ local: BridgePresence; remote: Pick<BridgePresence, "hosts" | "participants"> }> {
     const { local } = this.options;
     if (!local.owned) throw new Error("The hub side of a bridge must report the records it holds");
+    // A page/read/write can wait on the mesh lock longer than a mirrored lease.
+    // Refresh once before denying stale authority, sharing the normal presence pass.
+    // Store lock and transport call timeouts bound it; no retry loop or fresh-message RPC.
+    if (refreshIfStale && Date.now() - this.#presenceAt > DEFAULT_PRESENCE_MS) await this.syncPresence();
     const [presence, owned] = await Promise.all([local.presence(), local.owned()]);
     return { local: presence, remote: admitPresence(owned, new Set(presence.reserved)) };
   }
@@ -864,12 +979,12 @@ export class MeshBridge {
       await this.syncPresence();
     }
     if (this.#stopped) return { toRemote: 0, toLocal: 0, dropped: 0 };
-    const toRemote = await this.#forward("toRemote", this.options.local, this.options.remote, async () => {
-      const { remote } = await this.#authority();
+    const toRemote = await this.#forward("toRemote", this.options.local, this.options.remote, async (refreshIfStale = true) => {
+      const { remote } = await this.#authority(refreshIfStale);
       return { recipients: remoteAddresses(remote) };
     });
-    const toLocal = await this.#forward("toLocal", this.options.remote, this.options.local, async () => {
-      const { local, remote } = await this.#authority();
+    const toLocal = await this.#forward("toLocal", this.options.remote, this.options.local, async (refreshIfStale = true) => {
+      const { local, remote } = await this.#authority(refreshIfStale);
       // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
       return { recipients: addresses(local), senders: senders(remote), reserved: new Set(local.reserved) };
     });
@@ -880,7 +995,7 @@ export class MeshBridge {
     direction: "toRemote" | "toLocal",
     source: BridgeSide,
     target: BridgeSide,
-    authority: () => Promise<{ recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }>,
+    authority: (refreshIfStale?: boolean) => Promise<{ recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }>,
   ): Promise<{ forwarded: number; dropped: number }> {
     const cursor = this.#cursor![direction];
     const seen = this.#seen[direction];
@@ -888,15 +1003,35 @@ export class MeshBridge {
     let dropped = 0;
     while (true) {
       const start = cursor.after;
-      const page = await source.read(start);
-      const rules = await authority();
+      const startOffset = cursor.offset;
+      const page = await (source.tail?.(start, startOffset) ?? source.read(start));
+      // Even filtered/skip-only reads can carry this drain past the mirrors' lease.
+      // Renew only when due, independently of whether the page needs routing authority.
+      if (Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS)) await this.syncPresence();
+      // Authority reads are deliberately canonical (copied-marker ABA), so idle pages
+      // avoid them; every page with events retains the same fresh authority checks.
+      let rules = page.events.length ? await authority() : { recipients: new Set<string>() };
       for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
       }
       for (const event of page.events) {
         if (event.sequence <= cursor.after) continue;
-        const reason = this.#refusal(event, rules);
+        let refreshed = false;
+        const refresh = async (): Promise<void> => {
+          refreshed = true;
+          await this.syncPresence();
+          // This event gets one refresh, even if that pass itself waited on a lock.
+          rules = await authority(false);
+        };
+        let reason = this.#refusal(event, rules, direction);
+        const lapsedId = reason === "sender is not a live participant of the remote" ? event.from.id
+          : reason === "ack target is not bound to this link" && isObject(event.data) && typeof event.data.targetId === "string" ? event.data.targetId
+          : reason === "not addressed across" && direction === "toRemote" ? event.to : undefined;
+        if (lapsedId && this.options.local.mirrored?.(lapsedId)) {
+          await refresh();
+          reason = this.#refusal(event, rules, direction);
+        }
         if (reason) {
           if (reason !== "not addressed across") {
             dropped += 1;
@@ -916,18 +1051,41 @@ export class MeshBridge {
             const held = direction === "toLocal"
               ? [event.from.id, ...(event.topic === "fabric.control.ack" && isObject(event.data) && typeof event.data.targetId === "string" ? [event.data.targetId] : [])]
               : [];
-            if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(event.to!)) {
-              throw new BridgeOwnershipError(`${event.to} is no longer bound to bridge link ${this.options.remoteName}`);
+            const publish = async (): Promise<{ sequence: number }> => {
+              if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(event.to!)) {
+                throw new BridgeOwnershipError(`${event.to} is no longer bound to bridge link ${this.options.remoteName}`);
+              }
+              // Recheck the captured destination at the last seam, including after a refresh.
+              const destinationRefusal = this.#destinationRefusal(event, direction);
+              if (destinationRefusal) throw new BridgeOwnershipError(destinationRefusal);
+              return target.publish({
+                topic: event.topic, kind: event.kind, from: event.from, to: event.to!,
+                ...(event.verification === "mesh" || event.verification === "bridge" ? { principal: event.principal } : {}),
+                ...(event.text !== undefined ? { text: event.text } : {}),
+                data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
+              }, held);
+            };
+            let published: { sequence: number };
+            try {
+              published = await publish();
+            } catch (error) {
+              // Ownership errors happen before append, under the publish lock. A mirror can
+              // lapse during that wait: refresh once, reread authority, then retry once.
+              const ids = direction === "toLocal" ? held : [event.to!];
+              if (!(error instanceof BridgeOwnershipError) || refreshed || this.#destinationRefusal(event, direction) ||
+                  !ids.some((id) => this.options.local.mirrored?.(id))) throw error;
+              await refresh();
+              if (this.#stopped) return { forwarded, dropped };
+              if (this.#refusal(event, rules, direction)) throw error;
+              published = await publish();
             }
-            const published = await target.publish({
-              topic: event.topic, kind: event.kind, from: event.from, to: event.to!,
-              ...(event.text !== undefined ? { text: event.text } : {}),
-              data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
-            }, held);
+            seen.add(event.id);
             cursor.mark = Math.max(cursor.mark, published.sequence);
             cursor.after = event.sequence;
             forwarded += 1;
             this.#save();
+            // Only this newly inserted ID is covered by the checkpoint; recovery IDs stay.
+            seen.delete(event.id);
           } catch (error) {
             // Too large or refused by the far side: never retried, or it would stall the source.
             if (!isPermanent(error)) throw error;
@@ -938,17 +1096,35 @@ export class MeshBridge {
         cursor.after = event.sequence;
       }
       // The page may end in events the allow-list filtered out; a page that moved may have more.
-      if (page.through <= start) break;
       cursor.after = Math.max(cursor.after, page.through);
-      this.#save();
+      if (page.offset !== undefined) cursor.offset = page.offset;
+      else delete cursor.offset;
+      const moved = cursor.after > start || cursor.offset !== startOffset;
+      if (moved) this.#save();
+      if (!moved) break;
     }
     return { forwarded, dropped };
   }
 
-  #refusal(event: MeshEvent, rules: { recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }): string | undefined {
+  #destinationRefusal(event: MeshEvent, direction: "toRemote" | "toLocal"): string | undefined {
+    // This is control-plane routing metadata, not a business field on work events or ACKs.
+    // Absence alone is legacy compatibility; an explicitly present undefined is malformed.
+    if (event.topic !== "fabric.control.command" || !isObject(event.data) ||
+        !Object.hasOwn(event.data, "destinationRemoteHost")) return undefined;
+    const destination = event.data.destinationRemoteHost;
+    if (destination === null) return "command destination is native and must not cross a bridge";
+    if (typeof destination !== "string") return "command destinationRemoteHost is not a string or null";
+    const intended = direction === "toRemote" ? this.options.remoteName : this.options.localName;
+    if (destination !== intended) return `command destination is not bound to bridge link ${intended}`;
+    return undefined;
+  }
+
+  #refusal(event: MeshEvent, rules: { recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }, direction: "toRemote" | "toLocal"): string | undefined {
     if (!isBridgedTopic(event) || hasBridgeField(event)) return "not allowed";
     if (!event.to || !rules.recipients.has(event.to)) return "not addressed across";
     if (event.data !== undefined && !isObject(event.data)) return "data is not an object";
+    const destinationRefusal = this.#destinationRefusal(event, direction);
+    if (destinationRefusal) return destinationRefusal;
     if (!isIdentity(event.from)) return "no sender identity";
     if (rules.reserved?.has(event.from.id)) return "sender claims a hub identity";
     if (rules.senders && !rules.senders.has(event.from.id)) return "sender is not a live participant of the remote";
@@ -959,21 +1135,45 @@ export class MeshBridge {
     return undefined;
   }
 
-  /** Step until stop() or a transport failure (thrown). */
+  /** Step until stop() or a permanent/transport failure. Lock contention retries the pass. */
   async run(): Promise<void> {
-    this.#running = this.start();
-    await this.#running;
+    let started = false;
+    let retryMs = LOCK_RETRY_MIN_MS;
+    let reportedTimeout = false;
     while (!this.#stopped) {
-      const pass = this.step();
-      this.#running = pass.then(() => undefined);
-      await pass;
+      const pass = started ? this.step() : this.start();
+      // stop() needs a settlement fence, not a second unhandled rejection of a failed pass.
+      this.#running = pass.then(() => undefined, () => undefined);
+      let delay: number;
+      try {
+        await pass;
+        reportedTimeout = false;
+        if (!started) {
+          started = true;
+          retryMs = LOCK_RETRY_MIN_MS;
+          continue;
+        }
+        retryMs = LOCK_RETRY_MIN_MS;
+        delay = this.options.pollMs ?? DEFAULT_POLL_MS;
+      } catch (error) {
+        if (this.#stopped) return;
+        if (!isMeshLockTimeout(error)) throw error;
+        delay = retryMs;
+        retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
+        if (!reportedTimeout) {
+          this.#log(`mesh lock timeout; retrying in ${delay} ms: ${(error as Error).message}`);
+          reportedTimeout = true;
+        }
+      }
       if (this.#stopped) break;
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, this.options.pollMs ?? DEFAULT_POLL_MS);
-        this.#wake = () => {
+        const wake = (): void => {
           clearTimeout(timer);
+          this.#wake = undefined;
           resolve();
         };
+        const timer = setTimeout(wake, delay);
+        this.#wake = wake;
       });
     }
   }
@@ -1014,4 +1214,5 @@ const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<strin
 };
 
 const isPermanent = (error: unknown): boolean =>
-  error instanceof BridgeOwnershipError || error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message);
+  !isMeshLockTimeout(error) && (error instanceof BridgeOwnershipError ||
+    error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message));

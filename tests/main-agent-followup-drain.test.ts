@@ -17,6 +17,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { followUpDrainSupported } from "../src/host-compatibility.js";
 import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { registerCompactionHook } from "../src/compaction/hook.js";
+import { registerLazyCompactionHook } from "../src/compaction/lazy-hook.js";
 import { rootInboxSession } from "../src/topology/root-inbox.js";
 
 // smarty-dev#1495: a followUp to a Main that chains turns arrived about an hour late.
@@ -59,14 +61,55 @@ describe("Main followUp drain (unit)", () => {
     return { ...fake, state, ctx, main };
   };
 
+  it.each([0, 120_000])("tolerates a host without lifecycle subscriptions (flushMs=%s)", (flushMs) => {
+    const fake = fakePi();
+    const pi = { ...fake.pi, on: undefined } as unknown as ExtensionAPI;
+    const main = new MainAgentController(pi, "session:root", true, "/tmp/project", "root");
+    expect(() => main.attachFollowUpDrain(context({ idle: false }), flushMs)).not.toThrow();
+    expect(main.deliverAgent({ from: from("a"), message: "hello", delivery: "followUp" }))
+      .toMatchObject({ queued: true, pendingFollowUps: 0 });
+    expect(fake.sent).toHaveLength(1);
+    expect(fake.sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(fake.handlers.size).toBe(0);
+    main.closeFollowUpDrain();
+  });
+
   it("delivers to an idle Main as before, with a sent_at header", () => {
     const { main, sent } = setup(120_000, true);
     const result = main.deliverAgent({ from: from("a"), message: "hello", delivery: "followUp" });
-    expect(result).toMatchObject({ queued: true, routed: "main", pendingFollowUps: 0, oldestAgeS: 0 });
+    expect(result).toMatchObject({ queued: true, routed: "main", triggered: true, pendingFollowUps: 0, oldestAgeS: 0 });
     expect(sent).toHaveLength(1);
     expect(sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(sent[0]!.message.content).toContain('delivery="followUp" sent_at="2026-09-27T20:00:00.000Z">');
     expect(sent[0]!.message.details).toMatchObject({ id: result.messageId, delivery: "followUp", sentAt: "2026-09-27T20:00:00.000Z" });
+  });
+
+  it.each(["passive", "halted", "aborted", "provider-error", "nextTurn"])("reports no new turn for %s admission", (mode) => {
+    const { main, state, sent, emit, ctx } = setup(120_000, true);
+    if (mode === "provider-error") emit("turn_end", { message: { stopReason: "error" } }, ctx);
+    if (mode === "halted") main.halt();
+    if (mode === "aborted") state.aborted = true;
+    const receipt = main.deliverAgent({ from: from("a"), message: "context", delivery: mode === "nextTurn" ? "nextTurn" : "followUp",
+      ...(mode === "passive" ? { triggerTurn: false } : {}) });
+    expect(receipt.triggered).toBe(false);
+    if (mode === "provider-error") {
+      expect(receipt.reason).toBe("provider-backoff until 2026-09-27T20:01:00.000Z");
+      expect(sent).toHaveLength(0);
+      vi.advanceTimersByTime(60_000);
+      expect(sent[0]!.options.triggerTurn).toBe(true);
+      return;
+    }
+    expect(sent).toHaveLength(1);
+    if (mode !== "nextTurn") expect(sent[0]!.options.triggerTurn).toBe(false);
+  });
+
+  it("reports an idle wake when admission releases a previously held queue", () => {
+    const { main, state, sent } = setup();
+    expect(main.deliverAgent({ from: from("a"), message: "held", delivery: "followUp" }).triggered).toBe(false);
+    state.idle = true;
+    expect(main.deliverAgent({ from: from("a"), message: "wake", delivery: "followUp" }).triggered).toBe(true);
+    expect(sent).toHaveLength(1);
+    expect(main.queueDepth().pendingFollowUps).toBe(0);
   });
 
   it("stamps a steer with sent_at and sends it at once, even to a busy Main", () => {
@@ -80,10 +123,10 @@ describe("Main followUp drain (unit)", () => {
   it("holds followUps for a busy Main and reports each sender its own queue depth", () => {
     const { main, sent } = setup();
     expect(main.deliverAgent({ from: from("a"), message: "one", delivery: "followUp" }))
-      .toMatchObject({ pendingFollowUps: 1, oldestAgeS: 0 });
+      .toMatchObject({ pendingFollowUps: 1, oldestAgeS: 0, triggered: false });
     vi.advanceTimersByTime(45_000);
     expect(main.deliverAgent({ from: from("b"), message: "two", delivery: "followUp" }))
-      .toMatchObject({ pendingFollowUps: 1, oldestAgeS: 0 });                  // b's own, not a's
+      .toMatchObject({ pendingFollowUps: 1, oldestAgeS: 0, triggered: false });                  // b's own, not a's
     vi.advanceTimersByTime(5_000);
     expect(main.deliverAgent({ from: from("a"), message: "three", delivery: "followUp" }))
       .toMatchObject({ pendingFollowUps: 2, oldestAgeS: 50 });
@@ -443,7 +486,11 @@ describe("Main followUp drain (unit)", () => {
       emit(event === "session_tree" ? "session_before_tree" : "session_before_compact", { reason: "manual", signal: new AbortController().signal }, ctx);
       emit(event, payload, ctx);
       vi.advanceTimersByTime(25);
-      expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
+      if ("errorMessage" in payload) {
+        expect(sent).toHaveLength(0);
+        vi.advanceTimersByTime(59_975);
+        expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: true }]);
+      } else expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
     }
   });
 
@@ -501,6 +548,52 @@ describe("Main followUp drain (unit)", () => {
     expect(sent).toHaveLength(0);
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  // smarty-dev#2793 R2: Pi's deadline aborts the manual controller without owner intent.
+  it.each([0, 120_000].flatMap(flushMs => ["timeout", "owner", "timeout-after-owner-stop"].map(reason => ({ flushMs, reason }))))(
+    "$reason distinguishes operation recovery from durable owner authority (flushMs=$flushMs)",
+    ({ flushMs, reason }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-deadline-"));
+      const journal = path.join(root, "journal.json");
+      fs.writeFileSync(`${journal}.delivered`, JSON.stringify({ version: 1, ids: [] }));
+      const { pi, sent, emit } = fakePi();
+      const state = { idle: false };
+      const ctx = context(state);
+      const main = new MainAgentController(pi, "session:root", true, root, "root");
+      const stopped = reason !== "timeout";
+      main.attachFollowUpDrain(ctx, flushMs, journal);
+      try {
+        const operation = new AbortController();
+        emit("session_before_compact", { reason: "manual", signal: operation.signal }, ctx);
+        if (reason === "timeout-after-owner-stop") main.halt();
+        operation.abort(reason === "owner" ? undefined : new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
+        state.idle = true;
+        emit("session_compact_failed", { reason: "manual", aborted: reason === "owner", willRetry: false,
+          errorMessage: reason === "owner" ? undefined : "Compaction failed: Compaction exceeded its 20-minute deadline" }, ctx);
+        const held = main.deliverAgent({ from: from("peer"), message: "peer before recovery", delivery: "followUp" });
+        if (stopped) expect(sent.at(-1)!.options.triggerTurn).toBe(false); // Owner gate delivers passive context.
+        else {
+          // Main now journals recoverable peer wakes until its provider-backoff deadline.
+          expect(sent).toHaveLength(0);
+          expect(held).toMatchObject({ triggered: false, reason: expect.stringContaining("provider-backoff until ") });
+          expect(main.queueDepth().pendingFollowUps).toBe(1);
+        }
+        expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+        emit("session_before_compact", { reason: "manual", signal: new AbortController().signal }, ctx);
+        emit("session_compact", { reason: "manual" }, ctx); // Recovery, NOT user input.
+        main.deliverAgent({ from: from("peer"), message: "peer after recovery", delivery: "steer" });
+        expect(sent.at(-1)!.options.triggerTurn).toBe(!stopped);
+        main.closeFollowUpDrain();
+        main.attachFollowUpDrain(ctx, flushMs, journal);
+        main.deliverAgent({ from: from("peer"), message: "fresh peer after reload", delivery: "followUp" });
+        expect(sent.at(-1)!.options.triggerTurn).toBe(!stopped);
+        expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+      } finally {
+        main.closeFollowUpDrain();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("drops the pending wake when a later compaction is cancelled, a run starts, or the drain closes", () => {
     for (const end of ["cancelled", "run", "closed"] as const) {
@@ -570,7 +663,11 @@ describe("Main followUp drain (unit)", () => {
       emit("turn_end", { message: { role: "assistant", stopReason: "stop" } }, ctx);
       state.idle = true;
       emit("agent_settled", outcome === undefined ? {} : { outcome }, ctx);
-      expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
+      if (outcome === "error") {
+        expect(sent).toHaveLength(0);
+        vi.advanceTimersByTime(60_000);
+        expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: true }]);
+      } else expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
     }
   });
 
@@ -991,6 +1088,411 @@ describe("Main followUp journal across a live reload in a real Pi session", () =
     expect(delivered).toHaveLength(1);
     expect(fs.existsSync(journal)).toBe(false);          // confirmed from the session's entries
   });
+});
+
+// pi-fabric#184 Astra R4: rejecting /compact is not necessarily an owner stop.
+describe("Main benign compaction rejection and owner cancellation in a real Pi session", () => {
+  const cases = [0, 60_000].flatMap(flushMs => (["followUp", "steer"] as const).flatMap(delivery =>
+    (["small", "already", "declined", "owner-abort"] as const).flatMap(outcome =>
+      (outcome === "owner-abort" ? [false] : [false, true]).map(ownerHalt => ({ flushMs, delivery, outcome, ownerHalt })))));
+  it.each(cases)(
+    "$outcome compaction preserves peer $delivery permission before and after reload (flushMs=$flushMs, ownerHalt=$ownerHalt)",
+    async ({ flushMs, delivery, outcome, ownerHalt }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-compact-permission-"));
+      roots.push(root);
+      const journal = path.join(root, "journal.json");
+      const faux = fauxProvider();
+      const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+      modelRuntime.registerNativeProvider(faux.provider);
+      const mains: MainAgentController[] = [];
+      const failures: Array<{ aborted: boolean; errorMessage?: string }> = [];
+      const operationAborts: boolean[] = [];
+      let starts = 0;
+      let session: AgentSession;
+      const loader = new DefaultResourceLoader({
+        cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [{
+          name: "compact-permission",
+          factory: (pi: ExtensionAPI) => {
+            pi.on("agent_start", () => { starts++; });
+            pi.on("session_start", (_event, ctx) => {
+              const main = new MainAgentController(pi, "session:root", true, root, "root");
+              main.attachFollowUpDrain(ctx, flushMs, journal);
+              mains.push(main);
+            });
+            pi.on("session_shutdown", () => { mains.at(-1)?.closeFollowUpDrain(); });
+            pi.on("session_compact_failed", event => { failures.push(event); });
+            pi.on("session_before_compact", event => {
+              if (outcome === "owner-abort") session.abortCompaction();
+              operationAborts.push(event.signal.aborted);
+              if (outcome === "declined") return { cancel: true };
+              return { compaction: {
+                summary: "summary", firstKeptEntryId: event.preparation.firstKeptEntryId,
+                tokensBefore: event.preparation.tokensBefore,
+              } };
+            });
+          },
+        }],
+      });
+      await loader.reload();
+      ({ session } = await createAgentSession({
+        cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+        sessionManager: SessionManager.inMemory(root), noTools: "all",
+        settingsManager: SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: outcome === "small" ? 16_384 : 1 } }),
+      }));
+      sessions.push(session);
+      await session.bindExtensions({ shutdownHandler: () => undefined });
+      faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second"), fauxAssistantMessage("peer one"), fauxAssistantMessage("peer two")]);
+      const stopped = ownerHalt || outcome === "owner-abort";
+      try {
+        await session.prompt("first question");
+        await session.prompt("second question");
+        if (ownerHalt) mains.at(-1)!.halt(); // Escape while idle produces no aborted turn.
+        if (outcome === "already") await session.compact();
+        await expect(session.compact()).rejects.toThrow(outcome === "small" ? "Nothing to compact (session too small)" :
+          outcome === "already" ? "Already compacted" : "Compaction cancelled");
+        expect(failures).toHaveLength(1);
+        expect(failures[0]!.aborted).toBe(outcome === "declined" || outcome === "owner-abort");
+        if (outcome === "declined") expect(operationAborts).toEqual([false]);
+        if (outcome === "owner-abort") expect(operationAborts).toEqual([true]);
+        expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+        const initialStarts = starts;
+        const initialCalls = faux.state.callCount;
+        expect(initialStarts).toBe(2); // No compaction outcome itself started a run.
+        for (const phase of ["before", "after"] as const) {
+          if (phase === "after") {
+            await session.reload();
+            expect(mains).toHaveLength(2);
+            expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+          }
+          const request = { from: { id: "session:peer", name: "peer", kind: "main" as const },
+            message: `peer ${phase} reload`, delivery, deliveryId: `peer-${phase}` };
+          const result = mains.at(-1)!.deliverAgent(request);
+          expect(mains.at(-1)!.deliverAgent(request)).toMatchObject({ duplicate: true });
+          await session.waitForIdle();
+          const received = session.messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message");
+          expect(received).toHaveLength(phase === "before" ? 1 : 2);
+          expect(received.at(-1)).toMatchObject({ details: { id: result.messageId, triggerTurn: !stopped } });
+          const runs = stopped ? 0 : phase === "before" ? 1 : 2;
+          expect(starts - initialStarts).toBe(runs);
+          expect(faux.state.callCount - initialCalls).toBe(runs);
+        }
+      } finally {
+        await session.abort();
+        await session.waitForIdle();
+        mains.at(-1)?.closeFollowUpDrain();
+      }
+    },
+  );
+});
+
+// smarty-dev#2793 S7: session_compact is not terminal while later handlers still run.
+describe("Main manual compaction completion authority in a real Pi session", () => {
+  const cases = [0, 60_000].flatMap(flushMs => (["followUp", "steer"] as const).flatMap(delivery =>
+    (["late-owner-abort", "late-deadline", "success", "declined"] as const).map(outcome => ({ flushMs, delivery, outcome }))));
+  it.each(cases)(
+    "$outcome retains native cancellation evidence through completion and reload (flushMs=$flushMs, delivery=$delivery)",
+    async ({ flushMs, delivery, outcome }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manual-completion-"));
+      roots.push(root);
+      const journal = path.join(root, "journal.json");
+      const faux = fauxProvider();
+      const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+      modelRuntime.registerNativeProvider(faux.provider);
+      const mains: MainAgentController[] = [];
+      const failures: Array<{ reason: string; aborted: boolean }> = [];
+      let releaseCompletion: (() => void) | undefined;
+      let operation: AbortSignal | undefined;
+      let starts = 0;
+      const loader = new DefaultResourceLoader({
+        cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [{ name: "manual-completion", factory: (pi: ExtensionAPI) => {
+          pi.on("agent_start", () => { starts++; });
+          pi.on("session_before_compact", event => {
+            operation = event.signal;
+            if (outcome === "declined") return { cancel: true };
+            return { compaction: { summary: "summary", firstKeptEntryId: event.preparation.firstKeptEntryId,
+              tokensBefore: event.preparation.tokensBefore } };
+          });
+          pi.on("session_compact_failed", event => { failures.push(event); });
+          pi.on("session_start", (_event, ctx) => {
+            const main = new MainAgentController(pi, "session:root", true, root, "root");
+            main.attachFollowUpDrain(ctx, flushMs, journal);
+            mains.push(main);
+            // Registered AFTER Main: its session_compact handler has already returned.
+            pi.on("session_compact", () => new Promise<void>(resolve => { releaseCompletion = resolve; }));
+          });
+          pi.on("session_shutdown", () => { mains.at(-1)?.closeFollowUpDrain(); });
+        } }],
+      });
+      await loader.reload();
+      const { session } = await createAgentSession({
+        cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+        sessionManager: SessionManager.inMemory(root), noTools: "all",
+        settingsManager: SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 1 } }),
+      });
+      sessions.push(session);
+      await session.bindExtensions({ shutdownHandler: () => undefined });
+      faux.setResponses(Array.from({ length: 6 }, (_, index) => fauxAssistantMessage(`answer ${index}`)));
+      let compacting: Promise<unknown> | undefined;
+      const stopped = outcome === "late-owner-abort";
+      try {
+        await session.prompt("first question");
+        await session.prompt("second question");
+        const initialStarts = starts;
+        const initialCalls = faux.state.callCount;
+        compacting = session.compact().then(() => "completed", () => "failed");
+        if (outcome === "declined") {
+          expect(await compacting).toBe("failed");
+          expect(failures).toMatchObject([{ reason: "manual", aborted: true }]);
+          expect(operation?.aborted).toBe(false); // Benign veto is not native cancellation.
+        } else {
+          await waitFor(() => releaseCompletion !== undefined);
+          expect(session.isIdle).toBe(false);
+          expect(starts).toBe(initialStarts);
+          if (stopped) session.abortCompaction(); // Native SDK cancellation, never main.halt().
+          if (outcome === "late-deadline") {
+            // Pi 0.87.0 has no deadline timer; exercise the same native controller/reason
+            // used by installed Pi 0.87.1 without waiting twenty minutes.
+            (session as unknown as { _compactionAbortController: AbortController })._compactionAbortController
+              .abort(new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
+          }
+          expect(operation?.aborted).toBe(stopped || outcome === "late-deadline");
+          releaseCompletion!();
+          await compacting; // Pi versions differ on whether late abort emits compact_failed.
+        }
+        for (const phase of ["before", "after"] as const) {
+          if (phase === "after") {
+            await session.reload();
+            expect(mains).toHaveLength(2);
+          }
+          const result = mains.at(-1)!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" },
+            message: `peer ${phase} reload`, delivery, deliveryId: `completion-${phase}` });
+          await session.waitForIdle();
+          const received = session.messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message");
+          expect(received).toHaveLength(phase === "before" ? 1 : 2);
+          expect(received.at(-1)).toMatchObject({ details: { id: result.messageId, triggerTurn: !stopped } });
+          const runs = stopped ? 0 : phase === "before" ? 1 : 2;
+          expect(starts - initialStarts).toBe(runs);
+          expect(faux.state.callCount - initialCalls).toBe(runs);
+          expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+        }
+        if (stopped) {
+          await session.prompt("explicit owner resume");
+          expect(starts - initialStarts).toBe(1);
+          mains.at(-1)!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" },
+            message: "peer after owner resume", delivery });
+          await session.waitForIdle();
+          expect(starts - initialStarts).toBe(2);
+          expect(faux.state.callCount - initialCalls).toBe(2);
+        }
+      } finally {
+        session.abortCompaction();
+        releaseCompletion?.();
+        await compacting;
+        await session.abort();
+        await session.waitForIdle();
+        mains.at(-1)?.closeFollowUpDrain();
+      }
+    },
+  );
+});
+
+// pi-fabric#184 Astra R6: operation outcomes are not durable owner intent.
+describe("Main non-owner automatic decline and compaction recovery in a real Pi session", () => {
+  const cases = [0, 60_000].flatMap(flushMs => (["automatic-decline", "failure-recovery"] as const).flatMap(outcome =>
+    (["followUp", "steer"] as const).flatMap(delivery => [false, true].flatMap(ownerHalt =>
+      [false, true].flatMap(reloadFirst => [false, true].map(lazy => ({ flushMs, outcome, delivery, ownerHalt, reloadFirst, lazy })))))));
+  it.each(cases)(
+    "$outcome permits exactly one peer $delivery run before and after reload unless owner halted (flushMs=$flushMs, ownerHalt=$ownerHalt, reloadFirst=$reloadFirst, lazy=$lazy)",
+    async ({ flushMs, outcome, delivery, ownerHalt, reloadFirst, lazy }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-compaction-r6-"));
+      roots.push(root);
+      const journal = path.join(root, "journal.json");
+      const faux = fauxProvider();
+      const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+      modelRuntime.registerNativeProvider(faux.provider);
+      const mains: MainAgentController[] = [];
+      const failures: Array<{ reason: string; aborted: boolean; willRetry: boolean }> = [];
+      const settlements: string[] = [];
+      const inputs: string[] = [];
+      const operationSignals: AbortSignal[] = [];
+      let starts = 0;
+      let recovered = 0;
+      let recovering = false;
+      const loader = new DefaultResourceLoader({
+        cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [{
+          name: "compaction-r6",
+          factory: (pi: ExtensionAPI) => {
+            pi.on("agent_start", () => { starts++; });
+            pi.on("input", event => { inputs.push(event.source); });
+            pi.on("agent_settled", event => { settlements.push((event as { outcome?: string }).outcome ?? "unknown"); });
+            pi.on("session_compact_failed", event => { failures.push(event); });
+            pi.on("session_compact", () => { recovered++; });
+            pi.on("session_before_compact", event => {
+              operationSignals.push(event.signal);
+              if (ownerHalt) mains.at(-1)!.halt(); // Escape, including while compaction is active.
+              if (recovering) return { compaction: {
+                summary: "recovered summary", firstKeptEntryId: event.preparation.firstKeptEntryId,
+                tokensBefore: event.preparation.tokensBefore,
+              } };
+            });
+            // Register the actual Fabric veto BEFORE Main's handler. Pi short-circuits
+            // cancel dispatch, so the drain cannot rely on seeing session_before_compact.
+            (lazy ? registerLazyCompactionHook : registerCompactionHook)(pi, { getEngine: () => "pi", getThresholdTokens: () => outcome === "automatic-decline" ? 100_000 : undefined });
+            pi.on("session_start", (_event, ctx) => {
+              const main = new MainAgentController(pi, "session:root", true, root, "root");
+              main.attachFollowUpDrain(ctx, flushMs, journal);
+              mains.push(main);
+            });
+            pi.on("session_shutdown", () => { mains.at(-1)?.closeFollowUpDrain(); });
+          },
+        }],
+      });
+      await loader.reload();
+      const { session } = await createAgentSession({
+        cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+        sessionManager: SessionManager.inMemory(root), noTools: "all",
+        settingsManager: SettingsManager.inMemory({ retry: { enabled: false }, compaction: {
+          enabled: true, keepRecentTokens: 1,
+          reserveTokens: faux.getModel().contextWindow - 1_000,
+        } }),
+      });
+      sessions.push(session);
+      await session.bindExtensions({ shutdownHandler: () => undefined });
+      try {
+        faux.setResponses([
+          fauxAssistantMessage("first"), fauxAssistantMessage("second"),
+          ...(outcome === "failure-recovery" ? [fauxAssistantMessage("", { stopReason: "error", errorMessage: "summarizer unavailable" })] : []),
+          fauxAssistantMessage("peer before"), fauxAssistantMessage("peer after"),
+        ]);
+        await session.prompt("first question");
+        await session.prompt(`second question ${"x".repeat(8_000)}`);
+        if (outcome === "automatic-decline") {
+          expect(failures).toMatchObject([{ reason: "threshold", aborted: true, willRetry: false }]);
+          // Pi 0.87 omits outcome; installed-host probes must observe the aborted settlement.
+          expect(settlements).toEqual(settlements[0] === "unknown" ? ["unknown", "unknown"] : ["completed", "aborted"]);
+        } else {
+          expect(failures).toMatchObject([{ reason: "threshold", aborted: false, willRetry: false, errorMessage: "Auto-compaction failed: Summarization failed: summarizer unavailable" }]);
+          expect(settlements).toEqual(settlements[0] === "unknown" ? ["unknown", "unknown"] : ["completed", "error"]);
+          recovering = true;
+          await session.compact(); // Successful native operation, without any user input.
+          expect(recovered).toBe(1);
+        }
+        expect(operationSignals.every(signal => !signal.aborted)).toBe(true);
+        expect(inputs).toEqual(["interactive", "interactive"]);
+        expect(starts).toBe(2); // Failure/decline/recovery itself never wakes Main.
+        const initialCalls = faux.state.callCount;
+        if (reloadFirst) {
+          await session.reload(); // Prove a false persisted halt cannot hide behind earlier recovery/delivery.
+          expect(mains).toHaveLength(2);
+        }
+        for (const phase of ["before", "after"] as const) {
+          if (phase === "after") {
+            await session.reload();
+            expect(mains).toHaveLength(reloadFirst ? 3 : 2);
+          }
+          const request = { from: { id: "session:peer", name: "peer", kind: "main" as const },
+            message: `peer ${phase} reload`, delivery, deliveryId: `r6-peer-${phase}` };
+          const result = mains.at(-1)!.deliverAgent(request);
+          expect(mains.at(-1)!.deliverAgent(request)).toMatchObject({ duplicate: true });
+          await session.waitForIdle();
+          const runs = ownerHalt ? 0 : phase === "before" ? 1 : 2;
+          expect(starts - 2).toBe(runs);
+          expect(faux.state.callCount - initialCalls).toBe(runs);
+          const received = session.messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message");
+          expect(received).toHaveLength(phase === "before" ? 1 : 2);
+          expect(received.at(-1)).toMatchObject({ details: { id: result.messageId, triggerTurn: !ownerHalt } });
+          expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(ownerHalt ? true : undefined);
+          expect(inputs.filter(source => source !== "extension")).toEqual(["interactive", "interactive"]);
+        }
+      } finally {
+        await session.abort();
+        await session.waitForIdle();
+        mains.at(-1)?.closeFollowUpDrain();
+      }
+    },
+  );
+});
+
+// pi-fabric#184 Astra R3: a provider retry continues without a user input event.
+describe("Main provider recovery in a real Pi session", () => {
+  it.each([0, 60_000].flatMap((flushMs) => [false, true].map((ownerHalt) => ({ flushMs, ownerHalt }))))(
+    "provider error then recovery wakes once for a peer followUp, unless the owner halted (flushMs=$flushMs, ownerHalt=$ownerHalt)",
+    async ({ flushMs, ownerHalt }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-provider-recovery-"));
+      roots.push(root);
+      const journal = path.join(root, "journal.json");
+      const faux = fauxProvider();
+      const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+      modelRuntime.registerNativeProvider(faux.provider);
+      let main: MainAgentController | undefined;
+      const inputs: string[] = [];
+      const turns: string[] = [];
+      let settled = 0;
+      const loader = new DefaultResourceLoader({
+        cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [{
+          name: "provider-recovery",
+          factory: (pi: ExtensionAPI) => {
+            pi.on("session_start", (_event, ctx) => {
+              main = new MainAgentController(pi, "session:root", true, root, "root");
+              main.attachFollowUpDrain(ctx, flushMs, journal);
+            });
+            pi.on("input", (event) => { inputs.push(event.source); });
+            pi.on("turn_end", (event) => {
+              if (event.message.role !== "assistant") return;
+              turns.push(event.message.stopReason);
+              if (ownerHalt && event.message.stopReason === "error") main!.halt();
+            });
+            pi.on("agent_settled", () => { settled++; });
+          },
+        }],
+      });
+      await loader.reload();
+      const { session } = await createAgentSession({
+        cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+        sessionManager: SessionManager.inMemory(root), tools: [],
+        settingsManager: SettingsManager.inMemory({ retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 }, compaction: { enabled: false } }),
+      });
+      sessions.push(session);
+      await session.bindExtensions({});
+      const retries: boolean[] = [];
+      session.subscribe((event) => { if (event.type === "auto_retry_end") retries.push(event.success); });
+      try {
+        faux.setResponses([
+          fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 service unavailable" }),
+          fauxAssistantMessage("recovered"),
+          fauxAssistantMessage("peer result handled"),
+        ]);
+        await session.prompt("recover the provider");
+        await session.waitForIdle();
+        expect(turns).toEqual(["error", "stop"]);
+        expect(retries).toEqual([true]);
+        expect(inputs).toHaveLength(1); // Native retry did not provide user input to clear a latch.
+        expect(faux.state.callCount).toBe(2);
+        expect(settled).toBe(1);
+        const index = JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8"));
+        expect(index.halted).toBe(ownerHalt ? true : undefined);
+        const result = main!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" },
+          message: "peer after recovery", delivery: "followUp", deliveryId: "peer-after-recovery" });
+        expect(main!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" },
+          message: "peer after recovery", delivery: "followUp", deliveryId: "peer-after-recovery" })).toMatchObject({ duplicate: true });
+        await session.waitForIdle();
+        expect(faux.state.callCount).toBe(ownerHalt ? 2 : 3);
+        expect(settled).toBe(ownerHalt ? 1 : 2);
+        const custom = session.messages.filter((message) => message.role === "custom" && message.customType === "pi-fabric-agent-message");
+        expect(custom).toHaveLength(1);
+        expect(custom[0]).toMatchObject({ details: { id: result.messageId, triggerTurn: !ownerHalt } });
+        expect(inputs).toHaveLength(1);
+      } finally {
+        await session.abort();
+        await session.waitForIdle();
+        main?.closeFollowUpDrain();
+      }
+    },
+  );
 });
 
 // dev-lead's probe on pi-fabric#102: drain disabled, the process killed after the handoff to Pi

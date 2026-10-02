@@ -1,6 +1,23 @@
+import * as childProcess from "node:child_process";
 import { execFileSync } from "node:child_process";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as processUtils from "../src/agents/transports/process-utils.js";
 import { BunProcessRuntime, NodeProcessRuntime } from "../src/runtime/node-process-runtime.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+vi.mock("../src/agents/transports/process-utils.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/agents/transports/process-utils.js")>();
+  return { ...actual, resolveScriptRuntime: vi.fn(actual.resolveScriptRuntime) };
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.mocked(childProcess.spawn).mockReset();
+  vi.mocked(processUtils.resolveScriptRuntime).mockReset();
+});
 
 const options = {
   timeoutMs: 5_000,
@@ -16,7 +33,90 @@ const hasBun = (() => {
   }
 })();
 
+// An OS process-list check complements the spawn spy: the cancelled startup
+// must not leave a real idle guest behind. Inspect only this test worker's children.
+const guestChildren = (): number[] => {
+  if (process.platform === "win32") {
+    const text = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+      `Get-CimInstance Win32_Process -Filter "ParentProcessId = ${process.pid}" | Where-Object { $_.Name -in @('node.exe', 'bun.exe') } | ForEach-Object { $_.ProcessId }`,
+    ], { encoding: "utf8" });
+    return text.trim().split(/\s+/).filter(Boolean).map(Number);
+  }
+  return execFileSync("ps", ["-eo", "pid=,ppid=,comm="], { encoding: "utf8" }).split("\n").flatMap((line) => {
+    const [pid, parent, command] = line.trim().split(/\s+/);
+    return Number(parent) === process.pid && /(?:^|[\/])(node|bun)$/.test(command ?? "") ? [Number(pid)] : [];
+  });
+};
+const reap = async (child: childProcess.ChildProcess): Promise<void> => {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Guest ${child.pid} did not exit after SIGKILL`)), 2_000);
+    child.once("exit", () => { clearTimeout(timer); resolve(); });
+    child.kill("SIGKILL");
+  });
+};
+
+describe("process runtime startup ownership", () => {
+  it.skipIf(!hasBun)("spawns no Bun guest when cancelled during slowed runtime resolution", async () => {
+    const actualProcess = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    const actualUtils = await vi.importActual<typeof import("../src/agents/transports/process-utils.js")>("../src/agents/transports/process-utils.js");
+    const children: childProcess.ChildProcess[] = [];
+    vi.mocked(childProcess.spawn).mockImplementation(((...args: Parameters<typeof actualProcess.spawn>) => {
+      const child = actualProcess.spawn(...args); children.push(child); return child;
+    }) as typeof actualProcess.spawn);
+    let entered!: () => void; let release!: () => void;
+    const resolving = new Promise<void>((done) => { entered = done; });
+    const held = new Promise<void>((done) => { release = done; });
+    vi.mocked(processUtils.resolveScriptRuntime).mockImplementationOnce(async (args) => {
+      const binary = await actualUtils.resolveScriptRuntime(args);
+      entered(); await held; return binary;
+    });
+    const before = new Set(guestChildren());
+    const controller = new AbortController();
+    const pending = new BunProcessRuntime().execute("return 1;", async () => undefined, { ...options, signal: controller.signal });
+    try {
+      await resolving;
+      expect(vi.mocked(childProcess.spawn).mock.calls.length).toBe(0);
+      controller.abort(); release();
+      expect(await pending).toMatchObject({ terminationReason: "aborted", error: "Execution cancelled" });
+      // Give any incorrectly spawned native guest time to appear in the process list.
+      await new Promise<void>((done) => setImmediate(done));
+      const alivePids = children.filter(child => child.pid && actualUtils.processIsAlive(child.pid)).map(child => child.pid);
+      const newGuestPids = guestChildren().filter(pid => !before.has(pid));
+      expect({ spawnCount: vi.mocked(childProcess.spawn).mock.calls.length, alivePids, newGuestPids })
+        .toEqual({ spawnCount: 0, alivePids: [], newGuestPids: [] });
+    } finally {
+      controller.abort(); release(); await pending;
+      await Promise.all(children.map(reap));
+    }
+  });
+
+  it.each(["node", "bun"] as const)("does not acquire a %s child before fallible guest setup", async (engine) => {
+    if (engine === "bun" && !hasBun) return;
+    const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    const children: childProcess.ChildProcess[] = [];
+    vi.mocked(childProcess.spawn).mockImplementation(((...args: Parameters<typeof actual.spawn>) => {
+      const child = actual.spawn(...args); children.push(child); return child;
+    }) as typeof actual.spawn);
+    try {
+      await expect(new NodeProcessRuntime(engine).execute("return 1;", async () => undefined, {
+        ...options, get transpiledCode(): string { throw new Error("injected guest setup failure"); },
+      })).rejects.toThrow("injected guest setup failure");
+      expect(vi.mocked(childProcess.spawn).mock.calls.length).toBe(0);
+    } finally { await Promise.all(children.map(reap)); }
+  });
+});
+
 describe("NodeProcessRuntime", () => {
+  it("rejects unencodable host results without committing their observation", async () => {
+    let delivered = 0;
+    const result = await new NodeProcessRuntime().execute("return tools.providers();", async () => ({ value: 1n }), {
+      ...options, onHostResultDelivered() { delivered++; },
+    });
+    expect(result.terminationReason).toBe("runtime_error");
+    expect(result.error).toMatch(/BigInt|serialize/i);
+    expect(delivered).toBe(0);
+  });
   it("routes the records primitive through the shared guest setup", async () => {
     const result = await new NodeProcessRuntime().execute('return records.read({after:3});',
       async (ref, args) => ({ref, args}), options);
@@ -128,20 +228,22 @@ return { texts, walk };
   });
 
   it("extends the active deadline for a long host call", async () => {
-    const result = await new NodeProcessRuntime().execute(
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => new NodeProcessRuntime().execute(
       'await tools.call({ ref: "pi.bash", args: { timeout: 1 } }); return "ok";',
       async () => {
+        admitted = true;
         await new Promise((resolve) => setTimeout(resolve, 1_250));
         return { output: "ok" };
       },
       {
         ...options,
-        timeoutMs: 1_000,
+        timeoutMs: 1_000, signal,
         minimumTimeoutMsForHostCall(ref) {
           return ref === "fabric.$call" ? 3_000 : undefined;
         },
       },
-    );
+    ), () => admitted);
 
     expect(result.terminationReason).toBe("completed");
     expect(result.value).toBe("ok");
@@ -222,11 +324,12 @@ await Promise.all([
   });
 
   it("forcibly terminates synchronous infinite loops", async () => {
-    const result = await new NodeProcessRuntime().execute(
-      "while (true) {}",
-      async () => undefined,
-      { ...options, timeoutMs: 50 },
-    );
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => new NodeProcessRuntime().execute(
+      'await tools.call({ ref: "demo.ready" }); while (true) {}',
+      async () => { admitted = true; },
+      { ...options, timeoutMs: 50, signal },
+    ), () => admitted);
 
     expect(result.terminationReason).toBe("timed_out");
     expect(result.error).toContain("timed out after 50ms");
@@ -245,10 +348,9 @@ await Promise.all([
 
   it("terminates the child process when externally aborted", async () => {
     const controller = new AbortController();
-    setTimeout(() => controller.abort(new Error("stop")), 25);
     const result = await new NodeProcessRuntime().execute(
-      "await new Promise(() => {});",
-      async () => undefined,
+      'await tools.call({ ref: "demo.ready" }); await new Promise(() => {});',
+      async () => { controller.abort(new Error("stop")); },
       { ...options, signal: controller.signal },
     );
 
@@ -335,11 +437,12 @@ return { models, process: typeof process };
   });
 
   it("forcibly terminates synchronous infinite loops", async () => {
-    const result = await new BunProcessRuntime().execute(
-      "while (true) {}",
-      async () => undefined,
-      { ...options, timeoutMs: 50 },
-    );
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => new BunProcessRuntime().execute(
+      'await tools.call({ ref: "demo.ready" }); while (true) {}',
+      async () => { admitted = true; },
+      { ...options, timeoutMs: 50, signal },
+    ), () => admitted);
 
     expect(result.terminationReason).toBe("timed_out");
     expect(result.error).toContain("timed out after 50ms");
@@ -347,10 +450,9 @@ return { models, process: typeof process };
 
   it("terminates the child process when externally aborted", async () => {
     const controller = new AbortController();
-    setTimeout(() => controller.abort(new Error("stop")), 25);
     const result = await new BunProcessRuntime().execute(
-      "await new Promise(() => {});",
-      async () => undefined,
+      'await tools.call({ ref: "demo.ready" }); await new Promise(() => {});',
+      async () => { controller.abort(new Error("stop")); },
       { ...options, signal: controller.signal },
     );
 

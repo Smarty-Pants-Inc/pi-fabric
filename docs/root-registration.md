@@ -36,7 +36,11 @@ same-session runtime reinitialize keeps admission continuously held. Native
 `session_shutdown.reason === "reload"` preserves the file claim through module disposal;
 the replacement module reclaims it as the same owner. A lightweight process-global
 retained-release registry also allows a lazy replacement to release the claim at genuine
-native session retirement without importing runtime engines. Dead claims are retained while their tagged participant leases remain visible, then retired.
+native session retirement without importing runtime engines. Main keeps its bounded
+reload participant lease and journals in-flight deliveries before closing admission.
+Lazy retirement removes only the exact owner-tagged reload root (including its reload
+deadline) before releasing the claim; a replacement publication is never removed.
+Dead claims are retained while their tagged participant leases remain visible, then retired.
 
 Live native participant leases from older runtimes also block duplicate native-session
 or root IDs. Those records have no process ownership token, so dead legacy owners may

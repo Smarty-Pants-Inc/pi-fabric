@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { emitBeforeAgentStart } from "./helpers/emit-before-agent-start.js";
 
 const toolFor = (kernel: "typescript" | "python", pythonRuntime: "cpython" | "monty" = "cpython", mode: { fullCodeMode?: boolean; schema?: "off" | "enforce"; runtime?: "quickjs" | "node-process" } = {}) => {
   const state = {
@@ -173,7 +174,7 @@ describe("exclusive kernel tool surface", () => {
       expect(rules).not.toMatch(/\bpi\.[a-z]/);
       expect(rules).toContain(hostGlobalsGuidance(false));
       const event = { systemPrompt: "Base", prompt: "inspect", systemPromptOptions: { skills: [] } };
-      const prompt = await handlers.get("before_agent_start")![0]!(event, {});
+      const prompt = await emitBeforeAgentStart(handlers, event, {});
       expect(prompt.systemPrompt).toContain("orchestration-only mode");
       expect(prompt.systemPrompt).not.toContain("full code mode: `fabric_exec` is the only way");
       expect(prompt.systemPrompt).not.toContain("no host globals");
@@ -184,6 +185,74 @@ describe("exclusive kernel tool surface", () => {
     } finally {
       vi.unstubAllEnvs();
       rmSync(agentDir, { recursive: true, force: true });
+    }
+  });
+
+  // smarty-dev#2340: every runtime (QuickJS, node process, Monty, CPython) receives
+  // payloads only through execute(), so the shared validation must reject before dispatch.
+  it.each([
+    ["typescript", "cpython", "quickjs"],
+    ["typescript", "cpython", "node-process"],
+    ["python", "monty", undefined],
+    ["python", "cpython", undefined],
+  ] as const)("rejects placeholder payloads before %s/%s/%s runtime execution", async (kernel, pythonRuntime, runtime) => {
+    const execute = vi.fn(async () => ({ success: true, output: "ran" }));
+    const state = {
+      bootstrapped: true,
+      config: normalizeFabricConfig({
+        executor: { kernel, pythonRuntime, ...(runtime ? { runtime } : {}) }, ui: { toolDisplay: "full" },
+      }),
+      ensure: vi.fn(async () => {}),
+      execution: { execute },
+    } as unknown as FabricState;
+    const tool = createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), (value) => value);
+    const literal = "payloads are literal: read the file with a native tool first and pass its content";
+    for (const args of [
+      { code: "return 1", payloads: { spec: "@/tmp/spec.md" } },
+      { code: "return 1", payloads: '{"spec":"__SPEC__"}' },
+      { code: "return 1", strings: { spec: "file:///tmp/spec.md" } },
+    ]) {
+      expect(() => tool.prepareArguments!(args)).toThrow(literal);
+      await expect(tool.execute("call", args as never, undefined, undefined, {} as never)).rejects.toThrow(/"spec".*payloads are literal/s);
+    }
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("keeps the original session artifact writer when shutdown removes the runtime during execute", async () => {
+    const closedWriter = vi.fn(async (_content: string): Promise<string> => { throw new Error("session closed"); });
+    let writer: typeof closedWriter | undefined = closedWriter;
+    const state = {
+      bootstrapped: true,
+      config: normalizeFabricConfig({ executor: { kernel: "typescript", maxOutputChars: 1000 }, ui: { toolDisplay: "full" } }),
+      ensure: vi.fn(async () => {}),
+      get outputArtifactWriter() { return writer; },
+      execution: { execute: vi.fn(async () => {
+        writer = undefined;
+        return { success: true, value: "long output with spaces ".repeat(2000), logs: [], audits: [], phases: [], kernel: "typescript",
+          trace: { kind: "pi-fabric.execution", version: 1, outcome: "succeeded", phases: [], operations: [],
+            counts: { droppedValues: 0, truncatedValues: 0, redactedValues: 0, droppedOperations: 0 } } };
+      }) },
+      claimHandoff: vi.fn(async () => undefined),
+      prewalk: { planRequired: () => false },
+    } as unknown as FabricState;
+    const tool = createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), value => value);
+    const result = await tool.execute("late-output", { code: "return data" } as never, undefined, undefined, {
+      sessionManager: { getSessionId: () => "session" },
+    } as never);
+    expect(closedWriter).toHaveBeenCalledOnce();
+    expect(result.content).not.toEqual([]);
+  });
+
+  it.each(["typescript", "python"] as const)("tells %s programs that payloads are literal", (kernel) => {
+    for (const fullCodeMode of [true, false]) {
+      const line = "payloads are literal: read files with native tools first";
+      expect(defaultFabricExecutionGuidance(fullCodeMode, kernel, "monty")).toContain(line);
+      expect(defaultFabricExecutionGuidance(fullCodeMode, kernel, "cpython")).toContain(line);
+      const tool = toolFor(kernel, "cpython", { fullCodeMode });
+      // Full-code tool guidelines are budget-capped (prewalk-prompt); there the line
+      // rides the system-section default guidance and the payloads description.
+      if (!fullCodeMode) expect(tool.promptGuidelines!.join("\n")).toContain(line);
+      expect(tool.parameters.properties.payloads.description).toContain(line);
     }
   });
 });

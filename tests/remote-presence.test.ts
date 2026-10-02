@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
-import { writeHostLease } from "../src/topology/host-leases.js";
+import { removeHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { MIRROR_COLLISION_TOPIC, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readParticipantFiles, writeParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -50,13 +50,13 @@ const agentRecord = (id: string, rootId: string): FabricParticipantRecord => ({
   startedAt: 3, updatedAt: 4, controlProtocol: "v1",
 });
 
-const setup = async (options: { heartbeatMs?: number; children?: string[] } = {}) => {
+const setup = async (options: { heartbeatMs?: number; children?: string[]; readCacheMs?: number; remoteId?: string } = {}) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-remote-presence-"));
   cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   const meshRoot = path.join(dir, "mesh");
   const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000);
   const local = identityOf("dev1");
-  const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000), {
+  const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000, { readCacheMs: options.readCacheMs ?? 0 }), {
     enabled: true, hostId: local.id, rootId: local.id, identity: local,
     heartbeatMs: options.heartbeatMs ?? 100, leaseMs: Math.max(5_000, 2 * (options.heartbeatMs ?? 100)), reapDeadHosts: false,
   });
@@ -67,7 +67,9 @@ const setup = async (options: { heartbeatMs?: number; children?: string[] } = {}
   await directory.start();
   cleanup.push(() => directory.close());
 
-  const remote = identityOf("forge");
+  const remote = options.remoteId
+    ? { ...identityOf(options.remoteId), id: options.remoteId }
+    : identityOf("forge");
   // What the bridge writes: the remote records verbatim, as the remote identity, marked remoteHost.
   const mirror = async (
     options: {
@@ -145,6 +147,23 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(directory.list({ scope: "local" }).map((participant) => participant.id)).toEqual(["session:dev1"]);
   });
 
+  it.each(["steer", "followUp"] as const)("resolves a long-lived remote root from a fresh Main's negative cache within its first minute (%s)", async (kind) => {
+    const { mesh, directory, mirror, local, remote } = await setup({ heartbeatMs: 60_000, readCacheMs: 60_000 });
+    expect(directory.get(remote.id)).toBeUndefined(); // Main's first read, before presence arrived
+    await mirror(); // another process refreshes the already long-lived remote root
+    const { received } = await remoteOwner(mesh, local, remote);
+    const sender = senderOn(mesh, local, 5_000, directory);
+    const request = vi.spyOn(sender, "request");
+    const router = routerFor(directory, sender, local);
+    await expect(router.routeMessage(remote.id, "first-minute reply", undefined, kind))
+      .resolves.toMatchObject({ acknowledged: true, messageId: "m-1" });
+    expect(received).toEqual([[kind, remote.id, "first-minute reply", local.id]]);
+    expect(directory.peers()).toEqual([expect.objectContaining({ id: remote.id, host: "forge" })]);
+    expect(request).toHaveBeenCalledExactlyOnceWith(remote.id, remote.id, kind,
+      { message: "first-minute reply", data: undefined, principal: undefined,
+        ...(kind === "followUp" ? { triggerTurn: true } : {}) }, remote.id, { routedRemoteHost: "forge" });
+  });
+
   // The far side of the bridge: the owner runs on its own mesh; a relay carries commands there and
   // acknowledgements back, stamped data.bridge = { from: <side> } as the mesh bridge does.
   const remoteOwner = async (
@@ -182,8 +201,12 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     return { received };
   };
 
-  const senderOn = (mesh: MeshStore, local: MeshIdentity, acknowledgementTimeoutMs = 300) => {
-    const sender = new FabricControlPlane(mesh, local, { enabled: true, hostId: local.id, pollMs: 20, acknowledgementTimeoutMs });
+  const senderOn = (mesh: MeshStore, local: MeshIdentity, acknowledgementTimeoutMs = 300, directory?: ParticipantDirectory) => {
+    const sender = new FabricControlPlane(mesh, local, {
+      enabled: true, hostId: local.id, pollMs: 20, acknowledgementTimeoutMs,
+      ...(directory ? { readMirroredOwner: (host: string, ownerIdentity: string | undefined, target: string) =>
+        directory.mirroredControlOwner(host, ownerIdentity, target) } : {}),
+    });
     sender.start(() => ({ accepted: false, error: "unused" }));
     cleanup.push(() => sender.close());
     return sender;
@@ -193,17 +216,83 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     const { mesh, directory, mirror, local, remote } = await setup();
     await mirror();
     const { received } = await remoteOwner(mesh, local, remote);
-    const router = routerFor(directory, senderOn(mesh, local, 5_000), local);
+    const sender = senderOn(mesh, local, 5_000, directory);
+    const request = vi.spyOn(sender, "request");
+    const router = routerFor(directory, sender, local);
     await expect(router.routeMessage(remote.id, "steer me", undefined, "steer"))
       .resolves.toMatchObject({ routed: "mesh", acknowledged: true, messageId: "m-1" });
     await expect(router.routeMessage(remote.id, "later", undefined, "followUp"))
       .resolves.toMatchObject({ routed: "mesh", acknowledged: true, messageId: "m-2" });
+    expect(request).toHaveBeenNthCalledWith(1, remote.id, remote.id, "steer",
+      { message: "steer me", data: undefined }, remote.id, { routedRemoteHost: "forge" });
+    expect(request).toHaveBeenNthCalledWith(2, remote.id, remote.id, "followUp",
+      { message: "later", data: undefined, principal: undefined, triggerTurn: true }, remote.id, { routedRemoteHost: "forge" });
     expect(received).toEqual([
       ["steer", remote.id, "steer me", local.id],
       ["followUp", remote.id, "later", local.id],
     ]);
     const commands = mesh.tail(0, 100).events.filter((event) => event.topic === "fabric.control.command");
     expect(commands.map((event) => event.to)).toEqual([remote.id, remote.id]);
+    expect(commands.map((event) => (event.data as { destinationRemoteHost?: string }).destinationRemoteHost))
+      .toEqual(["forge", "forge"]);
+  });
+
+  it("routes a validated native root with a null destination and preserves request input", async () => {
+    const { mesh, directory, mirror, local, remote } = await setup();
+    await mirror({ unmarked: true, host: { remoteHost: undefined } });
+    const owner = new FabricControlPlane(mesh, remote, { enabled: true, hostId: remote.id, pollMs: 20 });
+    const received = vi.fn(() => ({ accepted: true, messageId: "native-root" }));
+    owner.start(received);
+    cleanup.push(() => owner.close());
+    const sender = senderOn(mesh, local, 5_000, directory);
+    const request = vi.spyOn(sender, "request");
+    const router = routerFor(directory, sender, local);
+    const data = { routedRemoteHost: "forge", destinationRemoteHost: "ryzen2", business: "unchanged" };
+    await expect(router.routeMessage(remote.id, "native", data, "steer", undefined, { triggerTurn: false }))
+      .resolves.toMatchObject({ acknowledged: true, messageId: "native-root" });
+    expect(request).toHaveBeenCalledWith(remote.id, remote.id, "steer",
+      { message: "native", data, triggerTurn: false }, remote.id, { routedRemoteHost: null });
+    expect(received).toHaveBeenCalledWith(expect.objectContaining({
+      destinationRemoteHost: null, message: "native", data, triggerTurn: false,
+    }), expect.objectContaining({ id: local.id }), expect.any(AbortSignal), "mesh");
+  });
+
+  it.each(["steer", "followUp"] as const)("refuses a cached native %s route replaced by a mirror without publication or replacement replay", async (kind) => {
+    const { meshRoot, mesh, directory, mirror, local, remote } = await setup({ heartbeatMs: 60_000 });
+    await mirror({ unmarked: true, host: { remoteHost: undefined } });
+    const native = directory.get(remote.id);
+    expect(native).toMatchObject({ id: remote.id });
+    expect(native?.remoteHost).toBeUndefined();
+    const get = directory.get.bind(directory);
+    const cached = vi.spyOn(directory, "get").mockImplementation((id, now, options) =>
+      id === remote.id && !options?.fresh ? native : get(id, now, options));
+    try {
+      await mesh.writeBatch({ identity: remote, ops: [
+        { kind: "delete", key: "topology/hosts/" + hash(remote.id) },
+        { kind: "delete", key: "topology/participants/" + hash(remote.id) },
+      ] });
+      removeHostLease(meshRoot, remote.id);
+      await mirror({ record: { remoteHost: "ryzen2" }, host: { remoteHost: "ryzen2" } });
+      expect(directory.get(remote.id, undefined, { fresh: true })).toMatchObject({ remoteHost: "ryzen2" });
+      const sender = senderOn(mesh, local, 300, directory);
+      const publish = vi.spyOn(sender.mesh, "publish");
+      const request = vi.spyOn(sender, "request");
+      const router = routerFor(directory, sender, local);
+      const failure = await router.routeMessage(remote.id, "private payload", { private: "native-only" }, kind).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ code: "FABRIC_ROUTE_AUTHORITY_CHANGED" });
+      expect(failure).toBeInstanceOf(Error);
+      expect(request).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+      const writer = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      await writer.publish({ topic: "fabric.control.ack", kind: "rejected", from: remote, to: local.id,
+        data: { version: 1, commandId: "foreign-native-replacement", targetId: remote.id, accepted: false,
+          error: "replacement says not run", notRun: true, bridge: { from: "ryzen2" } } });
+      await sender.close();
+      expect(mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual([]);
+      expect(publish).not.toHaveBeenCalled();
+    } finally {
+      cached.mockRestore();
+    }
   });
 
   // Lane A's security pass on pi-fabric#135 (F2): a faulty bridge must not answer for another
@@ -214,14 +303,59 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
       (data: Record<string, unknown>) => ({ ...data, bridge: { from: "ryzen2", id: "x" } }),    // another link
     ]) {
       const { mesh, directory, mirror, local, remote } = await setup();
-      await mirror();
+      // Keep the lease live beyond the 45 s bridge/ACK window. The fake clock drives
+      // the actual relay, command handler and sender observation without a real 45 s wait.
+      await mirror({ expiresAt: Date.now() + 120_000 });
+      vi.useFakeTimers();
       const { received } = await remoteOwner(mesh, local, remote, forged);
-      // Long enough for the relay to deliver on a loaded host: the owner must run before the wait ends.
-      const router = routerFor(directory, senderOn(mesh, local, 2_000), local);
-      await expect(router.routeMessage(remote.id, "hi", undefined, "steer"))
-        .rejects.toThrow("Timed out waiting for the remote Fabric owner to acknowledge");
+      const sender = senderOn(mesh, local, 2_000, directory);
+      const router = routerFor(directory, sender, local);
+      try {
+        const observation = router.routeMessage(remote.id, "hi", undefined, "steer");
+        void observation.catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(0); // publish the actual command before the clock jump
+        await vi.advanceTimersByTimeAsync(45_000);
+        await expect(observation).rejects.toThrow("Fabric mesh bridge to remote host forge is not responding");
+      } finally {
+        await sender.close();
+        vi.useRealTimers();
+      }
       expect(received.length).toBeGreaterThan(0);                                               // it ran; the forged answer was ignored
     }
+  });
+
+  it.each([
+    ["forge", "withdrawal"], ["forge", "replacement"],
+    ["dev1", "withdrawal"], ["dev1", "replacement"],
+  ] as const)("refuses cached %s routing before first fresh capture after %s without publication or replacement notRun replay", async (routedHost, change) => {
+    const { meshRoot, mesh, directory, mirror, local, remote } = await setup({ heartbeatMs: 60_000, readCacheMs: 2_000, remoteId: "X" });
+    // Both link orientations use canonical root X (host = identity = target).
+    await mirror({ record: { remoteHost: routedHost }, host: { remoteHost: routedHost } });
+    writeHostLease(meshRoot, { id: remote.id, rootId: remote.id, identityId: remote.id,
+      updatedAt: Date.now(), expiresAt: Date.now() + 60_000 });
+    expect(directory.mirroredControlOwner(remote.id, remote.id, remote.id)?.remoteHost).toBe(routedHost);
+    expect(directory.get(remote.id)).toMatchObject({ remoteHost: routedHost }); // prime production cache
+    const writer = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    await writer.writeBatch({ identity: remote, ops: [
+      { kind: "delete", key: "topology/hosts/" + hash(remote.id) },
+      { kind: "delete", key: "topology/participants/" + hash(remote.id) },
+    ] });
+    removeHostLease(meshRoot, remote.id);
+    if (change === "replacement") await mirror({ record: { remoteHost: "ryzen2" }, host: { remoteHost: "ryzen2" } });
+    // Same cached, unexpired shared-state lease still validates the router's old origin.
+    expect(directory.get(remote.id)).toMatchObject({ remoteHost: routedHost });
+    const sender = senderOn(mesh, local, 5_000, directory);
+    const publish = vi.spyOn(sender.mesh, "publish");
+    const router = routerFor(directory, sender, local);
+    await expect(router.routeMessage(remote.id, "private payload", { destinationRemoteHost: "ryzen2" }, "followUp"))
+      .rejects.toThrow(`Fabric mesh bridge routing to remote host ${routedHost} is unavailable for ${remote.id}; the routed owner could not be revalidated; this attempt was not published.`);
+    expect(publish).not.toHaveBeenCalled();
+    await writer.publish({ topic: "fabric.control.ack", kind: "rejected", from: remote, to: local.id,
+      data: { version: 1, commandId: "foreign-unadmitted", targetId: remote.id, accepted: false,
+        error: "replacement says not run", notRun: true, bridge: { from: "ryzen2" } } });
+    await sender.close(); // consume foreign ACK, prove no resurrection/replay/cancel
+    expect(writer.read({ topic: "fabric.control.command", limit: 100 })).toEqual([]);
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it("ignores a bridge-stamped acknowledgement for a native owner, and takes the same one unstamped", async () => {
@@ -266,6 +400,17 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     const router = routerFor(directory, { request } as unknown as FabricControlPlane, local);
     await expect(router.routeMessage(remote.id, "hello", undefined, "followUp"))
       .rejects.toThrow(`Unknown Fabric participant: ${remote.id} (its lease mirrored from remote host forge lapsed`);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each(["steer", "followUp"] as const)("refuses a non-interactive mirrored auditor with a named error (%s)", async (kind) => {
+    const { directory, mirror, local, remote } = await setup();
+    await mirror({ record: { interactive: false, capabilities: ["fabric"] } });
+    const request = vi.fn();
+    const router = routerFor(directory, { request } as unknown as FabricControlPlane, local);
+    await expect(router.routeMessage(remote.id, "do not interrupt audit", undefined, kind)).rejects.toMatchObject({
+      name: "FabricParticipantNonInteractiveError", code: "FABRIC_PARTICIPANT_NON_INTERACTIVE",
+    });
     expect(request).not.toHaveBeenCalled();
   });
 
@@ -343,7 +488,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
   it("drops a mirror with malformed optional fields alone, logs it once, and peers still lists the healthy ones", async () => {
     const { mesh, directory, mirror, remote } = await setup();
     await mirror();
-    for (const [field, bad] of [["sessionId", 42], ["cwd", {}], ["label", 7], ["role", []], ["project", 1]] as const) {
+    for (const [field, bad] of [["sessionId", 42], ["cwd", {}], ["label", 7], ["role", []], ["project", 1], ["repository", 42], ["interactive", "yes"]] as const) {
       await mirror({ record: { id: `session:bad-${field}`, rootId: remote.id, [field]: bad, ...(field === "label" ? {} : { label: undefined }) } as never });
     }
     expect(() => directory.peers()).not.toThrow();
@@ -351,7 +496,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(directory.sessions().map((session) => session.id).sort()).toEqual(["session:dev1", remote.id].sort());
     const refused = await vi.waitFor(() => {
       const texts = mesh.tail(0, 1_000).events.filter((event) => event.topic === MIRROR_COLLISION_TOPIC).map((event) => event.text);
-      if (texts.length < 5) throw new Error("not yet");
+      if (texts.length < 7) throw new Error("not yet");
       return texts;
     });
     expect(refused.every((text) => text?.endsWith("it is malformed"))).toBe(true);

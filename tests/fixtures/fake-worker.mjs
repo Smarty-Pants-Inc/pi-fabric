@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 const args = new Map();
@@ -125,8 +126,8 @@ if (task.includes("HANG_WITH_PROGRESS")) {
       usage: addUsage({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.001 }),
     }),
   );
-} else if (task.includes("LIVE_WITH_PROGRESS")) {
-  // A live attempt that already did work, keeps running, and finishes on its own
+} else if (task.includes("LIVE_WITH_PROGRESS") || task.includes("LIVE_WITHOUT_PROGRESS")) {
+  // A live attempt with optional progress that keeps running and finishes on its own
   // unless a stop or a kill gets there first. Attempts are counted beside the
   // status file so tests can prove whether a relaunch happened.
   process.on("SIGTERM", () => process.exit(0));
@@ -145,15 +146,29 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     cwd: args.get("cwd"),
     startedAt,
     updatedAt: startedAt,
-    turns: 4,
-    toolCalls: 2,
+    turns: task.includes("LIVE_WITHOUT_PROGRESS") ? 0 : 4,
+    toolCalls: task.includes("LIVE_WITHOUT_PROGRESS") ? 0 : 2,
     text: "",
     exitCode: null,
-    usage: { input: 40, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.002 },
+    usage: task.includes("LIVE_WITHOUT_PROGRESS")
+      ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
+      : { input: 40, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.002 },
   };
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
   fs.writeFileSync(statusFile, JSON.stringify(running));
-  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  // Opt-in gate carried in the actor task's JSON payload; existing LIVE markers
+  // still finish after 1.5 s. A missing release fails rather than hanging forever.
+  const releaseMatch = task.match(/"fakeWorkerReleasePath":\s*("(?:\\.|[^"\\])*")/);
+  if (releaseMatch) {
+    const releasePath = JSON.parse(releaseMatch[1]);
+    const deadline = Date.now() + 30_000;
+    while (!fs.existsSync(releasePath)) {
+      if (Date.now() >= deadline) throw new Error("Timed out waiting for fake worker release");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  } else {
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+  }
   const finishedAt = Date.now();
   fs.writeFileSync(
     statusFile,
@@ -312,12 +327,26 @@ if (task.includes("HANG_WITH_PROGRESS")) {
       nativePiSession = JSON.parse(first).type === "session";
     } catch {}
   }
-  if (sessionFile && !nativePiSession) {
+  // Actor files now arrive pre-seeded with a native header. Append tree-shaped
+  // messages there, while leaving branched trajectory handoff fixtures untouched.
+  if (sessionFile && (!nativePiSession || path.basename(sessionFile) === "session.jsonl")) {
     fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
     const turns = [
       { role: "user", content: task },
       { role: "assistant", content: text },
     ];
-    fs.appendFileSync(sessionFile, turns.map((turn) => JSON.stringify(turn)).join("\n") + "\n");
+    let parentId = null;
+    if (nativePiSession) {
+      const entries = fs.readFileSync(sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      parentId = entries.filter((entry) => entry.type !== "session").at(-1)?.id ?? null;
+    }
+    const entries = turns.map((turn) => {
+      if (!nativePiSession) return turn;
+      const id = randomUUID().slice(0, 8);
+      const entry = { type: "message", id, parentId, timestamp: new Date().toISOString(), message: { ...turn, timestamp: Date.now() } };
+      parentId = id;
+      return entry;
+    });
+    fs.appendFileSync(sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
   }
 }

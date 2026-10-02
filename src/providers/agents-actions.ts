@@ -1,5 +1,6 @@
 import { FABRIC_ACTOR_HOST_EVENTS } from "../actors/types.js";
 import { AGENT_WAIT_MAX_MS } from "../agents/wait-bound.js";
+import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import {
   MAX_COMPACTION_INSTRUCTIONS_CHARS,
   MAX_PRESERVE_ITEM_CHARS,
@@ -28,7 +29,7 @@ const runProperties = {
   model: {
     type: "string",
     description:
-      "Pi provider/id copied from agents.models({ runner: \"pi\" }), a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties). Reuse returned keys; never infer version numbers from agent names. Exact keys win; near-miss IDs resolve to the closest visible model on the same provider. Handles report the canonical model. Claude runtime value or Veda backend model/alias are forwarded verbatim.",
+      "Pi provider/id copied from agents.models({ runner: \"pi\" }), a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties). Reuse returned keys; never infer version numbers from agent names. Exact keys win; near-miss IDs resolve to the closest visible model on the same provider. Handles report the canonical model. Without host model policy, Claude runtime values and Veda backend models/aliases are forwarded verbatim. Under active policy, Claude aliases must resolve through its native CLI catalog; Veda requires backend pi and an exact visible provider/model (unresolved aliases/defaults are refused).",
   },
   persona: {
     type: "string",
@@ -79,8 +80,8 @@ const residencySchema = {
 
 const actorBindingScopeSchema = {
   type: "string",
-  enum: ["session", "project"],
-  description: "session (default) changes only this Pi session; project pins the shared actor default and requires ownership.",
+  enum: ["session", "project", "global"],
+  description: "session (default) changes this root's live session binding or a foreign caller's local overlay; project pins the shared default and requires ownership; global updates a non-live template.",
 };
 
 const actorInvocationProperties = {
@@ -279,7 +280,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "projectAgent",
-    description: "Return the live project agent for this session's project: the root whose role is project-agent and whose project (the checkout that owns the git common directory) is this session's. A worktree agent reports to it. Throws with the reason when none is live.",
+    description: "Return this session's interactive project lead by normalized repository origin, using the lead id recorded at launch (SMARTY_LEAD_SESSION or .local/lead) to resolve ambiguity and moved lanes. Unrecorded bridge mirrors cannot claim leadership. Throws a named error when unresolved or ambiguous.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     risk: "read",
   },
@@ -405,6 +406,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         transport: runProperties.transport,
         timeoutMs: runProperties.timeoutMs,
         nice: runProperties.nice,
+        bashTimeoutSeconds: { type: "integer", minimum: 0, maximum: MAX_ACTOR_BASH_TIMEOUT_S, description: "Default timeout in seconds for a bash call without one in this actor's runs (default 600, maximum 2147483); 0 = no default timeout." },
         extensions: runProperties.extensions,
         inferenceContext: { type: "string", enum: ["full-history", "activation"], description: "Inference-only activation window (Pi only); journals remain complete. Default full-history." },
         requires: {
@@ -770,13 +772,14 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "setInstructions",
     description:
-      'Replace an actor\'s default instruction (its persona / system-prompt body). Default scope "project" edits a live project actor; scope "global" edits a project-independent template. Takes effect on the actor\'s next queued message.',
+      'Replace an actor\'s default instruction (its persona / system-prompt body). Default scope "project" edits a live project actor; scope "global" edits a project-independent template. Takes effect on the actor\'s next queued message. A new body more than 80% shorter than the current one is refused unless replace is true.',
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
         instructions: { type: "string" },
         scope: { type: "string", enum: ["project", "global"] },
+        replace: { type: "boolean" },
       },
       required: ["id", "instructions"],
       additionalProperties: false,
@@ -835,7 +838,11 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         before: {
           type: "number",
           minimum: 0,
-          description: "Exclusive line cursor returned by a previous page to load older entries",
+          description: "Exclusive byte offset returned by a previous page. Requires beforeGeneration; an unbound cursor returns cursor-stale rather than silently reading wrong bytes.",
+        },
+        beforeGeneration: {
+          type: "string",
+          description: "Required with before: previous generation (agent generation, actor sessionGeneration or run.generation). Actor type must be session or run, not all. On cursor-stale, re-read from the start without the cursor pair.",
         },
         runId: { type: "string", description: "Specific retained run (default: actor's last run)" },
       },

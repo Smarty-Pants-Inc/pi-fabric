@@ -34,7 +34,51 @@ afterEach(() => {
   }
 });
 
+describe("fleet model policy configuration (#2490)", () => {
+  it("normalizes and registers host policy keys", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.deniedModels).toEqual([]);
+    const agents = normalizeFabricConfig({ agents: { deniedModels: [" CLIPROXYAPI/GPT-6-ASTRA ", "cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"], deniedModelReplacement: " cliproxyapi/gpt-6.1-sol " } }).agents;
+    expect(agents.deniedModels).toEqual(["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"]);
+    expect(agents.deniedModelReplacement).toBe("cliproxyapi/gpt-6.1-sol");
+  });
+  it.each([true, false])("takes policy only from agentDir, not workspace (trusted: %s)", (projectTrusted) => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { deniedModels: ["cliproxyapi/gpt-6-astra"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { deniedModels: [], deniedModelReplacement: "cliproxyapi/gpt-6-astra", model: "provider/project" } }));
+    for (const config of [loadFabricConfig({ cwd, agentDir, projectTrusted }), loadFabricConfigForScope({ cwd, agentDir, projectTrusted }, projectTrusted ? "project" : "global")]) {
+      expect(config.agents.deniedModels).toEqual(["cliproxyapi/gpt-6-astra"]);
+      expect(config.agents.deniedModelReplacement).toBe("cliproxyapi/gpt-6.1-sol");
+      expect(config.agents.model).toBe(projectTrusted ? "provider/project" : undefined);
+    }
+  });
+  it("ignores workspace policy even when no host policy exists", () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { deniedModels: ["provider/allowed"], deniedModelReplacement: "provider/other" } }));
+    const config = loadFabricConfig({ cwd, agentDir, projectTrusted: true });
+    expect(config.agents.deniedModels).toEqual([]);
+    expect(config.agents.deniedModelReplacement).toBeUndefined();
+  });
+});
+
 describe("Fabric configuration", () => {
+  it("defaults automatic per-host reload concurrency to six and preserves explicit unlimited mode", () => {
+    expect(DEFAULT_FABRIC_CONFIG.selfReloadConcurrency).toBe(6);
+    expect(normalizeFabricConfig({}).selfReloadConcurrency).toBe(6);
+    for (const value of [0, 2, 6, 12]) {
+      expect(normalizeFabricConfig({ selfReloadConcurrency: value }).selfReloadConcurrency).toBe(value);
+    }
+    for (const value of [-1, 1.5, "2", null, NaN, Infinity]) {
+      expect(normalizeFabricConfig({ selfReloadConcurrency: value }).selfReloadConcurrency).toBe(6);
+    }
+    const cwd = temporaryDirectory();
+    const options = { cwd, agentDir: cwd, projectTrusted: true, scope: "project" as const };
+    saveFabricConfig(options, { selfReloadConcurrency: 2 });
+    expect(loadFabricConfig(options).selfReloadConcurrency).toBe(2);
+  });
   it("normalizes models.aliases into fallback chains", () => {
     expect(DEFAULT_FABRIC_CONFIG.models.aliases).toEqual({});
     expect(normalizeFabricConfig({}).models.aliases).toEqual({});
@@ -154,6 +198,16 @@ describe("Fabric configuration", () => {
     });
     expect(floored.executor.hostCallTimeouts).toEqual({ "extensions.subagent": 300_000 });
   });
+  it("bounds the interactive Main ceiling by 60 s and the executor policy maximum", () => {
+    expect(DEFAULT_FABRIC_CONFIG.executor.mainMaxTimeoutMs).toBe(600_000);
+    expect(normalizeFabricConfig({}).executor.mainMaxTimeoutMs).toBe(600_000);
+    expect(normalizeFabricConfig({ executor: { mainMaxTimeoutMs: 1 } }).executor.mainMaxTimeoutMs).toBe(60_000);
+    expect(normalizeFabricConfig({ executor: { mainMaxTimeoutMs: 3_600_000, maxTimeoutMs: 900_000 } }).executor.mainMaxTimeoutMs).toBe(900_000);
+    expect(normalizeFabricConfig({ executor: { maxTimeoutMs: 300_000 } }).executor.mainMaxTimeoutMs).toBe(300_000);
+    // Existing smaller executor maxima remain authoritative, rather than being raised.
+    expect(normalizeFabricConfig({ executor: { maxTimeoutMs: 1_000, mainMaxTimeoutMs: 1 } }).executor.mainMaxTimeoutMs).toBe(1_000);
+  });
+
   it("floors fractional integers instead of resetting them to defaults", () => {
     const normalized = normalizeFabricConfig({
       executor: { timeoutMs: 1500.9, maxOutputChars: 2500.5 },
@@ -353,6 +407,14 @@ describe("Fabric configuration", () => {
     expect(
       normalizeFabricConfig({ retention: { orphanedTempRunMs: 1 } }).retention.orphanedTempRunMs,
     ).toBe(60 * 60 * 1_000);
+  });
+
+  it("bounds the configurable bridged command deadline to 30 s through 5 minutes", () => {
+    expect(DEFAULT_FABRIC_CONFIG.mesh.bridgeControlTimeoutMs).toBe(30_000);
+    expect(normalizeFabricConfig({ mesh: { bridgeControlTimeoutMs: 1 } }).mesh.bridgeControlTimeoutMs).toBe(30_000);
+    expect(normalizeFabricConfig({ mesh: { bridgeControlTimeoutMs: 60_000 } }).mesh.bridgeControlTimeoutMs).toBe(60_000);
+    expect(normalizeFabricConfig({ mesh: { bridgeControlTimeoutMs: 999_999 } }).mesh.bridgeControlTimeoutMs).toBe(300_000);
+    expect(normalizeFabricConfig({ mesh: { bridgeControlTimeoutMs: "bad" } }).mesh.bridgeControlTimeoutMs).toBe(30_000);
   });
 
   it("defaults actor scope to project and validates the value", () => {

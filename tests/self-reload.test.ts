@@ -8,6 +8,7 @@ import {
   SELF_RELOAD_COMMAND,
   activeFabricRoot,
   installSelfReload,
+  reloadTargetUiHold,
   loadedFabricRoot,
 } from "../src/lifecycle/self-reload.js";
 
@@ -38,9 +39,10 @@ const fakePi = () => {
     on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
     registerCommand: (name: string, command: { handler: (args: string, context: unknown) => Promise<void> }) =>
       commands.set(name, command),
-    sendUserMessage: (text: string) => sent.push(text),
+    sendUserMessage: vi.fn((text: string, _options?: unknown) => sent.push(text)),
   };
-  const emit = (name: string, context: unknown) => handlers.get(name)?.forEach((handler) => handler({}, context));
+  const emit = (name: string, context: unknown, event: unknown = {}) =>
+    handlers.get(name)?.forEach((handler) => handler(event, context));
   return { pi, emit, commands, sent };
 };
 
@@ -90,19 +92,40 @@ describe("release detection", () => {
 });
 
 describe("installSelfReload", () => {
-  const setup = (options: { busy?: () => number; configured?: boolean } = {}) => {
+  const setup = (options: { busy?: () => number; configured?: boolean; halted?: () => boolean; turnProvenance?: boolean } = {}) => {
     const old = release("aaa");
     const next = release("bbb");
     activate(old);
     const { pi, emit, commands, sent } = fakePi();
+    if (options.turnProvenance) Object.assign(pi, { hostCapabilities: { turnProvenance: 1 } });
     const selfReload = installSelfReload(pi as never, {
       busy: options.busy ?? (() => 0),
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
       autoReloadConfigured: () => options.configured ?? true,
       moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href,
       settingsPath: settingsPath(),
+      reloadTargetUiHold, // Production adapter: this fake old host intentionally lacks holdState.
+      ...(options.halted ? { halted: options.halted } : {}),
     });
-    return { old, next, emit, commands, sent, selfReload };
+    return { old, next, pi, emit, commands, sent, selfReload };
   };
+
+  it.each([false, true])("keeps Fabric commands untokenized with provenance compatibility (capable=%s)", async turnProvenance => {
+    const { next, pi, emit, commands, selfReload } = setup({ turnProvenance });
+    const context = fakeContext(`s-fabric-provenance-${turnProvenance}`, { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next);
+    emit("agent_settled", context);
+    emit("agent_settled", context);
+    expect(pi.sendUserMessage).toHaveBeenCalledExactlyOnceWith(`/${SELF_RELOAD_COMMAND} auto`,
+      { expandPromptTemplates: true, ...(turnProvenance ? { provenance: {
+        v: 1, channel: "fabric", sender: { id: `session:${context.sessionManager.getSessionId()}`,
+          name: "main", kind: "main", verified: "mesh" }, via: "followUp",
+      } } : {}) });
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).toHaveBeenCalledTimes(1);
+    emit("session_shutdown", context);
+  });
 
   it("reloads at settle onto the newly active release and reports old -> new once", async () => {
     const { next, emit, commands, sent, selfReload } = setup();
@@ -122,6 +145,7 @@ describe("installSelfReload", () => {
     const fresh = fakePi();
     const reloaded = installSelfReload(fresh.pi as never, {
       busy: () => 0,
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
       autoReloadConfigured: () => true,
       moduleUrl: pathToFileURL(path.join(next, "dist", "index.js")).href,
       settingsPath: settingsPath(),
@@ -132,6 +156,50 @@ describe("installSelfReload", () => {
     expect(fresh.sent).toEqual([]);
   });
 
+  it("rechecks a Fabric rollback at command execution even when mtime did not change", async () => {
+    const { old, next, emit, commands, sent, selfReload } = setup();
+    const context = fakeContext("s-fabric-rollback", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next); emit("agent_settled", context); expect(sent).toHaveLength(1);
+    const stat = fs.statSync(settingsPath());
+    activate(old); fs.utimesSync(settingsPath(), stat.atime, stat.mtime);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).not.toHaveBeenCalled();
+  });
+
+  it("superseded queued Fabric keeps its idle retry without another Main turn", async () => {
+    vi.useFakeTimers();
+    const { next, emit, commands, sent, selfReload } = setup();
+    const third = release("ccc");
+    const context = fakeContext("s-fabric-superseded", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next); emit("agent_settled", context); expect(sent).toHaveLength(1);
+    activate(third);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).not.toHaveBeenCalled(); // never retarget the queued command
+    await vi.advanceTimersByTimeAsync(6_000); // no input, agent turn or second settle
+    expect(sent).toHaveLength(2);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sent).toHaveLength(2); // the exact third target is consumed once
+    emit("session_shutdown", context);
+  });
+
+  it("attempts each exact Fabric target once even across intervening failed targets", async () => {
+    const { next, emit, commands, sent, selfReload } = setup();
+    const third = release("ccc");
+    const context = fakeContext("s-fabric-exact-attempt", { idle: true, pending: false });
+    context.reload.mockRejectedValue(new Error("native failure"));
+    selfReload.sessionStart("startup", context as never);
+    for (const target of [next, third]) {
+      activate(target); emit("agent_settled", context);
+      await expect(commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context)).rejects.toThrow("native failure");
+    }
+    activate(next); emit("agent_settled", context);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(sent).toHaveLength(2); expect(context.reload).toHaveBeenCalledTimes(2);
+  });
   it("waits for task agents and actor runs, then reloads while the Main stays idle", async () => {
     vi.useFakeTimers();
     let busy = 1;
@@ -148,6 +216,75 @@ describe("installSelfReload", () => {
     expect(sent).toEqual([`/${SELF_RELOAD_COMMAND} auto`]);
     await vi.advanceTimersByTimeAsync(20_000);
     expect(sent).toHaveLength(1);
+  });
+
+  it("reports a reload held by background work once per target (smarty-dev#2216)", async () => {
+    vi.useFakeTimers();
+    const old = release("aaa");
+    const next = release("bbb");
+    activate(old);
+    const { pi, emit, sent } = fakePi();
+    const published: Array<{ reason: string; heldForMs: number; target: string }> = [];
+    const selfReload = installSelfReload(pi as never, {
+      busy: () => 1, // a dev server that never ends
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
+      autoReloadConfigured: () => true,
+      moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href,
+      settingsPath: settingsPath(),
+      heldNoticeMs: 60_000,
+      publishHeld: (data) => published.push(data),
+    });
+    const context = fakeContext("s-held", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next);
+    emit("agent_settled", context);
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(context.notices).toEqual([]);
+    expect(published).toEqual([]);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(context.notices).toHaveLength(1);
+    expect(context.notices[0]).toMatch(/^Fabric reload to bbb held \d+ min: 1 task agent/);
+    expect(context.notices[0]).not.toContain("\n");
+    expect(published).toEqual([{ reason: expect.stringContaining("still running"), heldForMs: expect.any(Number), target: fs.realpathSync(next) }]);
+    expect(published[0]!.heldForMs).toBeGreaterThanOrEqual(60_000);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    emit("agent_settled", context);
+    expect(context.notices).toHaveLength(1);
+    expect(published).toHaveLength(1);
+    expect(sent).toEqual([]);
+  });
+
+  it("reports once per continuous background hold, not once per target (smarty-dev#2216)", async () => {
+    vi.useFakeTimers();
+    const old = release("aaa"), next = release("bbb");
+    activate(old);
+    const { pi, emit, sent } = fakePi();
+    let busy = 1;
+    const published: unknown[] = [];
+    const selfReload = installSelfReload(pi as never, {
+      busy: () => busy, autoReloadConfigured: () => true,
+      moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href,
+      settingsPath: settingsPath(), heldNoticeMs: 60_000,
+      publishHeld: data => { published.push(data); },
+    });
+    const state = { idle: true, pending: false };
+    const context = fakeContext("s-continuous-held", state);
+    selfReload.sessionStart("startup", context as never);
+    activate(next); emit("agent_settled", context);
+    await vi.advanceTimersByTimeAsync(65_000);
+    expect(context.notices).toHaveLength(1); expect(published).toHaveLength(1);
+    busy = 0; state.pending = true; // input holds the target while background work clears
+    await vi.advanceTimersByTimeAsync(5_000);
+    busy = 1;
+    await vi.advanceTimersByTimeAsync(55_000);
+    expect(context.notices).toHaveLength(1); expect(published).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(context.notices).toHaveLength(2); expect(published).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(context.notices).toHaveLength(2); expect(published).toHaveLength(2);
+    expect(context.notices.every(line => !line.includes("\n"))).toBe(true);
+    expect(sent).toEqual([]);
+    emit("session_shutdown", context);
   });
 
   it("never reloads under a prompt in preflight or during settle handlers (review/astra on #158)", async () => {
@@ -201,6 +338,54 @@ describe("installSelfReload", () => {
     expect(context.reload).toHaveBeenCalledTimes(1);
   });
 
+  it("an Escape halt holds the automatic reload until the user's next input (review/astra on #158)", async () => {
+    vi.useFakeTimers();
+    let halted = true;
+    let busy = 1;
+    const { next, emit, commands, sent, selfReload } = setup({ busy: () => busy, halted: () => halted });
+    const context = fakeContext("s-halted", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next);
+    emit("agent_settled", context, { outcome: "completed" });
+    busy = 0;
+    await vi.advanceTimersByTimeAsync(20_000); // no retry tick requests it either
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(sent).toEqual([]);
+    expect(context.reload).not.toHaveBeenCalled();
+    // An extension's prompt does not resume; the user's input does (and lifts the actor halt).
+    emit("input", context, { source: "extension" });
+    halted = false;
+    emit("input", context, { source: "interactive" });
+    emit("agent_settled", context, { outcome: "completed" });
+    expect(sent).toEqual([`/${SELF_RELOAD_COMMAND} auto`]);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("an aborted or failed settle holds the automatic reload until the user's next input", async () => {
+    vi.useFakeTimers();
+    let busy = 1;
+    const { next, emit, commands, sent, selfReload } = setup({ busy: () => busy });
+    const context = fakeContext("s-aborted", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next);
+    for (const outcome of ["aborted", "error"]) {
+      emit("agent_settled", context, { outcome });
+      busy = 0;
+      await vi.advanceTimersByTimeAsync(20_000);
+      await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+      emit("input", context, { source: "extension" });
+      emit("agent_settled", context, { outcome: "completed" }); // e.g. Fabric's inbox follow-up
+      expect(sent).toEqual([]);
+      expect(context.reload).not.toHaveBeenCalled();
+      busy = 1;
+    }
+    busy = 0;
+    emit("input", context, { source: "interactive" });
+    emit("agent_settled", context, { outcome: "completed" });
+    expect(sent).toEqual([`/${SELF_RELOAD_COMMAND} auto`]);
+  });
+
   it("the command defers when a turn or a queued message arrived meanwhile", async () => {
     const { next, commands, selfReload } = setup();
     const state = { idle: true, pending: true };
@@ -250,6 +435,7 @@ describe("installSelfReload", () => {
     const dev = fakePi();
     const devReload = installSelfReload(dev.pi as never, {
       busy: () => 0,
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
       autoReloadConfigured: () => true,
       moduleUrl: pathToFileURL(path.join(release("dev"), "dist", "index.js")).href,
       settingsPath: settingsPath(),

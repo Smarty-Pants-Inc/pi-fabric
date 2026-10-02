@@ -4,6 +4,8 @@ import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { MAX_EXECUTOR_TIMEOUT_MS } from "../src/config.js";
 import type { FabricHostCall, FabricSandboxOptions } from "../src/runtime/kernel.js";
 import { MontyRuntime } from "../src/runtime/monty-runtime.js";
+import { ExecutionDeadline } from "../src/runtime/execution-deadline.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 const require = createRequire(import.meta.url);
 let missing: string | undefined;
@@ -22,6 +24,22 @@ const run = (code: string, host: FabricHostCall = echo, extra: Partial<FabricSan
 afterEach(() => vi.restoreAllMocks());
 
 describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + missing + ")" : ""}`, () => {
+  it.each(["pool", "checkout"] as const)("contains a synchronous startup deadline before native %s admission without leaking a rejection", async (boundary) => {
+    // Windows native-package loading can consume the budget before the timer
+    // runs. checkDeadline aborts inside the async operation passed to runAbortable.
+    const native = await import("@pydantic/monty/node");
+    const create = vi.spyOn(native.Monty, "create");
+    const host = vi.fn(echo);
+    const reached = vi.spyOn(ExecutionDeadline.prototype, "reached", "get").mockReturnValue(true);
+    if (boundary === "checkout") reached.mockReturnValueOnce(false);
+    const result = await run("return await schema.status()", host, { timeoutMs: 1_500 });
+    expect(result).toMatchObject({ terminationReason: "timed_out", error: "Execution timed out after 1500ms" });
+    expect(create).toHaveBeenCalledTimes(boundary === "pool" ? 0 : 1);
+    expect(host).not.toHaveBeenCalled();
+    // Give Node its unhandled-rejection turn; Vitest must see none.
+    await new Promise<void>(resolve => setImmediate(resolve));
+  });
+
   it("routes the records primitive through the same host bridge", async () => {
     expect(await run('return await records.read(after=3, limit=2)')).toMatchObject({
       terminationReason: "completed", value: { ref: "records.read", args: { after: 3, limit: 2 } },
@@ -80,6 +98,50 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
     expect(await run('return await mcp._123._tool()', host)).toMatchObject({ terminationReason: "runtime_error", error: expect.stringContaining("AttributeError") });
     expect(host).not.toHaveBeenCalled();
     expect(await run('return await tools.call(ref="mcp._123._tool", args={"n": 2})')).toMatchObject({ terminationReason: "completed", value: { ref: "fabric.$call", args: { ref: "mcp._123._tool", args: { n: 2 } } } });
+  });
+
+  it("acknowledges a native response before guest continuation, not at callback return", async () => {
+    const receipt = vi.fn();
+    let firstArgs: Record<string, unknown> | undefined;
+    const result = await run('first = await schema.status(n=1)\nsecond = await schema.status(n=2)\nreturn [first, second]', async (_ref, args) => {
+      if (!firstArgs) firstArgs = args;
+      else expect(receipt).toHaveBeenCalledExactlyOnceWith(firstArgs);
+      return args.n;
+    }, { onHostResultDelivered: receipt });
+    expect(result).toMatchObject({ terminationReason: "completed", value: [1, 2] });
+    expect(receipt).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    'def factory():\n    return schema.status\nreturn await factory()()',
+    'saved = [schema.status]\nreturn await saved[0](**{"n": 2})',
+    'return f"{await schema.status()}"',
+    'def identity(value):\n    return value\nreturn identity(await schema.status())',
+  ])("admits native responses through nested/aliased call syntax: %s", async code => {
+    const receipt = vi.fn();
+    const result = await run(code, async () => "Unicode π\\r\\n", { onHostResultDelivered: receipt });
+    expect(result, result.error).toMatchObject({ terminationReason: "completed", value: "Unicode π\\r\\n" });
+    expect(receipt).toHaveBeenCalledOnce();
+  });
+
+  it("preserves built-in method calls and ordinary coroutine JSON-shaped results", async () => {
+    const value = { id: 1, responseId: 1, __fabric_response_token: "user data", value: "unchanged" };
+    const receipt = vi.fn();
+    const result = await run('async def observe():\n    result = await schema.status()\n    items = []\n    items.append(result)\n    return {key: item for key, item in items[0].items()}\nreturn await observe()', async () => value, { onHostResultDelivered: receipt });
+    expect(result, result.error).toMatchObject({ terminationReason: "completed", value });
+    expect(receipt).toHaveBeenCalledOnce();
+  });
+
+  it("correlates out-of-order native responses before gather continuation", async () => {
+    let releaseFirst!: () => void;
+    const first = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const receipt = vi.fn((args: Record<string, unknown>) => { if (args.n === 2) releaseFirst(); });
+    const result = await run('return await asyncio.gather(schema.status(n=1), schema.status(n=2))', async (_ref, args) => {
+      if (args.n === 1) await first;
+      return args.n;
+    }, { onHostResultDelivered: receipt });
+    expect(result, result.error).toMatchObject({ terminationReason: "completed", value: [1, 2] });
+    expect(receipt.mock.calls.map(([args]) => args.n)).toEqual([2, 1]);
   });
 
   it("runs actual host calls concurrently via asyncio.gather", async () => {
@@ -168,10 +230,12 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
   });
 
   it("extends host deadlines without a fixed VM/per-turn ceiling defeating the floor", async () => {
-    const result = await run('return await schema.status()', async () => {
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => run('return await schema.status()', async () => {
+      admitted = true;
       await new Promise((resolve) => setTimeout(resolve, 350));
       return "done";
-    }, { timeoutMs: 200, minimumTimeoutMsForHostCall: () => 900 });
+    }, { timeoutMs: 200, signal, minimumTimeoutMsForHostCall: () => 900 }), () => admitted);
     expect(result).toMatchObject({ terminationReason: "completed", value: "done" });
   });
 
@@ -185,7 +249,9 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
       vi.spyOn(pool, "checkout").mockImplementation(async (opts) => { checkouts.push(opts); return checkout(opts); });
       return pool;
     });
-    expect(await run("return 1", echo, { timeoutMs: 100, minimumTimeoutMsForHostCall: () => 1000 })).toMatchObject({ value: 1, terminationReason: "completed" });
+    let admitted = false;
+    expect(await executeAfterAdmission(signal => run('await schema.status()\nreturn 1', async (...args) => { admitted = true; return echo(...args); },
+      { timeoutMs: 100, signal, minimumTimeoutMsForHostCall: () => 1000 }), () => admitted)).toMatchObject({ value: 1, terminationReason: "completed" });
     expect(createSpy).toHaveBeenCalledWith(expect.objectContaining({ requestTimeout: MAX_EXECUTOR_TIMEOUT_MS / 1000 + 1, durationLimitGrace: null }));
     expect(checkouts[0]).toMatchObject({ limits: { maxMemory: options.memoryLimitBytes } });
     expect((checkouts[0] as { limits: object }).limits).not.toHaveProperty("maxDurationSecs");
@@ -194,7 +260,9 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
   it("hard-interrupts synchronous loops with and without extendable deadlines", async () => {
     for (const extra of [{}, { minimumTimeoutMsForHostCall: () => 500 }]) {
       const started = Date.now();
-      const result = await run('print("started")\nwhile True:\n    pass', echo, { ...extra, timeoutMs: 150 });
+      let admitted = false;
+      const result = await executeAfterAdmission(signal => run('print("started")\nawait schema.status()\nwhile True:\n    pass', async () => { admitted = true; },
+        { ...extra, timeoutMs: 150, signal }), () => admitted);
       expect(result.terminationReason).toBe("timed_out");
       expect(result.logs).toContain("started");
       expect(Date.now() - started).toBeLessThan(2000);
@@ -211,11 +279,11 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
     for (const cancel of [false, true]) {
       const controller = new AbortController();
       let hostSignal: AbortSignal | undefined;
-      const result = await run("return await schema.status()", async (_ref, _args, signal) => {
+      const result = await executeAfterAdmission(safety => run("return await schema.status()", async (_ref, _args, signal) => {
         hostSignal = signal;
         if (cancel) controller.abort();
         return new Promise(() => undefined);
-      }, { signal: controller.signal, timeoutMs: 200 });
+      }, { signal: AbortSignal.any([safety, controller.signal]), timeoutMs: 200 }), () => hostSignal !== undefined);
       expect(result.terminationReason).toBe(cancel ? "aborted" : "timed_out");
       expect(hostSignal?.aborted).toBe(true);
     }
@@ -238,7 +306,9 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
     });
     await run("return 1");
     await run('raise ValueError("fail")');
-    await run("while True: pass", echo, { timeoutMs: 100 });
+    let admitted = false;
+    await executeAfterAdmission(signal => run('await schema.status()\nwhile True: pass', async () => { admitted = true; },
+      { timeoutMs: 100, signal }), () => admitted);
     const controller = new AbortController();
     await run("return await schema.status()", async () => { controller.abort(); return null; }, { signal: controller.signal });
     expect(pids).toHaveLength(4);

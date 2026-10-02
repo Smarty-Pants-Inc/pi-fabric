@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { FabricModelDeniedError } from "../core/model-policy.js";
+import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,24 +11,45 @@ import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, 
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
-import { executeFile, processIsAlive, spawnDetached } from "../agents/transports/process-utils.js";
+import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
-import { hasUnresolvedWorker } from "../storage/retention.js";
+import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import {
+  RESIDENT_HANDOVER_ABI, residentLaunchSpec, handoverActive, handoverPath, handoverOutcomePath,
+  mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
+} from "./handover.js";
+import { kernelFenceAvailable } from "./file-lock.js";
+import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
+import { MeshBackgroundRetry } from "../core/atomic-write.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
+  ResidentActorAuthorizationError,
+  ResidentCommandUnsupportedError,
+  assertResidentCommandSupported,
+  assertResidentActorMain,
+  assertResidentActorToolCeiling,
+  type ResidentActorCaller,
+  ResidentOutcomeUnknownError,
+  readResidentRequestDecision,
+  registerResidentCancellation,
+  commitResidentRequest,
   RESIDENT_HOST_FORMAT,
+  RESIDENT_ACTOR_COMMAND_FORMAT,
   isResidentHostId,
   residentDeliveryPrefix,
   residentHostId,
+  residentHostStateNote,
   residentResultPath,
   sleepUnlessAborted,
   type ResidentAgentMetadata,
   type ResidentCommand,
   type ResidentCommandResponse,
+  type ResidentActorMutation,
   type ResidentDeliveryRecord,
   type ResidentHostConfig,
   type ResidentHostOwner,
@@ -46,7 +69,10 @@ const startupBudgetMs = (base: number): number => {
   return Math.round(base * Math.min(4, Math.max(1, loadPerCore)));
 };
 const COMMAND_TIMEOUT_MS = 30_000;
+const HANDOVER_WAIT_MS = 180_000;
 const STATUS_POLL_MS = 100;
+const WATCHDOG_INTERVAL_MS = 5_000;
+const WATCHDOG_MAX_BACKOFF_MS = 60_000;
 const AGENT_ID_PATTERN = /^[a-f0-9]{32}$/;
 
 const delay = (ms: number): Promise<void> =>
@@ -111,6 +137,8 @@ export interface ResidencyClientOptions {
   hostPath?: string;
   /** Start budget before load scaling; tests shorten it. */
   startupTimeoutMs?: number;
+  /** File-exchange deadline; tests shorten it without faking host execution. */
+  commandTimeoutMs?: number;
 }
 
 export class ResidencyClient {
@@ -127,7 +155,16 @@ export class ResidencyClient {
   #deliveryTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #drainingDeliveries = false;
+  readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup");
   #closed = false;
+  #startingHost: Promise<ResidentHostOwner> | undefined;
+  #nextWatchdogAt = 0;
+  #watchdogFailures = 0;
+  #watchdogWork: string | undefined;
+  readonly #runtimeNonce = randomUUID();
+  #generationRecorded = false;
+  readonly #releaseAbort = new AbortController();
+  readonly #releaseOwners = new Set<string>();
 
   constructor(readonly options: ResidencyClientOptions) {
     this.hostId = residentHostId(options.config.rootId);
@@ -145,18 +182,35 @@ export class ResidencyClient {
     if (this.#deliveryTimer || this.#closed || !this.options.mainAgent.local) return;
     this.syncPiModels();
     this.#deliveryTimer = setInterval(
-      () => void this.#drainDeliveries().catch(() => undefined),
+      () => {
+        void this.#backgroundDelivery.run(() => this.#drainDeliveries());
+        void this.#watchdog().catch(() => undefined);
+      },
       Math.max(20, this.options.config.mesh.actorPollMs),
     );
     this.#deliveryTimer.unref();
-    void this.#drainDeliveries().catch(() => undefined);
+    void this.#backgroundDelivery.run(() => this.#drainDeliveries());
+    // Every runtime activation, including manual native /reload, reconciles
+    // a live owner. This never starts an empty root or loads an optional engine.
+    void this.reconcileRelease().catch((error) => this.#deferRelease(error));
   }
 
   async close(): Promise<void> {
     this.#closed = true;
+    // Disposing a runtime during native reload/shutdown ends its authority even
+    // while the OS process remains alive. Never invalidate a newer runtime.
+    if (this.#generationRecorded) {
+      try {
+        const recorded = readHandoverJson<ResidentMainGeneration>(mainGenerationPath(this.options.config.residencyRoot));
+        if (recorded?.nonce === this.#runtimeNonce) writeJsonAtomic(mainGenerationPath(this.options.config.residencyRoot),
+          { ...recorded, nonce: `closed:${this.#runtimeNonce}` }, { durable: true });
+      } catch (error) { this.#deferRelease(error); }
+    }
+    this.#releaseAbort.abort();
     if (this.#deliveryTimer) clearInterval(this.#deliveryTimer);
     this.#deliveryTimer = undefined;
     while (this.#drainingDeliveries) await delay(10);
+    await this.#startingHost?.catch(() => undefined);
   }
 
   syncPiModels(): void {
@@ -179,11 +233,31 @@ export class ResidencyClient {
   }
 
   async ensureHost(): Promise<ResidentHostOwner> {
+    if (this.#startingHost) return this.#startingHost;
+    const starting = this.#startHost();
+    this.#startingHost = starting;
+    try { return await starting; }
+    finally { this.#startingHost = undefined; }
+  }
+
+  async #startHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
     this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
     const existing = this.#liveOwner();
     if (existing) return existing;
+    // The detached launcher already owns the exact attempt/fallback. Neither
+    // ensureHost nor the watchdog may become a competing handover executor.
+    const releaseDeadline = Date.now() + HANDOVER_WAIT_MS;
+    while (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) {
+      const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
+      if (this.#closed || state?.phase === "blocked" || Date.now() >= releaseDeadline) {
+        throw new Error("Resident release transaction is in launcher custody; do not start a duplicate");
+      }
+      await delay(STATUS_POLL_MS);
+    }
+    const followed = this.#liveOwner();
+    if (followed) return followed;
     fs.rmSync(this.#errorPath, { force: true });
     const launcher = await spawnDetached(
       this.#hostPath,
@@ -192,15 +266,23 @@ export class ResidencyClient {
     );
     // The budget counts from the launcher's first sign of life (its
     // launcher-started trace), so its own boot does not consume it.
+    const launcherBirth = processStartTime(launcher.pid);
     const budget = startupBudgetMs(this.options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS);
     let deadline = Date.now() + budget;
     let started = false;
     let launcherExited = false;
     while (true) {
+      if (this.#closed) {
+        await launcher.stop();
+        throw new Error("Fabric residency client is closed");
+      }
       const owner = this.#liveOwner();
       if (owner) return owner;
-      const failure = readJson<{ error?: unknown }>(this.#errorPath);
-      if (typeof failure?.error === "string") {
+      const failure = readJson<{ error?: unknown; launcherPid?: number; launcherBirth?: string }>(this.#errorPath);
+      // An exiting prior launcher can race this start after error.json was
+      // cleared. Its root diagnostic is not evidence about our owned attempt.
+      if (typeof failure?.error === "string" && (failure.launcherPid === undefined ||
+          (failure.launcherPid === launcher.pid && failure.launcherBirth === launcherBirth))) {
         await launcher.stop();
         throw new Error(`Fabric resident host failed to start: ${failure.error}`);
       }
@@ -235,6 +317,49 @@ export class ResidencyClient {
     throw new Error(`${launcherExited ? "Launcher exited while starting" : `Timed out after ${budget}ms starting`} Fabric resident host ${this.hostId}. ${diagnostics}`);
   }
 
+  /** Host-only Main lifecycle hook; not a guest-selected release path. */
+  async reconcileRelease(): Promise<void> {
+    if (this.#closed || !this.options.mainAgent.local || this.options.mainAgent.id !== this.options.config.rootId) return;
+    const owner = this.#liveOwner();
+    const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
+    // A new runtime must invalidate the old nonce even after A exited or while
+    // B is staged. Business readiness is not the Main generation boundary.
+    if (!owner && !handoverActive(state)) return;
+    const self = this.options.participants.self();
+    if (self.kind !== "root" || self.id !== this.options.config.rootId || self.sessionId !== this.options.config.sessionId) throw new ResidentActorAuthorizationError();
+    const releaseRoot = path.resolve(path.dirname(this.#hostPath), "../..");
+    const main: ResidentMainGeneration = { nonce: this.#runtimeNonce, pid: process.pid,
+      processStartTime: processStartTime(process.pid) ?? "", rootId: this.options.config.rootId,
+      sessionId: this.options.config.sessionId, releaseRoot };
+    if (!this.#generationRecorded) {
+      writeJsonAtomic(mainGenerationPath(this.options.config.residencyRoot), main, { durable: true });
+      this.#generationRecorded = true;
+    }
+    if (!owner || handoverActive(state) || this.#releaseOwners.has(owner.token)) return;
+    this.#releaseOwners.add(owner.token);
+    if (owner.releaseRoot === releaseRoot) return;
+    if (owner.handover?.abi !== RESIDENT_HANDOVER_ABI || !owner.commands?.includes("releaseChange")) {
+      this.#deferRelease(new Error("Legacy resident host/launcher has no release custody protocol; installer drain required")); return;
+    }
+    this.#refreshPiModels();
+    // A bundled Main's execPath is Pi, not a JavaScript interpreter. Resolve
+    // on this initiating generation and freeze the same runtime workers use.
+    const runtime = await resolveScriptRuntime({ execPath: process.execPath });
+    const target = residentLaunchSpec(this.options.config, path.join(path.dirname(this.#hostPath), "pi-entry.js"), runtime);
+    if (readHandoverJson(handoverOutcomePath(this.options.config.residencyRoot, target))) return;
+    await this.#command({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "releaseChange",
+      requestId: randomUUID(), rootId: main.rootId, createdAt: Date.now(), main, target,
+      caller: { identity: { id: self.id, name: self.name, kind: "main", sessionId: main.sessionId }, hostId: self.ownerHostId },
+    }, this.#releaseAbort.signal);
+  }
+
+  #deferRelease(error: unknown): void {
+    try { writeJsonAtomic(path.join(this.options.config.residencyRoot, "handover-deferred.json"), {
+      at: Date.now(), release: this.options.config.fabricExtensionPath,
+      reason: error instanceof Error ? error.message : String(error),
+    }); } catch { /* Deferred is diagnostic; never permission to exit A. */ }
+  }
+
   #refreshPiModels(): void {
     const state = this.options.piModelState?.();
     if (state) this.options.config.piModels = structuredClone(state);
@@ -245,7 +370,7 @@ export class ResidencyClient {
     await this.#waitForParticipant(id, "actor");
   }
 
-  async createActor(request: FabricActorRequest): Promise<FabricActorInfo> {
+  async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
     await this.ensureHost();
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
@@ -254,10 +379,55 @@ export class ResidencyClient {
       rootId: this.options.config.rootId,
       request,
       createdAt: Date.now(),
-    });
+    }, signal);
     if (!response.actor) throw new Error("Fabric resident host returned no actor");
-    await this.#waitForParticipant(response.actor.id, "actor");
+    await this.#waitForParticipant(response.actor.id, "actor", signal).catch((error) => {
+      throw new ResidentOutcomeUnknownError({
+        format: RESIDENT_HOST_FORMAT, operation: "createActor", requestId: response.requestId,
+        rootId: this.options.config.rootId, request, createdAt: Date.now(),
+      }, { requestId: response.requestId, state: "committed", id: response.actor!.id, ownerHostId: this.hostId }, error, signal);
+    });
     return response.actor;
+  }
+
+  /** Setters/status use only an existing owner, never create hidden residency. */
+  async setActor(mutation: ResidentActorMutation, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<FabricActorInfo> {
+    const self = this.options.participants.self();
+    if (!this.options.mainAgent.local || this.options.mainAgent.id !== this.options.config.rootId ||
+      self.kind !== "root" || self.id !== this.options.config.rootId || !self.sessionId) {
+      throw new ResidentActorAuthorizationError();
+    }
+    caller ??= { identity: { id: self.id, name: self.name, kind: "main", sessionId: self.sessionId }, hostId: self.ownerHostId };
+    assertResidentActorMain(caller, this.options.config.rootId);
+    if (this.#inheritedToolAllowlist !== undefined) caller = { ...caller, toolCeiling: [...this.#inheritedToolAllowlist] };
+    if (mutation.operation === "setTools") assertResidentActorToolCeiling(mutation.tools, caller.toolCeiling);
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      ...mutation, caller, format: RESIDENT_ACTOR_COMMAND_FORMAT, requestId: randomUUID(),
+      rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor from setter");
+    return response.actor;
+  }
+
+  async actorStatus(id: string, signal?: AbortSignal): Promise<FabricActorInfo> {
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actorStatus", id,
+      requestId: randomUUID(), rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor status");
+    return response.actor;
+  }
+
+  async actors(signal?: AbortSignal): Promise<FabricActorInfo[]> {
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actors", requestId: randomUUID(),
+      rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actors) throw new Error("Resident host returned no actors");
+    return response.actors;
   }
 
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
@@ -281,7 +451,12 @@ export class ResidencyClient {
       signal,
     );
     if (!response.handle) throw new Error("Fabric resident host returned no agent handle");
-    await this.#waitForParticipant(response.handle.id, "agent");
+    await this.#waitForParticipant(response.handle.id, "agent", signal).catch((error) => {
+      throw new ResidentOutcomeUnknownError({
+        format: RESIDENT_HOST_FORMAT, operation: "spawn", requestId: response.requestId,
+        rootId: this.options.config.rootId, request, createdAt: Date.now(),
+      }, { requestId: response.requestId, state: "committed", id: response.handle!.id, ownerHostId: this.hostId }, error, signal);
+    });
     return response.handle;
   }
 
@@ -348,23 +523,24 @@ export class ResidencyClient {
     this.options.onResultConsumed?.(id);
   }
 
-  async waitAgent(id: string, signal?: AbortSignal): Promise<AgentRunResult> {
+  async waitAgent(id: string, signal?: AbortSignal, deferConsumption?: (consume: () => void, abandon?: () => void) => void): Promise<AgentRunResult> {
     while (true) {
       if (signal?.aborted) throw new Error(`Waiting for durable Fabric agent ${id} was aborted`);
       const status = this.statusAgent(id);
       if (terminal(status.status) && "startedAt" in status) {
-        this.acknowledgeCompletion(id);
+        if (deferConsumption) deferConsumption(() => this.acknowledgeCompletion(id));
+        else this.acknowledgeCompletion(id);
         return status as AgentRunResult;
       }
       await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
     }
   }
 
-  readAgentLog(id: string, options: { lines?: number; before?: number } = {}): FabricAgentLog {
+  readAgentLog(id: string, options: { lines?: number; before?: number; beforeGeneration?: string } = {}): FabricAgentLog {
     const metadata = this.#metadata(id);
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
     const logFile = path.join(metadata.runDirectory, "events.jsonl");
-    const page = readJsonlPage(logFile, Math.max(1, Math.min(options.lines ?? 200, 5_000)), options.before);
+    const page = readJsonlPage(logFile, Math.max(1, Math.min(options.lines ?? 200, 5_000)), options.before, undefined, options.beforeGeneration);
     const status = this.#record(metadata);
     return {
       id,
@@ -374,26 +550,34 @@ export class ResidencyClient {
       events: page.lines,
       hasMore: page.hasMore,
       ...(page.before !== undefined ? { before: page.before } : {}),
+      ...(page.generation !== undefined ? { generation: page.generation } : {}),
     };
   }
 
-  async removeActor(id: string): Promise<{ removed: boolean }> {
+  async removeActor(id: string, signal?: AbortSignal): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }> {
     await this.ensureHost();
-    await this.#command({
+    const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
       operation: "removeActor",
       requestId: randomUUID(),
       rootId: this.options.config.rootId,
       id,
       createdAt: Date.now(),
-    });
-    return { removed: true };
+    }, signal);
+    return { removed: true, ...(response.pending === undefined ? {} : { pending: response.pending }),
+      ...(response.cleaned === undefined ? {} : { cleaned: response.cleaned }) };
   }
 
-  async cleanupAgent(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
+  /** Pending removals and a long request on the host, for error messages (smarty-dev#2184). */
+  hostStateNote(): string {
+    return residentHostStateNote(this.options.config.residencyRoot);
+  }
+
+  async cleanupAgent(id: string, deleteBranch = false, signal?: AbortSignal): Promise<{ cleaned: boolean }> {
+    throwIfAborted(signal);
     const metadata = this.#metadata(id);
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
-    if (!this.#liveOwner()) return this.#cleanupTerminalFiles(metadata, deleteBranch);
+    if (!this.#liveOwner()) return this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
     let response: ResidentCommandResponse;
     try {
       response = await this.#command({
@@ -404,10 +588,10 @@ export class ResidencyClient {
         id,
         deleteBranch,
         createdAt: Date.now(),
-      });
+      }, signal);
     } catch (error) {
-      if (error instanceof Error && /Unknown Fabric agent/.test(error.message)) {
-        return this.#cleanupTerminalFiles(metadata, deleteBranch);
+      if (!(error instanceof ResidentOutcomeUnknownError) && error instanceof Error && /Unknown Fabric agent/.test(error.message)) {
+        return this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
       }
       throw error;
     }
@@ -419,69 +603,126 @@ export class ResidencyClient {
   async #cleanupTerminalFiles(
     metadata: ResidentAgentMetadata,
     deleteBranch: boolean,
+    signal?: AbortSignal,
   ): Promise<{ cleaned: boolean }> {
+    throwIfAborted(signal);
     const status = this.statusAgent(metadata.id);
     if (!("startedAt" in status) || !terminal(status.status)) {
       throw new Error(`Cannot clean up running durable Fabric agent ${metadata.id}`);
     }
-    if (hasUnresolvedWorker(metadata.runDirectory)) {
+    const exitVeto = runTreeExitVeto(metadata.runDirectory);
+    if (exitVeto) {
       throw new Error(
-        `Cannot clean up durable Fabric agent ${metadata.id}: its worker may still be running ` +
+        `Cannot clean up durable Fabric agent ${metadata.id}: ${exitVeto} ` +
         `(see ${metadata.runDirectory}). Check the worker, then remove its files by hand.`,
       );
     }
-    if (metadata.handle.worktree) {
-      const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
-      const worktree = await registeredWorktree(gitRoot, metadata.handle.worktree);
-      await executeFile(
-        "git",
-        ["worktree", "remove", "--force", worktree],
-        { cwd: gitRoot, timeoutMs: 60_000 },
-      );
-      if (deleteBranch && metadata.handle.branch) {
+    const command: ResidentCommand = { format: RESIDENT_HOST_FORMAT, operation: "cleanup", requestId: randomUUID(),
+      rootId: this.options.config.rootId, id: metadata.id, deleteBranch, createdAt: Date.now() };
+    let commitAttempted = false;
+    const commit = (): void => {
+      throwIfAborted(signal);
+      registerResidentCancellation(signal, this.options.config.residencyRoot, command);
+      commitAttempted = true;
+      commitResidentRequest(this.options.config.residencyRoot, command, metadata.id, this.hostId);
+    };
+    try {
+      if (metadata.handle.worktree) {
+        const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
+        const worktree = await registeredWorktree(gitRoot, metadata.handle.worktree);
+        commit();
         await executeFile(
           "git",
-          ["branch", "-D", metadata.handle.branch],
-          { cwd: gitRoot, timeoutMs: 30_000 },
+          ["worktree", "remove", "--force", worktree],
+          { cwd: gitRoot, timeoutMs: 60_000 },
         );
+        if (deleteBranch && metadata.handle.branch) {
+          throwIfAborted(signal);
+          await executeFile(
+            "git",
+            ["branch", "-D", metadata.handle.branch],
+            { cwd: gitRoot, timeoutMs: 30_000 },
+          );
+        }
+      } else if (deleteBranch) {
+        throw new Error(`Durable Fabric agent ${metadata.id} has no worktree branch to delete`);
+      } else {
+        commit();
       }
-    } else if (deleteBranch) {
-      throw new Error(`Durable Fabric agent ${metadata.id} has no worktree branch to delete`);
+      throwIfAborted(signal);
+      fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
+      fs.rmSync(this.#metadataPath(metadata.id), { force: true });
+      fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
+      this.options.onResultConsumed?.(metadata.id);
+      return { cleaned: true };
+    } catch (error) {
+      if (!commitAttempted) throw error;
+      let decision;
+      try { decision = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unknown fence */ }
+      if (decision?.state === "abandoned") throw error;
+      // Partial cleanup or an unreadable fence is not a proved rejection either.
+      throw new ResidentOutcomeUnknownError(command, decision, error, signal);
     }
-    fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
-    fs.rmSync(this.#metadataPath(metadata.id), { force: true });
-    fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
-    this.options.onResultConsumed?.(metadata.id);
-    return { cleaned: true };
   }
 
   async #command(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    const owner = this.#liveOwner();
+    if (!owner) throw new Error("Root resident host is not live");
+    assertResidentCommandSupported(owner, command.operation);
+    if (owner.requestFence !== 1) {
+      throw new Error("Fabric resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
+    }
+    throwIfAborted(signal);
+    registerResidentCancellation(signal, this.options.config.residencyRoot, command);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
-    atomicWrite(path.join(this.#requestsPath, `${command.requestId}.json`), command);
-    const deadline = Date.now() + COMMAND_TIMEOUT_MS;
     try {
+      atomicWrite(path.join(this.#requestsPath, `${command.requestId}.json`), command);
+      const deadline = Date.now() + (this.options.commandTimeoutMs ?? COMMAND_TIMEOUT_MS);
       while (Date.now() < deadline) {
         if (signal?.aborted) throw new Error("Fabric residency request was aborted");
         const response = readJson<ResidentCommandResponse>(responsePath);
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           fs.rmSync(responsePath, { force: true });
-          if (!response.ok) throw new Error(response.error ?? "Fabric resident host rejected request");
+          if (!response.ok) {
+            if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
+            if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
+            if (response.errorCode === "FABRIC_MODEL_DENIED" && typeof response.modelDenied?.model === "string") {
+              throw new FabricModelDeniedError(response.modelDenied.model,
+                typeof response.modelDenied.replacement === "string" ? response.modelDenied.replacement : undefined);
+            }
+            throw new Error(response.error ?? "Fabric resident host rejected request");
+          }
+          if ((command.operation === "spawn" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
+            throw new Error("Fabric resident host returned no created entity");
+          }
           return response;
         }
         const owner = this.#liveOwner();
         if (!owner) throw new Error("Fabric resident host exited while processing a request");
         await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
       }
-      throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}`);
+      const note = this.hostStateNote();
+      throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}` +
+        ` (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
-      abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId);
+      let decision;
+      try {
+        decision = abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId);
+      } catch (fenceError) {
+        // No proven abandonment: never report a safe-to-retry rejection.
+        let known;
+        try { known = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unreadable fence */ }
+        throw new ResidentOutcomeUnknownError(command, known, fenceError, signal);
+      }
+      if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error, signal);
       throw error;
     }
   }
 
-  async #waitForParticipant(id: string, kind: "actor" | "agent"): Promise<void> {
+  async #waitForParticipant(id: string, kind: "actor" | "agent", signal?: AbortSignal): Promise<void> {
     const deadline = Date.now() + STARTUP_TIMEOUT_MS;
     while (Date.now() < deadline) {
+      if (signal?.aborted) throw new Error("Fabric residency publication wait was aborted");
       const participant = this.options.participants.get(id);
       if (
         participant?.kind === kind &&
@@ -491,7 +732,7 @@ export class ResidencyClient {
       ) {
         return;
       }
-      await delay(STATUS_POLL_MS);
+      await sleepUnlessAborted(STATUS_POLL_MS, signal);
     }
     throw new Error(`Timed out publishing durable Fabric ${kind} ${id} from ${this.hostId}`);
   }
@@ -575,11 +816,68 @@ export class ResidencyClient {
       owner?.format !== RESIDENT_HOST_FORMAT ||
       owner.hostId !== this.hostId ||
       !Number.isSafeInteger(owner.pid) ||
-      !processIsAlive(owner.pid)
+      !residentProcessAlive(owner.pid, owner.processStartTime)
     ) {
       return undefined;
     }
+    if (owner.attempt) {
+      const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
+      if (state?.plan.id !== owner.attempt.id || state.phase !== (owner.attempt.kind === "target" ? "complete" : "fallback")) return undefined;
+    }
     return owner;
+  }
+
+  async #watchdog(): Promise<void> {
+    const now = Date.now();
+    if (this.#closed || this.#startingHost || now < this.#nextWatchdogAt || !kernelFenceAvailable()) return;
+    this.#nextWatchdogAt = now + WATCHDOG_INTERVAL_MS;
+    if (this.#liveOwner()) {
+      void this.reconcileRelease().catch((error) => this.#deferRelease(error));
+      return;
+    }
+    if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) return;
+    const work = this.#durableWork();
+    if (!work) { this.#watchdogWork = undefined; this.#watchdogFailures = 0; return; }
+    const noProgress = work === this.#watchdogWork;
+    this.#watchdogWork = work;
+    try {
+      await this.ensureHost();
+      // A ready owner is not progress: it may exit idle with the same disk work.
+      this.#watchdogFailures = noProgress ? this.#watchdogFailures + 1 : 0;
+      this.#nextWatchdogAt = Date.now() + Math.min(WATCHDOG_MAX_BACKOFF_MS, WATCHDOG_INTERVAL_MS * 2 ** this.#watchdogFailures);
+    } catch {
+      this.#nextWatchdogAt = Date.now() + Math.min(WATCHDOG_MAX_BACKOFF_MS, WATCHDOG_INTERVAL_MS * 2 ** ++this.#watchdogFailures);
+    }
+  }
+
+  #durableWork(): string | undefined {
+    const work: string[] = [];
+    const config = this.options.config;
+    const actorRoots = [config.actorRoot, config.sessionActorRoot ??
+      (config.mesh.actorScope === "session" ? path.dirname(config.actorRoot) : path.join(config.actorRoot, config.sessionId))];
+    for (const root of actorRoots) {
+      const registry = readJson<{ actors?: Array<{ id?: string; rootId?: string; residency?: string; status?: string }> }>(path.join(root, "actors.json"));
+      for (const actor of registry?.actors ?? []) {
+        if (actor.rootId === config.rootId && actor.residency === "durable" && actor.status !== "stopped") {
+          work.push(`actor:${root}:${actor.id}:${actor.status}`);
+        }
+      }
+    }
+    // A terminal task can leave its producer outbox behind at idle exit. The live
+    // client owns recovery even with no durable actors; the fenced host replays
+    // the stable envelope id, not the completed agent.
+    const outbox = path.join(config.residencyRoot, "delivery-outbox");
+    let entries: string[];
+    try { entries = fs.readdirSync(outbox); } catch { entries = []; }
+    for (const entry of entries.filter(entry => entry.endsWith(".json"))) {
+      const record = readJson<ResidentDeliveryRecord>(path.join(outbox, entry));
+      if (record?.format === RESIDENT_HOST_FORMAT && typeof record.id === "string" && `${record.id}.json` === entry &&
+        typeof record.rootId === "string" && typeof record.message === "string" && typeof record.triggerTurn === "boolean" &&
+        (record.delivery === "steer" || record.delivery === "followUp") && record.from && typeof record.from.id === "string") {
+        work.push(`delivery:${record.rootId}:${record.id}`);
+      }
+    }
+    return work.length ? JSON.stringify(work.sort()) : undefined;
   }
 
   async #drainDeliveries(): Promise<void> {
@@ -587,7 +885,13 @@ export class ResidencyClient {
     this.#drainingDeliveries = true;
     try {
       const entries = this.options.mesh.listAll(this.#deliveryPrefix);
-      for (const entry of entries) await this.#deliver(entry);
+      for (const entry of entries) {
+        try { await this.#deliver(entry); } catch (error) {
+          // The record remains durable. Back off a locked mesh; retain ordinary failed senders
+          // without blocking the other entries in this pass.
+          if (isMeshLockTimeout(error)) throw error;
+        }
+      }
     } finally {
       this.#drainingDeliveries = false;
     }
@@ -632,12 +936,20 @@ export class ResidencyClient {
         return;
       }
     }
+    // smarty-dev#2236: one record reached Main twice (a failed delete, or a second drainer that
+    // listed it through the 2 s read cache before the delete). The record stays the durable copy
+    // until Main durably admitted it: deliverAgent journals it under the record's stable id before
+    // it returns, keeps it until the session holds it, and admits one id once across restarts and
+    // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
     this.options.mainAgent.deliverAgent({
       from: value.from,
+      verification: "mesh", // The authenticated resident-host record was checked above.
+      principal: value.principal,
       message: value.message,
       delivery: value.delivery,
       triggerTurn: value.triggerTurn,
       ...(value.data === undefined ? {} : { data: value.data }),
+      deliveryId: `resident:${this.options.config.rootId}:${value.id}`,
     });
     await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
   }

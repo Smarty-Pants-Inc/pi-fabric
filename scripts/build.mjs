@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { build } from "esbuild";
 import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 const primaryEntryPoints = [
   "src/index.ts",
@@ -32,6 +33,10 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/core/literal-bash-guard.ts",
+  "src/lifecycle/reload-target-profile.ts",
+  "src/lifecycle/reload-slots.ts",
+  "src/coordination/unverified-ids.ts",
   "src/core/provider-operations.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
@@ -68,6 +73,8 @@ const lazyEntryPoints = [
   "src/worker/event-projection.ts",
   "src/worker/activation-window.ts",
   "src/worker/reply-tool.ts",
+  "src/worker/principal-delivery.ts",
+  "src/worker/session-id.ts",
   "src/worker/model-control.ts",
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",
@@ -78,6 +85,16 @@ const lazyEntryPoints = [
 
 const result = await build({
   entryPoints: [...primaryEntryPoints, ...lazyEntryPoints],
+  // Both facades only re-export host metadata. Resolve to their implementation
+  // so empty facade-only chunks do not consume startup graph slots.
+  plugins: [{
+    name: "host-metadata-facades",
+    setup(pluginBuild) {
+      pluginBuild.onResolve({ filter: /\/(?:model-policy|fabric-provenance)\.js$/ }, () => ({
+        path: resolve("src/host-compatibility.ts"),
+      }));
+    },
+  }],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",
@@ -124,6 +141,22 @@ const standalone = await build({
           : { path: args.path, external: true });
     },
   }],
+});
+
+// smarty-dev#2184: the worker loads this timeout-only hook into every Pi actor run, native-tool
+// ones included. Built on its own, without splitting, so it shares no chunk with index.js.
+await build({
+  entryPoints: ["src/guards/actor-bash-hook.ts"],
+  outdir: "dist",
+  outbase: "src",
+  entryNames: "[dir]/[name]",
+  bundle: true,
+  packages: "external",
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: true,
+  logLevel: "info",
 });
 
 // The records service runs as its own OS user from a root-owned copy of one file:

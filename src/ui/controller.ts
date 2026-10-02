@@ -787,12 +787,13 @@ export class FabricUiController {
       if (unchanged) {
         this.#snapshot = { ...this.#snapshot, now };           // elapsed times keep moving
       } else {
-        // A rebuild for a remote change first revalidates the mesh read cache (a parse only when
-        // the file changed, at most every REMOTE_REFRESH_MS), so it shows the state it was built
-        // for. Every rebuild records the stamp of the payload it consumed, not the file's, so a
-        // payload older than the file keeps the gate open (review/astra F2 on #84).
+        // A remote rebuild checks the canonical generation even if another reader just warmed
+        // the cache: a new writer UUID requires a parse now, not after that reader's TTL. Copied
+        // or missing markers retain ordinary TTL fallback, without extra warm-window full reads.
+        // Every rebuild records the consumed payload's stamp, not the file's, so an older payload
+        // keeps the gate open (review/astra F2 on #84).
         const remoteRebuild = !force && !this.#dashboardOpen && !this.#conversationOpen && remote !== this.#builtRemote;
-        if (remoteRebuild && this.state.config.mesh.enabled) this.state.mesh.cachedStateStamp?.(true);
+        if (remoteRebuild && this.state.config.mesh.enabled) this.state.mesh.cachedStateStamp?.(true, true);
         if (remoteRebuild && participantsRoot) readParticipantFiles(participantsRoot);   // revalidate the listing
         this.#builtLocal = local;
         this.#builtAt = now;

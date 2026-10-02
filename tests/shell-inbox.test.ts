@@ -23,7 +23,8 @@ const harness = () => {
     emit: (name: string, event: unknown = {}) => handlers.get(name)?.(event, ctx) };
 };
 beforeEach(() => vi.useFakeTimers());
-afterEach(async () => { for (const close of cleanups.splice(0)) await close(); vi.useRealTimers(); });
+// Filesystem removal may use nextTick internally; restore real timers before async teardown.
+afterEach(async () => { vi.useRealTimers(); for (const close of cleanups.splice(0)) await close(); });
 
 describe("live shell awareness", () => {
   const project = (h: ReturnType<typeof harness>, messages: unknown[] = []) => h.emit("context", { type: "context", messages });
@@ -138,6 +139,19 @@ describe("live shell awareness", () => {
 });
 
 describe("shell event delivery", () => {
+  it("counts a completion notice held by an interrupted Main until it is delivered (smarty-dev#2216)", async () => {
+    const h = harness(); h.idle();
+    const build = h.begin();
+    h.emit("turn_end", { message: { stopReason: "aborted" } }); // Escape suspends delivery
+    await build.finish(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.inbox.pendingCount()).toBe(1); // a reload now would drop it: the busy gate counts it
+    h.emit("input");
+    h.emit("before_agent_start");
+    expect(h.inbox.pendingCount()).toBe(0);
+  });
+
   it("delivers one terminal deadline notice without renewing a monitor", async () => {
     const h = harness(); h.idle();
     const job = h.jobs.begin("bash", "watch", { monitor: parseShellMonitor({ delivery: "wake", timeoutMs: 1000 })! }); job.spill();
@@ -166,9 +180,9 @@ describe("shell event delivery", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(h.sendMessage).not.toHaveBeenCalled();
     h.pending(false);
-    const result = h.emit("before_agent_start");
-    expect(result.message.details.ids).toHaveLength(5);
-    expect(result.message.content).toContain("exit 7");
+    const returned = h.emit("before_agent_start");
+    expect(returned.message.details.ids).toHaveLength(5);
+    expect(returned.message.content).toContain("exit 7");
     expect(h.sendMessage).not.toHaveBeenCalled();
     const job = h.begin(); await job.finish(0);
     await vi.advanceTimersByTimeAsync(100);
@@ -233,7 +247,8 @@ describe("shell event delivery", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(h.sendMessage).not.toHaveBeenCalled();
     h.emit("input");
-    expect(h.emit("before_agent_start").message.details.ids).toEqual([build.id]);
+    expect(h.emit("before_agent_start")).toMatchObject({ message: { details: { ids: [build.id] } } });
+    expect(h.sendMessage).not.toHaveBeenCalled();
   });
   it("discards future events from an abandoned branch and removes hooks on close", async () => {
     const h = harness(); const job = h.begin(); h.emit("session_tree"); await job.finish(0);

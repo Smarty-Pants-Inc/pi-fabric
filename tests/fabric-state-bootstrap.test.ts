@@ -71,8 +71,8 @@ describe("FabricState lazy bootstrap", () => {
     try {
       await state.bootstrap(contextAt(cwd));
       await state.ensure(contextAt(cwd));
-      await state.shutdown({ preserveRootRegistration: true });
-      expect(harness.instances[0]?.shutdown).toHaveBeenCalledWith({ preserveRootRegistration: true });
+      await state.shutdown("reload");
+      expect(harness.instances[0]?.shutdown).toHaveBeenCalledWith("reload");
     } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
   });
   it("rereads component configuration at first use without activating the runtime while idle", async () => {
@@ -325,6 +325,18 @@ describe("FabricState lazy bootstrap", () => {
     vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
     expect(state.shouldEagerlyActivate(context)).toBe(true);
     vi.unstubAllEnvs();
+  });
+
+  it.each(["reload", "exit"])("forwards the %s shutdown intent to the activated runtime", async (reason) => {
+    const cwd = project({ mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    try {
+      await state.bootstrap(contextAt(cwd));
+      await state.ensure(contextAt(cwd));
+      await state.shutdown(reason);
+      expect(harness.instances[0]?.shutdown).toHaveBeenCalledWith(reason);
+    } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
   });
 
   it("cleans failed activation and retries with a fresh runtime", async () => {

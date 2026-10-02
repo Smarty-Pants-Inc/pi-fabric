@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import type { MeshStore } from "../mesh/store.js";
-import { retainRootRegistration, forgetRetainedRootRegistration } from "../main-agent.js";
+import { retainRootRegistration, forgetRetainedRootRegistration } from "./root-registration-retention.js";
 
 export interface RootRegistrationIdentity {
   sessionId: string;
@@ -186,13 +186,16 @@ export class RootRegistrationGuard {
     }
   }
 
-  async close(options: { preserve?: boolean } = {}): Promise<void> {
+  async close(options: { preserve?: boolean; onRetire?: () => Promise<void> } = {}): Promise<void> {
     this.#closed = true;
     // Native reload disposes this object but leaves its live process/session claim for the
     // replacement module. Never create a claim-free interval while that owner PID is live.
     if (options.preserve) {
       if (this.#claimed && this.#sessionId) {
-        retainRootRegistration(this.#sessionId, `${this.mesh.root}\0${this.#claimed.id}`, () => this.close());
+        retainRootRegistration(this.#sessionId, `${this.mesh.root}\0${this.#claimed.id}`, async () => {
+          await options.onRetire?.();
+          await this.close();
+        });
       }
       return;
     }

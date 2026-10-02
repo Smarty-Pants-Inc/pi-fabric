@@ -23,7 +23,7 @@ import {
   readFabricExecutionRenderDetails,
 } from "./audit/index.js";
 import { DEFAULT_FABRIC_CONFIG } from "./config.js";
-import { hostGlobalsGuidance } from "./core/system-guidance.js";
+import { PAYLOADS_LITERAL_GUIDANCE, hostGlobalsGuidance } from "./core/system-guidance.js";
 import type { FabricState } from "./fabric-state.js";
 import { formatFailureProgress } from "./failure-progress.js";
 import {
@@ -85,7 +85,7 @@ import {
 } from "./ui/row-balance.js";
 import { observeAnimationRows, type SpinnerTimerState, updateSpinner } from "./ui/spinner.js";
 import type { FabricToolDisplayController } from "./ui/tool-display.js";
-import { boundModelOutput, modelOutputBudget } from "./output-budget.js";
+import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import { formatFabricValue } from "./ui/structured.js";
 import { countNewlines } from "./util.js";
 
@@ -137,8 +137,12 @@ const compactResultHeader = (
 const countLabel = (count: number, singular: string): string =>
   `${count} ${count === 1 ? singular : `${singular}s`}`;
 
-// fabric_exec guidance for orchestration-only mode, where programs have no `pi` or
-// `extensions`: files and shell stay on the native tools.
+// Fold the Main limits into an existing guideline, rather than growing every turn's prompt.
+const executionDisplayGuidance =
+  "Use `display.name` and objective `display.description`; Fabric pairs them with verified outcomes in deterministic compaction. " +
+  "In a Main, a fabric_exec program ends after 10 min and agents.run/wait return after 60 s; spawned agents keep running and report back.";
+
+// Orchestration-only programs have no `pi` or `extensions`; files and shell stay native.
 const orchestrationGuidelines = (python: boolean): string[] => [
   python
     ? "Batch independent Fabric operations (`agents`, `mesh`, `memory`, `state`, `mcp`, `tools.call`) in one `fabric_exec` Python program with `asyncio.gather`; await dependent steps sequentially. Return only the compact final JSON-compatible value."
@@ -147,9 +151,9 @@ const orchestrationGuidelines = (python: boolean): string[] => [
   "For coding tasks, keep an acceptance ledger: turn the request into concrete checks, trace the relevant execution path before editing, implement end to end, then run targeted tests and direct behavioral probes. Mechanically confirm requested public symbols, registrations, and configuration entries. Use the smallest checks that cover the ledger, escalating only for failures or cross-cutting risk; inspect failures and iterate instead of rerunning unchanged passing checks. A build alone is not completion.",
   "Amortize round trips without inflating context: batch only independent, bounded work in one program, and keep a step sequential when its output decides the next one. Filter or summarize large results inside the program and return decisions and evidence, not raw data.",
   python
-    ? "Pass multiline or quote-heavy text through top-level `payloads`; read it as `π.key` or `payloads['key']`, with exactly the keys supplied."
-    : "Pass multiline or quote-heavy text through top-level `payloads`; each `π.key` must exactly match a key there.",
-  "Use `display.name` and objective `display.description`; Fabric pairs them with verified outcomes in deterministic compaction.",
+    ? "Pass multiline or quote-heavy text through top-level `payloads`; read it as `π.key` or `payloads['key']`, with exactly the keys supplied; " + PAYLOADS_LITERAL_GUIDANCE + "."
+    : "Pass multiline or quote-heavy text through top-level `payloads`; each `π.key` must exactly match a key there; " + PAYLOADS_LITERAL_GUIDANCE + ".",
+  executionDisplayGuidance,
 ];
 
 export const createFabricExecTool = (
@@ -187,16 +191,16 @@ export const createFabricExecTool = (
       ...(piTools ? [
         python
           ? "Batch independent operations in one `fabric_exec` Python program with `asyncio.gather`; await dependent/conditional steps sequentially. Coalesce independent replacements into one `await pi.edit(path=..., edits=[...])`. Return only the compact final JSON-compatible value."
-          : "Batch independent operations in one `fabric_exec` program (`Promise.all` for parallel, sequential `await` for ordered), not one call per tool; keep dependent/conditional steps sequential. Coalesce non-dependent replacements from one file snapshot into one `pi.edit({path, edits:[...]})`; use `all:true` only for intentional repeated exact anchors. Return only the compact final value; intermediate results stay in the sandbox.",
+          : "Batch independent operations in one `fabric_exec` program (`Promise.all` for parallel); await dependent steps sequentially. Coalesce independent replacements from one file snapshot into one `pi.edit({path, edits:[...]})`; use `all:true` only for intentional repeated exact anchors. Return only the compact final value; intermediate results stay in the sandbox.",
         python
           ? "Search before reading with `await pi.grep(pattern=..., path=...)` or `await pi.find(pattern=..., path=...)`, then `await pi.read(path=..., offset=..., limit=...)`. Use Python dict syntax, `True`/`False`/`None`, and bounded searches; unbounded reads cap at 2000 lines or 50KB. Read continuation notices when needed."
-          : "Search before reading: use `pi.grep`/`pi.find` to locate relevant lines, then `pi.read({path, offset, limit})` that range. Escape regex metacharacters, or use `literal:true` for exact punctuated text. Keep fan-out search limits small and widen only on misses. An unbounded `pi.read` returns at most 2000 lines or 50KB and, when truncated, ends with a `Use offset=…` continuation notice; reserve whole-file reads for small files you will use in full.",
+          : "Search before reading: locate lines with `pi.grep`/`pi.find`, then `pi.read({path, offset, limit})` that range. Escape regex metacharacters, or use `literal:true` for exact punctuated text. Keep fan-out search limits small; widen only on misses. Unbounded reads cap at 2000 lines or 50KB; follow `Use offset=…` notices. Reserve whole-file reads for small files you will use in full.",
         "For coding tasks, keep an acceptance ledger: turn the request into concrete checks, trace the relevant execution path before editing, implement end to end, then run targeted tests and direct behavioral probes. Mechanically confirm requested public symbols, registrations, and configuration entries. Use the smallest checks that cover the ledger, escalating only for failures or cross-cutting risk; inspect failures and iterate instead of rerunning unchanged passing checks. A build alone is not completion.",
         python
           ? "For test/probe nonzero exits, use `await pi.bash(command=..., settle=True)` and inspect the returned dict: `r['ok']`, `r['output']`, and `r.get('exitCode')`. Set shell `timeout` in seconds once for long suites. Return decisions and evidence rather than raw logs."
           : "Amortize round trips without inflating context: batch only independent, bounded work. Keep search→read and edit→verify sequential when an output determines the next action. Use `settle:true` for tests or probes whose nonzero result is evidence rather than an exceptional stop; for a known long suite, set `pi.bash` `timeout` in seconds once instead of retrying a timed-out call. Filter or summarize noisy command output inside the program and return decisions, failures, and evidence—not raw logs or unused intermediate results.",
         "For edits/writes, pass named payloads through top-level `payloads`; each `π.key` must exactly match a key there; prefer `pi.edit`/`pi.write`. `pi.bash`: no stdin.",
-        "Use `display.name` and objective `display.description`; Fabric pairs them with verified outcomes in deterministic compaction.",
+        executionDisplayGuidance,
       ] : orchestrationGuidelines(python)),
       ...(quickjs ? [hostGlobalsGuidance(piTools)] : []),
       ...(monty ? ["Monty requires acyclic JSON host arguments. For underscore-prefixed provider/tool names, use `await tools.call(ref=..., args={...})`, not direct attributes. Use `payloads['key']` for private/non-identifier payload keys."] : []),
@@ -227,7 +231,7 @@ export const createFabricExecTool = (
       payloads: Type.Optional(
         Type.Record(Type.String(), Type.String(), {
           description:
-            "Named payloads exposed under the same exact name as π.key (for example, payloads.contract becomes π.contract). Never reference a π key absent from this map. Useful for content that is awkward to quote inside code. Prefer an object of string values; a JSON-object string is parsed.",
+            "Named payloads exposed under the same exact name as π.key (for example, payloads.contract becomes π.contract). Never reference a π key absent from this map. Useful for content that is awkward to quote inside code. Prefer an object of string values; a JSON-object string is parsed. " + PAYLOADS_LITERAL_GUIDANCE + " (a bare `__TOKEN__`, `@/path` or `file://` value is rejected).",
         }),
       ),
       resultFormat: Type.Optional(Type.Union(RESULT_FORMATS.map((value) => Type.Literal(value)))),
@@ -249,7 +253,7 @@ export const createFabricExecTool = (
         Type.Number({
           minimum: 1,
           description:
-            "Optional whole-program deadline in ms for this invocation; raises (never lowers) the configured executor.timeoutMs, capped by executor.maxTimeoutMs",
+            "Optional whole-program deadline in ms for this invocation; raises (never lowers) the configured executor.timeoutMs, capped by executor.maxTimeoutMs and, in a Main, executor.mainMaxTimeoutMs",
         }),
       ),
       display: Type.Optional(
@@ -309,7 +313,7 @@ export const createFabricExecTool = (
         : renderFabricWriteArgumentPreview(
             {
               bindings: rendererState.fabricWriteBindings ?? [],
-              strings: resolveFabricExecPayloads(params),
+              strings: resolveFabricExecPayloads(params, { validate: false }),
               expanded: context.expanded,
               cwd: context.cwd,
               settings: codePreviewSettings,
@@ -856,11 +860,15 @@ export const createFabricExecTool = (
     },
     async execute(toolCallId, params, signal, onUpdate, context) {
       await state.ensure(context);
+      // Keep this session's writer: a late result must not allocate outside a closed scope.
+      const outputArtifactWriter = state.outputArtifactWriter;
       // prepareArguments joins code arrays / remaps `strings` → `payloads`
       // and quotes unquoted pi path arguments before Pi validates this call;
       // keep the same coercion here for direct internal invocations.
       const joined = Array.isArray(params.code) ? params.code.join("\n") : params.code;
       const code = state.config.executor.kernel === "python" ? joined : repairFabricGuestCode(joined);
+      // Shared payload validation (smarty-dev#2340) rejects before any runtime.
+      const strings = resolveFabricExecPayloads(params);
       const repeat = repeatGuard.observe(code);
       if (repeat.blocked) {
         return {
@@ -870,7 +878,6 @@ export const createFabricExecTool = (
         };
       }
       const runDisplay = normalizeRunDisplay(params.display);
-      const strings = resolveFabricExecPayloads(params);
       const tokenBudget = "tokenBudget" in params && typeof params.tokenBudget === "number"
         ? params.tokenBudget : undefined;
       const result = await state.execution.execute({
@@ -912,6 +919,14 @@ export const createFabricExecTool = (
         toolCallId,
       );
       if (pendingHandoff) {
+        // Final Pi message_end rewrites all content for every handoff kind.
+        // Keep execution failure and immutable host fence facts separately from
+        // guest prose / render details, so that rewrite cannot erase a writer.
+        pendingHandoff.executionOutcome = Object.freeze({
+          success: result.success,
+          ...(result.error !== undefined ? { error: result.error } : {}),
+          residentOutcomes: Object.freeze((result.residentOutcomes ?? []).map(receipt => Object.freeze({ ...receipt }))),
+        });
         pendingHandoffs.set(toolCallId, pendingHandoff);
         context.ui.setStatus(
           "fabric-prewalk",
@@ -936,7 +951,10 @@ export const createFabricExecTool = (
       }
       const fullFormattedValue = formatFabricValue(result.value, selectedResultFormat);
       const failureProgress = formatFailureProgress(result.trace);
-      const fullSections = [...result.logs];
+      const residentPriority = result.residentOutcomes?.length
+        ? formatResidentOutcomePriority(result.residentOutcomes)
+        : undefined;
+      const fullSections = residentPriority ? [residentPriority, ...result.logs] : [...result.logs];
       if (fullFormattedValue.text) fullSections.push(fullFormattedValue.text);
       if (result.error) fullSections.push(`Runtime error: ${result.error}`);
       if (failureProgress) fullSections.push(failureProgress);
@@ -962,6 +980,7 @@ export const createFabricExecTool = (
       if (repeat.warn) sections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
       const rawOutput = sections.join("\n\n");
       const outputFormat =
+        !residentPriority &&
         formattedValue.language &&
         formattedValue.text &&
         (result.logs.length === 0 || !outputWillTruncate)
@@ -1002,6 +1021,8 @@ export const createFabricExecTool = (
             recoveryHint ? `\n\n${recoveryHint}` : ""
           }`,
           outputBudget,
+          undefined,
+          outputArtifactWriter,
         );
         return {
           content: [{ type: "text", text: bounded.text }],
@@ -1014,6 +1035,17 @@ export const createFabricExecTool = (
         rawOutput || "(no output)",
         outputBudget,
         fullRawOutput || "(no output)",
+        outputArtifactWriter,
+        residentPriority ? {
+          text: residentPriority,
+          sections: [
+            logPrefix ? `Guest logs:\n${logPrefix}` : "",
+            formattedValue.text,
+            result.error ? `Runtime error: ${result.error}` : "",
+            failureProgress ?? "",
+            repeat.warn ? fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK) : "",
+          ],
+        } : undefined,
       )).text;
       // In-place prewalk continuation arrives as an in-band context message on
       // this boundary turn, so the loop must keep running: the executor's first
@@ -1066,7 +1098,7 @@ export const createFabricExecTool = (
         // text-only model still receives the description while the terminal
         // shows the kitty image.
         const textOutput =
-          singleAudit && mediaNote
+          singleAudit && mediaNote && !residentPriority
             ? mediaNote
             : (output === "(no output)" ? "" : output);
         if (textOutput) content.push({ type: "text", text: textOutput });

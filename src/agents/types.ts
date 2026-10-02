@@ -1,3 +1,4 @@
+import type { FabricTurnProvenance } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type {
   SessionEntry,
@@ -41,6 +42,10 @@ export interface AgentSessionSeed {
 }
 
 export interface AgentRunRequest {
+  /** Host-only resident startup probe: model/extension admission, no prompt or tools. */
+  residentStartupProbe?: boolean;
+  /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
+  provenance?: FabricTurnProvenance | undefined;
   task: string;
   images?: ImageContent[];
   name?: string;
@@ -85,6 +90,8 @@ export interface AgentRunRequest {
   inheritedSessionPins?: InheritedSessionPin[];
   /** Unix niceness 0-19; only raises agents.nice, never lowers it. */
   nice?: number;
+  /** Actor runs: default bash timeout (s), exported as PI_FABRIC_ACTOR_BASH_TIMEOUT_S; 0 = none. */
+  bashTimeoutSeconds?: number;
 }
 
 export interface AgentUsage {
@@ -121,6 +128,8 @@ export interface AgentRunRecord {
   name: string;
   task: string;
   status: AgentRunStatus;
+  /** One-based FIFO admission position; present only while queued. */
+  queuePosition?: number;
   runner: FabricAgentRunner;
   /** Resolved Fabric kernel; absent for runners without Fabric. */
   kernel?: FabricKernel;
@@ -145,14 +154,23 @@ export interface AgentRunRecord {
   replyVia?: "tool";
   value?: unknown;
   error?: string;
+  /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM";
   /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
   warnings?: string[];
   stderr?: string;
   exitCode?: number | null;
   usage: AgentUsage;
   budget?: FabricBudgetSummary;
+  /** Transport identity (e.g. process PID), not the native Pi session. */
   sessionId?: string;
+  /** Latest native runner session; joins Pi gateway session_id to this run. */
   runnerSessionId?: string;
+  /** Distinct native Pi sessions observed during this run, in first-seen order. */
+  runnerSessionIds?: string[];
+  /** Parent Main participant and its Pi/Fabric session, not the child session. */
+  mainAgentId?: string;
+  fabricSessionId?: string;
   attachCommand?: string;
   branch?: string;
   worktree?: string;
@@ -160,6 +178,8 @@ export interface AgentRunRecord {
   nestedAgents?: AgentRunRecord[];
   pendingMessages?: { steering: string[]; followUp: string[] };
   compaction?: AgentCompactionStatus;
+  /** Terminal event-log optimization was skipped; the full original log remains. */
+  compactionSkipped?: string;
 }
 
 export interface AgentRunResult extends AgentRunRecord {
@@ -167,9 +187,13 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  /** Present on terminal status snapshots when the full log was retained. */
+  compactionSkipped?: string;
   id: string;
   name: string;
   status: AgentRunStatus;
+  /** One-based FIFO admission position; present only while queued. */
+  queuePosition?: number;
   runner: FabricAgentRunner;
   /** Resolved Fabric kernel; absent for runners without Fabric. */
   kernel?: FabricKernel;
@@ -191,6 +215,7 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  residentStartupProbe?: boolean;
   id: string;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
@@ -221,6 +246,7 @@ export interface AgentWorkerOptions {
   maxTokens?: number;
   /** Niceness applied to the spawned child (and IO priority on Linux). */
   nice?: number;
+  bashTimeoutSeconds?: number;
   fabricExtensionPath?: string;
   model?: string;
   thinking?: string;
@@ -245,6 +271,8 @@ export interface AgentWorkerOptions {
   branch?: string;
   worktree?: string;
   inheritedSessionPins?: InheritedSessionPin[];
+  /** Observed native Pi session history carried across a same-run worker relaunch. Not a resume target. */
+  runnerSessionIds?: string[];
   carryOver?: AgentRunCarryOver;
 }
 
@@ -266,8 +294,10 @@ export interface AgentTransportLaunch {
   cwd: string;
   workerPath: string;
   workerArguments: string[];
-  /** Aborted when the agent manager closes; a transport may stop waiting to launch. */
-  signal?: AbortSignal;
+  /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
+  signal?: AbortSignal | undefined;
+  /** Host activation generation check. Recheck after preparation, immediately before worker creation. */
+  authorize?: () => boolean;
 }
 
 export interface AgentTransportHandle {
@@ -311,12 +341,15 @@ export interface FabricAgentLog {
   status?: AgentRunRecord;
   events: FabricLogLine[];
   hasMore: boolean;
+  /** Exclusive byte offset; pair with generation as beforeGeneration on the next request. */
   before?: number;
+  generation?: string;
 }
 
 export type FabricSteeringMode = "all" | "one-at-a-time";
 
 export interface AgentSteerEntry {
+  provenance?: FabricTurnProvenance | undefined;
   type: "steer" | "follow_up" | "set_steering_mode" | "set_follow_up_mode" | "compact";
   id: string;
   message?: string;

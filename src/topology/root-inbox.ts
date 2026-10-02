@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 
 /**
@@ -64,7 +65,7 @@ const workKey = (data: unknown): string | undefined => {
 
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {
-  /** An inbox message with all of these event ids. */
+  /** Inbox messages collectively holding all of these event ids. */
   holdsBatch(ids: readonly string[]): boolean;
   /** An agent message (a steer or follow-up) from this sender that carried this work key. */
   holdsSteer(fromId: string, key: string): boolean;
@@ -75,6 +76,9 @@ export class RootInbox {
   #saved: string | undefined;
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
+  readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
+
+  close(): Promise<void> { return this.#notifications.close(); }
 
   constructor(
     readonly mesh: MeshStore,
@@ -98,7 +102,12 @@ export class RootInbox {
     if (state.pending) {
       // Only the session's own record of the message moves the cursor; a pending batch is
       // delivered again, however many times, until then.
-      if (!session.holdsBatch(state.pending.ids)) return { events: this.#reread(state.after, state.pending), through: state.pending.through };
+      if (!session.holdsBatch(state.pending.ids)) {
+        // A failed pending-cursor save must be retried before handing the batch on. In-memory
+        // pending alone is not durable admission (including after an acquisition timeout).
+        await this.#save(true);
+        return { events: this.#reread(state.after, state.pending), through: state.pending.through };
+      }
       state.after = Math.max(state.after, state.pending.through);
       delete state.pending;
       await this.#save(true);
@@ -131,10 +140,10 @@ export class RootInbox {
     if (batch.events.length === 0 || !idle()) return undefined;
     const reason = urgent ? "p0" : "idle";
     this.#wokeAt = this.#now();
-    void this.mesh.publish({
+    void this.#notifications.enqueue(() => this.mesh.publish({
       topic: ROOT_INBOX_WAKE_TOPIC, kind: "idle-wake", from: this.identity,
       data: { count: batch.events.length, reason, ids: batch.events.map((event) => event.id) },
-    }).catch(() => undefined);
+    }));
     return batch;
   }
 
@@ -236,29 +245,47 @@ export class RootInbox {
   }
 }
 
-/** The inbox's view of a session's recent entries. */
-export const rootInboxSession = (entries: readonly unknown[], lookback = 500): RootInboxSession => ({
-  holdsBatch: (ids) => sessionHoldsInboxBatch(entries, ids, lookback),
-  holdsSteer: (fromId, key) => {
-    for (let index = entries.length - 1; index >= Math.max(0, entries.length - lookback); index--) {
-      type Carried = { from?: { id?: unknown }; data?: unknown };
-      const entry = entries[index] as { type?: string; customType?: string; details?: Carried & { items?: unknown } } | undefined;
-      if (entry?.type !== "custom_message" || entry.customType !== AGENT_MESSAGE_CUSTOM_TYPE) continue;
-      // A batch of followUps (smarty-dev#1495) carries each one in items.
-      const carried: Carried[] = Array.isArray(entry.details?.items) ? entry.details.items as Carried[] : [entry.details ?? {}];
-      if (carried.some((item) => item?.from?.id === fromId && workKey(item.data) === key)) return true;
+/** A receipt snapshot of recent entries; async inbox reads must not retain the history. */
+export const rootInboxSession = (entries: readonly unknown[], lookback = 500): RootInboxSession => {
+  const batchIds = new Set<string>();
+  let hasBatch = false;
+  const steers = new Map<string, Set<string>>();
+  for (let index = entries.length - 1; index >= Math.max(0, entries.length - lookback); index--) {
+    type Carried = { from?: { id?: unknown }; data?: unknown };
+    const entry = entries[index] as { type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown } } | undefined;
+    if (entry?.type !== "custom_message") continue;
+    if (entry.customType === ROOT_INBOX_CUSTOM_TYPE && Array.isArray(entry.details?.ids)) {
+      hasBatch = true;
+      for (const id of entry.details.ids) if (typeof id === "string") batchIds.add(id);
     }
-    return false;
-  },
-});
+    if (entry.customType !== AGENT_MESSAGE_CUSTOM_TYPE) continue;
+    // A batch of followUps (smarty-dev#1495) carries each one in items.
+    const carried: Carried[] = Array.isArray(entry.details?.items) ? entry.details.items as Carried[] : [entry.details ?? {}];
+    for (const item of carried) {
+      const fromId = item?.from?.id;
+      const key = workKey(item?.data);
+      if (typeof fromId !== "string" || key === undefined) continue;
+      const keys = steers.get(fromId) ?? new Set<string>();
+      keys.add(key);
+      steers.set(fromId, keys);
+    }
+  }
+  return {
+    holdsBatch: (ids) => hasBatch && ids.every((id) => batchIds.has(id)),
+    holdsSteer: (fromId, key) => steers.get(fromId)?.has(key) ?? false,
+  };
+};
 
 /** Whether a session's recent entries hold the inbox message for these event ids. */
 export const sessionHoldsInboxBatch = (entries: readonly unknown[], ids: readonly string[], lookback = 500): boolean => {
+  const missing = new Set(ids);
   for (let index = entries.length - 1; index >= Math.max(0, entries.length - lookback); index--) {
     const entry = entries[index] as { type?: string; customType?: string; details?: { ids?: unknown } } | undefined;
     if (entry?.type !== "custom_message" || entry.customType !== ROOT_INBOX_CUSTOM_TYPE) continue;
-    const held = Array.isArray(entry.details?.ids) ? new Set(entry.details.ids) : undefined;
-    if (held && ids.every((id) => held.has(id))) return true;
+    if (Array.isArray(entry.details?.ids)) {
+      for (const id of entry.details.ids) if (typeof id === "string") missing.delete(id);
+      if (missing.size === 0) return true;
+    }
   }
   return false;
 };

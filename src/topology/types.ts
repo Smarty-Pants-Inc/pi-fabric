@@ -32,7 +32,13 @@ export interface FabricParticipantRecord {
   role?: string;
   /** The checkout that owns the root's git common directory (smarty-dev#784). */
   project?: string;
+  /** Normalized origin identity, portable across checkout paths and hosts. */
+  repository?: string;
+  /** False for print/JSON roots: discoverable observers, never message or lead targets. */
+  interactive?: boolean;
   status: string;
+  /** Fixed expiry of a Main reload handoff; never a grace period for an exited session. */
+  reloadUntil?: number;
   residency?: FabricParticipantResidency;
   runner: FabricAgentRunner;
   transport: FabricAgentTransport | "host";
@@ -53,6 +59,10 @@ export interface FabricParticipantRecord {
   usage?: AgentUsage;
   actorQueued?: number;
   actorMessages?: number;
+  /** The actor's in-flight run (smarty-dev#2184 item 8). */
+  actorRun?: { id: string; startedAt: number };
+  /** The actor's removal, pending behind its in-flight run (smarty-dev#2184 item 8). */
+  actorRemoval?: { requestedAt: number; runId?: string; runStartedAt?: number };
   controlProtocol: "v1" | "legacy";
   /**
    * Set on a root that the mesh bridge mirrors from another host's mesh (smarty-dev#2004):
@@ -93,6 +103,10 @@ export interface FabricPeerInfo {
   label?: string;
   role?: string;
   project?: string;
+  /** Normalized origin identity, portable across checkout paths and hosts. */
+  repository?: string;
+  /** False for print/JSON roots: discoverable observers, never message or lead targets. */
+  interactive?: boolean;
   kind: "peer";
   status: "idle" | "running";
   runner: "pi";

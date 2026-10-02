@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { participantProject, participantRole } from "./project-identity.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { participantProject, participantRole, repositoryOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type {
@@ -40,6 +41,8 @@ const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
 const PARTICIPANT_LEASE_MS = 15_000;
+/** Addressable across a live reload, but a failed reload stops accepting after this lease. */
+export const MAIN_RELOAD_LEASE_MS = 30_000;
 /**
  * Change-driven refreshes (agent UI updates, actor changes) run at most once per this
  * interval, and write only when a published record changed (smarty-dev#367: each write
@@ -54,15 +57,13 @@ const CHANGE_REFRESH_MIN_MS = 1_000;
  * (the dashboard, agents.list/status/members of remote agents) show them up to this old.
  */
 const ACTIVITY_REFRESH_MS = 60_000;
-/** Fields a record's `changed` test ignores: timestamps and activity counters. */
+/** Ignore noisy model activity, not actor queue/mailbox state needed for live reads (#2726). */
 const QUIET_FIELDS = {
   updatedAt: undefined,
   currentTool: undefined,
   turns: undefined,
   toolCalls: undefined,
   usage: undefined,
-  actorQueued: undefined,
-  actorMessages: undefined,
 } as const;
 /** How often a host sweeps records of long-dead hosts (smarty-dev#367); the first sweep waits too. */
 const DEAD_HOST_SWEEP_MS = 15 * 60 * 1_000;
@@ -159,10 +160,11 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
   const kind = participantKind(value.kind);
   if (
     !kind ||
+    (value.interactive !== undefined && typeof value.interactive !== "boolean") ||
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "rootRegistrationOwnerId", "cwd", "label", "role", "project", "model", "thinking", "parentId"]) ||
+    !optionalStrings(value, ["sessionId", "rootRegistrationOwnerId", "cwd", "label", "role", "project", "repository", "model", "thinking", "parentId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -219,7 +221,7 @@ const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo
     participant.kind !== "root" ||
     !participant.cwd ||
     !participant.sessionId ||
-    (participant.status !== "idle" && participant.status !== "running" && participant.status !== "stopping")
+    (participant.status !== "idle" && participant.status !== "running" && participant.status !== "stopping" && participant.status !== "reloading")
   ) {
     return undefined;
   }
@@ -233,6 +235,8 @@ const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo
     ...(label ? { label } : {}),
     ...(typeof participant.role === "string" ? { role: participant.role } : {}),
     ...(typeof participant.project === "string" ? { project: participant.project } : {}),
+    ...(participant.repository ? { repository: participant.repository } : {}),
+    ...(participant.interactive !== undefined ? { interactive: participant.interactive } : {}),
     kind: "peer",
     // A shutting-down root stays listed as a peer (its steer fails with a clear error).
     status: participant.status === "running" ? "running" : "idle",
@@ -376,6 +380,8 @@ export interface ParticipantDirectoryOptions {
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
 export class ParticipantDirectory implements FabricParticipantSource {
+  readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh");
+  readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #startedAt = Date.now();
   readonly #heartbeatMs: number;
@@ -399,6 +405,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshError: unknown;
   #deadHostSweepAt = Date.now();
   #quiescing = false;
+  #reloadUntil: number | undefined;
+  #reloadPublished = false;
   /** When a committed write last carried this host's participant records. */
   #recordsWrittenAt = 0;
 
@@ -435,7 +443,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // publish fails (for example a contended mesh lock at startup), keep
       // retrying so this host joins the mesh once the lock clears instead of
       // staying invisible until the next restart.
-      this.#timer = setInterval(() => void this.refresh().catch(() => undefined), this.#heartbeatMs);
+      this.#timer = setInterval(() => void this.#backgroundRefresh.run(() => this.refresh(), false), this.#heartbeatMs);
       this.#timer.unref();
     }
     if (initialError) throw initialError;
@@ -454,7 +462,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const run = (): void => {
       this.#refreshScheduled = false;
       this.#refreshTimer = undefined;
-      void this.#runRefresh(false).catch(() => undefined);
+      void this.#backgroundRefresh.run(() => this.#runRefresh(false), false);
     };
     const wait = this.#changeRefreshAt + CHANGE_REFRESH_MIN_MS - Date.now();
     if (wait <= 0) {
@@ -493,6 +501,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try {
       const committed = await operation;
       if (!committed) return;
+      // An unchanged change-refresh proves nothing about the lock. Only a committed
+      // write/confirmWritable acquisition ends the background path's lock outage.
+      if (this.options.enabled) this.#backgroundRefresh.success();
       this.#refreshedAt = Date.now();
       this.#refreshError = undefined;
       if (full) this.#sweepDeadHosts();
@@ -540,6 +551,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const stale =
         !owner ||
         owner.expiresAt < now ||
+        (participant.status === "reloading" && (participant.reloadUntil ?? 0) < now) ||
         owner.identity.id !== participant.ownerIdentityId ||
         owner.rootId !== participant.rootId;
       if (stale && !options.includeStale) continue;
@@ -658,7 +670,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // unmirrored host's id, root or identity on this mesh.
   // ponytail: a mirror that overwrote another local host's child agent is not detectable here;
   // that host's next heartbeat takes its key back, and the bridge never overwrites unmirrored keys.
-  #collides(participant: FabricParticipantRecord, hosts: ReadonlyMap<string, FabricHostRecord>): boolean {
+  #collides(participant: FabricParticipantRecord, hosts: ReadonlyMap<string, FabricHostRecord>, report = true): boolean {
     if (participant.remoteHost === undefined) return false;
     const ids = new Set([participant.id, participant.rootId]);
     let collides = [...ids].some((id) =>
@@ -668,7 +680,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       collides = host.remoteHost === undefined &&
         (ids.has(host.id) || ids.has(host.rootId) || ids.has(host.identity.id));
     }
-    if (collides) this.#reportCollision(participant);
+    if (collides && report) this.#reportCollision(participant);
     return collides;
   }
 
@@ -691,13 +703,44 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const key = `${id}\0${remoteHost}\0${reason}`;
     if (this.#reportedCollisions.has(key) || this.#reportedCollisions.size >= 1_000) return;
     this.#reportedCollisions.add(key);
-    void this.mesh.publish({
+    void this.#notifications.enqueue(() => this.mesh.publish({
       topic: MIRROR_COLLISION_TOPIC,
       kind: "refused",
       from: this.options.identity,
       text: `Refused mirrored record ${id} from remote host ${remoteHost}: ${reason}`,
       data: { id, remoteHost, reason, ...data },
-    }).catch(() => undefined);
+    }));
+  }
+
+  /** Validated mirror attribution, including expired leases; fresh and without publishing refusals. */
+  mirroredControlOwner(
+    ownerHostId: string,
+    ownerIdentityId: string | undefined,
+    targetId: string,
+  ): { remoteHost: string; expiresAt: number } | undefined {
+    if (!this.options.enabled || ownerIdentityId === undefined) return undefined;
+    const read = { fresh: true };
+    const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, targetId), read);
+    const participant = entry ? participantFromEntry(entry) : undefined;
+    if (
+      !participant?.remoteHost ||
+      participant.id !== targetId ||
+      participant.kind !== "root" ||
+      participant.rootId !== targetId ||
+      participant.ownerHostId !== ownerHostId ||
+      participant.ownerIdentityId !== ownerIdentityId
+    ) return undefined;
+    const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read));
+    const owner = hosts.get(ownerHostId);
+    if (
+      !owner ||
+      !ownerMatches(participant, owner, this.options.hostId) ||
+      owner.identity.id !== ownerIdentityId ||
+      owner.rootId !== participant.rootId ||
+      !Number.isFinite(owner.expiresAt) ||
+      this.#collides(participant, hosts, false)
+    ) return undefined;
+    return { remoteHost: participant.remoteHost, expiresAt: owner.expiresAt };
   }
 
   lastKnown(id: string, now = Date.now()): { participant: FabricParticipantInfo; lapsedMs: number } | undefined {
@@ -740,6 +783,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (
           owner &&
           ownerMatches(participant, owner, this.options.hostId) &&
+          !(participant.status === "reloading" && (participant.reloadUntil ?? 0) < now) &&
           hostLeaseExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner) >= now &&
           owner.identity.id === participant.ownerIdentityId &&
           owner.rootId === participant.rootId
@@ -854,8 +898,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
   }
 
-  root(main: FabricMainAgentInfo, sessionName?: string, rootRegistrationOwnerId?: string): FabricParticipantRecord {
+  root(main: FabricMainAgentInfo, interactive = true, sessionName?: string, rootRegistrationOwnerId?: string): FabricParticipantRecord {
     const role = participantRole();
+    const project = main.cwd ? participantProject(main.cwd) : undefined;
+    const repository = project ? repositoryOf(project) : undefined;
     return {
       format: 1,
       id: main.id,
@@ -867,8 +913,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",
-      capabilities: ["steer", "followUp", "fabric"],
-      ...(main.cwd ? { cwd: main.cwd, project: participantProject(main.cwd) } : {}),
+      capabilities: interactive ? ["steer", "followUp", "fabric"] : ["fabric"],
+      interactive,
+      ...(main.cwd ? { cwd: main.cwd } : {}),
+      ...(project ? { project } : {}),
+      ...(repository ? { repository } : {}),
       ...(role ? { role } : {}),
       ...(main.sessionId ? { sessionId: main.sessionId } : {}),
       ...(rootRegistrationOwnerId ? { rootRegistrationOwnerId } : {}),
@@ -888,21 +937,44 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const now = Date.now();
     if (now - this.#deadHostSweepAt < (reap?.sweepMs ?? DEAD_HOST_SWEEP_MS)) return;
     this.#deadHostSweepAt = now;
-    void reapDeadHostRecords(this.mesh, this.options.identity, {
+    void this.#notifications.enqueue(() => reapDeadHostRecords(this.mesh, this.options.identity, {
       ownHostId: this.options.hostId,
       now,
       ...(reap?.deadAfterMs !== undefined ? { deadAfterMs: reap.deadAfterMs } : {}),
-    }).catch(() => undefined);
+    }));
   }
 
-  async quiesce(): Promise<void> {
+  async quiesce(reason?: string): Promise<void> {
     if (this.#closed || this.#quiescing) return;
     this.#quiescing = true;
+    if (reason === "reload" && this.options.identity.kind === "main" && this.options.hostId === this.options.rootId) {
+      this.#reloadUntil = Date.now() + MAIN_RELOAD_LEASE_MS;
+    }
     await this.#refreshing?.catch(() => undefined);
     await this.refresh();
+    this.#reloadPublished = this.#reloadUntil !== undefined;
+  }
+
+  /** A lazy reload replacement may retire without ever publishing a new directory. */
+  async retireReloadRoot(rootRegistrationOwnerId: string): Promise<void> {
+    if (!this.#reloadPublished || !this.options.enabled) return;
+    const ownReload = (entry: MeshStateEntry): boolean => {
+      const participant = participantFromEntry(entry);
+      return participant !== undefined && isLocal(participant, this.options.hostId) &&
+        participant.kind === "root" && participant.id === this.options.rootId &&
+        participant.rootRegistrationOwnerId === rootRegistrationOwnerId &&
+        participant.status === "reloading" && participant.reloadUntil === this.#reloadUntil;
+    };
+    // Conditional file/state removal cannot erase a replacement's newer publication. The
+    // fixed host lease may expire naturally; without its root it grants no root ownership.
+    await Promise.all(readParticipantFiles(this.mesh.root, { maxAgeMs: 0 }).filter(ownReload)
+      .map(entry => removeParticipantFileIf(this.mesh, entry.key, ownReload)));
+    const owned = this.mesh.listAll(PARTICIPANT_PREFIX).filter(ownReload);
+    await Promise.all(owned.map(entry => this.mesh.delete({ key: entry.key, ifVersion: entry.version })));
   }
 
   async close(): Promise<void> {
+    if (this.#closed) return;
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
@@ -910,10 +982,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
     await this.#refreshing?.catch(() => undefined);
+    await this.#notifications.close();
     if (!this.options.enabled) return;
     const own = (entry: MeshStateEntry): boolean => {
       const participant = participantFromEntry(entry);
-      return participant !== undefined && isLocal(participant, this.options.hostId);
+      return participant !== undefined && isLocal(participant, this.options.hostId) &&
+        !(this.#reloadPublished && participant.kind === "root" && participant.id === this.options.rootId);
     };
     await Promise.allSettled(readParticipantFiles(this.mesh.root, { maxAgeMs: 0 }).filter(own)
       .map((entry) => removeParticipantFileIf(this.mesh, entry.key, own)));
@@ -926,6 +1000,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
         await this.mesh.delete({ key: legacy.key, ifVersion: legacy.version }).catch(() => undefined);
       }
     }
+    // A reload leaves only its root and fixed host lease; the next session_start replaces both.
+    if (this.#reloadPublished) return;
     removeHostLease(this.mesh.root, this.options.hostId);
     const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
     if (hostEntry && hostFromEntry(hostEntry)?.remoteHost === undefined) {
@@ -948,7 +1024,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
           ownerHostId: this.options.hostId,
           ownerIdentityId: this.options.identity.id,
           // A root that is shutting down takes no new steer, and says why (smarty-dev#1113).
-          ...(this.#quiescing ? { capabilities: [], status: "stopping" } : {}),
+          ...(this.#quiescing
+            ? this.#reloadUntil !== undefined && candidate.kind === "root" && candidate.id === this.options.rootId
+              ? { status: "reloading", reloadUntil: this.#reloadUntil }
+              : { capabilities: [], status: "stopping" }
+            : {}),
           controlProtocol: "v1",
         };
         desired.set(record.id, record);
@@ -1138,7 +1218,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // The file lease is renewed first and on every heartbeat, without the mesh lock
     // (smarty-dev#816). Under the fleet owner's policy, a renewal that changes nothing writes
     // only the file, plus the shared host record every STATE_LEASE_RENEW_MS.
-    if (!this.#quiescing) {
+    if (!this.#quiescing || this.#reloadUntil !== undefined) {
       const leaseAt = this.#renewFileLease();
       if (!changed && fileLeasesOnly(this.mesh.get(LIVENESS_POLICY_KEY)?.value)) {
         const own = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
@@ -1173,7 +1253,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         identity: this.options.identity,
         startedAt: this.#startedAt,
         updatedAt: leaseAt,
-        expiresAt: leaseAt + this.#leaseMs,
+        expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
       }),
     });
     const results = await this.mesh.writeBatch({ identity: this.options.identity, ops });
@@ -1205,7 +1285,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: this.options.rootId,
       identityId: this.options.identity.id,
       updatedAt: leaseAt,
-      expiresAt: leaseAt + this.#leaseMs,
+      expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
     });
     return leaseAt;
   }

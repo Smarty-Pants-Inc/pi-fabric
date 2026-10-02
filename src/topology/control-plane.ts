@@ -1,7 +1,11 @@
+import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import type { FabricActorRunBinding } from "../actors/types.js";
+import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
+import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -10,6 +14,8 @@ const CONTROL_SEEN_PREFIX = "topology/control-seen/";
 const HOST_PREFIX = "topology/hosts/";
 const DEFAULT_POLL_MS = 100;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
+// A cancellation owns a separate retry deadline, longer than a production mesh lock wait.
+const CANCELLATION_RETENTION_MS = 60_000;
 const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
@@ -18,6 +24,8 @@ const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 // without this grace a delivered command was reported as timed out and then retried
 // (smarty-dev#367). A command not admitted by the deadline is acknowledged as expired.
 const MAX_CONTROL_ACK_GRACE_MS = 15_000;
+// A bridged request must cover queueing on both hosts and the transport, not just a local poll.
+const MIN_BRIDGE_CONTROL_TIMEOUT_MS = 30_000;
 // Records other hosts left in the shared state before smarty-dev#643 are checked this often.
 const LEGACY_SEEN_CLEANUP_MS = 15 * 60 * 1_000;
 // A lock wait that timed out committed nothing, so the step that hit it is retried.
@@ -32,15 +40,20 @@ export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel";
 
 export interface FabricControlCommand {
+  /** Hydrated from the admitted MeshEvent envelope, never event.data. */
+  principal?: FabricPrincipal | undefined;
   version: 1;
   commandId: string;
   targetId: string;
   operation: FabricControlOperation;
   replyTo: string;
+  /** Validated destination link; null binds native delivery, absent is legacy. */
+  destinationRemoteHost?: string | null;
   message?: string;
   data?: unknown;
   triggerTurn?: boolean;
   binding?: FabricActorRunBinding;
+  bindingProvenance?: FabricActorBindingProvenance;
   cancelCommandId?: string;
   requestedAt: number;
   deadlineAt?: number;
@@ -49,6 +62,10 @@ export interface FabricControlCommand {
 export interface FabricControlAcceptance {
   accepted: boolean;
   messageId?: string;
+  /** Main requested a new turn at admission; absent on older owners or non-Main targets. */
+  triggered?: boolean;
+  /** Main held a requested wake; includes the provider retry deadline when applicable. */
+  reason?: string;
   /** The owner's followUp queue for a Main target (smarty-dev#1495). */
   pendingFollowUps?: number;
   oldestAgeS?: number;
@@ -75,6 +92,9 @@ export interface FabricControlResult {
   messageId: string;
   routed: "mesh";
   acknowledged: true;
+  triggered?: boolean;
+  /** Main held a requested wake; includes the provider retry deadline when applicable. */
+  reason?: string;
   pendingFollowUps?: number;
   oldestAgeS?: number;
   stalled?: true;
@@ -94,6 +114,14 @@ const queueDepthOf = (source: Record<string, unknown>): { pendingFollowUps: numb
     : { pendingFollowUps, oldestAgeS, ...(source.stalled === true ? { stalled: true as const } : {}) };
 };
 
+/** Keep unknown/legacy receipts unknown; never coerce a malformed report to true. */
+const triggeredOf = (source: Record<string, unknown>): { triggered: boolean; reason?: string } | undefined =>
+  typeof source.triggered === "boolean" ? {
+    triggered: source.triggered,
+    ...(source.triggered === false && typeof source.reason === "string" && source.reason.length <= 200
+      ? { reason: source.reason } : {}),
+  } : undefined;
+
 /** The owner's coalesce report for a Main followUp (smarty-dev#1495), or nothing. */
 const coalescedOf = (source: Record<string, unknown>): { coalesced: true; replacedMessageId: string } | undefined =>
   source.coalesced === true && typeof source.replacedMessageId === "string" && source.replacedMessageId.length <= 200
@@ -104,6 +132,7 @@ export type FabricControlHandler = (
   command: FabricControlCommand,
   from: MeshIdentity,
   signal: AbortSignal,
+  verification?: MeshEvent["verification"],
 ) => Promise<FabricControlAcceptance> | FabricControlAcceptance;
 
 const controlSeenKey = (hostId: string, commandId: string): string =>
@@ -131,7 +160,12 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
     typeof data.replyTo !== "string" ||
     typeof data.requestedAt !== "number" ||
     (data.deadlineAt !== undefined && typeof data.deadlineAt !== "number") ||
+    (data.destinationRemoteHost !== undefined && data.destinationRemoteHost !== null &&
+      typeof data.destinationRemoteHost !== "string") ||
     (data.operation === "cancel" && typeof data.cancelCommandId !== "string") ||
+    (data.bindingProvenance !== undefined &&
+      (!isObject(data.bindingProvenance) || data.bindingProvenance.kind !== "owner-defaults" ||
+        typeof data.bindingProvenance.rootId !== "string")) ||
     (data.binding !== undefined &&
       (!isObject(data.binding) ||
         (data.binding.model !== undefined && typeof data.binding.model !== "string") ||
@@ -139,7 +173,8 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
   ) {
     return undefined;
   }
-  return data as unknown as FabricControlCommand;
+  return { ...data, principal: event.verification === "mesh" || event.verification === "bridge"
+    ? copyFabricPrincipal(event.principal) : undefined } as unknown as FabricControlCommand;
 };
 
 interface FabricControlSeenRecord {
@@ -173,30 +208,71 @@ export interface FabricControlPlaneOptions {
   hostId: string;
   pollMs?: number;
   acknowledgementTimeoutMs?: number;
+  /** Remote-link command window; at least 30 s, also used for bridged cancellation. */
+  bridgeTimeoutMs?: number;
+  /** Fresh, directory-validated mirror ownership, including expired leases. */
+  readMirroredOwner?: (
+    ownerHostId: string,
+    ownerIdentityId: string | undefined,
+    targetId: string,
+  ) => { remoteHost: string; expiresAt: number } | undefined;
 }
 
 export interface FabricControlInput {
+  /** Host-only scope snapshot, not a model-facing parameter. */
+  principal?: FabricPrincipal | undefined;
   message?: string;
   data?: unknown;
   triggerTurn?: boolean;
   binding?: FabricActorRunBinding;
+  bindingProvenance?: FabricActorBindingProvenance;
 }
 
+/** Trust owner-default provenance only from a validated member of that actor's root. */
+export const controlActorBindingOptions = (
+  command: Pick<FabricControlCommand, "binding" | "bindingProvenance">,
+  from: MeshIdentity,
+  actorRootId: string | undefined,
+  senderRootId: string | undefined,
+): { overrides?: FabricActorRunBinding; binding?: FabricActorRunBinding } => {
+  const provenance = command.bindingProvenance;
+  if (provenance) {
+    if (provenance.kind !== "owner-defaults" || !actorRootId || provenance.rootId !== actorRootId ||
+      (from.id !== actorRootId && senderRootId !== actorRootId)) {
+      throw new Error("Invalid actor owner-default binding provenance");
+    }
+    return { overrides: command.binding ?? {} };
+  }
+  // An explicit caller view is fixed, even when one or both fields are absent.
+  if (command.binding !== undefined) return { binding: command.binding };
+  // Preserve legacy unbound own-root requests, but never promote an empty foreign
+  // view into the owner's private session defaults.
+  return actorRootId && (from.id === actorRootId || senderRootId === actorRootId)
+    ? {} : { binding: {} };
+};
+
 export interface FabricControlRequestOptions {
+  /** Snapshot from the validated participant, never from message/data. */
+  routedRemoteHost?: string | null;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Host-selected ASK observation policy; only the private branded ceiling qualifies. */
+  detachOnMainCeiling?: boolean;
 }
 
 interface PendingControlRequest {
   resolve: (acceptance: FabricControlAcceptance) => void;
   reject: (error: Error) => void;
-  /** Armed when the command's publish commits, with its wire deadline (smarty-dev#816). */
+  /** Mirrored messages prearm at admission; other requests arm after publish commits. */
   timer?: NodeJS.Timeout;
   ownerHostId: string;
   ownerIdentityId: string;
   targetId: string;
   commandPublished: boolean;
+  readonly destinationRemoteHost?: string | null;
   cancellationRequested?: boolean;
+  cancellationPublished?: boolean;
+  mirroredOwner?: { remoteHost: string; expiresAt: number };
   signal?: AbortSignal;
   onAbort?: () => void;
 }
@@ -216,11 +292,20 @@ export class FabricControlPlane {
   readonly #unpublished = new Map<string, { acceptance: FabricControlAcceptance; expiresAt: number }>();
   readonly #pollMs: number;
   readonly #ackTimeoutMs: number;
+  readonly #bridgeTimeoutMs: number;
   #offset: number;
   #lastSequence: number;
   #timer: NodeJS.Timeout | undefined;
+  #mirrorWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
+  readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll");
+  readonly #backgroundNotifications = new MeshBackgroundQueue("control detached ack");
+  // Cancellation may become publishable after close, when an admitted command finally commits.
+  // Its queue owns that final obligation until success/deadline; idle has no timer or resources.
+  readonly #backgroundCancellations = new MeshBackgroundQueue("control cancellation");
   #closed = false;
+  #paused = false;
+  #releasePublicationFailed = false;
   #handler: FabricControlHandler | undefined;
   #seenCleanupAt = 0;
   #legacySeenCleanupAt = Date.now();
@@ -240,10 +325,13 @@ export class FabricControlPlane {
   ) {
     this.#pollMs = Math.max(20, options.pollMs ?? DEFAULT_POLL_MS);
     this.#ackTimeoutMs = Math.max(this.#pollMs * 4, options.acknowledgementTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS);
+    this.#bridgeTimeoutMs = Math.max(MIN_BRIDGE_CONTROL_TIMEOUT_MS,
+      Math.min(MAX_CONTROL_TIMEOUT_MS, Math.floor(options.bridgeTimeoutMs ?? MIN_BRIDGE_CONTROL_TIMEOUT_MS)));
     this.#seen = new MeshStore(
       path.join(mesh.root, "control-seen", createHash("sha256").update(options.hostId).digest("hex").slice(0, 32)),
       mesh.maxEventBytes,
       mesh.maxReadEvents,
+      { lockProtocol: mesh.lockProtocol },
     );
     // Replay the retained log from its current generation. Durable claims
     // recover unclaimed commands and make interrupted outcomes explicit without re-execution.
@@ -255,7 +343,8 @@ export class FabricControlPlane {
     this.#handler = handler;
     if (!this.options.enabled || this.#timer) return;
     this.#closed = false;
-    this.#timer = setInterval(() => void this.#poll().catch(() => undefined), this.#pollMs);
+    this.#paused = false;
+    this.#timer = setInterval(() => void this.#backgroundPoll.run(() => this.#poll()), this.#pollMs);
     this.#timer.unref();
   }
 
@@ -265,14 +354,20 @@ export class FabricControlPlane {
     operation: FabricControlOperation,
     input: FabricControlInput = {},
     ownerIdentityId = ownerHostId,
+    options: FabricControlRequestOptions = {},
   ): Promise<FabricControlResult> {
+    // Shared across the bounded retry: first admission may discover a mirror even
+    // for an older caller that supplied no routing snapshot.
+    const destination = { remoteHost: options.routedRemoteHost };
     const send = () => this.#requestAcceptance(
       ownerHostId,
       targetId,
       operation,
       input,
       ownerIdentityId,
-      { timeoutMs: this.#ackTimeoutMs },
+      { ...options, timeoutMs: options.timeoutMs ?? this.#ackTimeoutMs },
+      destination,
+      true,
     );
     let sent;
     try {
@@ -299,6 +394,7 @@ export class FabricControlPlane {
       acknowledged: true,
       ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
       ...coalescedOf(acceptance as unknown as Record<string, unknown>),
+      ...triggeredOf(acceptance as unknown as Record<string, unknown>),
     };
   }
 
@@ -331,17 +427,41 @@ export class FabricControlPlane {
     input: FabricControlInput,
     ownerIdentityId: string,
     options: FabricControlRequestOptions,
+    destination = { remoteHost: options.routedRemoteHost },
+    messageRequest = false,
   ): Promise<{ commandId: string; acceptance: FabricControlAcceptance }> {
     if (!this.options.enabled) {
       throw new Error("Fabric mesh is disabled; cannot control a remote participant");
     }
     if (!ownerHostId.trim()) throw new Error("Remote participant has no execution owner");
     if (options.signal?.aborted) throw new Error(`Remote Fabric request cancelled: ${targetId}`);
+    const commandId = randomUUID();
+    let mirroredOwner: PendingControlRequest["mirroredOwner"];
+    const unavailable = (host: string): Error => new Error(
+      `Fabric mesh bridge routing to remote host ${host} is unavailable for ${targetId}; ` +
+        "the routed owner could not be revalidated; this attempt was not published.",
+    );
+    try {
+      mirroredOwner = this.options.readMirroredOwner?.(ownerHostId, ownerIdentityId, targetId);
+    } catch (error) {
+      if (typeof destination.remoteHost === "string") throw unavailable(destination.remoteHost);
+      throw error;
+    }
+    if (typeof destination.remoteHost === "string" && mirroredOwner?.remoteHost !== destination.remoteHost) {
+      throw unavailable(destination.remoteHost);
+    }
+    if (destination.remoteHost === null && mirroredOwner) {
+      throw new Error(`Fabric native routing is unavailable for ${targetId}; the routed owner changed; this attempt was not published.`);
+    }
+    if (destination.remoteHost === undefined) {
+      destination.remoteHost = mirroredOwner?.remoteHost ?? (this.options.readMirroredOwner ? null : undefined);
+    }
+    const destinationRemoteHost = destination.remoteHost;
     const timeoutMs = Math.max(
       this.#pollMs * 4,
+      typeof destinationRemoteHost === "string" ? this.#bridgeTimeoutMs : 0,
       Math.min(MAX_CONTROL_TIMEOUT_MS, Math.floor(options.timeoutMs ?? this.#ackTimeoutMs)),
     );
-    const commandId = randomUUID();
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
     let pendingRequest: PendingControlRequest;
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
@@ -352,14 +472,31 @@ export class FabricControlPlane {
         ownerIdentityId,
         targetId,
         commandPublished: false,
+        ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
+        ...(mirroredOwner ? { mirroredOwner: { ...mirroredOwner } } : {}),
       };
       pendingRequest = pending;
       this.#pending.set(commandId, pending);
+      if (pending.mirroredOwner) {
+        // Capture validated authority first, then arm before publish can wait on the mesh lock.
+        // Renewal or a failed directory read cannot extend this sender-local message budget.
+        if (messageRequest && (operation === "steer" || operation === "followUp")) {
+          // The finite admission budget includes the bridge window and return-leg ACK grace.
+          // It is not refreshed by lease renewal, nor reset by a late publish.
+          pending.timer = setTimeout(() => this.#timeoutPending(commandId), timeoutMs + ackGraceMs);
+          pending.timer.unref();
+        }
+        this.#startMirrorWatchdog();
+      }
       if (options.signal) {
         const onAbort = (): void => {
           const cancelled = this.#clearPending(commandId);
-          if (cancelled) void this.#publishCancellation(commandId, cancelled);
-          reject(new Error(`Remote Fabric request cancelled: ${targetId}`));
+          const ceiling = operation === "ask" && options.detachOnMainCeiling
+            ? mainExecutionCeilingAbortReason(options.signal) : undefined;
+          // The remote owner already owns accepted work. Do not translate Main's
+          // observation ceiling into an unbranded activation-cancel wire command.
+          if (cancelled && !ceiling) void this.#publishCancellation(commandId, cancelled);
+          reject(ceiling ?? new Error(`Remote Fabric request cancelled: ${targetId}`));
         };
         pending.signal = options.signal;
         pending.onAbort = onAbort;
@@ -371,10 +508,15 @@ export class FabricControlPlane {
     // Attach a handler now; awaiting the original promise below still preserves the rejection.
     void acceptance.catch(() => undefined);
     try {
-      await this.mesh.publish({
+      // Settlement must not wait for the original publish or a best-effort cancellation.
+      // The publish still completes once, and then cancels if settlement won while in flight.
+      const publishing = this.mesh.publish({
         topic: CONTROL_TOPIC,
         kind: operation,
         from: this.identity,
+        principal: input.principal,
+        signal: operation === "ask" && options.detachOnMainCeiling
+          ? withoutMainExecutionCeiling(options.signal) : options.signal,
         to: ownerHostId,
         // Stamped at commit (smarty-dev#816): the owner gets the whole timeout, not what is
         // left after this sender waited for the mesh lock (2-3 s under load).
@@ -384,35 +526,30 @@ export class FabricControlPlane {
           targetId,
           operation,
           replyTo: this.options.hostId,
+          ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
           ...(input.message !== undefined ? { message: input.message } : {}),
           ...(input.data !== undefined ? { data: input.data } : {}),
           ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
           ...(input.binding !== undefined ? { binding: input.binding } : {}),
+          ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
           requestedAt: committedAt,
           deadlineAt: committedAt + timeoutMs,
         }),
+      }).then(() => {
+        pendingRequest!.commandPublished = true;
+        // Other requests retain their commit-time ACK window. Never overwrite a mirrored
+        // message's admission timer, or revive a request already settled while publishing.
+        if (this.#pending.get(commandId) === pendingRequest! && !pendingRequest!.timer) {
+          pendingRequest!.timer = setTimeout(
+            () => this.#timeoutPending(commandId), timeoutMs + ackGraceMs,
+          );
+          pendingRequest!.timer.unref();
+        }
+        if (pendingRequest!.cancellationRequested) {
+          void this.#publishCancellation(commandId, pendingRequest!);
+        }
       });
-      pendingRequest!.commandPublished = true;
-      // The wait starts at commit, like the owner's deadline: the lock wait before it (bounded by
-      // the mesh lock timeout) is not taken from the timeout. A request cancelled or closed
-      // meanwhile is no longer pending and is not revived.
-      if (this.#pending.get(commandId) === pendingRequest!) {
-        pendingRequest!.timer = setTimeout(() => {
-          const timedOut = this.#clearPending(commandId);
-          if (!timedOut) return;
-          void this.#publishCancellation(commandId, timedOut);
-          // The outcome is unknown: the owner may have admitted the command before its
-          // deadline. A retry is a new command, so it can deliver the message twice.
-          timedOut.reject(new Error(
-            `Timed out waiting for the remote Fabric owner to acknowledge ${targetId}; ` +
-              "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
-          ));
-        }, timeoutMs + ackGraceMs);
-        pendingRequest!.timer.unref();
-      }
-      if (pendingRequest!.cancellationRequested) {
-        await this.#publishCancellation(commandId, pendingRequest!);
-      }
+      await Promise.race([publishing, acceptance.then(() => undefined)]);
       const acknowledged = await acceptance;
       if (!acknowledged.accepted) {
         throw new FabricControlRejection(
@@ -428,6 +565,19 @@ export class FabricControlPlane {
     }
   }
 
+  #timeoutPending(commandId: string): void {
+    const timedOut = this.#clearPending(commandId);
+    if (!timedOut) return;
+    void this.#publishCancellation(commandId, timedOut);
+    // Neither a live lease nor a missing ACK proves the handler did not run. Never replay.
+    timedOut.reject(new Error(
+      (timedOut.mirroredOwner
+        ? `Fabric mesh bridge to remote host ${timedOut.mirroredOwner.remoteHost} is not responding for ${timedOut.targetId}; `
+        : `Timed out waiting for the remote Fabric owner to acknowledge ${timedOut.targetId}; `) +
+        "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
+    ));
+  }
+
   #clearPending(commandId: string): PendingControlRequest | undefined {
     const pending = this.#pending.get(commandId);
     if (!pending) return undefined;
@@ -436,7 +586,41 @@ export class FabricControlPlane {
       pending.signal.removeEventListener("abort", pending.onAbort);
     }
     this.#pending.delete(commandId);
+    if (this.#mirrorWatchdog && ![...this.#pending.values()].some((request) => request.mirroredOwner)) {
+      clearInterval(this.#mirrorWatchdog);
+      this.#mirrorWatchdog = undefined;
+    }
     return pending;
+  }
+
+  #startMirrorWatchdog(): void {
+    if (this.#mirrorWatchdog) return;
+    // Independent of the async mesh drain: a locked write must not hide a lease lapse.
+    this.#mirrorWatchdog = setInterval(() => {
+      for (const [commandId, pending] of this.#pending) {
+        const captured = pending.mirroredOwner;
+        if (!captured) continue;
+        let current: PendingControlRequest["mirroredOwner"];
+        try {
+          current = this.options.readMirroredOwner?.(pending.ownerHostId, pending.ownerIdentityId, pending.targetId);
+        } catch {
+          // A failed read is not evidence of a lapse. The independent request timer stays armed.
+          continue;
+        }
+        // Never adopt a different link's label. Missing ownership cannot renew this lease.
+        if (current?.remoteHost === captured.remoteHost) captured.expiresAt = current.expiresAt;
+        if (captured.expiresAt > Date.now()) continue;
+        const lapsed = this.#clearPending(commandId);
+        if (!lapsed) continue;
+        void this.#publishCancellation(commandId, lapsed);
+        lapsed.reject(new Error(
+          `Fabric lease mirrored from remote host ${captured.remoteHost} lapsed for ${pending.targetId}; ` +
+            "the mesh bridge is down or the owner is unavailable; " +
+            "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
+        ));
+      }
+    }, this.#pollMs);
+    this.#mirrorWatchdog.unref();
   }
 
   async #publishCancellation(
@@ -447,23 +631,60 @@ export class FabricControlPlane {
       pending.cancellationRequested = true;
       return;
     }
-    const requestedAt = Date.now();
-    await this.mesh.publish({
+    if (pending.cancellationPublished) return;
+    pending.cancellationPublished = true;
+    const expiresAt = Date.now() + Math.max(CANCELLATION_RETENTION_MS, 2 * this.#ackTimeoutMs);
+    const cancelCommandId = randomUUID();
+    const cancellation = {
       topic: CONTROL_TOPIC,
       kind: "cancel",
       from: this.identity,
       to: pending.ownerHostId,
-      data: {
+      data: (committedAt: number): FabricControlCommand => ({
         version: 1,
-        commandId: randomUUID(),
+        commandId: cancelCommandId,
         targetId: pending.targetId,
         operation: "cancel",
         cancelCommandId: commandId,
         replyTo: this.options.hostId,
-        requestedAt,
-        deadlineAt: requestedAt + this.#ackTimeoutMs,
-      } satisfies FabricControlCommand,
-    }).catch(() => undefined);
+        ...(pending.destinationRemoteHost !== undefined
+          ? { destinationRemoteHost: pending.destinationRemoteHost } : {}),
+        requestedAt: committedAt,
+        deadlineAt: committedAt + Math.max(this.#ackTimeoutMs,
+          typeof pending.destinationRemoteHost === "string" ? this.#bridgeTimeoutMs : 0),
+      }),
+    };
+    await this.#backgroundCancellations.enqueue(() => {
+      if (Date.now() <= expiresAt) return this.mesh.publish(cancellation);
+      return undefined;
+    });
+  }
+
+  /** Reload: leave new commands unclaimed in the durable mesh log for the next runtime. */
+  pause(): void {
+    this.#paused = true;
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = undefined;
+  }
+
+  resume(): void {
+    if (this.#closed || !this.#paused) return;
+    this.#paused = false;
+    this.#timer = setInterval(() => void this.#backgroundPoll.run(() => this.#poll()), this.#pollMs);
+    this.#timer.unref();
+    void this.#backgroundPoll.run(() => this.#poll());
+  }
+
+  /** Join through outcome and ACK publication, not merely the host admission counter. */
+  async checkpointForRelease(): Promise<void> {
+    if (!this.#paused) throw new Error("Control release gate is not paused");
+    await this.#polling;
+    await Promise.all([...this.#activeHandlers]);
+    await this.#backgroundNotifications.checkpointForRelease();
+    await this.#backgroundCancellations.checkpointForRelease();
+    if (this.#activeCommands.size || this.#pending.size || this.#unpublished.size || this.#releasePublicationFailed) {
+      throw new Error("Control release has unsettled publication obligations");
+    }
   }
 
   async close(): Promise<void> {
@@ -471,7 +692,7 @@ export class FabricControlPlane {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
     await this.#polling?.catch(() => undefined);
-    await this.#drain().catch(() => undefined);
+    if (!this.#paused) await this.#drain().catch(() => undefined);
     this.#closed = true;
     this.#sharedClaims.clear();
     this.#unpublished.clear();
@@ -485,11 +706,12 @@ export class FabricControlPlane {
     await Promise.allSettled(cancellations);
     for (const active of this.#activeCommands.values()) active.controller.abort();
     await Promise.allSettled([...this.#activeHandlers]);
+    await this.#backgroundNotifications.close();
     this.#handler = undefined;
   }
 
   async #poll(): Promise<void> {
-    if (this.#closed || !this.options.enabled) return;
+    if (this.#closed || this.#paused || !this.options.enabled) return;
     if (this.#polling) return this.#polling;
     const operation = this.#drain();
     this.#polling = operation;
@@ -507,6 +729,7 @@ export class FabricControlPlane {
     while (true) {
       const tail = this.mesh.tail(this.#offset, 100);
       for (const event of tail.events) {
+        if (this.#paused) return;
         if (event.sequence <= this.#lastSequence) continue;
         // An event is consumed only once handled: a command that hit a lock timeout throws,
         // and the next poll reads this page again from it (smarty-dev#424). Each retry is
@@ -520,7 +743,7 @@ export class FabricControlPlane {
       this.#offset = tail.nextOffset;
       if (tail.events.length < 100) break;
     }
-    await this.#cleanupSeen(Date.now()).catch(() => undefined);
+    await this.#cleanupSeen(Date.now()).catch(rethrowMeshLockTimeout);
   }
 
   #acceptAcknowledgement(event: MeshEvent): void {
@@ -531,7 +754,14 @@ export class FabricControlPlane {
       event.data.version !== 1 ||
       event.data.targetId !== pending.targetId ||
       event.from.id !== pending.ownerIdentityId ||
-      !this.#bridgeMatches(pending.ownerHostId, event.data)
+      // A validated mirror's answer authority survives record withdrawal/replacement.
+      // Known native requests require an unstamped ACK, regardless of later metadata.
+      // Only unbound legacy requests use the mutable metadata selector.
+      !(pending.mirroredOwner
+        ? isObject(event.data.bridge) && event.data.bridge.from === pending.mirroredOwner.remoteHost
+        : pending.destinationRemoteHost === null
+          ? !Object.prototype.hasOwnProperty.call(event.data, "bridge")
+          : this.#bridgeMatches(pending.ownerHostId, event.data))
     ) {
       return;
     }
@@ -541,6 +771,7 @@ export class FabricControlPlane {
       ...(typeof event.data.messageId === "string" ? { messageId: event.data.messageId } : {}),
       ...queueDepthOf(event.data),
       ...coalescedOf(event.data),
+      ...triggeredOf(event.data),
       ...(Object.prototype.hasOwnProperty.call(event.data, "result")
         ? { result: event.data.result }
         : {}),
@@ -713,6 +944,7 @@ export class FabricControlPlane {
       claim.version,
       deadlineAt,
       event.sequence,
+      event.verification,
     );
     if (command.operation === "ask") {
       this.#activeHandlers.add(execution);
@@ -741,6 +973,7 @@ export class FabricControlPlane {
     claimVersion: number,
     deadlineAt: number,
     sequence: number,
+    verification: MeshEvent["verification"],
   ): Promise<void> {
     const controller = new AbortController();
     this.#activeCommands.set(command.commandId, {
@@ -761,7 +994,7 @@ export class FabricControlPlane {
         // this runtime holds the claim and the handler did not run.
         if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
         else acceptance = this.#handler
-          ? await this.#handler(command, from, controller.signal)
+          ? await this.#handler(command, from, controller.signal, verification)
           : { accepted: false, error: "Fabric owner has no control handler" };
       } catch (error) {
         acceptance = {
@@ -770,8 +1003,7 @@ export class FabricControlPlane {
         };
       }
       acceptance = this.#boundedAcceptance(acceptance);
-      try {
-        await this.#seen.put({
+      const saveOutcome = () => this.#seen.put({
           key,
           value: {
             format: 1,
@@ -785,22 +1017,39 @@ export class FabricControlPlane {
           identity: this.identity,
           ifVersion: claimVersion,
         });
+      try {
+        await saveOutcome();
       } catch (error) {
-        // A conflict means another owner holds this claim; a lock timeout wrote nothing, and
-        // the command has run, so its sender still gets the outcome.
+        this.#releasePublicationFailed = true;
+        // A conflict belongs to another owner; a timeout wrote nothing. Preserve the actual
+        // result under the original version fence and retry it without running the handler.
         if (!isLockTimeout(error)) return;
+        void this.#backgroundNotifications.retry(() => {
+          if (Date.now() <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) return saveOutcome();
+          return undefined;
+        }, error);
+      }
+      if (command.operation === "ask") {
+        // Detached asks have already left the poll cursor. Retain just their outcome, never
+        // execute the handler again, and retry the ACK on the owned notification tick.
+        await this.#backgroundNotifications.enqueue(() => {
+          if (Date.now() <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) {
+            return this.#publishAcknowledgement(command, acceptance);
+          }
+          return undefined;
+        });
+        return;
       }
       try {
         await this.#publishAcknowledgement(command, acceptance);
       } catch (error) {
-        // An "ask" runs detached from the drain, which has consumed it: nothing retries it, so
-        // its outcome is not kept (its sender's result wait times out instead).
-        if (command.operation !== "ask") {
-          this.#unpublished.set(command.commandId, {
-            acceptance,
-            expiresAt: deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4,
-          });
-        }
+        this.#releasePublicationFailed = true;
+        // Non-detached commands remain at the poll cursor. Keep the actual outcome for
+        // its next pass, rather than executing a handler twice after an ACK lock timeout.
+        this.#unpublished.set(command.commandId, {
+          acceptance,
+          expiresAt: deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4,
+        });
         throw error;
       }
     } finally {
@@ -920,6 +1169,7 @@ export class FabricControlPlane {
           ...(acceptance.messageId ? { messageId: acceptance.messageId } : {}),
           ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
           ...coalescedOf(acceptance as unknown as Record<string, unknown>),
+          ...triggeredOf(acceptance as unknown as Record<string, unknown>),
           ...(Object.prototype.hasOwnProperty.call(acceptance, "result")
             ? { result: acceptance.result }
             : {}),

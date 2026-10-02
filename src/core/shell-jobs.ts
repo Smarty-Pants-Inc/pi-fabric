@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
-import { closeScratch, createScratch } from "../storage/scratch.js";
-import { tmpdir } from "node:os";
+import { closeScratch, processAlive, ScratchScope } from "../storage/scratch.js";
+import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
@@ -110,6 +110,8 @@ export interface FabricShellJobHandle {
   spill(): void;
   whenSpill(): Promise<void>;
   finish(exitCode?: number | null, footer?: string): Promise<void>;
+  operationStarted(): void;
+  operationExited(): Promise<void>;
 }
 
 class FabricShellJob implements FabricShellJobHandle {
@@ -123,6 +125,8 @@ class FabricShellJob implements FabricShellJobHandle {
   logPath?: string;
   spilled = false;
   finished = false;
+  /** The "finished" event went out; finish() sets finished before its awaits (smarty-dev#2216). */
+  announced = false;
   spilledAt?: number;
   finishedAt?: number;
   exitCode?: number | null;
@@ -138,16 +142,18 @@ class FabricShellJob implements FabricShellJobHandle {
   #monitor: ShellMonitor | undefined;
   #deadline: ReturnType<typeof setTimeout> | undefined;
   #timedOut = false;
+  #finishPromise: Promise<void> | undefined;
+  #operationPending = false;
   lastOutputAt?: number;
   lastEvent?: ShellMonitorBatch & { at: number };
   eventCount = 0;
   unread = false;
 
-  constructor(tool: PiShellToolName, command: string, readonly onChange: (type: FabricShellJobEvent["type"], output?: string) => void, tempRoot: string, readonly options: FabricShellJobOptions = {}) {
+  constructor(tool: PiShellToolName, command: string, readonly onChange: (type: FabricShellJobEvent["type"], output?: string) => void, tempRoot: string, readonly scratch: ScratchScope, readonly options: FabricShellJobOptions = {}) {
     this.id = randomUUID();
     this.tool = tool;
     this.command = command;
-    this.#directory = createScratch("shell", tempRoot);
+    this.#directory = scratch.create("shell", tempRoot);
     this.pidPath = path.join(this.#directory, "child.pid");
     if (options.monitor) {
       this.#monitor = new ShellMonitor(options.monitor, (batch) => {
@@ -317,8 +323,29 @@ class FabricShellJob implements FabricShellJobHandle {
     });
   }
 
-  async finish(exitCode?: number | null, footer?: string): Promise<void> {
-    if (this.finished) return;
+  /** Unknown files veto every scratch sweep, even after this owner dies. */
+  operationStarted(): void {
+    if (this.#operationPending) return;
+    fs.writeFileSync(path.join(this.#directory, "operation.pending"), "Exit not confirmed\n", { mode: 0o600, flag: "wx" });
+    this.#operationPending = true;
+  }
+
+  /** Only the underlying operations API's successful exit result is cleanup authority. */
+  async operationExited(): Promise<void> {
+    try { await unlink(path.join(this.#directory, "operation.pending")); }
+    catch { return; } // Housekeeping failure retains the veto, never changes a shell result.
+    this.#operationPending = false;
+    if (this.finished) {
+      await this.#finishPromise;
+      await this.#cleanup();
+    }
+  }
+
+  finish(exitCode?: number | null, footer?: string): Promise<void> {
+    return this.#finishPromise ??= this.#finish(exitCode, footer);
+  }
+
+  async #finish(exitCode?: number | null, footer?: string): Promise<void> {
     // A fast exit can beat the provider's persistLog continuation after spill.
     const persistence = this.spilled && !this.logPath ? this.persistLog() : undefined;
     const output = this.snapshotText(2000);
@@ -337,10 +364,27 @@ class FabricShellJob implements FabricShellJobHandle {
     this.#tail = Buffer.alloc(0);
     this.#omitted = false;
     if (!this.#spill.signal.aborted) this.#spill.abort();
-    await unlink(this.pidPath).catch(() => undefined);
-    if (this.logPath) closeScratch(this.#directory);
-    else { try { fs.rmSync(this.#directory, { recursive: true, force: true }); } catch {} }
+    await this.#cleanup();
+    this.announced = true;
     this.onChange("finished", [output, footer?.slice(-1000)].filter(Boolean).join("\n"));
+  }
+
+  async #cleanup(): Promise<void> {
+    // A provider can finish/abort while launch or the real operation is still unresolved.
+    // Do not close the owner marker or remove any durable liveness evidence in that case.
+    if (this.#operationPending) return;
+    let childAlive = this.pid !== undefined && processAlive(this.pid);
+    try {
+      // The asynchronous PID cache is not authority: the child may have written already.
+      childAlive ||= processAlive(Number(fs.readFileSync(this.pidPath, "utf8").trim()));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+    }
+    if (!childAlive) await unlink(this.pidPath).catch(() => undefined);
+    if (this.logPath || childAlive) closeScratch(this.#directory);
+    else {
+      try { fs.rmSync(this.#directory, { recursive: true, force: true }); this.scratch.forget(this.#directory); } catch {}
+    }
   }
 
   async outputText(maxBytes = 8000): Promise<string> {
@@ -393,14 +437,19 @@ export const trackShellOperations = (
   job: FabricShellJobHandle,
   tool: PiShellToolName,
 ): BashOperations => ({
-  exec: (command, cwd, options) =>
-    inner.exec(testPidDelay(tool) + wrapShellCommandForPid(command, job.pidPath, tool), cwd, {
+  exec: async (command, cwd, options) => {
+    job.operationStarted();
+    const result = await inner.exec(testPidDelay(tool) + wrapShellCommandForPid(command, job.pidPath, tool), cwd, {
       ...options,
       onData: (data) => {
         job.append(data);
         options.onData(data);
       },
-    }).then(result => { job.exitCode = result.exitCode; return result; }),
+    });
+    job.exitCode = result.exitCode;
+    await job.operationExited();
+    return result;
+  },
 });
 
 export class FabricShellJobStore {
@@ -421,10 +470,15 @@ export class FabricShellJobStore {
     }
   }
 
-  constructor(readonly tempRoot = tmpdir()) {}
+  readonly #scratch = new ScratchScope();
+  #closePromise: Promise<void> | undefined;
+
+  constructor(readonly tempRoot = fabricDataRoot()) {}
 
   #prune(): void {
-    const completed = [...this.#jobs.values()].filter((job) => job.finishedAt !== undefined);
+    // finishedAt precedes async log/PID cleanup. Only announced jobs are safe to evict:
+    // otherwise retention pressure can remove the last reload hold before the inbox sees it.
+    const completed = [...this.#jobs.values()].filter((job) => job.announced && job.finishedAt !== undefined);
     completed.sort((a, b) => (a.finishedAt ?? 0) - (b.finishedAt ?? 0));
     for (const [index, job] of completed.entries()) {
       if (index < completed.length - SHELL_COMPLETED_HANDLES || Date.now() - (job.finishedAt ?? 0) >= SHELL_COMPLETED_MAX_AGE_MS) this.#jobs.delete(job.id);
@@ -437,7 +491,7 @@ export class FabricShellJobStore {
     const job = new FabricShellJob(tool, command, (type, output) => {
       this.#emit({ type, job: job.info(), ...(output ? { output } : {}) });
       if (type === "finished") this.#prune();
-    }, this.tempRoot, options);
+    }, this.tempRoot, this.#scratch, options);
     this.#jobs.set(job.id, job);
     this.#emit({ type: "started", job: job.info() });
     return job;
@@ -503,6 +557,11 @@ export class FabricShellJobStore {
     return [...this.#jobs.values()].filter((job) => !job.finished);
   }
 
+  /** Jobs whose "finished" event is not sent yet: a reload would drop that notice (smarty-dev#2216). */
+  unannounced(): number {
+    return [...this.#jobs.values()].filter((job) => !job.announced).length;
+  }
+
   spillWaiting(): number {
     const jobs = this.waiting();
     for (const job of jobs) job.spill();
@@ -517,15 +576,20 @@ export class FabricShellJobStore {
     return jobs.length;
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
     this.#closed = true;
+    return this.#closePromise ??= this.#close();
+  }
+
+  async #close(): Promise<void> {
     this.#closing.abort(new Error("Shell job store is closed"));
     this.#listeners.clear();
     const live = this.live();
     for (const job of live) {
       if (!job.abort.signal.aborted) job.abort.abort(new Error("Fabric session ended"));
     }
-    await Promise.allSettled(live.map((job) => job.finish(null, "\n\n[Process ended: session closed]\n")));
+    await Promise.allSettled([...this.#jobs.values()].map((job) => job.finish(null, "\n\n[Process ended: session closed]\n")));
+    await this.#scratch.close();
     this.#jobs.clear();
   }
 }
@@ -571,6 +635,8 @@ export const raceShellHang = async <T>(options: {
     void job.whenSpill().then(finish);
   });
 
+  // Hold before invoking the tool: validation/middleware may delay the actual spawn.
+  job.operationStarted();
   const execute = options.execute(job.abort.signal).then(
     (value) => ({ status: "done" as const, value }),
     (error) => ({ status: "error" as const, error }),

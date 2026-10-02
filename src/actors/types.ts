@@ -1,3 +1,4 @@
+import type { FabricPrincipal } from "../fabric-provenance.js";
 import type { ExtensionEvent } from "@earendil-works/pi-coding-agent";
 import type { FabricAgentRunner, FabricAgentTransport, FabricPythonRuntime } from "../config.js";
 import type { FabricThinking } from "../thinking.js";
@@ -127,6 +128,12 @@ export interface FabricActorRunBinding {
   thinking?: FabricThinking;
 }
 
+/** Raw per-call fields from the actor's own root; omitted fields stay owner-defaulted. */
+export interface FabricActorBindingProvenance {
+  kind: "owner-defaults";
+  rootId: string;
+}
+
 /** The reading session's own model/thinking overlay; it pins that session's activations. */
 interface FabricActorBindingView extends FabricActorRunBinding {
   scope: "session";
@@ -226,6 +233,8 @@ export interface FabricActorRequest {
   timeoutMs?: number;
   /** Unix niceness 0-19 for this actor's runs; only raises agents.nice. */
   nice?: number;
+  /** Default timeout (s) for a bash call without one in this actor's runs; 0 = none. Default 600. */
+  bashTimeoutSeconds?: number;
   /**
    * Fabric capability for the actor. Defaults to true (today's behavior: a Pi
    * actor is recursively Fabric-equipped with the host-required fabric_exec
@@ -298,10 +307,25 @@ export interface FabricActorInfo {
   createdAt: number;
   updatedAt: number;
   lastRunId?: string;
+  /** The run in flight now, and how long it has run (smarty-dev#2184 item 8). */
+  inFlightRun?: { id: string; startedAt: number; ageS: number };
+  /** A removal that returned at once and finishes when the in-flight run ends (smarty-dev#2184). */
+  removal?: { requestedAt: number; runId?: string; runStartedAt?: number; state: string };
   lastError?: string;
   sessionFile?: string;
   logDir?: string;
 }
+
+/**
+ * Provider read view: a non-owned actor's execution state comes only from its live owner.
+ * Unknown means no fresh owner state; omitted counts are unavailable, not zero.
+ * FabricActorStatus stays closed for ManagedActor execution and registry snapshots.
+ */
+export type FabricActorReadInfo = Omit<FabricActorInfo, "status" | "queued" | "messages"> & {
+  status: FabricActorStatus | "unknown";
+  queued?: number;
+  messages?: number;
+};
 
 export interface FabricActorLog {
   actorId: string;
@@ -311,6 +335,8 @@ export interface FabricActorLog {
   session: FabricLogLine[];
   sessionHasMore: boolean;
   sessionBefore?: number;
+  /** Bind sessionBefore using beforeGeneration with type: "session". */
+  sessionGeneration?: string;
   run?: {
     runId: string;
     eventsFile: string;
@@ -318,11 +344,14 @@ export interface FabricActorLog {
     events: FabricLogLine[];
     hasMore: boolean;
     before?: number;
+    /** Bind before using beforeGeneration with type: "run". */
+    generation?: string;
   };
   retainedRuns: string[];
 }
 
 export interface FabricActorMessage {
+  principal?: FabricPrincipal | undefined;
   id: string;
   actorId: string;
   actorName: string;

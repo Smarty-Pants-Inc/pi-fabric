@@ -1,11 +1,27 @@
 #!/usr/bin/env node
 
+import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
+import {
+  RESIDENT_HANDOVER_ABI, HANDOVER_DRAIN_MS, exactResidentProcess, assertAutomaticReleaseRecovery,
+  residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec,
+  handoverPath, handoverCustodyPath, handoverOutcomePath, handoverActive,
+  readHandoverJson, writeHandoverState, writeLaunchSnapshot, mainGenerationCurrent, decideHandover,
+  type ResidentLaunchSpec, type ResidentLauncherIdentity, type ResidentHandoverPlan, type ResidentHandoverState,
+} from "./handover.js";
+
+interface ResidentHostLaunchContext {
+  launcher: ResidentLauncherIdentity;
+  spec: ResidentLaunchSpec;
+  attempt?: { id: string; kind: "target" | "fallback" };
+}
+import { lockFile, FileLockBusy } from "./file-lock.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { FabricModelDeniedError } from "../core/model-policy.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
 import { resolvePiModel, type PiModelRegistryView } from "../core/model-refresh.js";
 import {
@@ -15,17 +31,31 @@ import {
 import { ActorDirectory } from "../actors/directory.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
+import type { AgentRunRecord } from "../agents/types.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mesh/store.js";
-import { FabricControlPlane, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
+import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
   RESIDENT_HOST_FORMAT,
+  RESIDENT_ACTOR_COMMAND_FORMAT,
+  ResidentActorAuthorizationError,
+  ResidentCommandUnsupportedError,
+  RESIDENT_COMMANDS,
+  isResidentCommandOperation,
+  assertResidentActorMain,
+  assertResidentActorToolCeiling,
+  type ResidentActorCaller,
+  commitResidentRequest,
+  readResidentRequestDecision,
   residentDeliveryPrefix,
   residentHostId,
+  residentRemovalsPath,
   residentResultPath,
   type ResidentAgentMetadata,
   type ResidentCommand,
@@ -35,13 +65,92 @@ import {
   type ResidentHostOwner,
 } from "./protocol.js";
 import { deliveryRoot, projectOf } from "../topology/project-identity.js";
+import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import { canRemoveTerminalRun } from "../storage/retention.js";
+import { ownedStat } from "../storage/scratch.js";
+
+export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+
+/** A worker can finish after its host dies, leaving status.json as the only completion copy. */
+const hasPreservedResidentResult = (runsRoot: string, id: string): boolean => {
+  const residencyRoot = path.dirname(runsRoot);
+  const metadataPath = path.join(residencyRoot, "agents", `${id}.json`);
+  // Only proven absence permits ordinary actor/untracked collection. Unreadable or unsafe
+  // metadata may still describe a public task, so uncertainty keeps its run directory.
+  try { fs.lstatSync(metadataPath); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+  const readOwnedJson = <T>(file: string): T | undefined => {
+    const stat = ownedStat(file);
+    if (!stat?.isFile() || stat.size > 1024 * 1024) return undefined;
+    return readJson<T>(file);
+  };
+  const time = (value: unknown): value is number =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0;
+  const metadata = readOwnedJson<ResidentAgentMetadata>(metadataPath);
+  if (metadata?.format !== RESIDENT_HOST_FORMAT || metadata.id !== id ||
+      typeof metadata.rootId !== "string" || metadata.handle?.id !== id ||
+      metadata.handle.residency !== "durable" || metadata.handle.actorId !== undefined ||
+      typeof metadata.handle.name !== "string" || typeof metadata.handle.cwd !== "string" ||
+      !["pi", "claude", "veda"].includes(metadata.handle.runner) ||
+      !["process", "tmux", "screen", "localterm", "herdr"].includes(metadata.handle.transport) ||
+      !["queued", "running", "completed", "failed", "stopped", "timed_out"].includes(metadata.handle.status) ||
+      !time(metadata.createdAt) || !time(metadata.updatedAt) ||
+      typeof metadata.runDirectory !== "string" ||
+      path.resolve(metadata.runDirectory) !== path.resolve(runsRoot, id)) return false;
+  const saved = readOwnedJson<AgentRunRecord>(residentResultPath(residencyRoot, id));
+  // Validate the terminal record, not just a matching id/status stub: deleting the run must
+  // leave a usable result (including its text) for client status/wait across restarts.
+  return !!saved && saved.id === id && saved.actorId === undefined &&
+    ["completed", "failed", "stopped", "timed_out"].includes(saved.status) &&
+    typeof saved.name === "string" && typeof saved.task === "string" &&
+    typeof saved.cwd === "string" && typeof saved.text === "string" &&
+    ["pi", "claude", "veda"].includes(saved.runner) &&
+    ["process", "tmux", "screen", "localterm", "herdr"].includes(saved.transport) &&
+    time(saved.startedAt) && time(saved.updatedAt) &&
+    (saved.finishedAt === undefined || time(saved.finishedAt)) &&
+    time(saved.turns) && time(saved.toolCalls) &&
+    (saved.error === undefined || typeof saved.error === "string") &&
+    !!saved.usage && [saved.usage.input, saved.usage.output, saved.usage.cacheRead,
+      saved.usage.cacheWrite, saved.usage.cost].every(time);
+};
+
+/** Called under the host fence, before constructing the manager: every existing run is untracked. */
+export const sweepResidentRuns = (runsRoot: string, now = Date.now(), budgetMs = 100): string[] => {
+  const removed: string[] = [];
+  if (!ownedStat(runsRoot)?.isDirectory()) return removed;
+  const started = performance.now();
+  const expired = () => performance.now() - started >= budgetMs;
+  let directory: fs.Dir;
+  try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
+  try {
+    let entry: fs.Dirent | null;
+    while (!expired() && (entry = directory.readSync())) {
+      if (!entry.isDirectory()) continue;
+      const run = path.join(runsRoot, entry.name);
+      const stat = ownedStat(run);
+      if (!stat?.isDirectory() || now - stat.mtimeMs <= RESIDENT_RUN_RETENTION_MS) continue;
+      if (!canRemoveTerminalRun(run, expired) ||
+          !hasPreservedResidentResult(runsRoot, entry.name) || expired()) continue;
+      try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
+    }
+  } finally { directory.closeSync(); }
+  return removed;
+};
 
 const REQUEST_POLL_MS = 50;
 const IDLE_EXIT_MS = 30_000;
 const COMPLETION_MAX_CHARS = 8_000;
+const HOST_CLOSING_RETRY = "Fabric resident host is closing; retry";
 
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Test-only native-process proof seam. Unset/invalid values are inert; never a startup hook. */
+const testResidentRequestDelay = async (stage: "before_commit" | "after_commit"): Promise<void> => {
+  if (process.env.PI_FABRIC_TEST_RESIDENT_DELAY_STAGE !== stage) return;
+  const ms = Number(process.env.PI_FABRIC_TEST_RESIDENT_DELAY_MS);
+  if (Number.isInteger(ms) && ms > 0 && ms <= 10_000) await delay(ms);
+};
 
 const atomicWrite = (filePath: string, value: unknown): void => {
   writeJsonAtomic(filePath, value, { space: 2 });
@@ -58,19 +167,7 @@ const readJson = <T>(filePath: string): T | undefined => {
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
-const processAlive = (pid: number): boolean => {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // On Windows, EPERM means the process exists but cannot be opened for
-    // signaling; only ESRCH (or other errors) mean it is gone.
-    return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-};
-
-class ResidentHostAlreadyRunning extends Error {}
+export class ResidentHostAlreadyRunning extends Error {}
 
 const parseResidentHostConfigPath = (argv: readonly string[]): string => {
   const index = argv.indexOf("--config");
@@ -118,15 +215,17 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
   return config as ResidentHostConfig;
 };
 
-class ResidentHost {
+export class ResidentHost {
   readonly hostId: string;
   readonly identity: MeshIdentity;
-  readonly mesh: MeshStore;
-  readonly participants: ParticipantDirectory;
-  readonly control: FabricControlPlane;
-  readonly agents: AgentManager;
-  readonly actors: ActorDirectory;
-  readonly lifecycle: LifecycleBroker;
+  mesh!: MeshStore;
+  participants!: ParticipantDirectory;
+  control!: FabricControlPlane;
+  agents!: AgentManager;
+  actors!: ActorDirectory;
+  lifecycle!: LifecycleBroker;
+  #lockFd: number | undefined;
+  #fallbackLock = false;
   readonly #ownerPath: string;
   readonly #lockPath: string;
   readonly #errorPath: string;
@@ -134,19 +233,34 @@ class ResidentHost {
   readonly #processingPath: string;
   readonly #responsesPath: string;
   readonly #agentsPath: string;
-  readonly #deliveryPrefix: string;
+  readonly #removalsPath: string;
+  readonly #deliveryOutboxPath: string;
+  readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery");
+  #flushingDeliveries: Promise<unknown> | undefined;
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
   #closed = false;
+  readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
+  readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
   #idleSince = Date.now();
+  #admissions = 0;
+  #handover: ResidentHandoverPlan | undefined;
+  #advancingRelease = false;
+  #staged = false;
+  #publicationFailed = false;
+  #reloadEvent: Promise<unknown> | undefined;
+  readonly #publications = new Set<Promise<unknown>>();
+  #effectiveConfig: (() => ResidentHostConfig) | undefined;
 
   constructor(
     readonly config: ResidentHostConfig,
     readonly onIdle: () => void = () => {},
-    modelRegistry?: PiModelRegistryView,
+    private readonly modelRegistry?: PiModelRegistryView,
+    readonly launch?: ResidentHostLaunchContext,
   ) {
+    this.#staged = !!launch?.attempt;
     this.hostId = residentHostId(config.rootId);
     this.identity = { id: this.hostId, name: "Fabric resident host", kind: "agent" };
     this.#ownerPath = path.join(config.residencyRoot, "owner.json");
@@ -156,9 +270,14 @@ class ResidentHost {
     this.#processingPath = path.join(config.residencyRoot, "processing");
     this.#responsesPath = path.join(config.residencyRoot, "responses");
     this.#agentsPath = path.join(config.residencyRoot, "agents");
-    this.#deliveryPrefix = residentDeliveryPrefix(config.rootId);
+    this.#removalsPath = residentRemovalsPath(config.residencyRoot);
+    this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
+  }
+
+  #initialize(): void {
+    const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS });
+      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       hostId: this.hostId,
@@ -170,6 +289,9 @@ class ResidentHost {
       enabled: true,
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
+      bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
+      readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
+        this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
     if (config.agents.budgetUsd > 0) {
       const budgetFile = path.join(config.residencyRoot, "budget.jsonl");
@@ -182,8 +304,20 @@ class ResidentHost {
       });
     }
     const guidanceConfigPath = path.join(config.residencyRoot, "config.json");
-    const currentConfig = (): Partial<ResidentHostConfig> =>
-      readJson<Partial<ResidentHostConfig>>(guidanceConfigPath) ?? config;
+    const currentConfig = (): Partial<ResidentHostConfig> => {
+      const desired = readJson<Partial<ResidentHostConfig>>(guidanceConfigPath);
+      // Desired B/C is NOT an effective A overlay or an A rollback snapshot.
+      return desired?.fabricExtensionPath === config.fabricExtensionPath && desired.workerPath === config.workerPath &&
+        desired.rootId === config.rootId && desired.sessionId === config.sessionId ? desired : config;
+    };
+    this.#effectiveConfig = () => {
+      const overlay = currentConfig();
+      return { ...config,
+        ...(overlay.piModels ? { piModels: overlay.piModels } : {}),
+        ...(overlay.modelGuidance ? { modelGuidance: overlay.modelGuidance } : {}),
+        ...(overlay.kernel ? { kernel: overlay.kernel } : {}),
+        ...(overlay.pythonRuntime ? { pythonRuntime: overlay.pythonRuntime } : {}) };
+    };
     const currentModelGuidance = () =>
       parseFabricOwnedModelGuidance(currentConfig().modelGuidance ?? config.modelGuidance);
     // The session's visible models (synced at each ensureHost) plus, after a miss, this host's
@@ -208,6 +342,7 @@ class ResidentHost {
         aliases: normalizeModelAliases(state?.aliases),
         defaultModel: state?.defaultModel,
         snapshot,
+        policy: config.agents,
       });
       return `${resolved.provider}/${resolved.id}`;
     };
@@ -237,26 +372,27 @@ class ResidentHost {
           includeSlots: false,
         }).appendText || undefined;
       },
-      onLifecycle: (event) => void this.lifecycle?.publish(event).catch(() => undefined),
+      onLifecycle: (event) => { if (this.lifecycle) this.#trackPublication(this.lifecycle.publishBackground(event)); },
       onSettled: (result) => {
         // Only public durable task runs: actor activations are cleaned by their actor (review/astra on #136).
         if (result.actorId) return;
         const file = residentResultPath(config.residencyRoot, result.id);
         fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-        atomicWrite(file, result);
+        try { writeJsonAtomic(file, result, { durable: true }); }
+        catch (error) { this.#publicationFailed = true; throw error; }
       },
       onBackgroundComplete: (result) => {
         if (!config.agents.notifyOnComplete) return;
         const durationMs = Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt);
         const summary = (result.text || result.error || "no result").slice(0, COMPLETION_MAX_CHARS);
-        void this.#queueDelivery(
+        this.#trackPublication(this.#queueDelivery(
           { id: result.id, name: result.name, kind: "agent" },
           `Fabric agent ${result.id.slice(0, 8)} ${result.status} after ${Math.round(durationMs / 1_000)}s: ${summary}`,
           "followUp",
           true,
           result,
           result.id,
-        ).catch(() => undefined);
+        ));
       },
     });
     const canManageActor = (id: string): boolean | undefined => {
@@ -280,7 +416,7 @@ class ResidentHost {
         if (!message.text) return;
         const mode = delivery === "steer" ? "steer" : "followUp";
         const triggers = delivery === "nextTurn" ? false : triggerTurn;
-        void this.#queueDelivery(
+        this.#trackPublication(this.#queueDelivery(
           { id: actor.id, name: actor.name, kind: "actor" },
           message.text,
           mode,
@@ -293,9 +429,11 @@ class ResidentHost {
             this.participants.list({ scope: "project", kinds: ["root"] }),
             actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd)),
           ),
-        ).catch(() => undefined);
+          message.source === "fabric-host" ? undefined : message.principal,
+        ));
       },
       {
+        releasePaused: this.#staged,
         persistent: true,
         canManageActor,
         lineageAlive,
@@ -326,81 +464,128 @@ class ResidentHost {
 
   async start(): Promise<void> {
     if (this.#started) return;
-    this.#acquireLock();
+    await this.#acquireLock();
     this.#started = true;
-    fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });
-    this.#recoverInterruptedRequests();
-    const firstSeenAgents = new Map<string, number>();
-    this.participants.registerSource(() =>
-      agentParticipantRecords(
-        this.agents.listForUi(),
-        this.config.rootId,
-        this.hostId,
-        this.identity.id,
-        this.config.rootId,
-        firstSeenAgents,
-      ),
-    );
-    this.participants.registerSource(() =>
-      this.actors.listOwned().map((actor) =>
-        actorParticipantRecord(
-          actor,
+    try {
+      if (!this.config.agents.retainRuns) sweepResidentRuns(path.join(this.config.residencyRoot, "runs"));
+      this.#initialize();
+      fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });
+      this.#recoverInterruptedRequests();
+      const firstSeenAgents = new Map<string, number>();
+      this.participants.registerSource(() =>
+        agentParticipantRecords(
+          this.agents.listForUi(),
           this.config.rootId,
           this.hostId,
           this.identity.id,
           this.config.rootId,
+          firstSeenAgents,
         ),
-      ),
-    );
-    this.agents.subscribeUi(() => this.participants.scheduleRefresh());
-    this.actors.subscribe(() => this.participants.scheduleRefresh());
-    this.control.start((command, from, signal) =>
-      this.#acceptControl(command, from, signal));
-    await this.participants.start().catch(() => undefined);
-    this.lifecycle.start();
-    this.#requestTimer = setInterval(
-      () => void this.#pollRequests().catch(() => undefined),
-      REQUEST_POLL_MS,
-    );
-    const now = Date.now();
-    const owner: ResidentHostOwner = {
-      format: RESIDENT_HOST_FORMAT,
-      hostId: this.hostId,
-      pid: process.pid,
-      token: this.#token,
-      startedAt: now,
-      readyAt: now,
-    };
-    atomicWrite(this.#ownerPath, owner);
-    fs.rmSync(this.#errorPath, { force: true });
-    await this.#pollRequests();
+      );
+      this.participants.registerSource(() =>
+        this.actors.listOwned().map((actor) =>
+          actorParticipantRecord(
+            actor,
+            this.config.rootId,
+            this.hostId,
+            this.identity.id,
+            this.config.rootId,
+          ),
+        ),
+      );
+      this.agents.subscribeUi(() => this.participants.scheduleRefresh());
+      this.actors.subscribe(() => this.participants.scheduleRefresh());
+      this.control.start((command, from, signal, verification) =>
+        this.#acceptControl(command, from, signal, verification));
+      if (this.#staged) this.control.pause();
+      await this.participants.start().catch(() => undefined);
+      this.lifecycle.start();
+      if (this.#staged) {
+        this.lifecycle.pause();
+        await this.#probeWorkerStartup();
+      }
+      this.#requestTimer = setInterval(
+        () => {
+          void this.#backgroundRequests.run(() => this.#pollRequests());
+          void this.#retryDeliveries();
+        },
+        REQUEST_POLL_MS,
+      );
+      const now = Date.now();
+      const owner: ResidentHostOwner = {
+        format: RESIDENT_HOST_FORMAT,
+        hostId: this.hostId,
+        pid: process.pid,
+        processStartTime: processStartTime(process.pid),
+        token: this.#token,
+        startedAt: now,
+        readyAt: now,
+        commands: RESIDENT_COMMANDS,
+        requestFence: 1,
+        ...(this.launch ? { releaseRoot: this.launch.spec.releaseRoot, configDigest: this.launch.spec.digest,
+          handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
+          ...(this.launch.attempt ? { attempt: this.launch.attempt } : {}) } : {}),
+      };
+      atomicWrite(this.#ownerPath, owner);
+      fs.rmSync(this.#errorPath, { force: true });
+      // Removals a previous host accepted: their runs ended with it.
+      if (!this.#staged) {
+      void this.#backgroundDeliveries.enqueue(async () => {
+        await this.actors.finishPendingRemovals();
+        this.#writeRemovals();
+      });
+      void this.#retryDeliveries();
+      }
+      await this.#pollRequests();
+    } catch (error) {
+      await this.close();
+      throw error;
+    }
   }
 
   async close(): Promise<void> {
-    if (this.#closed) return;
+    if (this.#closed || !this.#started) return;
     this.#closed = true;
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
-    while (this.#pollingRequests) await delay(10);
-    await this.participants.quiesce().catch(() => undefined);
-    await this.lifecycle.close().catch(() => undefined);
+    // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
+    const actorsClosed = this.actors?.close();
+    while (this.#pollingRequests || this.#admissions) await delay(10);
+    await this.participants?.quiesce().catch(() => undefined);
+    await this.lifecycle?.close().catch(() => undefined);
     try {
-      await closeWithActors(this.actors, () => this.control.close().catch(() => undefined));
+      await closeWithActors({ close: () => actorsClosed }, () => this.control?.close().catch(() => undefined));
     } finally {
-      await this.agents.close();
-      await this.participants.close().catch(() => undefined);
-      this.#releaseLock();
+      try {
+        try {
+          await this.agents?.close();
+        } finally {
+          await this.#backgroundDeliveries.close();
+          await this.#flushingDeliveries;
+          await this.participants?.close().catch(() => undefined);
+        }
+      } finally { this.#releaseLock(); }
     }
   }
 
   async #acceptControl(
     command: FabricControlCommand,
-    _from: MeshIdentity,
+    from: MeshIdentity,
     signal?: AbortSignal,
+    verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
+    if (this.#closed || this.#staged || this.#handover) {
+      return { accepted: false, error: HOST_CLOSING_RETRY };
+    }
+    this.#admissions++;
+    try { return await this.#handleControl(command, from, signal, verification); }
+    finally { this.#admissions--; }
+  }
+
+  async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal, verification?: "mesh" | "bridge"): Promise<FabricControlAcceptance> {
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
     }
@@ -415,6 +600,7 @@ class ResidentHost {
         }
       }
       try {
+        if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
         if (!this.actors.owns(command.targetId)) {
           return { accepted: false, error: `Resident host does not own ${command.targetId}` };
         }
@@ -425,6 +611,8 @@ class ResidentHost {
         return { accepted: false, error: errorMessage(error) };
       }
     }
+    const provenance = from && (verification === "mesh" || verification === "bridge")
+      ? fabricTurnProvenance(from, command.operation === "steer" ? "steer" : "followUp", verification, command.principal) : undefined;
     const message = command.message?.trim();
     if (!message) return { accepted: false, error: "Fabric control message must not be empty" };
     if (command.operation === "ask") {
@@ -437,7 +625,8 @@ class ResidentHost {
           message,
           command.data,
           signal,
-          command.binding !== undefined ? { binding: command.binding } : {},
+          { provenance, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+            this.participants.get(from.id)?.rootId) },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -447,8 +636,8 @@ class ResidentHost {
     try {
       this.agents.status(command.targetId);
       const result = command.operation === "steer"
-        ? this.agents.steer(command.targetId, message, command.data)
-        : this.agents.followUp(command.targetId, message, command.data);
+        ? this.agents.steer(command.targetId, message, command.data, provenance)
+        : this.agents.followUp(command.targetId, message, command.data, provenance);
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
@@ -459,11 +648,12 @@ class ResidentHost {
       if (!this.actors.owns(command.targetId)) {
         return { accepted: false, error: `Resident host does not own ${command.targetId}` };
       }
-      const binding = await this.actors.resolveActivationBinding(
-        command.targetId,
-        command.binding !== undefined ? { binding: command.binding } : {},
-      );
-      const result = this.actors.tell(command.targetId, message, command.data, { binding });
+      const options = controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+        this.participants.get(from.id)?.rootId);
+      // Validate now without turning the resolved owner defaults into per-call overrides.
+      await this.actors.resolveActivationBinding(command.targetId, options);
+      if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
+      const result = this.actors.tell(command.targetId, message, command.data, { provenance, ...options });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       return { accepted: false, error: errorMessage(error) };
@@ -474,6 +664,13 @@ class ResidentHost {
     subscription: FabricLifecycleSubscription,
     event: FabricLifecycleEvent,
   ): Promise<void> {
+    if (this.#closed || this.#staged || this.#handover) throw new Error(HOST_CLOSING_RETRY);
+    this.#admissions++;
+    try { await this.#handleLifecycle(subscription, event); }
+    finally { this.#admissions--; }
+  }
+
+  async #handleLifecycle(subscription: FabricLifecycleSubscription, event: FabricLifecycleEvent): Promise<void> {
     const message = `Fabric lifecycle ${event.event} from ${event.source.name} (${event.source.id})${event.status ? ` with status ${event.status}` : ""}.`;
     if (subscription.to === this.config.rootId) {
       await this.#queueDelivery(
@@ -509,6 +706,7 @@ class ResidentHost {
       subscription.delivery,
       { message, data: event, triggerTurn: subscription.triggerTurn },
       target.ownerIdentityId,
+      { routedRemoteHost: target.remoteHost ?? null },
     );
   }
 
@@ -520,14 +718,15 @@ class ResidentHost {
     data?: unknown,
     agentCompletionId?: string,
     rootId = this.config.rootId,
+    principal?: FabricPrincipal,
   ): Promise<void> {
     const id = randomUUID();
-    const prefix = rootId === this.config.rootId ? this.#deliveryPrefix : residentDeliveryPrefix(rootId);
     const record: ResidentDeliveryRecord = {
       format: RESIDENT_HOST_FORMAT,
       id,
       rootId,
       from,
+      ...(principal ? { principal } : {}),
       delivery,
       triggerTurn,
       message,
@@ -535,29 +734,53 @@ class ResidentHost {
       ...(agentCompletionId ? { agentCompletionId } : {}),
       createdAt: Date.now(),
     };
-    try {
-      await this.mesh.put({
-        key: `${prefix}${id}`,
-        value: record,
-        identity: this.identity,
-        ifVersion: 0,
-      });
-    } catch {
-      await this.mesh.put({
-        key: `${prefix}${id}`,
-        value: {
-          ...record,
-          message: message.slice(0, Math.max(1, this.config.mesh.eventContextChars)),
-          data: { fabricTruncated: true },
-        },
-        identity: this.identity,
-        ifVersion: 0,
-      });
+    // Persist before yielding: AgentManager has already marked this notification sent.
+    // Idle exit/queue pressure must not drop the host's ownership of the handoff.
+    writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record, { durable: true });
+    await this.#retryDeliveries();
+  }
+
+  #retryDeliveries(): Promise<unknown> {
+    if (this.#closed || this.#staged) return Promise.resolve();
+    if (this.#flushingDeliveries) return this.#flushingDeliveries;
+    const flushing = this.#deliveryRetry.run(() => this.#flushDeliveries());
+    this.#flushingDeliveries = flushing;
+    void flushing.finally(() => {
+      if (this.#flushingDeliveries === flushing) this.#flushingDeliveries = undefined;
+    }).catch(() => undefined);
+    return flushing;
+  }
+
+  async #flushDeliveries(): Promise<void> {
+    if (!fs.existsSync(this.#deliveryOutboxPath)) return;
+    for (const entry of fs.readdirSync(this.#deliveryOutboxPath).filter(entry => entry.endsWith(".json")).slice(0, 32)) {
+      const file = path.join(this.#deliveryOutboxPath, entry);
+      const record = readJson<ResidentDeliveryRecord>(file);
+      if (!record || record.format !== RESIDENT_HOST_FORMAT || `${record.id}.json` !== entry) {
+        throw new Error(`Invalid resident delivery outbox item: ${file}`);
+      }
+      const key = `${residentDeliveryPrefix(record.rootId)}${record.id}`;
+      try {
+        await this.mesh.put({ key, value: record, identity: this.identity, ifVersion: 0 });
+      } catch (error) {
+        // A restart after put but before unlink replays the SAME private UUID. A CAS
+        // conflict (including a consumed tombstone) means it was handed off already.
+        if (!(error instanceof Error && error.message.startsWith(`Mesh compare-and-swap failed for ${key}: expected version 0,`))) {
+          if (isMeshLockTimeout(error)) throw error;
+          await this.mesh.put({
+            key, value: { ...record, message: record.message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
+            identity: this.identity, ifVersion: 0,
+          });
+        }
+      }
+      // Only a durable mesh handoff releases ownership. Main journals the stable id.
+      fs.rmSync(file);
     }
   }
 
   async #pollRequests(): Promise<void> {
     if (this.#pollingRequests || this.#closed) return;
+    if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
       let entries: string[];
@@ -567,6 +790,7 @@ class ResidentHost {
         return;
       }
       for (const entry of entries.slice(0, 32)) {
+        if (this.#handover || this.#closed) break;
         const source = path.join(this.#requestsPath, entry);
         const processing = path.join(this.#processingPath, entry);
         try {
@@ -583,53 +807,230 @@ class ResidentHost {
   }
 
   #checkIdle(): void {
-    const activeActor = this.actors
-      .listOwned()
-      .some((actor) => actor.residency === "durable" && actor.status !== "stopped");
+    if (this.#closed || this.#staged || this.#handover) return;
+    const ownedActors = this.actors.listOwned();
+    const activeActor = ownedActors.some((actor) => actor.residency === "durable" && actor.status !== "stopped");
     const activeAgent = this.agents
       .listForUi()
       .some((agent) => agent.status === "queued" || agent.status === "running");
-    let pendingRequest = false;
-    try {
-      pendingRequest = fs.readdirSync(this.#requestsPath).some((entry) => entry.endsWith(".json"));
-    } catch {
-      // Missing request directory is empty.
-    }
-    if (activeActor || activeAgent || pendingRequest) {
+    const pendingRequest = [this.#requestsPath, this.#processingPath].some((directory) => {
+      try { return fs.readdirSync(directory).some((entry) => entry.endsWith(".json")); }
+      catch { return false; }
+    });
+    if (activeActor || activeAgent || pendingRequest || this.#admissions) {
       this.#idleSince = Date.now();
       return;
     }
     if (Date.now() - this.#idleSince >= IDLE_EXIT_MS) this.onIdle();
   }
 
+  #trackPublication(promise: Promise<unknown>): void {
+    this.#publications.add(promise);
+    void promise.then(() => this.#publications.delete(promise), () => {
+      this.#publicationFailed = true;
+      this.#publications.delete(promise);
+    });
+  }
+
+  async #probeWorkerStartup(): Promise<void> {
+    const probe = await this.agents.spawn({ task: "Resident release startup probe; no inference", name: "resident-startup-probe",
+      runner: "pi", transport: "process", tools: [], extensions: true, recursive: true,
+      residentStartupProbe: true, timeoutMs: 20_000, thinking: "off" });
+    const result = await this.agents.wait(probe.id, { timeoutMs: 25_000 });
+    if (result.status !== "completed" || result.text !== "resident worker startup verified") {
+      throw new Error(`Resident worker startup probe failed: ${result.error ?? result.status}`);
+    }
+    await this.agents.cleanup(probe.id);
+  }
+
+  #prepareRelease(command: Extract<ResidentCommand, { operation: "releaseChange" }>): void {
+    this.#authorizeResidentSetter(command.caller);
+    const launch = this.launch;
+    if (!launch || process.platform !== "linux" || !exactResidentProcess(launch.launcher)) {
+      throw new Error("Resident launcher has no attested handover custody capability; stay on current release");
+    }
+    if (!mainGenerationCurrent(this.config.residencyRoot, command.main) ||
+        command.main.rootId !== this.config.rootId || command.main.sessionId !== this.config.sessionId ||
+        command.main.releaseRoot !== command.target.releaseRoot) throw new ResidentActorAuthorizationError("Obsolete Main release intent");
+    validateLaunchSpec(command.target);
+    const previous = residentLaunchSpec(this.#effectiveConfig?.() ?? this.config, launch.spec.entry, launch.spec.runtime);
+    if (previous.releaseRoot === command.target.releaseRoot) return;
+    assertPreviousLaunchSpec(launch.spec, previous);
+    assertHandoverTopology(previous, command.target);
+    const active = readHandoverJson<ResidentHandoverState>(handoverPath(this.config.residencyRoot));
+    if (handoverActive(active)) throw new Error("Another resident release transaction is in custody");
+    if (readHandoverJson(handoverOutcomePath(this.config.residencyRoot, command.target))) {
+      throw new Error("Resident target was already attempted; release retry is suppressed");
+    }
+    const owner = readHandoverJson<ResidentHostOwner>(this.#ownerPath);
+    if (owner?.token !== this.#token || owner.pid !== process.pid || !owner.processStartTime) throw new Error("Resident owner fence is uncertain");
+    const plan: ResidentHandoverPlan = { id: randomUUID(), rootId: this.config.rootId, old: {
+      pid: owner.pid, processStartTime: owner.processStartTime, token: owner.token, hostId: owner.hostId },
+      launcher: launch.launcher, previous, target: command.target, caller: command.caller, main: command.main, createdAt: Date.now() };
+    writeLaunchSnapshot(this.config.residencyRoot, previous);
+    writeLaunchSnapshot(this.config.residencyRoot, command.target);
+    commitResidentRequest(this.config.residencyRoot, command, plan.id, this.hostId);
+    // Check before publishing an active transaction: a crash between preparing
+    // and cancellation would otherwise strand dead-host recovery without custody.
+    // A deferred diagnostic is terminal from its very first publication.
+    try { assertAutomaticReleaseRecovery(); }
+    catch (error) {
+      writeHandoverState(this.config.residencyRoot, plan, "cancelled", errorMessage(error));
+      return;
+    }
+    writeHandoverState(this.config.residencyRoot, plan, "preparing");
+    this.#handover = plan;
+    this.actors.pauseForRelease(); this.control.pause(); this.lifecycle.pause();
+  }
+
+  #cancelRelease(plan: ResidentHandoverPlan, reason: string): void {
+    if (decideHandover(this.config.residencyRoot, { id: plan.id, state: "cancelled" }).state === "custody") return;
+    writeHandoverState(this.config.residencyRoot, plan, "cancelled", reason);
+    this.#handover = undefined;
+    this.actors.resumeAfterRelease(); this.control.resume(); this.lifecycle.resume();
+  }
+
+  async #advanceRelease(): Promise<void> {
+    if (this.#advancingRelease || this.#closed) return;
+    this.#advancingRelease = true;
+    try {
+      if (this.#staged) {
+        const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.config.residencyRoot));
+        const attempt = this.launch?.attempt;
+        if (!state || state.plan.id !== attempt?.id) throw new Error("Staged resident transaction identity changed");
+        const terminal = attempt.kind === "target" ? "complete" : "fallback";
+        if (state.phase !== terminal) return;
+        if (attempt.kind === "target") {
+          this.#reloadEvent ??= this.mesh.publish({ topic: "host.reloaded", from: this.identity,
+            data: { old: state.plan.previous.releaseRoot, new: state.plan.target.releaseRoot, transaction: state.plan.id } });
+          await this.#reloadEvent;
+        }
+        const owner = readHandoverJson<ResidentHostOwner>(this.#ownerPath);
+        if (owner?.token !== this.#token || owner.attempt?.id !== attempt.id) throw new Error("Staged resident owner changed before service commitment");
+        // Attempt identity gates staging only. Retire it before business service
+        // so a later C prepare/cancellation cannot hide this healthy owner.
+        const { attempt: _completedAttempt, ...servingOwner } = owner;
+        writeJsonAtomic(this.#ownerPath, servingOwner, { durable: true });
+        this.#staged = false;
+        this.actors.resumeAfterRelease(); this.control.resume(); this.lifecycle.resume();
+        this.#trackPublication(this.#backgroundDeliveries.enqueue(async () => {
+          await this.actors.finishPendingRemovals();
+          this.#writeRemovals();
+        }));
+        return;
+      }
+      const plan = this.#handover;
+      if (!plan || this.#pollingRequests) return;
+      const custody = readHandoverJson<{ id: string; launcher: ResidentLauncherIdentity }>(handoverCustodyPath(this.config.residencyRoot, plan.id));
+      if (custody) {
+        assertAutomaticReleaseRecovery();
+        if (custody.id !== plan.id || JSON.stringify(custody.launcher) !== JSON.stringify(plan.launcher) ||
+            !exactResidentProcess(plan.launcher)) throw new Error("Resident launcher custody is uncertain");
+        // Receipt precedes release of A's stable flock. The Main is no longer the executor.
+        writeHandoverState(this.config.residencyRoot, plan, "released");
+        this.onIdle();
+        return;
+      }
+      if (!mainGenerationCurrent(this.config.residencyRoot, plan.main) || !exactResidentProcess(plan.launcher)) {
+        this.#cancelRelease(plan, "Main/launcher lost before custody"); return;
+      }
+      if (Date.now() - plan.createdAt > HANDOVER_DRAIN_MS) {
+        this.#cancelRelease(plan, "Release drain timed out without cutting a run"); return;
+      }
+      if (fs.readdirSync(this.#processingPath).some((entry) => entry.endsWith(".json"))) return;
+      if (this.#admissions || this.actors.inFlightCount() || this.actors.pendingRemovals().length ||
+          this.agents.listForUi().some((agent) => agent.status === "queued" || agent.status === "running")) return;
+      const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.config.residencyRoot));
+      if (state?.plan.id !== plan.id) throw new Error("Resident release transaction changed");
+      if (state.phase === "cancelled") { this.#cancelRelease(plan, state.error ?? "Launcher deferred release before custody"); return; }
+      if (state.phase === "custody") return;
+      await this.control.checkpointForRelease();
+      await this.lifecycle.checkpointForRelease();
+      await Promise.all([...this.#publications]);
+      await this.#backgroundDeliveries.checkpointForRelease();
+      await this.#flushingDeliveries;
+      await this.#flushDeliveries();
+      if (fs.existsSync(this.#deliveryOutboxPath) && fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json"))) {
+        throw new Error("Resident release has pending delivery outbox obligations");
+      }
+      if (this.#publicationFailed) throw new Error("Resident release has unconfirmed public results/deliveries");
+      await this.actors.checkpointForRelease();
+      await this.agents.checkpointForRelease(plan.createdAt + HANDOVER_DRAIN_MS);
+      assertAutomaticReleaseRecovery();
+      validateLaunchSpec(plan.previous); validateLaunchSpec(plan.target);
+      writeHandoverState(this.config.residencyRoot, plan, "custody");
+    } catch (error) {
+      // Preparation is reversible. After custody an independent launcher owns recovery.
+      if (this.#handover && !readHandoverJson(handoverCustodyPath(this.config.residencyRoot, this.#handover.id))) {
+        this.#cancelRelease(this.#handover, errorMessage(error));
+      } else if (this.#staged) {
+        // Never turn a failed event/commit check into ungated business work.
+        this.#publicationFailed = true;
+      }
+    } finally { this.#advancingRelease = false; }
+  }
+
+  #authorizeResidentSetter(caller: ResidentActorCaller | undefined): void {
+    assertResidentActorMain(caller, this.config.rootId);
+    // Verify the actual root session's existing control identity, not merely
+    // inherited mainAgent.id. get(fresh) validates the record's writer and host
+    // lease through the same directory used by native Fabric control routing.
+    const root = this.participants.get(this.config.rootId, Date.now(), { fresh: true });
+    if (!caller || caller.identity.sessionId !== this.config.sessionId ||
+      !root || root.stale || root.remoteHost !== undefined || root.kind !== "root" ||
+      root.rootId !== this.config.rootId || root.sessionId !== this.config.sessionId ||
+      root.ownerIdentityId !== caller.identity.id || root.ownerHostId !== caller.hostId) {
+      throw new ResidentActorAuthorizationError();
+    }
+  }
+
   async #processRequest(filePath: string): Promise<void> {
     const command = readJson<ResidentCommand>(filePath);
-    const requestId = command?.requestId ?? path.basename(filePath, ".json");
+    const requestId = path.basename(filePath, ".json");
     let response: ResidentCommandResponse;
     try {
       if (
-        command?.format !== RESIDENT_HOST_FORMAT ||
+        (command?.format !== RESIDENT_HOST_FORMAT && command?.format !== RESIDENT_ACTOR_COMMAND_FORMAT) ||
         command.rootId !== this.config.rootId ||
         command.requestId !== requestId
       ) {
         throw new Error("Invalid Fabric residency request");
       }
-      if (command.operation === "spawn") {
+      // Validate the runtime JSON discriminant before any actor lookup/mutation.
+      if (!isResidentCommandOperation(command.operation)) {
+        throw new ResidentCommandUnsupportedError(`Unsupported Fabric residency command: ${String(command.operation)}`);
+      }
+      if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+        throw new Error(`Fabric residency request ${requestId} was abandoned before commit`);
+      }
+      await testResidentRequestDelay("before_commit");
+      const commit = (id: string): void => commitResidentRequest(this.config.residencyRoot, command, id, this.hostId);
+      if (command.operation === "releaseChange") {
+        this.#prepareRelease(command);
+        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, completedAt: Date.now() };
+      } else if (command.operation === "spawn") {
         if (
+          command.request.residentStartupProbe ||
           command.request.sessionSeed ||
           command.request.sessionFile ||
           command.request.actorId ||
           command.request.actorName ||
           command.request.meshRoot ||
           command.request.runnerSessionId ||
-          command.request.systemPrompt ||
           command.request.images
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
         }
-        const handle = await this.agents.spawn({ ...command.request, residency: "durable" });
+        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit);
         const runDirectory = this.agents.runDirectory(handle.id);
-        if (!runDirectory) throw new Error(`Resident agent ${handle.id} has no run directory`);
+        if (!runDirectory) {
+          // Durable metadata currently requires an admitted run directory. Never
+          // report a failed spawn while leaving its accepted queue entry alive:
+          // stop revokes admission synchronously and joins any admission race.
+          await this.agents.stop(handle.id);
+          await this.agents.cleanup(handle.id);
+          throw new Error("Resident host cannot queue durable spawns while all permits are occupied; the queued request was stopped. Retry after capacity is available.");
+        }
         const worktreeGitRoot = this.agents.worktreeGitRoot(handle.id);
         const metadata: ResidentAgentMetadata = {
           format: RESIDENT_HOST_FORMAT,
@@ -652,6 +1053,7 @@ class ResidentHost {
           completedAt: Date.now(),
         };
       } else if (command.operation === "foreground") {
+        commit(command.id);
         this.agents.markForeground(command.id);
         response = {
           format: RESIDENT_HOST_FORMAT,
@@ -660,7 +1062,10 @@ class ResidentHost {
           completedAt: Date.now(),
         };
       } else if (command.operation === "cleanup") {
-        await this.agents.wait(command.id);
+        // Joining is preparation, not foregrounding or consumption: abandonment
+        // must preserve the background completion notification as well as files.
+        await this.agents.join(command.id);
+        commit(command.id);
         await this.agents.cleanup(command.id, command.deleteBranch);
         fs.rmSync(path.join(this.#agentsPath, `${command.id}.json`), { force: true });
         fs.rmSync(residentResultPath(this.config.residencyRoot, command.id), { force: true });
@@ -677,7 +1082,7 @@ class ResidentHost {
         // This handler already runs inside the authoritative durable host.
         // Keep the new actor locally owned; ceding it here created a needless
         // self-transfer window that blocked the next recruitment request.
-        const actor = await this.actors.create(command.request, { asRegistryOwner: true });
+        const actor = await this.actors.create(command.request, { asRegistryOwner: true, beforeCommit: commit });
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,
@@ -685,15 +1090,54 @@ class ResidentHost {
           actor: actor as FabricActorInfo,
           completedAt: Date.now(),
         };
+      } else if (command.operation === "actors") {
+        response = {
+          format: RESIDENT_HOST_FORMAT, requestId, ok: true,
+          actors: this.actors.listOwned().filter((actor) => actor.rootId === this.config.rootId),
+          completedAt: Date.now(),
+        };
+      } else if (command.operation !== "removeActor") {
+        if (command.operation === "setInstructions" || command.operation === "setModel" ||
+          command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools") {
+          this.#authorizeResidentSetter(command.caller);
+          if (command.operation === "setTools") assertResidentActorToolCeiling(command.tools, command.caller?.toolCeiling);
+        }
+        const actor = this.actors.status(String(command.id));
+        if (actor.rootId !== this.config.rootId || !this.actors.owns(actor.id)) {
+          throw new Error(`Resident host does not own root actor ${actor.id}`);
+        }
+        let updated: FabricActorInfo;
+        switch (command.operation) {
+          case "actorStatus": updated = actor; break;
+          case "setInstructions": updated = await this.actors.setInstructions(actor.id, command.instructions, commit); break;
+          case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit); break;
+          case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope, commit); break;
+          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit); break;
+          case "setTools": updated = await this.actors.setTools(actor.id, command.tools, commit); break;
+          default: throw new Error("Unknown resident actor operation");
+        }
+        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, completedAt: Date.now() };
       } else {
-        if (!this.actors.owns(command.id)) {
+        const cleanup = this.actors.cleanupObligation(command.id);
+        if (!this.actors.owns(command.id) || (cleanup && cleanup.residency !== "durable")) {
           throw new Error(`Resident host does not own ${command.id}`);
         }
-        await this.actors.remove(command.id);
+        // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
+        commit(command.id);
+        const removed = await this.actors.remove(command.id, { wait: false });
+        this.#writeRemovals();
+        if (removed.pending) {
+          void this.actors.removalSettled(command.id)?.finally(() => {
+            this.#writeRemovals();
+            this.participants.scheduleRefresh();
+          });
+        }
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,
           ok: true,
+          ...(removed.pending ? { pending: removed.pending } : {}),
+          ...(removed.cleaned !== undefined ? { cleaned: removed.cleaned } : {}),
           completedAt: Date.now(),
         };
       }
@@ -703,12 +1147,30 @@ class ResidentHost {
         requestId,
         ok: false,
         error: errorMessage(error),
+        ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError
+          ? { errorCode: error.code } : {}),
+        ...(error instanceof FabricModelDeniedError ? {
+          errorCode: error.code, modelDenied: { model: error.model, ...(error.replacement ? { replacement: error.replacement } : {}) },
+        } : {}),
         completedAt: Date.now(),
       };
     }
-    atomicWrite(path.join(this.#responsesPath, `${requestId}.json`), response);
+    if (response.ok) await testResidentRequestDelay("after_commit");
+    const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
+    writeJsonAtomic(responsePath, response, { durable: true });
+    // An abandoned caller already left; clean late responses as well as processing files.
+    if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+      fs.rmSync(responsePath, { force: true });
+    }
     fs.rmSync(filePath, { force: true });
     this.participants.scheduleRefresh();
+  }
+
+  /** Pending removals for clients' error messages (smarty-dev#2184 item 8). */
+  #writeRemovals(): void {
+    const removals = this.actors.pendingRemovals();
+    if (removals.length === 0) fs.rmSync(this.#removalsPath, { force: true });
+    else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals });
   }
 
   #recoverInterruptedRequests(): void {
@@ -720,6 +1182,11 @@ class ResidentHost {
     }
     for (const entry of entries) {
       const requestId = path.basename(entry, ".json");
+      if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+        fs.rmSync(path.join(this.#processingPath, entry), { force: true });
+        fs.rmSync(path.join(this.#responsesPath, entry), { force: true });
+        continue;
+      }
       const response: ResidentCommandResponse = {
         format: RESIDENT_HOST_FORMAT,
         requestId,
@@ -732,38 +1199,85 @@ class ResidentHost {
     }
   }
 
-  #acquireLock(): void {
+  async #acquireLock(): Promise<void> {
     fs.mkdirSync(this.config.residencyRoot, { recursive: true, mode: 0o700 });
-    const existing = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (existing && processAlive(existing.pid)) {
-      throw new ResidentHostAlreadyRunning(`Fabric resident host is already running (${existing.pid})`);
-    }
-    try {
-      const descriptor = fs.openSync(this.#lockPath, "wx", 0o600);
-      fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid }));
-      fs.closeSync(descriptor);
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-        const locked = readJson<{ pid?: unknown }>(this.#lockPath);
-        if (typeof locked?.pid === "number" && processAlive(locked.pid)) {
-          throw new ResidentHostAlreadyRunning(`Fabric resident host is starting (${locked.pid})`);
-        }
-        fs.rmSync(this.#lockPath, { force: true });
-        const descriptor = fs.openSync(this.#lockPath, "wx", 0o600);
-        fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid }));
-        fs.closeSync(descriptor);
-      } else {
+    if (process.platform === "linux") {
+      try { this.#lockFd = await lockFile(this.#lockPath, 0, true); }
+      catch (error) {
+        if (error instanceof FileLockBusy) throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
+        throw error; // Never weaken Linux ownership when util-linux is missing/broken.
+      }
+    } else {
+      // ponytail: without Linux flock/setpriv, retain PID + start-time staleness.
+      // Windows durable residency is unsupported; non-Linux identity is #2566.
+      const existing = readJson<ResidentHostOwner>(this.#ownerPath);
+      const locked = readJson<ResidentHostOwner>(this.#lockPath);
+      if ((existing && residentProcessAlive(existing.pid, existing.processStartTime)) ||
+          (locked && residentProcessAlive(locked.pid, locked.processStartTime))) {
+        throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
+      }
+      fs.rmSync(this.#lockPath, { force: true });
+      try { this.#lockFd = fs.openSync(this.#lockPath, "wx", 0o600); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new ResidentHostAlreadyRunning("Fabric resident host is starting");
         throw error;
       }
+      this.#fallbackLock = true;
     }
+    // A pre-flock host may own these diagnostic records without holding our fence.
+    // Read BEFORE overwriting; unknown birth identity is not authority to displace it.
+    const records = [readJson<ResidentHostOwner>(this.#lockPath), readJson<ResidentHostOwner>(this.#ownerPath)];
+    if (records.some((owner) => owner && owner.pid !== process.pid && residentProcessAlive(owner.pid, owner.processStartTime))) {
+      this.#releaseLock();
+      throw new ResidentHostAlreadyRunning("Fabric resident host is already running (legacy owner)");
+    }
+    try {
+      fs.ftruncateSync(this.#lockFd, 0);
+      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
+    } catch (error) { this.#releaseLock(); throw error; }
   }
 
   #releaseLock(): void {
-    const lock = readJson<{ token?: unknown }>(this.#lockPath);
-    if (lock?.token === this.#token) fs.rmSync(this.#lockPath, { force: true });
+    if (this.#lockFd === undefined) return;
+    // Remove our publication while still holding the fence; never unlink the Linux inode.
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
     if (owner?.token === this.#token) fs.rmSync(this.#ownerPath, { force: true });
+    if (this.#fallbackLock && readJson<{ token?: string }>(this.#lockPath)?.token === this.#token) {
+      fs.rmSync(this.#lockPath, { force: true });
+    }
+    fs.closeSync(this.#lockFd);
+    this.#lockFd = undefined;
   }
+}
+
+function residentHostLaunchContext(config: ResidentHostConfig): ResidentHostLaunchContext | undefined {
+  const raw = process.env.PI_FABRIC_RESIDENT_LAUNCHER;
+  if (!raw) return undefined;
+  const launcher = JSON.parse(raw) as ResidentLauncherIdentity;
+  if (launcher.pid !== process.ppid || !exactResidentProcess(launcher)) throw new Error("Resident launcher identity is uncertain");
+  // host.ts and its built shared chunk both live one directory below dist.
+  const loadedRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  // A bundled Pi executable is not a generic JS runtime. Reconstruct with
+  // the birth-validated parent launcher runtime, checked against its kernel exe.
+  if (fs.realpathSync(`/proc/${launcher.pid}/exe`) !== launcher.runtime) {
+    throw new Error("Resident launcher runtime identity is uncertain");
+  }
+  const attempt = process.env.PI_FABRIC_RESIDENT_ATTEMPT ? JSON.parse(process.env.PI_FABRIC_RESIDENT_ATTEMPT) as ResidentHostLaunchContext["attempt"] : undefined;
+  let pinned: ResidentLaunchSpec | undefined;
+  if (attempt) {
+    const state = readHandoverJson<ResidentHandoverState>(handoverPath(config.residencyRoot));
+    pinned = attempt.kind === "target" ? state?.plan.target : state?.plan.previous;
+    if (!["target", "fallback"].includes(attempt.kind) || state?.plan.id !== attempt.id || !pinned || state.plan.launcher.token !== launcher.token) {
+      throw new Error("Resident successor is not the launcher's owned attempt");
+    }
+  }
+  // The successor's retained script runtime can differ from launcher A's.
+  // Its identity is already bound to the immutable custody plan.
+  const spec = residentLaunchSpec(config, path.join(loadedRoot, "dist/residency/pi-entry.js"), pinned?.runtime ?? launcher.runtime);
+  if (spec.digest !== process.env.PI_FABRIC_RESIDENT_SPEC_DIGEST || (pinned && pinned.digest !== spec.digest)) {
+    throw new Error("Resident loaded release does not match launcher snapshot");
+  }
+  return { launcher, spec, ...(attempt ? { attempt } : {}) };
 }
 
 const runResidentHost = async (
@@ -775,7 +1289,7 @@ const runResidentHost = async (
   const idle = new Promise<void>((resolve) => {
     finishIdle = resolve;
   });
-  const host = new ResidentHost(config, () => finishIdle?.(), modelRegistry);
+  const host = new ResidentHost(config, () => finishIdle?.(), modelRegistry, residentHostLaunchContext(config));
   await host.start();
   if (signal?.aborted) {
     await host.close();
@@ -809,6 +1323,8 @@ export const runResidentHostFromConfigPath = async (
       atomicWrite(path.join(residencyRoot, "error.json"), {
         error: errorMessage(error),
         occurredAt: Date.now(),
+        launcherPid: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? process.ppid : undefined,
+        launcherBirth: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? processStartTime(process.ppid) : undefined,
       });
     } catch {
       // Startup diagnostics are best-effort.

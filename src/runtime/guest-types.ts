@@ -72,6 +72,8 @@ interface FabricAgentRequest {
   cwd?: string;
   worktree?: boolean;
   schema?: Record<string, unknown>;
+  /** Extra child system instructions; supported by session and durable runs. */
+  systemPrompt?: string;
   prompt?: string;
   instructions?: string;
   timeout_ms?: number;
@@ -129,6 +131,10 @@ interface FabricPeerInfo {
   role?: string;
   /** The checkout that owns the root's git common directory. */
   project?: string;
+  /** Normalized repository origin, independent of checkout path or host. */
+  repository?: string;
+  /** False for print/JSON roots, which cannot receive messages or become project leads. */
+  interactive?: boolean;
   name: string;
   kind: "peer";
   status: "idle" | "running";
@@ -156,6 +162,10 @@ interface FabricParticipantInfo {
   role?: string;
   /** The checkout that owns the root's git common directory. */
   project?: string;
+  /** Normalized repository origin, independent of checkout path or host. */
+  repository?: string;
+  /** False for print/JSON roots, which cannot receive messages or become project leads. */
+  interactive?: boolean;
   kind: FabricParticipantKind;
   rootId: string;
   ownerHostId: string;
@@ -245,6 +255,10 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  /** Present on terminal status snapshots when the full log was retained. */
+  compactionSkipped?: string;
+  /** One-based FIFO admission position; present only while queued. */
+  queuePosition?: number;
   /** Resolved Fabric kernel, absent for non-Fabric runners. */
   kernel?: FabricKernel;
   id: string;
@@ -264,6 +278,9 @@ interface FabricAgentHandle {
   actorName?: string;
   sessionId?: string;
   runnerSessionId?: string;
+  runnerSessionIds?: string[];
+  mainAgentId?: string;
+  fabricSessionId?: string;
   attachCommand?: string;
   branch?: string;
   worktree?: string;
@@ -280,6 +297,8 @@ interface FabricRemoteControlResult {
   acknowledged: true;
 }
 interface FabricAgentResult extends FabricAgentHandle {
+  /** Terminal event-log optimization was skipped; the full original log remains. */
+  compactionSkipped?: string;
   task: string;
   startedAt: number;
   finishedAt?: number;
@@ -321,6 +340,7 @@ interface FabricAgentLog {
   events: FabricLogLine[];
   hasMore: boolean;
   before?: number;
+  generation?: string;
 }
 interface FabricActorLog {
   actorId: string;
@@ -330,6 +350,7 @@ interface FabricActorLog {
   session: FabricLogLine[];
   sessionHasMore: boolean;
   sessionBefore?: number;
+  sessionGeneration?: string;
   run?: {
     runId: string;
     eventsFile: string;
@@ -337,6 +358,7 @@ interface FabricActorLog {
     events: FabricLogLine[];
     hasMore: boolean;
     before?: number;
+    generation?: string;
   };
   retainedRuns: string[];
 }
@@ -741,11 +763,22 @@ interface FabricActorInfo {
   messages: number;
   createdAt: number;
   updatedAt: number;
+  /** Last settled run, not the run currently in flight. */
   lastRunId?: string;
+  /** Present only when the current execution owner reports an in-flight run. */
+  inFlightRun?: { id: string; startedAt: number; ageS: number };
+  /** Removal pending behind an in-flight run; state includes a useful progress note. */
+  removal?: { requestedAt: number; runId?: string; runStartedAt?: number; state: string };
   lastError?: string;
   sessionFile?: string;
   logDir?: string;
 }
+/** Live read view: unknown owner state is not idle; omitted counts are unavailable, not zero. */
+type FabricActorReadInfo = Omit<FabricActorInfo, "status" | "queued" | "messages"> & {
+  status: FabricActorInfo["status"] | "unknown";
+  queued?: number;
+  messages?: number;
+};
 interface FabricModelSwitchRequest {
   /** provider/id, a models.aliases name, or a search term; resolution tries aliases first, then exact matches, then the closest fuzzy match (recency from pi-model-sort breaks ties) against authenticated models. */
   model: string;
@@ -797,10 +830,16 @@ interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
 type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricMessageDelivery {
+  /** Advisory only: unverified ids in sender history; also delivered when admission permits. */
+  notice?: string;
   queued: true;
   messageId: string;
   routed?: "local" | "main" | "mesh";
   acknowledged?: boolean;
+  /** Whether this delivery started an idle Main turn; absent when the route cannot prove it. */
+  triggered?: boolean;
+  /** Why a requested wake was held, including provider-backoff until an ISO timestamp. */
+  reason?: string;
   /** For a Main target: your own followUps it still holds unread. Switch to steer when this or oldestAgeS grows. */
   pendingFollowUps?: number;
   /** For a Main target: the age in seconds of your oldest followUp it still holds (0 when none). */
@@ -826,7 +865,7 @@ interface FabricAgentsApi {
   main(): Promise<FabricMainAgentInfo>;
   sessions(): Promise<FabricParticipantInfo[]>;
   peers(): Promise<FabricPeerInfo[]>;
-  /** The live project agent for this session's project (role project-agent, same git common checkout). */
+  /** Resolve by normalized repository origin and launch-recorded lead id; throws if unresolved or ambiguous. */
   projectAgent(): Promise<FabricParticipantInfo>;
   subscribe(args: {
     from: string;
@@ -842,9 +881,9 @@ interface FabricAgentsApi {
   stop(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
   cleanup(args: FabricAgentTargetArgs & { deleteBranch?: boolean; delete_branch?: boolean }): Promise<{ cleaned: boolean }>;
   create(args: FabricActorRequest): Promise<FabricActorInfo>;
-  setModel(args: { id: string; model?: string; scope?: FabricActorBindingScope }): Promise<FabricActorInfo>;
+  setModel(args: { id: string; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
-  setThinking(args: { id: string; thinking?: FabricThinking; scope?: FabricActorBindingScope }): Promise<FabricActorInfo>;
+  setThinking(args: { id: string; thinking?: FabricThinking; scope?: FabricActorBindingScope | "global" }): Promise<FabricActorInfo>;
   setTools(args: { id: string; tools: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setNice(args: { id: string; nice: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
@@ -861,11 +900,13 @@ interface FabricAgentsApi {
     id: string;
     instructions: string;
     scope?: "project" | "global";
+    /** Required to shrink the body by more than 80%. */
+    replace?: boolean;
   }): Promise<FabricActorInfo>;
   ask(args: FabricActorMessageArgs): Promise<FabricActorMessage>;
   ask(id: string, message: string): Promise<FabricActorMessage>;
-  tell(args: FabricActorMessageArgs): Promise<{ queued: true; messageId: string }>;
-  tell(id: string, message: string): Promise<{ queued: true; messageId: string }>;
+  tell(args: FabricActorMessageArgs): Promise<FabricMessageDelivery>;
+  tell(id: string, message: string): Promise<FabricMessageDelivery>;
   steer(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
   followUp(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
@@ -874,7 +915,7 @@ interface FabricAgentsApi {
   setFollowUpMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */
   compact(args: { id: string; instructions?: string }): Promise<{ queued: true; messageId: string }>;
-  actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorInfo>;
+  actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorReadInfo>;
   /** Read a live actor's instruction text and its sha256 digest. Writes nothing. */
   instructions(args: FabricAgentTargetArgs): Promise<{
     id: string;
@@ -883,11 +924,11 @@ interface FabricAgentsApi {
     instructionsDigest: string;
     instructionsLength: number;
   }>;
-  actors(args?: { scope?: "project" }): Promise<FabricActorInfo[]>;
+  actors(args?: { scope?: "project" }): Promise<FabricActorReadInfo[]>;
   /** Project-independent templates in the global registry. */
   actors(args: { scope: "global" }): Promise<FabricActorTemplate[]>;
   messages(args: { id: string; limit?: number }): Promise<FabricActorMessage[]>;
-  remove(args: { id: string }): Promise<{ removed: boolean }>;
+  remove(args: { id: string }): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }>;
   /** Drop an actor's mailbox history without stopping the actor. */
   clearMessages(args: { id: string }): Promise<FabricActorInfo>;
   /** Start an actor's next run on a fresh Pi session; waits for an in-flight run, keeps the mailbox. */
@@ -901,6 +942,8 @@ interface FabricAgentsApi {
     type?: "session" | "run" | "all";
     lines?: number;
     before?: number;
+    /** Required with before. Pair the previous page's generation; cursor-stale means restart without either. */
+    beforeGeneration?: string;
     runId?: string;
   }): Promise<FabricActorLog | FabricAgentLog>;
 }
@@ -973,7 +1016,8 @@ interface FabricMeshStateEntry<T = unknown> {
 }
 interface FabricMeshApi {
   self(): Promise<FabricMeshIdentity>;
-  publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; message?: string; body?: string }): Promise<FabricMeshEvent>;
+  /** An unverified-ids notice is advisory; it is also appended to the durable event text. */
+  publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; message?: string; body?: string }): Promise<FabricMeshEvent & { notice?: string }>;
   read(args?: { after?: number; topic?: string; to?: string; limit?: number; max?: number }): Promise<FabricMeshEvent[]>;
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean; limit?: number; max?: number; include_stale?: boolean }): Promise<FabricParticipantInfo[]>;
   get<T = unknown>(args: { key: string }): Promise<FabricMeshStateEntry<T> | null>;

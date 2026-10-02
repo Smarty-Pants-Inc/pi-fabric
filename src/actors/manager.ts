@@ -1,9 +1,13 @@
+import { copyFabricProvenance, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
+import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
-import os from "node:os";
+import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
 import type { FabricCapabilityRequirement } from "../components/types.js";
 import type { FabricCapabilityViewLease } from "../core/action-registry.js";
@@ -46,15 +50,22 @@ import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore } from "./registry-store.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
+import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 
 export interface ActorMessageBindingOptions {
+  /** Host-only admitted requester snapshot, separate from payload and bindings. */
+  provenance?: FabricTurnProvenance | undefined;
   /** Per-call values layered over this session binding. */
   overrides?: FabricActorRunBinding;
   /** Already-resolved caller view received through the owner control plane. */
   binding?: FabricActorRunBinding;
+  /** Host-only ASK policy: Main's program ceiling ends observation, not accepted activation. */
+  detachOnMainCeiling?: boolean;
 }
 
 interface ActorQueueItem {
+  provenance?: FabricTurnProvenance | undefined;
   id: string;
   source: string;
   payload: unknown;
@@ -62,7 +73,11 @@ interface ActorQueueItem {
   createdAt: number;
   coalesceKey?: string;
   activation: FabricActorActivation;
+  /** Supplied fields, interpreted according to bindingMode (including absent fields). */
   binding: FabricActorRunBinding;
+  /** Only raw own-root work inherits current owner defaults at launch. */
+  bindingMode: "owner-defaults" | "resolved";
+  bindingVersion?: 2;
   resolve?: (message: FabricActorMessage) => void;
   reject?: (error: Error) => void;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
@@ -109,6 +124,7 @@ interface ManagedActor {
   transport?: FabricAgentTransport;
   timeoutMs?: number;
   nice?: number;
+  bashTimeoutSeconds?: number;
   extensions?: boolean;
   inferenceContext?: FabricActorInferenceContext;
   requirements: FabricCapabilityRequirement[];
@@ -122,6 +138,10 @@ interface ManagedActor {
   createdAt: number;
   updatedAt: number;
   lastRunId?: string;
+  /** The run in flight, known from its spawn (smarty-dev#2184 item 8). */
+  inFlightRun?: { id: string; startedAt: number };
+  /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
+  removal?: { requestedAt: number; runId?: string; runStartedAt?: number };
   lastError?: string;
   abortController?: AbortController;
   /** The in-flight run an ownership change aborted: its event is parked, not failed. */
@@ -131,6 +151,29 @@ interface ManagedActor {
   drain?: Promise<void>;
   draining: boolean;
 }
+
+/** Validate an actor's bashTimeoutSeconds within Pi's timer limit (0 = no default timeout). */
+export const parseBashTimeoutSeconds = (value: unknown): number => {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > MAX_ACTOR_BASH_TIMEOUT_S) {
+    throw new Error(`bashTimeoutSeconds must be a non-negative integer at most ${MAX_ACTOR_BASH_TIMEOUT_S} (0 = no default timeout)`);
+  }
+  return value;
+};
+
+interface RemovalCleanup {
+  id: string;
+  sessionDir: string;
+  presenceKey: string;
+  lastRunId?: string;
+  pending?: string;
+  owner?: { name: string; rootId: string; residency: FabricParticipantResidency; requestedAt: number };
+}
+
+type RemovalResult = { removed: boolean; cleaned?: boolean; pending?: string };
+
+/** An accepted removal whose cleanup fails is retried this often, from REMOVAL_RETRY_MS doubling. */
+const REMOVAL_RETRIES = 5;
+const REMOVAL_RETRY_MS = 1_000;
 
 const ACTOR_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9 _.-]{0,59}$/;
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
@@ -279,6 +322,13 @@ export class ActorManager {
   readonly #takenOver = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
   readonly #draining = new Map<string, ManagedActor>();
+  /** Removals that returned before their in-flight run ended, by actor id (smarty-dev#2184). */
+  readonly #removals = new Map<string, Promise<void>>();
+  /** Revoked actors still owe directory/presence cleanup; persisted independently of the registry. */
+  readonly #removalCleanup = new Map<string, RemovalCleanup>();
+  readonly #revoked = new Set<string>();
+  readonly #removeCalls = new Map<string, Promise<RemovalResult>>();
+  readonly #finishCalls = new Map<string, Promise<RemovalResult>>();
   readonly #actorRoot: string;
   readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registry: ActorRegistryStore;
@@ -286,6 +336,7 @@ export class ActorManager {
   readonly #bindings: ActorBindingStore;
   readonly #mainAgent: FabricMainAgentTarget | undefined;
   readonly #canManageActor: ((id: string) => boolean | undefined) | undefined;
+  readonly #isOwnResidentActor: ((id: string) => boolean) | undefined;
   // Set while one mesh event is delivered synchronously after a single ownership refresh.
   #ownershipSnapshot = false;
   readonly #resolvePiModel: ((model: string) => string | Promise<string>) | undefined;
@@ -320,14 +371,18 @@ export class ActorManager {
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
   readonly #presenceQueued = new Set<string>();
+  readonly #presenceRetries = new Map<string, MeshBackgroundRetry>();
+  readonly #notifications = new MeshBackgroundQueue("actor notification/reap");
   /** Actor ids named by the last successfully parsed registry (undefined until one is). */
   #registryIds: Set<string> | undefined;
   /** Orphan deletes, fenced to the entry version seen when it was found. */
   readonly #orphanPresence = new Map<string, number>();
   #presenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
+  #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
   #closing = false;
+  #releasePaused = false;
   readonly #closeGraceMs: number;
   // Stop-the-world gate armed by haltAll() (ESC): while true, host-event and
   // mesh dispatch are frozen so interrupted actors are not re-armed by the
@@ -348,11 +403,15 @@ export class ActorManager {
     readonly agents: AgentManager,
     readonly onDeliver: (request: FabricActorDeliveryRequest) => void,
     options: {
+      /** Staged resident successor: no business activation before launcher commitment. */
+      releasePaused?: boolean;
       actorRoot?: string;
       actorScope?: import("./types.js").FabricActorStorageScope;
       persistent?: boolean;
       mainAgent?: FabricMainAgentTarget;
       canManageActor?: (id: string) => boolean | undefined;
+      /** Creation-only proof of a live actor owned by this Main's resident host. Never grants management. */
+      isOwnResidentActor?: (id: string) => boolean;
       /** May refresh the model registry on a miss, so it is awaited (smarty-dev#1830). */
       resolvePiModel?: (model: string) => string | Promise<string>;
       lineageAlive?: (rootId: string) => boolean;
@@ -365,6 +424,8 @@ export class ActorManager {
       meshCursorPath?: string;
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
+      /** First backoff of a failed accepted-removal cleanup (tests shorten it). */
+      removalRetryMs?: number;
       /** With meshCursorPath: on resume, replay only events newer than this (ms). */
       meshReplayAgeMs?: number;
       relayParticipantSteering?: boolean;
@@ -385,13 +446,15 @@ export class ActorManager {
     } = {},
   ) {
     this.#actorRoot =
-      options.actorRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actors-"));
+      options.actorRoot ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-actors-"));
     this.#actorScope = options.actorScope ?? meshConfig.actorScope;
     this.#persistent = options.persistent ?? false;
+    this.#releasePaused = options.releasePaused ?? false;
     this.#closeGraceMs = Math.max(0, options.closeGraceMs ?? 30_000);
     this.#maxSessionBytes = Math.max(0, options.maxSessionBytes ?? DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes);
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
+    this.#isOwnResidentActor = options.isOwnResidentActor;
     this.#resolvePiModel = options.resolvePiModel;
     this.#lineageAlive = options.lineageAlive;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
@@ -424,6 +487,7 @@ export class ActorManager {
       cursorPath: options.meshCursorPath,
       maxReplayAgeMs: options.meshReplayAgeMs,
       beforePoll: () => {
+        if (this.#releasePaused) return false;
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();
         // Preserve deferred events while halted; fencing remains manager-owned.
@@ -432,11 +496,12 @@ export class ActorManager {
       onEvent: (event) => {
         if (event.topic === "fabric.steer") this.#relaySteer(event);
         else if (!event.topic.startsWith("fabric.control.")) return this.#dispatchMeshEvent(event);
-        return true;
+        return event.topic === "fabric.steer" ? true : "ignored";
       },
     });
     this.#meshMonitor.start();
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
+    this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
     // Presence entries this runtime wrote for actors it no longer knows (a remove whose
     // delete never landed) are orphans: reap them once at start.
     setTimeout(() => this.#reapOrphanPresence(), 0).unref();
@@ -461,17 +526,23 @@ export class ActorManager {
    * host already is the authoritative registry owner, so the foreign-live-actor
    * guard—which protects against concurrent local starters—must not veto the
    * request while a transferred actor still advertises its creating host.
+   * A Main may also create session actors beside its own live resident-owned
+   * durable rows. This creation-only exception never grants actor management.
    */
   async create(
     request: FabricActorRequest,
-    { asRegistryOwner = false }: { asRegistryOwner?: boolean } = {},
+    { asRegistryOwner = false, beforeCommit, checkActive }: { asRegistryOwner?: boolean; beforeCommit?: (id: string) => void | Promise<void>; checkActive?: () => void } = {},
   ): Promise<FabricActorInfo> {
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
+    const sessionMainCreate = (request.residency ?? "session") === "session" &&
+      this.#claimResidency === "session" && this.identity.kind === "main" && this.identity.id === this.#rootId;
     if (
       !registryOwnerCreate &&
       [...this.#actors.values()].some(
-        (actor) => actor.status !== "stopped" && !this.#canManage(actor.id),
+        (actor) => actor.status !== "stopped" && !this.#canManage(actor.id) &&
+          !(sessionMainCreate && actor.rootId === this.#rootId && actor.residency === "durable" &&
+            this.#isOwnResidentActor?.(actor.id) === true),
       )
     ) {
       throw new ActorRegistryOwnershipError();
@@ -479,11 +550,11 @@ export class ActorManager {
     if (!this.meshConfig.enabled) throw new Error("Fabric mesh and actors are disabled");
     const name = request.name.trim();
     if (!ACTOR_NAME_PATTERN.test(name)) throw new Error(`Invalid Fabric actor name: ${name}`);
-    const sameName = [...this.#actors.values()].find((actor) => actor.name === name);
+    // A predecessor whose removal is pending keeps its name until its run ends (smarty-dev#2184).
+    const sameName = [...this.#actors.values()].find((actor) => actor.name === name && !actor.removal);
     if (sameName && sameName.status !== "stopped") {
       throw new Error(`A Fabric actor named ${name} is already active (${sameName.id})`);
     }
-    if (sameName?.status === "stopped") await this.remove(sameName.id);
     if (!request.instructions.trim()) throw new Error("Actor instructions must not be empty");
     if (Buffer.byteLength(request.instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
@@ -518,12 +589,23 @@ export class ActorManager {
     });
     const pythonRuntime = kernel ? this.agents.resolvePythonRuntime(request.pythonRuntime) : undefined;
     const requestedModel = typeof request.model === "string" ? request.model.trim() : "";
-    const model = requestedModel ? await this.#resolvedModel(runner, requestedModel) : undefined;
+    const effectiveModel = requestedModel || this.agents.defaultModel(runner);
+    const admittedModel = effectiveModel ? await this.#resolvedModel(runner, effectiveModel) : undefined;
+    // No binding keeps actor defaults dynamic, but must still admit the current default.
+    const model = requestedModel ? admittedModel : undefined;
     const requirements = normalizeCapabilityRequirements(request.requires);
     if (requirements.length > 0 && !this.#acquireCapabilityView) {
       throw new Error("This Fabric host cannot commit actor capability requirements");
     }
     const id = randomUUID().replaceAll("-", "");
+    // Fence after async validation/model preparation, before even predecessor removal.
+    await beforeCommit?.(id);
+    // The async directory/predecessor hook may outlive cancellation. The local
+    // invocation fence must run synchronously next to each persistent effect.
+    checkActive?.();
+    // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
+    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
+    checkActive?.();
     const actorDirectory = path.join(this.#actorRoot, id);
     fs.mkdirSync(actorDirectory, { recursive: true, mode: 0o700 });
     const actor: ManagedActor = {
@@ -551,6 +633,7 @@ export class ActorManager {
       ...(request.transport ? { transport: request.transport } : {}),
       ...(request.timeoutMs ? { timeoutMs: request.timeoutMs } : {}),
       ...(request.nice !== undefined ? { nice: parseAgentNice(request.nice) } : {}),
+      ...(request.bashTimeoutSeconds !== undefined ? { bashTimeoutSeconds: parseBashTimeoutSeconds(request.bashTimeoutSeconds) } : {}),
       ...(typeof request.extensions === "boolean" ? { extensions: request.extensions } : {}),
       ...(request.inferenceContext !== undefined ? { inferenceContext: request.inferenceContext } : {}),
       requirements,
@@ -568,8 +651,7 @@ export class ActorManager {
     this.#ownQueueRead.add(id);                                 // a new actor has no queue file
     this.#ownership.set(id, true);
     await this.#publishPresence(actor);
-    await this.mesh
-      .publish({
+    await this.#publishNotification({
         topic: "fabric.actor.lifecycle",
         kind: "created",
         from: this.identity,
@@ -581,7 +663,18 @@ export class ActorManager {
 
   list(): FabricActorInfo[] {
     this.#syncActorsFromRegistry();
-    return [...this.#actors.values()].map((actor) => this.#publicInfo(actor));
+    this.#loadCleanupObligations();
+    return this.#listedActors();
+  }
+
+  #listedActors(): FabricActorInfo[] {
+    // Revoked rows are stopped cleanup obligations, not runnable actors or presence entries.
+    return [...this.#actors.values()].map((actor) => this.#publicInfo(actor)).concat(
+      [...this.#removalCleanup.keys()].flatMap((id) => {
+        const obligation = this.cleanupObligation(id);
+        return obligation ? [obligation] : [];
+      }),
+    );
   }
 
   listOwned(): FabricActorInfo[] {
@@ -621,11 +714,13 @@ export class ActorManager {
 
   owns(id: string): boolean {
     this.#syncActorsFromRegistry();
+    // The obligation loads lazily from disk: read the map after cleanupObligation() (named pass N3-1).
+    if (this.cleanupObligation(id)) return this.#ownsCleanup(this.#removalCleanup.get(id)!);
     const actor = this.#requireActor(id);
     return this.#canManage(actor.id);
   }
 
-  /** Resolve the immutable model/thinking view that a direct activation will pin. */
+  /** Resolve a caller-local view for foreign routing; own-root defaults stay dynamic. */
   resolveBinding(
     id: string,
     overrides: FabricActorRunBinding = {},
@@ -662,6 +757,7 @@ export class ActorManager {
     id: string,
     model: string | undefined,
     scope: FabricActorBindingScope = "session",
+    beforeCommit?: (id: string) => void,
   ): Promise<FabricActorInfo> {
     if (scope !== "session" && scope !== "project") {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
@@ -670,15 +766,24 @@ export class ActorManager {
     if (scope === "session") this.#syncActorsFromRegistry();
     const actor = scope === "session" ? this.#requireActor(id) : this.#requireOwnedActor(id);
     const resolved = next
-      ? scope === "project" || this.#canManage(actor.id)
+      ? scope === "project" || this.#canManage(actor.id) || this.agents.config.deniedModels.length > 0
         ? await this.#resolvedModel(actor.runner, next)
         : next
       : undefined;
+    this.agents.assertModelAllowed(resolved);
+    if (!resolved) {
+      const fallback = scope === "session" ? actor.model ?? this.agents.defaultModel(actor.runner)
+        : this.#bindings.get(actor.id)?.model ?? this.agents.defaultModel(actor.runner);
+      if (fallback) await this.#resolvedModel(actor.runner, fallback);
+      else await this.agents.prepareModelForAdmission(undefined, actor.runner);
+    }
+    // Fence after model refresh and (for session scope) binding-lock acquisition.
     if (scope === "session") {
-      await this.#bindings.setModel(actor.id, resolved);
+      await this.#bindings.setModel(actor.id, resolved, beforeCommit);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
+    beforeCommit?.(actor.id);
     if (resolved) actor.model = resolved;
     else delete actor.model;
     actor.updatedAt = Date.now();
@@ -694,6 +799,7 @@ export class ActorManager {
     id: string,
     thinking: string | undefined,
     scope: FabricActorBindingScope = "session",
+    beforeCommit?: (id: string) => void,
   ): Promise<FabricActorInfo> {
     if (scope !== "session" && scope !== "project") {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
@@ -706,11 +812,12 @@ export class ActorManager {
     if (scope === "session") {
       this.#syncActorsFromRegistry();
       const actor = this.#requireActor(id);
-      await this.#bindings.setThinking(actor.id, next);
+      await this.#bindings.setThinking(actor.id, next, beforeCommit);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
     const actor = this.#requireOwnedActor(id);
+    beforeCommit?.(actor.id);
     if (next) actor.thinking = next;
     else delete actor.thinking;
     actor.updatedAt = Date.now();
@@ -725,9 +832,11 @@ export class ActorManager {
    * and a Claude actor with no tools — unless the Pi actor was created with
    * `extensions: false`, in which case an empty list leaves it with no tools.
    */
-  async setTools(id: string, tools: string[]): Promise<FabricActorInfo> {
+  async setTools(id: string, tools: string[], beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
-    actor.tools = [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
+    const next = [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
+    beforeCommit?.(actor.id);
+    actor.tools = next;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -771,9 +880,10 @@ export class ActorManager {
    * Set or clear (null or []) the skip-only activation filter (smarty-dev#1579). It applies to
    * queued work from the next item on; the filtered count is kept.
    */
-  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null): Promise<FabricActorInfo> {
+  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
+    beforeCommit?.(actor.id);
     if (filter.length > 0) actor.activationFilter = filter;
     else delete actor.activationFilter;
     delete actor.invalidActivationFilter;
@@ -839,7 +949,9 @@ export class ActorManager {
   async resetSession(id: string): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#draining.get(actor.id);
-    if (actor.abortController || running?.abortController) {
+    // A drain owns admission before it installs its abort controller, including
+    // while a boundary presence write or launch preparation is awaiting.
+    if (actor.draining || running || this.#inFlight.has(actor.id) || actor.abortController) {
       return new Promise((resolve, reject) => {
         const waiters = this.#pendingResets.get(actor.id) ?? [];
         waiters.push({ resolve, reject });
@@ -855,6 +967,9 @@ export class ActorManager {
   // run never starts that would compact it. The archive is synchronous, so no run starts
   // between the check and the move.
   #resetAtBoundary(actor: ManagedActor): Promise<void> | undefined {
+    // Do not consume the waiters until the admitted activation has fully settled.
+    const running = this.#runningActor(actor.id);
+    if (this.#inFlight.has(actor.id) || running?.abortController || running?.inFlightRun) return undefined;
     const live = this.#liveActor(actor);
     const waiters = this.#pendingResets.get(actor.id);
     this.#pendingResets.delete(actor.id);
@@ -885,7 +1000,13 @@ export class ActorManager {
 
   // Moves session.jsonl to session.jsonl.<UTC stamp>.bak, keeps the 2 newest backups and logs it.
   #archiveSession(actor: ManagedActor, trigger: "requested" | "size"): void {
+    const running = this.#runningActor(actor.id);
+    if (this.#inFlight.has(actor.id) || running?.abortController || running?.inFlightRun) {
+      throw new Error(`Cannot rotate actor ${actor.name} while an activation is in flight`);
+    }
     const file = actor.sessionFile;
+    // Preserve malformed content separately from the bounded rotation history.
+    if (actor.runner === "pi" && fs.existsSync(file) && !this.#hasSessionHeader(file)) this.#ensurePiSession(actor);
     const dir = path.dirname(file);
     // Oldest first: by stamp, then by the -n suffix a same-millisecond archive gets.
     const prefix = `${path.basename(file)}.`;
@@ -894,7 +1015,7 @@ export class ActorManager {
       return [stamp, Number(n) || 0];
     };
     const listBackups = (): string[] => fs.readdirSync(dir)
-      .filter((name) => name.startsWith(prefix) && name.endsWith(".bak"));
+      .filter((name) => name.startsWith(prefix) && name.endsWith(".bak") && !name.includes(".orphan-noheader"));
     let bytes = 0;
     let archived: string | null = null;
     try {
@@ -916,6 +1037,8 @@ export class ActorManager {
         return a < b ? -1 : a > b ? 1 : m - n;
       });
     for (const name of backups.slice(0, -2)) fs.rmSync(path.join(dir, name), { force: true });
+    // Publish a complete header by temp + rename before a future writer can append.
+    this.#ensurePiSession(actor);
     // A Claude-runner actor resumes by runner session id: drop it, too.
     delete actor.runnerSessionId;
     actor.updatedAt = Date.now();
@@ -933,6 +1056,60 @@ export class ActorManager {
     });
   }
 
+  // A native Pi header is tiny; never read the multi-megabyte transcript just to validate it.
+  #hasSessionHeader(file: string): boolean {
+    const fd = fs.openSync(file, "r");
+    try {
+      const buffer = Buffer.alloc(64 * 1024);
+      const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+      const first = buffer.subarray(0, bytes).toString("utf8").split("\n", 1)[0]!;
+      try {
+        const header = JSON.parse(first);
+        return header?.type === "session" && typeof header.id === "string" && header.id.length > 0 &&
+          typeof header.cwd === "string" && typeof header.timestamp === "string" &&
+          Number.isFinite(Date.parse(header.timestamp)) &&
+          (header.version === undefined || [1, 2, 3].includes(header.version));
+      } catch { return false; }
+    } finally { fs.closeSync(fd); }
+  }
+
+  #ensurePiSession(actor: ManagedActor): void {
+    if (actor.runner !== "pi") return;
+    let archived: string | undefined;
+    try {
+      if (fs.existsSync(actor.sessionFile)) {
+        if (this.#hasSessionHeader(actor.sessionFile)) return;
+        const stamp = new Date().toISOString().replace(/[-:.]/g, "");
+        archived = `${actor.sessionFile}.${stamp}.${randomUUID()}.orphan-noheader.bak`;
+        fs.renameSync(actor.sessionFile, archived);
+      }
+      writeJsonAtomic(actor.sessionFile, {
+        type: "session", version: 3, id: randomUUID(),
+        timestamp: new Date().toISOString(), cwd: this.agents.cwd,
+      }, { newline: true, durable: this.#persistent });
+    } catch (error) {
+      this.#sessionAlarm(actor, "error", archived, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+    if (archived) this.#sessionAlarm(actor, "repaired", archived);
+  }
+
+  #sessionAlarm(actor: ManagedActor, outcome: "repaired" | "error", archived?: string, error?: string): void {
+    const text = `Fabric host notice: actor ${actor.name} session ${outcome === "repaired" ? "repaired (no valid header)" : "repair failed"}; ` +
+      `${archived ? `orphan preserved at ${archived}` : "no orphan archive"}${error ? `; ${error.split("\n")[0]}` : ""}.`;
+    const data = { actorId: actor.id, sessionFile: actor.sessionFile, archived, ...(error ? { error } : {}) };
+    const message: FabricActorMessage = {
+      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
+      source: "fabric-host", createdAt: Date.now(), action: "message", text, data,
+    };
+    this.#recordMessage(this.#liveActor(actor), message);
+    void this.mesh.publish({ topic: "ops.owner", kind: `actor.session.${outcome}`, from: this.identity, to: actor.rootId, text, data }).catch(() => undefined);
+    // Preserve the alarm above, but ESC/shutdown must not restart Main with a followUp.
+    if (this.#halted || this.#closing) return;
+    // Host alarms are visible even when the actor's own delivery policy is silent/mailbox.
+    try { this.onDeliver({ actor: this.#publicInfo(actor), message, delivery: "followUp", triggerTurn: true }); } catch { /* alarm remains in the mesh/message log */ }
+  }
+
   /**
    * Replace an existing actor's default instruction (its persona / system-prompt
    * body). Takes effect on the actor's next queued message: #runRequest builds
@@ -940,12 +1117,13 @@ export class ActorManager {
    * keeps the instructions it was launched with. Lets a steering user refine an
    * actor's role from the dashboard without recreating it.
    */
-  async setInstructions(id: string, instructions: string): Promise<FabricActorInfo> {
+  async setInstructions(id: string, instructions: string, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     if (!instructions.trim()) throw new Error("Actor instructions must not be empty");
     if (Buffer.byteLength(instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
     }
+    beforeCommit?.(actor.id);
     actor.instructions = instructions;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
@@ -966,8 +1144,7 @@ export class ActorManager {
       { message, ...(data === undefined ? {} : { data }) },
       bindingOptions,
     );
-    void this.mesh
-      .publish({
+    void this.#publishNotification({
         topic: "fabric.actor.input",
         kind: "direct.queued",
         from: this.identity,
@@ -988,6 +1165,8 @@ export class ActorManager {
     message: string,
     kind: "steer" | "followUp",
     data?: unknown,
+    principal?: FabricPrincipal,
+    signal?: AbortSignal,
   ): Promise<{ queued: true; messageId: string; routed: "mesh" }> {
     if (!this.meshConfig.enabled) {
       throw new Error("Fabric mesh is disabled; cannot steer a remote agent");
@@ -995,6 +1174,8 @@ export class ActorManager {
     if (!message.trim()) throw new Error("Steering message must not be empty");
     const event = await this.mesh.publish({
       topic: "fabric.steer",
+      principal,
+      signal,
       kind,
       from: this.identity,
       to: targetId,
@@ -1026,6 +1207,14 @@ export class ActorManager {
         { ...bindingOptions, resolve, reject },
       );
       const onAbort = () => {
+        // Only the interactive Main watchdog is observation-only. Escape, ordinary deadlines,
+        // explicit stop and non-Main callers keep their existing activation cancellation.
+        // Keep the accepted item (queued or in flight), its result history and normal delivery.
+        const reason = bindingOptions.detachOnMainCeiling ? mainExecutionCeilingAbortReason(signal) : undefined;
+        if (reason) {
+          reject(reason);
+          return;
+        }
         const index = actor.queue.findIndex((queued) => queued.id === item.id);
         if (index >= 0) {
           actor.queue.splice(index, 1);
@@ -1056,8 +1245,7 @@ export class ActorManager {
         cleanup();
         originalReject?.(error);
       };
-      void this.mesh
-        .publish({
+      void this.#publishNotification({
           topic: "fabric.actor.input",
           kind: "direct.queued",
           from: this.identity,
@@ -1127,27 +1315,55 @@ export class ActorManager {
 
   readLog(
     id: string,
-    opts: { type?: "session" | "run" | "all"; lines?: number; runId?: string; before?: number } = {},
+    opts: { type?: "session" | "run" | "all"; lines?: number; runId?: string; before?: number; beforeGeneration?: string } = {},
   ): FabricActorLog {
     this.#syncActorsFromRegistry();
     const actor = this.#requireActor(id);
     const type = opts.type ?? "session";
+    if (type === "all" && opts.beforeGeneration !== undefined) {
+      throw new Error("Generation-bound actor paging requires type session or run; re-read all without a cursor");
+    }
     const lines = Math.max(1, Math.min(opts.lines ?? 200, 5000));
     const sessionFile = actor.sessionFile;
     const logDir = path.join(path.dirname(sessionFile), "runs");
+    const retainedRuns = this.#logs.retainedRunIds(actor);
     const sessionPage = type === "run"
       ? { lines: [], hasMore: false }
-      : readJsonlPage(sessionFile, lines, opts.before);
+      : readJsonlPage(sessionFile, lines, opts.before, undefined, opts.beforeGeneration);
     const session = sessionPage.lines;
     let run: FabricActorLog["run"];
     if (type !== "session") {
       const targetRunId = opts.runId ?? actor.lastRunId;
-      if (targetRunId) {
-        const runPath = path.join(logDir, targetRunId);
-        if (fs.existsSync(runPath)) {
-          const statusRecord = readRunRecord(path.join(runPath, "status.json"));
+      if (targetRunId !== undefined) {
+        // Run IDs are produced by AgentManager, not caller-selected paths.
+        if (targetRunId.length !== 32 || !/^[0-9a-f]{32}$/.test(targetRunId)) {
+          throw new Error("Invalid retained run ID: expected 32 lowercase hexadecimal characters");
+        }
+        if (!retainedRuns.includes(targetRunId)) {
+          if (opts.runId !== undefined) {
+            throw new Error(`Run ${targetRunId} is not retained by actor ${actor.id}`);
+          }
+        } else {
+          const runPath = path.join(logDir, targetRunId);
+          const realRunPath = fs.realpathSync(runPath);
+          if (path.dirname(realRunPath) !== fs.realpathSync(logDir)) {
+            throw new Error(`Run ${targetRunId} is outside actor log directory`);
+          }
+          const statusFile = path.join(runPath, "status.json");
           const eventsFile = path.join(runPath, "events.jsonl");
-          const page = readJsonlPage(eventsFile, lines, opts.before);
+          for (const file of [statusFile, eventsFile]) {
+            if (fs.existsSync(file) && path.dirname(fs.realpathSync(file)) !== realRunPath) {
+              throw new Error(`Run ${targetRunId} log file is outside retained run directory`);
+            }
+          }
+          const statusRecord = readRunRecord(statusFile);
+          // Older archives and synthetic workers may omit actor attribution;
+          // their direct archive membership still binds them to this actor.
+          if (!statusRecord || statusRecord.id !== targetRunId ||
+            (statusRecord.actorId !== undefined && statusRecord.actorId !== actor.id)) {
+            throw new Error(`Run ${targetRunId} does not belong to actor ${actor.id}`);
+          }
+          const page = readJsonlPage(eventsFile, lines, opts.before, undefined, opts.beforeGeneration);
           run = {
             runId: targetRunId,
             eventsFile,
@@ -1155,6 +1371,7 @@ export class ActorManager {
             events: page.lines,
             hasMore: page.hasMore,
             ...(page.before !== undefined ? { before: page.before } : {}),
+            ...(page.generation !== undefined ? { generation: page.generation } : {}),
           };
         }
       }
@@ -1167,8 +1384,9 @@ export class ActorManager {
       session,
       sessionHasMore: sessionPage.hasMore,
       ...(sessionPage.before !== undefined ? { sessionBefore: sessionPage.before } : {}),
+      ...(sessionPage.generation !== undefined ? { sessionGeneration: sessionPage.generation } : {}),
       ...(run ? { run } : {}),
-      retainedRuns: this.#logs.retainedRunIds(actor),
+      retainedRuns,
     };
   }
 
@@ -1178,8 +1396,9 @@ export class ActorManager {
     this.#mainIdle = idle;
   }
 
-  observeHostEvent(event: FabricActorHostEvent, idle = false): boolean {
-    if (!this.#beginHostEvent(event, idle)) return false;
+  /** `source` is the Pi input event's source: an extension's own prompt never lifts a halt. */
+  observeHostEvent(event: FabricActorHostEvent, idle = false, source?: string): boolean {
+    if (!this.#beginHostEvent(event, idle, source)) return false;
     return [...this.#actors.values()].some(
       (actor) => this.#observesHostEvent(actor, event),
     );
@@ -1194,7 +1413,11 @@ export class ActorManager {
       typeof (payload as { signal?: { idle?: unknown } }).signal?.idle === "boolean"
       ? (payload as { signal: { idle: boolean } }).signal.idle
       : undefined;
-    if (!this.#beginHostEvent(event, payloadIdle ?? event === "agent_settled")) return 0;
+    const signal = typeof payload === "object" && payload !== null
+      ? (payload as { signal?: { payload?: { source?: unknown } } }).signal
+      : undefined;
+    const source = typeof signal?.payload?.source === "string" ? signal.payload.source : undefined;
+    if (!this.#beginHostEvent(event, payloadIdle ?? event === "agent_settled", source)) return 0;
     return this.dispatchObservedHostEvent(event, payload, images);
   }
 
@@ -1269,9 +1492,11 @@ export class ActorManager {
             : {}),
         },
       });
-    void publish(images.length > 0).catch(() =>
-      images.length > 0 ? publish(false).catch(() => undefined) : undefined,
-    );
+    void this.#notifications.enqueue(() => publish(images.length > 0).catch(error => {
+      if (isMeshLockTimeout(error)) throw error;
+      if (images.length > 0) return publish(false);
+      throw error;
+    }));
   }
 
   #acceptRelayedHostEvent(actor: ManagedActor, event: MeshEvent): void {
@@ -1314,7 +1539,7 @@ export class ActorManager {
     });
   }
 
-  #beginHostEvent(event: FabricActorHostEvent, idle: boolean): boolean {
+  #beginHostEvent(event: FabricActorHostEvent, idle: boolean, source?: string): boolean {
     if (this.#closing || !this.meshConfig.enabled) return false;
     // Streaming/message/provider hooks are frequent. The actor registry watcher
     // keeps this in-memory roster current, so events that do not participate in
@@ -1327,8 +1552,9 @@ export class ActorManager {
     this.#syncActorsFromRegistry();
     this.#refreshOwnership();
     // The user sending a new message ends a stop-the-world halt: lift the gate
-    // before dispatching so input-subscribed actors receive this event.
-    if (event === "input" && this.#halted) {
+    // before dispatching so input-subscribed actors receive this event. An
+    // extension's own prompt is not the user resuming (pi-fabric#160 S2).
+    if (event === "input" && this.#halted && source !== "extension") {
       this.#halted = false;
       this.#meshMonitor.schedule();
       this.#scheduleRestoreParked();
@@ -1341,17 +1567,40 @@ export class ActorManager {
     return true;
   }
 
-  async stop(id: string): Promise<FabricActorInfo> {
-    const actor = this.#requireOwnedActor(id);
-    if (actor.status === "stopped") return this.#publicInfo(actor);
+  /** Registry reloads replace metadata, not the object executing this immutable ID's run. */
+  #runningActor(id: string): ManagedActor | undefined {
+    return this.#draining.get(id) ?? this.#actors.get(id);
+  }
+
+  #stopRun(actor: ManagedActor): void {
     actor.status = "stopped";
     actor.updatedAt = Date.now();
+    // Explicit stop wins over an ownership abort: do not park/retry the abandoned activation.
+    if (actor.abortController) actor.cancelAbort = actor.abortController;
+    delete actor.ownershipAbort;
+    // Mark abandonment before abort, so a dead worker cannot be recovered for this owner.
+    if (actor.inFlightRun) this.agents.abandon(actor.inFlightRun.id);
     actor.abortController?.abort();
-    this.#drop(actor, [...this.#takeQueued(actor), ...this.#takeParked(actor.id)],
+  }
+
+  async #joinStoppedRun(id: string): Promise<void> {
+    const running = this.#runningActor(id);
+    if (!running) return;
+    this.#stopRun(running);
+    await running.drain?.catch(() => undefined);
+  }
+
+  async stop(id: string): Promise<FabricActorInfo> {
+    const actor = this.#requireOwnedActor(id);
+    const running = this.#runningActor(actor.id)!;
+    const stopped = actor.status === "stopped";
+    this.#stopRun(running);
+    if (running !== actor) this.#stopRun(actor);
+    if (stopped && running === actor) return this.#publicInfo(actor);
+    this.#drop(actor, [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
     await this.#publishPresence(actor);
-    await this.mesh
-      .publish({
+    await this.#publishNotification({
         topic: "fabric.actor.lifecycle",
         kind: "stopped",
         from: this.identity,
@@ -1436,19 +1685,334 @@ export class ActorManager {
     return { halted };
   }
 
-  async remove(id: string): Promise<{ removed: boolean }> {
+  /**
+   * Remove an actor. With `wait: false` (the resident host, smarty-dev#2184 item 8) a removal
+   * behind an in-flight run stops the actor, returns at once with the pending state, and
+   * finishes (drain, then cleanup) when that run ends; the host's request queue never waits.
+   */
+  async remove(
+    id: string,
+    { wait = true }: { wait?: boolean } = {},
+  ): Promise<RemovalResult> {
+    // Resolve aliases only against registered actors; cleanup retries require the exact full id.
+    const actorId = this.cleanupObligation(id) || this.#removeCalls.has(id) ? id : this.#requireOwnedActor(id).id;
+    // Share acceptance, not the first caller's wait policy. Every caller joins the same finisher.
+    const call = this.#removeCalls.get(actorId) ?? this.#remove(actorId);
+    this.#removeCalls.set(actorId, call);
+    let result: RemovalResult;
+    try { result = await call; } finally {
+      if (this.#removeCalls.get(actorId) === call) this.#removeCalls.delete(actorId);
+    }
+    if (!wait) return result;
+    const pending = this.#removals.get(actorId);
+    if (pending) await pending;
+    if (pending || (result.pending && result.cleaned !== false)) {
+      const actor = this.#actors.get(actorId);
+      // Retries that ran out leave the actor and its saved marker: that is not a removal.
+      if (actor?.removal) throw new Error(`Fabric actor ${actor.name} (${actor.id}): ${this.#removalState(actor)}`);
+      return this.#cleanupState(actorId);
+    }
+    return result;
+  }
+
+  async #remove(id: string): Promise<RemovalResult> {
+    if (this.cleanupObligation(id)) {
+      if (!this.#ownsCleanup(this.#removalCleanup.get(id)!)) throw new Error("Only the owning host can finish this actor's cleanup");
+      const running = this.#runningActor(id);
+      if (!this.#removals.has(id) && running?.drain) {
+        this.#stopRun(running);
+        this.#removals.set(id, this.#finishBehind(running, running.drain));
+      }
+      if (!this.#removals.has(id)) return this.#finishCleanup(this.#removalCleanup.get(id)!);
+      return this.#cleanupState(id);
+    }
     const actor = this.#requireOwnedActor(id);
-    await this.stop(id);
-    await actor.drain?.catch(() => undefined);
-    const retainedRunId = actor.lastRunId;
-    await this.#bindings.delete(actor.id);
-    this.#actors.delete(actor.id);
-    this.#emitChange();
-    fs.rmSync(path.dirname(actor.sessionFile), { recursive: true, force: true });
-    await this.#saveActors(new Set([actor.id]));
-    await this.#writePresence(actor.id);                      // the actor is gone: a delete
-    if (retainedRunId) await this.agents.cleanup(retainedRunId).catch(() => ({ cleaned: false }));
-    return { removed: true };
+    if (actor.removal) {
+      await this.stop(actor.id);
+      // A missing drain on reloaded metadata is not proof that the old run settled.
+      const drain = this.#runningActor(actor.id)?.drain;
+      if (!this.#removals.has(actor.id) && drain) {
+        this.#removals.set(actor.id, this.#finishBehind(actor, drain));
+      }
+      if (this.#removals.has(actor.id)) return { removed: true, pending: this.#removalState(actor) };
+      return this.#finishRemove(actor);
+    }
+    await this.stop(actor.id);
+    const running = this.#runningActor(actor.id);
+    const drain = running?.drain;
+    if (drain) {
+      const inFlightRun = running.inFlightRun;
+      actor.removal = {
+        requestedAt: Date.now(),
+        ...(inFlightRun ? { runId: inFlightRun.id, runStartedAt: inFlightRun.startedAt } : {}),
+      };
+      // The marker is the durable revocation: a restarted owner finishes the removal from it. The
+      // removal is accepted only once it is saved (review round 1 on pi-fabric#160).
+      try {
+        await this.#saveActors(new Set(), { durable: true });
+      } catch (error) {
+        delete actor.removal;
+        throw new Error(`Fabric actor ${actor.name} (${actor.id}) is stopped, but its removal was not saved: ` +
+          `${error instanceof Error ? error.message : String(error)}; remove it again`);
+      }
+      this.#removals.set(actor.id, this.#finishBehind(actor, drain));
+      this.#emitChange();
+      await this.#publishPresence(actor).catch(() => undefined);
+      return { removed: true, pending: this.#removalState(actor) };
+    }
+    return this.#finishRemove(actor);
+  }
+
+  /**
+   * Finish an accepted removal once its run ends, retrying a failed cleanup with backoff. A cleanup
+   * that still fails keeps its saved marker: the next remove() or owner start finishes it.
+   */
+  async #finishBehind(actor: ManagedActor, drain: Promise<void>): Promise<void> {
+    await drain.catch(() => undefined);
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const result = await this.#finishRemove(actor);
+          if (result.cleaned === false) throw new Error(result.pending);
+          return;
+        } catch (error) {
+          actor.lastError = `removal cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+          if (attempt >= REMOVAL_RETRIES || this.#closing) return;
+          await new Promise((resolve) => setTimeout(resolve, this.#removalRetryMs * 2 ** attempt).unref?.());
+        }
+      }
+    } finally {
+      this.#removals.delete(actor.id);
+      this.#emitChange();
+    }
+  }
+
+  /** In-flight removals and revoked cleanup obligations; the resident host reports both. */
+  pendingRemovals(): Array<{ id: string; name: string; requestedAt: number; runId?: string; runStartedAt?: number; state: string }> {
+    this.#loadCleanupObligations();
+    return this.#listedActors().filter((actor) => actor.removal).map((actor) => ({
+      id: actor.id,
+      name: actor.name,
+      requestedAt: actor.removal!.requestedAt,
+      ...(actor.removal!.runId ? { runId: actor.removal!.runId } : {}),
+      ...(actor.removal!.runStartedAt ? { runStartedAt: actor.removal!.runStartedAt } : {}),
+      state: actor.removal!.state,
+    }));
+  }
+
+  /** Settles when the pending removal of `id` (if any) has finished. */
+  removalSettled(id: string): Promise<void> | undefined {
+    return this.#removals.get(id);
+  }
+
+  /** A restarted owner finishes the removals its predecessor accepted: no run survives a restart. */
+  async finishPendingRemovals(): Promise<void> {
+    this.#loadCleanupObligations();
+    for (const cleanup of [...this.#removalCleanup.values()]) {
+      if (this.cleanupObligation(cleanup.id) && this.#ownsCleanup(cleanup) &&
+          !this.#removals.has(cleanup.id) && !this.#removeCalls.has(cleanup.id) && !this.#finishCalls.has(cleanup.id)) {
+        await this.remove(cleanup.id);
+      }
+    }
+    for (const actor of [...this.#actors.values()]) {
+      if (actor.removal && this.#canManage(actor.id)) {
+        // Recovery shares acceptance and finalization, including a run still alive in this host.
+        await this.remove(actor.id).catch(() => undefined);
+      }
+    }
+  }
+
+  #removalState(actor: ManagedActor): string {
+    const since = actor.removal?.requestedAt ?? Date.now();
+    const inFlightRun = this.#runningActor(actor.id)?.inFlightRun;
+    const runId = actor.removal?.runId ?? inFlightRun?.id;
+    const age = formatAge(Date.now() - (actor.removal?.runStartedAt ?? inFlightRun?.startedAt ?? since));
+    const state = runId
+      ? `removal of ${actor.name} (${actor.id}) is pending behind its in-flight run ${runId} (${age})`
+      : `removal of ${actor.name} (${actor.id}) is pending (${formatAge(Date.now() - since)})`;
+    // A cleanup that failed says so, and how it will finish.
+    return actor.lastError?.startsWith("removal cleanup failed") && !this.#removals.has(actor.id)
+      ? `${state}; ${actor.lastError} (a later remove or host start finishes it)`
+      : state;
+  }
+
+  /** Exact-id, stopped reporting row for a committed cleanup obligation. */
+  cleanupObligation(id: string): FabricActorInfo | undefined {
+    this.#syncActorsFromRegistry();
+    // A passive Main learns the resident owner's obligation from disk, even without a restart.
+    if (/^[a-f0-9]{32}$/.test(id) && !this.#removalCleanup.has(id) && this.#registryRevoked(id)) {
+      const saved = this.#readCleanup(id);
+      if (saved) { this.#removalCleanup.set(id, saved); this.#revoked.add(id); }
+    }
+    const cleanup = this.#removalCleanup.get(id);
+    if (!cleanup || !this.#revoked.has(id) || this.#actors.has(id)) return undefined;
+    const owner = cleanup.owner;
+    const requestedAt = owner?.requestedAt ?? 0;
+    return { id, scope: this.#actorScope, name: owner?.name ?? id,
+      ...(owner ? { rootId: owner.rootId, residency: owner.residency } : {}), status: "stopped", runner: "pi", events: [], topics: [],
+      delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false,
+      queued: 0, messages: 0, createdAt: requestedAt, updatedAt: requestedAt,
+      removal: { requestedAt, state: cleanup.pending ?? "registry revoked; removal cleanup pending" } };
+  }
+
+  #ownsCleanup(cleanup: RemovalCleanup): boolean {
+    if (this.#ceded.has(cleanup.id)) return false;
+    const decision = this.#canManageActor?.(cleanup.id);
+    if (decision !== undefined) return decision;
+    if (this.#claimResidency !== undefined) {
+      return cleanup.owner?.rootId === this.#rootId && cleanup.owner.residency === this.#claimResidency;
+    }
+    return this.#canManageActor === undefined || cleanup.owner?.rootId === this.#rootId;
+  }
+
+  #loadCleanupObligations(): void {
+    if (!this.#persistent || !this.meshConfig.enabled) return;
+    try {
+      const registry = this.#registry.read() as { actors?: Array<{ id: string }> } | null;
+      if (!Array.isArray(registry?.actors) || !registry.actors.every((actor) => actor && typeof actor.id === "string")) return;
+      const live = new Set(registry.actors.map((actor) => actor.id));
+      const files = fs.readdirSync(this.#actorRoot);
+      for (const id of this.#removalCleanup.keys()) {
+        if (this.#revoked.has(id) && !files.includes(`removal-${id}.json`) &&
+            !this.#removeCalls.has(id) && !this.#finishCalls.has(id) && !this.#removals.has(id)) {
+          this.#removalCleanup.delete(id);
+          this.#revoked.delete(id);
+        }
+      }
+      for (const file of files) {
+        const match = /^removal-([a-f0-9]{32})\.json$/.exec(file);
+        if (!match || live.has(match[1]!)) continue;
+        // A corrupt or symlinked marker cannot suppress unrelated valid obligations.
+        const cleanup = this.#removalCleanup.get(match[1]!) ?? this.#readCleanup(match[1]!);
+        if (cleanup) { this.#removalCleanup.set(cleanup.id, cleanup); this.#revoked.add(cleanup.id); }
+      }
+    } catch { /* An unreadable registry/directory proves no revocation; retry later. */ }
+  }
+
+  #registryRevoked(id: string): boolean {
+    if (!this.#persistent || !this.meshConfig.enabled) return true;
+    try {
+      const registry = this.#registry.read() as { actors?: Array<{ id: string }> } | null;
+      return Array.isArray(registry?.actors) && registry.actors.every((actor) =>
+        actor && typeof actor.id === "string" && actor.id !== id);
+    } catch { return false; }
+  }
+
+  #readCleanup(id: string): RemovalCleanup | undefined {
+    try {
+      const file = this.#cleanupPath(id);
+      if (!fs.lstatSync(file).isFile()) return undefined; // Never follow marker symlinks.
+      const cleanup = JSON.parse(fs.readFileSync(file, "utf8")) as RemovalCleanup | null;
+      if (!cleanup || cleanup.id !== id || cleanup.sessionDir !== path.join(this.#actorRoot, id) ||
+          typeof cleanup.presenceKey !== "string" || !/^actors\/[^/]+\/[^/]+$/.test(cleanup.presenceKey) ||
+          !cleanup.presenceKey.endsWith(`/${id}`) ||
+          (cleanup.lastRunId !== undefined && typeof cleanup.lastRunId !== "string") ||
+          (cleanup.owner !== undefined && (!cleanup.owner || typeof cleanup.owner.name !== "string" ||
+            typeof cleanup.owner.rootId !== "string" || !["session", "durable"].includes(cleanup.owner.residency) ||
+            !Number.isFinite(cleanup.owner.requestedAt)))) return undefined;
+      return cleanup;
+    } catch { return undefined; } // Skip only this unreadable/malformed marker.
+  }
+
+  #cleanupPath(id: string): string {
+    return path.join(this.#actorRoot, `removal-${id}.json`);
+  }
+
+  #cleanupState(id: string): RemovalResult {
+    const cleanup = this.#removalCleanup.get(id);
+    return cleanup ? { removed: true, cleaned: false, pending: cleanup.pending ?? "removal cleanup pending" }
+      : { removed: true };
+  }
+
+  async #finishCleanup(cleanup: RemovalCleanup): Promise<RemovalResult> {
+    // A prepared marker (or a transient hole in the actor map) is not a revocation receipt.
+    if (!this.#revoked.has(cleanup.id) || !this.#registryRevoked(cleanup.id)) {
+      throw new Error(`Fabric actor ${cleanup.id}: registry revocation did not commit`);
+    }
+    try {
+      await this.#joinStoppedRun(cleanup.id);
+      await this.#bindings.delete(cleanup.id);
+      fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
+      if (cleanup.presenceKey === this.#presenceKey(cleanup.id)) {
+        await this.#writePresence(cleanup.id);
+        if (this.#pendingPresence.has(cleanup.id)) throw new Error("presence deletion pending");
+      } else {
+        await this.mesh.delete({ key: cleanup.presenceKey });
+      }
+      if (cleanup.lastRunId) await this.agents.cleanup(cleanup.lastRunId).catch(() => ({ cleaned: false }));
+      if (this.#persistent && this.meshConfig.enabled) fs.rmSync(this.#cleanupPath(cleanup.id), { force: true });
+      this.#removalCleanup.delete(cleanup.id);
+      this.#revoked.delete(cleanup.id);
+      this.#emitChange();
+    } catch (error) {
+      cleanup.pending = `removal cleanup failed: ${error instanceof Error ? error.message : String(error)} (a later remove or host start finishes it)`;
+    }
+    return this.#cleanupState(cleanup.id);
+  }
+
+  async #finishRemove(actor: ManagedActor): Promise<RemovalResult> {
+    const running = this.#finishCalls.get(actor.id);
+    if (running) return running;
+    const call = this.#commitRemove(actor);
+    this.#finishCalls.set(actor.id, call);
+    try { return await call; } finally { this.#finishCalls.delete(actor.id); }
+  }
+
+  async #commitRemove(actor: ManagedActor): Promise<RemovalResult> {
+    // Finalization and recovery must fence the actual old-object drain before revocation.
+    await this.#joinStoppedRun(actor.id);
+    const cleanup: RemovalCleanup = this.#removalCleanup.get(actor.id) ?? this.#readCleanup(actor.id) ?? {
+      id: actor.id, sessionDir: path.dirname(actor.sessionFile), presenceKey: this.#presenceKey(actor.id),
+      ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
+    };
+    cleanup.owner ??= { name: actor.name, rootId: actor.rootId, residency: actor.residency,
+      requestedAt: actor.removal?.requestedAt ?? Date.now() };
+    // Re-establish the barrier on every attempt, including a marker left by a failed rename
+    // directory sync. A visible marker alone is not proof that the obligation is durable.
+    if (this.#persistent && this.meshConfig.enabled) {
+      writeJsonAtomic(this.#cleanupPath(actor.id), cleanup, { durable: true });
+    }
+    this.#removalCleanup.set(actor.id, cleanup);
+    if (this.#actors.has(actor.id)) {
+      this.#actors.delete(actor.id);
+      try {
+        await this.#saveActors(new Set([actor.id]));
+        if (!this.#registryRevoked(actor.id)) throw new Error(`Fabric actor ${actor.id}: registry revocation did not commit`);
+      } catch (error) {
+        // Not revoked: retain the actor and any accepted-removal marker for a later attempt.
+        if (!this.#actors.has(actor.id)) this.#actors.set(actor.id, actor);
+        throw error;
+      }
+      this.#revoked.add(actor.id);
+      this.#emitChange();
+    }
+    return this.#finishCleanup(cleanup);
+  }
+
+  /** Reversible activation gate. It never aborts a worker or consumes mesh input. */
+  pauseForRelease(): void { this.#releasePaused = true; }
+  resumeAfterRelease(): void {
+    this.#releasePaused = false;
+    for (const actor of this.#actors.values()) if (actor.queue.length) this.#ensureDrain(actor);
+    this.#meshMonitor.schedule();
+  }
+  /** Save accepted queues (including empty completion fences) BEFORE either cursor advances. */
+  async checkpointForRelease(): Promise<void> {
+    if (!this.#releasePaused || this.inFlightCount() || this.#pendingResets.size ||
+        this.#removals.size || this.#removeCalls.size || this.#finishCalls.size || this.pendingRemovals().length) {
+      throw new Error("Actor release boundary is not quiescent");
+    }
+    await Promise.all([...this.#presenceChains.values()]);
+    let checkpointedActor = false;
+    for (const actor of this.#actors.values()) {
+      if (!this.#ownershipDecision(actor.id)) continue;
+      checkpointedActor = true;
+      if (!this.#persistQueue(actor.id, true, true)) throw new Error(`Actor ${actor.id} queue did not checkpoint`);
+    }
+    // An untouched empty secondary scope has no registry inode to checkpoint.
+    // Do not turn its proven absence into a rollback-read of a nonexistent file.
+    if (checkpointedActor || this.#registry.records().length) await this.#saveActors(new Set(), { durable: true });
+    this.#meshMonitor.checkpointForRelease();
   }
 
   async close(): Promise<void> {
@@ -1459,6 +2023,7 @@ export class ActorManager {
     this.#presenceTimer = undefined;
     // Let presence writes already in flight finish before the runtime goes.
     await Promise.allSettled([...this.#presenceChains.values()]);
+    await this.#notifications.close();
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
     this.#listeners.clear();
@@ -1512,21 +2077,22 @@ export class ActorManager {
       holdWhenFull?: boolean;
     } = {},
   ): ActorQueueItem {
+    if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
     const canManage = options.ownershipChecked
       ? this.#canManageCached(actor.id)
       : this.#canManage(actor.id);
     if (!canManage) {
       throw new Error(`Fabric actor is owned by another host: ${actor.id}`);
     }
+    if (actor.removal) throw new Error(`Fabric actor ${actor.name} (${actor.id}): ${this.#removalState(actor)}`);
     if (actor.status === "stopped") {
       throw new Error(`Fabric actor ${actor.name} (${actor.id}) is stopped`);
     }
     if (options.binding !== undefined && options.overrides !== undefined) {
       throw new Error("Actor activation cannot carry both overrides and a resolved binding");
     }
-    const unresolved = options.binding !== undefined
-      ? this.#validatedRunBinding(options.binding)
-      : this.#runBinding(actor, options.overrides);
+    const bindingMode = options.binding !== undefined ? "resolved" : "owner-defaults";
+    const unresolved = this.#validatedRunBinding(options.binding ?? options.overrides ?? {});
     // A synchronous resolver (the resident owner) rejects a hidden model here, so the caller
     // learns at once. A resolver that may refresh the registry is async: #drain resolves the
     // model again when the activation runs, and enqueue stays synchronous (smarty-dev#1830).
@@ -1540,6 +2106,7 @@ export class ActorManager {
         .find((item) => item.coalesceKey === options.coalesceKey);
       if (existing) {
         existing.payload = structuredClone(payload);
+        existing.provenance = options.provenance ? structuredClone(options.provenance) : undefined;
         if (options.images && options.images.length > 0) {
           existing.images = options.images.map((image) => ({ ...image }));
         } else {
@@ -1548,6 +2115,8 @@ export class ActorManager {
         existing.createdAt = createdAt;
         existing.activation = this.#activation(existing.id, source, payload, sequence, createdAt);
         existing.binding = binding;
+        existing.bindingMode = bindingMode;
+        existing.bindingVersion = 2;
         this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
         return existing;
@@ -1562,6 +2131,7 @@ export class ActorManager {
     const itemId = randomUUID();
     const item: ActorQueueItem = {
       id: itemId,
+      ...(options.provenance ? { provenance: structuredClone(options.provenance) } : {}),
       source,
       payload: structuredClone(payload),
       ...(options.images && options.images.length > 0
@@ -1570,6 +2140,8 @@ export class ActorManager {
       createdAt,
       activation: this.#activation(itemId, source, payload, sequence, createdAt),
       binding,
+      bindingMode,
+      bindingVersion: 2,
       ...(options.resolve ? { resolve: options.resolve } : {}),
       ...(options.reject ? { reject: options.reject } : {}),
       ...(options.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
@@ -1591,7 +2163,7 @@ export class ActorManager {
       actor.queue.push(item);
     }
     this.#persistQueue(actor.id);
-    actor.status = "queued";
+    if (!this.#inFlight.has(actor.id)) actor.status = "queued";
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
       id: item.id,
@@ -1622,6 +2194,7 @@ export class ActorManager {
       // replaced the object an older drain still runs on (smarty-dev#442).
       this.#draining.has(actor.id) ||
       actor.status === "stopped" ||
+      (this.#releasePaused && !actor.queue.some((item) => item.resolve || item.reject)) ||
       this.#closing ||
       !this.#canManage(actor.id)
     ) {
@@ -1641,6 +2214,7 @@ export class ActorManager {
     try {
       while (
         actor.queue.length > 0 &&
+        (!this.#releasePaused || actor.queue.some((item) => item.resolve || item.reject)) &&
         actor.status !== "stopped" &&
         !this.#closing &&
         this.#canManage(actor.id)
@@ -1717,10 +2291,27 @@ export class ActorManager {
             delete actor.capabilityDigest;
           }
           // A miss fails this activation with the resolver's error (ask rejects, lastError set).
-          item.binding = await this.#resolvedRunBinding(actor, item.binding);
+          // Foreign caller views are already resolved: missing fields must reach the
+          // runner/config fallback, never the owner's private session binding.
+          const launchBinding = await this.#resolvedRunBinding(actor, item.bindingMode === "resolved"
+            ? item.binding : this.#runBinding(actor, item.binding));
+          // Admission is held, but no child writer has launched yet. Repair/create
+          // the native session before handing its path to the process.
+          this.#ensurePiSession(actor);
           const result = await this.agents.run(
-            this.#runRequest(actor, item, inferenceContext, committedRefs, actor.capabilityDigest),
+            this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
+            (handle) => {
+              actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
+              void this.#publishPresence(actor).catch(() => undefined);
+            },
+            // The controller identity is this activation's generation token. A
+            // permit may arrive after stop/remove/halt or after a newer drain.
+            () => !this.#closing && !abortController.signal.aborted &&
+              this.#runningActor(actor.id)?.abortController === abortController &&
+              actor.status !== "stopped" && this.#actors.has(actor.id) &&
+              this.#actors.get(actor.id)?.status !== "stopped" && this.#ownershipDecision(actor.id),
+            () => this.#downgradeOutputPrincipal(actor, item),
           );
           runId = result.id;
           // Captured before any check that can throw: a completed run is never parked and
@@ -1777,6 +2368,8 @@ export class ActorManager {
             throw new Error(result.error || `Actor run ${result.status}`);
           }
           const message = this.#outgoingMessage(actor, item, result);
+          const principal = this.agents.outputPrincipal(result.id);
+          if (principal) message.principal = principal;
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
           this.#failureStreaks.delete(actor.id);
@@ -1789,9 +2382,9 @@ export class ActorManager {
             continue;
           }
           this.#recordMessage(this.#liveActor(actor), message);
-          await this.mesh
-            .publish({
+          await this.#publishNotification({
               topic: "fabric.actor.output",
+              principal: message.principal,
               kind: message.action ?? "message",
               from: { id: actor.id, name: actor.name, kind: "actor", sessionId: this.sessionId },
               ...(message.text ? { text: message.text } : {}),
@@ -1875,6 +2468,7 @@ export class ActorManager {
             await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
           }
           delete actor.abortController;
+          delete actor.inFlightRun;
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           this.#finishInFlight(actor.id, item);
@@ -1888,7 +2482,11 @@ export class ActorManager {
       // A reset requested during the last run is applied before a new drain can start one.
       // Its caller may queue work at once, which the drain after this one runs.
       const resetAtExit = this.#pendingResets.has(actor.id);
-      if (resetAtExit) await this.#resetAtBoundary(actor)?.catch(() => undefined);
+      // A reset caller can enqueue another reset from its resolved promise while
+      // the boundary presence write is settling. Consume it before releasing admission.
+      while (this.#pendingResets.has(actor.id) && !this.#inFlight.has(actor.id) && !actor.abortController) {
+        await this.#resetAtBoundary(actor)?.catch(() => undefined);
+      }
       actor.draining = false;
       if (this.#draining.get(actor.id) === actor) this.#draining.delete(actor.id);
       // A reload may have moved this actor's queue to a new object while this drain ran.
@@ -1935,14 +2533,26 @@ export class ActorManager {
     }
   }
 
+  #downgradeOutputPrincipal(actor: ManagedActor, item: ActorQueueItem): void {
+    if (item.provenance) delete item.provenance.principal;
+    // Caller-owned asks are not recovered; durable callerless activations must commit
+    // their cumulative lineage before the child can consume the foreign/UNKNOWN input.
+    if (this.#persistent && !item.resolve && !item.reject &&
+      (this.#inFlight.get(actor.id) !== item || !this.#persistQueue(actor.id, true))) {
+      throw new Error(`Cannot persist output-principal downgrade for Fabric actor ${actor.id}; steering rejected`);
+    }
+  }
+
   #runRequest(
     actor: ManagedActor,
     item: ActorQueueItem,
+    binding: FabricActorRunBinding,
     inferenceContext: FabricActorInferenceContext | undefined,
     capabilityRequirements?: string[],
     capabilityDigest?: string,
   ): AgentRunRequest {
     return {
+      ...(item.provenance ? { provenance: structuredClone(item.provenance) } : {}),
       task: [
         `Fabric actor message from ${item.source}:`,
         JSON.stringify({ source: item.source, payload: item.payload, id: item.id }, null, 2),
@@ -1968,12 +2578,13 @@ export class ActorManager {
         ? { schema: directiveSchema, ...(actor.runner === "pi" ? { replyTool: true } : {}) }
         : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
-      ...(item.binding.model ? { model: item.binding.model } : {}),
-      ...(item.binding.thinking ? { thinking: item.binding.thinking } : {}),
+      ...(binding.model ? { model: binding.model } : {}),
+      ...(binding.thinking ? { thinking: binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
       ...(actor.nice !== undefined ? { nice: actor.nice } : {}),
+      ...(actor.bashTimeoutSeconds !== undefined ? { bashTimeoutSeconds: actor.bashTimeoutSeconds } : {}),
     };
   }
 
@@ -2180,6 +2791,8 @@ export class ActorManager {
     const target = event.to;
     if (!target) return;
     const kind = event.kind === "followUp" ? "followUp" : "steer";
+    const provenance = event.verification === "mesh" || event.verification === "bridge"
+      ? fabricTurnProvenance(event.from, kind, event.verification, event.principal) : undefined;
     const message = typeof event.text === "string" ? event.text : "";
     if (!message) return;
     if (this.#relayParticipantSteering) {
@@ -2187,6 +2800,8 @@ export class ActorManager {
         try {
           this.#mainAgent.deliverAgent({
             from: event.from,
+            ...(event.verification === undefined ? {} : { verification: event.verification }),
+            principal: event.principal,
             message,
             delivery: kind,
             ...(event.data === undefined ? {} : { data: event.data }),
@@ -2198,8 +2813,8 @@ export class ActorManager {
       }
       try {
         this.agents.status(target);
-        if (kind === "steer") this.agents.steer(target, message);
-        else this.agents.followUp(target, message);
+        if (kind === "steer") this.agents.steer(target, message, undefined, provenance);
+        else this.agents.followUp(target, message, undefined, provenance);
         return;
       } catch (error) {
         if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
@@ -2209,7 +2824,7 @@ export class ActorManager {
     }
     try {
       const actor = this.#requireActor(target);
-      this.tell(actor.id, message, event.data);
+      this.tell(actor.id, message, event.data, { provenance });
     } catch {
       /* target lives in another process or is unknown — best-effort drop */
     }
@@ -2217,7 +2832,7 @@ export class ActorManager {
 
   // Returns false when an owned receiver's queue was full; the monitor then offers the event
   // again while it catches up, and actors that already took it are skipped.
-  #dispatchMeshEvent(event: MeshEvent): boolean {
+  #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
     // One ownership refresh per event. Each decision reads the participant directory, and
     // re-deciding for every actor per actor (and before the topic filter) cost 182 directory
     // reads per event on a host with 13 actors and saturated its event loop (smarty-dev#784).
@@ -2232,8 +2847,9 @@ export class ActorManager {
     }
   }
 
-  #deliverMeshEvent(event: MeshEvent): boolean {
+  #deliverMeshEvent(event: MeshEvent): boolean | "ignored" {
     let full = false;
+    let handedOn = false;
     for (const actor of this.#actors.values()) {
       if (actor.status === "stopped") continue;
       const addressed = event.to === actor.id || event.to === actor.name;
@@ -2251,6 +2867,8 @@ export class ActorManager {
           // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
           // so a joined key could merge two topics' subjects. Keeps the value's type.
           this.#enqueue(actor, `mesh:${event.topic}`, event, {
+            ...(event.verification === "mesh" || event.verification === "bridge"
+              ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
             ownershipChecked: true,
             // Work waits for room; the monitor offers it again (smarty-dev#754).
             ...(event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
@@ -2258,6 +2876,7 @@ export class ActorManager {
           });
         }
         this.#delivered.add(delivery);
+        handedOn = true;
         if (this.#delivered.size > DELIVERED_EVENT_MEMORY) {
           this.#delivered.delete(this.#delivered.values().next().value!);
         }
@@ -2266,7 +2885,7 @@ export class ActorManager {
         if (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached")) full = true;
       }
     }
-    return !full;
+    return full ? false : handedOn ? true : "ignored";
   }
 
   async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {
@@ -2280,10 +2899,10 @@ export class ActorManager {
       if (this.#canManage(actor.id)) this.#logs.pruneRuns(actor, now);
     }
     if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
-      void reapDeadSessionPresence(this.mesh, this.identity, {
+      void this.#notifications.enqueue(() => reapDeadSessionPresence(this.mesh, this.identity, {
         ownSessionId: this.sessionId,
         ...(typeof this.#deadSessionReap === "object" ? { deadAfterMs: this.#deadSessionReap.deadAfterMs } : {}),
-      }).catch(() => undefined);
+      }));
     }
   }
 
@@ -2330,11 +2949,25 @@ export class ActorManager {
     this.#presenceChains.set(id, next);
     void next.finally(() => {
       if (this.#presenceChains.get(id) === next) this.#presenceChains.delete(id);
-    });
+    }).catch(error => this.#presenceRetries.get(id)?.failure(error));
     return next;
   }
 
+  #publishNotification(request: Parameters<MeshStore["publish"]>[0]): Promise<void> {
+    return this.#notifications.enqueue(() => this.mesh.publish(request));
+  }
+
   async #writePresenceNow(id: string): Promise<void> {
+    let retry = this.#presenceRetries.get(id);
+    if (!retry) {
+      retry = new MeshBackgroundRetry(`actor presence ${id}`, this.#presenceRetryMs);
+      this.#presenceRetries.set(id, retry);
+    }
+    if (retry.waitMs > 0) {
+      this.#pendingPresence.add(id);
+      this.#schedulePresenceRetry();
+      return;
+    }
     const actor = this.#actors.get(id);
     if (actor && !this.#canManageCached(id)) {
       this.#pendingPresence.delete(id);                        // another host owns its presence
@@ -2349,6 +2982,7 @@ export class ActorManager {
       }
       this.#pendingPresence.delete(id);
       this.#orphanPresence.delete(id);
+      this.#presenceRetries.delete(id);
     } catch (error) {
       if (fence !== undefined && error instanceof Error && error.message.includes("compare-and-swap failed")) {
         // Someone wrote this entry since it was found orphaned: it is not ours to delete.
@@ -2356,6 +2990,7 @@ export class ActorManager {
         this.#orphanPresence.delete(id);
         return;
       }
+      retry.failure(error);
       this.#pendingPresence.add(id);
       this.#schedulePresenceRetry();
     }
@@ -2370,8 +3005,13 @@ export class ActorManager {
           if (this.#closing) return;
           await this.#writePresence(id);
         }
-      })();
-    }, this.#presenceRetryMs);
+      })().catch(error => {
+        // Keep the owned timer contained even if a non-mesh presence precondition fails.
+        console.warn(`[pi-fabric] actor presence retry failed: ${error instanceof Error ? error.message : String(error)}`);
+        this.#schedulePresenceRetry();
+      });
+    }, Math.max(1, [...this.#pendingPresence].reduce((wait, id) =>
+      Math.min(wait, this.#presenceRetries.get(id)?.waitMs || this.#presenceRetryMs), 5_000)));
     this.#presenceTimer.unref();
   }
 
@@ -2427,6 +3067,7 @@ export class ActorManager {
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
       ...(actor.nice !== undefined ? { nice: actor.nice } : {}),
+      ...(actor.bashTimeoutSeconds !== undefined ? { bashTimeoutSeconds: actor.bashTimeoutSeconds } : {}),
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
@@ -2445,19 +3086,23 @@ export class ActorManager {
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
+      ...(actor.removal ? { removal: actor.removal } : {}),
     };
   }
 
-  async #saveActors(removedIds: ReadonlySet<string> = new Set()): Promise<void> {
+  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean }): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     await this.#registry.withLock(() => {
+      // Finalization fences reloads and serialization, but only this save's explicit ids
+      // are authorized to revoke: their own durable write-ahead markers already exist.
+      // Preserve every other finalizer's current registry row, prepared or not.
       const owned = [...this.#actors.values()].filter((actor) =>
-        this.#ownershipDecision(actor.id),
+        !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id),
       );
       const replaced = new Set([...removedIds, ...owned.map((actor) => actor.id)]);
       const preserved = this.#registry.records().filter((record) => !replaced.has(record.id));
       const actors = [...preserved, ...owned.map((actor) => this.#serializedActor(actor))];
-      this.#registry.write(actors);
+      this.#registry.write(actors, { durable: removedIds.size > 0 || options?.durable === true });
       this.#registryFingerprint = this.#registry.fingerprint();
       for (const id of removedIds) this.#persistedRoots.delete(id);
       for (const actor of owned) this.#persistedRoots.set(actor.id, actor.rootId);
@@ -2560,6 +3205,8 @@ export class ActorManager {
       ) {
         continue;
       }
+      // A temporary hole during revocation is not an invitation to resurrect the registry row.
+      if (this.#removeCalls.has(record.id) || this.#removals.has(record.id) || this.#finishCalls.has(record.id) || this.#revoked.has(record.id)) continue;
       if (onlyMissing && this.#actors.has(record.id)) continue;
       const status = record.status === "stopped" ? "stopped" : "idle";
       const delivery: FabricActorDelivery =
@@ -2630,6 +3277,7 @@ export class ActorManager {
           : {}),
         ...(typeof record.timeoutMs === "number" ? { timeoutMs: record.timeoutMs } : {}),
         ...(typeof record.nice === "number" && Number.isFinite(record.nice) ? { nice: parseAgentNice(record.nice) } : {}),
+        ...(Number.isInteger(record.bashTimeoutSeconds) && (record.bashTimeoutSeconds as number) >= 0 ? { bashTimeoutSeconds: record.bashTimeoutSeconds as number } : {}),
         ...(typeof record.extensions === "boolean" ? { extensions: record.extensions } : {}),
         ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
         ...(typeof record.coalesceKey === "string" && COALESCE_KEY_LOAD_PATTERN.test(record.coalesceKey)
@@ -2656,6 +3304,15 @@ export class ActorManager {
         createdAt: record.createdAt,
         updatedAt: Date.now(),
         ...(typeof record.lastRunId === "string" ? { lastRunId: record.lastRunId } : {}),
+        ...(typeof record.removal?.requestedAt === "number"
+          ? {
+              removal: {
+                requestedAt: record.removal.requestedAt,
+                ...(typeof record.removal.runId === "string" ? { runId: record.removal.runId } : {}),
+                ...(typeof record.removal.runStartedAt === "number" ? { runStartedAt: record.removal.runStartedAt } : {}),
+              },
+            }
+          : {}),
       };
       if (Array.isArray(record.messages)) {
         for (const candidate of record.messages.slice(-MESSAGE_HISTORY_LIMIT)) {
@@ -2727,7 +3384,7 @@ export class ActorManager {
 
   // Returns whether this lineage's file now holds the actor's work. Only then are the predecessor
   // files it took over deleted (review/astra F5 on #79): a failed write keeps them for the next load.
-  #persistQueue(actorId: string): boolean {
+  #persistQueue(actorId: string, durable = false, release = false): boolean {
     if (!this.#persistent || this.#closing) return false;
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
@@ -2737,20 +3394,24 @@ export class ActorManager {
     ]
       .filter((item) => !item.resolve && !item.reject);
     const file = this.#ownQueueFile(actor);
+    const cleanHandover = release || this.#releasePaused;
     try {
-      if (items.length === 0) fs.rmSync(file, { force: true });
+      if (items.length === 0 && !cleanHandover) fs.rmSync(file, { force: true });
       else {
       const records = items.flatMap((item) => {
         try {
           return [JSON.parse(JSON.stringify({
             id: item.id, source: item.source, payload: item.payload, createdAt: item.createdAt,
-            activation: item.activation, binding: item.binding,
+            activation: item.activation, binding: item.binding, bindingMode: item.bindingMode, bindingVersion: 2,
+            principalLineageVersion: 1,
+            ...(item.provenance ? { provenance: item.provenance } : {}),
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
             attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
             ...(item === inFlight || item.resumed ? { resumed: true } : {}),
           }))];
-        } catch {
+        } catch (error) {
+          if (durable) throw error;                         // a security fence cannot omit an activation
           return [];
         }
       });
@@ -2758,9 +3419,11 @@ export class ActorManager {
         writeJsonAtomic(file, {
           format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
           mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
-        });
+          ...(cleanHandover ? { cleanHandover: true } : {}),
+        }, { durable });
       }
-    } catch {
+    } catch (error) {
+      if (release) throw error;
       return false;                                         // best-effort; memory still runs the work
     }
     for (const source of this.#takenOver.get(actorId) ?? []) if (source !== file) fs.rmSync(source, { force: true });
@@ -2807,7 +3470,7 @@ export class ActorManager {
   #restoreQueue(actor: ManagedActor, parsed: unknown, foreign: boolean): void {
     if (!this.#persistent || typeof parsed !== "object" || parsed === null) return;
     const saved = parsed as {
-      format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown;
+      format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
     };
     const records = saved.format === 1 ? saved.items : undefined;
     if (!Array.isArray(records)) return;
@@ -2835,19 +3498,34 @@ export class ActorManager {
     const restored: ActorQueueItem[] = [];
     for (const record of records) {
       if (typeof record !== "object" || record === null) continue;
-      const value = record as Partial<ActorQueueItem> & { attempts?: unknown };
+      const value = record as Partial<ActorQueueItem> & { attempts?: unknown; principalLineageVersion?: unknown };
       if (
         typeof value.id !== "string" || typeof value.source !== "string" || held.has(value.id) ||
         typeof value.createdAt !== "number" || typeof value.activation !== "object" || value.activation === null
       ) continue;
-      const attempts = (typeof value.attempts === "number" ? value.attempts : 0) + 1;
+      // A deliberate quiescent release is not a failed attempt at untouched backlog.
+      const attempts = (typeof value.attempts === "number" ? value.attempts : 0) +
+        (saved.cleanHandover === true && (value as { resumed?: unknown }).resumed !== true ? 0 : 1);
+      const provenance = copyFabricProvenance(value.provenance);
+      // Old records may still name the launch requester after native-session steering.
+      // Even an unmarked item can have run: older snapshots did not always mark in-flight work.
+      if (provenance && value.principalLineageVersion !== 1) delete provenance.principal;
       const item = {
         id: value.id,
         source: value.source,
         payload: value.payload,
         createdAt: value.createdAt,
+        ...(provenance ? { provenance } : {}),
         activation: shift(value.activation as FabricActorActivation),
-        binding: typeof value.binding === "object" && value.binding !== null ? value.binding : {},
+        // Old mesh/host bindings were enqueue-time defaults. Old direct bindings may be
+        // genuine resolved caller views: preserve them conservatively. Unmarked version 2
+        // records retain their prior raw-field interpretation; new records preserve the mode.
+        binding: (value.bindingVersion === 2 || value.source === "direct") &&
+          typeof value.binding === "object" && value.binding !== null ? value.binding : {},
+        bindingMode: value.bindingMode === "resolved" ||
+          (value.bindingMode === undefined && value.bindingVersion !== 2 && value.source === "direct")
+          ? "resolved" : "owner-defaults",
+        bindingVersion: 2,
         ...(Array.isArray(value.images) ? { images: value.images } : {}),
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
         ...((value as { resumed?: unknown }).resumed === true ? { resumed: true } : {}),
@@ -2872,9 +3550,10 @@ export class ActorManager {
   }
 
   #resolvedModel(runner: FabricAgentRunner, model: string): string | Promise<string> {
-    return runner === "pi" && this.#resolvePiModel
-      ? this.#resolvePiModel(model)
-      : model;
+    this.agents.assertModelAllowed(model, runner);
+    const resolved = runner === "pi" && this.#resolvePiModel ? this.#resolvePiModel(model) : model;
+    const admit = (key: string): string => { this.agents.assertModelAllowed(key, runner); return key; };
+    return resolved instanceof Promise ? resolved.then(admit) : admit(resolved);
   }
 
   #resolvedRunBinding(
@@ -2974,6 +3653,17 @@ export class ActorManager {
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
+      ...(actor.inFlightRun
+        ? {
+            inFlightRun: {
+              ...actor.inFlightRun,
+              ageS: Math.max(0, Math.round((Date.now() - actor.inFlightRun.startedAt) / 1_000)),
+            },
+          }
+        : {}),
+      ...(actor.removal
+        ? { removal: { ...actor.removal, state: this.#removalState(actor) } }
+        : {}),
       ...(actor.lastError ? { lastError: actor.lastError } : {}),
       sessionFile: actor.sessionFile,
       logDir: path.join(path.dirname(actor.sessionFile), "runs"),
@@ -3258,11 +3948,13 @@ export class ActorManager {
       }
       if (this.#newerEvent(item, first)) {
         first.payload = item.payload;
+        first.provenance = item.provenance ? structuredClone(item.provenance) : undefined;
         if (item.images) first.images = item.images;
         else delete first.images;
         first.createdAt = item.createdAt;
         first.activation = { ...item.activation, id: first.id };
         first.binding = item.binding;
+        first.bindingVersion = 2;
       }
       if (item.resumed) first.resumed = true;
       merged.add(item);
@@ -3379,6 +4071,7 @@ export class ActorManager {
 
   #requireOwnedActiveActor(id: string): ManagedActor {
     const actor = this.#requireOwnedActor(id);
+    if (actor.removal) throw new Error(`Fabric actor ${actor.name} (${actor.id}): ${this.#removalState(actor)}`);
     if (actor.status === "stopped") {
       throw new Error(`Fabric actor ${actor.name} (${actor.id}) is stopped`);
     }
@@ -3392,6 +4085,9 @@ export class ActorManager {
       (actor) => actor.id.startsWith(id) || actor.name === id,
     );
     if (matches.length === 1 && matches[0]) return matches[0];
+    // A same-name successor created while its predecessor's removal is pending wins.
+    const current = matches.filter((actor) => !actor.removal);
+    if (current.length === 1 && current[0]) return current[0];
     if (matches.length > 1) throw new Error(`Ambiguous Fabric actor: ${id}`);
     throw new Error(`Unknown Fabric actor: ${id}`);
   }

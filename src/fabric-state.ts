@@ -32,12 +32,12 @@ import type {
   FabricParticipantListOptions,
   FabricPeerInfo,
 } from "./topology/types.js";
-import {
-  resolveFabricIdentity,
-  releaseRetainedRootRegistrations,
-  type FabricAgentMessageDelivery,
-  type FabricAgentMessageResult,
-  type FabricMainAgentInfo,
+import { resolveFabricIdentity } from "./fabric-provenance.js";
+import { releaseRetainedRootRegistrations } from "./topology/root-registration-retention.js";
+import type {
+  FabricAgentMessageDelivery,
+  FabricAgentMessageResult,
+  FabricMainAgentInfo,
 } from "./main-agent.js";
 import type { FabricActorHostEvent } from "./actors/types.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
@@ -172,6 +172,7 @@ export class FabricState {
   get agents(): FabricRuntimeState["agents"] { return this.#required().agents; }
   get actors(): FabricRuntimeState["actors"] { return this.#required().actors; }
   get shellJobs(): FabricRuntimeState["shellJobs"] | undefined { return this.#runtime?.shellJobs; }
+  get outputArtifactWriter(): FabricRuntimeState["outputArtifactWriter"] | undefined { return this.#runtime?.outputArtifactWriter; }
   get globalActors(): FabricRuntimeState["globalActors"] { return this.#required().globalActors; }
   get mesh(): FabricRuntimeState["mesh"] { return this.#required().mesh; }
   get compact(): FabricRuntimeState["compact"] { return this.#required().compact; }
@@ -315,6 +316,8 @@ export class FabricState {
     return this.#required().runHandoffAtBoundary(pending, result, context);
   }
   get advisorsHalted(): boolean { return this.#current()?.advisorsHalted ?? false; }
+  get escapeHalted(): boolean { return this.#current()?.escapeHalted ?? false; }
+  haltMain(): void { this.#current()?.haltMain(); }
   haltAdvisors(): number { return this.#current()?.haltAdvisors() ?? 0; }
   noteMainActivity(context: ExtensionContext): void { this.#current()?.noteMainActivity(context); }
   dispatchHostEvent(event: FabricActorHostEvent, payload: unknown, context: ExtensionContext): number {
@@ -439,7 +442,7 @@ export class FabricState {
     if (this.#shutDown) throw new Error("Pi Fabric is shut down for this session (reload or session replacement); retry in the new session");
   }
 
-  async shutdown(options: { preserveRootRegistration?: boolean; sessionId?: string } = {}): Promise<void> {
+  async shutdown(reason?: string, sessionId = this.#sessionId): Promise<void> {
     this.#shutDown = true;
     const generation = ++this.#generation;
     const activation = this.#activation;
@@ -449,10 +452,9 @@ export class FabricState {
     const runtime = this.#runtime;
     this.#runtime = undefined;
     try {
-      await runtime?.shutdown(options);
+      await runtime?.shutdown(reason);
       await this.#managedHost?.close();
-      const sessionId = options.sessionId ?? this.#sessionId;
-      if (!options.preserveRootRegistration && sessionId) {
+      if (reason !== "reload" && sessionId) {
         await releaseRetainedRootRegistrations(sessionId);
       }
     } finally {

@@ -53,6 +53,8 @@ Monty is always sandboxed, including under schema enforce, and does not require 
 
 Every raised deadline is capped by `executor.maxTimeoutMs` (default `900000`, i.e. 15 minutes: the former undocumented clamp, now explicit), which itself can be raised up to the hard implementation maximum of 24 hours. Values above a cap are visibly normalized down to the cap during config load and the effective values are shown in `/fabric` settings, never silently surprising. A per-invocation request or ref floor takes effect even when the ref is unknown to Fabric, so captured tools, MCP calls, and future host calls all run within an intentionally longer deadline without Fabric knowing their argument semantics. Existing `pi.bash` behavior (extending the deadline from an explicit `timeout` argument) is unchanged, and deadline expiry still cancels the active host call and any child process it owns.
 
+**Interactive Main only** (TUI or RPC, not task agents or actors): `executor.mainMaxTimeoutMs` is a fixed whole-program ceiling, default `600000` (10 minutes). It overrides the orchestration floor, per-invocation requests, exact-ref floors, and explicit shell-timeout floors, including programs that repeatedly wait or sleep. It normalizes to `60000`–`executor.maxTimeoutMs`; if the executor maximum is itself below 60 seconds, that smaller maximum wins. Hitting this ceiling returns `MainExecutionCeilingError` and ends only the foreground program/observation: spawned agents, durable runs, and detached tasks keep running, and agents report their results as completion messages. Check `agents.status` / `agents.list`. Main `agents.run`, `agents.wait`, and `agents.join` also bound each observation to 60 seconds and return live status with `waitTimedOut: true`, without consuming the later result. Noninteractive runs and task/actor/residency hosts retain their existing behavior.
+
 `executor.shellHangMs` (default `120000` / 2 minutes, max `600000` / 10 minutes, `0` disables) is a nested-shell wait budget, not a program deadline. When a `pi.bash` / `pi.powershell` await exceeds it, Fabric **settles the await successfully** (`ok: true`) with a still-running notice, pid, and live output path while the process keeps writing that file. `background: true` (alias `run_in_background`) detaches immediately with the same envelope. Inspect with `pi.read(logPath)` and stop by running `kill <pid>` through `pi.bash`. Do not poll. An explicit shell `timeout` remains a hard cap. **ctrl+b twice** spills early (tmux-safe); **ctrl+k** kills the waiting command. Session shutdown aborts leftover processes. Captured shell overrides normally keep their own execution semantics; an extension can opt into [Fabric-owned bash execution with middleware](shell-middleware.md) to preserve its environment/output filters while gaining the same background handling.
 
 The precedence across all sources is:
@@ -64,7 +66,7 @@ effective timeout = min(
 )
 ```
 
-where absent values do not participate. Orchestration programs (`agents.run` / `agents.wait` / `agents.ask`, `workflow.agent`, ...) keep their separate `agents.timeoutMs` floor, which is unaffected by `executor.maxTimeoutMs`.
+where absent values do not participate. Outside interactive Main, orchestration programs (`agents.run` / `agents.wait` / `agents.ask`, `workflow.agent`, ...) keep their separate `agents.timeoutMs` floor, which is unaffected by `executor.maxTimeoutMs`. In interactive Main, the fixed `executor.mainMaxTimeoutMs` ceiling takes precedence over every source above; repeated host calls cannot extend it.
 
 ## Full reference
 
@@ -78,6 +80,7 @@ where absent values do not participate. Orchestration programs (`agents.run` / `
     "runtime": "quickjs",
     "timeoutMs": 120000,
     "maxTimeoutMs": 900000,
+    "mainMaxTimeoutMs": 600000,
     "hostCallTimeouts": {},
     "shellHangMs": 120000,
     "memoryLimitBytes": 67108864,
@@ -189,6 +192,7 @@ where absent values do not participate. Orchestration programs (`agents.run` / `
     "actorRunArchiveMs": 604800000
   },
   "mesh": {
+    "lockProtocol": 1,
     "enabled": true,
     "announce": false,
     "actorScope": "project",
@@ -337,6 +341,8 @@ In orchestration-only mode:
 
 A top-level Main (TUI or RPC; not a task agent, an actor or `pi -p`) watches the Pi profile's `settings.json`. When its `packages` list activates a different local `pi-fabric` package than the one this Main loaded, the Main reloads itself after a run settles, once nothing a reload would stop is still running: no task agent it started, no actor it hosts with a run in flight or a queue draining (both actor scopes), no live Fabric shell job (`pi.bash`/`pi.powershell` in the background, a monitor, or a command the hang threshold detached), and no running Jev program or observer. A long-lived monitor or observer therefore holds the reload until it ends; stop it, or run `/reload`, to move sooner. While it is busy, it re-checks every 5 seconds while idle. After the reload the pane shows `Fabric reloaded: <old> → <new>` (the release directory names; also in the footer until the next input), actors are re-armed, and the mesh gets `ops.fabric.reloaded` with `{ old, new, sessionId }`. A Fabric loaded from anywhere other than the release the profile activated at load (for example `pi -e` or a project package) never follows the profile, even after a later swap. The reload waits until no prompt is in preflight and no `agent_settled` handler is running.
 
+Automatic reloads share **6 slots per host/user** by default (`"selfReloadConcurrency": 6` in `fabric.json`). A new target adds 0–30 seconds of random jitter before its first automatic attempt; a full limiter keeps the target pending on the same 5-second idle retry. Busy Mains are never made to wait inside an admission call. Slots live in `/tmp/pi-fabric-reload-slots-<uid>` on POSIX (the user's temp directory on Windows), independent of profile, worktree, mesh settings and session-specific `TMPDIR`. They expire after 120 seconds, or immediately when the recorded PID/Linux birth identity is dead, and are released on reload completion, failure or the new `session_start`. Use the same concurrency setting across Mains on a host; mixed settings cannot enforce one common cap. `"selfReloadConcurrency": 0` restores unlimited automatic reloads without jitter. Manual `/reload` and `/fabric-release-reload` bypass admission.
+
 Opt out per session with `PI_FABRIC_NO_AUTO_RELOAD=1`, or with `"autoReload": false` in `fabric.json`. An opted-out Main shows once that a newer release is active; `/reload` or `/fabric-release-reload` loads it.
 
 ## Captured extension tools
@@ -453,15 +459,15 @@ Reader checkpoints are lossless live state: they are **never pressure-evicted**.
 
 `agents.runner` selects the default harness: `"pi"`, `"claude"`, or `"veda"`. `agents.model` is the optional Pi `provider/id` override. `agents.claude.model` is the optional canonical Claude runtime key. `agents.claude.binary` defaults to `claude`. You can supply an absolute path or a wrapper. `PI_FABRIC_CLAUDE_BINARY` overrides it for the current process. `/fabric settings` enumerates Claude models from that binary in the background and stores the two runner defaults independently.
 
-The `veda` runner drives the [Veda CLI](https://github.com/kennyfrc/veda) as the child harness. `agents.veda.binary` defaults to `veda`. An absolute path or wrapper works, and `PI_FABRIC_VEDA_BINARY` overrides it for the current process. `agents.veda.backend` selects which backend Veda wraps: `agy` (Antigravity CLI, the default), `codex`, `claude-code`, `droid`, `pi`, or another backend registered by the installed Veda build. Fabric passes this value through unchanged and never hardcodes AGY. `agents.veda.model` is an optional backend-specific model or Veda alias. When you omit it, Veda selects its own backend default. `agents.veda.persona` picks the global Veda persona: `navigator-plan`, `navigator-chat` (default), `reviewer`, `worker`, or a custom persona under `~/.config/veda/personas/<name>/AGENTS.md`. Per-run selection overrides it through `agents.run({ persona })`. You can also edit the Veda backend, persona, and model in the Fabric settings panel under Agents. Each child runs one headless `veda --json` prompt with an isolated `fabric-<run-id>` session, so parallel children never share Veda selection or conversation state. Veda sessions lack persistence, and steering is unsupported. Veda children are **not** recursively Fabric-equipped (`recursive: true` is rejected), and they cannot back persistent actors.
+The `veda` runner drives the [Veda CLI](https://github.com/kennyfrc/veda) as the child harness. `agents.veda.binary` defaults to `veda`. An absolute path or wrapper works, and `PI_FABRIC_VEDA_BINARY` overrides it for the current process. `agents.veda.backend` selects which backend Veda wraps: `agy` (Antigravity CLI, the default), `codex`, `claude-code`, `droid`, `pi`, or another backend registered by the installed Veda build. Fabric passes this value through unchanged and never hardcodes AGY. `agents.veda.model` is an optional backend-specific model or Veda alias. With no active host model policy, omitting it lets Veda select its own backend default. Under a nonempty host `agents.deniedModels` policy, Veda requires `agents.veda.backend: "pi"` and an exact concrete `provider/model` resolved by the Pi registry; bare IDs, aliases, unknown selectors and backend defaults are refused before admission. Claude aliases are admitted only after the native CLI catalog establishes an allowed `resolvedModel`. `agents.veda.persona` picks the global Veda persona: `navigator-plan`, `navigator-chat` (default), `reviewer`, `worker`, or a custom persona under `~/.config/veda/personas/<name>/AGENTS.md`. Per-run selection overrides it through `agents.run({ persona })`. You can also edit the Veda backend, persona, and model in the Fabric settings panel under Agents. Each child runs one headless `veda --json` prompt with an isolated `fabric-<run-id>` session, so parallel children never share Veda selection or conversation state. Veda sessions lack persistence, and steering is unsupported. Veda children are **not** recursively Fabric-equipped (`recursive: true` is rejected), and they cannot back persistent actors.
 
 A JS runtime launches each Fabric worker module. Fabric reuses the current runtime when `process.execPath` names `node` or `bun`. For a Bun-compiled Pi binary, `process.execPath` names the `pi` executable. Fabric then uses `PI_FABRIC_NODE_BINARY` or the first `node` or `bun` on `PATH`. The resolved runtime launches the workers. `PI_FABRIC_NODE_BINARY` overrides this choice for the current process. The Node-process executor (`executor.runtime: "node-process"`) requires Node.js because it uses `--eval` and `--input-type=module`; the Bun-process executor (`executor.runtime: "bun-process"`) requires Bun because it uses `--eval`.
 
 Other agent settings:
 
 - `thinking`: default reasoning effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), default `medium`.
-- `maxConcurrent`: global child concurrency semaphore.
-- `maxPerExecution`: hard cap on children per `fabric_exec` invocation.
+- `maxConcurrent`: child concurrency semaphore. A session spawn beyond this limit returns a `queued` handle immediately. Queued children start in FIFO order as slots become free; `queuePosition` in list/status is one-based. Queued receipts are session-only for now: saturated durable spawns cancel their queue entry, safely reject, and return no queued handle.
+- `maxPerExecution`: hard cap on accepted child launches per `fabric_exec` invocation, including queued spawns. Cancelling a queued child does not refund that invocation's launch count.
 - `maxDepth`: nesting bound for child agent calls, including `rlm.query()`. It accepts any non-negative safe integer. A value of `0` disables child spawning. `/fabric settings` provides free-form numeric entry.
 - `timeoutMs`: default wall-clock budget per child and the floor for per-call overrides (24 hours by default, which is also the policy ceiling). Fabric ignores lower per-call values. The default matches the ceiling on purpose: an orchestration program inherits this value as its own whole-program deadline floor, so a lower default would cut a long participant short well inside the allowed maximum. Lower it to bound a class of runs, and raise a single run with a per-call value.
 - `extensions`: whether Claude children keep their normal Claude Code customizations.
@@ -536,6 +542,21 @@ Mesh data lives at `<project>/.pi/fabric/mesh` by default. Set `mesh.root` to a 
 
 Sessions that share one `mesh.root` share one participant directory, so each sees the others through `agents.sessions()` and can `steer` or `followUp` them. A Main normally joins that directory when it first uses Fabric. Set `mesh.announce` to `true` in the project configuration to join at session start instead, so an idle peer is reachable. Announcing loads the Fabric runtime during startup, so avoid it in a global configuration that applies to every project.
 
+`mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
+when each mesh store is constructed; editing configuration does not switch an existing
+store. Protocol 1 uses the B68 canonical-directory mkdir, three-line token/PID/time
+owner and token-prefix recursive canonical release. Protocol 2 uses fully initialized
+private-directory publication and detached release. Both retain immediate dead-holder
+recovery, recovery fences, bounded jitter/backoff and typed lock timeouts. There is no
+environment fallback, runtime marker, transition guard or hot reload for this selector.
+
+Keep `1` for compatibility with B68 writers. Protocol 2 activation is deferred to the
+coordinated rollout in smarty-dev#2570: drain/terminate all old-format-capable writers
+and prevent their restart or rollback on the shared root before selecting `2`. Mixed
+protocol 1/2 operation on one root is not safe. Standalone `mesh-bridge` does not load
+Fabric config: set `--lock-protocol 1|2` separately on each `run` and `agent` startup
+(default `1`); an SSH forced command must pin the remote agent's selection explicitly.
+
 When several projects share a root, project-scoped actors are shared too: any live Main on that root can adopt a project actor whose owner has gone. Set `mesh.actorScope` to `"session"` so new actors default to their root Pi session, which other sessions do not load or adopt. This is only the default for `agents.create`: existing project actors, and actors created with an explicit `scope: "project"`, stay shared. Session actors do not survive `/new`.
 
 `mesh.actorScope` is the default storage scope for `agents.create`; each actor can override it with `scope: "project"` or `scope: "session"`. Both scopes run concurrently:
@@ -556,6 +577,8 @@ Each live actor publishes a presence record in the shared mesh state. When a ses
 ```text
 call override → session binding → project default → Fabric default
 ```
+
+`mesh.bridgeControlTimeoutMs` (default 30000, range 30000–300000) is the admission window for control commands to a validated participant mirrored from another host. It covers outbound bridge queueing; senders also allow up to 15 seconds for the acknowledgement's return leg. A longer explicit request timeout wins. Mirrored steer/followUp waits are bounded from admission even during a mesh-lock wait; lease renewal cannot extend them. Native commands retain their existing timeout. An absent acknowledgement means the outcome is unknown, not that the handler did not run; do not retry blindly.
 
 `mesh.followUpFlushMs` (default 120000) bounds how late an agent `followUp` reaches a busy Main. Fabric holds such a followUp while Main works. At the next boundary between tool calls, it sends every followUp that has waited this long as one batched steer, oldest first, behind any steer already queued. When the run is about to settle (`agent_before_settle`), it hands the rest to Pi's followUp queue, so Pi continues the run for them unless the user cancelled. `0` keeps Pi's own followUp queue, which Pi reads only when Main has no more work. Pi hosts older than 0.87.0 have no `agent_before_settle` and always keep Pi's queue.
 

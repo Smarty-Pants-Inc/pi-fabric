@@ -382,6 +382,94 @@ describe("participant files", () => {
       child.once("exit", () => resolve(child.pid!));
     });
 
+    for (const cleanup of ["rmdir", "recursive"] as const) {
+      it.skipIf(process.platform === "win32")(`holder release preserves a successor installed during ${cleanup} cleanup`, async () => {
+        const root = meshRoot();
+        const mesh = new MeshStore(root, 64 * 1024, 1_000);
+        const key = keyOf("session:a");
+        const lock = lockOf(root, "session:a");
+        fs.mkdirSync(path.dirname(lock), { recursive: true });
+        const staging = `${lock}.successor.tmp`;
+        const successor = `${process.pid}\n\nsuccessor\n`;
+        fs.mkdirSync(staging);
+        fs.writeFileSync(path.join(staging, "owner"), successor);
+        const rm = fs.rmSync.bind(fs);
+        let installed = false;
+        vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+          const target = String(file);
+          if (!installed && (target === lock || (target.startsWith(`${lock}.`) && target.endsWith(".dead")))) {
+            // Node's recursive remover unlinks owner before rmdir. An acquiring writer can
+            // rename its nonempty staging directory over that now-empty canonical lock.
+            rm(path.join(target, "owner"));
+            fs.renameSync(staging, lock);
+            installed = true;
+            if (cleanup === "rmdir") {
+              fs.rmdirSync(target); // old release: ENOTEMPTY; detached release: removes only our empty tombstone
+              return;
+            }
+            // A recursive retry must not delete the successor either (no swallowed error proves safety).
+          }
+          rm(file, options);
+        });
+        await expect(participantFiles.writeParticipantFileIf(mesh, key, () => ({
+          key, value: record("a"), version: 1, updatedAt: 1, updatedBy: identityOf("a"),
+        }))).resolves.toBe(true);
+        expect(installed).toBe(true);
+        expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(successor);
+        expect(fs.readdirSync(path.dirname(lock))).toEqual([path.basename(lock)]);
+        expect(readParticipantFiles(root, { maxAgeMs: 0 })[0]).toMatchObject({ key, version: 1 });
+      });
+    }
+
+    it.each(["EPERM", "EBUSY"])("holder release retries transient %s without touching a successor", async (code) => {
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const key = keyOf("session:a");
+      const lock = lockOf(root, "session:a");
+      const rename = fs.renameSync.bind(fs);
+      const rm = fs.rmSync.bind(fs);
+      const targets: string[] = [];
+      const successor = `${process.pid}\n\nsuccessor\n`;
+      vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+        if (String(source) === lock && String(target).endsWith(".dead")) {
+          targets.push(String(target));
+          if (targets.length <= 2) throw Object.assign(new Error("Windows sharing violation"), { code });
+        }
+        rename(source, target);
+      });
+      vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+        if (String(file).startsWith(`${lock}.`) && String(file).endsWith(".dead")) {
+          // Once detached, the canonical name belongs to a successor. Retries and
+          // recursive cleanup must target only this holder's unique tombstone.
+          fs.mkdirSync(lock);
+          fs.writeFileSync(path.join(lock, "owner"), successor);
+        }
+        rm(file, options);
+      });
+      await expect(participantFiles.writeParticipantFileIf(mesh, key, () => ({
+        key, value: record("a"), version: 1, updatedAt: 1, updatedBy: identityOf("a"),
+      }))).resolves.toBe(true);
+      expect(targets).toHaveLength(3);
+      expect(new Set(targets).size).toBe(1);
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(successor);
+      expect(fs.readdirSync(path.dirname(lock))).toEqual([path.basename(lock)]);
+      expect(readParticipantFiles(root, { maxAgeMs: 0 })[0]).toMatchObject({ key, version: 1 });
+    });
+
+    it("holder release cleans its detached lock after success and a failed decision", async () => {
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const key = keyOf("session:a");
+      const lock = lockOf(root, "session:a");
+      await expect(participantFiles.writeParticipantFileIf(mesh, key, () => undefined)).resolves.toBe(false);
+      expect(fs.existsSync(lock)).toBe(false);
+      expect(fs.readdirSync(path.dirname(lock))).toEqual([]);
+      await expect(participantFiles.writeParticipantFileIf(mesh, key, () => { throw new Error("decision failed"); }))
+        .rejects.toThrow("decision failed");
+      expect(fs.existsSync(lock)).toBe(false);
+      expect(fs.readdirSync(path.dirname(lock))).toEqual([]);
+    });
+
     it("a live holder past any age keeps its lock; a contender times out and writes nothing", async () => {
       const root = meshRoot();
       const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });

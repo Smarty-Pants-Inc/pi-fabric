@@ -54,6 +54,8 @@ interface FabricExecutorConfig {
   /** Policy maximum for any executor deadline, including per-invocation
    * requests and per-ref floors. Values above this are visibly normalized. */
   maxTimeoutMs: number;
+  /** Fixed whole-program ceiling for interactive Main only; overrides every deadline floor. */
+  mainMaxTimeoutMs: number;
   /** Exact-ref deadline floors (ms) for known long-running host calls, e.g.
    * "extensions.subagent". Keys are exact refs; no wildcard matching. */
   hostCallTimeouts: Record<string, number>;
@@ -158,6 +160,9 @@ export interface FabricAgentConfig {
   runner: FabricAgentRunner;
   transport: FabricAgentTransport;
   model?: string;
+  /** Host-only fleet policy; workspace configuration cannot override these keys. */
+  deniedModels: string[];
+  deniedModelReplacement?: string;
   claude: FabricClaudeRunnerConfig;
   veda: FabricVedaRunnerConfig;
   thinking: FabricThinking;
@@ -251,7 +256,17 @@ export interface FabricActorsConfig {
   maxSessionBytes: number;
 }
 
+export type MeshLockProtocol = 1 | 2;
+
+const meshLockProtocol = (value: unknown): MeshLockProtocol => {
+  if (value === undefined) return 1;
+  if (value === 1 || value === 2) return value;
+  throw new Error("mesh.lockProtocol must be 1 or 2");
+};
+
 export interface FabricMeshConfig {
+  /** Startup-only wire protocol; 1 preserves compatibility with B68 writers. */
+  lockProtocol: MeshLockProtocol;
   enabled: boolean;
   root?: string;
   /** Publish the Main participant at session start instead of on first Fabric use. */
@@ -260,6 +275,8 @@ export interface FabricMeshConfig {
   maxEventBytes: number;
   maxReadEvents: number;
   actorPollMs: number;
+  /** Admission window for commands routed over a mesh bridge, minimum 30 s. */
+  bridgeControlTimeoutMs: number;
   actorQueueLimit: number;
   eventContextChars: number;
   actorContextEntries: number;
@@ -327,6 +344,8 @@ export interface FabricConfig {
   fullCodeMode: boolean;
   /** A Main reloads itself onto a newer active Fabric release at a safe run end (smarty-dev#2160). */
   autoReload: boolean;
+  /** Automatic reload slots shared per host/user; 0 disables admission and jitter. */
+  selfReloadConcurrency: number;
   executor: FabricExecutorConfig;
   approvals: FabricApprovalConfig;
   mcp: FabricMcpConfig;
@@ -357,8 +376,8 @@ export const MAX_EXECUTOR_TIMEOUT_MS = 24 * 3_600_000;
 export const MIN_AGENT_TIMEOUT_MS = 1_000;
 export const MAX_AGENT_TIMEOUT_MS = 24 * 3_600_000;
 /** Default per-run wall-clock budget. It equals the policy ceiling on purpose:
- *  an orchestration program inherits agents.timeoutMs as its own whole-program
- *  deadline floor, so any lower default truncates long participants at a
+ *  outside interactive Main, an orchestration program inherits agents.timeoutMs
+ *  as its whole-program deadline floor, so any lower default truncates participants at a
  *  fraction of the maximum the policy already allows. Narrow one run by setting
  *  agents.timeoutMs explicitly; per-call values can only raise it. */
 const DEFAULT_AGENT_TIMEOUT_MS = MAX_AGENT_TIMEOUT_MS;
@@ -379,6 +398,7 @@ export const maxExecutorMemoryLimitBytes = (
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   fullCodeMode: true,
   autoReload: true,
+  selfReloadConcurrency: 6,
   executor: {
     kernel: "typescript",
     pythonRuntime: "monty",
@@ -386,6 +406,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     runtime: "quickjs",
     timeoutMs: 120_000,
     maxTimeoutMs: 900_000,
+    mainMaxTimeoutMs: 600_000,
     hostCallTimeouts: {},
     shellHangMs: DEFAULT_SHELL_HANG_MS,
     memoryLimitBytes: 64 * 1024 * 1024,
@@ -428,6 +449,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     enabled: true,
     runner: "pi",
     transport: "process",
+    deniedModels: [],
     claude: { binary: "claude" },
     veda: { binary: "veda", backend: "agy", persona: "navigator-chat" },
     thinking: DEFAULT_FABRIC_THINKING,
@@ -493,12 +515,14 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     maxSessionBytes: 20 * 1024 * 1024,
   },
   mesh: {
+    lockProtocol: 1,
     enabled: true,
     announce: false,
     actorScope: "project",
     maxEventBytes: 256 * 1024,
     maxReadEvents: 500,
     actorPollMs: 250,
+    bridgeControlTimeoutMs: 30_000,
     actorQueueLimit: 32,
     eventContextChars: 40_000,
     actorContextEntries: 14,
@@ -784,6 +808,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalkModel = stringValue(prewalk.model);
   const prewalkThinking = isFabricThinking(prewalk.thinking) ? prewalk.thinking : undefined;
   const agentModel = stringValue(agents.model);
+  const deniedModelReplacement = stringValue(agents.deniedModelReplacement)?.trim();
   const claudeBinary = stringValue(claude.binary);
   const claudeModel = stringValue(claude.model);
   const vedaBinary = stringValue(veda.binary);
@@ -845,6 +870,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   return {
     fullCodeMode: booleanValue(input.fullCodeMode, DEFAULT_FABRIC_CONFIG.fullCodeMode),
     autoReload: booleanValue(input.autoReload, DEFAULT_FABRIC_CONFIG.autoReload),
+    selfReloadConcurrency: typeof input.selfReloadConcurrency === "number"
+      && Number.isSafeInteger(input.selfReloadConcurrency) && input.selfReloadConcurrency >= 0
+      ? input.selfReloadConcurrency : DEFAULT_FABRIC_CONFIG.selfReloadConcurrency,
     executor: {
       kernel: executorKernel,
       pythonRuntime: executor.pythonRuntime === "cpython" ? "cpython" : "monty",
@@ -857,6 +885,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.executor.maxTimeoutMs,
         1_000,
         MAX_EXECUTOR_TIMEOUT_MS,
+      ),
+      mainMaxTimeoutMs: boundedInteger(
+        executor.mainMaxTimeoutMs,
+        Math.min(DEFAULT_FABRIC_CONFIG.executor.mainMaxTimeoutMs, executorMaxTimeoutMs),
+        Math.min(60_000, executorMaxTimeoutMs),
+        executorMaxTimeoutMs,
       ),
       hostCallTimeouts: Object.fromEntries(
         Object.entries(objectValue(executor.hostCallTimeouts))
@@ -995,6 +1029,10 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       runner: runnerValue(agents.runner, DEFAULT_FABRIC_CONFIG.agents.runner),
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
       ...(agentModel ? { model: agentModel } : {}),
+      deniedModels: [...new Set((Array.isArray(agents.deniedModels) ? agents.deniedModels : [])
+        .filter((model): model is string => typeof model === "string" && !!model.trim())
+        .map((model) => model.trim().toLowerCase()))],
+      ...(deniedModelReplacement ? { deniedModelReplacement } : {}),
       claude: {
         binary: claudeBinary ?? DEFAULT_FABRIC_CONFIG.agents.claude.binary,
         ...(claudeModel ? { model: claudeModel } : {}),
@@ -1143,6 +1181,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ),
     },
     mesh: {
+      lockProtocol: meshLockProtocol(mesh.lockProtocol),
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),
@@ -1164,6 +1203,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.mesh.actorPollMs,
         50,
         10_000,
+      ),
+      bridgeControlTimeoutMs: boundedInteger(
+        mesh.bridgeControlTimeoutMs,
+        DEFAULT_FABRIC_CONFIG.mesh.bridgeControlTimeoutMs,
+        30_000,
+        300_000,
       ),
       actorQueueLimit: boundedInteger(
         mesh.actorQueueLimit,
@@ -1470,15 +1515,19 @@ const resolveFabricConfig = (
   applyEnvironmentOverrides: boolean,
 ): FabricConfig => {
   let merged = structuredClone(DEFAULT_FABRIC_CONFIG) as unknown as Record<string, unknown>;
-  const plans = [
-    planConfigFile(path.join(options.agentDir, "fabric.json")),
-    ...(includeProject
-      ? [planConfigFile(path.join(options.cwd, ".pi", "fabric.json"))]
-      : []),
-  ].filter((plan): plan is FabricConfigFilePlan => plan !== undefined);
-  for (const plan of plans) {
+  const hostPlan = planConfigFile(path.join(options.agentDir, "fabric.json"));
+  const projectPlan = includeProject ? planConfigFile(path.join(options.cwd, ".pi", "fabric.json")) : undefined;
+  for (const plan of [hostPlan, projectPlan]) {
+    if (!plan) continue;
     if (plan.changed) writeJsonAtomic(plan.path, plan.document, plan.source);
-    merged = mergeObjects(merged, plan.document);
+    const document = { ...plan.document };
+    if (plan === projectPlan) {
+      const agents = { ...objectValue(document.agents) };
+      delete agents.deniedModels;
+      delete agents.deniedModelReplacement;
+      document.agents = agents;
+    }
+    merged = mergeObjects(merged, document);
   }
   const inheritedKernel = process.env.PI_FABRIC_KERNEL;
   if (applyEnvironmentOverrides && inheritedKernel !== undefined) {

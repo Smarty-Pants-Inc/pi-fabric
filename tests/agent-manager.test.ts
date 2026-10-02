@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +12,8 @@ import {
   AgentManager,
 } from "../src/agents/manager.js";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
+import * as retentionStorage from "../src/storage/retention.js";
+import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import {
   clearOwnedBudgetEnv,
   readBudgetLedgerDetailed,
@@ -117,7 +119,258 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
+describe("AgentManager fleet model admission (#2490)", () => {
+  it.each([
+    ["veda", "backend-shortcut", "explicit"],
+    ["veda", "veda/gpt-6-astra", "configured"],
+    ["veda", "cliproxyapi/not-registered", "explicit"],
+    ["claude", "default", "explicit"],
+    ["claude", "anthropic/default", "configured"],
+    ["claude", "unknown-runtime-alias", "explicit"],
+  ] as const)("round 5 F5 refuses unresolved/denied %s %s (%s) before a saturated queue", async (runner, selector, source) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-f5-manager-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model === "cliproxyapi/gpt-6.1-sol" ? model : "cliproxyapi/gpt-6-astra");
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1,
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", ...(runner === "veda" && source === "configured" ? { model: selector } : {}) },
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, ...(runner === "claude" && source === "configured" ? { model: selector } : {}) },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
+    const occupied = await manager.spawn({ task: "HANG", model: "cliproxyapi/gpt-6.1-sol", transport: "process" });
+    manager.config.deniedModels = ["cliproxyapi/gpt-6-astra", "anthropic/claude-sonnet-test"];
+    const before = fs.readdirSync(root); const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const beforeCommit = vi.fn();
+    try {
+      await expect(manager.spawn({ task: "must not queue", runner, ...(source === "explicit" ? { model: selector } : {}) }, undefined, undefined, beforeCommit)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      expect(manager.list().map(agent => agent.id)).toEqual([occupied.id]);
+      expect(fs.readdirSync(root)).toEqual(before);
+      expect(launch).not.toHaveBeenCalled(); expect(beforeCommit).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); await manager.stop(occupied.id); }
+  });
+
+  it("round 5 F5 forwards authoritative allowed concrete Veda and Claude alias targets", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-f5-controls-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: ["cliproxyapi/gpt-6-astra"],
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
+    const veda = await manager.run({ task: "allowed concrete", runner: "veda", model: "veda/cliproxyapi/gpt-6.1-sol", transport: "process" });
+    expect(veda).toMatchObject({ status: "completed", model: "cliproxyapi/gpt-6.1-sol" });
+    expect(preparePiModel).toHaveBeenCalledWith("cliproxyapi/gpt-6.1-sol");
+    const claude = await manager.run({ task: "allowed alias", runner: "claude", model: "claude/haiku", transport: "process" });
+    expect(claude).toMatchObject({ status: "completed", model: "claude-haiku-test" });
+  });
+
+  it.each(["missing-resolver", "void-resolver", "other-backend", "unresolved-catalog"] as const)("round 5 F5 refuses targets without authoritative proof (%s)", async mode => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-f5-proof-")); roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: ["cliproxyapi/gpt-6-astra"],
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: mode === "other-backend" ? "agy" : "pi" },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      ...(mode !== "missing-resolver" ? { preparePiModel: async () => {} } : {}),
+    }); managers.push(manager);
+    const catalog = vi.spyOn(manager, "claudeModels").mockResolvedValue([{ value: "shortcut", resolvedModel: "shortcut", resolvedModelKnown: false, displayName: "Shortcut", description: "No native target" }]);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "no proof", runner: mode === "unresolved-catalog" ? "claude" : "veda", model: mode === "unresolved-catalog" ? "shortcut" : "cliproxyapi/gpt-6.1-sol" })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      expect(manager.list()).toEqual([]); expect(launch).not.toHaveBeenCalled(); expect(fs.readdirSync(root)).toEqual([]);
+    } finally { launch.mockRestore(); catalog.mockRestore(); }
+  });
+
+  it.each(["veda", "claude"] as const)("round 5 F5 leaves %s backend aliases unchanged with no policy", async runner => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-f5-no-policy-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [] }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
+    const catalog = vi.spyOn(manager, "claudeModels");
+    try {
+      expect(await manager.run({ task: "legacy alias", runner, model: "backend-shortcut", transport: "process" })).toMatchObject({ status: "completed", model: "backend-shortcut" });
+      expect(preparePiModel).not.toHaveBeenCalled(); expect(catalog).not.toHaveBeenCalled();
+    } finally { catalog.mockRestore(); }
+  });
+
+  it("round 3 F3 rejects unknown Veda defaults before queue admission and preserves allowed configured default", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-default-policy-")); roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], budgetUsd: 0,
+      veda: { binary: DEFAULT_FABRIC_CONFIG.agents.veda.binary, persona: DEFAULT_FABRIC_CONFIG.agents.veda.persona, backend: "pi" },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel: async model => model }); managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "backend default must not launch" })).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      expect(manager.list()).toEqual([]); expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root).filter(entry => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
+      manager.config.veda.model = "veda/cliproxyapi/gpt-6.1-sol";
+      expect((await manager.run({ task: "allowed configured default", transport: "process" })).status).toBe("completed");
+      expect(launch).toHaveBeenCalledOnce();
+    } finally { launch.mockRestore(); }
+  });
+
+  it.each([
+    ["veda", "veda/cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-astra"],
+    ["claude", "claude/denied-backend", "denied-backend"],
+    ["claude", "anthropic/denied-backend", "denied-backend"],
+  ] as const)("review round F1 denies normalized %s selector %s before queue admission", async (runner, selector, denied) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-policy-runner-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner, deniedModels: [denied], budgetUsd: 0, maxConcurrent: 1,
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, ...(runner === "claude" ? { model: selector } : {}) },
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", ...(runner === "veda" ? { model: selector } : {}) },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel: async model => model, claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs") });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      for (const model of [selector, undefined]) {
+        await expect(manager.spawn({ task: "HANG", ...(model ? { model } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      }
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root).filter((entry) => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
+      const allowed = await manager.run({ task: "allowed control", model: runner === "veda" ? "veda/cliproxyapi/gpt-6.1-sol" : "claude/haiku", transport: "process" });
+      expect(allowed.status).toBe("completed");
+      expect(launch).toHaveBeenCalledTimes(1);
+    } finally { launch.mockRestore(); }
+  });
+  it.each(["explicit", "default", "resolved"])("refuses a denied %s before creating a child", async (source) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-policy-"));
+    roots.push(root);
+    const denied = "cliproxyapi/gpt-6-astra";
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, ...(source === "default" ? { model: denied } : {}), deniedModels: [denied], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: async (model) => source === "resolved" ? denied : model,
+    });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "review", ...(source === "explicit" ? { model: " CLIPROXYAPI/GPT-6-ASTRA " } : {}) })).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", model: denied, replacement: "cliproxyapi/gpt-6.1-sol" });
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root).filter((entry) => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
+    } finally { launch.mockRestore(); }
+  });
+});
+
 describe("AgentManager", () => {
+  it("F1 tracked retention retries the full failed save before collection, without pinning session or actor runs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-save-fault-"));
+    roots.push(root);
+    let sweep: (() => void) | undefined;
+    const interval = globalThis.setInterval;
+    const timer = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+      if (ms === 15 * 60 * 1_000) sweep = callback;
+      return interval(callback, ms, ...args);
+    }) as typeof setInterval);
+    // This probe owns one manager, not the host-global detached temp-directory sweep.
+    const detachedSweep = vi.spyOn(retentionStorage, "claimTempRunSweep").mockReturnValue(false);
+    let unblocked = false;
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    const save = vi.fn((result: AgentRunResult) => {
+      if (result.task !== "LARGE_RESULT") return; // only the public durable task uses this result store
+      const file = path.join(root, `${result.id}.json`);
+      if (!unblocked) fs.mkdirSync(file, { recursive: true });
+      writeJsonAtomic(file, result);
+    });
+    const inheritedRunRoot = process.env.PI_FABRIC_RUN_ROOT;
+    delete process.env.PI_FABRIC_RUN_ROOT; // task-agent nesting must not disable the managed-root timer
+    let manager: AgentManager;
+    try {
+      manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, budgetUsd: 0 }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        retention: { ...DEFAULT_FABRIC_CONFIG.retention, oneShotRunMs: 1_000 }, onSettled: save,
+      });
+    } finally {
+      if (inheritedRunRoot !== undefined) process.env.PI_FABRIC_RUN_ROOT = inheritedRunRoot;
+    }
+    managers.push(manager);
+    try {
+      const result = await manager.run({ task: "LARGE_RESULT", residency: "durable", transport: "process" });
+      const run = manager.runDirectory(result.id)!;
+      roots.push(path.dirname(run));
+      const worker = fs.readFileSync(path.join(run, "status.json"), "utf8");
+      expect(result).toMatchObject({ status: "completed", text: "x".repeat(100_000), value: { output: "x".repeat(100_000) } });
+      const ordinary = await manager.run({ task: "ordinary session", transport: "process" });
+      const ordinaryRun = manager.runDirectory(ordinary.id)!;
+      const actor = await manager.run({ task: "actor activation", residency: "durable", actorId: "actor:fixture", transport: "process" });
+      const actorRun = manager.runDirectory(actor.id)!;
+      expect(sweep).toBeTypeOf("function");
+      // Advance only the manager's clock after real subprocess completion; do not fabricate status.
+      clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
+      const attempts = save.mock.calls.length;
+      sweep!();
+      await vi.waitFor(() => expect(fs.existsSync(ordinaryRun)).toBe(false), { timeout: 2_000 });
+      expect(fs.existsSync(run), "unsaved completion stays tracked").toBe(true);
+      expect(save.mock.calls.length).toBeGreaterThan(attempts);
+      expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(worker);
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/Cannot clean up agent.*Terminal result save failed/);
+      expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(worker);
+      expect(result.warnings).toEqual(expect.arrayContaining([expect.stringMatching(/save failed.*retained/i)]));
+      expect(result.warnings!.join(" ")).toContain(`${result.id}.json`);
+      expect(fs.existsSync(actorRun), "retention still leaves activation cleanup to its actor").toBe(true);
+      expect((await manager.wait(result.id)).text).toHaveLength(100_000);
+      // Fix the native obstruction. The next sweep must retry the original, non-UI-truncated result.
+      fs.rmSync(path.join(root, `${result.id}.json`), { recursive: true });
+      unblocked = true;
+      sweep!();
+      await vi.waitFor(() => expect(fs.existsSync(run)).toBe(false), { timeout: 2_000 });
+      const saved = JSON.parse(fs.readFileSync(path.join(root, `${result.id}.json`), "utf8"));
+      expect(saved).toMatchObject({ id: result.id, status: "completed", text: "x".repeat(100_000), value: { output: "x".repeat(100_000) } });
+      expect(saved.warnings).toBeUndefined(); // a failed save must not corrupt the original completion
+      await manager.close();
+      expect(fs.existsSync(actorRun), "ordinary close can still collect a finished actor activation").toBe(false);
+    } finally {
+      clock?.mockRestore();
+      await manager.close(); // keep the host-global sweep disabled even on an assertion failure
+      timer.mockRestore();
+      detachedSweep.mockRestore();
+    }
+  }, 15_000);
+
+  it.each([["cleanup", "durable"], ["close", "session"]] as const)("F1 %s retries a thrown save with the original full completion before collection (%s request)", async (collection, residency) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-save-throw-"));
+    roots.push(root);
+    let blocked = true;
+    const savedPath = path.join(root, "result.json");
+    const save = vi.fn((result: AgentRunResult) => {
+      if (result.task !== "LARGE_RESULT") return;
+      if (blocked) throw new Error(`EIO writing ${savedPath}`);
+      writeJsonAtomic(savedPath, result);
+    });
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, budgetUsd: 0 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"), onSettled: save,
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "LARGE_RESULT", residency, transport: "process" });
+    const run = manager.runDirectory(result.id)!;
+    const worker = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+    expect(result).toMatchObject({ status: worker.status, text: worker.text, value: worker.value });
+    expect(result.text).toHaveLength(100_000);
+    expect(result.error).toBe(worker.error);
+    expect(result.warnings).toEqual(expect.arrayContaining([expect.stringContaining(savedPath)]));
+    expect(fs.existsSync(savedPath)).toBe(false);
+    if (collection === "cleanup") {
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/EIO writing/);
+      expect(fs.existsSync(run), "throwing callback must veto explicit cleanup").toBe(true);
+    }
+    // Ordinary nonresident manager: no callback and no persistence obligation.
+    const ordinary = new AgentManager(process.cwd(), manager.config, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "ordinary"),
+    });
+    managers.push(ordinary);
+    const session = await ordinary.run({ task: "ordinary session", transport: "process" });
+    const sessionRun = ordinary.runDirectory(session.id)!;
+    await ordinary.cleanup(session.id);
+    expect(fs.existsSync(sessionRun)).toBe(false);
+    // Actor callback returns normally; it must not inherit the unrelated public task's pin.
+    const actor = await manager.run({ task: "actor activation", actorId: "actor:fixture", residency: "durable", transport: "process" });
+    const actorRun = manager.runDirectory(actor.id)!;
+    await manager.cleanup(actor.id);
+    expect(fs.existsSync(actorRun)).toBe(false);
+    blocked = false;
+    if (collection === "cleanup") await manager.cleanup(result.id);
+    else await manager.close();
+    expect(fs.existsSync(run), "successful preservation authorizes collection").toBe(false);
+    const saved = JSON.parse(fs.readFileSync(savedPath, "utf8"));
+    expect(saved).toMatchObject(worker); // manager may add transport metadata, never truncate the completion
+    expect(saved.error).toBe(worker.error);
+    expect(saved.warnings).toBeUndefined();
+    expect(save.mock.calls.filter(([record]) => record.id === result.id).length).toBeGreaterThan(1);
+  }, 15_000);
+
   it("notifies and releases UI subscribers", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -136,6 +389,381 @@ describe("AgentManager", () => {
     const beforeCleanup = listener.mock.calls.length;
     await manager.cleanup(result.id);
     expect(listener).toHaveBeenCalledTimes(beforeCleanup);
+  });
+
+  it("owns a returned queued handle independently of the caller's abort signal", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const caller = new AbortController();
+    const queued = await manager.spawn({ task: "complete after caller abort", transport: "process" }, caller.signal);
+    expect(queued.status).toBe("queued");
+    caller.abort();
+    expect(manager.listForUi().find((run) => run.id === queued.id)).toMatchObject({ status: "queued", queuePosition: 1 });
+    await manager.stop(first.id);
+    expect((await manager.wait(queued.id)).status).toBe("completed");
+  });
+
+  it.each([false, true])("keeps the resident commit fence separate from activation authority (queued: %s)", async (queued) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const prepared = vi.fn(async () => {});
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: prepared,
+    });
+    managers.push(manager);
+    const first = queued ? await manager.spawn({ task: "HANG", transport: "process" }) : undefined;
+    const commit = vi.fn((id: string): void => {
+      expect(prepared).toHaveBeenCalled();
+      expect(fs.existsSync(path.join(root, id))).toBe(false);
+    });
+    const handle = await manager.spawn({ task: "independent commit", transport: "process" }, undefined, () => true, commit);
+    if (first) {
+      expect(handle.status).toBe("queued");
+      expect(commit).not.toHaveBeenCalled();
+      await manager.stop(first.id);
+    }
+    expect(await manager.wait(handle.id)).toMatchObject({ status: "completed" });
+    expect(commit).toHaveBeenCalledExactlyOnceWith(handle.id);
+  });
+
+  it.each([false, true])("vetoes an abandoned resident commit before worker mutation and releases capacity (queued: %s)", async (queued) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const first = queued ? await manager.spawn({ task: "HANG", transport: "process" }) : undefined;
+    let abandonedId = "";
+    const commit = (id: string): void => { abandonedId = id; throw new Error("resident request abandoned"); };
+    const spawn = manager.spawn({ task: "no late mutation", transport: "process" }, undefined, () => true, commit);
+    if (first) {
+      const handle = await spawn;
+      expect(handle.status).toBe("queued");
+      await manager.stop(first.id);
+      expect(await manager.wait(handle.id)).toMatchObject({ status: "failed", error: "resident request abandoned" });
+    } else {
+      await expect(spawn).rejects.toThrow("resident request abandoned");
+    }
+    expect(abandonedId).not.toBe("");
+    expect(fs.existsSync(path.join(root, abandonedId))).toBe(false);
+    expect(manager.runningCount()).toBe(0);
+    expect(await manager.run({ task: "capacity released", transport: "process" })).toMatchObject({ status: "completed" });
+  });
+
+  it("revokes a queued activation when its owner generation changes without aborting the signal", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const first = await manager.spawn({ task: "HANG", transport: "process" });
+      let generation = 1;
+      const owner = new AbortController();
+      const queued = await manager.spawn({ task: "stale generation", transport: "process" }, owner.signal, () => generation === 1);
+      generation++;
+      await manager.stop(first.id);
+      expect(await manager.wait(queued.id)).toMatchObject({ status: "stopped", error: "Agent activation no longer authorized" });
+      expect(owner.signal.aborted).toBe(false);
+      expect(launch).toHaveBeenCalledTimes(1);
+      expect(manager.runningCount()).toBe(0);
+    } finally { launch.mockRestore(); }
+  });
+
+  it("checks owner revocation again after asynchronous transport preparation", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    let release!: () => void;
+    let ready!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const preparing = new Promise<void>((resolve) => { ready = resolve; });
+    const available = vi.spyOn(ProcessTransport.prototype, "available").mockImplementation(async () => { ready(); await gate; return true; });
+    try {
+      let authorized = true;
+      const queued = await manager.spawn({ task: "revoked during preparation", transport: "process" }, undefined, () => authorized);
+      await manager.stop(first.id);
+      await preparing;
+      authorized = false;
+      release();
+      expect(await manager.wait(queued.id)).toMatchObject({ status: "stopped", error: "Agent activation no longer authorized" });
+      expect(launch).toHaveBeenCalledTimes(1);
+    } finally { release(); available.mockRestore(); launch.mockRestore(); }
+  });
+
+  it("rechecks the owner generation inside delayed transport creation", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const original = ProcessTransport.prototype.launch;
+    let release!: () => void;
+    let ready!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const creating = new Promise<void>((resolve) => { ready = resolve; });
+    const created: string[] = [];
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      ready(); await gate;
+      const handle = await original.call(this, request);
+      created.push(request.id);
+      return handle;
+    });
+    try {
+      let authorized = true;
+      const owner = new AbortController();
+      const queued = await manager.spawn({ task: "revoked generation during creation", transport: "process" }, owner.signal, () => authorized);
+      await manager.stop(first.id);
+      await creating;
+      authorized = false;
+      release();
+      expect(await manager.wait(queued.id)).toMatchObject({ status: "stopped", error: "Agent activation no longer authorized" });
+      expect(owner.signal.aborted).toBe(false);
+      expect(created).toEqual([]);
+    } finally { release(); launch.mockRestore(); }
+  });
+
+  it("cancels an admitted queued run during model preparation without launching its worker", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    let resume!: () => void;
+    let preparing!: () => void;
+    const gate = new Promise<void>((resolve) => { resume = resolve; });
+    const ready = new Promise<void>((resolve) => { preparing = resolve; });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: async (model) => { if (model === "test/queued") { preparing(); await gate; } },
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "queued preparation", model: "test/queued", transport: "process" });
+    await manager.stop(first.id);
+    await ready;
+    const stopped = manager.stop(queued.id);
+    resume();
+    expect((await stopped).status).toBe("stopped");
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(manager.runningCount()).toBe(0);
+  });
+
+  it.each([new Error("queued model preparation failed"), null])("settles and notifies a detached queued launch failure exactly once (%s)", async (failure) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const complete = vi.fn();
+    const settled = vi.fn();
+    const lifecycle = vi.fn();
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: async (model) => { if (model === "test/broken") throw failure; },
+      onBackgroundComplete: complete, onSettled: settled, onLifecycle: lifecycle,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "queued failure", model: "test/broken", transport: "process" });
+    manager.detachSignal(queued.id);
+    await manager.stop(first.id);
+    await vi.waitFor(() => expect(manager.status(queued.id).status).toBe("failed"));
+    expect(complete.mock.calls.filter(([result]) => result.id === queued.id)).toHaveLength(1);
+    expect(settled.mock.calls.filter(([result]) => result.id === queued.id)).toHaveLength(1);
+    expect(lifecycle).toHaveBeenCalledWith(expect.objectContaining({ event: "run.failed", runId: queued.id }));
+    expect(await manager.wait(queued.id)).toMatchObject({ status: "failed", error: failure instanceof Error ? failure.message : String(failure) });
+    expect(await manager.cleanup(queued.id)).toMatchObject({ cleaned: true });
+    expect(manager.list().some((run) => run.id === queued.id)).toBe(false);
+  });
+
+  it("preserves queued launch-uncertainty artifacts and refuses cleanup", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "uncertain queued launch", transport: "process" });
+    vi.spyOn(ProcessTransport.prototype, "launch").mockRejectedValueOnce(Object.assign(new Error("launch outcome unknown"), { launchOutcome: "unknown" }));
+    await manager.stop(first.id);
+    expect(await manager.wait(queued.id)).toMatchObject({ status: "failed", error: "launch outcome unknown" });
+    const runDirectory = path.join(root, queued.id);
+    expect(fs.existsSync(runDirectory)).toBe(true);
+    await expect(manager.cleanup(queued.id)).rejects.toThrow("lost track of its worker");
+    await manager.close();
+    expect(fs.existsSync(runDirectory)).toBe(true);
+  });
+
+  it.each(["alive", "failed-probe", "lost-contact", "hung-probe", "failed-stop"] as const)("retains cancelled queued worker files and reports cleanup pending (%s)", async (mode) => {
+    const repository = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-cancelled-repo-"));
+    roots.push(repository);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: repository, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_AUTHOR_NAME: "Fabric tests", GIT_AUTHOR_EMAIL: "tests@example.invalid", GIT_COMMITTER_NAME: "Fabric tests", GIT_COMMITTER_EMAIL: "tests@example.invalid" } });
+    git("init", "-q");
+    fs.writeFileSync(path.join(repository, "README.md"), "test\n");
+    git("add", "."); git("commit", "-q", "-m", "init");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(repository, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    let release!: () => void;
+    let ready!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const creating = new Promise<void>((resolve) => { ready = resolve; });
+    let workerExited = false;
+    let worktree: string | undefined;
+    const stop = vi.fn(async () => { if (mode === "failed-stop") throw new Error("close acknowledgment lost"); });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementationOnce(async (request) => {
+      worktree = request.cwd;
+      ready(); await gate;
+      return { kind: "process", sessionId: "unconfirmed-worker", stop, isAlive: async () => {
+        if (workerExited) return false;
+        if (mode === "failed-probe") throw new Error("liveness acknowledgment lost");
+        if (mode === "hung-probe") return new Promise<boolean>(() => {});
+        return mode !== "lost-contact";
+      }, lostContact: () => !workerExited && mode === "lost-contact" ? "server unreachable; worker may still run" : undefined };
+    });
+    try {
+      const queued = await manager.spawn({ task: "cancel during worker creation", transport: "process", worktree: true });
+      await manager.stop(first.id);
+      await creating;
+      const started = Date.now();
+      const stopped = manager.stop(queued.id);
+      release();
+      // Exit is not confirmed: even a successful stop request is not deletion authority.
+      const result = await stopped;
+      expect({ status: result.status, error: result.error, worktreeRetained: fs.existsSync(worktree!) }).toMatchObject({
+        status: "stopped", error: expect.stringContaining("cleanup pending"), worktreeRetained: true,
+      });
+      expect(Date.now() - started).toBeLessThan(9_000);
+      if (mode === "alive") expect(Date.now() - started).toBeGreaterThanOrEqual(6_900);
+      expect(stop).toHaveBeenCalledTimes(1);
+      const runDirectory = path.join(root, queued.id);
+      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8"))).toMatchObject({ runId: queued.id, worktree, cleanupPending: true, sessionId: "unconfirmed-worker" });
+      expect(fs.existsSync(path.join(runDirectory, "task.txt"))).toBe(true);
+      expect(fs.existsSync(worktree!)).toBe(true);
+      await expect(manager.cleanup(queued.id)).rejects.toThrow("lost track of its worker");
+      expect(fs.existsSync(runDirectory)).toBe(true);
+      expect(fs.existsSync(worktree!)).toBe(true);
+      // The manager and retention guards preserve the obligation across shutdown too.
+      workerExited = true;
+      await manager.close();
+      expect(fs.existsSync(runDirectory)).toBe(true);
+      expect(fs.existsSync(worktree!)).toBe(true);
+    } finally {
+      workerExited = true; release(); launch.mockRestore();
+      if (worktree && fs.existsSync(worktree)) git("worktree", "remove", "--force", worktree);
+    }
+  }, 20_000);
+
+  it("waits for a cancelled queued worker's confirmed exit before allowing cleanup", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    let release!: () => void;
+    let ready!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const creating = new Promise<void>((resolve) => { ready = resolve; });
+    let stoppedAt: number | undefined;
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementationOnce(async () => {
+      ready(); await gate;
+      return { kind: "process", stop: async () => { stoppedAt = Date.now(); }, isAlive: async () => stoppedAt === undefined || Date.now() - stoppedAt < 150 };
+    });
+    try {
+      const queued = await manager.spawn({ task: "exit after termination", transport: "process" });
+      await manager.stop(first.id);
+      await creating;
+      let settled = false;
+      const stopped = manager.stop(queued.id).then((result) => { settled = true; return result; });
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(settled).toBe(false);
+      expect(fs.existsSync(path.join(root, queued.id, "task.txt"))).toBe(true);
+      expect(await stopped).toMatchObject({ status: "stopped", error: "Agent launch aborted" });
+      expect(fs.existsSync(path.join(root, queued.id, "unresolved-worker.json"))).toBe(false);
+      expect(await manager.cleanup(queued.id)).toEqual({ cleaned: true });
+      expect(fs.existsSync(path.join(root, queued.id))).toBe(false);
+    } finally { release(); launch.mockRestore(); }
+  });
+
+  it("reattaches completion notification when a queued wait reaches its bound after admission", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const complete = vi.fn();
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onBackgroundComplete: complete,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "LIVE_WITH_PROGRESS", transport: "process" });
+    const waiting = expect(manager.wait(queued.id, { timeoutMs: 500 })).rejects.toThrow("is still running after");
+    await manager.stop(first.id);
+    await waiting;
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledWith(expect.objectContaining({ id: queued.id, status: "completed" })), { timeout: 10_000 });
+    expect(await manager.wait(queued.id)).toMatchObject({ status: "completed" });
+  });
+
+  it.each([false, true])("detaches an aborted queued wait without consuming and delivers completion exactly once (deferred: %s)", async (deferred) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-wait-"));
+    roots.push(root);
+    const complete = vi.fn();
+    const consumed = vi.fn();
+    const deferConsumption = vi.fn();
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      onBackgroundComplete: complete, onResultConsumed: consumed,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "LIVE_WITH_PROGRESS", transport: "process" });
+    expect(queued.status).toBe("queued");
+    const controller = new AbortController();
+    const wait = manager.wait(queued.id, {
+      signal: controller.signal,
+      ...(deferred ? { deferConsumption } : {}),
+    });
+    let timer: NodeJS.Timeout | undefined;
+    const observation = Promise.race([wait, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("queued observation remained blocked")), 100);
+    })]);
+    controller.abort(new Error("Main stopped waiting for queued run"));
+    try {
+      await expect(observation).rejects.toThrow("Main stopped waiting for queued run");
+    } finally {
+      clearTimeout(timer);
+    }
+    expect(manager.status(queued.id).status).toBe("queued");
+    expect(consumed.mock.calls.filter(([id]) => id === queued.id)).toHaveLength(0);
+    expect(deferConsumption).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+    await manager.stop(first.id);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledWith(expect.objectContaining({
+      id: queued.id, status: "completed", text: expect.stringMatching(/^live attempt \d+ complete$/),
+    })), { timeout: 10_000 });
+    expect(consumed.mock.calls.filter(([id]) => id === queued.id)).toHaveLength(0);
+    expect(deferConsumption).not.toHaveBeenCalled();
+    expect(await manager.wait(queued.id)).toMatchObject({ status: "completed" });
+    expect(consumed.mock.calls.filter(([id]) => id === queued.id)).toHaveLength(1);
+    expect(complete.mock.calls.filter(([result]) => result.id === queued.id)).toHaveLength(1);
   });
 
   it("runs a worker through the direct process transport", async () => {
@@ -708,6 +1336,32 @@ describe("AgentManager", () => {
     }
   }, 45_000);
 
+  it.skipIf(process.platform === "win32")("R3 close preserves an untracked surviving worker directory and removes tracked terminal runs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-orphan-"));
+    roots.push(root);
+    const runRoot = path.join(root, "runs");
+    const untracked = path.join(runRoot, "previous-host-worker");
+    fs.mkdirSync(untracked, { recursive: true });
+    fs.writeFileSync(path.join(untracked, "evidence"), "still in use");
+    const child = spawn("sleep", ["60"], { stdio: "ignore" });
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    try {
+      await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "complete quickly", transport: "process" });
+      expect(result.status).toBe("completed");
+      const tracked = manager.runDirectory(result.id)!;
+      await manager.close();
+      expect(child.exitCode).toBeNull();
+      expect(fs.existsSync(tracked)).toBe(false);
+      expect(fs.existsSync(untracked)).toBe(true);
+      expect(fs.readFileSync(path.join(untracked, "evidence"), "utf8")).toBe("still in use");
+    } finally { child.kill(); await exited; }
+  }, 30_000);
+
   // review/astra on e170d9e: a marked nested child keeps its completed parent's files too.
   it("keeps a completed parent run whose nested child is marked unresolved", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
@@ -814,6 +1468,114 @@ describe("AgentManager", () => {
     expect(result.status).toBe("completed");
     expect(result.text).toBe("resumed attempt 2");
     expect(result.turns).toBe(1);
+  },
+  30_000);
+
+  // smarty-dev#2184 item 8b: a removed actor's run (its caller aborted after progress, so it was
+  // detached) was relaunched when its worker died, so it ran on and its removal never finished.
+  it("ends an abandoned run as failed when its worker dies, with no relaunch", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: root,
+    });
+    managers.push(manager);
+    const abort = new AbortController();
+    const handle = await manager.spawn({ task: "HANG_WITH_PROGRESS", transport: "process" }, abort.signal);
+    const runDirectory = manager.runDirectory(handle.id)!;
+    await vi.waitFor(
+      () => expect((manager.status(handle.id) as AgentRunRecord).turns).toBe(3),
+      { timeout: 10_000 },
+    );
+    abort.abort();                                             // the actor was stopped: detached
+    manager.abandon(handle.id);                                // and its run given up
+    const worker = Number(handle.sessionId);
+    process.kill(worker, "SIGKILL");
+    const result = await Promise.race([
+      manager.wait(handle.id),
+      new Promise<"hung">((resolve) => setTimeout(resolve, 15_000, "hung")),
+    ]);
+    expect(result).not.toBe("hung");
+    expect((result as AgentRunResult).status).toBe("failed");
+    expect((result as AgentRunResult).error).toContain("Agent transport exited without a result");
+    expect(fs.existsSync(path.join(runDirectory, "relaunches.jsonl"))).toBe(false);
+  },
+  30_000);
+
+  // Review round 2 (security S3) on pi-fabric#160: an abandonment that lands while recovery is
+  // already under way (after the backoff, or while the new worker launches) still stops it.
+  it.each(["after the backoff", "during the relaunch"] as const)(
+    "never keeps a relaunched worker for a run abandoned %s",
+    async (when) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+      roots.push(root);
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      let id = "";
+      const launch = ProcessTransport.prototype.launch;
+      const launched: Array<{ stop(): Promise<void>; isAlive(): Promise<boolean> }> = [];
+      const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+        const handle = await launch.call(this, request);
+        launched.push(handle);
+        if (launched.length === 1 && when === "after the backoff") {
+          // #relaunch stops the dead worker's transport first, after the backoff.
+          const stop = handle.stop;
+          handle.stop = async () => { manager.abandon(id); return stop(); };
+        }
+        if (launched.length === 2 && when === "during the relaunch") manager.abandon(id);
+        return handle;
+      });
+      try {
+        const handle = await manager.spawn({ task: "HANG_WITH_PROGRESS", transport: "process" });
+        id = handle.id;
+        await vi.waitFor(() => expect((manager.status(id) as AgentRunRecord).turns).toBe(3), { timeout: 10_000 });
+        process.kill(Number(handle.sessionId), "SIGKILL");
+        const result = await Promise.race([
+          manager.wait(id),
+          new Promise<"hung">((resolve) => setTimeout(resolve, 20_000, "hung")),
+        ]);
+        expect(result).not.toBe("hung");
+        expect((result as AgentRunResult).status).toBe("failed");
+        // The relaunched worker was signalled; it is gone within moments, not left running.
+        for (const transport of launched) {
+          await vi.waitFor(async () => expect(await transport.isAlive()).toBe(false), { timeout: 5_000 });
+        }
+        expect(launched.length).toBe(when === "after the backoff" ? 1 : 2);
+      } finally {
+        spy.mockRestore();
+      }
+    },
+    40_000,
+  );
+
+  // Review round 1 on pi-fabric#160: a caller that only stopped waiting still wants the run.
+  it("still resumes a detached run whose caller only stopped waiting when its worker dies", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: root,
+    });
+    managers.push(manager);
+    const abort = new AbortController();
+    const handle = await manager.spawn({ task: "HANG_WITH_PROGRESS", transport: "process" }, abort.signal);
+    const runDirectory = manager.runDirectory(handle.id)!;
+    await vi.waitFor(
+      () => expect((manager.status(handle.id) as AgentRunRecord).turns).toBe(3),
+      { timeout: 10_000 },
+    );
+    abort.abort();                                             // a canceled wait: detached, still wanted
+    process.kill(Number(handle.sessionId), "SIGKILL");
+    await vi.waitFor(
+      () => expect(fs.existsSync(path.join(runDirectory, "relaunches.jsonl"))).toBe(true),
+      { timeout: 15_000 },
+    );
+    expect(manager.status(handle.id).status).toBe("running");
+    await manager.stop(handle.id);
   },
   30_000);
 
@@ -1181,7 +1943,13 @@ describe("AgentManager", () => {
       timeoutMs: 5_000,
     });
     expect(native.status).toBe("completed");
-    expect(JSON.parse(native.text).extensionPath).toBeUndefined();
+    // --no-extensions disables Fabric/discovery, not explicitly installed host helpers.
+    // Principal delivery and native session observation remain installed host helpers;
+    // neither widens the child's tools nor enables Fabric/discovery.
+    expect(JSON.parse(native.text).extensionPaths).toEqual([
+      path.resolve("src/worker/principal-delivery.ts"),
+      path.resolve("src/worker/session-id.ts"),
+    ]);
     expect(JSON.parse(native.text)).toMatchObject({
       extensions: false,
       tools: ["read"],
@@ -1257,6 +2025,51 @@ describe("AgentManager", () => {
       parentRun: result.id,
       agentName: "recursive implementor",
     });
+  });
+
+  it("marks ordinary process children as task agents without replacing actor identity (smarty-dev#2088)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
+    fs.chmodSync(fakePi, 0o755);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("src/worker.ts"),
+      piBinary: fakePi,
+      runRoot: root,
+    });
+    managers.push(manager);
+    const report = async (actorName?: string): Promise<unknown> => {
+      const result = await manager.run({
+        task: "REPORT_FLEET_ROLE", transport: "process", timeoutMs: 5_000,
+        ...(actorName ? { actorId: "fleet-role-test", actorName } : {}),
+      });
+      expect(result.status).toBe("completed");
+      return JSON.parse(result.text);
+    };
+
+    try {
+      vi.stubEnv("SMARTY_ROLE", "worktree-agent@abc123");
+      vi.stubEnv("PI_FABRIC_ACTOR_NAME", undefined);
+      vi.stubEnv("PI_FABRIC_ROLE", undefined);
+      expect(await report()).toEqual({ role: "task-agent", actorName: null, fabricRole: null });
+      expect(await report("security-review")).toEqual({
+        role: "worktree-agent@abc123", actorName: "security-review", fabricRole: null,
+      });
+      vi.stubEnv("SMARTY_ROLE", undefined);
+      expect(await report()).toEqual({ role: "task-agent", actorName: null, fabricRole: null });
+      expect(await report("security-review")).toEqual({
+        role: null, actorName: "security-review", fabricRole: null,
+      });
+      // These inherited identities are deliberately unchanged: the governor prioritizes actors,
+      // and participantRole prioritizes PI_FABRIC_ROLE over SMARTY_ROLE.
+      vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
+      vi.stubEnv("PI_FABRIC_ROLE", "project-agent");
+      expect(await report()).toEqual({
+        role: "task-agent", actorName: "parent-actor", fabricRole: "project-agent",
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("keeps the RPC worker alive when Pi announces a retry", async () => {
@@ -1442,6 +2255,32 @@ describe("AgentManager", () => {
     expect(manager.status(handle.id).status).toBe("running");
     await expect(completion).resolves.toMatch(/^live attempt \d+ complete$/);
   }, 15_000);
+
+  it.each([false, true])("cancels only a Main wait observation and preserves completion (already aborted: %s)", async alreadyAborted => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-main-wait-"));
+    roots.push(root);
+    const consumed = vi.fn();
+    let resolveCompletion!: (text: string) => void;
+    const completion = new Promise<string>(resolve => { resolveCompletion = resolve; });
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      onBackgroundComplete: result => resolveCompletion(result.text),
+      onResultConsumed: consumed,
+    });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "LIVE_WITH_PROGRESS", transport: "process" });
+    const controller = new AbortController();
+    if (alreadyAborted) controller.abort(new Error("Main ceiling hit"));
+    const wait = manager.wait(handle.id, { timeoutMs: 60_000, signal: controller.signal });
+    if (!alreadyAborted) controller.abort(new Error("Main ceiling hit"));
+    // A bounded assertion lets the regression fail promptly on the unfixed base.
+    const observation = Promise.race([wait, new Promise((_, reject) => setTimeout(() => reject(new Error("observation remained blocked")), 100))]);
+    await expect(observation).rejects.toThrow("Main ceiling hit");
+    expect(manager.status(handle.id).status).toBe("running");
+    expect(consumed).not.toHaveBeenCalled();
+    await expect(completion).resolves.toMatch(/^live attempt \d+ complete$/);
+    expect(consumed).not.toHaveBeenCalled();
+  });
 
   it("surfaces the run-log tail when a worker exits without a terminal result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));

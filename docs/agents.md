@@ -24,21 +24,73 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 ## Agents
 
+Fabric injections carry structured [turn provenance](turn-provenance.md) on capable Pi hosts. The sender is the admitted participant; message text cannot select a human channel or principal.
+
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. In an interactive Main (TUI or RPC; not a task agent, actor, or print/JSON run), the bound is 60 seconds and reaching it is not an error: the wait returns the child's live status record (`status: "running"`) with `waitTimedOut: true`, so Main is back at a tool boundary where held followUps land (smarty-dev#2119). Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
 ### Background completion inbox
 
-`agents.spawn` returns immediately; independent work can continue without polling. With `agents.notifyOnComplete` enabled (the default), a concise UI notice appears when a detached run finishes. Full outcomes remain in agent activity and logs. Unread results are batched into Main's context after the current assistant turn's entire tool batch, without waiting for its final answer. If Main is idle, unread results wake it once.
+`agents.spawn` validates the request and returns a handle. With a free concurrency slot, Fabric launches the worker and returns a `running` handle. When every slot is occupied, it returns a `queued` handle without waiting for admission. `agents.list` and `agents.status` show queued runs with a one-based `queuePosition`. Fabric admits them in FIFO order as running children finish. Queued spawns count against `maxPerExecution` and the calling program's `agentBudget`; cancelling one does not refund that count.
+
+`agents.wait`/`join` can wait on a queued handle through admission and completion. Their wait bound includes time spent queued. `agents.stop` removes a queued run without launching its worker and settles its result as `stopped`. A returned queued handle belongs to the session: returning from, timing out, or aborting the calling `fabric_exec` program leaves it queued. Session shutdown still stops session-owned queued and running children. These admission rules apply to every local worker transport. Queued receipts are currently session-only: a saturated durable spawn cancels its accepted queue entry, safely rejects, and returns no queued handle. If a cancellation races worker creation and exit cannot be confirmed, Fabric retains its run/worktree files, reports cleanup pending, and refuses cleanup until the worker is checked manually.
+
+Independent work can continue without polling. With `agents.notifyOnComplete` enabled (the default), a concise UI notice appears when a detached run finishes. Full outcomes remain in agent activity and logs. Unread results are batched into Main's context after the current assistant turn's entire tool batch, without waiting for its final answer. If Main is idle, unread results wake it once.
 
 `agents.wait`/`join`, terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop. Fabric refuses a foreground `bash` call, native or through `pi.bash`, whose sleeps add up to more than 5 minutes: a long `sleep`, a sleep in a counted `for` loop, a sleep in a `while` or `until` loop without a `timeout`, a sleep whose length is not a literal (`sleep $((t-now))`), or a `flock -w` wait. The tool call's own `timeout` or a literal `timeout N` bounds the estimate. A session that waits in the foreground takes no steer or ask. Start the poll detached, or wait for a completion message or a mesh event, and end the turn.
 
 Durable spawns use the same inbox. Undelivered envelopes survive disconnects; receipts survive reconnects. Escape or an errored Main turn parks pending results: Fabric does not start a turn to deliver them, and they join Main's next turn, whatever starts it (typed input, a peer message or another trigger). Explicit lifecycle subscriptions, actor messages, and trajectory handoffs retain their separate delivery policies. A terminal run can still report incomplete work; Main must inspect its result.
+
+### Native runner session attribution
+
+Pi runs record the live native Pi session ID in `runnerSessionId`, including
+`--no-session` task agents and durable actors owned by Main or a resident host.
+This is the ID sent upstream as the gateway's `session_id`; it is **not** the
+transport `sessionId` (for example, a process PID) or the Fabric run ID.
+`agents.status`, `agents.wait`, and run listings expose the latest native ID.
+If Pi replaces its session during a run, `runnerSessionIds` keeps the distinct
+observed IDs in first-seen order, while `runnerSessionId` follows the latest.
+
+Run records also retain `mainAgentId` and `fabricSessionId` for the parent Main,
+alongside the task name and, for actor activations, `actorId`/`actorName`.
+Actor run copies retain these fields in `runs/<run-id>/status.json`.
+The `pi.agent_start` and terminal `run.*` lifecycle payloads carry
+`runnerSessionId` and the parent `fabricSessionId` when available.
+Native identity comes from Pi's live session manager, not a pre-launch session
+header: Pi can replace a header-only session's seeded ID during startup.
+No new store or configuration is required.
 
 ### Stalled Pi error recovery
 
 After a failed or aborted assistant response (including `Error: Terminated`), Fabric allows Pi's own retries to recover. If no recovery output arrives for 60 seconds, the worker fails the run with the original error and terminates the child, escalating from SIGTERM to SIGKILL after another 5 seconds. Repeated retry announcements, errors, or lifecycle events do not extend this deadline. Nonempty text/thinking/tool-call deltas refresh it; a successful assistant response clears it. Healthy inference and tool execution are not subject to this recovery timer, and the overall run deadline still applies.
 
 When Pi exhausts its retries, Fabric ends the run; it no longer waits forever on an earlier `willRetry` flag. Child shutdown after RPC stdin closes is also bounded: 5 seconds for graceful exit, then SIGTERM and a further 5 seconds before SIGKILL. These failures settle `agents.wait`/`join` and notify detached callers normally; they do not automatically replay potentially side-effecting work. Already-running workers must be stopped and respawned to use the fix.
+
+### Fleet write attribution for process children
+
+Ordinary process children receive `SMARTY_ROLE=task-agent`, whether the parent has a stamped
+fleet role or no role. The fleet write governor derives their lane from the child's cwd, not
+from a role or a lane environment variable. Explicit actor runs retain their inherited role
+and set `PI_FABRIC_ACTOR_NAME`; that actor identity takes precedence in the governor. An
+ordinary task spawned by an actor also inherits `PI_FABRIC_ACTOR_NAME`, so its governed
+writes still count as that actor. This is write attribution, not an authorization boundary.
+`PI_FABRIC_ROLE` is unchanged: when the parent sets it, `participantRole` still prefers that
+inherited value over `SMARTY_ROLE`.
+
+Task agents return status to their parent; they must not call `smarty-status` to update the
+parent's status comment. That helper keys ordinary comments by role/worktree, so a task
+agent's call would create a separate `task-agent/<worktree>` comment and leave the
+parent's unchanged. The parent owns and writes its status updates. No parent-role environment variable
+is exported for status impersonation.
+
+The installed admin audit's `actor()` likewise records `PI_FABRIC_ACTOR_NAME`, else
+`SMARTY_ROLE`. Non-actor session roles rendered by `smarty-role --format fabric` (including
+security passes and acceptance auditors) therefore execute and are recorded as `task-agent`;
+the role instructions describe the assignment, not a separate process identity. This coarse
+attribution is intentional for delegated work: it identifies the actual task-agent writer
+without claiming the parent's role. It does not identify the named review assignment; retain
+that provenance in the Fabric run/task and review receipt. Work requiring a distinct session
+role in the admin audit must use a separately role-launched root session, not an ordinary task
+agent. Fabric does not change those external helpers or their audit schema.
 
 ### Image-heavy lifecycle events
 
@@ -64,6 +116,21 @@ return results.map(result => result.status === "fulfilled"
   ? { ok: true, handle: result.value }
   : { ok: false, error: String(result.reason) });
 ```
+
+### Parent inheritance and fleet model policy
+
+Without an explicit `model`, Pi children and live actors inherit the spawning run's **actual admitted model and thinking**, ahead of `agents.model` / `agents.thinking`. This includes actor/task parents, not just Main. Explicit model/effort choices still win; a different runner does not inherit a Pi model. Global actor templates retain deferred inheritance until import.
+
+The trusted host's `<agentDir>/fabric.json` can set:
+
+```json
+{ "agents": {
+  "deniedModels": ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"],
+  "deniedModelReplacement": "cliproxyapi/gpt-6.1-sol"
+} }
+```
+
+These policy keys are ignored in project/workspace `.pi/fabric.json`, even in trusted projects. The default deny-list is empty. Fabric checks requested selectors and canonical selections case-insensitively, including aliases, inherited models and defaults, before spawn/create or model-setter mutation. A denial raises `FabricModelDeniedError` (`code: "FABRIC_MODEL_DENIED"`), names #2236 and the configured replacement, and never silently falls back to another model. Alternate runners also admit the backend selector produced by their argv normalizer (including `veda/`, `claude/` and `anthropic/` routing forms). Under active policy, Claude aliases must have an allowed native CLI catalog `resolvedModel` (checked as both a runtime ID and `anthropic/<id>`); Veda requires backend `pi` and an exact concrete `provider/model` resolved by the Pi registry. Unknown targets, Veda aliases/bare IDs/defaults and other Veda backends fail closed with the same typed refusal before queueing or durable submission. Allowed canonical targets, not unresolved selectors, are forwarded to workers. In-place Prewalk checks policy at manual/automatic arm and again before switching Main, and denied binding clears preserve the old binding when the actual owning-session fallback is denied. The fixed refusal code is preserved in public TypeScript guest catches; arbitrary host error properties are not transferred. Deploy the host policy to enforce the fleet list; rebuilding does not retroactively change existing workers or resident owners. See the [public-path CLI proof and installation-only owner gate](model-policy-acceptance.md).
 
 ### Requested models are authoritative
 
@@ -167,13 +234,23 @@ A Main session's actors keep a mesh cursor in the session's actor directory. Aft
 
 A local Main with `mesh.enabled` has a work inbox (smarty-dev#754): `fleet.*` events whose `to` is its session id or name, and that no steer or follow-up delivered. Main receives them as one `<fabric-inbox>` message at turn start and when a completed run settles. An event younger than 60 s waits, so its steer arrives first; a shadow copy whose steer the session holds is skipped. On a Pi that queues a triggered message behind a live prompt preflight and reports that preflight with `ctx.isPromptPending()` (it sets `pi.hostCapabilities.triggeredMessageQueuesBehindPreflight`, Smarty-Pants-Inc/pi#74, and `promptPendingVisible`, Smarty-Pants-Inc/pi#76), an idle Main also reads the inbox every 15 s (`PI_FABRIC_INBOX_WAKE_MS`) and starts a turn for it (smarty-dev#1595): an event published to an idle Main starts a turn about 60–75 s later. Because each wake is a model turn, an idle Main wakes at most once per 5 minutes (`PI_FABRIC_INBOX_WAKE_COOLDOWN_MS`); an event of kind `p0` or `steer` wakes it at once. Each idle wake publishes one `fabric.inbox.wake` event (kind `idle-wake`, data `{count, reason, ids}`), so wakes can be counted from the mesh log. After a run that the user cancelled or that failed, the idle wake stays off until the next turn starts. While a prompt is in its preflight, the timer sends nothing: that prompt's turn start takes the batch. On an older Pi the idle wake is off: a wake could start a run while a prompt is still in its preflight, and that prompt would fail.
 
-The first durable request starts one hidden resident host for the current root when needed. Fabric transfers actor ownership to this host or starts the one-shot run there. It publishes the owner in the standard participant directory. Fabric routes `steer`, `followUp`, `tell`, blocking `ask`, and `stop` through the acknowledged mesh control plane. The process uses the captured agent, mesh, timeout, recursion, and cost-ceiling configuration. It also uses the runner, model, and tool capabilities that the originating call explicitly authorized. Users do not configure a daemon profile or workflow policy.
+The first durable request starts one hidden resident host for the current root when needed. Every durable actor create/import and one-shot spawn uses its authoritative fenced request path, including the first actor in an empty registry. It publishes the owner in the standard participant directory. Fabric routes `steer`, `followUp`, `tell`, blocking `ask`, and `stop` through the acknowledged mesh control plane. The process uses the captured agent, mesh, timeout, recursion, and cost-ceiling configuration. It also uses the runner, model, and tool capabilities that the originating call explicitly authorized. Users do not configure a daemon profile or workflow policy.
 
 The original TUI can shut down after the transfer. Durable agents continue until they reach a terminal status. A resumed copy of the same root can call `agents.status`, `agents.wait`, `agents.log`, and `agents.cleanup`. The mesh stores terminal notifications and active actor deliveries until Main resumes. Durable actors keep their registry definition, mailbox history, runner session, mesh subscriptions, and replay cursor. Main relays session-bound host events while it is available. The cross-process relay can omit oversized raw image blocks. The relay keeps their redacted media descriptors.
 
 A durable actor has one resident execution owner. Other trusted sessions in the project can call `ask`, `tell`, `steer`, `followUp`, and `stop`; Fabric routes each call to that owner. Direct messages carry the caller's model and thinking binding. Actor status, mailbox history, logs, and definition export are shared project views. Only the owner can clear the mailbox or change tools, events, instructions, delivery policy, and project defaults. Fabric sends durable actor removal to the resident owner. The hidden host exits after a short idle grace when it owns no live durable actor or running durable agent. Durable residency requires a trusted project and `mesh.enabled`. Schema enforce mode does not support it.
 
 Recursive cwd also works with durable `agents.spawn()`: the caller resolves explicit relative cwd before ownership transfer, and persisted handles retain effective cwd, kernel, and recursion metadata for later status/log reads. Startup retries reuse the original launch (including effective worktree cwd and capability flags); they do not resolve the target again. Resident-host recovery does not replay an interrupted spawn: its outcome is reported as indeterminate to avoid duplicate execution. This is not migration of a running session to a new cwd; existing workers must finish or be replaced by a new launch.
+
+#### Cancellation and uncertain durable outcomes
+
+Resident mutations race cancellation on one immutable decision record. If abandonment wins before commitment, the host cannot create the requested actor/run/worker or perform cleanup later. Cleanup joins a running worker without foregrounding it or consuming its completion; these effects happen only after commitment. Caller cancellation is forwarded through the public provider, registry, executor and resident exchange, including offline cleanup.
+
+If commitment wins, cancellation, an executor deadline, publication failure or host loss cannot prove rejection. The caller receives `ResidentOutcomeUnknownError` (including its name in public error text), with request/entity/owner IDs when known and **do not retry or reassign** guidance. The outer registry/QuickJS cancellation gates preserve all resident receipts, even if the guest cannot resume or leaves host calls unawaited. Reconcile via `agents.status` / `agents.actorStatus`, `agents.list` / `agents.actors`, and `agents.stop` with the known ID once registered. There is no local create/cede/compensating-remove/reclaim recovery for durable creation. New clients refuse mutation dispatch to live owners without `requestFence: 1`; restart/upgrade old owners at their safe boundary.
+
+**Retention follow-up (P3, not implemented here):** immutable decisions, retained committed late responses and crash-orphan temporary files currently have no bounded collector. Treat this as capacity-monitored rollout debt. Add safe generation/expiry retention that cannot reopen a request to replay, and collect orphan temporaries only after proving they cannot publish a live decision. Never blindly delete a live fencing record to recover space. Linux/local-filesystem checks do not establish Windows, network-filesystem or power-loss/fsync guarantees.
+
+For deterministic native-process regression proof only, the resident host accepts `PI_FABRIC_TEST_RESIDENT_DELAY_STAGE=before_commit|after_commit` plus `PI_FABRIC_TEST_RESIDENT_DELAY_MS` (integer 1–10000). Both are off by default; absent/invalid values do nothing, and no startup/idle work is delayed. The first stage pauses a picked-up request before preparation/commit; the second pauses a successful committed request before response publication. Use an isolated HOME/agent/mesh under a private temporary directory, and leave these variables unset in production. They change timing only, never the winning fence decision.
 
 ### Trajectory-preserving handoff
 
@@ -291,7 +368,7 @@ return agents.run({
 });
 ```
 
-Fabric forwards Veda model values unchanged to the selected backend. Use `agents.veda.model` to set a backend-specific default. An explicit `agents.run({ model })` value has priority. If you omit both values, Veda selects its own backend default. Personas do not depend on models. Add custom personas at `~/.config/veda/personas/<name>/AGENTS.md`. Set the global default with `agents.veda.persona`, or select a persona for one run with `agents.run({ persona })`. `agents.models({ runner: "veda" })` currently returns an empty advisory list. Fabric normalizes usage (`inputTokens`/`outputTokens`/`cachedTokens`), backend conversation ID, turns, and errors from the Veda `--json` envelope. The data appears in the standard Fabric result, dashboard, lifecycle events, and budget ledger.
+With no active host policy, Fabric forwards Veda model values unchanged to the selected backend. Use `agents.veda.model` to set a backend-specific default. An explicit `agents.run({ model })` value has priority. If you omit both values and the host deny-list is empty, Veda selects its own backend default. Under an active host deny policy, Fabric refuses unknown defaults, aliases and bare selectors before queueing or durable submission; select `agents.veda.backend: "pi"` and configure `agents.veda.model` or pass an exact allowed `provider/model` present in the Pi registry. Other Veda backends are refused because their actual target cannot be established. The admitted concrete selection is forwarded to Veda. Personas do not depend on models. Add custom personas at `~/.config/veda/personas/<name>/AGENTS.md`. Set the global default with `agents.veda.persona`, or select a persona for one run with `agents.run({ persona })`. `agents.models({ runner: "veda" })` currently returns an empty advisory list. Fabric normalizes usage (`inputTokens`/`outputTokens`/`cachedTokens`), backend conversation ID, turns, and errors from the Veda `--json` envelope. The data appears in the standard Fabric result, dashboard, lifecycle events, and budget ledger.
 
 For each run, Fabric passes `--tools <allowlist>`. It passes `--no-tools` for an empty allowlist. This setting has priority over tool frontmatter in the persona. The built-in read-only personas specify `tools: none`. The `worker` persona specifies `tools: all` with `sandbox: workspace-write`. Fabric does not pass `--sandbox`, so persona frontmatter defines the sandbox, and `worker` agents can change files. The `navigator-plan` persona also requires a `<program>` design block, and `worker` requires a `<worker_report>`. A failure in either protocol appears as a run error, so `navigator-chat` is the default for free-form tasks.
 
@@ -347,7 +424,7 @@ Set `worktree: true` to create a dedicated Git worktree and a `pi-fabric/<name>-
 
 Fabric uses one participant directory for each project. Every live entity has a fixed `kind` of `root`, `agent`, or `actor`. It also has a `rootId`, an optional `parentId`, an `ownerHostId`, and an authenticated owner identity for the process that controls its lifecycle. **Main** is the local user-facing view of one root. **Peers** provide compatibility views of the other roots. These views do not use separate registries or control planes. **Fabric reserves Peer for another root Pi session. The term never means a child agent.** When asked about a peer, call `agents.peers()` first. `agents.list()` reports only child agents, so it cannot determine whether a peer root has settled.
 
-`agents.self()` returns the participant record for the caller. `agents.sessions()` lists every live root Pi session, including the caller's root and peers, as symmetric participant records for session-to-session coordination. Call `agents.members({ scope?, kinds?, includeStale? })` to list all kinds. `agents.list({ scope? })` lists agents and uses `scope: "local"` by default. Set the scope to `"lineage"` for descendants of the same root across recursive runtimes. Use `"project"` for all live project agents. `agents.main()` and `agents.peers()` remain convenient compatibility projections. A root publishes its `role` (`PI_FABRIC_ROLE`, else `SMARTY_ROLE` without its `@` stamp) and its `project`: the checkout that owns its git common directory, so every linked worktree of one repository shares its main checkout's project. A root whose cwd is in another repository (a lead working from a worktree of a shared repository) sets `PI_FABRIC_PROJECT` to its own checkout, or any path in it; the root's actors and resident host use that project too. `agents.projectAgent()` returns the live root with role `project-agent` in the caller's project, the most recently started when several match. A worktree agent reports to it, because `agents.main()` returns the worktree agent's own root. A root from a runtime that publishes neither field counts when its cwd is the project checkout. When no project agent is live, the call throws and names the roots in that project. Standard discovery hides participants with expired execution-host leases. Shared summaries include operational metadata. They exclude agent prompts, results, and errors.
+`agents.self()` returns the participant record for the caller. `agents.sessions()` lists every live root Pi session, including the caller's root and peers, as symmetric participant records for session-to-session coordination. Call `agents.members({ scope?, kinds?, includeStale? })` to list all kinds. `agents.list({ scope? })` lists agents and uses `scope: "local"` by default. Set the scope to `"lineage"` for descendants of the same root across recursive runtimes. Use `"project"` for all live project agents. `agents.main()` and `agents.peers()` remain convenient compatibility projections. A root publishes its `role` (`PI_FABRIC_ROLE`, else `SMARTY_ROLE` without its `@` stamp) and its `project`: the checkout that owns its git common directory, so every linked worktree of one repository shares its main checkout's project. A root whose cwd is in another repository (a lead working from a worktree of a shared repository) sets `PI_FABRIC_PROJECT` to its own checkout, or any path in it; the root's actors and resident host use that project too. Roots also publish `repository`, their normalized Git origin identity, so moved lanes on other hosts can match the same repository despite different checkout paths. `agents.projectAgent()` uses that identity and the lead id captured at provider launch from `SMARTY_LEAD_SESSION` or the lane's `.local/lead` (a file containing the exact `session:<id>`). The recorded id wins when several same-origin roots exist and permits that exact bridge mirror; an unrecorded mirror cannot claim leadership. Without a recorded id, a single native `project-agent` is selected; multiple candidates throw `FabricProjectAgentAmbiguousError`, and an unavailable or wrong-repository recorded lead throws `FabricProjectAgentUnresolvedError` and does not choose another session. Legacy native records retain checkout-path matching, including an untagged root whose cwd is exactly the project checkout. Print/JSON roots publish `interactive: false`: they remain discoverable but cannot receive `followUp`/`steer`/`tell` or become project leads. A worktree agent reports to its project lead because `agents.main()` returns the worktree agent's own root. Standard discovery hides participants with expired execution-host leases. Shared summaries include operational metadata. They exclude agent prompts, results, and errors.
 
 ```ts
 const main = await agents.main();
@@ -363,6 +440,12 @@ return { self: await agents.self(), lineage };
 ```
 
 For Main and one-shot agents, `steer` arrives after the tool calls in the current turn and before the next model call. `followUp` waits until the current run settles, or, for a busy Main, until the next tool boundary after it has waited `mesh.followUpFlushMs` (2 minutes by default). Each delivered message header carries `delivery` and `sent_at` (ISO UTC). A followUp to Main returns `pendingFollowUps` and `oldestAgeS`: how many of the caller's own followUps Fabric still holds for that Main, and the age of the oldest; switch to `steer` when they grow. When Main is idle and its oldest held followUp, from any sender, is older than `mesh.followUpStallSeconds` (10 minutes by default), the queue is stalled: the followUp (or `tell`) throws `Fabric followUp to <target> was accepted but is not being delivered: ...`, and the message stays held. A busy Main admits at most 50 held followUps or 256 KiB per sender, and 200 or 1 MiB in total; past that, the followUp is rejected with the reason. Held followUps are journalled under the mesh root until the session holds them, so a restart does not lose them. A followUp whose `data.coalesceKey` is a non-empty string (at most 200 characters) replaces a followUp from the same sender with the same key that Main still holds unread: the newest message and data take its place in the queue, the result reports `coalesced: true` and `replacedMessageId`, and the replaced one is never delivered, also after a restart. A replacement does not count twice against the quota. A followUp without a key, with another key, or from another sender is held as before, and one already handed to Main is never replaced. `agents.tell` to Main is a followUp and coalesces the same way. This is the Main parallel of an actor's mailbox `coalesceKey`; judging whether a notice is stale stays the sender's job. For actors, both operations add a message to the serial mailbox. `agents.status({ id })` accepts any participant ID. It returns complete details for a local run or actor and a bounded directory summary for a remote participant. `agents.setSteeringMode` and `setFollowUpMode` continue to control local one-shot runs.
+
+Main message receipts include `triggered: true | false` when the owner can report it. `true` means delivery requested a new turn from an idle Main at admission; it is not a completion receipt. A normal `followUp` (including `tell` to Main) carries the same wake permission across mesh bridges as local delivery. A busy Main reports `false` while holding the followUp for the next eligible boundary, without starting an extra run. Passive, halted, provider-backoff-held, reload-held, and duplicate admissions also report `false`.
+
+A provider/compaction failure holds triggering peer `followUp` and `steer` messages until 60 seconds after the failure; consecutive failures without a successful turn double this delay, capped at 30 minutes. Held receipts include `reason: "provider-backoff until <ISO timestamp>"`. Fabric retains the messages (with the existing durable journal and quotas) and schedules their release at the deadline, even with the ordinary busy followUp drain disabled. Only one byte/provenance-bounded triggering batch is handed to Pi for a retry whose outcome is still unknown: remaining batches and new peer wakes stay in Fabric, not Pi's native continuation queue. New held admissions during that attempt report `reason: "provider-retry in flight"`. One best-effort `fabric.main.wake` mesh event per released batch, with kind `provider-backoff-released`, reports its message IDs and deadline. A successful turn resets the delay. Successful manual compaction also releases held wakes once Pi becomes idle, even with `mesh.followUpFlushMs: 0`, without resetting the consecutive-failure count. Escape/owner halts still suppress wakes indefinitely and cancel the timer; passive and `nextTurn` context do not arm it. An older owner or non-Main target may omit the field: treat that as unknown, not as `false`. A replayed control acknowledgement retains the original admission report; it does not describe a new wake. Existing cancellation gates and `steer` delivery semantics are unchanged.
+
+Exact-id `followUp`, `steer`, and `tell` use the same participant directory and mesh root as `peers()`, including participant files, state-only records and bridge mirrors. A cached miss is retried with a fresh read. If discovery lists the target but control presence is not yet admissible, the call throws `FabricParticipantNotYetMirroredError` (`code: FABRIC_PARTICIPANT_NOT_YET_MIRRORED`, `retryable: true`, “not yet mirrored”); retry after the next bridge presence refresh. Discovery never bypasses owner/capability or bridge admission checks. Messages to print/JSON roots fail with `FabricParticipantNonInteractiveError`.
 
 Local routing returns `"main"` or `"local"`. For cross-process `steer`, `followUp`, and `stop`, Fabric resolves the exact owner of the target. It sends a control command addressed to that owner and waits for an acknowledgement that matches the version, target, and owner identity. Success returns `routed: "mesh", acknowledged: true` after this verified acknowledgement. Unknown IDs, stale owners, rejection, and timeout throw an error. The owner records each command it admits, so a replayed command is answered from the record and not run again. Each host keeps these records and their outcomes in its own store under the mesh root (`control-seen/`) until the command has expired and left the event log. Each claim is also made in the shared state, so owners that run an older Fabric version for the same host cannot run the command again. That shared copy is kept while the command is in the retained event log, unless the fleet owner has ended support for runtimes before Fabric B8 (see [architecture](architecture.md)). The dashboard actions `s`, `u`, and `x` use the same route. Set `mesh.enabled` to use cross-process control. See [`references/agents.md`](../skillsets/typescript/fabric-exec/references/agents.md).
 
@@ -483,7 +566,7 @@ Omit `model` or `thinking` to clear the selected layer. A cleared session bindin
 
 `FabricActorInfo.model` and `thinking` show the effective values for the caller. `binding` shows the session layer. `projectDefaults` shows the shared definition layer.
 
-Fabric stores the resolved binding on each mailbox item before it queues. Later binding changes cannot alter a running activation or an older queued item. `ask` waits for the owner to return a result. `tell`, `steer`, and `followUp` enqueue through the same owner. Pi and Claude actors both support these direct-call bindings.
+Own-root requests queue only explicit per-call model/thinking pins; omitted fields resolve from the owner's current session/project defaults when the activation launches, including after mailbox restoration. Foreign requests queue an already-resolved caller view: later owner binding changes cannot alter it, and absent fields use Fabric or runner configuration, never the owner's private session layer. This distinction survives persistence and restoration. An already-launched activation keeps its launch-time binding. `ask` waits for the owner to return a result. `tell`, `steer`, and `followUp` enqueue through the same owner. Pi and Claude actors both support these direct-call bindings.
 
 The mailbox, history, and runner session remain shared. Host events and mesh subscriptions run once on the owner and use the owner's session binding. Opening another Pi session does not start another copy of the actor.
 
@@ -657,19 +740,23 @@ Fabric also resets a session automatically. Before a run starts, it checks the s
 
 ## Paged agent logs
 
-`agents.log()` reads bounded pages from JSONL logs. It does not load the full file. The first call returns the newest entries. If `hasMore` is true, pass the returned `before` cursor to load the next older page. For an actor session, use `sessionHasMore` and `sessionBefore`:
+`agents.log()` reads bounded pages from JSONL logs. The first call returns the newest entries. A next-page call must pair its `before` byte offset with the returned `generation`, passed as `beforeGeneration`. For an actor run these fields are inside `run`; for an actor session use `sessionBefore` and `sessionGeneration` with `type: "session"`. An initial `type: "all"` returns both streams, but a bound next page must select one stream.
 
 ```ts
 const { id } = await agents.actorStatus({ id: "release-reviewer" });
 const newest = await agents.log({ id, type: "run", lines: 100 });
-if ("before" in newest && newest.hasMore) {
-  const older = await agents.log({ id, type: "run", lines: 100, before: newest.before });
-  return older;
+const page = "run" in newest ? newest.run : "events" in newest ? newest : undefined;
+if (page?.hasMore) {
+  return await agents.log({
+    id, type: "run", lines: 100,
+    before: page.before, beforeGeneration: page.generation,
+    ...("runId" in page ? { runId: page.runId } : {}),
+  });
 }
 return newest;
 ```
 
-The `offset` values on log lines and all page cursors are byte offsets in the JSONL file.
+Terminal run-log compaction can replace the file atomically. A stale generation, or a public call with a bare `before` and no generation, returns the named `cursor-stale` error and reads no wrong bytes. Re-read from the start without the cursor pair, or supply the generation returned with that cursor. This deliberately tightens the old numeric-only paging contract. Same-file appends do not invalidate a bound cursor; internal descriptor readers remain compatible.
 
 ## Global actor templates
 

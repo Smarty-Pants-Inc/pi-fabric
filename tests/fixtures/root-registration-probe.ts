@@ -19,7 +19,7 @@ try {
   directory.registerSource(() => [directory!.root({
     id, name: "Main", kind: "main", status: "idle", runner: "pi", transport: "host",
     sessionId, cwd: meshRoot, updatedAt: Date.now(), pendingMessages: false, local: true,
-  }, name, guard.ownerId)]);
+  }, true, name, guard.ownerId)]);
   await directory.start();
   process.stdout.write(JSON.stringify({ state: "claimed" }) + "\n");
   await new Promise<void>(resolve => { process.stdin.once("data", () => resolve()); process.stdin.once("end", () => resolve()); });

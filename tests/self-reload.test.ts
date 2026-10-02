@@ -79,6 +79,17 @@ afterEach(() => {
 });
 
 describe("release detection", () => {
+  it.each([undefined, "{", "null", "[]", "{}", '{"name":42}', '{"name":["pi-fabric"]}', '{"name":"other"}'])
+    ("ignores missing, malformed and non-Fabric package metadata: %s", (metadata) => {
+      const root = release("invalid");
+      const manifest = path.join(root, "package.json");
+      if (metadata === undefined) fs.rmSync(manifest);
+      else fs.writeFileSync(manifest, metadata);
+      activate(root);
+      expect(activeFabricRoot(settingsPath())).toBeUndefined();
+      expect(loadedFabricRoot(pathToFileURL(path.join(root, "dist", "index.js")).href)).toBeUndefined();
+    });
+
   it("finds the loaded package root and the one active pi-fabric package entry", () => {
     const old = release("aaa");
     const next = release("bbb");

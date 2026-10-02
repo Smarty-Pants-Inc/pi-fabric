@@ -474,6 +474,8 @@ export class FabricControlPlane {
       destination.remoteHost = mirroredOwner?.remoteHost ?? (this.options.readMirroredOwner ? null : undefined);
     }
     const destinationRemoteHost = destination.remoteHost;
+    // One budget drives the wire deadline and the sender's ACK timer: mirrored owners
+    // need bridge transit time, while native commands retain the local ACK window.
     const timeoutMs = Math.max(
       this.#pollMs * 4,
       typeof destinationRemoteHost === "string" ? this.#bridgeTimeoutMs : 0,
@@ -569,8 +571,11 @@ export class FabricControlPlane {
       await Promise.race([publishing, acceptance.then(() => undefined)]);
       const acknowledged = await acceptance;
       if (!acknowledged.accepted) {
+        const error = acknowledged.error || "Remote Fabric owner rejected command for " + targetId;
         throw new FabricControlRejection(
-          acknowledged.error || "Remote Fabric owner rejected command for " + targetId,
+          acknowledged.notRun === true && error === CONTROL_COMMAND_EXPIRED
+            ? `${error}; not delivered, safe to resend.`
+            : error,
           acknowledged.notRun === true,
         );
       }

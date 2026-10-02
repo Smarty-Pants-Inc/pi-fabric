@@ -737,7 +737,7 @@ describe("cross-host Main delivery semantics (#3015)", () => {
 });
 
 describe("mesh bridge", () => {
-  it("accepts and ACKs a bridged control command after 10 s of injected transport latency", async () => {
+  it.each([9_000, 10_000])("accepts and ACKs a bridged control command after %i ms of injected transport latency", async (latencyMs) => {
     const { hub, far, bridge, remote } = setup(undefined, { realPipe: true, presenceMs: 5_000 });
     const lane = await addRoot(hub, "lane", 60_000);
     const target = await addRoot(far, "remote", 60_000);
@@ -756,7 +756,7 @@ describe("mesh bridge", () => {
       const publish = remote.publish.bind(remote);
       vi.spyOn(remote, "publish").mockImplementation(async (...args) => {
         if (args[0].topic === "fabric.control.command" && args[0].kind !== "cancel") {
-          await new Promise(resolve => setTimeout(resolve, 10_000));
+          await new Promise(resolve => setTimeout(resolve, latencyMs));
         }
         return publish(...args);
       });

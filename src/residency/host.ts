@@ -521,6 +521,7 @@ export class ResidentHost {
         hostId: this.hostId,
         pid: process.pid,
         processStartTime: processStartTime(process.pid),
+        fabricExtensionPath: this.config.fabricExtensionPath,
         token: this.#token,
         startedAt: now,
         readyAt: now,

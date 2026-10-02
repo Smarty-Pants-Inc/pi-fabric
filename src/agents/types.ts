@@ -47,6 +47,8 @@ export interface AgentRunRequest {
   idempotencyKey?: string;
   /** Host-created shadow decision; never accepted from external argument normalization. */
   routeDecision?: ModelRouteDecision;
+  /** Host-only judgment join; never normalized from public agent arguments. */
+  routeRecord?: { ledger: string; decisionRecorded: boolean };
   /** Host-only resident startup probe: model/extension admission, no prompt or tools. */
   residentStartupProbe?: boolean;
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
@@ -260,6 +262,8 @@ export interface AgentWorkerOptions {
   bashTimeoutSeconds?: number;
   fabricExtensionPath?: string;
   routeHeader?: string;
+  /** Host-only bounded judge: no ambient resources, compaction or retry. */
+  judgment?: boolean;
   model?: string;
   thinking?: string;
   systemPrompt?: string;

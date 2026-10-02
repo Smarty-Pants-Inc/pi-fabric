@@ -397,6 +397,8 @@ export class ActorManager {
   readonly #persistedRoots = new Map<string, string>();
   // In-flight fenced adoption attempts, one per actor.
   readonly #adoptionPending = new Set<string>();
+  /** Claim publication and predecessor copy still owed by this live successor. */
+  readonly #adoptionClaims = new Map<string, { expectedRootId: string; confirmed: boolean }>();
   readonly #adoptionGraceMs: number;
   readonly #listeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
@@ -3723,17 +3725,19 @@ export class ActorManager {
   // only delays the copy. A taken-over file is deleted once this lineage's own file is written.
   // Only the claiming lineage takes over: its root and its residency (a Main and its resident host
   // share a root, review/astra F6 on #79), and never from its own file (F7).
-  #takeOverPredecessors(actor: ManagedActor): void {
-    if (actor.rootId !== this.#rootId || (this.#claimResidency ?? actor.residency) !== actor.residency) return;
+  #takeOverPredecessors(actor: ManagedActor): boolean {
+    if (actor.rootId !== this.#rootId || (this.#claimResidency ?? actor.residency) !== actor.residency) return false;
     const own = this.#ownQueueFile(actor);
+    let readable = true;
     for (const rootId of actor.adoptedFrom ?? []) {
       const file = this.#queueFile(actor.id, rootId, actor.residency);
       if (file === own) continue;
       const saved = this.#readQueue(file);
-      if (saved === undefined) continue;
+      if (saved === undefined) { if (fs.existsSync(file)) readable = false; continue; }
       this.#takenOver.set(actor.id, new Set([...(this.#takenOver.get(actor.id) ?? []), file]));
       this.#restoreQueue(actor, saved, true);
     }
+    return readable && !this.#takenOver.has(actor.id) && !this.#restoredDeliveries.has(actor.id);
   }
 
   // Merges saved queue items into the actor's parked work (which waits for ownership), skipping
@@ -3971,7 +3975,7 @@ export class ActorManager {
   }
 
   #ownershipDecision(id: string): boolean {
-    if (this.#ceded.has(id)) return false;
+    if (this.#ceded.has(id) || this.#adoptionClaims.get(id)?.confirmed === false) return false;
     const actor = this.#actors.get(id);
     const decision = this.#canManageActor?.(id);
 
@@ -4007,6 +4011,12 @@ export class ActorManager {
     ) {
       return;
     }
+    // A failed barrier may already have installed our root. Retry the claim
+    // and queue copy even though this process loaded its own queue earlier.
+    if (this.#adoptionClaims.has(actor.id)) {
+      void this.#confirmAdoption(actor).catch(() => undefined);
+      return;
+    }
     if (actor.rootId === this.#rootId) return;
     // Only residency-matched rows: Main adopts "session" actors, the resident
     // host adopts "durable" actors.
@@ -4038,12 +4048,33 @@ export class ActorManager {
     if (this.#adoptionPending.has(actor.id)) return;
     this.#adoptionPending.add(actor.id);
     try {
-      const expectedRootId = actor.rootId;
+      const expectedRootId = this.#adoptionClaims.get(actor.id)?.expectedRootId ?? actor.rootId;
       const adopted = await this.#registry.withLock(() => {
         const records = this.#registry.records();
         const current = records.find((record) => record.id === actor.id);
         // A racing adopter rewrote the lineage since we loaded it; they win.
-        if (!current || current.rootId !== expectedRootId) return false;
+        // records() can be temporarily unreadable. Absence is not authority
+        // to drop an unconfirmed claim and its predecessor-copy obligation.
+        if (!current) return false;
+        if (current.rootId !== expectedRootId && current.rootId !== this.#rootId) {
+          this.#adoptionClaims.delete(actor.id);
+          return false;
+        }
+        if (current.rootId === this.#rootId && this.#adoptionClaims.has(actor.id)) {
+          if (this.#canManageActor?.(actor.id) === false) return false;
+          // Post-rename failure: confirm a fresh durable copy of the actual
+          // winning registry, preserving other rows, before importing work.
+          if (!this.#adoptionClaims.get(actor.id)!.confirmed) {
+            this.#registry.write(records);
+            this.#registryFingerprint = this.#registry.fingerprint();
+          }
+          actor.rootId = this.#rootId;
+          actor.adoptedFrom = Array.isArray(current.adoptedFrom)
+            ? current.adoptedFrom.filter((root): root is string => typeof root === "string") : [];
+          if (typeof current.adoptedAt === "number") actor.adoptedAt = current.adoptedAt;
+          return true;
+        }
+        if (current.rootId !== expectedRootId) return false;
         // A live owner opinion appeared while we waited for the lock.
         if (this.#canManageActor?.(actor.id) !== undefined) return false;
         // The lineage root turned out to be alive after all.
@@ -4060,6 +4091,7 @@ export class ActorManager {
         }
         // The claim and the queue copy cannot commit together, so the claim names the roots whose
         // files still hold work; the copy completes on adoption, or on this lineage's next load.
+        this.#adoptionClaims.set(actor.id, { expectedRootId, confirmed: false });
         const earlier = Array.isArray(current.adoptedFrom) ? current.adoptedFrom : [];
         // Never this lineage itself: a returning predecessor keeps its own file (F7).
         actor.adoptedFrom = [...new Set([expectedRootId, ...earlier])].filter((root): root is string =>
@@ -4074,8 +4106,9 @@ export class ActorManager {
         return true;
       });
       if (adopted) {
+        this.#adoptionClaims.get(actor.id)!.confirmed = true;
         this.#persistedRoots.set(actor.id, this.#rootId);
-        this.#takeOverPredecessors(this.#actors.get(actor.id) ?? actor);
+        if (this.#takeOverPredecessors(this.#actors.get(actor.id) ?? actor)) this.#adoptionClaims.delete(actor.id);
       } else {
         const current = this.#registry.records().find((record) => record.id === actor.id);
         if (!current) {
@@ -4089,11 +4122,14 @@ export class ActorManager {
         }
       }
     } catch {
-      // Lock timeout or IO failure: state untouched; a later refresh retries.
+      // Rename may already have installed the claim. Keep its confirmation
+      // and takeover obligation; the existing poll retries without a restart.
     } finally {
+      // Refresh while this attempt is fenced, not a microtask retry loop when
+      // storage stays unavailable. The next ordinary poll owns the retry.
+      this.#refreshOwnership();
       this.#adoptionPending.delete(actor.id);
     }
-    this.#refreshOwnership();
     this.#emitChange();
   }
 
@@ -4113,7 +4149,7 @@ export class ActorManager {
       } else if (!previous && next) {
         acquired = true;
       }
-      if (!next) this.#maybeAdoptOrphan(actor);
+      if (!next || this.#adoptionClaims.has(actor.id)) this.#maybeAdoptOrphan(actor);
     }
     if (!acquired || !this.#persistent || this.#closing) {
       this.#scheduleRestoreParked();

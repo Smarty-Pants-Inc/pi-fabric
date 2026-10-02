@@ -311,6 +311,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   relaunchFailure?: AgentRunRecord;
   /** Set when the run failed because its transport lost contact: its worker may still run. */
   lostContact?: string;
+  /** A visible worker answer awaiting inode/namespace confirmation, retained even at close. */
+  terminalConfirmation?: AgentRunResult;
   /** Full terminal publication owed after effects have finished; retry storage only. */
   terminalPublication?: AgentRunResult;
   model?: string;
@@ -1635,7 +1637,9 @@ export class AgentManager {
     const managed = this.#runs.get(id);
     if (!managed || managed.settled || this.#closing) return;
     if (!this.#observedWork(managed)) {
-      void this.stop(id);
+      // This caller observer is detached from the monitor. Own its rejection;
+      // the monitor retains and retries the complete terminal storage obligation.
+      void this.stop(id).catch(() => undefined);
       return;
     }
     this.#detach(managed, "caller aborted; the run continues");
@@ -1801,15 +1805,15 @@ export class AgentManager {
     managed.stopRequested = true;
     if (managed.settled) return this.wait(id);
     managed.background = false;
-    const existing = readRecord(managed.statusFile);
-    if (existing && terminalStatuses.has(existing.status)) {
-      const result = this.#withTransportMetadata(confirmTerminalRecord(managed.statusFile), managed) as AgentRunResult;
-      this.#finishTerminal(managed, result);
-      return result;
-    }
     if (managed.terminalPublication) {
       const result = managed.terminalPublication;
       this.#finishTerminal(managed, result, true);
+      return result;
+    }
+    const existing = managed.terminalConfirmation ?? readRecord(managed.statusFile);
+    if (existing && terminalStatuses.has(existing.status)) {
+      const result = this.#confirmTerminal(managed, existing);
+      this.#finishTerminal(managed, result);
       return result;
     }
     await managed.transport.stop();
@@ -1818,7 +1822,7 @@ export class AgentManager {
     const terminal = readRecord(managed.statusFile);
     const record =
       terminal && terminalStatuses.has(terminal.status)
-        ? (this.#withTransportMetadata(confirmTerminalRecord(managed.statusFile), managed) as AgentRunResult)
+        ? this.#confirmTerminal(managed, terminal)
         : failedRecord(managed, "stopped", "Agent stopped");
     this.#finishTerminal(managed, record, !terminal || !terminalStatuses.has(terminal.status));
     return record;
@@ -2063,7 +2067,8 @@ export class AgentManager {
     const alive = await Promise.all(transports.map((transport) =>
       uncheckedExternalExit(transport) ? true :
         this.#transportAliveUntil(transport, observationDeadline).then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
-    const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
+    const unresolved = all.some((managed) => !managed.settled || managed.resolve || managed.terminalConfirmation || managed.terminalPublication ||
+      managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
       [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasUnresolvedWorker(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {
@@ -2444,9 +2449,12 @@ export class AgentManager {
         toolCalls: Math.max(record.toolCalls, managed.observedProgress.toolCalls),
         error: `${record.error ?? "Agent run failed"} · relaunch failed: ${retryError}`,
       };
-      writeRecord(managed.statusFile, failed);
-      managed.latestRecord = failed;
+      // Launch effects are over. Keep the full failure before the throwing
+      // publication so a barrier retry cannot launch a third worker.
       managed.relaunchFailure = failed;
+      managed.terminalPublication = this.#withTransportMetadata(failed, managed) as AgentRunResult;
+      managed.latestRecord = failed;
+      writeRecord(managed.statusFile, managed.terminalPublication);
       return false;
     }
   }
@@ -2461,7 +2469,7 @@ export class AgentManager {
           return;
         }
         this.#drainLifecycle(managed);
-        let record = readRecord(managed.statusFile);
+        let record = managed.terminalConfirmation ?? readRecord(managed.statusFile);
         if (record) {
           this.#observeProgress(managed, record);
           const previous = managed.latestRecord;
@@ -2482,7 +2490,7 @@ export class AgentManager {
           managed.runnerSessionId = record.runnerSessionId;
         }
         if (record && terminalStatuses.has(record.status)) {
-          record = confirmTerminalRecord(managed.statusFile);
+          record = this.#confirmTerminal(managed, record);
           if (await this.#resumeStopped(managed, record, deadline)) continue;
           // A relaunch that failed is terminal: no fallback launch may run after it.
           if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
@@ -2501,7 +2509,7 @@ export class AgentManager {
           ) {
             this.#finishTerminal(
               managed,
-              this.#withTransportMetadata(confirmTerminalRecord(managed.statusFile), managed) as AgentRunResult,
+              this.#confirmTerminal(managed, completed),
             );
             return;
           }
@@ -2577,6 +2585,15 @@ export class AgentManager {
     }
   }
 
+  #confirmTerminal(managed: ManagedAgent, visible: AgentRunRecord): AgentRunResult {
+    // Retain the full answer before the throwing barriers. Close and later
+    // collection must not turn a visible, unconfirmed answer into missing bytes.
+    managed.terminalConfirmation = this.#withTransportMetadata(visible, managed) as AgentRunResult;
+    const confirmed = this.#withTransportMetadata(confirmTerminalRecord(managed.statusFile), managed) as AgentRunResult;
+    delete managed.terminalConfirmation;
+    return confirmed;
+  }
+
   #finishTerminal(managed: ManagedAgent, result: AgentRunResult, publish = false): void {
     if (managed.settled) return;
     if (publish || managed.lostContact) {
@@ -2647,6 +2664,7 @@ export class AgentManager {
   }
 
   #canCollect(managed: ManagedAgent): boolean {
+    if (!managed.settled || managed.resolve || managed.terminalConfirmation || managed.terminalPublication) return false;
     if (managed.lostContact) this.#markLost(managed, managed.lostContact);
     if (uncheckedExternalExit(managed.transport) || runTreeExitVeto(managed.runDirectory)) return false;
     // Settlement compacts UI caches. Retry only the original full result, never those caches.

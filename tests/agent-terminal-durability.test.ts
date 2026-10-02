@@ -18,7 +18,7 @@ afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-const fixture = (options: { timeoutMs?: number; lost?: boolean; dead?: boolean } = {}) => {
+const fixture = (options: { timeoutMs?: number; lost?: boolean; dead?: boolean; retainRuns?: boolean } = {}) => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-terminal-durability-")); roots.push(temp);
   const root = path.join(temp, FABRIC_RUN_ROOT_PREFIX + "fixture");
   let alive = !options.dead;
@@ -31,9 +31,9 @@ const fixture = (options: { timeoutMs?: number; lost?: boolean; dead?: boolean }
     return { kind: options.lost ? "herdr" : "process", relaunchable: false, livenessPollIntervalMs: 1, isAlive: async () => options.lost ? false : alive, stop, ...(options.lost ? { lostContact: () => "Herdr contact lost; pane may still run" } : {}) };
   });
   const consumed = vi.fn();
-  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: options.timeoutMs ?? 60_000, retainRuns: true, maxConcurrent: 1 }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onResultConsumed: consumed });
+  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: options.timeoutMs ?? 60_000, retainRuns: options.retainRuns ?? true, maxConcurrent: 1 }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onResultConsumed: consumed });
   managers.push(manager);
-  return { temp, root, manager, launch, stop, consumed };
+  return { temp, root, manager, launch, stop, consumed, exit: () => { alive = false; } };
 };
 const faults = (reject: (file: string, fd: number) => boolean) => {
   const descriptors = new Map<number, string>();
@@ -46,7 +46,53 @@ const faults = (reject: (file: string, fd: number) => boolean) => {
 };
 const status = (manager: AgentManager, id: string) => path.join(manager.runDirectory(id)!, "status.json");
 
-describe("Astra F15-F17 terminal publication obligations", () => {
+describe("Astra F15-F21 terminal publication obligations", () => {
+  it.skipIf(process.platform === "win32")("F18 close retains a completed answer with default retention until terminal confirmation recovers", async () => {
+    const { manager, exit, consumed } = fixture({ retainRuns: false });
+    const handle = await manager.spawn({ task: "fixture", transport: "process" });
+    const file = status(manager, handle.id), directory = path.dirname(file);
+    const answer = { ...JSON.parse(fs.readFileSync(file, "utf8")), status: "completed", finishedAt: Date.now(), text: "original completed answer", turns: 7 };
+    fs.writeFileSync(file, JSON.stringify(answer));
+    exit();
+    let unavailable = true, confirmations = 0;
+    const fault = faults((target, fd) => target === directory && fs.fstatSync(fd).isDirectory() && (++confirmations, unavailable));
+    try {
+      await manager.close();
+      expect(confirmations).toBeGreaterThan(0);
+      expect(consumed).not.toHaveBeenCalled();
+      expect(fs.existsSync(file)).toBe(true);
+      expect(fs.existsSync(path.join(directory, "task.txt"))).toBe(true);
+      await expect(manager.cleanup(handle.id)).rejects.toThrow();
+      await expect(manager.wait(handle.id, { timeoutMs: 350 })).rejects.toThrow();
+      unavailable = false;
+      expect(await manager.wait(handle.id, { timeoutMs: 3000 })).toMatchObject({ status: "completed", text: answer.text, turns: 7 });
+      expect(consumed).toHaveBeenCalled();
+    } finally { fault.mockRestore(); }
+  });
+
+  it("F19 caller abort before progress owns a one-shot terminal fsync rejection and retries settlement", async () => {
+    const { manager, launch, stop } = fixture();
+    const abort = new AbortController();
+    const handle = await manager.spawn({ task: "fixture", transport: "process" }, abort.signal);
+    const file = status(manager, handle.id);
+    let attempts = 0;
+    const fault = faults(target => target.startsWith(file + ".") && target.endsWith(".tmp") && attempts++ === 0);
+    const unhandled: unknown[] = [];
+    const rejection = (error: unknown) => { unhandled.push(error); };
+    process.on("unhandledRejection", rejection);
+    try {
+      abort.abort();
+      expect((await manager.wait(handle.id, { timeoutMs: 4000 })).status).toBe("stopped");
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(unhandled).toEqual([]);
+      expect(stop).toHaveBeenCalledOnce();
+      expect(launch).toHaveBeenCalledOnce();
+      const next = await manager.spawn({ task: "next admitted", transport: "process" });
+      expect(launch).toHaveBeenCalledTimes(2);
+      await manager.stop(next.id);
+    } finally { fault.mockRestore(); process.off("unhandledRejection", rejection); }
+  });
+
   it.skipIf(process.platform === "win32")("F15 stop retries visible post-rename bytes without settling while directory confirmation still fails", async () => {
     const { manager, stop, consumed } = fixture();
     const handle = await manager.spawn({ task: "fixture", transport: "process" });

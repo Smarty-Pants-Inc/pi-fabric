@@ -955,6 +955,74 @@ describe("ActorManager across a session reload", () => {
     await waitFor(() => runs.filter((run) => /backlog-[ab]/.test(run.task) && run.finishedAt !== undefined).length === 2, 30_000);
   }, 60_000);
 
+  it.skipIf(process.platform === "win32")("F21 live successor retries a post-rename adoption barrier and imports predecessor backlog without restart", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-adoption-"));
+    roots.push(root);
+    const actorRoot = path.join(root, "actors"), registry = path.join(actorRoot, "actors.json");
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const runs = recordRuns(agents);
+    let ownerAlive = true;
+    const host = (name: string, owns: () => boolean | undefined) => {
+      const manager = new ActorManager(name, { id: `session:${name}`, name: "main", kind: "main", sessionId: name }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
+          actorRoot, persistent: true, rootId: `session:${name}`, claimResidency: "session", canManageActor: owns,
+          lineageAlive: id => id !== "session:owner" || ownerAlive, adoptionGraceMs: 0,
+          meshCursorPath: path.join(root, `cursor-${name}.json`),
+        });
+      actorManagers.push(manager); return manager;
+    };
+    const owner = host("owner", () => ownerAlive ? true : undefined);
+    const actor = await owner.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    await waitFor(() => owner.status(actor.id).status === "running", 10_000);
+    await mesh.publish({ topic: "team.pulls", from, text: "backlog-a" });
+    await mesh.publish({ topic: "team.pulls", from, text: "backlog-b" });
+    await waitFor(() => owner.status(actor.id).queued === 2, 10_000);
+    const successor = host("successor", () => undefined); // own queue already loaded; cursor beyond backlog
+    await new Promise(resolve => setTimeout(resolve, 100));
+    await owner.close();
+    const ownerFile = path.join(actorRoot, actor.id, queueFiles(root, actor.id)[0]!.name);
+    const descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let claimFailures = 0, copyUnavailable = true;
+    const openSpy = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd;
+    });
+    const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = descriptors.get(fd) ?? "";
+      const row = JSON.parse(fs.readFileSync(registry, "utf8")).actors.find((value: { id: string }) => value.id === actor.id);
+      if (file === actorRoot && fs.fstatSync(fd).isDirectory() && row.rootId === "session:successor" && claimFailures === 0) {
+        claimFailures++;
+        throw new Error("F21 injected post-rename registry barrier failure");
+      }
+      // Independently keep the predecessor until the successor's queue copy is confirmed.
+      if (copyUnavailable && file.startsWith(path.join(actorRoot, actor.id, "queue-")) && file.endsWith(".tmp")) {
+        throw new Error("F21 queue copy unavailable");
+      }
+      sync(fd);
+    });
+    try {
+      ownerAlive = false;
+      await waitFor(() => claimFailures === 1, 10_000);
+      expect(JSON.parse(fs.readFileSync(registry, "utf8")).actors.find((value: { id: string }) => value.id === actor.id).rootId).toBe("session:successor");
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(fs.existsSync(ownerFile)).toBe(true);
+      expect(runs.filter(run => /backlog-[ab]/.test(run.task))).toHaveLength(0);
+      copyUnavailable = false;
+      // No restart or fresh ingress: existing polling owns the failed claim/copy obligations.
+      await waitFor(() => runs.filter(run => /backlog-[ab]/.test(run.task) && run.finishedAt !== undefined).length === 2, 10_000);
+      await waitFor(() => !fs.existsSync(ownerFile), 5_000);
+      expect(successor.status(actor.id).rootId).toBe("session:successor");
+      expect(runs.filter(run => run.task.includes("backlog-a"))).toHaveLength(1);
+      expect(runs.filter(run => run.task.includes("backlog-b"))).toHaveLength(1);
+    } finally { syncSpy.mockRestore(); openSpy.mockRestore(); }
+  }, 45_000);
+
   // review/astra F5 on #79: the registry claim and the queue copy cannot commit together. A restart
   // between them, or a copy that cannot be written, must still recover the whole accepted backlog,
   // with no cursor replay, and never delete the only durable copy.

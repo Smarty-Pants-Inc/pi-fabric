@@ -1358,13 +1358,6 @@ describe("runtime observation receipts", () => {
     const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => { record("background completion", { id: result.id, status: result.status }); inbox.enqueue(result); });
     const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
     const registry = new ActionRegistry(); registry.register(h.provider);
-    let admitGuest: (() => void) | undefined;
-    registry.register({
-      name: "receipt_probe", description: "Receipt regression guest readiness",
-      async list() { return [{ name: "ready", description: "Mark guest admission", risk: "read" as const, inputSchema: { type: "object", properties: {} } }]; },
-      async describe() { return (await this.list({}, context))[0]; },
-      async invoke() { admitGuest?.(); return null; },
-    });
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     config.executor.memoryLimitBytes = 128 * 1024 * 1024;
     const python = backend === "monty" || backend === "cpython";
@@ -1382,38 +1375,19 @@ describe("runtime observation receipts", () => {
     }, 35_000);
     const execute = async (parentToolCallId: string, code: string) => {
       record(`${parentToolCallId}: start`);
-      const controller = new AbortController();
-      let guard: ReturnType<typeof setTimeout> | undefined;
-      // As with the admission-clock regressions, startup is not the tested
-      // boundary. CPython starts a fresh interpreter/Windows IPC for every call;
-      // a warmup cannot make later starts cheap. Arm the active-work guard only
-      // when a real guest host call proves admission, not before cold startup.
-      admitGuest = () => {
-        if (guard !== undefined) return;
-        record(`${parentToolCallId}: guest admitted`);
-        guard = setTimeout(() => {
-          record(`${parentToolCallId}: hang guard`);
-          controller.abort(new Error("Receipt regression execution exceeded its 12-second admitted hang guard"));
-        }, 12_000);
-      };
-      try {
-        const ready = python ? 'await tools.call(ref="receipt_probe.ready", args={})\n' : 'await tools.call({ ref: "receipt_probe.ready", args: {} });\n';
-        const result = await service.execute({ code: ready + code, context: mainContext, signal: AbortSignal.any([controller.signal, lifetime.signal]), parentToolCallId, onPartial() {} });
-        record(`${parentToolCallId}: end`, { success: result.success, error: result.error, logs: result.logs, phases: result.phases, audits: result.audits });
-        return result;
-      } finally { clearTimeout(guard); admitGuest = undefined; }
+      const result = await service.execute({ code, context: mainContext, signal: lifetime.signal, parentToolCallId, onPartial() {} });
+      record(`${parentToolCallId}: end`, { success: result.success, error: result.error, logs: result.logs, phases: result.phases, audits: result.audits });
+      // A test safety timeout is not a product cancellation regression.
+      lifetime.signal.throwIfAborted();
+      return result;
     };
     const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
     try {
-      // Startup is not the behavior under test. Both watchdogs rearm on early
-      // firings; advance the wall clock only at the tested boundary. The old
-      // real 5-second ceiling could expire before encode on a cold CI runner.
-      const warmupClock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
-      try {
-        const warmup = await execute("receipt-warmup", python ? "return 1" : "return 1;");
-        expect(warmup.success, warmup.error).toBe(true);
-        expect(warmup.value).toBe(1);
-      } finally { warmupClock.mockRestore(); }
+      // CPython starts a fresh interpreter for each execution; a warmup and
+      // readiness round trip only add untested startup/IPC work. Freeze the
+      // budget until encoding or the real guest continuation below, not for a
+      // guessed amount of wall time after admission. The lifetime guard above
+      // bounds hangs without racing those receipt boundaries on slow hosts.
       const handle = await h.agents.spawn({ task: "encoding receipt", transport: "process" });
       h.agents.detachSignal(handle.id);
       await waitFor(() => completed.mock.calls.length === 1, 5_000);
@@ -1438,6 +1412,7 @@ describe("runtime observation receipts", () => {
         rejected = await execute("receipt-encoding", python ? `return await agents.wait(id=${JSON.stringify(handle.id)})` : `return await agents.wait({ id: ${JSON.stringify(handle.id)} });`);
       } finally { encoding.mockRestore(); clock.mockRestore(); }
       expect(encode).toHaveBeenCalled();
+      expect(rejected.success).toBe(false);
       expect(rejected.error).toMatch(/MainExecutionCeilingError/);
       expect(consumed).not.toHaveBeenCalled();
       boundary(); boundary();
@@ -1474,6 +1449,7 @@ describe("runtime observation receipts", () => {
         record("fire runtime deadline", { deadlineAt });
         timer.fireAt(deadlineAt);
         const observed = await execution;
+        expect(observed.success).toBe(false);
         expect(observed.error).toMatch(/MainExecutionCeilingError/);
         expect(consumed).toHaveBeenCalledExactlyOnceWith(delivered.id);
         boundary(); boundary();

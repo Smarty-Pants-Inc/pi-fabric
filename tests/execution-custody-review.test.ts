@@ -10,6 +10,7 @@ import { ScreenTransport } from "../src/agents/transports/screen-transport.js";
 import { LocaltermTransport } from "../src/agents/transports/localterm-transport.js";
 import { HerdrTransport } from "../src/agents/transports/herdr-transport.js";
 import type { AgentTransportHandle } from "../src/agents/types.js";
+import * as processUtils from "../src/agents/transports/process-utils.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 
@@ -31,7 +32,7 @@ const fixture = () => {
 process.on('SIGTERM', () => {}); process.on('SIGHUP', () => {}); setInterval(() => {}, 1000);`);
   return { root, descendant };
 };
-const dispose = async (manager: AgentManager, root: string) => {
+const dispose = async (manager: AgentManager, root: string, afterClose?: () => Promise<void>) => {
   // Failure-before runs must drain every fixture birth, including a reparented
   // descendant. Never signal a PID merely because it appears in a file.
   for (const name of ["execution.json", "descendant.json", "leader.json", "worker.json"]) {
@@ -42,6 +43,7 @@ const dispose = async (manager: AgentManager, root: string) => {
     await vi.waitFor(() => expect(active(birth)).toBe(false), { timeout: 5000 });
   }
   await manager.close().catch(() => undefined);
+  await afterClose?.();
   fs.rmSync(root, { recursive: true, force: true });
 };
 
@@ -163,6 +165,12 @@ setTimeout(() => process.exit(0), 700);`);
     // Launch the real worker with native pipes but NO IPC custody tracker. This
     // is the worker contract used by session transports (tmux/screen/etc.).
     let session: AgentTransportHandle | undefined;
+    let sentinel: AgentTransportHandle | undefined;
+    const socket = path.join(root, "t.sock");
+    const execute = processUtils.executeFile;
+    const isolatedExecute = (command: string, args: string[], options?: Parameters<typeof execute>[2]) =>
+      execute(command, command === "tmux" ? ["-f", "/dev/null", "-S", socket, ...args] : args, options);
+    const query = transport === "tmux" ? vi.spyOn(processUtils, "executeFile").mockImplementation(isolatedExecute) : undefined;
     const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
       // Give the worker its real run deadline before the manager's fallback
       // deadline can forcibly remove a session. Public session admission is
@@ -185,6 +193,16 @@ setTimeout(() => process.exit(0), 700);`);
       workerPath, piBinary, runRoot: path.join(root, "runs"),
     });
     try {
+      if (transport === "tmux") {
+        // Main's checked inventory deliberately treats an unreachable server as
+        // unknown, not worker exit. Keep a healthy, isolated server after this
+        // worker's last pane exits; the test is about its execution-group drain.
+        const sentinelWorker = path.join(root, "sentinel.mjs");
+        fs.writeFileSync(sentinelWorker, `import fs from 'node:fs'; ${birthSource} setInterval(() => {}, 1000);`);
+        sentinel = await new TmuxTransport().launch({ id: "custody-sentinel", name: "sentinel", cwd: root,
+          workerPath: sentinelWorker, workerArguments: [path.join(root, "sentinel.json")] });
+        await vi.waitFor(() => expect(fs.existsSync(path.join(root, "sentinel.json"))).toBe(true));
+      }
       const handle = await manager.spawn({ task: "cancel leaderless execution", transport: "process" });
       await vi.waitFor(() => expect(fs.existsSync(path.join(root, "descendant.json"))).toBe(true));
       const birth = readBirth(path.join(root, "descendant.json"));
@@ -197,6 +215,25 @@ setTimeout(() => process.exit(0), 700);`);
       const result = await manager.wait(handle.id);
       expect(result.status).toBe("timed_out");
       expect(active(birth), "same-birth descendant must exit before cancellation settles").toBe(false);
-    } finally { launch.mockRestore(); await dispose(manager, root); await session?.stop(); }
+      expect(active(readBirth(path.join(root, "worker.json"))), "native worker birth must also exit").toBe(false);
+      if (session) expect(await session.observe!()).toEqual({ state: "absent" });
+    } finally {
+      launch.mockRestore();
+      try {
+        await dispose(manager, root, async () => {
+          await session?.stop();
+          await sentinel?.stop();
+          if (transport === "tmux") {
+            await isolatedExecute("tmux", ["kill-server"], { timeoutMs: 3000 }).catch(() => undefined);
+            const file = path.join(root, "sentinel.json");
+            if (fs.existsSync(file)) {
+              const birth = readBirth(file);
+              if (active(birth)) process.kill(birth.pid, "SIGKILL");
+              await vi.waitFor(() => expect(active(birth)).toBe(false), { timeout: 5000 });
+            }
+          }
+        });
+      } finally { query?.mockRestore(); }
+    }
   }, 30000);
 });

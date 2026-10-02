@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as childProcess from "node:child_process";
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -325,8 +326,14 @@ describe("spawnDetached", () => {
       await vi.waitFor(() => expect(child.exitCode).toBe(0));
       const ps = vi.spyOn(childProcess, "execFile").mockImplementation(((...args: unknown[]) => {
         const callback = args.at(-1) as (error: null, stdout: string, stderr: string) => void;
-        callback(null, `${handle.pid + 1} 0 ${handle.pid} S\n`, "");
-        return child;
+        // executeFile now waits for the query's native close, not only its
+        // callback. The already-exited worker is NOT this synthetic ps child.
+        const query = new EventEmitter() as ChildProcess;
+        queueMicrotask(() => {
+          callback(null, `${handle.pid + 1} 0 ${handle.pid} S\n`, "");
+          query.emit("close", 0, null);
+        });
+        return query;
       }) as typeof childProcess.execFile);
       const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
       vi.useFakeTimers();

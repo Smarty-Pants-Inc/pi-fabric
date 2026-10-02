@@ -1,3 +1,4 @@
+import type { ModelRouteDecision } from "./model-route.js";
 import type { FabricTurnProvenance } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type {
@@ -42,6 +43,8 @@ export interface AgentSessionSeed {
 }
 
 export interface AgentRunRequest {
+  /** Host-created shadow decision; never accepted from external argument normalization. */
+  routeDecision?: ModelRouteDecision;
   /** Host-only resident startup probe: model/extension admission, no prompt or tools. */
   residentStartupProbe?: boolean;
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
@@ -124,6 +127,9 @@ export interface AgentCompactionStatus {
 export interface AgentRunRecord {
   /** Requested launch model; model below follows verified state/assistant attribution. */
   requestedModel?: string;
+  /** Shadow-route children: model/effort verified at the pre-prompt admission boundary. */
+  admittedModel?: string;
+  admittedThinking?: FabricThinking;
   id: string;
   name: string;
   task: string;
@@ -248,6 +254,7 @@ export interface AgentWorkerOptions {
   nice?: number;
   bashTimeoutSeconds?: number;
   fabricExtensionPath?: string;
+  routeHeader?: string;
   model?: string;
   thinking?: string;
   systemPrompt?: string;
@@ -359,7 +366,19 @@ export interface AgentSteerEntry {
   ts: number;
 }
 
+export const FOLLOW_UP_RUNNING_TASK_MESSAGE = "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.";
+
+/** Sender-only, receiver-time advisory; it does not change followUp delivery. */
+export interface AgentFollowUpRunningWarning {
+  code: "FABRIC_FOLLOW_UP_RUNNING_TASK";
+  targetId: string;
+  kind: "agent";
+  status: "running";
+  message: string;
+}
+
 export interface AgentSteerResult {
+  warning?: AgentFollowUpRunningWarning;
   queued: true;
   messageId: string;
 }

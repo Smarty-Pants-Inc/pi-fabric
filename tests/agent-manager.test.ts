@@ -2745,9 +2745,16 @@ describe("AgentManager steering", () => {
     roots.push(root);
     const manager = hangManager(root);
     const handle = await manager.spawn({ task: "HANG", transport: "process" });
-    manager.followUp(handle.id, "then summarize");
+    await waitFor(() => fs.existsSync(path.join(manager.runDirectory(handle.id)!, "status.json")));
+    const receipt = manager.followUp(handle.id, "then summarize");
+    expect(receipt).toEqual({ queued: true, messageId: expect.any(String), warning: {
+      code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: handle.id, kind: "agent", status: "running",
+      message: "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.",
+    } });
     const entries = readSteerFile(manager.runDirectory(handle.id)!);
-    expect(entries[0]).toMatchObject({ type: "follow_up", message: "then summarize" });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ type: "follow_up", message: "then summarize", id: receipt.messageId });
+    expect(entries[0]).not.toHaveProperty("warning");
     await manager.stop(handle.id);
   });
 

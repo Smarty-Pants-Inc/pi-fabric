@@ -43,18 +43,41 @@ describe.skipIf(process.platform !== "linux" || !fs.existsSync("dist/residency/l
     if (mode === 'crash-at-first-publication') {
       const preload = path.join(root, 'crash-handover-preload.mjs');
       fs.writeFileSync(preload, `import fs from 'node:fs'; import path from 'node:path';
-const remove = fs.rmSync;
-fs.rmSync = function(file, options) {
+// Observe real durability barriers, not optional post-rename temp cleanup.
+const rename = fs.renameSync;
+const sync = fs.fsyncSync;
+let published = false;
+fs.renameSync = function(source, target) {
+ const result = rename.call(this, source, target);
  const config = process.env.PI_FABRIC_RESIDENT_CONFIG;
- if (config) {
+ if (config && String(target) === path.join(path.dirname(config), 'handover.json')) published = true;
+ return result;
+};
+let owed;
+const barriers = [];
+fs.fsyncSync = function(fd) {
+ const result = sync.call(this, fd);
+ const config = process.env.PI_FABRIC_RESIDENT_CONFIG;
+ if (published && config && fs.fstatSync(fd).isDirectory()) {
   const handover = path.join(path.dirname(config), 'handover.json');
-  if (String(file).startsWith(handover + '.') && String(file).endsWith('.tmp') && fs.existsSync(handover)) {
-   const state = JSON.parse(fs.readFileSync(handover, 'utf8'));
-   fs.writeFileSync(${JSON.stringify(crashReceipt)}, JSON.stringify({phase:state.phase,pid:process.pid}));
-   process.kill(process.pid, 'SIGKILL');
+  if (fs.existsSync(handover)) {
+   if (!owed) {
+    owed = new Set();
+    for (let directory = fs.realpathSync(path.dirname(handover)); ; directory = path.dirname(directory)) {
+     owed.add(directory);
+     if (path.dirname(directory) === directory) break;
+    }
+   }
+   const directory = fs.readlinkSync('/proc/self/fd/' + fd);
+   if (owed.delete(directory)) barriers.push(directory);
+   if (owed.size === 0) {
+    const state = JSON.parse(fs.readFileSync(handover, 'utf8'));
+    fs.writeFileSync(${JSON.stringify(crashReceipt)}, JSON.stringify({phase:state.phase,pid:process.pid,barriers}));
+    process.kill(process.pid, 'SIGKILL');
+   }
   }
  }
- return remove.call(this, file, options);
+ return result;
 };`);
       ownership.env.NODE_OPTIONS += ` --import=${pathToFileURL(preload).href}`;
     }
@@ -103,7 +126,15 @@ fs.rmSync = function(file, options) {
         await until(() => fs.existsSync(crashReceipt));
         await exited; // The original launcher has no custody and must exit, too.
         await clientB.close(); await releaseRequest;
-        expect(JSON.parse(fs.readFileSync(crashReceipt, 'utf8')).phase).toBe('cancelled');
+        const firstPublication = JSON.parse(fs.readFileSync(crashReceipt, 'utf8'));
+        expect(firstPublication.phase).toBe('cancelled');
+        expect(firstPublication.pid).toBe(owner.pid);
+        const expectedBarriers: string[] = [];
+        for (let directory = fs.realpathSync(config.residencyRoot); ; directory = path.dirname(directory)) {
+          expectedBarriers.push(directory);
+          if (path.dirname(directory) === directory) break;
+        }
+        expect(firstPublication.barriers).toEqual(expectedBarriers);
         process.execPath = exec; vi.unstubAllEnvs();
         vi.stubEnv('NODE_OPTIONS', ownership.env.NODE_OPTIONS);
         vi.stubEnv('PI_FABRIC_TEST_LAUNCH_LOG', ownership.env.PI_FABRIC_TEST_LAUNCH_LOG);

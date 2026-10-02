@@ -581,7 +581,13 @@ export class ActorManager {
    */
   async create(
     request: FabricActorRequest,
-    { asRegistryOwner = false, beforeCommit, checkActive }: { asRegistryOwner?: boolean; beforeCommit?: (id: string) => void | Promise<void>; checkActive?: () => void } = {},
+    { asRegistryOwner = false, beforeCommit, checkActive, onCommit }: {
+      asRegistryOwner?: boolean;
+      beforeCommit?: (id: string) => void | Promise<void>;
+      checkActive?: () => void;
+      /** Synchronous receipt registration, before the first creation effect; no await follows before insertion. */
+      onCommit?: (id: string) => void;
+    } = {},
   ): Promise<FabricActorInfo> {
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
@@ -656,6 +662,10 @@ export class ActorManager {
     // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
     if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
     checkActive?.();
+    // Local creation commits here: directory creation and runnable/subscribed insertion
+    // cannot yield before the caller has registered the actual ID's cancellation outcome.
+    // Preserve the pre-commit fences above, including an awaited predecessor removal.
+    onCommit?.(id);
     const actorDirectory = path.join(this.#actorRoot, id);
     fs.mkdirSync(actorDirectory, { recursive: true, mode: 0o700 });
     const actor: ManagedActor = {

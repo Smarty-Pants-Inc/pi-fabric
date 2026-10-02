@@ -78,8 +78,10 @@ interface ActorQueueItem {
   bindingVersion?: 2;
   resolve?: (message: FabricActorMessage) => void;
   reject?: (error: Error) => void;
-  /** Failed preparation attempts (also persisted with accepted work). */
+  /** Owner restorations without settlement; only #restoreQueue consumes this budget. */
   attempts?: number;
+  /** Unlaunched preparation failures, independent of the crash/drop budget (#3167). */
+  preparationAttempts?: number;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
   resumed?: boolean;
 }
@@ -392,6 +394,8 @@ export class ActorManager {
   /** A timed-out write stays serialized; drains need not join that same stalled chain again. */
   readonly #stalledPresence = new Set<string>();
   readonly #drainRetries = new Map<string, NodeJS.Timeout>();
+  /** A wake received during an active finalizer must survive until that drain releases. */
+  readonly #drainRearms = new Set<string>();
   readonly #preparationTimeoutMs: number;
   readonly #preparationRetryMs: number;
   readonly #presenceQueued = new Set<string>();
@@ -534,9 +538,21 @@ export class ActorManager {
   retryCapabilityWaiters(): void {
     queueMicrotask(() => {
       for (const actor of this.#actors.values()) {
-        if (actor.missingCapabilities && actor.queue.length > 0) this.#ensureDrain(actor);
+        if ((actor.missingCapabilities || actor.preparing?.phase === "capabilities") &&
+          (actor.queue.length > 0 || this.#inFlight.has(actor.id))) this.#requestDrain(actor);
       }
     });
+  }
+
+  /** Re-admit restored work after the host's providers and ownership directory are ready. */
+  resumeQueued(): void {
+    if (this.#closing || this.#halted) return;
+    this.#syncActorsFromRegistry();
+    this.#refreshOwnership();
+    this.#scheduleRestoreParked();
+    for (const actor of this.#actors.values()) {
+      if (actor.queue.length > 0 || this.#inFlight.has(actor.id)) this.#requestDrain(actor);
+    }
   }
 
   /**
@@ -1999,6 +2015,7 @@ export class ActorManager {
     this.#meshMonitor.close();
     for (const timer of this.#drainRetries.values()) clearTimeout(timer);
     this.#drainRetries.clear();
+    this.#drainRearms.clear();
     if (this.#presenceTimer) clearTimeout(this.#presenceTimer);
     this.#presenceTimer = undefined;
     // Let presence writes already in flight finish before the runtime goes.
@@ -2166,6 +2183,14 @@ export class ActorManager {
    * starts a fresh drain — preventing a queued item from being stranded with
    * no drain to process it (the "stuck at queue:1" race).
    */
+  #requestDrain(actor: ManagedActor): void {
+    if (this.#closing || this.#halted || actor.status === "stopped" || !this.#canManageCached(actor.id)) return;
+    // Catalog installation and reload recovery can race the old drain's awaited cleanup.
+    // Remember that wake rather than relying on another mesh event or user turn to arrive.
+    if (this.#draining.has(actor.id)) this.#drainRearms.add(actor.id);
+    this.#ensureDrain(actor);
+  }
+
   #ensureDrain(actor: ManagedActor): void {
     if (
       actor.draining ||
@@ -2238,7 +2263,7 @@ export class ActorManager {
       source: item?.source ?? "preparation", createdAt: Date.now(), error: message,
       data: { errorType: error instanceof Error ? error.name : "Error",
         ...(error instanceof ActorPreparationError ? { code: error.code, phase: error.phase } : {}),
-        ...(item ? { itemId: item.id, attempts: item.attempts ?? 0 } : {}) },
+        ...(item ? { itemId: item.id, attempts: item.preparationAttempts ?? 0 } : {}) },
     });
     this.#noteFailedActivation(actor, message, undefined, false);
   }
@@ -2272,7 +2297,7 @@ export class ActorManager {
         this.#inFlight.set(actor.id, item);
         const inferenceContext = actor.inferenceContext;
         actor.status = "preparing";
-        actor.preparing = { phase: "presence", startedAt: Date.now(), attempts: item.attempts ?? 0 };
+        actor.preparing = { phase: "presence", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
         actor.updatedAt = Date.now();
         delete actor.lastError;
         const abortController = new AbortController();
@@ -2349,7 +2374,7 @@ export class ActorManager {
             () => this.#downgradeOutputPrincipal(actor, item),
             (handle) => {
               actor.status = "waiting";
-              actor.preparing = { phase: "waiting", startedAt: Date.now(), attempts: item.attempts ?? 0,
+              actor.preparing = { phase: "waiting", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0,
                 runId: handle.id, ...(handle.queuePosition !== undefined ? { queuePosition: handle.queuePosition } : {}) };
               void this.#publishPresence(actor).catch(() => undefined);
             },
@@ -2484,7 +2509,7 @@ export class ActorManager {
             (error instanceof ActorPreparationError && error.phase !== "binding");
           if (preLaunch && retryPreparation && !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
             preparationAbort.abort(error);
-            item.attempts = (item.attempts ?? 0) + 1;
+            item.preparationAttempts = (item.preparationAttempts ?? 0) + 1;
             actor.queue.unshift(item);
             this.#recordPreparationFailure(actor, error, item);
             retryDrain = true;
@@ -2558,6 +2583,7 @@ export class ActorManager {
       if (this.#draining.get(actor.id) === actor) this.#draining.delete(actor.id);
       // A reload may have moved this actor's queue to a new object while this drain ran.
       const live = this.#actors.get(actor.id);
+      const rearm = this.#drainRearms.delete(actor.id);
       if (live && live.queue.length > 0) {
         if (retryDrain && !this.#closing && live.status !== "stopped") {
           const timer = setTimeout(() => {
@@ -2567,7 +2593,7 @@ export class ActorManager {
           }, this.#preparationRetryMs);
           timer.unref();
           this.#drainRetries.set(live.id, timer);
-        } else if (live !== actor || resetAtExit) queueMicrotask(() => this.#ensureDrain(live));
+        } else if (live !== actor || resetAtExit || rearm) queueMicrotask(() => this.#ensureDrain(live));
       }
     }
   }
@@ -3462,7 +3488,8 @@ export class ActorManager {
             ...(item.provenance ? { provenance: item.provenance } : {}),
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
-            attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
+            attempts: item.attempts ?? 0,
+            preparationAttempts: item.preparationAttempts ?? 0,
             ...(item === inFlight || item.resumed ? { resumed: true } : {}),
           }))];
         } catch (error) {
@@ -3581,6 +3608,7 @@ export class ActorManager {
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
         ...((value as { resumed?: unknown }).resumed === true ? { resumed: true } : {}),
         attempts,
+        preparationAttempts: counter(value.preparationAttempts),
       } as ActorQueueItem & { attempts: number };
       if (attempts > 3) {
         this.#recordDropped(actor, item, "it was restored after three restarts that did not finish it");

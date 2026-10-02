@@ -43,7 +43,7 @@ const retryEvent = (actors: ActorManager, id: string, phase: string) => actors.m
 const readQueue = (sessionFile: string) => {
   const directory = path.dirname(sessionFile);
   const queue = fs.readdirSync(directory).find((file) => file.startsWith("queue-"))!;
-  return JSON.parse(fs.readFileSync(path.join(directory, queue), "utf8")).items as Array<{ attempts: number; resumed?: boolean }>;
+  return JSON.parse(fs.readFileSync(path.join(directory, queue), "utf8")).items as Array<{ attempts: number; preparationAttempts?: number; resumed?: boolean }>;
 };
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks(); });
 
@@ -76,7 +76,7 @@ describe("actor preparation (#3167)", () => {
     await waitFor(() => retryEvent(actors, actor.id, "presence") !== undefined && actors.inFlightCount() === 0);
     expect(run).not.toHaveBeenCalled();
     expect(actors.status(actor.id)).toMatchObject({ status: "queued", queued: 2 });
-    expect(readQueue(actor.sessionFile!)[0]).toMatchObject({ attempts: 1 });
+    expect(readQueue(actor.sessionFile!)[0]).toMatchObject({ attempts: 0, preparationAttempts: 1 });
     expect(retryEvent(actors, actor.id, "presence")?.data).toMatchObject({ errorType: "ActorPreparationTimeoutError", attempts: 1 });
     await waitFor(() => actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0);
     expect(run).toHaveBeenCalledTimes(2);
@@ -132,6 +132,39 @@ describe("actor preparation (#3167)", () => {
     expect(actors.messages(actor.id).find((message) => message.error)?.data).toMatchObject({ code: "FABRIC_ACTOR_PREPARATION_FAILED", attempts: 1, phase: "registry" });
     await waitFor(() => actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0);
     expect(agents.list().every((run) => run.status !== "running")).toBe(true);
+  });
+
+  it("survives three failed preparations and owner recreation, executing the accepted activation once", async () => {
+    const { actors: before, agents: oldAgents, mesh, root } = setup({ preparationRetryMs: 120 });
+    const actor = await before.create({ name: "retry-restart", instructions: "Reply", responseMode: "text",
+      coalesce: false });
+    const registry = vi.spyOn(ActorRegistryStore.prototype, "withLock")
+      .mockRejectedValue(new Error("temporary registry unavailable"));
+    const oldRun = vi.spyOn(oldAgents, "run");
+    before.tell(actor.id, "accepted across preparation failures");
+    await waitFor(() => before.messages(actor.id).filter((message) =>
+      (message.data as { itemId?: string } | undefined)?.itemId !== undefined).length === 3 && before.inFlightCount() === 0);
+    const saved = readQueue(actor.sessionFile!)[0]!;
+    expect(saved.preparationAttempts ?? saved.attempts).toBe(3);
+    expect(oldRun).not.toHaveBeenCalled();
+    registry.mockRestore();
+    await before.close();
+    await oldAgents.close();
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "restarted-runs"),
+    });
+    const run = vi.spyOn(agents, "run");
+    const after = new ActorManager("preparation", { id: "session:preparation", name: "main", kind: "main" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+      { actorRoot: path.join(root, "actors"), persistent: true });
+    cleanups.push(async () => { await after.close(); await agents.close(); });
+    // Assert acceptance before waiting: the old head drops this item on its first restore.
+    expect(after.messages(actor.id).filter((message) => message.error?.includes("Dropped a queued event"))).toEqual([]);
+    await waitFor(() => after.inFlightCount() === 0 && after.status(actor.id).queued === 0 && run.mock.calls.length > 0);
+    await pause(150);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(after.messages(actor.id).filter((message) => message.direction === "out" && !message.error)).toHaveLength(1);
+    expect(fs.readdirSync(path.dirname(actor.sessionFile!)).filter((file) => file.startsWith("queue-"))).toEqual([]);
   });
 
   it("keeps finite unavailable-model errors terminal instead of retrying them", async () => {
@@ -190,6 +223,28 @@ describe("actor preparation (#3167)", () => {
     expect(release).toHaveBeenCalledTimes(1);
     gate.resolve(lease);
     await waitFor(() => release.mock.calls.length === 2);
+  });
+
+  it("retains the catalog wake received during capability acquisition, before the missing marker exists", async () => {
+    const gate = deferred<FabricCapabilityViewLease>();
+    const release = vi.fn(async () => {});
+    const satisfied: FabricCapabilityViewLease = { satisfied: true, missing: [], optionalMissing: [],
+      view: { id: "ready", digest: "ready", semanticDigest: "ready", bindings: {} }, release };
+    let calls = 0;
+    const { actors, agents } = setup({ acquireCapabilityView: () => ++calls === 1 ? gate.promise : Promise.resolve(satisfied) });
+    cleanups.push(async () => { gate.resolve(satisfied); });
+    const actor = await actors.create({ name: "early-catalog-wake", instructions: "Reply", responseMode: "text", requires: ["demo.echo"] });
+    const run = vi.spyOn(agents, "run");
+    actors.tell(actor.id, "accepted before catalog ready");
+    await waitFor(() => calls === 1 && actors.status(actor.id).preparing?.phase === "capabilities");
+    expect(actors.status(actor.id).missingCapabilities).toBeUndefined();
+    actors.retryCapabilityWaiters(); actors.retryCapabilityWaiters(); // Coalesce, do not create two drains.
+    await pause(10);
+    gate.resolve({ satisfied: false, missing: ["demo.echo"], optionalMissing: [], release });
+    await waitFor(() => actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0 && run.mock.calls.length > 0);
+    expect(calls).toBe(2);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(actors.messages(actor.id).filter((message) => message.direction === "out" && !message.error)).toHaveLength(1);
   });
 
   it("14 stalled presence writes neither starve four healthy actors nor impose a cap of four", async () => {

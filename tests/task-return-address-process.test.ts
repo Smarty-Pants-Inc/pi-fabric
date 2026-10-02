@@ -128,6 +128,19 @@ describe("spawn-bound task return address through real process transport (#2950)
     expect(f.delivered.filter(send => send.id === KATE)).toHaveLength(0);
   }, 25_000);
 
+  it("does not let published root names bypass the Main guard (#321 integration)", async () => {
+    vi.stubEnv("PI_FABRIC_TASK_ESCALATION_TARGETS", JSON.stringify([ORG]));
+    const f = await fixture();
+    const { report } = await f.spawn(targets("org-kate", "named-wrong-P0"));
+    for (const send of report.sends) {
+      expect(send).toMatchObject({ ok: false, code: "FABRIC_TASK_ESCALATION_TARGET_DENIED" });
+      expect(send.error).toContain(KATE);
+      expect(send.error).toContain("Nothing was delivered");
+    }
+    expect(f.delivered.filter(send => send.id === KATE)).toHaveLength(0);
+    expect(f.mesh.read({ topic: "fabric.control.command" }).filter(event => (event.data as any)?.targetId === KATE)).toHaveLength(0);
+  }, 25_000);
+
   it("binds nested tasks to their immediate spawner; keeps ancestor and sibling sends unchanged", async () => {
     const f = await fixture();
     const parent = "d".repeat(32), sibling = "e".repeat(32);

@@ -904,7 +904,8 @@ export class FabricRuntimeState {
     const firstSeenAgents = new Map<string, number>();
     if (mainAgent.local) {
       this.#participants.registerSource(() => [
-        this.#participants!.root(mainAgent.info(context), mainAgent.interactive),
+        // The existing presence heartbeat rereads the Pi name, including renames and clearing.
+        this.#participants!.root(mainAgent.info(context), mainAgent.interactive, this.pi.getSessionName?.()),
       ]);
     }
     this.#participants.registerSource(() =>
@@ -941,6 +942,10 @@ export class FabricRuntimeState {
       (request, signal) => {
         const owner = routeOwner;
         if (!owner || owner.signal.aborted) throw new Error("Jev routing unavailable");
+        // Optional shadow inference cannot borrow the agent action's approval.
+        // Only an explicit current host network allow authorizes this internal call;
+        // ask/auto/deny (including inherited grants) take the recorded pinned fallback.
+        if (this.#config?.approvals.network !== "allow") throw new Error("Jev shadow routing requires explicit network allow");
         const pending = owner.client.evaluate(request, AbortSignal.any([signal, owner.signal])).catch(error => {
           if (owner.signal.aborted && !signal.aborted) throw new Error("Jev routing owner retired");
           throw error;

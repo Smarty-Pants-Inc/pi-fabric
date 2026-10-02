@@ -76,6 +76,7 @@ import {
 import type { BudgetLedgerDetail } from "./budget-ledger.js";
 import type { BudgetLedgerState } from "./budget-ledger.js";
 import { readJsonlPage } from "../log-tail.js";
+import { ownedStat, processAlive } from "../storage/scratch.js";
 import {
   canRemoveManagedRunRoot,
   canRemoveTerminalRun,
@@ -545,6 +546,12 @@ const failedRecord = (
   error: string,
 ): AgentRunResult => {
   const now = Date.now();
+  const previous = readRecord(managed.statusFile) ?? managed.latestRecord;
+  const progress = managed.observedProgress;
+  const usage = { ...progress.usage };
+  for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) {
+    usage[key] = Math.max(usage[key], previous?.usage[key] ?? 0);
+  }
   return {
     id: managed.id,
     name: managed.name,
@@ -561,11 +568,11 @@ const failedRecord = (
     startedAt: now,
     updatedAt: now,
     finishedAt: now,
-    turns: 0,
-    toolCalls: 0,
+    turns: Math.max(progress.turns, previous?.turns ?? 0),
+    toolCalls: Math.max(progress.toolCalls, previous?.toolCalls ?? 0),
     text: "",
     error,
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    usage,
     ...(managed.model ? { model: managed.model } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
     ...(managed.latestRecord?.admittedModel ? { admittedModel: managed.latestRecord.admittedModel } : {}),
@@ -767,6 +774,9 @@ export class AgentManager {
       // Allocate ownership now; scan only on actual agent use or close.
     }
   }
+
+  /** This runtime's creation host, not a child participant's upstream owner. */
+  get runtimeHostId(): string | undefined { return this.#hostId; }
 
   defaultModel(runner: FabricAgentRunner = this.config.runner): string | undefined {
     return runner === "claude" ? this.config.claude.model
@@ -1051,7 +1061,7 @@ export class AgentManager {
     let routeDispatch: ReturnType<typeof import("./model-route.js")["prepareRouteDispatch"]> | undefined;
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
-      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id);
+      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id, request.routeRecord);
     }
     const startPrepared = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try {
@@ -1219,6 +1229,7 @@ export class AgentManager {
           ...(model ? ["--model", model] : []),
           ...(thinking ? ["--thinking", thinking] : []),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
+          ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
           ...(sessionFile ? ["--session-file", sessionFile] : []),
           ...(request.inferenceContext ? ["--inference-context", request.inferenceContext] : []),
@@ -1745,6 +1756,59 @@ export class AgentManager {
     return value;
   }
 
+  /** Full ownership references for retention, never the bounded UI/status snapshot.
+   * A terminal status or abandonment is not worker-exit evidence. "*" vetoes
+   * stopped-actor exit proofs when untracked ownership cannot be determined. */
+  retentionReferences(): Set<string> {
+    const refs = new Set<string>();
+    const protect = (id: string, actorId?: string) => { refs.add(id); if (actorId) refs.add(actorId); };
+    for (const queued of this.#queued.values()) {
+      if (!queued.terminal || queued.cleanupPending || hasUnresolvedWorker(path.join(this.#runRoot, queued.info.id))) {
+        protect(queued.info.id, queued.info.actorId);
+      }
+    }
+    for (const managed of this.#runs.values()) {
+      const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
+      const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
+      if (!managed.settled || managed.lostContact || uncheckedExternalExit(managed.transport) ||
+          // Settlement and primary exit do not prove descendant exit. The
+          // persistent tree veto checks every descendant's worker identity too.
+          unconfirmedProcess || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) protect(managed.id, managed.actorId);
+    }
+    // A restarted host does not own handles for the previous host's actor workers.
+    // Reuse offline retention's exit/ownership predicate; a truncated or unknown
+    // tree vetoes all stopped-actor proofs, rather than guessing its association.
+    const started = performance.now();
+    const expired = () => performance.now() - started >= 5;
+    let directory: fs.Dir | undefined;
+    try {
+      try { fs.lstatSync(this.#runRoot); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return refs; throw error; }
+      if (!ownedStat(this.#runRoot)?.isDirectory()) { refs.add("*"); return refs; }
+      directory = fs.opendirSync(this.#runRoot);
+      let entry: fs.Dirent | null;
+      while (!expired() && (entry = directory.readSync())) {
+        if (this.#managedTempRoot && entry.name === ".fabric-owner.json") continue;
+        if (this.#runs.has(entry.name) || this.#queued.has(entry.name)) continue;
+        const run = path.join(this.#runRoot, entry.name);
+        if (!entry.isDirectory()) { refs.add("*"); continue; }
+        const status = ownedStat(path.join(run, "status.json"));
+        const record = status?.isFile() && status.size <= 1024 * 1024 ? readRecord(path.join(run, "status.json")) : undefined;
+        // Without a surviving handle, only a checked process identity can
+        // establish exit; a terminal record with no PID is still uncertain.
+        const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
+          ? Number(record.sessionId) : undefined;
+        if (pid !== undefined && !processAlive(pid) && canRemoveTerminalRun(run, expired)) continue;
+        const actorId = record?.actorId;
+        if (typeof actorId === "string" && /^[A-Za-z0-9_-]+$/.test(actorId)) protect(entry.name, actorId);
+        else refs.add("*");
+      }
+      if (expired()) refs.add("*");
+    } catch { refs.add("*"); }
+    finally { try { directory?.closeSync(); } catch { refs.add("*"); } }
+    return refs;
+  }
+
   runDirectory(id: string): string | undefined {
     return this.#runs.get(id)?.runDirectory;
   }
@@ -1808,6 +1872,15 @@ export class AgentManager {
     await this.#waitForTransportExit(managed);
     await this.#noteUnconfirmedExit(managed);
     const terminal = readRecord(managed.statusFile);
+    // A force-killed worker (notably on Windows) may leave only running status.
+    // Its session telemetry can be newer than the monitor's last poll. Preserve
+    // that snapshot, or the pre-stop one if stopping removed the status file,
+    // before synthesizing a terminal result.
+    const observed = terminal ?? existing;
+    if (observed) {
+      managed.latestRecord = observed;
+      if (observed.runnerSessionId) managed.runnerSessionId = observed.runnerSessionId;
+    }
     const record =
       terminal && terminalStatuses.has(terminal.status)
         ? (this.#withTransportMetadata(terminal, managed) as AgentRunResult)
@@ -2229,6 +2302,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.startupAttempts >= AGENT_STARTUP_MAX_ATTEMPTS ||
       managed.settled ||
@@ -2276,6 +2350,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.settled ||
       this.#closing ||

@@ -3,9 +3,8 @@ import type {
   AgentTransportHandle,
   AgentTransportLaunch,
 } from "../types.js";
-import { EXTERNAL_TRANSPORT_LIVENESS_POLL_INTERVAL_MS } from "../constants.js";
-import { commandAvailable, executeFile, scriptSpawnArgs } from "./process-utils.js";
-
+import { commandAvailable, scriptSpawnArgs } from "./process-utils.js";
+import { externalSessionHandle, launchExternalSession } from "./external-session.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 
 const sessionName = (id: string): string => `pi-fabric-${id.slice(0, 12)}`;
@@ -21,30 +20,7 @@ export class ScreenTransport implements AgentTransportAdapter {
     const session = sessionName(request.id);
     const command = await scriptSpawnArgs(request.workerPath, request.workerArguments);
     assertTransportLaunchAllowed(request);
-    await executeFile(
-      "screen",
-      ["-DmS", session, ...command],
-      { cwd: request.cwd },
-    );
-    return {
-      kind: this.kind,
-      relaunchable: false, // Query failure is not proof the old session exited.
-      livenessPollIntervalMs: EXTERNAL_TRANSPORT_LIVENESS_POLL_INTERVAL_MS,
-      sessionId: session,
-      attachCommand: `screen -r ${session}`,
-      async isAlive() {
-        try {
-          const { stdout } = await executeFile("screen", ["-ls"]);
-          return stdout.includes(`.${session}`) || stdout.includes(`\t${session}`);
-        } catch {
-          return false;
-        }
-      },
-      async stop() {
-        try {
-          await executeFile("screen", ["-S", session, "-X", "quit"]);
-        } catch { /* session already exited */ }
-      },
-    };
+    await launchExternalSession(this.kind, session, ["-dmS", session, ...command], request.cwd, request.signal);
+    return externalSessionHandle(this.kind, session);
   }
 }

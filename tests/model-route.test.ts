@@ -107,6 +107,22 @@ describe("shadow model routing", () => {
 });
 
 describe("durable route dispatch", () => {
+  it("preserves participant preparation arguments and explicitly marks required route pins", async () => {
+    const dir = root();
+    const preparePiModel = vi.fn(async (model: string | undefined, _requiredPin?: boolean) => model);
+    const manager = new AgentManager(dir, DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: path.join(dir, "runs"),
+      preparePiModel,
+    }); managers.push(manager);
+    await expect(manager.prepareModelForAdmission(pin.model, "pi")).resolves.toBe(pin.model);
+    expect(preparePiModel).toHaveBeenNthCalledWith(1, pin.model);
+    await expect(manager.prepareModelForAdmission(pin.model, "pi", undefined, true)).resolves.toBe(pin.model);
+    expect(preparePiModel).toHaveBeenNthCalledWith(2, pin.model, true);
+    await expect(manager.prepareModelForAdmission(undefined, "pi")).resolves.toBeUndefined();
+    expect(preparePiModel).toHaveBeenNthCalledWith(3, undefined);
+    expect(preparePiModel).toHaveBeenCalledTimes(3);
+  });
   it.each(["startup", "resume"])("R3 refuses a replacement model during %s recovery", async phase => {
     const dir = root();
     const decision = await decideModelRoute(input, async () => response());

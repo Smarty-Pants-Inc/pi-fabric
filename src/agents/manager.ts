@@ -813,7 +813,9 @@ export class AgentManager {
     const key = `${requiredPin ? "route-pin:" : "participant:"}${model?.trim() || "<session-default>"}`;
     const existing = this.#piModelPreparations.get(key);
     if (existing) return existing;
-    const preparation = this.#preparePiModel(model, requiredPin).then((prepared) => {
+    // Ordinary participant admission keeps the host's original one-argument contract.
+    // Only required route pins opt in to strict preparation with the second argument.
+    const preparation = (requiredPin ? this.#preparePiModel(model, true) : this.#preparePiModel(model)).then((prepared) => {
       const effective = typeof prepared === "string" ? prepared.trim() || model : model;
       if (requiredPin && effective !== model) {
         throw Object.assign(new Error(`MODEL_ROUTE_PIN_MISMATCH: required ${model}, prepared ${effective}; task was not sent`), {

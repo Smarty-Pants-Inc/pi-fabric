@@ -1,6 +1,6 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
-import type { RouteEvaluate } from "../agents/model-route.js";
+import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
@@ -410,7 +410,7 @@ export class AgentsProvider implements FabricProvider {
     readonly modelsConfig: () => FabricModelsConfig = () => DEFAULT_FABRIC_CONFIG.models,
     /** Current host effort, including child processes where the Main target is remote. */
     readonly callerThinking: () => string | undefined = () => undefined,
-    readonly routeEvaluate: RouteEvaluate = async () => { throw new Error("Jev routing unavailable"); },
+    readonly routeEvaluate: (request: JevRequest, signal: AbortSignal, context: FabricInvocationContext) => Promise<JevResponse> = async () => { throw new Error("Jev routing unavailable"); },
   ) {
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
@@ -570,7 +570,7 @@ export class AgentsProvider implements FabricProvider {
     const { decideModelRoute } = await import("../agents/model-route.js");
     const routeDecision = await decideModelRoute({ routeClass: args.routeClass, protected: args.protected, pin,
       candidates, candidatesValid, parentSessionId: context.extensionContext.sessionManager?.getSessionId() ?? this.participants.self().sessionId ?? "unknown" },
-      this.routeEvaluate, context.signal);
+      (request, signal) => this.routeEvaluate(request, signal, context), context.signal);
     // PR1 invariant: the choice is recorded, but dispatch ALWAYS uses the role pin.
     return { ...await this.#runRequest(resolved, context), routeDecision };
   }
@@ -865,6 +865,7 @@ export class AgentsProvider implements FabricProvider {
           const result = this.manager.status(id);
           // Model-facing terminal status returns the result; UI polling must not acknowledge it.
           if (terminalAgentStatuses.has(result.status)) {
+            this.manager.prepareForeground(id);
             if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.detachSignal(id));
             else this.manager.markForeground(id);
           }
@@ -917,6 +918,9 @@ export class AgentsProvider implements FabricProvider {
         return this.participants.self();
       case "main":
         return this.mainAgent.info(context.extensionContext);
+      case "spawner":
+        if (!this.#router.spawner) throw new Error("This worker has no bound Fabric spawner; specify an explicit reply target");
+        return structuredClone(this.#router.spawner);
       case "sessions": {
         const stalled = this.participants.writeStalled?.();
         if (stalled) throw stalled;
@@ -1625,7 +1629,7 @@ export class AgentsProvider implements FabricProvider {
     const live = this.participants.get(actor.id, undefined, { fresh: true });
     // Strip passive counts and runs even when an older owner omits its live counters.
     // In particular, an idle owner without actorRun must clear a registry's stale run.
-    const { queued: _queued, messages: _messages, inFlightRun: _run, ...definition } = actor;
+    const { queued: _queued, messages: _messages, preparing: _preparing, inFlightRun: _run, ...definition } = actor;
     if (!live || live.stale || live.kind !== "actor") return { ...definition, status: "unknown" };
     const now = Date.now();
     const removal = live.actorRemoval ?? actor.removal;
@@ -1633,12 +1637,16 @@ export class AgentsProvider implements FabricProvider {
     const runId = removal?.runId ?? run?.id;
     const runAge = formatAge(now - (removal?.runStartedAt ?? run?.startedAt ?? removal?.requestedAt ?? now));
     const status = live.status === "idle" || live.status === "queued" ||
+      live.status === "preparing" || live.status === "waiting" ||
       live.status === "running" || live.status === "stopped" ? live.status : "unknown";
     return {
       ...definition,
       status,
       ...(live.actorQueued !== undefined ? { queued: live.actorQueued } : {}),
       ...(live.actorMessages !== undefined ? { messages: live.actorMessages } : {}),
+      ...(live.actorPreparing
+        ? { preparing: { ...live.actorPreparing, ageS: Math.max(0, Math.round((now - live.actorPreparing.startedAt) / 1_000)) } }
+        : {}),
       ...(run ? { inFlightRun: { ...run, ageS: Math.max(0, Math.round((now - run.startedAt) / 1_000)) } } : {}),
       ...(removal
         ? {

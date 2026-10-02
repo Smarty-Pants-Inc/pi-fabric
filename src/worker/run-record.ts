@@ -38,6 +38,7 @@ export const createRunningRecord = (
 ): AgentRunRecord => ({
   id: options.id,
   name: options.name,
+  ...(options.spawner ? { spawner: options.spawner } : {}),
   task,
   status: "running",
   runner: options.runner,
@@ -62,6 +63,7 @@ export const createRunningRecord = (
   startedAt,
   updatedAt: startedAt,
   turns: options.carryOver?.turns ?? 0,
+  ...(options.runner === "pi" ? { inferenceStarted: false } : {}),
   toolCalls: options.carryOver?.toolCalls ?? 0,
   text: "",
   usage: options.carryOver?.usage ?? emptyUsage(),

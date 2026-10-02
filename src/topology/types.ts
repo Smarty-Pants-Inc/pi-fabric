@@ -1,3 +1,4 @@
+import type { FabricActorInfo } from "../actors/types.js";
 import type { FabricAgentRunner, FabricAgentTransport } from "../config.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { AgentUsage } from "../agents/types.js";
@@ -57,6 +58,8 @@ export interface FabricParticipantRecord {
   usage?: AgentUsage;
   actorQueued?: number;
   actorMessages?: number;
+  /** Accepted activation preparation or AgentManager admission receipt, before worker launch. */
+  actorPreparing?: FabricActorInfo["preparing"];
   /** The actor's in-flight run (smarty-dev#2184 item 8). */
   actorRun?: { id: string; startedAt: number };
   /** The actor's removal, pending behind its in-flight run (smarty-dev#2184 item 8). */

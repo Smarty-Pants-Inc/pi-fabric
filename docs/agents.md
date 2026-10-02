@@ -40,6 +40,26 @@ Independent work can continue without polling. With `agents.notifyOnComplete` en
 
 Durable spawns use the same inbox. Undelivered envelopes survive disconnects; receipts survive reconnects. Escape or an errored Main turn parks pending results: Fabric does not start a turn to deliver them, and they join Main's next turn, whatever starts it (typed input, a peer message or another trigger). Explicit lifecycle subscriptions, actor messages, and trajectory handoffs retain their separate delivery policies. A terminal run can still report incomplete work; Main must inspect its result.
 
+### Actor children and reply targets
+
+A child's immediate spawner is distinct from its lineage root. `agents.spawner()` returns `{ id, kind, runId? }`; `agents.followUp({ id: "spawner", message })` and `agents.steer` accept that bound target. Inside an actor-spawned task, it names the actor and its spawning activation run, not the implementing lead's Main. `agents.main()` / `id: "main"` still deliberately address the root Main. An absent spawner binding fails rather than falling back to the root; old workers must be respawned to get the new binding.
+
+Automatic completion goes to the spawning actor's live run inbox. If that activation ends before consumption, a write-ahead result is transferred once to that actor's persisted mailbox for its next activation. Wait/status consumption or live-inbox delivery suppresses a later mailbox copy. The mailbox envelope includes `data.resultFile`, an actor-local JSON file containing the full result (including structured value), so a later activation can read more than the bounded notification. Consumed foreground/live results leave no full-result archive; a mailbox handoff retains its result until that activation consumes it. Unread results and receipt tombstones are bounded by `retention.actorRunArchiveMs` on the existing owner sweep (pending mailbox items are protected). Stopped actors retain unread results within that retention window; Fabric never silently delivers them to Main as Main-owned children. A session-owned child still stops when its spawning worker shuts down; that stopped outcome is preserved, not a promise that the child survives shutdown.
+
+Live preparation never consumes individual outcomes: only a completely prepared batch gets one atomic pre-send receipt, and its full results remain until delivery cleanup. As with any uncertain `sendMessage` outcome, a committed pre-send claim chooses at-most-once delivery. Foreground `run`/`wait`/terminal `status` commits durable consumption **before returning the value to the actor program**, not in a best-effort post-delivery receipt. A transient receipt failure is retried once; persistent failure rejects the observation without returning an unrecorded result. Archive unlink failure does not undo consumption or fail a returned result. A mailbox activation refused by `validWhile`, unable to start its worker, or failing without actual model output/tool execution retains the full result in a persisted deferred-handoff side store, outside the runnable FIFO. The next valid activation receives labelled unread-child context with the original activation facts and `data.resultFile`; it does not retry the stale handoff as the current activation. Owner restart restores this side store but does not independently launch a retry. Successful inference consumes the attached snapshot and removes its full archives. Deferred handoffs expire with `retention.actorRunArchiveMs`.
+
+**Review-role mitigation for older installations — synthetic (unit-tested), not independently native-Pi verified:** this mitigation's evidence is separate from the native actor-child routing proof; do not attribute that proof to this workaround. For bounded subtasks, keep the result in the same `fabric_exec` program and wait before deciding the verdict:
+
+```ts
+const result = await agents.run({
+  task: "Review this bounded part of the diff; return your findings. Do not message Main.",
+  transport: "process",
+});
+return result;
+```
+
+`agents.run` includes the wait; alternatively `spawn` followed by `await agents.wait({ id: child.id })` in the same program acknowledges the result. Inspect its terminal status/error and do not declare review complete if the wait or program deadline expired. On updated workers, addressed progress can use `id: "spawner"`; no `fabric_reply` action is required for ordinary task-agent final results. Do not substitute `id: "main"` for an actor reply target.
+
 ### Native runner session attribution
 
 Pi runs record the live native Pi session ID in `runnerSessionId`, including
@@ -75,8 +95,8 @@ all session roles with the shared org repository revision, not a role-specific c
 An unstamped parent stays unstamped; Fabric does not invent provenance. The fleet write
 governor derives their lane from the child's cwd, not from a role or a lane environment variable. Explicit actor runs retain their inherited role
 and set `PI_FABRIC_ACTOR_NAME`; that actor identity takes precedence in the governor. An
-ordinary task spawned by an actor also inherits `PI_FABRIC_ACTOR_NAME`, so its governed
-writes still count as that actor. This is write attribution, not an authorization boundary.
+ordinary task spawned by an actor clears `PI_FABRIC_ACTOR_NAME`, so its governed
+writes count as the task-agent writer, not as the spawning actor. This is write attribution, not an authorization boundary.
 Ordinary tasks drop the spawner's `PI_FABRIC_ROLE` override and `SMARTY_READ_CLASS`,
 so participant discovery cannot still report the parent's role or critical-read class.
 Explicit actor runs retain both. Parent environment and bound session/mesh routing are unchanged.
@@ -585,8 +605,10 @@ Actor status distinguishes accepted work from a worker: `preparing` reports boun
 `inFlightRun` and `running`. Each actor-side pre-launch await has a 30-second deadline,
 independent of the run timeout and legitimate permit waiting. A timeout logs
 `ActorPreparationTimeoutError` (`FABRIC_ACTOR_PREPARATION_TIMEOUT`) with the phase,
-returns the unlaunched activation to its durable queue with `attempts` incremented, and
-re-arms dispatch after a one-second backoff. Infrastructure rejections use
+returns the unlaunched activation to its durable queue with `preparationAttempts` incremented,
+not the execution/restart `attempts` counter, and re-arms dispatch after a one-second backoff.
+Each activation allows three preparation requeues; a further retryable preparation failure
+reaches terminal exhaustion instead of requeuing again. Infrastructure rejections use
 `ActorPreparationError` (`FABRIC_ACTOR_PREPARATION_FAILED`); finite unavailable-model
 errors still fail the activation. A timed-out presence publisher remains serialized and
 owes the latest state, but drains do not keep joining the same stalled mesh write.

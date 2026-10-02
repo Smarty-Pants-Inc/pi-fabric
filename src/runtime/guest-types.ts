@@ -192,6 +192,8 @@ interface FabricParticipantInfo {
   usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
   actorQueued?: number;
   actorMessages?: number;
+  /** Accepted actor activation without a launched worker. */
+  actorPreparing?: FabricActorInfo["preparing"];
   controlProtocol: "v1" | "legacy";
   /** The remote host of a root mirrored by the mesh bridge; never a local owner. */
   remoteHost?: string;
@@ -255,6 +257,8 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  /** Immediate spawning participant, distinct from rootId. */
+  spawner?: { id: string; kind: "main" | "agent" | "actor"; runId?: string };
   /** Present on terminal status snapshots when the full log was retained. */
   compactionSkipped?: string;
   /** One-based FIFO admission position; present only while queued. */
@@ -303,6 +307,7 @@ interface FabricAgentResult extends FabricAgentHandle {
   startedAt: number;
   finishedAt?: number;
   turns: number;
+  inferenceStarted?: boolean;
   toolCalls: number;
   text: string;
   value?: unknown;
@@ -720,6 +725,8 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   activationFilterError?: string;
   validWhile?: { version: 1; source: string };
 };
+// Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
+type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped";
 interface FabricActorInfo {
   kernel?: FabricKernel;
   pythonRuntime?: "cpython" | "monty";
@@ -732,7 +739,7 @@ interface FabricActorInfo {
   name: string;
   /** The session that owns and runs the actor, whoever reads it; binding.sessionId is the reading session. */
   ownerSessionId?: string;
-  status: "idle" | "queued" | "running" | "stopped";
+  status: FabricActorStatus;
   runner: FabricAgentRunner;
   events: FabricActorHostEvent[];
   topics: string[];
@@ -767,6 +774,15 @@ interface FabricActorInfo {
   updatedAt: number;
   /** Last settled run, not the run currently in flight. */
   lastRunId?: string;
+  /** Accepted activation without a worker: bounded setup, or waiting for admission. */
+  preparing?: {
+    phase: string;
+    startedAt: number;
+    ageS: number;
+    attempts: number;
+    runId?: string;
+    queuePosition?: number;
+  };
   /** Present only when the current execution owner reports an in-flight run. */
   inFlightRun?: { id: string; startedAt: number; ageS: number };
   /** Removal pending behind an in-flight run; state includes a useful progress note. */
@@ -873,6 +889,8 @@ interface FabricAgentsApi {
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;
   self(): Promise<FabricParticipantInfo>;
   main(): Promise<FabricMainAgentInfo>;
+  /** Immediate spawning participant; main is the root, not an actor spawner. Address it with id: "spawner". */
+  spawner(): Promise<{ id: string; kind: "main" | "agent" | "actor"; runId?: string }>;
   sessions(): Promise<FabricParticipantInfo[]>;
   peers(): Promise<FabricPeerInfo[]>;
   /** Resolve by normalized repository origin and launch-recorded lead id; throws if unresolved or ambiguous. */

@@ -103,6 +103,7 @@ export const actorParticipantRecord = (
   updatedAt: actor.updatedAt,
   actorQueued: actor.queued,
   actorMessages: actor.messages,
+  ...(actor.preparing ? { actorPreparing: { ...actor.preparing } } : {}),
   ...(actor.inFlightRun ? { actorRun: { id: actor.inFlightRun.id, startedAt: actor.inFlightRun.startedAt } } : {}),
   ...(actor.removal
     ? {

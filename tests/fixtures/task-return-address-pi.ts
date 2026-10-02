@@ -49,6 +49,7 @@ input.on("line", async line => {
     await directory.start();
     control.start(() => ({ accepted: false }));
     outcome.main = await provider.invoke("main", {}, context);
+    outcome.spawner = await provider.invoke("spawner", {}, context);
     // The runtime must retain its binding even if ambient env changes after startup.
     process.env.PI_FABRIC_SPAWNER_ID = "session:wrong-after-startup";
     process.env.PI_FABRIC_TASK_ESCALATION_TARGETS = '["session:wrong-after-startup"]';

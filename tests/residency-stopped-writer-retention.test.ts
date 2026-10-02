@@ -1,14 +1,15 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
-import { hasUnresolvedWorker, markUnresolvedWorker } from "../src/storage/retention.js";
+import { canRemoveTerminalRun, hasUnresolvedWorker, markUnresolvedWorker } from "../src/storage/retention.js";
 import { processAlive } from "../src/storage/scratch.js";
 import { cancellationError } from "../src/async-settlement.js";
 import { ResidencyClient } from "../src/residency/client.js";
-import { ResidentHost } from "../src/residency/host.js";
+import { ResidentHost, RESIDENT_RUN_RETENTION_MS } from "../src/residency/host.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { RESIDENT_REQUEST_RETENTION_MS } from "../src/residency/request-expiry.js";
 import { readResidentRequestDecision, registerResidentCancellation, residentRoot, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -123,7 +124,10 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
 // relies on POSIX detached process groups. Windows durable residency is unsupported
 // (src/residency/host.ts, docs/residency-runtime.md), and there the nested child does
 // not survive the primary's exit, so this descendant-tracking claim is not made.
-it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a settled tracked activation retains reconciliation IDs while its real nested writer survives, then collects once (%s scope)", async scope => {
+it.skipIf(process.platform === "win32").each([
+  ["project", false, "known"], ["session", false, "known"], ["project", true, "known"], ["session", true, "known"],
+  ["project", true, "unknown"], ["session", true, "unknown"],
+] as const)("a settled tracked activation retains reconciliation IDs while its real nested writer survives, then collects once (%s scope, restart=%s, descendant=%s)", async (scope, restart, descendant) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nested-writer-retention-"));
   const rootId = "session:nested-writer-retention";
   const meshRoot = path.join(root, "mesh");
@@ -138,7 +142,7 @@ it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
   };
-  const host = new ResidentHost(config);
+  let host = new ResidentHost(config);
   let client: ResidencyClient | undefined;
   let control: FabricControlPlane | undefined;
   let scanTime: number | undefined;
@@ -185,6 +189,8 @@ it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a
     expect(processAlive(child.pid)).toBe(true);
     expect(host.agents.runDirectory(writer.id)).toBeDefined(); // Still tracked, disk-scan skip applies.
     expect(hasUnresolvedWorker(host.agents.runDirectory(writer.id)!)).toBe(false);
+    await expect(host.agents.cleanup(writer.id)).rejects.toThrow(/descendant worker may still be running/);
+    expect(processAlive(child.pid)).toBe(true);
 
     scanTime = ack.acknowledgedAt + RESIDENT_REQUEST_RETENTION_MS + 1;
     due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
@@ -208,6 +214,46 @@ it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a
     expect(outcome.message).toMatch(/do not replay or reassign/i);
     expect(Object.isFrozen(outcome.residentOutcome)).toBe(true);
     expect(create).toHaveBeenCalledTimes(1);
+
+    if (restart) {
+      const runDirectory = host.agents.runDirectory(writer.id)!;
+      expect(config.agents.retainRuns).toBe(false);
+      await control.close(); await client.close(); await host.close();
+      // Teardown must not erase the dead primary's owning-actor evidence while
+      // a descendant still owns the tree, even without an unresolved marker.
+      expect(processAlive(child.pid)).toBe(true);
+      expect(fs.existsSync(runDirectory)).toBe(true);
+      expect(fs.existsSync(child.statusFile)).toBe(true);
+      if (descendant === "unknown") {
+        // Legacy native descendants may settle without a persisted sessionId.
+        // The actual process is still live: terminal status is not exit evidence.
+        const { sessionId: _pid, ...legacy } = JSON.parse(fs.readFileSync(child.statusFile, "utf8"));
+        fs.writeFileSync(child.statusFile, JSON.stringify({ ...legacy, status: "completed" }));
+        expect(canRemoveTerminalRun(runDirectory)).toBe(true); // Otherwise collectable startup tree.
+      }
+      const aged = new Date(Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000);
+      fs.utimesSync(runDirectory, aged, aged);
+      host = new ResidentHost(config);
+      await host.start(); // Acquires a new owner fence; scans previous owner's runs.
+      expect(fs.existsSync(runDirectory)).toBe(true); // Startup cannot erase ownership before maintenance.
+      expect(fs.existsSync(child.statusFile)).toBe(true);
+      client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+      const before = scans;
+      scanTime = (scanTime ?? 0) + 60_001;
+      due.mockReturnValue(true);
+      await waitFor(() => scans > before);
+      due.mockReturnValue(false);
+      expect(host.agents.retentionReferences().has(actor.id)).toBe(true);
+      expect(fs.readFileSync(decisionPath, "utf8")).toBe(committed);
+      expect(JSON.parse(fs.readFileSync(ackPath, "utf8"))).toEqual(ack);
+      const late = new AbortController();
+      registerResidentCancellation(late.signal, config.residencyRoot, command);
+      late.abort();
+      expect(cancellationError(late.signal, new Error("late descendant settlement"))).toMatchObject({
+        code: "RESIDENT_REQUEST_EXPIRED", residentOutcome: { requestId, id: actor.id, ownerHostId: client.hostId, expired: true },
+      });
+      expect(host.actors.status(actor.id)).toMatchObject({ id: actor.id, status: "stopped" });
+    }
 
     fs.writeFileSync(release, "finish nested");
     await waitFor(() => !processAlive(child.pid));
@@ -244,6 +290,87 @@ it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a
   }
 }, 30_000);
 
+it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)("public recovered durable cleanup retains a real live descendant through the client fallback (%s owner)", async owner => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-durable-descendant-cleanup-"));
+  const rootId = "session:durable-descendant-cleanup";
+  const meshRoot = path.join(root, "mesh");
+  const crash = path.join(root, "crash-primary");
+  const release = path.join(root, "release-nested");
+  const observation = path.join(root, "nested-observation.json");
+  const config: ResidentHostConfig = {
+    format: 1, rootId, sessionId: "durable-descendant-cleanup", cwd: root, projectRoot: root,
+    meshRoot, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, rootId),
+    fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
+    retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/nested-writer-worker.ts"),
+    fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
+    piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
+  };
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "ignore" });
+  git("init", "-q"); git("config", "user.name", "Pi Fabric tests"); git("config", "user.email", "pi-fabric-tests@example.invalid");
+  fs.writeFileSync(path.join(root, "README.md"), "fixture repository\n"); git("add", "README.md"); git("commit", "-qm", "initial");
+  let host = new ResidentHost(config);
+  let client: ResidencyClient | undefined;
+  try {
+    await host.start();
+    client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+    const handle = await client.spawnAgent({
+      task: JSON.stringify({ primaryCrashPath: crash, nestedReleasePath: release, nestedObservationPath: observation, primaryTerminalFailure: true }),
+      residency: "durable", transport: "process", recursive: true, worktree: true,
+    }, AbortSignal.timeout(5_000));
+    await waitFor(() => fs.existsSync(observation));
+    const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { pid: number; statusFile: string };
+    const run = host.agents.runDirectory(handle.id)!;
+    const metadata = path.join(config.residencyRoot, "agents", `${handle.id}.json`);
+    const result = path.join(config.residencyRoot, "results", `${handle.id}.json`);
+    fs.writeFileSync(crash, "crash only primary");
+    await waitFor(() => host.agents.status(handle.id).status === "failed" && fs.existsSync(result) && !processAlive(Number(handle.sessionId)));
+    expect(processAlive(Number(handle.sessionId))).toBe(false);
+    expect(processAlive(child.pid)).toBe(true);
+    expect(hasUnresolvedWorker(run)).toBe(false);
+    await client.close(); await host.close();
+    for (const file of [run, child.statusFile, metadata, result]) expect(fs.existsSync(file), file).toBe(true);
+    if (owner === "replacement") { host = new ResidentHost(config); await host.start(); }
+    client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+    const join = vi.spyOn(host.agents, "join");
+    const committed = () => fs.readdirSync(path.join(config.residencyRoot, "decisions"))
+      .map(name => JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "decisions", name), "utf8")))
+      .filter(decision => decision.operation === "cleanup" && decision.state === "committed");
+    const output = fs.readFileSync(child.statusFile, "utf8");
+    const saved = fs.readFileSync(result, "utf8");
+    await expect(client.cleanupAgent(handle.id)).rejects.toThrow(/descendant worker may still be running/);
+    expect(join).toHaveBeenCalledTimes(owner === "replacement" ? 1 : 0); // Real Unknown Fabric agent route.
+    expect(processAlive(child.pid)).toBe(true);
+    for (const file of [run, metadata, result, handle.worktree!]) expect(fs.existsSync(file), file).toBe(true);
+    expect(execFileSync("git", ["branch", "--list", handle.branch!], { cwd: root, encoding: "utf8" })).toContain(handle.branch);
+    expect(fs.readFileSync(child.statusFile, "utf8")).toBe(output);
+    expect(fs.readFileSync(result, "utf8")).toBe(saved);
+    expect(client.hasAgent(handle.id)).toBe(true);
+    expect(committed()).toEqual([]); // Veto precedes the cancellation/commit fence.
+    const { sessionId: _pid, ...legacy } = JSON.parse(output);
+    fs.writeFileSync(child.statusFile, JSON.stringify({ ...legacy, status: "completed" }));
+    await expect(client.cleanupAgent(handle.id)).rejects.toThrow(/unknown descendant identity/);
+    expect(fs.existsSync(run)).toBe(true); expect(fs.existsSync(handle.worktree!)).toBe(true);
+    expect(committed()).toEqual([]); // Missing identity fails closed even with terminal status.
+    fs.writeFileSync(child.statusFile, output);
+    fs.writeFileSync(release, "checked nested exit");
+    await waitFor(() => !processAlive(child.pid));
+    expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ status: "completed", turns: 5 });
+    await expect(client.cleanupAgent(handle.id)).resolves.toEqual({ cleaned: true });
+    for (const file of [run, metadata, result, handle.worktree!]) expect(fs.existsSync(file), file).toBe(false);
+    expect(client.hasAgent(handle.id)).toBe(false);
+    expect(committed()).toHaveLength(1);
+  } finally {
+    fs.writeFileSync(release, "cleanup nested"); fs.writeFileSync(crash, "cleanup primary");
+    for (const run of host.agents?.listForUi() ?? []) await host.agents.stop(run.id);
+    if (fs.existsSync(observation)) {
+      const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { pid: number };
+      await waitFor(() => !processAlive(child.pid));
+    }
+    await client?.close(); await host.close(); vi.restoreAllMocks();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
 it("retention ownership uses checked orphan exit evidence, not terminal status, and fails closed on unknown trees", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-orphan-writer-retention-"));
   const runs = path.join(root, "runs");
@@ -270,10 +397,13 @@ it("retention ownership uses checked orphan exit evidence, not terminal status, 
     const nested = path.join(record("parent", "parent_actor", "2147483647"), "nested", "child");
     fs.mkdirSync(nested, { recursive: true });
     markUnresolvedWorker(nested, "nested worker exit unconfirmed");
+    const unknownChild = path.join(record("unknown_child", "unknown_child_actor", "2147483647"), "nested", "child");
+    fs.mkdirSync(unknownChild, { recursive: true });
+    fs.writeFileSync(path.join(unknownChild, "status.json"), JSON.stringify({ transport: "process", status: "completed" }), { mode: 0o600 });
     record("external", "external_actor", "pane", "tmux");
     record("missing_pid", "missing_pid_actor", "");
     refs = manager.retentionReferences();
-    for (const id of ["unresolved_actor", "parent_actor", "external_actor", "missing_pid_actor"]) expect(refs.has(id)).toBe(true);
+    for (const id of ["unresolved_actor", "parent_actor", "unknown_child_actor", "external_actor", "missing_pid_actor"]) expect(refs.has(id)).toBe(true);
     fs.mkdirSync(path.join(runs, "unknown"));
     expect(manager.retentionReferences().has("*")).toBe(true);
     fs.rmSync(path.join(runs, "unknown"), { recursive: true });

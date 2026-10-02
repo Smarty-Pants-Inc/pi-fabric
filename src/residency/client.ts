@@ -638,7 +638,10 @@ export class ResidencyClient {
     if (!("startedAt" in status) || !terminal(status.status)) {
       throw new Error(`Cannot clean up running durable Fabric agent ${metadata.id}`);
     }
-    const exitVeto = runTreeExitVeto(metadata.runDirectory);
+    // A proven absent tree has no descendant files left to remove (saved-result
+    // cleanup). Other stat errors fail closed; every existing tree needs strict exit evidence.
+    const runDirectoryPresent = fs.lstatSync(metadata.runDirectory, { throwIfNoEntry: false }) !== undefined;
+    const exitVeto = runDirectoryPresent ? runTreeExitVeto(metadata.runDirectory, 0, undefined, true) : undefined;
     if (exitVeto) {
       throw new Error(
         `Cannot clean up durable Fabric agent ${metadata.id}: ${exitVeto} ` +
@@ -678,7 +681,7 @@ export class ResidencyClient {
         commit();
       }
       throwIfAborted(signal);
-      fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
+      if (runDirectoryPresent) fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
       fs.rmSync(this.#metadataPath(metadata.id), { force: true });
       fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
       this.options.onResultConsumed?.(metadata.id);

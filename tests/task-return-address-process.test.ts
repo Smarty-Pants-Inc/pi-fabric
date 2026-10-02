@@ -165,7 +165,8 @@ describe("spawn-bound task return address through real process transport (#2950)
     vi.stubEnv("PI_FABRIC_ACTOR_ID", parent); vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
     const { report } = await f.spawn(targets(KATE, "actor-child-P0"), { identityId: parent });
     expect(report.env.actorId).toBeUndefined();
-    expect(report.env.actorName).toBe("parent-actor"); // Write attribution remains compatible.
+    expect(report.env.actorName).toBeUndefined(); // Main #2643 isolates task identity from its actor parent.
+    expect(report.spawner).toMatchObject({ id: parent, kind: "actor" });
     expect(report.main.id).toBe(parent);
     for (const send of report.sends) {
       expect(send.ok).toBe(false);

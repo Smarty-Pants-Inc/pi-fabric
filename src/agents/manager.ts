@@ -45,7 +45,9 @@ import { ProcessTransport } from "./transports/process-transport.js";
 import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
+import { resolveAgentSpawner } from "./spawner.js";
 import type {
+  AgentSpawner,
   FabricBudgetSummary,
   FabricSteeringMode,
   FabricAgentLog,
@@ -320,6 +322,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   routePin?: Readonly<NonNullable<AgentRunRequest["routeDecision"]>["pin"]>;
   actorId?: string;
   actorName?: string;
+  spawner?: AgentSpawner;
   capabilityRequirements?: string[];
   capabilityDigest?: string;
   runnerSessionId?: string;
@@ -579,6 +582,7 @@ const failedRecord = (
     ...(managed.latestRecord?.admittedThinking ? { admittedThinking: managed.latestRecord.admittedThinking } : {}),
     ...(managed.actorId ? { actorId: managed.actorId } : {}),
     ...(managed.actorName ? { actorName: managed.actorName } : {}),
+    ...(managed.spawner ? { spawner: managed.spawner } : {}),
     ...(managed.runnerSessionId ? { runnerSessionId: managed.runnerSessionId } : {}),
     ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
     ...(managed.transport.attachCommand ? { attachCommand: managed.transport.attachCommand } : {}),
@@ -605,12 +609,14 @@ const hostStoppedResult = (result: AgentRunResult, lastEventAt: number | undefin
   return { ...rest, error: `${HOST_STOP_REASON}; last error: ${result.error ?? "none"}; last event: ${lastEvent}` };
 };
 
-const runRootHasUnresolvedWorker = (root: string): boolean => {
+// Settled handles can be evicted while their descendants still use the shared
+// budget. Inspect persisted trees too; marker absence is not checked child exit.
+const runRootHasExitVeto = (root: string): boolean => {
   try {
     return fs.readdirSync(root, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && hasUnresolvedWorker(path.join(root, entry.name)));
-  } catch {
-    return false;
+      .some((entry) => entry.isDirectory() && !!runTreeExitVeto(path.join(root, entry.name), 0, undefined, true));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
 };
 
@@ -634,6 +640,7 @@ export class AgentManager {
   readonly #kernel: () => FabricKernel;
   readonly #pythonRuntime: () => FabricPythonRuntime;
   readonly #mainAgentId: string | undefined;
+  readonly #spawner: AgentSpawner | undefined;
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
   readonly #projectRoot: string;
@@ -643,6 +650,7 @@ export class AgentManager {
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
+  readonly #onBeforeResultReturned: ((id: string) => void) | undefined;
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
   readonly #onSettled: ((result: AgentRunResult) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
@@ -701,6 +709,8 @@ export class AgentManager {
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult) => void;
       onResultConsumed?: (id: string) => void;
+      /** Fail-closed durable fence before a foreground value reaches its caller. */
+      onBeforeResultReturned?: (id: string) => void;
       onStoppedAtClose?: (results: AgentRunResult[]) => void;
       /** Every terminal result, foreground or background, before its run directory can be removed. */
       onSettled?: (result: AgentRunResult) => void;
@@ -729,6 +739,7 @@ export class AgentManager {
       options.vedaBinary ?? process.env.PI_FABRIC_VEDA_BINARY ?? config.veda.binary;
     this.#onBackgroundComplete = options.onBackgroundComplete;
     this.#onResultConsumed = options.onResultConsumed;
+    this.#onBeforeResultReturned = options.onBeforeResultReturned;
     this.#onStoppedAtClose = options.onStoppedAtClose;
     this.#onSettled = options.onSettled;
     this.#onLifecycle = options.onLifecycle;
@@ -753,6 +764,7 @@ export class AgentManager {
       options.spawnerSessionId ?? process.env.PI_SESSION_ID ?? this.#fabricSessionId,
       this.#mainAgentId,
     );
+    this.#spawner = resolveAgentSpawner(this.#identityId, this.#mainAgentId);
     const inheritedBudget = activeBudgetState();
     this.#budget =
       inheritedBudget ??
@@ -1162,7 +1174,12 @@ export class AgentManager {
         const componentGuidance = recursive
           ? undefined
           : this.#resolveParticipantGuidance?.({ ...(model ? { model } : {}), runner })?.trim();
-        const systemPrompt = [request.systemPrompt?.trim(), componentGuidance]
+        const spawnerGuidance = runner === "pi" && extensions && this.#spawner && this.#spawner.kind !== "main"
+          ? `Your immediate Fabric spawner is ${this.#spawner.kind} ${this.#spawner.id}${this.#spawner.runId ? ` (run ${this.#spawner.runId})` : ""}. ` +
+            "Your final result is returned to that spawner automatically. For addressed updates use agents.followUp({id:'spawner',message:'...'}); " +
+            "agents.spawner() discovers this binding. The 'main' target is the lineage root, NOT an actor spawner."
+          : undefined;
+        const systemPrompt = [request.systemPrompt?.trim(), componentGuidance, spawnerGuidance]
           .filter((section): section is string => Boolean(section))
           .join("\n\n") || undefined;
         const sessionExportDir = resolveSessionExportDir(this.config);
@@ -1207,6 +1224,8 @@ export class AgentManager {
           "--full-code-mode",
           String(inheritedFullCodeMode),
           ...(this.#mainAgentId ? ["--main-agent-id", this.#mainAgentId] : []),
+          ...(this.#spawner ? ["--spawner-id", this.#spawner.id, "--spawner-kind", this.#spawner.kind,
+            ...(this.#spawner.runId ? ["--spawner-run", this.#spawner.runId] : [])] : []),
           ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
           ...(adapter.kind === "process" && !request.actorId
             ? callerReturnAddress ? ["--task-return-address", JSON.stringify(callerReturnAddress)] : this.#taskReturnAddressArguments
@@ -1331,6 +1350,7 @@ export class AgentManager {
           ...(routePin ? { routePin } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
           ...(request.actorName ? { actorName: request.actorName } : {}),
+          ...(this.#spawner ? { spawner: this.#spawner } : {}),
           ...(request.capabilityRequirements
             ? { capabilityRequirements: [...request.capabilityRequirements] }
             : {}),
@@ -1382,8 +1402,8 @@ export class AgentManager {
           } catch { /* best effort: the worktree is kept either way */ }
           throw error;
         }
-        try { routeDispatch?.outcome({ status: "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
-        if (worktree && !runTreeExitVeto(runDirectory)) await this.#worktrees.cleanup(id, true).catch(() => false);
+        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
+        if (worktree && !runTreeExitVeto(runDirectory, 0, undefined, true)) await this.#worktrees.cleanup(id, true).catch(() => false);
         throw error;
       }
     };
@@ -1415,6 +1435,7 @@ export class AgentManager {
         ? { thinking: request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking } : {}),
       ...(request.actorId ? { actorId: request.actorId } : {}),
       ...(request.actorName ? { actorName: request.actorName } : {}),
+      ...(this.#spawner ? { spawner: this.#spawner } : {}),
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
@@ -1543,11 +1564,13 @@ export class AgentManager {
   async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal; deferConsumption?: (consume: () => void, abandon?: () => void) => void } = {}): Promise<AgentRunResult> {
     const previous = this.#previousRun(id);
     if (previous) {
+      this.prepareForeground(id);
       if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id));
       else this.#onResultConsumed?.(id);
       return previous;
     }
     const consumed = (): void => {
+      this.prepareForeground(id);
       if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id), () => this.detachSignal(id));
       else this.#onResultConsumed?.(id);
     };
@@ -1608,7 +1631,12 @@ export class AgentManager {
     });
   }
 
+  prepareForeground(id: string): void {
+    this.#onBeforeResultReturned?.(id);
+  }
+
   markForeground(id: string): void {
+    this.prepareForeground(id);
     if (!this.#previousRun(id)) {
       const queued = this.#queued.get(id);
       if (queued) queued.background = false;
@@ -1770,7 +1798,7 @@ export class AgentManager {
     for (const managed of this.#runs.values()) {
       const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
       const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
-      if (!managed.settled || managed.lostContact || uncheckedExternalExit(managed.transport) ||
+      if (!managed.settled || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
           // Settlement and primary exit do not prove descendant exit. The
           // persistent tree veto checks every descendant's worker identity too.
           unconfirmedProcess || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) protect(managed.id, managed.actorId);
@@ -1798,7 +1826,7 @@ export class AgentManager {
         // establish exit; a terminal record with no PID is still uncertain.
         const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
           ? Number(record.sessionId) : undefined;
-        if (pid !== undefined && !processAlive(pid) && canRemoveTerminalRun(run, expired)) continue;
+        if (pid !== undefined && !processAlive(pid) && !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired)) continue;
         const actorId = record?.actorId;
         if (typeof actorId === "string" && /^[A-Za-z0-9_-]+$/.test(actorId)) protect(entry.name, actorId);
         else refs.add("*");
@@ -1916,7 +1944,7 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
-    const exitVeto = runTreeExitVeto(managed.runDirectory);
+    const exitVeto = runTreeExitVeto(managed.runDirectory, 0, undefined, true);
     if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
     if (!this.#canCollect(managed)) {
       throw new Error(`Cannot clean up agent ${id}: ${uncheckedExternalExit(managed.transport) ? "external transport has no checked worker exit receipt" : managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
@@ -2129,8 +2157,11 @@ export class AgentManager {
     const alive = await Promise.all(transports.map((transport) =>
       uncheckedExternalExit(transport) ? true :
         this.#transportAliveUntil(transport, observationDeadline).then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
-    const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
-      [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasUnresolvedWorker(this.#runRoot);
+    // Primary transport exit cannot release a surviving descendant's files or
+    // shared budget. Keep the persistent run tree (and its owning actor ID) for
+    // the next fenced owner whenever tree-wide exit evidence is incomplete.
+    const unresolved = all.some((managed) => managed.lostContact || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) ||
+      [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasExitVeto(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {
       this.#unregisteredTransports.clear();
@@ -2212,6 +2243,8 @@ export class AgentManager {
     });
     for (const managed of expired) {
       if (!this.#canCollect(managed)) continue;
+      // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
+      if (!canRemoveTerminalRun(managed.runDirectory)) continue;
       await removeTree(managed.runDirectory).catch(() => undefined);
       if (!fs.existsSync(managed.runDirectory)) this.#runs.delete(managed.id);
     }
@@ -2692,7 +2725,7 @@ export class AgentManager {
   }
 
   #canCollect(managed: ManagedAgent): boolean {
-    if (uncheckedExternalExit(managed.transport) || runTreeExitVeto(managed.runDirectory)) return false;
+    if (uncheckedExternalExit(managed.transport) || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) return false;
     // Settlement compacts UI caches. Retry only the original full result, never those caches.
     if (managed.settlementSaveFailure &&
         !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) return false;
@@ -2943,6 +2976,7 @@ export class AgentManager {
       ...(thinking ? { thinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),
+      ...(managed.spawner ? { spawner: managed.spawner } : {}),
       ...(managed.capabilityRequirements
         ? { capabilityRequirements: [...managed.capabilityRequirements] }
         : {}),
@@ -3009,6 +3043,7 @@ export class AgentManager {
       ...(thinking ? { thinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),
+      ...(managed.spawner ? { spawner: managed.spawner } : {}),
       ...(managed.capabilityRequirements
         ? { capabilityRequirements: [...managed.capabilityRequirements] }
         : {}),

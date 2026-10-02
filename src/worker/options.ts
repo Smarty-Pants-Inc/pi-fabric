@@ -132,6 +132,16 @@ export const parseWorkerOptions = (
     if (!carryOver) throw new Error("Invalid worker carry-over");
   }
   const mainAgentId = optional(args, "main-agent-id");
+  const spawnerId = optional(args, "spawner-id");
+  const spawnerKind = optional(args, "spawner-kind");
+  const spawnerRun = optional(args, "spawner-run");
+  if (spawnerId && spawnerKind !== "main" && spawnerKind !== "agent" && spawnerKind !== "actor") {
+    throw new Error("Invalid worker spawner kind");
+  }
+  const spawner = spawnerId ? {
+    id: spawnerId, kind: spawnerKind as "main" | "agent" | "actor",
+    ...(spawnerRun ? { runId: spawnerRun } : {}),
+  } : undefined;
   const fabricSessionId = optional(args, "fabric-session-id");
   const runner = required(args, "runner");
   if (runner !== "pi" && runner !== "claude" && runner !== "veda") {
@@ -186,6 +196,7 @@ export const parseWorkerOptions = (
     depth: Number(required(args, "depth")),
     fullCodeMode: required(args, "full-code-mode") === "true",
     ...(mainAgentId ? { mainAgentId } : {}),
+    ...(spawner ? { spawner } : {}),
     ...(fabricSessionId ? { fabricSessionId } : {}),
     extensions,
     tools: JSON.parse(required(args, "tools")) as string[],

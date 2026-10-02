@@ -77,7 +77,13 @@ describe.skipIf(!built)("fabric_reply in a real Pi session with Fabric", () => {
     const active = session.getActiveToolNames();
     expect(active).toContain("fabric_exec");
     expect(active).toContain("fabric_reply");
-    expect(active).not.toContain("bash");                         // Fabric does own the model's tools
+    // Pi 0.99 keeps tools callable; loadout/context hooks hide model declarations.
+    expect(active).toContain("bash");
+    const fabricTool = session.extensionRunner!.getToolDefinition("fabric_exec")!;
+    const loadout = { registered: active.map(name => ({ name })) } as never;
+    const hidden = fabricTool.prepareLoadout!(loadout)?.hiddenDeclarations;
+    expect(hidden).toContain("bash");
+    expect(hidden).not.toContain("fabric_reply");
 
     faux.setResponses([
       fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })),

@@ -71,6 +71,22 @@ export const parseWorkerOptions = (
   const imagesFile = optional(args, "images-file");
   const systemPrompt = optional(args, "system-prompt");
   const sessionFile = optional(args, "session-file");
+  const persistSessionSource = optional(args, "persist-session");
+  if (persistSessionSource !== undefined && persistSessionSource !== "true" && persistSessionSource !== "false") {
+    throw new Error("Invalid worker persist-session flag");
+  }
+  const persistSession = persistSessionSource === "true";
+  const modelAdmissionSource = optional(args, "model-admission");
+  if (
+    modelAdmissionSource !== undefined &&
+    modelAdmissionSource !== "strict" &&
+    modelAdmissionSource !== "permissive"
+  ) {
+    throw new Error("Invalid worker model-admission flag");
+  }
+  const modelAdmission = modelAdmissionSource === "strict" || modelAdmissionSource === "permissive"
+    ? modelAdmissionSource
+    : undefined;
   const sessionExportFile = optional(args, "session-export-file");
   const actorId = optional(args, "actor-id");
   const actorName = optional(args, "actor-name");
@@ -144,6 +160,9 @@ export const parseWorkerOptions = (
   if (inferenceContext === "activation" && (runner !== "pi" || !sessionFile || !actorId)) {
     throw new Error("Activation inference context requires a persistent Pi actor session");
   }
+  if (persistSession && runner !== "claude") {
+    throw new Error("Worker persist-session requires the Claude runner");
+  }
   const extensions = required(args, "extensions") === "true";
   const selectedKernel = args.get("kernel");
   const pythonRuntime = args.get("python-runtime") ?? "monty";
@@ -195,6 +214,8 @@ export const parseWorkerOptions = (
     ...(routeHeader ? { routeHeader } : {}),
     ...(thinking ? { thinking } : {}),
     ...(systemPrompt ? { systemPrompt } : {}),
+    ...(persistSession ? { persistSession: true } : {}),
+    ...(modelAdmission ? { modelAdmission } : {}),
     ...(sessionFile ? { sessionFile } : {}),
     ...(inferenceContext ? { inferenceContext } : {}),
     ...(sessionExportFile ? { sessionExportFile } : {}),

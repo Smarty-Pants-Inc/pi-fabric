@@ -246,7 +246,7 @@ export class FabricProviderBindings {
     const binding = this.#all.get(id);
     if (!binding) return;
     binding.closeError = error instanceof Error ? error.message : String(error);
-    this.#step(binding, { $: "Fail" });
+    this.#step(binding, { $: "Abort" });
     this.revoke(id);
   }
 
@@ -312,7 +312,7 @@ export class FabricProviderBindings {
   async #maybeClose(binding: FabricProviderBinding): Promise<void> {
     if (binding.closeTask) return binding.closeTask;
     // The reducer reserves Closing synchronously, before arbitrary callbacks.
-    if (this.#step(binding, { $: "Close" }) !== "StartClose") return;
+    if (this.#step(binding, { $: "Shut" }) !== "StartClose") return;
     binding.closeTask = Promise.resolve().then(async () => {
       try {
         const unsubscribe = binding.unsubscribeCatalog;

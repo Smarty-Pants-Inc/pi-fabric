@@ -74,7 +74,7 @@ function createPiArgumentNormalizer() {
     grep: ["path", "glob", "ignoreCase", "literal", "context", "limit"],
     find: ["path", "limit"],
     ls: ["path", "limit"],
-    bash: ["timeout", "background"],
+    bash: ["timeout", "background", "durable"],
     powershell: ["timeout", "background"],
   };
   const __normalizePiArgs = (name: string, args: any, canonicalFields: readonly string[] = []): unknown => {

@@ -21,7 +21,7 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { FabricExecutionService } from "../src/execution-service.js";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { FabricState } from "../src/fabric-state.js";
 import piFabric from "../src/index.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -571,13 +571,24 @@ const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, m
   expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "fabric_exec" }));
   const tool = registered.get("fabric_exec")!;
   expect(tool.name).toBe("fabric_exec");
-  const context = { ...main.context.extensionContext, cwd: state.root, hasUI: false,
-    sessionManager: { getSessionId: () => "round4", getSessionFile: () => undefined },
-    ...(mainTimeoutMs !== undefined ? { mode: "rpc" } : {}),
-  } as unknown as FabricInvocationContext["extensionContext"];
+  const context = {
+    ...({ ...main.context.extensionContext, cwd: state.root, hasUI: false,
+      sessionManager: { getSessionId: () => "round4", getSessionFile: () => undefined },
+      ...(mainTimeoutMs !== undefined ? { mode: "rpc" } : {}),
+    } as unknown as NonNullable<FabricInvocationContext["extensionContext"]>),
+    // Direct tool execution requires Pi's tool context, not just its session context.
+    tools: [],
+    async executeTool(name) {
+      return {
+        toolCall: { type: "toolCall", id: "round4-nested", name, arguments: {} },
+        result: { content: [{ type: "text", text: `Unknown tool: ${name}` }], details: undefined },
+        isError: true,
+      };
+    },
+  } satisfies ExtensionToolContext;
   let sequence = 0;
   return async (code: string, signal?: AbortSignal) => {
-    const result = await tool.execute(`round4-${++sequence}`, { code }, signal, undefined, context!);
+    const result = await tool.execute(`round4-${++sequence}`, { code }, signal, undefined, context);
     // Pi's ToolDefinition return type omits the runtime-supported isError flag.
     return result as typeof result & { isError?: boolean };
   };

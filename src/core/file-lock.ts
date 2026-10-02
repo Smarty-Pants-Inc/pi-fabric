@@ -11,6 +11,14 @@ const DEFAULT_LOCK_ATTEMPTS = 50;
 const DEFAULT_LOCK_DELAY_MS = 5;
 const DEFAULT_STALE_LOCK_MS = 30_000;
 
+/** Contention is retryable; permission, I/O, and operation errors are not. */
+export class FileLockTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FileLockTimeoutError";
+  }
+}
+
 export interface ExclusiveLockOptions {
   directory: string;
   lockName: string;
@@ -42,9 +50,21 @@ const processAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // EPERM (or an unknown probe failure) is not evidence of a dead owner.
+    return errorCode(error) !== "ESRCH";
   }
+};
+
+const ownerCanBeReaped = (owner: string, mtimeMs: number, staleMs: number): boolean => {
+  const [, pid, created] = owner.split("\n");
+  const timestamp = Number(created);
+  // Damaged metadata must not strand the lock forever. Still protect a live
+  // PID, and use filesystem age when the creation timestamp is unusable.
+  const since = created?.trim() && Number.isSafeInteger(timestamp) && timestamp >= 0 && timestamp <= Date.now()
+    ? timestamp
+    : mtimeMs;
+  return Date.now() - since > staleMs && !processAlive(Number(pid));
 };
 
 const sleepAsync = (ms: number): Promise<void> =>
@@ -104,17 +124,15 @@ export const withExclusiveFileLockAsync = async <T>(
       if (errorCode(error) !== "EEXIST") throw error;
       try {
         const firstOwner = await fs.promises.readFile(ownerPath, "utf8");
-        const [, pidText, createdText] = firstOwner.trim().split("\n");
-        const stale = Date.now() - Number(createdText) > staleMs;
-        if (stale && !processAlive(Number(pidText))) {
+        if (ownerCanBeReaped(firstOwner, (await fs.promises.stat(lock)).mtimeMs, staleMs)) {
           const secondOwner = await fs.promises.readFile(ownerPath, "utf8");
           if (
             secondOwner === firstOwner &&
             await reapStaleLockAsync(lock, async (claimed) => {
               try {
                 const owner = await fs.promises.readFile(path.join(claimed, "owner"), "utf8");
-                const [, pid, created] = owner.trim().split("\n");
-                return Date.now() - Number(created) > staleMs && !processAlive(Number(pid));
+                return owner === firstOwner &&
+                  ownerCanBeReaped(owner, (await fs.promises.stat(claimed)).mtimeMs, staleMs);
               } catch {
                 return false;
               }
@@ -123,13 +141,20 @@ export const withExclusiveFileLockAsync = async <T>(
             continue;
           }
         }
-      } catch {
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error;
         try {
           const first = await fs.promises.stat(lock);
           if (
             Date.now() - first.mtimeMs > staleMs &&
             await reapStaleLockAsync(lock, async (claimed) => {
               try {
+                try {
+                  await fs.promises.readFile(path.join(claimed, "owner"), "utf8");
+                  return false;
+                } catch (error) {
+                  if (errorCode(error) !== "ENOENT") return false;
+                }
                 return Date.now() - (await fs.promises.stat(claimed)).mtimeMs > staleMs;
               } catch {
                 return false;
@@ -146,7 +171,7 @@ export const withExclusiveFileLockAsync = async <T>(
       await sleepAsync(delayMs);
     }
   }
-  if (!acquired) throw new Error(options.timeoutMessage);
+  if (!acquired) throw new FileLockTimeoutError(options.timeoutMessage);
   try {
     return await operation();
   } finally {
@@ -221,17 +246,15 @@ export const withExclusiveFileLock = <T>(
       if (errorCode(error) !== "EEXIST") throw error;
       try {
         const firstOwner = fs.readFileSync(ownerPath, "utf8");
-        const [, pidText, createdText] = firstOwner.trim().split("\n");
-        const stale = Date.now() - Number(createdText) > staleMs;
-        if (stale && !processAlive(Number(pidText))) {
+        if (ownerCanBeReaped(firstOwner, fs.statSync(lock).mtimeMs, staleMs)) {
           const secondOwner = fs.readFileSync(ownerPath, "utf8");
           if (
             secondOwner === firstOwner &&
             reapStaleLock(lock, (claimed) => {
               try {
                 const owner = fs.readFileSync(path.join(claimed, "owner"), "utf8");
-                const [, pid, created] = owner.trim().split("\n");
-                return Date.now() - Number(created) > staleMs && !processAlive(Number(pid));
+                return owner === firstOwner &&
+                  ownerCanBeReaped(owner, fs.statSync(claimed).mtimeMs, staleMs);
               } catch {
                 return false;
               }
@@ -240,7 +263,8 @@ export const withExclusiveFileLock = <T>(
             continue;
           }
         }
-      } catch {
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error;
         try {
           // Ownerless lock (crash between mkdir and the owner write): age is
           // the only signal, and the claim re-verifies it after the rename.
@@ -249,6 +273,12 @@ export const withExclusiveFileLock = <T>(
             Date.now() - first.mtimeMs > staleMs &&
             reapStaleLock(lock, (claimed) => {
               try {
+                try {
+                  fs.readFileSync(path.join(claimed, "owner"), "utf8");
+                  return false;
+                } catch (error) {
+                  if (errorCode(error) !== "ENOENT") return false;
+                }
                 return Date.now() - fs.statSync(claimed).mtimeMs > staleMs;
               } catch {
                 return false;
@@ -265,7 +295,7 @@ export const withExclusiveFileLock = <T>(
       sleepSync(delayMs);
     }
   }
-  if (!acquired) throw new Error(options.timeoutMessage);
+  if (!acquired) throw new FileLockTimeoutError(options.timeoutMessage);
   try {
     return operation();
   } finally {

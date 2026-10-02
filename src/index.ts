@@ -18,22 +18,11 @@ import {
 } from "./ui/code-preview-shell.js";
 import { registerFabricActorHostEventObservers } from "./actors/host-event-observer.js";
 import { CapturedToolCatalog } from "./capture/catalog.js";
+import { isSelectedNativeMcpTool } from "./core/native-mcp-identity.js";
 import { installRegisteredToolCapture } from "./capture/interceptor.js";
 import { registerFabricCommand } from "./commands/fabric.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
-import {
-  comparableCompiledSurfaceScore,
-  BackgroundEntropyCompiler,
-  SessionObservationCache,
-  entropyRepairRows,
-  formatEntropyCompileNotice,
-  liveSurfaceSnapshot,
-  loadCompiledSurfaceAsync,
-  loadObservationPoolAsync,
-  saveCompiledSurfaceAsync,
-  saveObservationPoolAsync,
-  sessionWindowEvidenceAsync,
-} from "./entropy/index.js";
+import { FileLockTimeoutError } from "./core/file-lock.js";
 import { setActiveCompiledSurface } from "./entropy/active.js";
 import {
   filterPrewalkContinuationMessages,
@@ -54,6 +43,7 @@ import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
 import { compactAtConfiguredThreshold } from "./compaction/threshold.js";
 import {
   createToolOwnershipReassertion,
+  fabricModelContext,
   FabricToolLifecycle,
   FabricToolOwnership,
   ownsFabricToolSource,
@@ -113,7 +103,7 @@ import path from "node:path";
 import { writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
-import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
+import { ownsRunReplyTool, isRunReplyTool } from "./core/reply-tool-identity.js";
 import { readStoppedRuns, takeReloadStoppedNotice } from "./agents/stopped-runs.js";
 import { installSelfReload, reloadTargetUiHold, RELOAD_HELD_TOPIC, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
 
@@ -264,8 +254,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   const capturePolicy = () => effectiveToolCaptureConfig(state.config);
   const fabricOwnsModelTools = (): boolean =>
     state.config.fullCodeMode || state.config.schema.mode === "enforce";
-  // Captured tools that must stay out of the model's active set in full code
-  // mode: every captured extension tool minus the capture.keepVisible names.
+  // Native loadout hiding preserves the fork's configured extension visibility
+  // (enforce mode permits only Fabric and the verified run-local reply hook).
   const hiddenCapturedToolNames = (): Set<string> => {
     const visible = new Set(capturePolicy().keepVisible);
     return new Set(
@@ -281,8 +271,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     createToolOwnershipReassertion({
       ready: () => state.cwd !== undefined,
       active: () => {
-        const policy = capturePolicy();
-        return policy.enabled && policy.hideFromModel && fabricOwnsModelTools();
+        return fabricOwnsModelTools();
       },
       hiddenNames: hiddenCapturedToolNames,
       apply: (hidden) => toolOwnership.apply(true, hidden),
@@ -462,21 +451,31 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   let entropyCompileInFlight: Promise<void> | undefined;
   let entropyCompilePending: EntropyCompileRequest | undefined;
   let entropyLifecycleEpoch = 0;
-  // Aborted when the lifecycle epoch ends: reads, stats and scoring stop at once (smarty-dev#2010).
+  let entropyStopping = false;
+  let entropyRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let entropyRetryDelayMs = 1_000;
+  const clearEntropyRetry = (reset = true): void => {
+    if (entropyRetryTimer) clearTimeout(entropyRetryTimer);
+    entropyRetryTimer = undefined;
+    if (reset) entropyRetryDelayMs = 1_000;
+  };
+  // Reads, merges and scoring stop when the lifecycle epoch ends (smarty-dev#2010).
   let entropyAbort = new AbortController();
   const endEntropyLifecycle = (): void => {
     entropyLifecycleEpoch += 1;
     entropyAbort.abort();
     entropyAbort = new AbortController();
-    entropyCaches = createEntropyCaches();
+    clearEntropyRetry();
+    entropyCaches = undefined;
     entropyEvidenceThisTurn = false;
     entropyCompilePending = undefined;
   };
-  const createEntropyCaches = () => ({
-    compiler: new BackgroundEntropyCompiler(),
-    observations: new SessionObservationCache(),
-  });
-  let entropyCaches = createEntropyCaches();
+  // Entropy is optional advisory work. Do not compile its transitive graph
+  // during registration/session_start; load it only after a Fabric turn.
+  let entropyCaches: {
+    compiler: import("./entropy/compiler.js").BackgroundEntropyCompiler;
+    observations: import("./entropy/pool.js").SessionObservationCache;
+  } | undefined;
 
   interface EntropyCompileRequest {
     context: ExtensionContext;
@@ -489,40 +488,46 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     context: ExtensionContext,
     epoch: number,
     signal: AbortSignal,
-  ): Promise<void> => {
+  ): Promise<boolean> => {
     const current = (): boolean =>
-      !signal.aborted && epoch === entropyLifecycleEpoch && state.initialized &&
-      state.config.entropy.compile;
-    if (!current()) return;
+      !signal.aborted && epoch === entropyLifecycleEpoch && state.initialized && state.config.entropy.compile;
+    if (!current()) return false;
+    const {
+      comparableCompiledSurfaceScore, BackgroundEntropyCompiler, SessionObservationCache,
+      entropyRepairRows, formatEntropyCompileNotice, liveSurfaceSnapshot,
+      loadCompiledSurfaceAsync, saveCompiledSurfaceAsync, updateObservationPoolAsync,
+      sessionWindowEvidenceAsync,
+    } = await import("./entropy/index.js");
+    if (!current()) return false;
+    let retry = false;
     const agentDir = resolveAgentDir();
     const cwd = state.cwd ?? context.cwd;
     const repairs = entropyRepairRows(state.repairs.repairs);
-    const caches = entropyCaches;
-    // Only this session's file, read by an appended-bytes cursor. The machine-wide window made every
-    // Pi re-read the host's newest (often 100-300 MB) foreign sessions (smarty-dev#2010). The compiled
-    // normal forms derive from the declared schemas alone; traces feed only the advisory score, and
-    // the machine-wide observation pool still receives each session's own window.
+    const caches = entropyCaches ??= {
+      compiler: new BackgroundEntropyCompiler(), observations: new SessionObservationCache(),
+    };
+    // Only the active file, read by an appended-bytes cursor: never re-scan the
+    // host's foreign multi-hundred-MB sessions in background (smarty-dev#2010).
     const sessionFile = context.sessionManager.getSessionFile?.();
     const files = sessionFile ? [sessionFile] : [];
-    const [loaded, poolLoaded, snapshot] = await Promise.all([
+    const [loaded, snapshot] = await Promise.all([
       loadCompiledSurfaceAsync(agentDir),
-      loadObservationPoolAsync(agentDir),
       liveSurfaceSnapshot({ registry: state.registry, extensionContext: context, cwd }),
     ]);
-    if (!current() || loaded.error) return;
+    if (!current() || loaded.error) return false;
     const evidence = await sessionWindowEvidenceAsync(files, { windowsOnly: true, signal });
-    if (!current()) return;
-    const mergedPool = await caches.observations.merge(
-      poolLoaded.file,
-      evidence.observationWindows,
-      signal,
-    );
-    // Shutdown may land during the merge: never start the pool write after it.
-    if (!current()) return;
-    if (!poolLoaded.error && (mergedPool.mergedSessions > 0 || !poolLoaded.file)) {
-      await saveObservationPoolAsync(agentDir, mergedPool.file);
+    if (!current()) return false;
+    try {
+      await updateObservationPoolAsync(agentDir, evidence.observationWindows, caches.observations, signal);
+    } catch (error) {
+      if (signal.aborted) return false;
+      if (error instanceof FileLockTimeoutError) {
+        retry = true;
+      } else {
+        console.warn(`[pi-fabric] observation pool update failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
-    if (!current()) return;
+    if (!current()) return false;
     const outcome = await caches.compiler.compile({
       windows: evidence.traceWindows,
       surface: snapshot,
@@ -530,35 +535,41 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       ...(loaded.file ? { artifact: loaded.file } : {}),
       signal,
     });
-    if (!current()) return;
+    if (!current()) return false;
     if (outcome.status === "compiled" && outcome.artifact) {
-      const saved = await saveCompiledSurfaceAsync(agentDir, outcome.artifact);
-      if (current()) {
-        // Activate even when another process already persisted identical bytes.
-        setActiveCompiledSurface(saved.file);
-        // The notice is progress evidence, not a heartbeat: show it only when
-        // the fresh score measurably lowered the previously persisted surface.
-        const previousScore = comparableCompiledSurfaceScore(loaded.file, saved.file.metricVersion);
-        if (previousScore !== undefined && outcome.report.score < previousScore && context.hasUI) {
-          context.ui.notify(formatEntropyCompileNotice({
-            beforeScore: previousScore,
-            afterScore: outcome.report.score,
-            normalizations: saved.file.normalizations?.length ?? 0,
-          }), "info");
+      try {
+        const saved = await saveCompiledSurfaceAsync(agentDir, outcome.artifact, signal);
+        if (current()) {
+          // Activate even when another process already persisted identical bytes.
+          setActiveCompiledSurface(saved.file);
+          const previousScore = comparableCompiledSurfaceScore(loaded.file, saved.file.metricVersion);
+          if (previousScore !== undefined && outcome.report.score < previousScore && context.hasUI) {
+            context.ui.notify(formatEntropyCompileNotice({
+              beforeScore: previousScore,
+              afterScore: outcome.report.score,
+              normalizations: saved.file.normalizations?.length ?? 0,
+            }), "info");
+          }
         }
+      } catch (error) {
+        if (!(error instanceof FileLockTimeoutError)) throw error;
+        // Proof-checked plans are usable now; durable persistence can catch up
+        // later without blocking this session on another process's writer.
+        if (current()) setActiveCompiledSurface(outcome.artifact);
+        retry = true;
       }
     }
-    // Advisory abstraction suggestions remain available on demand. Static
-    // normalization never asks the user to approve a compatibility repair.
+    return retry && current();
   };
 
   const launchEntropyCompile = (request: EntropyCompileRequest): void => {
+    let retry = false;
     const task = (async () => {
       try {
         if (request.delayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, request.delayMs));
         }
-        await compileEntropyNow(request.context, request.epoch, request.signal);
+        retry = await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {
         if (request.signal.aborted) return;
         console.warn(
@@ -574,7 +585,21 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       entropyCompileInFlight = undefined;
       const pending = entropyCompilePending;
       entropyCompilePending = undefined;
-      if (pending) launchEntropyCompile(pending);
+      if (!retry && request.epoch === entropyLifecycleEpoch) entropyRetryDelayMs = 1_000;
+      if (pending) {
+        launchEntropyCompile(pending);
+      } else if (retry && !entropyStopping && request.epoch === entropyLifecycleEpoch) {
+        // One unref'ed timer, not an in-flight sleep: idle retries never hold
+        // shutdown open. Equal jitter prevents sibling Pi processes retrying
+        // in lockstep, and the delay caps at 30 seconds without a tight loop.
+        const delay = entropyRetryDelayMs * (0.5 + Math.random() * 0.5);
+        entropyRetryDelayMs = Math.min(30_000, entropyRetryDelayMs * 2);
+        entropyRetryTimer = setTimeout(() => {
+          entropyRetryTimer = undefined;
+          launchEntropyCompile({ ...request, delayMs: 0 });
+        }, delay);
+        entropyRetryTimer.unref();
+      }
     });
   };
 
@@ -582,6 +607,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     context: ExtensionContext,
     delayMs = 250,
   ): void => {
+    clearEntropyRetry(false);
     const request = { context, delayMs, epoch: entropyLifecycleEpoch, signal: entropyAbort.signal };
     if (entropyCompileInFlight) {
       entropyCompilePending = request;
@@ -649,12 +675,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   pi.on("session_start", async (event, context) => {
     fabricPrewarm = undefined;
     stopInboxWake();
-    // The pre-reload warning leaves with the redraw; say it again where the user can read it (smarty-dev#1882).
     const reloadNotice = takeReloadStoppedNotice(context.sessionManager?.getSessionId?.() ?? "", event?.reason ?? "");
     if (reloadNotice && context.hasUI) context.ui.notify(reloadNotice, "warning");
     inboxWake.context = context;
     inboxWake.armed = true;
     endEntropyLifecycle();
+    entropyStopping = false;
     pendingHandoffs.clear();
     directToolApproval.clear();
     toolDisplay.clear();
@@ -1035,12 +1061,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         state.prewalk.acceptContinuation(sessionId, continuationId),
       pendingContinuation,
     );
-    // Planning directives are phase-scoped: visible only while this session's
-    // arm is live (Main still owes its plan). A claimed handoff or an off arm
-    // must not project stale planning instructions into later requests.
+    // Retire requests to plan as soon as the plan is recorded, not just when
+    // handoff claims the arm. Ungated arm advisories remain while armed.
     const planning = filterPrewalkPlanningDirectives(
       continuation.messages,
       state.initialized && state.prewalk.isArmed(sessionId),
+      state.initialized && state.prewalk.planRequired(sessionId),
     );
     let changed = continuation.changed || planning.changed;
     const messages = planning.messages.map((message) => {
@@ -1100,7 +1126,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       ? coreOverridePromptGuidance(capturedTools).trim()
       : undefined;
     const extensionRoster = effectiveFullCodeMode
-      ? extensionToolRosterGuidance(capturedTools.list(), new Set(PI_CORE_TOOL_NAMES))
+      ? extensionToolRosterGuidance(capturedTools.list().filter(entry =>
+          !state.config.mcp.enabled || !isSelectedNativeMcpTool(entry.definition, state.config.mcp.nativeServers),
+        ), new Set(PI_CORE_TOOL_NAMES))
       : undefined;
     // Only turn-stable sections go into the system prompt. Anything derived
     // from the current prompt (skill references) rides
@@ -1192,6 +1220,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("session_shutdown", async (event, context) => {
+    entropyStopping = true;
+    clearEntropyRetry();
     stopInboxWake();
     const reason = event?.reason ?? "exit";
     let stopping = 0;
@@ -1232,6 +1262,20 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // must not leak into the model's next turn.
   pi.on("before_agent_start", () => {
     reassertToolOwnership();
+  });
+
+  pi.on("context_with_system", (event) => {
+    if (!fabricOwnsModelTools()) return;
+    reassertToolOwnership();
+    const visibleNames = new Set(capturePolicy().keepVisible);
+    const activeNames = new Set(pi.getActiveTools());
+    const visible = capturedTools.registeredTools().filter(({ definition, sourceInfo }) =>
+      activeNames.has(definition.name) && definition.name !== "fabric_exec" && definition.exposure !== "hidden" &&
+      (visibleNames.has(definition.name) || isRunReplyTool(definition.name, sourceInfo.path)),
+    ).map(({ definition }) => ({ name: definition.name, description: definition.description, parameters: definition.parameters }));
+    return { messages: fabricModelContext(event.messages, {
+      name: fabricTool.name, description: fabricTool.description, parameters: fabricTool.parameters,
+    }, visible) };
   });
 
   registerFabricCommand(pi, {

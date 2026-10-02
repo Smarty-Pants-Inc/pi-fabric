@@ -67,6 +67,27 @@ never implicit filesystem discovery. Provider actions accept the same optional
 `source` argument; omitting it preserves the normal filesystem behavior.
 Source-qualified follow pointers and guest `memory.walk` retain this binding.
 
+Hosts that only need a local directory of session JSONL files (a synced
+laptop archive, a copied agent tree) do not have to write an adapter:
+declare it in `fabric.json` and the runtime registers a built-in `fs`
+source before installing the provider.
+
+```json
+{
+  "memory": {
+    "sources": [{ "id": "laptop", "kind": "fs", "root": "/home/me/pi-archive" }]
+  }
+}
+```
+
+The root is walked recursively for `*.jsonl`, so native agent trees and flat
+archive directories both work; session keys are root-relative paths. The
+adapter satisfies the same interface as a hand-written source, including
+content-hash revisions and coverage reporting, so everything below applies
+to it unchanged. Key rules and validation errors are documented in
+[configuration](configuration.md#memory-sources); with no `memory.sources`
+entries the provider behaves exactly as before.
+
 Host records reuse the normal branch, normalization, ranking, structural trace,
 coverage, and lossless expansion paths. Revision/content hashes and lineage
 fingerprints reject stale follow pointers. Host shards are rebuilt within

@@ -182,6 +182,15 @@ describe("Fabric bash tool_call hook in an actor run (smarty-dev#2184)", () => {
     vi.stubEnv("PI_FABRIC_ACTOR_ID", undefined);
     expect((await bashCall({ command: "ls" })).input.timeout).toBeUndefined();
   });
+
+  it("loads the fork guard at first bash use and refuses pattern kills and shared tmp wipes", async () => {
+    for (const actorId of [undefined, "actor:a"]) {
+      vi.stubEnv("PI_FABRIC_ACTOR_ID", actorId);
+      expect((await bashCall({ command: "pkill -f pi-fabric" })).blocked).toBe(true);
+      expect((await bashCall({ command: "rm -rf /tmp/*" })).blocked).toBe(true);
+      expect((await bashCall({ command: "kill 12345" })).blocked).toBe(false);
+    }
+  });
 });
 
 // Review finding 4: a native-tool actor (extensions: false) runs Pi with --no-extensions, so the

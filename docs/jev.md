@@ -2,7 +2,7 @@
 
 Fabric follows the shell-first model of `jev-fabric`: ordinary code launches and supervises processes, consumes bounded evidence, and calls Jev **explicitly** only for a fuzzy decision. Exact checks need no model. Jev returns Choice, Noul, or Score values, never generated shell commands or prose.
 
-Programs run in persistent QuickJS contexts with exact granted capabilities. Use the existing `pi.bash` / `pi.powershell` and `tasks` provider, not a new process engine or browser/macOS bridge. No standalone `jev-fabric` installation is required. Unlike its native supervisor, Fabric programs and tasks are session-owned, not restart-durable.
+Programs run in persistent QuickJS contexts with exact granted capabilities. Use the existing `pi.bash` / `pi.powershell` and `tasks` provider, not a new process engine or browser/macOS bridge. No standalone `jev-fabric` installation is required. Fabric programs and ordinary tasks are session-owned, not restart-durable; `pi.bash({durable: true})` delegates one process to a jev-fabric store so it outlives Pi (see [durable tasks](background-tasks.md#durable-tasks-through-jev-fabric)).
 
 For guided authoring, invoke `/skill:fabric-jev <task>`. It is user-opt-in and available in both kernel skill trees. Python callers use `tools.call` dictionaries; the Jev program artifact itself remains TypeScript in QuickJS, without changing the outer Fabric kernel. See [skills](skills.md).
 
@@ -40,15 +40,15 @@ return {id:run.id, state:run.state, result:run.result ?? null, error:run.error ?
 
 `maxEvaluations: 0` rejects program inference before dispatch, even if accidentally granted. Omit `jev.evaluate` entirely for deterministic programs; they need no credentials. This does not disable a separately configured host auto-approval classifier or inference in a shell command: do not change approval policy implicitly.
 
-For filtered progress, launch with `monitor:{delivery:"ui",match:"BUILD:",intervalMs:1000,timeoutMs:60000}` and grant `tasks.watch`. Await `tools.call({ref:"tasks.watch",args:{id,after:cursor,timeoutMs:5000}})`, beginning with cursor 0. Consume `lines`, inspect `omitted`, and advance to `nextCursor`. `reason` is `event`, `finished`, or `timeout`. A match is evidence, not completion; an omitted batch is incomplete evidence. No automatic Jev calls or Main wakeups occur with UI-only delivery. See [task wait/watch](background-tasks.md#programmatic-wait-and-watch) for bounds and cancellation.
+For filtered progress, launch with `monitor:{delivery:"ui",match:"BUILD:",intervalMs:1000,timeoutMs:60000}` and grant `tasks.watch`. Await `tools.call({ref:"tasks.watch",args:{id,after:cursor,timeoutMs:5000}})`, beginning with cursor 0. Consume `lines`, inspect `losses`/`omitted`, advance to `nextCursor`, and call again at once while `more` is true. `reason` is `event`, `finished`, or `timeout`. A match is evidence, not completion; an omitted batch is incomplete evidence. No automatic Jev calls or Main wakeups occur with UI-only delivery. See [task wait/watch](background-tasks.md#programmatic-wait-and-watch) for bounds and cancellation.
 
-Timeouts are ceilings, not delays: ready evidence returns immediately. `tasks.wait`/`watch` timing out or being cancelled never stops the task. Detached tasks belong to the Pi session, **not the Jev run**: `jev.stop` stops the program, while `tasks.stop` stops its task. Keep task IDs in progress events and configure finite shell/monitor deadlines. A foreground shell still follows caller cancellation until it detaches. For work that must outlive Pi itself, use an explicitly authorized standalone supervisor; Fabric does not claim durable recovery.
+Timeouts are ceilings, not delays: ready evidence returns immediately. `tasks.wait`/`watch` timing out or being cancelled never stops the task. Detached tasks belong to the Pi session, **not the Jev run**: `jev.stop` stops the program, while `tasks.stop` stops its task. Keep task IDs in progress events and configure finite shell/monitor deadlines. A foreground shell still follows caller cancellation until it detaches. For work that must outlive Pi itself, use `durable: true` with an installed jev-fabric: the process survives, while the Jev program and its pending waits do not.
 
-Shell execution retains Fabric approvals, compatible shell middleware, and capability checks. It requires full-code mode and cannot silently replace an opaque captured shell backend. `pi.bash` accepts shell source, not literal argv or an interactive stdin handle. Use a reviewed script/file for quoting-sensitive arguments, pipes, or persistent subprocess I/O; bounded task previews are not a protocol transport.
+Shell execution retains Fabric approvals, compatible shell middleware, and capability checks. It requires full-code mode and cannot silently replace an opaque captured shell backend. `pi.bash` accepts shell source, not literal argv or an interactive stdin handle. For literal argv or persistent subprocess I/O, grant `sessions.open`/`sessions.write`/`sessions.read` (jev-fabric, macOS/Linux): the session child ends with the program. See [shell composition](shell-composition.md) for the verbs, records and a realtime loop.
 
 ## Authentication
 
-On Pi 0.85.1 or newer, `/login jev` prompts privately for a TypeSafe API key and stores an ordinary API-key credential under `jev` in Pi's `auth.json`. `/logout` removes it. Jev registers an **auth-only provider with no chat models**; it does not appear as a selectable text-generating model.
+On Pi 0.99.0 or newer, `/login jev` prompts privately for a TypeSafe API key and stores an ordinary API-key credential under `jev` in Pi's `auth.json`. `/logout` removes it. Jev registers an **auth-only provider with no chat models**; it does not appear as a selectable text-generating model.
 
 Jev has three upstream routes. Bare aliases (`jev-latest`, `jev-1.13`, `jev-1.13.0`, `jev-preview`) post to TypeSafe's `/v1/systemone`. OpenRouter decisions IDs (`typesafe/jev-1.13`, `~typesafe/jev-latest`) post to OpenRouter's `/api/alpha/decisions` and reuse the **existing `openrouter` credential** (the same `auth.json` entry as your chat models), so `/login openrouter` covers both. OpenRouter serves Jev on its Decisions API, not `/chat/completions`, and has no `jev-preview` alias. Vercel AI Gateway model IDs (`typesafe-ai/jev`, or the `jev-latest` alias) post to its TypeSafe-compatible `/typesafe/v1/systemone` endpoint and reuse the **existing `vercel-ai-gateway` credential** (`/login vercel-ai-gateway`, `AI_GATEWAY_API_KEY`); the request and response shapes stay TypeSafe's own, so only the base URL and key change. No second provider is registered.
 
@@ -199,6 +199,10 @@ A realtime controller is one program: observe, judge, act, pace, repeat. Two dec
 - **Factorized control axes.** One request asks several independent questions whose answers execute together, for example movement / view / trigger / interaction. This is the shape of the browser-native Doom example.
 
 Both are ordinary `jev.evaluate` batches: keep independent questions in one request, and keep the mapping from answers to effects in code. A counterfactual head that is not executed is still a judgment; never let unused heads write state.
+
+### Persistent children
+
+When observation or control goes through a long-lived process (a game bridge, a harness `serve`, a REPL), open it with `sessions.open` and exchange lines with `sessions.write` and `sessions.read` (long-poll `waitMs`, byte `offset`/`next`). A write reaches the child's stdin at once; a session child ends when the program ends. [Shell composition](shell-composition.md#a-realtime-loop) has a complete controller.
 
 ### Observation stays structured state
 
@@ -352,9 +356,11 @@ Default per-run limits: **60 seconds, 100 evaluations, 1,000 host calls, 100,000
 }
 ```
 
+`jev.transport` chooses where program decisions are dispatched. `"fabric"` (default) keeps them in this process. `"auto"` opts into one jev-fabric `serve` connection per program run when a compatible binary resolves (macOS/Linux; see [which jev-fabric](shell-composition.md#which-jev-fabric)), with the request, route, and a per-request credential passed over its private pipe and the answer validated by both; otherwise it stays in-process. `"jev-fabric"` requires the binary. Direct `jev.evaluate` calls and the auto-approval classifier always stay in-process, and this process's per-run budgets apply first either way.
+
 Duration can be configured up to 24 hours. Evaluation slots are reserved before dispatch, including failed requests. One evaluation may be in flight per program; batch independent questions to avoid building an inference backlog. Other granted tool calls may run concurrently. Token usage is reported **after** inference: exceeding the token threshold stops the program before it can use that answer, but the final request can overshoot the threshold and still incurs charges. This is not a hard dollar-spend limit. Request-size and evaluation-count limits are the pre-dispatch bounds. Failed requests with no usage report may still have incurred upstream charges.
 
-Every external action keeps Fabric argument validation, approvals, Schema policy, and a pinned capability generation. A restricted caller cannot widen its own capability view by spawning a program. Recursive Jev lifecycle calls are denied inside programs. Jev is unavailable in Schema enforce and managed-host modes. Other deliberately granted capabilities can be powerful: **granting `pi.bash` or an unrestricted evaluator is not a read-only sandbox** and can defeat data-isolation assumptions. Shell effects run with host privileges; QuickJS isolation does not sandbox a granted shell. Use the harness-owned CLI and library contracts; add no Fabric adapter for them.
+Every external action keeps Fabric argument validation, approvals, Schema policy, and a pinned capability generation. A restricted caller cannot widen its own capability view by spawning a program. Recursive Jev lifecycle calls are denied inside programs. Jev is unavailable in Schema enforce and managed-host modes. Other deliberately granted capabilities can be powerful: **granting `pi.bash` or an unrestricted evaluator is not a read-only sandbox** and can defeat data-isolation assumptions. Shell effects run with host privileges; QuickJS isolation does not sandbox a granted shell. Follow the harness-owned CLI/library contracts without adding a Fabric adapter.
 
 ## Browser and desktop tools
 

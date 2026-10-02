@@ -67,10 +67,19 @@ changes still update the report. These caches are session-owned, retain at most
 16 windows, and are discarded on session start/shutdown. Cached snapshot inputs
 must not be mutated by callers.
 
-The background compile reads only the active session's file, from a
-complete-line cursor: a partial tail is left for the next read, so a live
-session is never re-read from byte 0. Reads and scoring stop at once when the
-session ends; shutdown does not wait for them. Explicit `/fabric entropy`
+Persistence contention is advisory. Pool updates reload and merge evidence
+under the shared lock so sibling Pi processes cannot overwrite contributions.
+A busy pool does not stop normal-form compilation; a busy artifact store does
+not prevent activation of freshly proved plans. One coalesced background retry
+uses exponential backoff with jitter (capped at 30 seconds), re-reading current
+evidence each attempt. Retry timers do not keep Pi alive and are canceled on
+session start/shutdown. Dead-owner, incomplete, and malformed locks recover
+after 30 seconds; live owners are never evicted merely because a lock is old.
+Damaged data is preserved and reported, not treated as ordinary contention.
+
+The background compile reads only the active session's file, from a complete-line
+cursor: partial tails wait for the next read. Reads, merges and scoring stop
+when the session ends; shutdown does not wait for them. Explicit `/fabric entropy`
 inspection remains machine-wide and immediately fresh. Advisory enum/overload/sequence analysis runs only on the inspection path,
 not in background compilation. No normalizations or historical outcomes change.
 `bun run benchmark:turn-cpu` compares cached/uncached source paths using synthetic

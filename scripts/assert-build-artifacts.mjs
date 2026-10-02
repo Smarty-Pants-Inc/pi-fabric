@@ -145,7 +145,7 @@ const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLe
 if (startupBytes > 1150 * 1024 || startupFiles.size > 45) {
   throw new Error(`Startup static graph grew beyond its budget: ${startupBytes} bytes in ${startupFiles.size} files`);
 }
-const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter"];
+const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter", "jev-fabric"];
 for (const file of startupFiles) {
   for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
     if (optionalPackages.some(name => match[1] === name || match[1]?.startsWith(`${name}/`))) {

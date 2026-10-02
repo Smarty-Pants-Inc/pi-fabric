@@ -104,11 +104,11 @@ law inspect_open_complete:
 
 law close_safe:
   for +life: L.Life
-  CloseSafe(life, K.bindingStep(life, L.Close{}))
+  CloseSafe(life, K.bindingStep(life, L.Shut{}))
 
 law close_complete:
   for +revoked: Bool
-  {K.bindingStep(L.Life{L.Retiring{}, False{}, 0n, 0n, revoked}, L.Close{}) == L.Outcome{L.Life{L.Closing{}, False{}, 0n, 0n, revoked}, L.StartClose{}} : L.Outcome}
+  {K.bindingStep(L.Life{L.Retiring{}, False{}, 0n, 0n, revoked}, L.Shut{}) == L.Outcome{L.Life{L.Closing{}, False{}, 0n, 0n, revoked}, L.StartClose{}} : L.Outcome}
 
 law begin_complete:
   for +owner: Bool
@@ -190,7 +190,7 @@ law quarantine_preserves_work:
   for +holds: Nat
   for +calls: Nat
   for +revoked: Bool
-  {K.bindingStep(L.Life{L.Retiring{}, owner, holds, calls, revoked}, L.Fail{}) == L.Outcome{L.Life{L.Failed{}, False{}, holds, calls, True{}}, L.Granted{}} : L.Outcome}
+  {K.bindingStep(L.Life{L.Retiring{}, owner, holds, calls, revoked}, L.Abort{}) == L.Outcome{L.Life{L.Failed{}, False{}, holds, calls, True{}}, L.Granted{}} : L.Outcome}
 
 law cleanup_after_revocation:
   for +owner: Bool
@@ -243,7 +243,7 @@ law failure_exact:
   for +holds: Nat
   for +calls: Nat
   for +revoked: Bool
-  {K.bindingStep(L.Life{phase, owner, holds, calls, revoked}, L.Fail{}) == Failure(phase, owner, holds, calls, revoked) : L.Outcome}
+  {K.bindingStep(L.Life{phase, owner, holds, calls, revoked}, L.Abort{}) == Failure(phase, owner, holds, calls, revoked) : L.Outcome}
 
 law closing_refuses_work:
   for +owner: Bool

@@ -225,6 +225,8 @@ export class LifecycleBroker {
     const entries = this.mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX);
     const listed = new Set<string>();
     let latestSequence: number | undefined;
+    // One directory snapshot, built only after the cheap ownership/cursor gates.
+    let directory: Map<string, FabricParticipantInfo> | undefined;
     for (const entry of entries) {
       const subscription = lifecycleSubscriptionFromValue(entry.value);
       if (!subscription || entry.key !== subscriptionKey(subscription.id)) continue;
@@ -241,7 +243,10 @@ export class LifecycleBroker {
       if (this.participants.publishes?.(subscription.to) === false) continue;
       latestSequence ??= this.mesh.latestSequence();
       if (latestSequence <= this.#cursor(subscription)) continue;
-      const target = this.participants.get(subscription.to);
+      directory ??= new Map(
+        this.participants.list({ scope: "project" }).map((record) => [record.id, record]),
+      );
+      const target = directory.get(subscription.to) ?? this.participants.get(subscription.to);
       if (!target || target.stale || !target.local) continue;
       await this.#drainSubscription(entry, subscription);
     }

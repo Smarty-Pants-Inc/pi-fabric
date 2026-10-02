@@ -512,6 +512,50 @@ describe("agents provider message routing service boundaries", () => {
     expect(control.request).not.toHaveBeenCalled();
   });
 
+  it("routes a remote root to its authenticated owner without actor validation", async () => {
+    const { router, participants, control, actors, main } = routing();
+    const remote = { ...participant(), id: "session:peer", rootId: "session:peer" };
+    participants.get.mockReturnValue(remote);
+    const ack = { queued: true, messageId: "peer-msg", routed: "mesh", acknowledged: true } as const;
+    control.request.mockResolvedValue(ack);
+    await expect(router.routeMessage(remote.id, "hello", { topic: "work" }, "followUp", undefined, { triggerTurn: false })).resolves.toEqual(ack);
+    expect(control.request).toHaveBeenCalledWith(
+      "host", remote.id, "followUp", { message: "hello", data: { topic: "work" }, triggerTurn: false }, "owner", { routedRemoteHost: null },
+    );
+    expect(main.deliverAgent).not.toHaveBeenCalled();
+    expect(actors.validateDirectMessage).not.toHaveBeenCalled();
+    expect(actors.steerRemote).not.toHaveBeenCalled();
+  });
+
+  it("rejects a remote root without its capability and uses the authenticated legacy relay without v1 control", async () => {
+    const { router, participants, control, actors, agents, main } = routing();
+    const remote: FabricParticipantInfo = { ...participant(), id: "session:peer", rootId: "session:peer", capabilities: [] };
+    participants.get.mockReturnValue(remote);
+    await expect(router.routeMessage(remote.id, "hello", undefined, "steer")).rejects.toThrow("does not support steer");
+    remote.capabilities = ["steer"];
+    remote.controlProtocol = "legacy";
+    await router.routeMessage(remote.id, "hello", undefined, "steer");
+    expect(actors.steerRemote).toHaveBeenCalledWith(remote.id, "hello", "steer", undefined);
+    remote.controlProtocol = "v1";
+    const withoutControl = new AgentMessageRouter(agents, actors, main, participants, undefined, (binding) => binding);
+    await withoutControl.routeMessage(remote.id, "hello", undefined, "steer");
+    expect(control.request).not.toHaveBeenCalled();
+    expect(actors.steerRemote).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves local Main delivery and remote actor routing unchanged", async () => {
+    const { router, participants, control, main, actors } = routing();
+    participants.get.mockReturnValue({ ...participant(), local: true });
+    await router.routeMessage("main", "local", undefined, "followUp");
+    expect(main.deliverAgent).toHaveBeenCalledOnce();
+    expect(control.request).not.toHaveBeenCalled();
+    const actor: FabricParticipantInfo = { ...participant(), id: "actor:peer", kind: "actor", rootId: "session:peer", capabilities: ["steer"] };
+    participants.get.mockReturnValue(actor);
+    await router.routeMessage(actor.id, "actor message", undefined, "steer");
+    expect(actors.validateDirectMessage).toHaveBeenCalledWith("actor message", undefined);
+    expect(control.request).toHaveBeenCalledWith("host", actor.id, "steer", { message: "actor message", data: undefined }, "owner", { routedRemoteHost: null });
+  });
+
   it("does not hide local agent failures by falling through to actors", async () => {
     const { router, agents, actors } = routing();
     const failure = new Error("worker unavailable");

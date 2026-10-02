@@ -37,6 +37,7 @@ describe("package manifest", () => {
       expect(manifest.dependencies?.[name], `${name} must not be a dependency`).toBeUndefined();
     }
     expect(manifest.peerDependencies).toEqual({
+      "@earendil-works/pi-agent-core": "*",
       "@earendil-works/pi-ai": "*",
       "@earendil-works/pi-coding-agent": "*",
       "@earendil-works/pi-tui": "*",

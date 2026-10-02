@@ -29,8 +29,11 @@ export interface RegisteredToolCaptureOptions {
   // active-tool ownership. Tools are deliberately left in Pi's registry — the
   // listener observes rather than filters — because extensions that gate tool
   // calls against `pi.getAllTools()` (e.g. permission systems) must still see
-  // captured tools as registered; hiding from the model happens exclusively in
-  // the active tool set (see FabricToolOwnership).
+  // captured tools as registered. Pi 0.99 prepareLoadout/context_with_system
+  // own model visibility; this observer retains full definitions/renderers and
+  // the owning runner for Fabric-specific shell middleware and prepared args.
+  // Neither ctx.tools nor getAllTools exposes that metadata, so this bridge is
+  // still needed (and must patch the live SDK or bundled CLI class identity).
   onCatalogRefresh?: () => void;
 }
 

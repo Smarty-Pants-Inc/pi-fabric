@@ -189,12 +189,14 @@ const runRequest = (
   args: Record<string, unknown>,
   context: FabricInvocationContext,
   manager: AgentManager,
+  modelsConfig: FabricModelsConfig,
   options: { allowCwd?: boolean; inheritedThinking?: string | undefined } = {},
 ): AgentRunRequest => ({
   ...normalizeAgentRunRequest(
     { ...args, timeoutMs: longerTimeoutOverride(args.timeoutMs, manager) },
     {
       ...manager.config,
+      models: modelsConfig,
       inheritedThinking: options.inheritedThinking,
       ...(context.extensionContext.model ? { inheritedModel: context.extensionContext.model } : {}),
     },
@@ -515,7 +517,7 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #runRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
-    const request = runRequest(args, context, this.manager, { inheritedThinking: this.callerThinking() });
+    const request = runRequest(args, context, this.manager, this.modelsConfig(), { inheritedThinking: this.callerThinking() });
     const model = request.model ?? this.manager.defaultModel(request.runner);
     return await this.#resolvePiModelArgs({ ...request, ...(model ? { model } : {}) }, context) as unknown as AgentRunRequest;
   }
@@ -634,7 +636,7 @@ export class AgentsProvider implements FabricProvider {
       "pi",
     );
     delete handoffArgs.cwd;
-    const request = runRequest({ ...handoffArgs, runner: "pi" }, context, this.manager);
+    const request = runRequest({ ...handoffArgs, runner: "pi" }, context, this.manager, this.modelsConfig());
     const kernel = this.manager.resolveKernel(request);
     delete handoffArgs.kernel;
     if (kernel) handoffArgs.kernel = kernel;
@@ -667,6 +669,7 @@ export class AgentsProvider implements FabricProvider {
       ),
       context,
       this.manager,
+      this.modelsConfig(),
       { allowCwd: false },
     );
     request.runner = "pi";

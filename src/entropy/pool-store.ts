@@ -11,6 +11,8 @@ import { writeJsonAtomic, writeJsonAtomicAsync } from "../core/atomic-write.js";
 import { withExclusiveFileLock, withExclusiveFileLockAsync } from "../core/file-lock.js";
 import {
   OBSERVATION_POOL_VERSION,
+  SessionObservationCache,
+  type EntropyObservationWindow,
   type EntropyObservationPoolEntry,
   type EntropyObservationPoolFile,
   type EntropyPoolTrackedSession,
@@ -205,6 +207,65 @@ export const saveObservationPool = (
     },
   );
 
+const writeObservationPoolAsync = async (
+  agentDir: string,
+  file: EntropyObservationPoolFile,
+  signal?: AbortSignal,
+): Promise<SavedObservationPool> => {
+  signal?.throwIfAborted();
+  const target = poolPath(observationPoolDirectory(agentDir));
+  const serialized = `${JSON.stringify(file, null, 2)}\n`;
+  try {
+    if (await fs.promises.readFile(target, "utf8") === serialized) {
+      return { file, written: false };
+    }
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+  }
+  signal?.throwIfAborted();
+  await writeJsonAtomicAsync(target, file, {
+    space: 2, newline: true, mode: 0o600, dirMode: 0o700,
+  });
+  return { file, written: true };
+};
+
+/** Rebase observations on the latest pool while holding the cross-process lock. */
+export const updateObservationPoolAsync = async (
+  agentDir: string,
+  windows: readonly EntropyObservationWindow[],
+  cache = new SessionObservationCache(),
+  signal?: AbortSignal,
+): Promise<SavedObservationPool> => {
+  signal?.throwIfAborted();
+  // Warm expensive summaries outside the critical section. The second merge
+  // reuses immutable snapshots, but must read the pool inside the lock to
+  // preserve writes from other Pi processes.
+  await cache.merge(undefined, windows, signal);
+  signal?.throwIfAborted();
+  return withExclusiveFileLockAsync(
+    {
+      directory: observationPoolDirectory(agentDir),
+      lockName: "observation-pool.lock",
+      timeoutMessage: "Timed out waiting for the observation pool lock",
+      attempts: 2,
+      delayMs: POOL_LOCK_DELAY_MS,
+      staleMs: POOL_STALE_LOCK_MS,
+    },
+    async () => {
+      signal?.throwIfAborted();
+      const loaded = await loadObservationPoolAsync(agentDir);
+      signal?.throwIfAborted();
+      if (loaded.error) throw new Error(loaded.error);
+      const merged = await cache.merge(loaded.file, windows, signal);
+      signal?.throwIfAborted();
+      if (loaded.file && merged.mergedSessions === 0) {
+        return { file: loaded.file, written: false };
+      }
+      return writeObservationPoolAsync(agentDir, merged.file, signal);
+    },
+  );
+};
+
 export const saveObservationPoolAsync = async (
   agentDir: string,
   file: EntropyObservationPoolFile,
@@ -221,21 +282,6 @@ export const saveObservationPoolAsync = async (
     async () => {
       const loaded = await loadObservationPoolAsync(agentDir);
       if (loaded.error) throw new Error(loaded.error);
-      const target = poolPath(observationPoolDirectory(agentDir));
-      const serialized = `${JSON.stringify(file, null, 2)}\n`;
-      try {
-        if (await fs.promises.readFile(target, "utf8") === serialized) {
-          return { file, written: false };
-        }
-      } catch {
-        // Missing file: proceed to write.
-      }
-      await writeJsonAtomicAsync(target, file, {
-        space: 2,
-        newline: true,
-        mode: 0o600,
-        dirMode: 0o700,
-      });
-      return { file, written: true };
+      return writeObservationPoolAsync(agentDir, file);
     },
   );

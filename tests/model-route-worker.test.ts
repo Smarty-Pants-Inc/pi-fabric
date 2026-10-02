@@ -16,7 +16,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker", () => {
-  const run = async (scenario: string, route = true) => {
+  const run = async (scenario: string, route = true, modelAdmission: "strict" | "permissive" = "strict") => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-worker-")); roots.push(root);
     const scenarioFile = path.join(root, "scenario"); fs.writeFileSync(scenarioFile, scenario);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
@@ -27,7 +27,7 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
       candidates: [{ model: "test/luna", effort: "medium" }], parentSessionId: "parent" }, async () => ({ model: "jev", answers: {
       route: { type: "choice", choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } },
     }, usage: { input_tokens: 1, output_tokens: 1 } }));
-    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 5000, retainRuns: true }, {
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, modelAdmission, timeoutMs: 5000, retainRuns: true }, {
       workerPath, piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), runRoot: path.join(root, "runs"),
     }); managers.push(manager);
     const result = await manager.run({ task: "harmless lookup", model: pin.model, thinking: pin.effort,
@@ -35,7 +35,9 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     const events = fs.readFileSync(path.join(root,"runs",result.id,"events.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line));
     const launch = events.find(event => event.type === "fake_route_launch");
     const rows = route ? fs.readFileSync(path.join(root,"agent/fabric/model-routing.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
-    return { result, rows, launch, events, pin };
+    const terminationFile = `${scenarioFile}.terminated`;
+    const termination = fs.existsSync(terminationFile) ? JSON.parse(fs.readFileSync(terminationFile, "utf8")) : undefined;
+    return { result, rows, launch, events, pin, termination };
   };
   it("R3 real-Pi routed worktree uses native tool cwd and committed worktree contents, not parent edits", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-real-cwd-")); roots.push(root);
@@ -94,6 +96,26 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     expect(result.admittedThinking).toBeUndefined();
     expect(events.filter(event => event.type === "fake_received").some(event => event.frame.type === "prompt")).toBe(false);
     expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null });
+  });
+  it.each(["message_start", "message_update", "message_end"].flatMap(frameType =>
+    ["different", "missing"].map(attribution => ({ frameType, attribution })),
+  ))("keeps a required pin exact after permissive admission ($frameType, $attribution)", async ({ frameType, attribution }) => {
+    const { result, rows, events, pin, launch, termination } = await run(`required-pin:${attribution}:${frameType}`, true, "permissive");
+    expect(result.admittedModel).toBe(pin.model);
+    expect(result.admittedThinking).toBe(pin.effort);
+    expect(events.filter(event => event.type === "fake_received").some(event => event.frame.type === "prompt")).toBe(true);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain(`assistant reports ${attribution === "different" ? "runinfra/glm-5-3-flash" : "missing model attribution"}; terminating child`);
+    expect(rows[1]).toMatchObject({ status: "failed", admittedModel: pin.model, admittedEffort: pin.effort });
+    // Windows terminates SIGTERM targets directly instead of running handlers.
+    if (process.platform !== "win32") expect(termination).toMatchObject({ signal: "SIGTERM", pid: launch.pid });
+    // manager.wait must not leave the off-pin child running on either platform.
+    expect(() => process.kill(launch.pid, 0)).toThrow();
+  });
+  it.each(["different", "missing"])("keeps ordinary permissive worker attribution open (%s)", async attribution => {
+    const { result, termination } = await run(`required-pin:${attribution}:message_start`, false, "permissive");
+    expect(result.status).toBe("completed");
+    expect(termination).toBeUndefined();
   });
   it("R3 preserves ordinary non-auto effort clamping", async () => {
     const { result } = await run("effort-lower", false);

@@ -24,7 +24,8 @@ describe.runIf(process.env.FABRIC_754_REAL_CLI === "1")("compiled Fabric public 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cli-754-"));
     const clients: RpcClient[] = [];
     let bridge: ChildProcess | undefined;
-    let prompt: Promise<void> | undefined;
+    // Derived from RpcClient: Pi 0.87 resolves void, newer Pi resolves a PromptDisposition.
+    let prompt: ReturnType<RpcClient["prompt"]> | undefined;
     let bridgeLog = "";
     const records: Record<string, RpcAgentSessionEvent[]> = { receiver: [], sender: [] };
     const entries: Record<string, unknown> = {};

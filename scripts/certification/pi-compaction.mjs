@@ -12,7 +12,7 @@ const internalCompactionUrl = pathToFileURL(
 ).href;
 const internalCompaction = await import(internalCompactionUrl);
 
-const CERTIFIED_PI_VERSION = "0.83.0";
+const CERTIFIED_PI_VERSION = "0.99.0";
 
 if (piPackage.version !== CERTIFIED_PI_VERSION) {
   throw new Error(
@@ -20,7 +20,7 @@ if (piPackage.version !== CERTIFIED_PI_VERSION) {
   );
 }
 if (typeof internalCompaction.prepareCompaction !== "function"
-  || typeof internalCompaction.estimateContextTokens !== "function") {
+  || typeof internalCompaction.estimateProjectedContextTokens !== "function") {
   throw new Error(
     `Installed Pi compaction internals do not expose the expected ${CERTIFIED_PI_VERSION} functions`,
   );
@@ -44,7 +44,7 @@ export const SMALL_COMPACTION_SETTINGS = Object.freeze({
 export const SMALL_CONTEXT_WINDOW = 64;
 
 export const getPiContextTokens = (manager) =>
-  internalCompaction.estimateContextTokens(manager.buildSessionContext().messages).tokens;
+  internalCompaction.estimateProjectedContextTokens(manager.buildSessionProjection(), manager.getBranch()).tokens;
 
 export const prepareEligibleCompaction = (
   manager,

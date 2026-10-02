@@ -72,6 +72,9 @@ const totalCost = (
     .filter((agent) => (run ? agent.runId === run.id : isActiveStatus(agent.status)))
     .reduce((sum, agent) => sum + (agent.usage?.cost ?? 0), 0);
 
+const agentRecency = (agent: FabricUiAgent): number =>
+  agent.finishedAt ?? agent.updatedAt ?? agent.startedAt ?? 0;
+
 const agentLines = (
   theme: Theme,
   agent: FabricUiAgent,
@@ -220,14 +223,17 @@ export class FabricWidget implements Component {
     const orderedAgents = orderAgentsByCreation(ownAgents(snapshot));
     const activeAgents = orderedAgents.filter((agent) => isActiveStatus(agent.status));
     const activeAgentIds = new Set(activeAgents.map((agent) => agent.id));
-    const terminalAgents = run
-      ? orderedAgents.filter(
-          (agent) =>
-            agent.runId === run.id &&
-            !activeAgentIds.has(agent.id) &&
-            !isActiveStatus(agent.status),
-        )
-      : [];
+    // Completed agents stay visible after their run ends: a new fabric_exec must
+    // not collapse the finished work back to the header. The newest completions
+    // sort first so the configured row budget keeps the most recent results, and
+    // an explicit dismissal watermark still retires everything it covers.
+    const dismissedAt = snapshot.widgetDismissedAt ?? 0;
+    const terminalAgents = orderedAgents
+      .filter((agent) =>
+        !activeAgentIds.has(agent.id) &&
+        !isActiveStatus(agent.status) &&
+        agentRecency(agent) > dismissedAt)
+      .sort((left, right) => agentRecency(right) - agentRecency(left));
     const visibleActors = snapshot.actors.filter((actor) => actor.status !== "stopped");
     const activeActorWorkers = visibleActors
       .filter((actor) => actor.worker && isActiveStatus(actor.worker.status))

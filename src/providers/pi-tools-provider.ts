@@ -23,7 +23,7 @@ import {
   PI_CORE_TOOL_NAMES,
   type PiCoreToolName,
 } from "../core/pi-tools.js";
-import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
+import { classifyPiBashError, classifyPiBashResult, piBashResultError } from "../core/pi-bash-error.js";
 import {
   appendShellHangNotice,
   DEFAULT_SHELL_HANG_MS,
@@ -60,6 +60,7 @@ import { writeContentForPreview } from "./write-diff-limits.js";
 import { createPreviewWriteToolDefinition } from "./write-preview.js";
 
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
+import { executionToolContext } from "../capture/tool-context.js";
 
 const closedPiInputSchema = (name: PiCoreToolName, source: unknown): Record<string, unknown> => {
   const schema = source as Record<string, unknown>;
@@ -71,6 +72,14 @@ const closedPiInputSchema = (name: PiCoreToolName, source: unknown): Record<stri
       type: "boolean",
       description:
         "Detach immediately: returns ok:true with taskId, pid and a bounded live log. Completion notifies the owning agent. Inspect/stop with tools.call tasks.get/tasks.stop; bounded controllers can await tasks.wait/tasks.watch without polling. monitor also detaches, requires explicit ui/wake delivery and has a finite deadline. Do not poll.",
+    };
+  }
+  // jev-fabric is macOS/Linux only: Windows never advertises durable tasks.
+  if (name === "bash" && process.platform !== "win32") {
+    properties.durable = {
+      type: "boolean",
+      description:
+        "Run as a durable background task owned by jev-fabric (the user's install or the bundled package). It keeps running if Pi exits and reattaches to this session on resume; other harnesses sharing the store can see it. Implies background. Use for dev servers and long jobs that must outlive the session; stop explicitly with tasks.stop.",
     };
   }
   if (name === "edit") {
@@ -225,14 +234,8 @@ const normalizeResult = (
   };
 };
 
-// Shape of a pi core tool's execute() result. AgentToolResult<unknown> is
-// { content, details, terminate? }; pi core tools throw on error rather than
-// returning isError, so isError is tracked separately in #invokeWithEvents.
-interface PiToolResult {
-  content: ToolContent;
-  details: unknown;
-  terminate?: boolean;
-}
+// Pi 0.99 reports ordinary shell exits through isError + structuredContent.
+type PiToolResult = AgentToolResult<unknown>;
 
 export class PiToolsProvider implements FabricProvider {
   readonly name = "pi";
@@ -276,6 +279,32 @@ export class PiToolsProvider implements FabricProvider {
     this.#ownsShellJobs = hostCapabilities.shellJobs === undefined;
     this.#shellJobs = hostCapabilities.shellJobs ?? new FabricShellJobStore();
     this.#getShellHangMs = hostCapabilities.getShellHangMs;
+  }
+
+  /** Interactive backends cannot preserve opaque overrides/middleware. Reuse bash
+   * authority and the host's tool_call admission, or fail closed. */
+  async admitInteractiveShell(args: Record<string, unknown>, context: FabricInvocationContext): Promise<Record<string, unknown>> {
+    this.#assertAllowed("bash");
+    if (this.#catalog?.get("bash")) throw new Error("Interactive sessions would bypass bash shell protection");
+    const runner = this.#catalog?.runner;
+    if (!runner) throw new Error("Interactive sessions require host shell admission");
+    const input = this.prepareArguments("bash", args);
+    const original = { ...input };
+    const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
+      type: "tool_call", toolName: "bash", toolCallId: context.nestedToolCallId, input,
+    }));
+    if (preflight?.block) throw new Error(preflight.reason || "Pi tool bash was blocked");
+    // Only a host-owned timeout can be carried to the interactive backend.
+    if (Object.keys(input).some(key => key !== "timeout" && input[key] !== original[key])
+      || Object.keys(original).some(key => key !== "timeout" && input[key] !== original[key])) {
+      throw new Error("Interactive sessions cannot preserve shell admission argument changes");
+    }
+    if (input.timeout !== undefined && (typeof input.timeout !== "number" || !Number.isFinite(input.timeout) || input.timeout <= 0)) {
+      throw new Error("Invalid host shell admission timeout");
+    }
+    throwIfAborted(context.signal);
+    if (this.#catalog?.get("bash")) throw new Error("Interactive sessions would bypass bash shell protection");
+    return input;
   }
 
   get shellJobs(): FabricShellJobStore {
@@ -425,11 +454,12 @@ export class PiToolsProvider implements FabricProvider {
   #executionContextFor(
     name: PiCoreToolName,
     args: Record<string, unknown>,
-    context: ExtensionContext,
-  ): ExtensionContext {
+    invocation: FabricInvocationContext,
+  ): import("@earendil-works/pi-coding-agent").ExtensionToolContext {
+    const context = executionToolContext(invocation.extensionContext, this.#catalog?.runner, invocation.nestedToolCallId, invocation.signal);
     const cwd = args[PI_BASH_CWD_KEY];
     return isPiShellToolName(name) && typeof cwd === "string"
-      ? { ...context, cwd }
+      ? Object.defineProperty(Object.create(context), "cwd", { value: cwd, enumerable: true })
       : context;
   }
 
@@ -443,16 +473,21 @@ export class PiToolsProvider implements FabricProvider {
     return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : DEFAULT_SHELL_HANG_MS;
   }
 
-  #trackedShellDefinition(
+  async #trackedShellDefinition(
     name: "bash" | "powershell",
     args: Record<string, unknown>,
     job: ReturnType<FabricShellJobStore["begin"]>,
     middleware: FabricBashMiddlewareV1 | undefined,
-  ): ToolDefinition<any, any, any> {
+  ): Promise<ToolDefinition<any, any, any>> {
     const cwd = typeof args[PI_BASH_CWD_KEY] === "string" ? args[PI_BASH_CWD_KEY] : this.#cwd;
     if (name === "bash") {
       const options = middleware?.options;
-      const local = createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
+      const local = job.durable
+        ? await this.#shellJobs.durable!.launch(job, {
+            shellPath: options?.shellPath, label: job.options.description, filtered: middleware !== undefined,
+            command: typeof args.command === "string" ? args.command : "", cwd, ownerId: job.options.ownerId,
+          })
+        : createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
       const operations = middleware ? middleware.wrapOperations(local) : local;
       if (!operations || typeof operations.exec !== "function") {
         throw new Error("Invalid Fabric bash middleware operations; refusing to bypass shell protection");
@@ -488,7 +523,7 @@ export class PiToolsProvider implements FabricProvider {
           args,
           context.signal,
           onUpdate,
-          this.#executionContextFor(name, args, context.extensionContext),
+          this.#executionContextFor(name, args, context),
         ),
       ) as PiToolResult;
     }
@@ -506,9 +541,16 @@ export class PiToolsProvider implements FabricProvider {
     const monitor = parseShellMonitor(args.monitor);
     if (monitor && args.background === false) throw new Error("monitor runs in the background; omit background:false");
     if (monitor && this.#shellJobs.live().filter(job => job.options.monitor).length >= 8) throw new Error("At most 8 monitors may run per session; stop an existing task first");
-    const background = args.background === true || monitor !== undefined;
-    const { background: _background, monitor: _monitor, description: _description, ...executeArgs } = args;
+    const durable = args.durable === true;
+    if (durable) {
+      if (name !== "bash") throw new Error("durable is available for pi.bash only");
+      if (args.background === false) throw new Error("durable runs in the background; omit background:false");
+      if (process.platform === "win32" || !this.#shellJobs.durable) throw new Error("Durable shell tasks need jev-fabric on macOS or Linux in a Fabric full-code session");
+    }
+    const background = args.background === true || monitor !== undefined || durable;
+    const { background: _background, monitor: _monitor, description: _description, durable: _durable, ...executeArgs } = args;
     const job = this.#shellJobs.begin(name, command, {
+      ...(durable ? { durable: { home: this.#shellJobs.durable!.home } } : {}),
       cwd: typeof args[PI_BASH_CWD_KEY] === "string" ? args[PI_BASH_CWD_KEY] : this.#cwd,
       ownerId: context.extensionContext.sessionManager?.getSessionId?.(),
       ...(typeof args.description === "string" ? { description: args.description } : {}),
@@ -516,7 +558,7 @@ export class PiToolsProvider implements FabricProvider {
     });
     let tool: ToolDefinition<any, any, any>;
     try {
-      tool = this.#trackedShellDefinition(name, executeArgs, job, middleware);
+      tool = await this.#trackedShellDefinition(name, executeArgs, job, middleware);
     } catch (error) {
       await job.finish(null);
       throw error;
@@ -537,12 +579,18 @@ export class PiToolsProvider implements FabricProvider {
             if (spilled) return;
             onUpdate(partialResult as PiToolResult);
           },
-          this.#executionContextFor(name, args, context.extensionContext),
+          this.#executionContextFor(name, args, context),
         ),
     });
     if (outcome.status === "done") {
+      // Explicit background/durable calls always return the task receipt, even
+      // when the command beats the PID read. Retain its real exit/log for wait.
+      if (background) {
+        job.spill();
+        await job.persistLog();
+      }
       await job.finish((outcome.value as PiToolResult & { isError?: boolean }).isError ? null : 0);
-      return outcome.value as PiToolResult;
+      if (!background) return outcome.value as PiToolResult;
     }
     if (outcome.status === "error") {
       await job.finish(null);
@@ -553,14 +601,15 @@ export class PiToolsProvider implements FabricProvider {
     // Only the hang-timer auto-spill waits for a late pid (smarty-dev#883). An explicit background,
     // monitor or manual Ctrl+B handoff returns at once with whatever the bounded read found; a
     // later pid still reaches the job record through the late-pid watch.
-    const pid = outcome.auto ? await job.waitForPid() : await job.readPid();
+    const pid = outcome.status === "spilled" && outcome.auto ? await job.waitForPid() : await job.readPid();
     const elapsedMs = Date.now() - job.startedAt;
     const notice = formatShellHangNotice({
       elapsedMs,
       logPath,
       ...(pid !== undefined ? { pid } : {}),
     });
-    const output = appendShellHangNotice(job.snapshotText(), `${notice}\n[Task ${job.id}; /fabric tasks or tools.call({ref:"tasks.get",args:{id:"${job.id}"}}). ${monitor?.delivery === "ui" ? "UI-only monitor: will not wake the agent." : "Completion will notify this session; do not poll."}]`);
+    const durableNotice = job.durable ? ` Durable: owned by the jev-fabric store at ${job.durable.home}; it keeps running if Pi exits and reattaches to this session on resume. Stop it explicitly with tasks.stop when no longer needed.` : "";
+    const output = appendShellHangNotice(job.finished ? await job.outputText() : job.snapshotText(), `${notice}\n[Task ${job.id}; /fabric tasks or tools.call({ref:"tasks.get",args:{id:"${job.id}"}}). ${monitor?.delivery === "ui" ? "UI-only monitor: will not wake the agent." : "Completion will notify this session; do not poll."}${durableNotice}]`);
     context.update(`${name}: still running after ${Math.max(1, Math.round(elapsedMs / 1000))}s`);
     return {
       content: [{ type: "text", text: output }],
@@ -597,7 +646,10 @@ export class PiToolsProvider implements FabricProvider {
     // CapturedToolsProvider, so delegate to it unchanged.
     if (this.#catalog?.get(name) && !middleware) {
       if (isPiShellToolName(name) && args.monitor !== undefined) throw new Error("Shell monitors are unavailable for opaque shell overrides; a Fabric-compatible middleware adapter is required");
-      const result = await this.#capturedTools!.invoke(name, args, context);
+      if (isPiShellToolName(name) && args.durable === true) throw new Error("Durable shell tasks are unavailable for opaque shell overrides; a Fabric-compatible middleware adapter is required");
+      // `durable` is Fabric's own argument; an override never sees it.
+      const { durable: _durable, ...overrideArgs } = args;
+      const result = await this.#capturedTools!.invoke(name, overrideArgs, context);
       this.#attachReadMedia(name, result, context);
       this.#attachReadNote(name, result, context);
       this.#attachPreview(name, result, args, context);
@@ -620,6 +672,7 @@ export class PiToolsProvider implements FabricProvider {
         throwIfAborted(context.signal);
         throw isPiShellToolName(name) ? classifyPiBashError(error) : error;
       });
+      if (result.isError && isPiShellToolName(name)) throw classifyPiBashResult(result);
       this.#attachReadMedia(name, result, context);
       this.#attachReadNote(name, result, context);
       this.#attachPreview(name, result, args, context);
@@ -689,6 +742,8 @@ export class PiToolsProvider implements FabricProvider {
         },
         middleware,
       );
+      isError = result.isError === true;
+      if (isError && isPiShellToolName(name)) thrown = classifyPiBashResult(result);
     } catch (error) {
       thrown = isPiShellToolName(name) && executionStarted ? classifyPiBashError(error) : error;
       isError = true;
@@ -715,6 +770,7 @@ export class PiToolsProvider implements FabricProvider {
       input: args,
       content: result.content,
       details: result.details,
+      ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
       isError,
     }));
     if (patch) {
@@ -722,9 +778,13 @@ export class PiToolsProvider implements FabricProvider {
         ...result,
         content: patch.content ?? result.content,
         ...(patch.details !== undefined ? { details: patch.details } : {}),
+        ...((patch.content !== undefined || patch.structuredContent !== undefined)
+          ? { structuredContent: patch.structuredContent } : {}),
       };
       isError = patch.isError ?? isError;
     }
+
+    result = { ...result, isError };
 
     // Capture the read's clean text note AFTER the patch — the handoff strips
     // pi's non-vision note and swaps the image for a description, so the first

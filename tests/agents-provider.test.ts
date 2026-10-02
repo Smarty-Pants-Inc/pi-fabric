@@ -5090,6 +5090,75 @@ describe("AgentsProvider switchModel", () => {
   });
 
   it.each(["run", "spawn"] as const)(
+    "preserves a case-insensitive alias thinking default in agents.%s",
+    async (action) => {
+      const { provider, agents } = setup([], [], undefined, {
+        modelsConfig: {
+          aliases: {
+            fast: { targets: ["provider/model-a"], thinking: "high" },
+          },
+        },
+        agentsConfig: { thinking: "medium" },
+      });
+      const spawn = vi.spyOn(agents, "spawn");
+
+      const result = await provider.invoke(
+        action,
+        { task: `alias ${action}`, model: "FAST" },
+        context,
+      );
+
+      expect(spawn).toHaveBeenCalledWith(
+        expect.objectContaining({ model: "provider/model-a", thinking: "high" }),
+        undefined,
+      );
+      if (action === "run") {
+        expect(result).toMatchObject({ thinking: "high" });
+      } else {
+        await expect(agents.wait((result as { id: string }).id)).resolves.toMatchObject({
+          thinking: "high",
+        });
+      }
+    },
+  );
+
+  it("keeps explicit thinking above an alias and the agent default below it", async () => {
+    const { provider, agents } = setup([], [], undefined, {
+      modelsConfig: {
+        aliases: {
+          fast: { targets: ["provider/model-a"], thinking: "high" },
+          steady: { targets: ["provider/model-b"] },
+        },
+      },
+      agentsConfig: { thinking: "medium" },
+    });
+    const spawn = vi.spyOn(agents, "spawn");
+
+    const explicit = (await provider.invoke(
+      "spawn",
+      { task: "explicit alias level", model: "fast", thinking: "low" },
+      context,
+    )) as { id: string };
+    expect(spawn).toHaveBeenLastCalledWith(
+      expect.objectContaining({ model: "provider/model-a", thinking: "low" }),
+      undefined,
+    );
+    await expect(agents.wait(explicit.id)).resolves.toMatchObject({ thinking: "low" });
+
+    const fallback = (await provider.invoke(
+      "spawn",
+      { task: "global default level", model: "steady" },
+      context,
+    )) as { id: string };
+    expect(spawn).toHaveBeenLastCalledWith(
+      expect.objectContaining({ model: "provider/model-b" }),
+      undefined,
+    );
+    expect(spawn.mock.calls.at(-1)?.[0]).not.toHaveProperty("thinking");
+    await expect(agents.wait(fallback.id)).resolves.toMatchObject({ thinking: "medium" });
+  });
+
+  it.each(["run", "spawn"] as const)(
     "rejects unavailable exact models for agents.%s",
     async (action) => {
       const { provider, agents } = setup();

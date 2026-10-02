@@ -10,6 +10,7 @@ import {
   FABRIC_COMPONENT_PROVIDER_NAMES,
   FABRIC_PROVIDER_COMPONENT_PREFIX,
 } from "./components/provider-component.js";
+import { builtinModelGuidance } from "./components/builtin-guidance.js";
 import type { FabricOwnedModelGuidance } from "./components/model-guidance.js";
 import type { FabricComponentGraph } from "./components/types.js";
 import {
@@ -298,7 +299,11 @@ export class FabricState {
   componentGraph(): FabricComponentGraph {
     return this.#current()?.componentGraph() ?? { components: [], edges: [], cycles: [] };
   }
-  modelGuidance(): FabricOwnedModelGuidance[] { return this.#current()?.modelGuidance() ?? []; }
+  modelGuidance(): FabricOwnedModelGuidance[] {
+    // Built-in provider guidance is a pure function of configuration, so it is
+    // already available before (and independent of) runtime activation.
+    return this.#current()?.modelGuidance() ?? (this.#config ? builtinModelGuidance(this.#config) : []);
+  }
   participantInfos(options: FabricParticipantListOptions = {}): FabricParticipantInfo[] {
     return this.#current()?.participantInfos(options) ?? [];
   }

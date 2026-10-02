@@ -26,6 +26,7 @@ import {
   APPROVAL_MODES,
 } from "./settings-values.js";
 import { maxExecutorMemoryLimitBytes } from "../config.js";
+import { jevFabricStatus } from "../jev-fabric/status.js";
 import { INHERIT_VALUE } from "./model-picker.js";
 
 export const buildFullCodeModeSection = (
@@ -78,6 +79,10 @@ export const buildExecutorSection = (
         setting("executor.cpython.binary", "CPython binary", config.executor.cpython.binary, {
           description: cpythonDescription,
           submenu: stringInputSubmenu(theme, "CPython binary", cpythonDescription),
+        }),
+        setting("executor.jevFabric.binary", "jev-fabric binary", config.executor.jevFabric.binary || "auto", {
+          description: `Durable tasks and interactive sessions (macOS/Linux). auto uses your compatible install outside this workspace (PATH or ~/.local/bin), then the bundled package; an explicit path never falls back. ${jevFabricStatus() ? `In use: ${jevFabricStatus()}` : "Resolved at first durable or session use."}`,
+          submenu: stringInputSubmenu(theme, "jev-fabric binary", "auto, or a trusted absolute path or executable name. No shell arguments."),
         }),
         setting("executor.runtime", "Runtime (TS)", config.executor.runtime, {
           description: enforceTypeScript
@@ -338,8 +343,13 @@ export const buildMcpSection = (
           description: "Enable the MCP provider inside fabric_exec.",
           values: BOOLEANS,
         }),
+        setting("mcp.nativeServers", "Pi-owned servers", (config.mcp.nativeServers ?? []).join(", "), {
+          description: "Opt-in exact server names from Pi's /mcp, comma-separated. Others stay on mcporter; no automatic fallback. Reload Fabric to apply.",
+          submenu: stringInputSubmenu(theme, "Pi-owned MCP servers",
+            "Exact names, comma-separated; blank disables. Pi owns connections and OAuth. Configure servers with /mcp; reload Fabric after changing this list."),
+        }),
         setting("mcp.disableOAuth", "Disable OAuth", config.mcp.disableOAuth ? "true" : "false", {
-          description: "Skip MCP OAuth flows.",
+          description: "Skip mcporter OAuth flows. Pi-owned servers use Pi's authentication and /mcp login.",
           values: BOOLEANS,
         }),
         setting("mcp.allowDynamicServers", "Dynamic servers", config.mcp.allowDynamicServers ? "true" : "false", {

@@ -955,6 +955,9 @@ export class AgentManager {
     if (request.persona && runner !== "veda") {
       throw new Error(`The persona option is only supported by the Veda runner, not ${runner}`);
     }
+    if (request.persistSession === true && runner !== "claude") {
+      throw new Error("persistSession is only supported by the Claude runner");
+    }
     if (runner === "claude" && request.recursive) {
       throw new Error(
         "Claude runner does not support recursive Fabric. Use a Pi runner for recursive: true, or omit recursive for Claude Code tools.",
@@ -1168,6 +1171,10 @@ export class AgentManager {
           ...(thinking ? ["--thinking", thinking] : []),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
+          "--persist-session",
+          String(request.persistSession === true),
+          "--model-admission",
+          this.config.modelAdmission ?? "strict",
           ...(sessionFile ? ["--session-file", sessionFile] : []),
           ...(request.inferenceContext ? ["--inference-context", request.inferenceContext] : []),
           ...(sessionExportFile ? ["--session-export-file", sessionExportFile] : []),

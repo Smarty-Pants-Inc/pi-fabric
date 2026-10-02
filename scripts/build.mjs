@@ -34,6 +34,9 @@ const primaryEntryPoints = [
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
   "src/core/literal-bash-guard.ts",
+  "src/core/pattern-kill.ts",
+  "src/topology/peer-settle.ts",
+  "src/ui/fabric-model-selector.ts",
   "src/lifecycle/reload-target-profile.ts",
   "src/lifecycle/reload-slots.ts",
   "src/coordination/unverified-ids.ts",
@@ -49,6 +52,11 @@ const lazyEntryPoints = [
   "src/records/service.ts",
   "src/jev/client.ts",
   "src/jev/observation.ts",
+  "src/jev-fabric/client.ts",
+  "src/jev-fabric/registry.ts",
+  "src/jev-fabric/operations.ts",
+  "src/jev-fabric/resolve.ts",
+  "src/jev-fabric/serve.ts",
   "src/runtime/core-override-guest-types.ts",
   "src/runtime/dynamic-guest-types.ts",
   "src/runtime/guest-types.ts",

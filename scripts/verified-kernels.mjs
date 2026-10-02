@@ -9,7 +9,7 @@ import { build, transform } from "esbuild";
 import ts from "typescript";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const version = "2.0.26";
+const version = "2.0.34";
 const targets = [
   { stem: "storage-kernel", source: "proofs/storage-kernel.bend", abi: "proofs/storage-abi.json", types: "proofs/storage-types.d.ts" },
   { stem: "authority-kernel", source: "proofs/authority-kernel.bend", abi: "proofs/authority-abi.json", types: "proofs/authority-types.d.ts" },
@@ -58,40 +58,80 @@ if (mode === "--artifact") {
     }
   }
   const checked = bend("PROOF.bend", "--check-only");
-  if (!checked.includes("All terms check.")) throw new Error(`Bend did not confirm closed proofs: ${checked}`);
+  if (!checked.includes("ALL PROOFS CHECK")) throw new Error(`Bend did not confirm closed proofs: ${checked}`);
   const temp = mkdtempSync(join(tmpdir(), "fabric-bend-"));
   try {
     const files = new Map();
     let exportsCount = 0;
     for (const target of targets) {
-      const emitted = join(temp, `${target.stem}.js`);
+      const emitted = join(temp, `${target.stem}.mjs`);
       bend(target.source, "-o", emitted);
       const js = readFileSync(emitted, "utf8");
       const ast = ts.createSourceFile("kernel.js", js, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
       const statements = [...ast.statements];
-      const last = statements.slice(-2).map((statement) => statement.getText(ast).replace(/\s/g, ""));
-      if (last[0] !== "cli(process.argv.slice(2));" || last[1] !== "io_exit($main$,null);") {
-        throw new Error("Unrecognized Bend executable footer; review the compiler bridge before upgrading");
+      const table = statements.at(-1);
+      if (!table || !ts.isExportAssignment(table) || !ts.isObjectLiteralExpression(table.expression) ||
+          statements.some((statement) => ts.isExpressionStatement(statement))) {
+        throw new Error("Unrecognized Bend module footer; review the compiler bridge before upgrading");
       }
       const defs = new Map(statements.filter(ts.isFunctionDeclaration).map((node) => [node.name?.text, node]));
+      const entries = new Map(table.expression.properties.filter(ts.isPropertyAssignment)
+        .map((property) => [property.name.getText(ast).replace(/^"|"$/g, ""), property.initializer]));
+      // Bend host tags carry the declaring module ("lifecycle.Life"); root and
+      // Base constructors stay bare. The host ABI keeps bare tags, so every
+      // namespaced tag must name exactly one constructor in this kernel.
+      const literals = new Set();
+      const collect = (node) => { if (ts.isStringLiteral(node)) literals.add(node.text); ts.forEachChild(node, collect); };
+      collect(ast);
+      const tags = new Map();
+      for (const literal of literals) {
+        const bare = /^[a-z][a-z0-9-]*\.([A-Z][A-Za-z0-9]*)$/.exec(literal)?.[1];
+        if (!bare) continue;
+        if (tags.has(bare) || literals.has(bare)) throw new Error(`Ambiguous host tag ${bare} in ${target.source}`);
+        tags.set(bare, literal);
+      }
       const abi = JSON.parse(read(target.abi));
       const exports = Object.entries(abi).map(([name, signature]) => {
         const symbol = `$${name}$`;
         const arity = signature.length - 1;
-        if (!/^[a-zA-Z][a-zA-Z0-9]*$/.test(name) || defs.get(symbol)?.parameters.length !== arity) {
+        const entry = entries.get(name);
+        if (!/^[a-zA-Z][a-zA-Z0-9]*$/.test(name) || defs.get(symbol)?.parameters.length !== arity ||
+            !entry || !ts.isCallExpression(entry) || entry.expression.getText(ast) !== "run_lib" ||
+            entry.arguments[1]?.getText(ast) !== String(arity) || !ts.isArrowFunction(entry.arguments[0]) ||
+            entry.arguments[0].parameters.length !== arity || !entry.arguments[0].getText(ast).includes(`${symbol}(`)) {
           throw new Error(`Missing or incompatible compiled definition: ${name}`);
         }
-        return `export const ${name} = /* @__PURE__ */ run_lib(${symbol}, ${arity});`;
+        const params = Array.from({ length: arity }, (_, index) => `a${index}`);
+        return `const $lib$${name} = /* @__PURE__ */ ${entry.getText(ast)};\n` +
+          `export const ${name} = (${params.join(", ")}) => $retag$($lib$${name}(${params.map((param) => `$retag$(${param}, $tag$)`).join(", ")}), $untag$);`;
       });
-      // Only remove the two checked CLI invocations and expose actual compiler
-      // definitions through Bend's own trampoline. No algorithm is translated.
-      const library = js.slice(0, statements.at(-2).getFullStart()) + "\n" + exports.join("\n");
+      // Keep only the ABI entries of Bend's own module table, which marshal host
+      // naturals and drain the trampoline, and rename constructor tags at the
+      // boundary. No algorithm is translated.
+      const bridge = [
+        `const $tag$ = new Map(${JSON.stringify([...tags])});`,
+        `const $untag$ = new Map(${JSON.stringify([...tags].map(([bare, full]) => [full, bare]))});`,
+        `function $retag$(value, names) {
+  const top = [value];
+  for (const stack = [[top, 0]]; stack.length > 0;) {
+    const [parent, key] = stack.pop();
+    const node = parent[key];
+    if (node === null || typeof node !== "object") continue;
+    const copy = Array.isArray(node) ? [...node] : { ...node };
+    if (typeof copy.$ === "string") copy.$ = names.get(copy.$) ?? copy.$;
+    parent[key] = copy;
+    for (const field of Object.keys(copy)) stack.push([copy, field]);
+  }
+  return top[0];
+}`,
+      ];
+      const library = js.slice(0, table.getFullStart()) + "\n" + bridge.join("\n") + "\n" + exports.join("\n");
       const result = await build({
         stdin: { contents: library, sourcefile: "bend-kernel.js", resolveDir: root },
         bundle: true, write: false, format: "esm", platform: "node", packages: "external", external: ["bun:ffi"], target: "es2022",
         minifySyntax: true,
         legalComments: "none", treeShaking: true,
-        banner: { js: `// Generated by Bend ${version}; do not edit. See LAWS.bend and PROOF.bend.\n// Includes adapted Bend runtime/Base code, Copyright 2026 HigherOrderCO, Apache-2.0.\n// CLI removed and exports added by Pi Fabric; see THIRD_PARTY_NOTICES.md.` },
+        banner: { js: `// Generated by Bend ${version}; do not edit. See LAWS.bend and PROOF.bend.\n// Includes adapted Bend runtime/Base code, Copyright 2026 HigherOrderCO, Apache-2.0.\n// ABI exports selected and tags adapted by Pi Fabric; see THIRD_PARTY_NOTICES.md.` },
       });
       const pure = result.outputFiles[0].text;
       const generatedAst = ts.createSourceFile("generated.js", pure, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
@@ -101,7 +141,7 @@ if (mode === "--artifact") {
       // Check unmangled names before compacting compiler locals. ABI exports stay stable.
       const generated = (await transform(pure, {
         format: "esm", target: "es2022", minifyIdentifiers: true, minifySyntax: true, legalComments: "none",
-        banner: `// Generated by Bend ${version}; do not edit. See LAWS.bend and PROOF.bend.\n// Includes adapted Bend runtime/Base code, Copyright 2026 HigherOrderCO, Apache-2.0.\n// CLI removed and exports added by Pi Fabric; see THIRD_PARTY_NOTICES.md.`,
+        banner: `// Generated by Bend ${version}; do not edit. See LAWS.bend and PROOF.bend.\n// Includes adapted Bend runtime/Base code, Copyright 2026 HigherOrderCO, Apache-2.0.\n// ABI exports selected and tags adapted by Pi Fabric; see THIRD_PARTY_NOTICES.md.`,
       })).code;
       const types = `// Generated ABI declarations; see ${target.abi}.\n` + read(target.types) + "\n" +
         Object.entries(abi).map(([name, signature]) => {

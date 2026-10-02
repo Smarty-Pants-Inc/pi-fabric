@@ -10,6 +10,21 @@ const temporary: string[] = [];
 afterEach(() => { for (const dir of temporary.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe("verified kernel artifact receipt", () => {
+  it("astra-6 fork CI verifies artifact hashes without executing its incompatible Bend compiler", () => {
+    const result = spawnSync("bun", ["run", "proof:check"], {
+      cwd: root, encoding: "utf8", timeout: 20_000,
+      env: { ...process.env, CI: "true", GITHUB_ACTIONS: "true", BEND_BIN: path.join(root, "deliberately-unavailable-bend-2.0.26") },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("artifact hash verification only");
+    expect(result.stdout).toContain("matches its proof sources");
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, "src/verified/generated/manifest.json"), "utf8"));
+    expect(manifest.bend).toBe("2.0.34");
+    const scripts = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).scripts;
+    expect(scripts["proof:reproduce"]).toContain("verified-kernels.mjs --check");
+    expect(scripts.prepack).toContain("proof:reproduce");
+  });
   it("checks without Bend and rejects source, executable, and receipt drift", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-proof-artifact-"));
     temporary.push(dir);

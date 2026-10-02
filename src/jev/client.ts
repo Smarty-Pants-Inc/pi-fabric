@@ -57,6 +57,13 @@ export class JevCredentials {
   }
   clear(): void { this.#cached = undefined; }
 }
+/**
+ * Sends one validated, model-resolved request and returns the raw JSON answer.
+ * The default posts to the route over HTTPS; a jev-fabric `serve` connection
+ * can take its place. Either way the answer is checked again here.
+ */
+export type JevDispatch = (request: JevRequest & { model: string }, credential: string, signal: AbortSignal) => Promise<unknown>;
+
 export class JevClient {
   readonly credentials: JevCredentials;
   /** Actual operations, not the abort-raced waiters; host credential APIs may not cancel. */
@@ -69,7 +76,7 @@ export class JevClient {
   ) {
     this.credentials = credentials ?? new JevCredentials(config.credentialCommand, process.env, undefined, route.envKeys);
   }
-  async evaluate(request: JevRequest, signal: AbortSignal): Promise<JevResponse> {
+  async evaluate(request: JevRequest, signal: AbortSignal, dispatch?: JevDispatch): Promise<JevResponse> {
     checkRequest(request, this.config.maxRequestBytes);
     const requestedModel = request.model ?? this.config.model;
     const model = resolveJevUpstreamModel(this.route, requestedModel);
@@ -81,6 +88,15 @@ export class JevClient {
       void pending.then(() => this.#pendingCredentials.delete(pending), () => this.#pendingCredentials.delete(pending));
       return pending;
     });
+    if (dispatch) {
+      let answer: unknown;
+      try {
+        answer = await runAbortable(timedSignal, () => dispatch({ ...request, model }, key, timedSignal));
+      } catch (error) {
+        throw new Error(timedSignal.aborted ? "Jev request cancelled or timed out" : error instanceof Error ? error.message.slice(0, 500) : "Jev dispatch failed");
+      }
+      return checkResponse(answer, request);
+    }
     const body = jsonText({ ...request, model }, this.config.maxRequestBytes, "Jev request");
     let response: Response;
     try {

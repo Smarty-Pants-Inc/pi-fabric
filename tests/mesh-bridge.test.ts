@@ -1517,6 +1517,10 @@ describe("mesh bridge", () => {
 
   // Security review round 2, F4: presence both ways stays inside one frame, over a real pipe.
   it("keeps presence replies and mirror requests inside one frame over a real pipe", async () => {
+    // This tests frame sizing, not lease expiry. These roots do not heartbeat, and
+    // serializing their large state can outlast their 60 s leases on a busy runner.
+    // Freeze only the lease clock: pipe I/O and RPC deadline timers remain real.
+    vi.spyOn(Date, "now").mockReturnValue(Date.now());
     // Nine 1.9 MiB roots a side: about 17 MiB of presence, over the 16 MiB frame.
     const { hub, far, bridge, remote, logs } = setup(undefined, { maxEventBytes: 2 * 1024 * 1024, realPipe: true, callTimeoutMs: 240_000 });
     const cwd = "c".repeat(1_900 * 1024);

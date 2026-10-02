@@ -16,6 +16,20 @@ export type {
   FabricCacheSample, FabricCacheObservation, FabricCacheStatus,
 } from "./cache/types.js";
 
+/** Host-local background shell accounting, independent of model-facing notifications. */
+export const FABRIC_SHELL_TIMING_EVENT = "pi-fabric:shell:timing:v1";
+
+export interface FabricShellTimingV1 {
+  version: 1;
+  sessionId: string;
+  taskId: string;
+  tool: "bash" | "powershell";
+  /** started = handoff to background; finished includes runtime teardown. */
+  phase: "started" | "finished";
+  /** Synchronous observation time, not a backdated process timestamp. */
+  timestamp: number;
+}
+
 export const FABRIC_PROVIDER_REGISTER_EVENT = "pi-fabric:provider:register:v1";
 export const FABRIC_PROVIDER_DISCOVER_EVENT = "pi-fabric:provider:discover:v1";
 export const FABRIC_COMPONENT_REGISTER_EVENT = "pi-fabric:component:register:v1";

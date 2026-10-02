@@ -357,9 +357,6 @@ export class ResidentHost {
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: config.retention,
-      publishStaleMain: data => this.mesh.publish({
-        topic: "ops.fabric.stale-main", kind: "fabric.stale_main", from: this.identity, data: { ...data },
-      }).then(() => undefined, () => undefined),
       preparePiModel: async (model) => resolveResidentPiModel(model),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;
@@ -779,7 +776,7 @@ export class ResidentHost {
       try { return fs.readdirSync(directory).some((entry) => entry.endsWith(".json")); }
       catch { return false; }
     });
-    if (activeActor || activeAgent || this.actors.inFlightCount() > 0 || pendingRequest || this.#admissions) {
+    if (activeActor || activeAgent || pendingRequest || this.#admissions) {
       this.#idleSince = Date.now();
       return;
     }

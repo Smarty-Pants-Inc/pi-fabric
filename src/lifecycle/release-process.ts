@@ -34,6 +34,6 @@ export const recordMainRelease = (sessionId: string, loadedRoot: string | undefi
     fs.writeFileSync(temporary, JSON.stringify(record), { mode: 0o600 });
     fs.renameSync(temporary, file);
   } catch {
-    try { fs.unlinkSync(temporary); } catch { /* best-effort report metadata, never an admission bypass */ }
+    try { fs.unlinkSync(temporary); } catch { /* best-effort observational metadata; launch behavior is unchanged */ }
   }
 };

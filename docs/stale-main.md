@@ -1,87 +1,27 @@
-# Stale Main admission and release report
+# Release census
 
-A task worker uses its Main's loaded Fabric package. Activation changes the fleet profile's
-`settings.json` `packages` selector. It does not replace code in an existing Main or select a
-newer worker for that Main. The spawn guard and the self-reload watch share `activeFabricRoot`
-and `loadedFabricRoot` from `src/core/agent-dir.ts`, also exported by `src/lifecycle/self-reload.ts`.
+PR #190 (smarty-dev#2665) ships release observability only. Release launch enforcement
+and durable recovery are deferred to **smarty-dev#3285**. This census does not change
+launch admission, agent routing, actor queue behavior, or resident retirement authority.
 
-## Task admission
+## Loaded generation versus active selection
 
-`agents.spawn`, `agents.run`, actor task activations and worker relaunches check the loaded
-package against the profile selector before native launch. A stale Main's handle, status and
-terminal result include this one-line `notice`:
+Activation changes the profile's `settings.json` `packages` selector. It does not replace
+code in an existing Main, worker, or resident host. An ordinary task worker uses its
+launching runtime's loaded Fabric package; a durable task routed to an existing resident
+uses that resident's running generation. The report distinguishes those loaded paths from
+the profile's current active selection; an active selector is not evidence that a running
+process has changed generation.
 
-```text
-This Main runs <loaded>; the fleet runs <active>; it self-reloads at its next safe settle
-```
-
-Fabric publishes `ops.fabric.stale-main` once per Main identity and active release. Its data
-includes the loaded and active roots, notice, refusal reason and critical releases. Publishing
-is best effort when the mesh is disabled or unavailable. Replacing a manager or reloading in
-the same process does not reset the deduplication. Atomic markers under the profile's
-`fabric/stale-main-events/` directory also deduplicate its local resident hosts. Task-worker
-runtimes do not publish their parent Main's ops notice. An unwritable profile keeps process-local
-deduplication; a disabled mesh consumes the best-effort notice attempt.
-
-A safety-critical release in `(loaded, active]` refuses the launch. Finish the Main's existing
-work and let it settle, then use `/fabric-release-reload` or `/reload`. The automatic reload
-keeps its existing streaming, prompt, background-work and halt checks. A refusal never stops
-existing workers or substitutes a new worker release.
-
-A mutable resident config entry-path change is not release authority: the serving host
-does not fence itself or exit on that change alone. Resident replacement requires a current
-Main intent and attested launcher custody, and main's automatic-recovery safety gate remains
-closed until attempt-owned membership and complete whole-attempt exit receipts exist. Legacy
-or pre-protocol owners are never suspended, sampled, killed or automatically replaced;
-reconciliation records `Legacy resident host/launcher has no release custody protocol; installer
-drain required` in `handover-deferred.json`. Direct actor routing keeps main's serving-owner
-semantics; it does not acquire retirement authority from config. Installer-managed draining
-remains required. Automatic
-retirement is deferred to a follow-up implementing whole-attempt exit receipts, not an idle
-participant or process census. Refused actor events are parked
-in their durable queue (not failed or consumed), then retried by the replacement runtime;
-repeated stale reloads do not exhaust their interrupted-run retry budget. Caller `ask` requests
-still reject immediately so their caller hears the refusal.
-
-## Safety metadata
-
-The installer writes `<base>/<sha>.receipt.json`, next to `<base>/releases/`. Fabric reads the
-optional `safetyCritical` boolean from those receipts and from a release's `install-receipt.json`
-or `manifest.json`. It orders releases by `installedAt`, falling back to `activatedAt` for
-legacy metadata. First-install time remains stable across reactivation.
-
-Mutable safety marks live in `<base>/releases-safety.json`, alongside the `releases` directory.
-This file is authoritative for policy entries; a `false` mark cannot erase a receipt's `true`
-mark. If the adjacent file is absent, Fabric uses the package's shipped `releases-safety.json`.
-The shipped policy marks B66 (the `/tmp` and kill-by-pattern guards) and B68 as safety critical.
-Install receipts are immutable inputs and are never rewritten by Fabric.
-
-```json
-{
-  "version": 1,
-  "releases": {
-    "<full-release-sha>": {
-      "safetyCritical": true,
-      "installedAt": "<ISO-8601-install-time-from-receipt>"
-    }
-  }
-}
-```
-
-Keep receipts for pruned release trees. A policy row may supply a recorded install time when
-its receipt is unavailable. Use the install record's time; filesystem mtimes, SHA sorting and
-commit dates do not establish install order. Shipped, undated safety marks without a local
-receipt, recorded time or surviving release directory do not establish an installation on this
-host. If no critical release is evidenced as installed, missing chronology alone gives the stale
-notice, not a refusal. When an installed critical release exists, missing or invalid chronology, a tied endpoint
-time, an ambiguous critical boundary timestamp, an unreadable selector, or a rollback refuses an installed Main's spawn with a metadata
-reason and the reload path. Equal loaded/active roots need no safety-gap check or notice.
-Explicit development packages outside `releases/` receive the stale notice without a claimed
-position in the fleet's release chronology.
+The census and existing self-reload watch share `activeFabricRoot` and `loadedFabricRoot`
+from `src/core/agent-dir.ts`, also exported by `src/lifecycle/self-reload.ts`. The existing
+Main self-reload keeps its safe-settle checks for streaming, prompts, background work and
+halts. A Main reload is not proof that a resident has changed generation. Neither the
+census nor the selector helpers grant process-control or resident-retirement authority.
 
 ## Report
 
-Run on each Linux host with the fleet profile selected:
+Run on each Linux host with the appropriate profile selected:
 
 ```sh
 bin/fabric-releases
@@ -90,18 +30,39 @@ bin/fabric-releases --snapshot host-one.json --snapshot host-two.json
 ```
 
 `--settings FILE` selects a profile explicitly; `--host NAME` labels a host snapshot. The
-command performs no network calls, process controls or writes. JSON lists each Main and its
-workers and resident hosts, including actor tasks, by loaded and active release. Recorded
-Mains use the actual `session:<sessionId>` lineage carried by workers, so detached resident
-workers join their Main by ID rather than process ancestry. Text groups workers by release
-on each Main's row and includes resident-host and worker rows with lineage/run/actor IDs.
-Truly remote worker lineages have a null Main PID on that host. Synthetic `/proc` fixtures are
-portable; live census requires Linux, and other platforms can aggregate `--snapshot` files.
+command performs no network calls, process controls or writes. It reads only selected
+non-secret process-environment keys, native argv, Fabric lineage/owner metadata, profile
+settings and runtime release records, not prompts, history or authentication files.
 
-New runtimes record a Main's loaded root when their lazy runtime initializes, binding it to
-Linux process-start ticks. The report rejects PID-reused and exited records. Legacy Mains with
-one observed worker release show `worker-inferred`; legacy Mains with no workers or mixed
-worker releases show `unknown`. It never presents today's active selector as proof of a
-legacy Main's loaded release. Run the report again after those Mains safely reload for a
-runtime-record observation. Other users' inaccessible or disappearing processes are counted
-in `skippedProcesses`; this is a live, best-effort snapshot, not a fleet-wide atomic census.
+JSON lists each Main and its workers and resident hosts, including actor tasks, by loaded
+and active release. Recorded Mains use the actual `session:<sessionId>` lineage carried
+by workers, so detached resident workers join their Main by ID rather than process
+ancestry. Text groups workers by release on each Main's row and includes resident-host
+and worker rows with lineage/run/actor IDs. Truly remote worker lineages have a null Main
+PID on that host. Synthetic `/proc` fixtures are portable; live census requires Linux,
+and other platforms can aggregate `--snapshot` files.
+
+## Evidence and limits
+
+New runtimes record a Main's loaded root when their lazy runtime initializes, binding it
+to Linux process-start ticks. Registration and idle lifecycle hooks do not load the
+runtime recorder or write a Main record. The report rejects PID-reused and exited records.
+
+- `runtime-record`: a live PID and birth-time match identifies the Main's recorded loaded
+  root and session lineage.
+- `worker-inferred`: a legacy or unrecorded Main has exactly one observed worker release.
+  This is an inference, not a runtime attestation of the Main's loaded code.
+- `unknown`: no matching runtime record and no unique worker-release inference. Legacy
+  Mains with no workers or mixed worker releases remain unknown.
+
+The report never presents today's active selector as proof of a legacy Main's loaded
+release. Run it again after a Main safely reloads and initializes its runtime for a
+runtime-record observation. Resident hosts publish their immutable launch-time Fabric
+extension path in `owner.json`; the census does not infer their loaded generation from
+mutable desired configuration. Older owners may instead expose their resident entry path
+in argv; without either source, the loaded release is unknown.
+
+Other users' inaccessible or disappearing processes are counted in `skippedProcesses`;
+this is a live, best-effort snapshot, not a fleet-wide atomic census. It is not a safety
+policy, a launch guard, or a durable recovery mechanism. The separately reviewed
+launch-enforcement and recovery contract is tracked in **smarty-dev#3285**.

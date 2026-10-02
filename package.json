@@ -52,8 +52,7 @@
     "PROOF.bend",
     "proofs/",
     "scripts/verified-kernels.mjs",
-    "scripts/test-verified-kernels.mjs",
-    "releases-safety.json"
+    "scripts/test-verified-kernels.mjs"
   ],
   "scripts": {
     "proof:generate": "node scripts/verified-kernels.mjs --write",

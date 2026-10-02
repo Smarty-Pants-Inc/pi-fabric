@@ -1,8 +1,5 @@
 import { copyFabricPrincipal, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
-import { StaleMainGuard, StaleMainRefusal, type StaleMainNotice } from "../lifecycle/stale-main.js";
-import { loadedFabricRoot } from "../core/agent-dir.js";
-import { pathToFileURL } from "node:url";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
@@ -256,7 +253,6 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   id: string;
   name: string;
   task: string;
-  notice?: string;
   /** Conservative activation lineage: foreign/UNKNOWN admitted input clears it forever. */
   outputPrincipal: FabricPrincipal | undefined;
   /** Host-only activation persistence fence, invoked before conflicting input is admitted. */
@@ -324,8 +320,6 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
 }
 
 interface QueuedAgent {
-  /** Preserve pre-launch admission identity for actor run(), not a failed activation. */
-  admissionRefusal?: StaleMainRefusal;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
   cleanupPending?: string;
   info: AgentHandleInfo;
@@ -605,7 +599,6 @@ export class AgentManager {
   readonly #fullCodeMode: boolean;
   readonly #kernel: () => FabricKernel;
   readonly #pythonRuntime: () => FabricPythonRuntime;
-  readonly #releaseGuard: StaleMainGuard;
   readonly #mainAgentId: string | undefined;
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
@@ -655,10 +648,6 @@ export class AgentManager {
       /** The detached temp-root sweep entry (dist/storage/sweep-main.js). */
       sweepPath?: string;
       fabricExtensionPath?: string;
-      /** Profile selector override for tests/embedding; defaults to resolveAgentDir()/settings.json. */
-      releaseSettingsPath?: string;
-      /** Best-effort ops.fabric.stale-main publication; once per Main and active release. */
-      publishStaleMain?: (data: StaleMainNotice) => void | Promise<void>;
       piBinary?: string;
       claudeBinary?: string;
       vedaBinary?: string;
@@ -696,12 +685,6 @@ export class AgentManager {
       options.sweepPath ?? fileURLToPath(new URL("../storage/sweep-main.js", import.meta.url));
     this.#fabricExtensionPath =
       options.fabricExtensionPath ?? fileURLToPath(new URL("../index.js", import.meta.url));
-    this.#releaseGuard = new StaleMainGuard(
-      loadedFabricRoot(pathToFileURL(this.#fabricExtensionPath).href),
-      options.mainAgentId ?? process.env.PI_FABRIC_MAIN_AGENT_ID ?? options.fabricSessionId ?? `pid:${process.pid}`,
-      options.releaseSettingsPath,
-      options.publishStaleMain,
-    );
     this.#piBinary = resolvePiBinary(options.piBinary);
     this.#claudeBinary =
       options.claudeBinary ?? process.env.PI_FABRIC_CLAUDE_BINARY ?? config.claude.binary;
@@ -891,11 +874,6 @@ export class AgentManager {
     return runtime;
   }
 
-  /** Admission before forwarding to a durable host; local/native launches recheck at use. */
-  checkReleaseAdmission(): string | undefined {
-    return this.#releaseGuard.check();
-  }
-
   /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
    */
@@ -909,14 +887,8 @@ export class AgentManager {
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     if (this.#closing) throw new Error("Fabric agent manager is closing");
-    this.#releaseGuard.check(); // Includes worker resume/startup retries, not just public spawns.
     const signal = request.signal ? AbortSignal.any([request.signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
-    const pending = adapter.launch({ ...request, signal, authorize: () => {
-      // Transports recheck synchronously after their own async waits, at dispatch.
-      if (request.authorize && !request.authorize()) return false;
-      this.#releaseGuard.check();
-      return true;
-    } });
+    const pending = adapter.launch({ ...request, signal });
     this.#launches.add(pending);
     try {
       const transport = await pending;
@@ -934,7 +906,6 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
-    let notice = this.#releaseGuard.check();
     const kernel = this.resolveKernel({
       ...request,
       ...(request.recursive === true ? { extensions: true } : {}),
@@ -1012,9 +983,6 @@ export class AgentManager {
     };
     const start = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
       try {
-        // Queue receipts do not grant launch authority: recheck both laws on admission.
-        assertAuthorized();
-        notice = this.#releaseGuard.check();
         model = await this.prepareModelForAdmission(model, runner);
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
@@ -1217,7 +1185,6 @@ export class AgentManager {
         // Preparation/transport resolution may have yielded since admission. Check the
         // current owner and activation generation at the final launch boundary too.
         assertAuthorized();
-        notice = this.#releaseGuard.check();
         const transport = await this.#launchTransport(adapter, launch);
         const queued = this.#queued.get(id);
         const lifecycle = createAgentLifecycle<AgentRunResult>(release);
@@ -1241,7 +1208,6 @@ export class AgentManager {
           id,
           name,
           task: request.task,
-          ...(notice ? { notice } : {}),
           ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
           ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),
           outputPrincipal: copyFabricPrincipal(request.provenance?.principal),
@@ -1326,7 +1292,6 @@ export class AgentManager {
     return this.#enqueue({
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
       cwd: selectedCwd, residency, recursive: request.recursive === true,
-      ...(notice ? { notice } : {}),
       ...(kernel ? { kernel } : {}),
       ...(model ? { model } : {}),
       ...(request.thinking ?? this.config.thinking ? { thinking: request.thinking ?? this.config.thinking } : {}),
@@ -1361,7 +1326,6 @@ export class AgentManager {
         await start(release, signal);
       } catch (error) {
         release?.();
-        if (!signal.aborted && error instanceof StaleMainRefusal) queued.admissionRefusal = error;
         this.#settleQueued(queued, signal.aborted ? "stopped" : "failed", error instanceof Error ? error.message : String(error));
       }
     })();
@@ -1410,12 +1374,7 @@ export class AgentManager {
   ): Promise<AgentRunResult> {
     const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade);
     onSpawned?.(handle);
-    const queued = this.#queued.get(handle.id);
-    const result = await this.wait(handle.id);
-    // An accepted receipt is not an executed activation. Preserve the typed
-    // refusal so actors park the event for reload rather than count a failure.
-    if (queued?.admissionRefusal) throw queued.admissionRefusal;
-    return result;
+    return this.wait(handle.id);
   }
 
   /** Side-effect-free settlement join for preparation before a durable mutation fence. */
@@ -2747,7 +2706,6 @@ export class AgentManager {
       name: managed.name,
       status,
       runner: managed.runner,
-      ...(managed.notice ? { notice: managed.notice } : {}),
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
       transport: managed.transport.kind,
       cwd: managed.cwd,
@@ -2813,7 +2771,6 @@ export class AgentManager {
         : {}),
       cwd: managed.cwd,
       runner: managed.runner,
-      ...(managed.notice ? { notice: managed.notice } : {}),
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       logFile: path.join(managed.runDirectory, "events.jsonl"),

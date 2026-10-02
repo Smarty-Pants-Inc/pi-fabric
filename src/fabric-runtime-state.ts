@@ -696,10 +696,6 @@ export class FabricRuntimeState {
       hostId,
       identityId: identity.id,
       retention: this.#config.retention,
-      ...(identity.kind === "main" ? {
-        publishStaleMain: (data: import("./lifecycle/stale-main.js").StaleMainNotice) =>
-          this.publishOpsEvent("ops.fabric.stale-main", "fabric.stale_main", { ...data }),
-      } : {}),
       ...(this.#paths
         ? {
             workerPath: this.#paths.worker,

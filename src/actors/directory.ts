@@ -140,7 +140,6 @@ export class ActorDirectory extends ActorManager {
   override get halted(): boolean { return super.halted && this.#secondary.halted; }
   /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
   override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
-  override fenceActivations(): void { super.fenceActivations(); this.#secondary.fenceActivations(); }
   override haltAll(): { halted: number } { const first = super.haltAll(); const second = this.#secondary.haltAll(); return { halted: first.halted + second.halted }; }
   override pendingRemovals(): ReturnType<ActorManager["pendingRemovals"]> { return [...super.pendingRemovals(), ...this.#secondary.pendingRemovals()]; }
   override removalSettled(id: string): Promise<void> | undefined { return super.removalSettled(id) ?? this.#secondary.removalSettled(id); }

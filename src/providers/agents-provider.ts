@@ -698,7 +698,6 @@ export class AgentsProvider implements FabricProvider {
     checkCommit();
     switch (actionName) {
       case "run": {
-        this.manager.checkReleaseAdmission();
         const main = isInteractiveMain(context.extensionContext);
         const handle = await this.manager.spawn(
           await this.#runRequest(args, context),
@@ -735,7 +734,6 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        this.manager.checkReleaseAdmission();
         const request = await this.#runRequest(args, context);
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...baseRequest } = request;
@@ -748,7 +746,6 @@ export class AgentsProvider implements FabricProvider {
           extensions: request.extensions ?? this.manager.config.extensions,
           ...(durableCwd !== undefined ? { cwd: durableCwd } : {}),
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
-        const notice = this.manager.checkReleaseAdmission(); // Activation may have changed during model/cwd resolution.
         const handle = durableRequest.residency === "durable"
           ? await this.#resident().spawnAgent(durableRequest, context.signal)
           : await this.manager.spawn(durableRequest, isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal);
@@ -761,7 +758,7 @@ export class AgentsProvider implements FabricProvider {
           name: handle.name,
         });
         context.update(agentStartedMessage(handle));
-        return notice ? { ...handle, notice } : handle;
+        return handle;
       }
       case "join":
       case "wait": {

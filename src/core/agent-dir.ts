@@ -25,7 +25,7 @@ export const resolveAgentDir = (): string => {
   return path.join(homedir(), CONFIG_DIR_NAME, "agent");
 };
 
-// Shared with self-reload and spawn admission. Kept in this existing cheap core module so
+// Shared with self-reload and the release census. Kept in this existing cheap core module so
 // code splitting does not create an additional eager startup chunk for release selectors.
 export const SELF_RELOAD_COMMAND = "fabric-release-reload";
 

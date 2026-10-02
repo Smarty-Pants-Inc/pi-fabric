@@ -4,21 +4,16 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const guardLoaded = vi.hoisted(() => vi.fn());
 const recordLoaded = vi.hoisted(() => vi.fn());
 vi.mock("../src/lifecycle/release-process.js", async original => {
   recordLoaded();
   return original<typeof import("../src/lifecycle/release-process.js")>();
 });
-vi.mock("../src/lifecycle/stale-main.js", async original => {
-  guardLoaded();
-  return original<typeof import("../src/lifecycle/stale-main.js")>();
-});
 
 afterEach(() => vi.unstubAllEnvs());
 
-describe("stale Main startup boundary", () => {
-  it("keeps safety catalogs and report metadata out of cold registration and idle lifecycle", async () => {
+describe("release census startup boundary", () => {
+  it("keeps report metadata out of cold registration and idle lifecycle", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-prewalk-startup-"));
     const agentDir = path.join(cwd, "agent");
     fs.mkdirSync(agentDir);
@@ -54,20 +49,19 @@ describe("stale Main startup boundary", () => {
     try {
       vi.resetModules();
       const { default: register } = await import("../src/index.js");
-      expect(guardLoaded).not.toHaveBeenCalled();
+      expect(recordLoaded).not.toHaveBeenCalled();
       await register(pi);
       expect(pi.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "fabric_exec" }));
       expect(pi.registerCommand).toHaveBeenCalledWith("fabric", expect.anything());
       for (const event of ["resources_discover", "session_start"]) {
         expect(handlers.get(event)?.length).toBeGreaterThan(0);
         await emit(event);
-        expect(guardLoaded).not.toHaveBeenCalled();
+        expect(recordLoaded).not.toHaveBeenCalled();
       }
       await new Promise<void>(resolve => setImmediate(resolve));
-      expect(guardLoaded).not.toHaveBeenCalled();
       expect(recordLoaded).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(agentDir, "fabric", "release-processes"))).toBe(false);
       await import("../src/fabric-runtime-state.js");
-      expect(guardLoaded).toHaveBeenCalledOnce();
       expect(recordLoaded).toHaveBeenCalledOnce();
     } finally {
       await emit("session_shutdown");

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { parseAgentNice } from "../agents/priority.js";
+import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { FabricCapabilityRequirement } from "../components/types.js";
@@ -17,7 +18,6 @@ import type {
   GlobalActorDefinition,
 } from "./types.js";
 
-const ACTOR_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9 _.-]{0,59}$/;
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const HOST_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set(FABRIC_ACTOR_HOST_EVENTS);
 const DELIVERIES = new Set<FabricActorDelivery>(["mailbox", "steer", "followUp", "nextTurn"]);

@@ -1061,6 +1061,13 @@ return true;
     expect(trace.counts.droppedValues).toBeGreaterThan(0);
   });
 
+  it("records the root and dryRun for prune without retaining arbitrary arguments", () => {
+    const recorder = new FabricExecutionTraceRecorder();
+    recorder.issueCall("agents.prune", { root: "session:dead-root", dryRun: true, payload: "secret" }).succeed(undefined);
+    const trace = recorder.seal("succeeded", []);
+    expect(trace.operations[0]?.args).toEqual({ root: "session:dead-root", dryRun: true });
+    expect(JSON.stringify(trace)).not.toContain("secret");
+  });
   it("retains identifiers for every actor-targeting management action", () => {
     const recorder = new FabricExecutionTraceRecorder();
     for (const ref of [

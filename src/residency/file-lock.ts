@@ -22,8 +22,9 @@ export class FileLockBusy extends Error {}
 // #1720: the wait is bounded (`flock -w`), and on Linux `setpriv --pdeathsig KILL` kills the helper when this
 // process dies, so a killed issuer never leaves a waiter behind. Without setpriv only the deadline bounds it.
 
-export const lockFile = async (file: string, waitSeconds = 120, requireParentDeath = false): Promise<number> => {
-  const fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
+export const lockFile = async (file: string, waitSeconds = 120, requireParentDeath = false, create = true): Promise<number> => {
+  // Maintenance plans may lock an existing inode, but must never create one while proving liveness.
+  const fd = fs.openSync(file, fs.constants.O_RDWR | (create ? fs.constants.O_CREAT : 0) | fs.constants.O_NOFOLLOW, 0o600);
   try {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || stat.uid !== process.getuid?.()) throw new Error(`${file} is not a regular file owned by this user`);

@@ -10,6 +10,7 @@ export interface ActorDirectoryRoots {
 export class ActorDirectory extends ActorManager {
   readonly #secondary: ActorManager;
   readonly #defaultScope: FabricActorStorageScope;
+  readonly #roots: ActorDirectoryRoots;
 
   constructor(
     base: ConstructorParameters<typeof ActorManager>,
@@ -50,8 +51,21 @@ export class ActorDirectory extends ActorManager {
       actorScope: secondaryScope,
     });
     this.#defaultScope = defaultScope;
+    this.#roots = roots;
   }
 
+  protected override pruneStorageRoots(_root: string): string[] {
+    const roots = [this.#roots.project, this.#roots.session];
+    // PI_FABRIC_SESSION_ID can differ from the root session id. Inspect each real session
+    // registry, not a guessed directory name; never follow a user-supplied root as a path.
+    if (fs.existsSync(this.#roots.project)) {
+      for (const entry of fs.readdirSync(this.#roots.project, { withFileTypes: true })) {
+        const at = `${this.#roots.project}/${entry.name}`;
+        if (entry.isDirectory() && fs.existsSync(`${at}/actors.json`)) roots.push(at);
+      }
+    }
+    return roots;
+  }
   #isPrimary(id: string): boolean {
     const actors = this.list();
     const exact = actors.find((actor) => actor.id === id);

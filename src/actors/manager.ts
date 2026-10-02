@@ -53,6 +53,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 
+import type { ActorPruneRequest, ActorPruneResult } from "./prune.js";
 export interface ActorMessageBindingOptions {
   /** Host-only admitted requester snapshot, separate from payload and bindings. */
   provenance?: FabricTurnProvenance | undefined;
@@ -1683,6 +1684,34 @@ export class ActorManager {
       void this.#publishPresence(actor).catch(() => undefined);
     }
     return { halted };
+  }
+
+  /** Host-only storage projection: ActorDirectory also includes the dead root's session scope. */
+  protected pruneStorageRoots(_root: string): string[] { return [this.#actorRoot]; }
+
+  async prune(request: ActorPruneRequest, assertDead?: () => void): Promise<ActorPruneResult> {
+    if (typeof request.root !== "string" || !request.root.trim()) throw new Error("agents.prune requires a non-empty root");
+    if (request.root === this.#rootId || request.root === this.identity.id || request.root === "main") {
+      throw new Error("agents.prune refuses the caller's own root");
+    }
+    if (!this.#persistent || !this.meshConfig.enabled) throw new Error("agents.prune requires durable actor storage");
+    const check = () => {
+      if (!assertDead && !this.#lineageAlive) throw new Error("Cannot prove lineage dead: no ownership directory");
+      assertDead?.();
+      if (this.#lineageAlive?.(request.root) === true) throw new Error(`Cannot prune live lineage ${request.root}`);
+      for (const row of this.#registry.records().filter(row => row.rootId === request.root)) {
+        if (this.#canManageActor?.(row.id) !== undefined ||
+            (typeof row.adoptedAt === "number" && Date.now() - row.adoptedAt < this.#adoptionGraceMs)) {
+          throw new Error(`Cannot prune live lineage ${request.root}: actor owner or adoption fence is live`);
+        }
+      }
+    };
+    check();
+    const { pruneActorRoot } = await import("./prune.js");
+    const result = await pruneActorRoot(request, { roots: this.pruneStorageRoots(request.root), mesh: this.mesh, identity: this.identity, assertDead: check,
+      canManageActor: this.#canManageActor, adoptionGraceMs: this.#adoptionGraceMs });
+    if (!request.dryRun) { this.#registryFingerprint = undefined; this.#syncActorsFromRegistry(); this.#emitChange(); }
+    return result;
   }
 
   /**

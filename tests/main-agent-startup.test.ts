@@ -6,6 +6,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mainLoaded = vi.hoisted(() => vi.fn());
 const routerLoaded = vi.hoisted(() => vi.fn());
+const pruneLoaded = vi.hoisted(() => vi.fn());
+vi.mock("../src/actors/prune.js", async original => {
+  pruneLoaded();
+  return original<typeof import("../src/actors/prune.js")>();
+});
 vi.mock("../src/main-agent.js", async original => {
   mainLoaded();
   return original<typeof import("../src/main-agent.js")>();
@@ -55,6 +60,7 @@ describe("Main replay and route-authority startup boundary", () => {
       vi.resetModules();
       mainLoaded.mockClear();
       routerLoaded.mockClear();
+      pruneLoaded.mockClear();
       const { default: register } = await import("../src/index.js");
       expect(mainLoaded).not.toHaveBeenCalled();
       expect(routerLoaded).not.toHaveBeenCalled();
@@ -72,6 +78,7 @@ describe("Main replay and route-authority startup boundary", () => {
       expect(state.initialized).toBe(true);
       expect(mainLoaded).toHaveBeenCalledOnce();
       expect(routerLoaded).toHaveBeenCalledOnce();
+      expect(pruneLoaded).not.toHaveBeenCalled();
       await state.ensure(context);
       expect(mainLoaded).toHaveBeenCalledOnce();
       expect(routerLoaded).toHaveBeenCalledOnce();

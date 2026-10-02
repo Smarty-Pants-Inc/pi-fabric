@@ -32,6 +32,18 @@ describe("guest agents surface", () => {
     expect(typeCheckFabricCode(code, GUEST_TYPE_DECLARATIONS, true).errors).toEqual([]);
   });
 
+  it("types dead-root prune plans and rejects malformed root/dryRun arguments", () => {
+    const result = typeCheckFabricCode(`const plan = await agents.prune({ root: "session:old", dryRun: true });
+      const ids: string[] = plan.actors.map(actor => actor.id);
+      const files: string[] = plan.files;
+      const keys: string[] = plan.stateKeys;
+      const removed: number = plan.removed.actors;
+      return { ids, files, keys, removed };`, GUEST_TYPE_DECLARATIONS, true);
+    expect(result.errors).toEqual([]);
+    for (const args of ['{ root: 123 }', '{ root: "session:old", dryRun: "yes" }', '{}']) {
+      expect(typeCheckFabricCode(`return await agents.prune(${args});`, GUEST_TYPE_DECLARATIONS, true).errors.length).toBeGreaterThan(0);
+    }
+  });
   it("types the FIFO position on a queued spawn receipt", () => {
     const result = typeCheckFabricCode(
       `const handle = await agents.spawn({ task: "work" });

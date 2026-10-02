@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
+import { lineageAlive as actorLineageAlive } from "../topology/lineage-liveness.js";
 import { randomUUID } from "node:crypto";
 import {
   RESIDENT_HANDOVER_ABI, HANDOVER_DRAIN_MS, exactResidentProcess, assertAutomaticReleaseRecovery,
@@ -400,7 +401,7 @@ export class ResidentHost {
       return participant ? participant.ownerHostId === this.hostId : undefined;
     };
     const lineageAlive = (rootId: string): boolean =>
-      this.participants.get(rootId) !== undefined;
+      actorLineageAlive(this.mesh, this.participants, rootId);
     const actorRoots = config.sessionActorRoot
       ? { project: config.actorRoot, session: config.sessionActorRoot }
       : config.mesh.actorScope === "session"

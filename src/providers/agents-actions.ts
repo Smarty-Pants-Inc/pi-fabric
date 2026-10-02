@@ -755,6 +755,18 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "agent",
   },
   {
+    name: "prune",
+    description:
+      "Plan or remove durable actor records, inbox and state of a proven-dead root. Refuses live owner leases/hosts and the caller's own root. dryRun returns the plan without changes; repeated pruning is safe. Keeps append-only audit history.",
+    inputSchema: {
+      type: "object",
+      properties: { root: { type: "string", minLength: 1 }, dryRun: { type: "boolean" } },
+      required: ["root"],
+      additionalProperties: false,
+    },
+    risk: "agent",
+  },
+  {
     name: "remove",
     description:
       'Stop and remove a persistent actor. Default scope "project" removes a live project actor; scope "global" removes a project-independent template from the global registry.',

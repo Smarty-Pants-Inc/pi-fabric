@@ -556,6 +556,7 @@ globalThis.agents = Object.freeze({
   setInstructions: (args) => __call("agents.setInstructions", args),
   actors: (args = {}) => __call("agents.actors", args),
   messages: (args) => __call("agents.messages", args),
+  prune: (args) => __call("agents.prune", args),
   remove: (args) => __call("agents.remove", args),
   // Keyword keys for the actor-template routes, spelled as the provider,
   // audit projection, and docs already spell them.

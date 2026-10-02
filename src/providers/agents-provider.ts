@@ -1352,6 +1352,20 @@ export class AgentsProvider implements FabricProvider {
         return this.actorManager.clearMessages(String(args.id));
       case "resetSession":
         return this.actorManager.resetSession(String(args.id));
+      case "prune": {
+        const root = args.root;
+        if (typeof root !== "string" || !root.trim()) throw new Error("agents.prune requires a non-empty root");
+        if (root === "main" || root === this.mainAgent.id || root === this.participants.self().rootId) {
+          throw new Error("agents.prune refuses the caller's own root");
+        }
+        const { lineageAlive } = await import("../topology/lineage-liveness.js");
+        const result = await this.actorManager.prune({ root, dryRun: args.dryRun === true }, () => {
+          throwIfExecutionExpired(context);
+          if (lineageAlive(this.actorManager.mesh, this.participants, root)) throw new Error(`Cannot prune live lineage ${root}`);
+        });
+        if (args.dryRun !== true) this.participants.scheduleRefresh();
+        return result;
+      }
       case "remove": {
         if (args.scope === "global") return this.globalActors.remove(String(args.id));
         const cleanup = this.actorManager.cleanupObligation(String(args.id));

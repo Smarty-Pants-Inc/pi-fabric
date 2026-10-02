@@ -926,6 +926,15 @@ interface FabricAgentsApi {
   /** Project-independent templates in the global registry. */
   actors(args: { scope: "global" }): Promise<FabricActorTemplate[]>;
   messages(args: { id: string; limit?: number }): Promise<FabricActorMessage[]>;
+  /** Explicit dead-lineage maintenance; refuses live lineages and the caller's own root. dryRun writes nothing. */
+  prune(args: { root: string; dryRun?: boolean }): Promise<{
+    root: string;
+    dryRun: boolean;
+    actors: Array<{ id: string; name: string; registry: string }>;
+    files: string[];
+    stateKeys: string[];
+    removed: { actors: number; files: number; stateKeys: number };
+  }>;
   remove(args: { id: string }): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }>;
   /** Drop an actor's mailbox history without stopping the actor. */
   clearMessages(args: { id: string }): Promise<FabricActorInfo>;

@@ -1,3 +1,4 @@
+import { lineageAlive as actorLineageAlive } from "./topology/lineage-liveness.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession } from "./topology/root-inbox.js";
 import type { RecordsService } from "./records/service.js";
@@ -774,7 +775,7 @@ export class FabricRuntimeState {
       return participant ? participant.ownerHostId === hostId : undefined;
     };
     const lineageAlive = (rootId: string): boolean =>
-      this.#participants?.get(rootId) !== undefined;
+      actorLineageAlive(this.#mesh!, this.#participants!, rootId);
     const actorRoots = {
       project: path.join(meshRoot, "actors"),
       session: path.join(meshRoot, "actors", fabricSessionId),

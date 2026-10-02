@@ -820,14 +820,18 @@ export class ResidentHost {
   #maintainRequests(): void {
     const now = Date.now();
     if (this.#closed || !this.#requestRetention.due(now)) return;
-    const live = new Set<string>();
-    for (const agent of this.agents.listForUi()) if (agent.status === "queued" || agent.status === "running") live.add(agent.id);
-    for (const actor of this.actors.listOwned()) if (actor.status !== "stopped") live.add(actor.id);
+    const live = this.agents.retentionReferences();
+    for (const id of this.actors.inFlightActorIds()) live.add(id);
+    const stoppedWritersGone = new Set<string>();
+    for (const actor of this.actors.listOwned()) {
+      if (actor.status !== "stopped" || actor.inFlightRun) live.add(actor.id);
+      else if (!live.has(actor.id) && !live.has("*")) stoppedWritersGone.add(actor.id);
+    }
     for (const removal of this.actors.pendingRemovals()) {
       live.add(removal.id);
       if (removal.runId) live.add(removal.runId);
     }
-    this.#requestRetention.sweep(now, live);
+    this.#requestRetention.sweep(now, live, 5, stoppedWritersGone);
   }
 
   #checkIdle(): void {

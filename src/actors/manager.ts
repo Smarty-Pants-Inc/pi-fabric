@@ -1621,10 +1621,14 @@ export class ActorManager {
     return this.#halted;
   }
 
-  /**
-   * Actors with a run in flight or a queue being drained in this runtime: a reload would stop
-   * them (smarty-dev#1830, #2160).
-   */
+  /** Include immutable executing objects even if a registry reload replaced their rows. */
+  inFlightActorIds(): string[] {
+    return [...new Set([...this.#actors.values(), ...this.#draining.values()])]
+      .filter(actor => actor.abortController !== undefined || actor.draining || actor.inFlightRun !== undefined || this.#inFlight.has(actor.id))
+      .map(actor => actor.id);
+  }
+
+  /** Actors whose runs or drains a reload would stop (smarty-dev#1830, #2160). */
   inFlightCount(): number {
     return [...new Set([...this.#actors.values(), ...this.#draining.values()])]
       .filter((actor) => actor.abortController !== undefined || actor.draining).length;

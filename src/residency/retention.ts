@@ -48,7 +48,7 @@ export class ResidentRequestRetention {
     try { directory?.closeSync(); } catch { this.#health.unknown++; }
   }
 
-  sweep(now: number, liveIds: ReadonlySet<string>, budgetMs = 5): void {
+  sweep(now: number, liveIds: ReadonlySet<string>, budgetMs = 5, stoppedWritersGone: ReadonlySet<string> = new Set()): void {
     if (!this.#scanning) {
       if (now < this.#nextSample) return;
       this.#scanning = true; this.#index = 0; this.#now = now;
@@ -86,7 +86,7 @@ export class ResidentRequestRetention {
           const value = readOwned<ResidentResponseAcknowledgement & ResidentCommandResponse>(file);
           if (kind === "acknowledgements") {
             if (!validAck(value, id)) throw new Error("Invalid acknowledgement");
-            if (this.#collect(id, value, liveIds)) { this.#health.collected++; continue; }
+            if (this.#collect(id, value, liveIds, stoppedWritersGone)) { this.#health.collected++; continue; }
           } else if (kind === "responses") {
             if (!validResponse(value, id)) throw new Error("Invalid response");
           } else {
@@ -104,7 +104,7 @@ export class ResidentRequestRetention {
     }
   }
 
-  #collect(id: string, ack: ResidentResponseAcknowledgement, liveIds: ReadonlySet<string>): boolean {
+  #collect(id: string, ack: ResidentResponseAcknowledgement, liveIds: ReadonlySet<string>, stoppedWritersGone: ReadonlySet<string>): boolean {
     const generation = residentRequestGeneration(id)!;
     if (generation >= this.#expiredBefore || this.#now - Math.max(ack.completedAt, ack.acknowledgedAt) <= RESIDENT_REQUEST_RETENTION_MS) return false;
     // An unreadable/symlinked exchange directory is a possible pending reference.
@@ -121,7 +121,7 @@ export class ResidentRequestRetention {
     const decision = decisionValue === undefined ? undefined : readResidentRequestDecision(this.root, id);
     if (decision && decision.requestFormat !== 3) throw new Error("Legacy decision is not collectable");
     if (decision?.state === "committed" && !/^[A-Za-z0-9_-]+$/.test(decision.id!)) throw new Error("Invalid resident entity ID");
-    if (decision?.state === "committed" && (!isResidentCommandOperation(decision.operation) || liveIds.has(decision.id!))) return false;
+    if (decision?.state === "committed" && (!isResidentCommandOperation(decision.operation) || liveIds.has("*") || liveIds.has(decision.id!))) return false;
     if (ack.pending && (!decision?.id || liveIds.has(decision.id))) return false;
     if (decision?.state === "committed") {
       const metadata = readOwned<{ id?: unknown; handle?: { status?: unknown } }>(path.join(this.root, "agents", `${decision.id}.json`));
@@ -139,7 +139,9 @@ export class ResidentRequestRetention {
           const actor = registry.actors.find(actor => actor.id === decision.id);
           if (actor) {
             if (!["idle", "queued", "running", "stopped"].includes(String(actor.status))) throw new Error("Unknown resident actor status");
-            if (actor.status !== "stopped" || actor.removal !== undefined) return false;
+            // Stopped closes admission; it does not join an executing writer.
+            // Only the owning host's full writer/drain snapshot can clear this row.
+            if (actor.status !== "stopped" || actor.removal !== undefined || !stoppedWritersGone.has(decision.id!)) return false;
           }
         }
         // Revocation removes the registry row before cleanup finishes. Even an

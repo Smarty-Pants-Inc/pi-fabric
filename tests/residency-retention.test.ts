@@ -44,11 +44,11 @@ describe("bounded resident request retention", () => {
     expect(readResidentRequestDecision(dir, command.requestId)).toBeUndefined();
     expect(residentHostStateNote(dir)).toMatch(/residency retention:.*0 entries.*0 bytes/);
   });
-  it.each(["unacknowledged", "recent", "request", "processing", "live", "pending"])("keeps %s references", (kind) => {
+  it.each(["unacknowledged", "recent", "request", "processing", "live", "unknown writer", "pending"])("keeps %s references", (kind) => {
     const dir = root(); const command = seed(dir, kind === "recent" ? now : old, kind !== "unacknowledged");
     if (kind === "request" || kind === "processing") write(dir, kind === "request" ? "requests" : kind, command.requestId, command);
     if (kind === "pending") write(dir, "acknowledgements", command.requestId, { format: 1, requestFormat: 3, requestId: command.requestId, completedAt: old, acknowledgedAt: old, pending: "entity" });
-    sweep(dir, now, new Set(kind === "live" || kind === "pending" ? ["entity"] : []));
+    sweep(dir, now, new Set(kind === "unknown writer" ? ["*"] : kind === "live" || kind === "pending" ? ["entity"] : []));
     expect(exists(dir, "decisions", command.requestId)).toBe(true);
     expect(exists(dir, "responses", command.requestId)).toBe(true);
   });
@@ -243,6 +243,17 @@ describe("bounded resident request retention", () => {
     expect(exists(dir, "decisions", command.requestId)).toBe(true);
     expect(exists(dir, "responses", command.requestId)).toBe(true);
     if (kind.includes("unreadable")) expect(residentHostStateNote(dir)).toMatch(/unknown=[1-9]/);
+  });
+  it.each(["stopped alone", "writer gone", "live overrides proof"])("requires owner-confirmed writer exit for a stopped registry row: %s", (kind) => {
+    const dir = root(); const command = seed(dir, old); const actors = path.join(dir, "actor-root");
+    fs.mkdirSync(actors);
+    fs.writeFileSync(path.join(actors, "actors.json"), JSON.stringify({ actors: [{ id: "entity", status: "stopped" }] }));
+    const live = new Set(kind === "live overrides proof" ? ["entity"] : []);
+    const gone = new Set(kind === "stopped alone" ? [] : ["entity"]);
+    const collector = new ResidentRequestRetention(dir, [actors]);
+    try { collector.sweep(now, live, 10_000, gone); } finally { collector.close(); }
+    expect(exists(dir, "decisions", command.requestId)).toBe(kind !== "writer gone");
+    expect(exists(dir, "acknowledgements", command.requestId)).toBe(kind !== "writer gone");
   });
   it("an acknowledgement publication failure retains the response", () => {
     const dir = root(); const command = seed(dir, old, false);

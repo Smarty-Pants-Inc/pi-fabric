@@ -466,8 +466,36 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
     const again = await h.run('return await agents.prune({ root: "session:old-main" });');
     expect(again.success, again.error).toBe(true); expect((again.value as any).removed.actors).toBe(0);
   });
-  it.skipIf(process.platform !== "linux")("keeps an actor claimed by a racing adopter under the registry lock", async () => {
-    const h = await fixture(); await h.owner.close();
+  it.skipIf(process.platform !== "linux")("keeps an actor claimed by a racing adopter under the registry lock and resumes its receipt", async () => {
+    const h = await fixture();
+    const revoked = await h.owner.actors.create({ name: "already-revoked", instructions: "Wait." });
+    await h.owner.close();
+    const at = h.owner.actorRoots.project; const store = new ActorRegistryStore(at);
+    const durable = "d".repeat(32); const durableRow = { ...store.records()[0]!, id: durable, name: "keep-durable", residency: "durable" };
+    await store.withLock(() => store.write([...store.records().filter(row => row.id !== revoked.id), durableRow], { durable: true }));
+    fs.rmSync(path.join(at, revoked.id), { recursive: true, force: true });
+    fs.mkdirSync(path.join(at, durable), { recursive: true });
+    fs.writeFileSync(path.join(at, durable, "session.jsonl"), "durable transcript\n");
+    const unrelated = await h.caller.actors.create({ name: "keep-unrelated", instructions: "Wait.", scope: "session" });
+    const oldBinding = new ActorBindingStore("old-main", at, h.owner.identity.id);
+    await oldBinding.setThinking(h.project.id, "high"); await oldBinding.setThinking(durable, "low");
+    const adoptedBinding = new ActorBindingStore("winner-overlay", at, "session:winner");
+    await adoptedBinding.setModel(h.project.id, "provider/adopted-model");
+    const unrelatedBinding = new ActorBindingStore("unrelated-overlay", at, h.caller.identity.id);
+    await unrelatedBinding.setThinking(unrelated.id, "high");
+    fs.writeFileSync(path.join(at, `removal-${h.project.id}.json`), JSON.stringify({ id: h.project.id,
+      owner: { rootId: h.owner.identity.id, residency: "session" } }));
+    for (const actor of [h.project, h.session, revoked, { ...h.project, id: durable, residency: "durable" as const }]) {
+      const value = actorParticipantRecord(actor, h.owner.identity.id, h.owner.identity.id, h.owner.identity.id, h.owner.identity.id);
+      const entry = await h.mesh.put({ key: `topology/participants/${hash(actor.id)}`, value, identity: h.owner.identity });
+      writeParticipantFile(h.mesh.root, entry);
+    }
+    await h.mesh.put({ key: `actors/old-main/${durable}`, value: { id: durable, rootId: h.owner.identity.id, residency: "durable" }, identity: h.owner.identity });
+    const receiptPath = path.join(residentRoot(h.mesh.root, h.owner.identity.id), "prune.json");
+    fs.mkdirSync(path.dirname(receiptPath), { recursive: true });
+    const revokedProof = { actors: [`${at}/${revoked.id}`], files: [path.join(at, revoked.id)], stateKeys: [] };
+    fs.writeFileSync(receiptPath, JSON.stringify({ format: 1, rootId: h.owner.identity.id, meshRoot: h.mesh.root,
+      actors: [{ at, id: revoked.id, residency: "session" }], removed: revokedProof }));
     const original = ActorRegistryStore.prototype.withLock;
     let raced = false;
     vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function (this: ActorRegistryStore, operation) {
@@ -475,15 +503,104 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
         if (!raced) {
           raced = true;
           const rows = this.records();
-          this.write(rows.map(row => row.id === h.project.id ? { ...row, rootId: "session:winner" } : row));
+          this.write(rows.map(row => row.id === h.project.id ? { ...row, rootId: "session:winner", adoptedAt: Date.now() } : row));
+          writeHostLease(h.mesh.root, { id: "session:winner", rootId: "session:winner", identityId: "session:winner",
+            updatedAt: Date.now(), expiresAt: Date.now() + 60_000 });
         }
         return operation();
       }) as ReturnType<typeof original>;
     });
     const result = await h.run('return await agents.prune({ root: "session:old-main" });');
     expect(result.success).toBe(false); expect(result.error).toMatch(/ownership changed/i);
-    expect(fs.existsSync(path.join(h.owner.actorRoots.project, h.project.id))).toBe(true);
-    expect(new ActorRegistryStore(h.owner.actorRoots.project).records().find(row => row.id === h.project.id)?.rootId).toBe("session:winner");
+    expect(fs.existsSync(path.join(at, h.project.id))).toBe(true);
+    expect(store.records().find(row => row.id === h.project.id)?.rootId).toBe("session:winner");
+    expect(JSON.parse(fs.readFileSync(receiptPath, "utf8")).actors.map((actor: any) => actor.id).sort())
+      .toEqual([h.project.id, h.session.id, revoked.id].sort());
+    vi.restoreAllMocks();
+    const adoptedRow = store.records().find(row => row.id === h.project.id)!;
+    const controlState = h.mesh.listAll("actors/", { fresh: true }).filter(entry => [h.project.id, durable, unrelated.id].some(id => entry.key.endsWith(id)));
+    const controls = snapshot(h.root);
+    const plan = await h.run('return await agents.prune({ root: "session:old-main", dryRun: true });');
+    expect(plan.success, plan.error).toBe(true);
+    expect((plan.value as any).actors.map((actor: any) => actor.id)).toEqual([h.session.id]);
+    expect((plan.value as any).stateKeys).toContain(`actors/old-main/${revoked.id}`);
+    expect((plan.value as any).files).not.toContain(path.join(at, h.project.id));
+    expect(snapshot(h.root)).toEqual(controls);
+    let checkpointed = false;
+    const publish = h.mesh.publish.bind(h.mesh);
+    vi.spyOn(h.mesh, "publish").mockImplementation(async options => {
+      if (options.kind === "actor.prune") {
+        checkpointed = true;
+        const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+        expect(receipt.actors.map((actor: any) => actor.id).sort()).toEqual([h.session.id, revoked.id].sort());
+        expect(receipt.removed).toEqual(revokedProof);
+      }
+      return publish(options);
+    });
+    const retry = await h.run('const plan = await agents.prune({ root: "session:old-main" }); return { plan, members: await agents.members({ includeStale: true }), actors: await agents.actors() };');
+    expect(retry.success, retry.error).toBe(true); expect(checkpointed).toBe(true);
+    const value = retry.value as any; expect(value.plan.removed.actors).toBe(1);
+    for (const id of [h.session.id, revoked.id]) {
+      expect(h.mesh.listAll("actors/", { fresh: true }).some(entry => entry.key.endsWith(id))).toBe(false);
+      expect(fs.existsSync(path.join(h.mesh.root, "participants", `${hash(id)}.json`))).toBe(false);
+      expect([...value.members, ...value.actors].some((actor: any) => actor.id === id)).toBe(false);
+    }
+    expect(new ActorRegistryStore(h.owner.actorRoots.session).records()).toEqual([]);
+    expect(fs.existsSync(path.join(h.owner.actorRoots.session, h.session.id))).toBe(false);
+    expect(fs.existsSync(receiptPath)).toBe(false);
+    expect(store.records()).toEqual([adoptedRow, durableRow]);
+    const after = snapshot(h.root);
+    for (const [file, bytes] of Object.entries(controls)) {
+      if (file.startsWith(path.relative(h.root, path.join(at, h.project.id))) ||
+          file.startsWith(path.relative(h.root, path.join(at, durable))) ||
+          file.startsWith(path.relative(h.root, path.join(h.caller.actorRoots.session, unrelated.id))) ||
+          file.startsWith(path.relative(h.root, path.join(at, "bindings"))) ||
+          file === path.relative(h.root, path.join(at, `removal-${h.project.id}.json`)) ||
+          [h.project.id, durable, unrelated.id].some(id => file === `mesh/participants/${hash(id)}.json`)) {
+        expect(after[file], file).toBe(bytes);
+      }
+    }
+    expect(h.mesh.listAll("actors/", { fresh: true }).filter(entry => [h.project.id, durable, unrelated.id].some(id => entry.key.endsWith(id)))).toEqual(controlState);
+    expect(store.records().find(row => row.id === h.project.id)?.rootId).toBe("session:winner");
+  });
+  it.skipIf(process.platform !== "linux").each(["absent", "expired", "malformed", "host-conflict", "participant-conflict", "scope", "revoked", "disappeared-under-lock", "expired-under-lock"])("F6 refuses ambiguous %s receipt adoption without cleanup", async fault => {
+    const h = await fixture(); await h.owner.close();
+    const at = h.owner.actorRoots.project; const store = new ActorRegistryStore(at);
+    const winner = "session:winner"; const now = Date.now();
+    await store.withLock(() => store.write(store.records().map(row => row.id === h.project.id ? {
+      ...row, rootId: fault === "scope" ? h.owner.identity.id : winner, residency: fault === "scope" ? "durable" : "session",
+    } : row)));
+    if (fault !== "absent") writeHostLease(h.mesh.root, { id: winner, rootId: winner, identityId: winner,
+      updatedAt: fault === "expired" ? 1 : now, expiresAt: fault === "expired" ? 2 : now + 60_000 });
+    if (fault === "malformed") fs.writeFileSync(path.join(h.mesh.root, "host-leases", `${hash(winner).slice(0, 32)}.json`), "{broken");
+    if (fault === "host-conflict") await h.mesh.put({ key: `topology/hosts/${hash(winner)}`, identity: h.caller.identity,
+      value: { format: 1, id: winner, rootId: winner, identity: h.caller.identity, updatedAt: now, startedAt: 1, expiresAt: now + 60_000 } });
+    if (fault === "participant-conflict") await h.mesh.put({ key: `topology/participants/${hash(h.project.id)}`, identity: h.caller.identity,
+      value: actorParticipantRecord(h.project, winner, winner, h.caller.identity.id, h.caller.identity.id) });
+    const dir = residentRoot(h.mesh.root, h.owner.identity.id); fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "host.lock"), "");
+    fs.writeFileSync(path.join(dir, "prune.json"), JSON.stringify({ format: 1, rootId: h.owner.identity.id, meshRoot: h.mesh.root,
+      actors: [{ at, id: h.project.id, residency: "session" }],
+      removed: { actors: fault === "revoked" ? [`${at}/${h.project.id}`] : [], files: [], stateKeys: [] } }));
+    const original = ActorRegistryStore.prototype.withLock;
+    let before = snapshot(h.root);
+    if (fault.endsWith("under-lock")) vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function (this: ActorRegistryStore, operation) {
+      return original.call(this, () => {
+        if (fault === "disappeared-under-lock") this.write(this.records().filter(row => row.id !== h.project.id));
+        else writeHostLease(h.mesh.root, { id: winner, rootId: winner, identityId: winner, updatedAt: 1, expiresAt: 2 });
+        // The injected ownership change is allowed; prune itself must leave all evidence untouched.
+        before = snapshot(h.root);
+        delete before[path.relative(h.root, path.join(at, "actors.json.lock", "owner"))];
+        return operation();
+      }) as ReturnType<typeof original>;
+    });
+    for (const dryRun of [true, false]) {
+      const result = await h.run(`return await agents.prune({ root: "session:old-main", dryRun: ${dryRun} });`);
+      expect(result.success).toBe(false); expect(result.error).toMatch(/ownership|receipt/i);
+      expect(snapshot(h.root)).toEqual(before);
+      // This attempt cannot prove adoption once the row vanishes during its lock wait.
+      if (fault === "disappeared-under-lock") break;
+    }
   });
   it("refuses a recently adopted lineage even before its owner presence appears", async () => {
     const h = await fixture(); await h.owner.close();

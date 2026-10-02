@@ -164,10 +164,25 @@ export const pruneActorRoot = async (
     for (const { at, store } of stores) {
       const registry = path.join(at, "actors.json");
       if (exists(registry)) {
-        const rows = readRecords(at, store);
+        let rows = readRecords(at, store);
         proveUnowned(rows);
-        if (rows.some(row => selected.get(at)?.has(row.id) && !eligible(row))) {
-          throw new Error(`Cannot prune lineage ${root}: receipt actor ownership changed`);
+        const obsolete = rows.filter(row => selected.get(at)?.has(row.id) && !eligible(row));
+        if (obsolete.length) {
+          rows = await store.withLock(() => {
+            assertDead();
+            const current = readRecords(at, store); proveUnowned(current);
+            const changed = current.filter(row => selected.get(at)?.has(row.id) && !eligible(row));
+            const { liveRoots } = assertPruneOwnershipDead(options.mesh.root, root);
+            if (obsolete.some(row => !current.some(candidate => candidate.id === row.id)) ||
+                changed.some(row => row.rootId === root || !liveRoots.has(row.rootId as string) ||
+                  receipt!.removed.actors.includes(`${at}/${row.id}`))) {
+              throw new Error(`Cannot prune lineage ${root}: receipt actor ownership changed`);
+            }
+            // Adoption owns this registry lock. Relinquish only proved live-root IDs, never revoked proof.
+            for (const row of changed) { selected.get(at)!.delete(row.id); preserved.add(row.id); }
+            receipt!.actors = receipt!.actors.filter(actor => actor.at !== at || !changed.some(row => row.id === actor.id));
+            return current;
+          });
         }
         for (const row of rows.filter(row => row.rootId === root && !eligible(row))) preserved.add(row.id);
         for (const row of rows.filter(eligible)) {
@@ -193,8 +208,8 @@ export const pruneActorRoot = async (
           if (selected.get(at)?.has(match[1]!)) throw new Error(`Cannot prove lineage ${root} dead: conflicting removal scope ${marker}`);
           preserved.add(match[1]!); continue;
         }
-        // A prepared/obsolete marker cannot delete an adopted or excluded actor.
-        if (readRecords(at, store).some(row => row.id === match[1] && !eligible(row))) continue;
+        // A prepared/obsolete marker cannot reselect an adopted ID, even if its row disappears after reconciliation.
+        if (preserved.has(match[1]!) || readRecords(at, store).some(row => row.id === match[1] && !eligible(row))) continue;
         selected.set(at, new Set([...(selected.get(at) ?? []), match[1]!]));
         addFile(at, path.join(at, file)); addFile(at, path.join(at, match[1]!));
       }

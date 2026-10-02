@@ -13,7 +13,7 @@ const missing = (error: unknown): boolean => object(error)?.code === "ENOENT";
 
 /** Destructive maintenance never consults the tolerant discovery caches. */
 export const assertPruneOwnershipDead = (meshRoot: string, root: string): {
-  state: MeshStateEntry[]; participants: MeshStateEntry[];
+  state: MeshStateEntry[]; participants: MeshStateEntry[]; liveRoots: Set<string>;
 } => {
   const unknown = (reason: string): never => { throw new Error(`Cannot prove lineage ${root} dead: ${reason}`); };
   const live = (reason: string): never => { throw new Error(`Cannot prune live lineage ${root}: ${reason}`); };
@@ -70,6 +70,7 @@ export const assertPruneOwnershipDead = (meshRoot: string, root: string): {
     if (!/^[a-f0-9]{64}\.json$/.test(name) || value?.format !== 1) unknown(`invalid participant ownership file ${file}`);
     participants.push(entryOf(value, `topology/participants/${name.slice(0, -5)}`, file));
   }
+  const ambiguousRoots = new Set<string>();
   const hosts = new Map<string, { rootId: string; identityId: string; expiresAt: number }>();
   for (const entry of state.filter(entry => entry.key.startsWith("topology/hosts/"))) {
     const host = object(entry.value);
@@ -84,8 +85,10 @@ export const assertPruneOwnershipDead = (meshRoot: string, root: string): {
     const expiresAt = host!.expiresAt as number;
     hosts.set(id, { rootId, identityId, expiresAt });
     const lease = leases.get(id);
-    if (lease && (rootId === root || lease.rootId === root) &&
-        (lease.rootId !== rootId || lease.identityId !== identityId)) unknown(`conflicting host lease ownership ${id}`);
+    if (lease && (lease.rootId !== rootId || lease.identityId !== identityId)) {
+      ambiguousRoots.add(rootId); ambiguousRoots.add(lease.rootId);
+      if (rootId === root || lease.rootId === root) unknown(`conflicting host lease ownership ${id}`);
+    }
     if (rootId === root && expiresAt >= Date.now()) live(`shared host lease ${id} is live`);
   }
   for (const entry of [...participants, ...state.filter(entry => entry.key.startsWith("topology/participants/"))]) {
@@ -97,14 +100,19 @@ export const assertPruneOwnershipDead = (meshRoot: string, root: string): {
         entry.updatedBy.id !== participant.ownerIdentityId || !timestamp(participant.updatedAt)) {
       unknown(`invalid participant ownership ${entry.key}`);
     }
-    if (participant!.rootId !== root) continue;
+    const participantRoot = participant!.rootId as string;
     const host = hosts.get(participant!.ownerHostId as string);
     const lease = leases.get(participant!.ownerHostId as string);
     for (const owner of [host, lease]) {
-      if (owner && (owner.rootId !== root || owner.identityId !== participant!.ownerIdentityId)) {
-        unknown(`conflicting participant ownership ${entry.key}`);
+      if (owner && (owner.rootId !== participantRoot || owner.identityId !== participant!.ownerIdentityId)) {
+        ambiguousRoots.add(participantRoot); ambiguousRoots.add(owner.rootId);
+        if (participantRoot === root) unknown(`conflicting participant ownership ${entry.key}`);
       }
     }
   }
-  return { state, participants };
+  // Only strict, fresh and non-conflicting ownership evidence may cancel an adopted receipt ID.
+  const liveRoots = new Set([...leases.values(), ...hosts.values()]
+    .filter(owner => owner.expiresAt >= Date.now() && !ambiguousRoots.has(owner.rootId))
+    .map(owner => owner.rootId));
+  return { state, participants, liveRoots };
 };

@@ -4,6 +4,7 @@ import path from "node:path";
 import http from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { processStartTime } from "../src/residency/process-identity.js";
 import { findExecutable } from "../src/agents/transports/process-utils.js";
 import { decideModelRoute } from "../src/agents/model-route.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
@@ -99,8 +100,9 @@ const makeUnsafe = (run: string, kind: UnsafeKind) => {
   if (kind === "directory-link") { fs.rmdirSync(delivery); fs.symlinkSync(path.join(run, "handoff-session"), delivery, "dir"); }
   if (kind === "pending-outcome") fs.writeFileSync(path.join(run, "pending-route-outcome.json"), "{}");
   if (kind === "live") {
+    // Replace the full identity: keeping the exited worker's birth time models PID reuse.
     const file = path.join(run, "status.json");
-    fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), sessionId: String(process.pid) }));
+    fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), sessionId: String(process.pid), processStartTime: processStartTime(process.pid) }));
   }
   if (kind === "unresolved") fs.writeFileSync(path.join(run, "unresolved-worker.json"), "{}");
   if (kind === "unknown-json") fs.writeFileSync(path.join(run, "unowned.provenance.json"), "{}");

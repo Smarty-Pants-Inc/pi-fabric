@@ -704,6 +704,7 @@ export class FabricRuntimeState {
       projectRoot,
       hostId,
       identityId: identity.id,
+      spawnerSessionId: sessionId,
       retention: this.#config.retention,
       ...(this.#paths
         ? {

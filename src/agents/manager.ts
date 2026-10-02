@@ -1,5 +1,6 @@
 import { copyFabricPrincipal, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
+import { taskReturnAddressArguments } from "./task-return-address.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
@@ -606,6 +607,7 @@ export class AgentManager {
   readonly #projectRoot: string;
   readonly #hostId: string | undefined;
   readonly #identityId: string | undefined;
+  readonly #taskReturnAddressArguments: string[];
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
@@ -662,6 +664,8 @@ export class AgentManager {
       projectRoot?: string;
       hostId?: string;
       identityId?: string;
+      /** Immediate caller's Pi session, distinct from the inherited root Fabric session. */
+      spawnerSessionId?: string;
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult) => void;
       onResultConsumed?: (id: string) => void;
@@ -712,6 +716,11 @@ export class AgentManager {
       options.projectRoot ?? process.env.PI_FABRIC_PROJECT_ROOT ?? cwd;
     this.#hostId = options.hostId ?? process.env.PI_FABRIC_HOST_ID;
     this.#identityId = options.identityId ?? process.env.PI_FABRIC_IDENTITY_ID;
+    this.#taskReturnAddressArguments = taskReturnAddressArguments(
+      this.#identityId ?? process.env.PI_FABRIC_ACTOR_ID ?? process.env.PI_FABRIC_PARENT_RUN,
+      options.spawnerSessionId ?? process.env.PI_SESSION_ID ?? this.#fabricSessionId,
+      this.#mainAgentId,
+    );
     const inheritedBudget = activeBudgetState();
     this.#budget =
       inheritedBudget ??
@@ -1120,6 +1129,7 @@ export class AgentManager {
           String(inheritedFullCodeMode),
           ...(this.#mainAgentId ? ["--main-agent-id", this.#mainAgentId] : []),
           ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
+          ...(adapter.kind === "process" && !request.actorId ? this.#taskReturnAddressArguments : []),
           "--extensions",
           String(extensions),
           "--tools",

@@ -1,5 +1,6 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
+import { readTaskReturnAddress } from "../agents/task-return-address.js";
 import { formatAge, residentHostId, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
@@ -390,6 +391,7 @@ export class AgentsProvider implements FabricProvider {
   readonly #toolCeiling = readChildToolAllowlist();
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
+  readonly #taskReturnAddress = readTaskReturnAddress();
   readonly name = "agents";
   readonly description =
     "The user-facing Main target, one-shot Pi or Claude Code agents, and persistent mailbox actors over process, tmux, screen, LocalTerm, or Herdr";
@@ -865,8 +867,14 @@ export class AgentsProvider implements FabricProvider {
       }
       case "self":
         return this.participants.self();
-      case "main":
-        return this.mainAgent.info(context.extensionContext);
+      case "main": {
+        const address = this.#taskReturnAddress;
+        const info = this.mainAgent.info(context.extensionContext);
+        return address?.spawnerId ? {
+          ...info, id: address.spawnerId, local: false, status: "remote",
+          sessionId: address.spawnerSessionId,
+        } : info;
+      }
       case "sessions": {
         const stalled = this.participants.writeStalled?.();
         if (stalled) throw stalled;
@@ -1667,7 +1675,7 @@ export class AgentsProvider implements FabricProvider {
 
   #participantAlias(value: string): string {
     const id = value.trim();
-    return id === "main" ? this.mainAgent.id : id;
+    return id === "main" ? this.#taskReturnAddress?.spawnerId || this.mainAgent.id : id;
   }
 
   #participantScope(

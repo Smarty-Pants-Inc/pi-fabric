@@ -95,6 +95,47 @@ that provenance in the Fabric run/task and review receipt. Work requiring a dist
 role in the admin audit must use a separately role-launched root session, not an ordinary task
 agent. Fabric does not change those external helpers or their audit schema.
 
+### Spawn-bound task return address and escalation guard
+
+For process-transport tasks, `agents.main()` returns the **immediate spawner's exact
+participant id and native Pi session id**, captured at launch. Sending to `"main"`
+uses that same address. Recursive tasks may return to their task/actor spawner;
+Fabric does not discover a replacement by name, role, or principal. The original
+`PI_FABRIC_MAIN_AGENT_ID` and `PI_FABRIC_SESSION_ID` remain the root topology and
+storage fields; they are not overwritten with a nested task's return address.
+
+A process task's `agents.steer`, `agents.followUp`, or `agents.tell` to a Main may
+address only its bound spawner, that spawner's ancestor chain, or an explicitly
+allowlisted exact Main session. Other Main-bound sends fail before publication
+with `TaskEscalationTargetError` (`FABRIC_TASK_ESCALATION_TARGET_DENIED`), naming
+all allowed ids. Task-to-task/actor sends retain existing routing; Mains, explicit
+actor activations, and other transports are not subject to this guard. A task
+spawned by an actor remains a task (the inherited actor id is cleared), while the
+actor name remains available for existing fleet write attribution.
+
+**Launcher/helper contract (smarty-dev#2950 / #2982):** set
+`PI_FABRIC_TASK_ESCALATION_TARGETS` on the spawning Pi process **before its Fabric
+runtime is initialized** to a JSON array of exact session targets, for example:
+
+```sh
+PI_FABRIC_TASK_ESCALATION_TARGETS='["session:<product-owner-org-session-uuid>"]' pi
+```
+
+The shared helper must obtain that session from the product owner's explicit org
+instance binding, never from a role/name lookup. The default/unset value is `[]`;
+invalid JSON or non-`session:` entries are rejected. This smallest implementation
+uses the environment contract, not a new `fabric.json` key or public spawn option.
+The manager snapshots the list and propagates it unchanged to recursive process
+children, so later ambient changes cannot retarget a running child's sends.
+Stop/respawn children to apply a changed binding or allowlist.
+
+Fabric—not the external helper—sets `PI_FABRIC_SPAWNER_ID`,
+`PI_FABRIC_SPAWNER_SESSION_ID` (the actual native Pi session, not a PID),
+`PI_FABRIC_SPAWNER_CHAIN` (JSON exact ancestor ids), and
+`PI_FABRIC_TASK_PROCESS_CHILD=1` through the manager-owned launch snapshot. Do not
+set those manually. These are wrong-recipient safety checks within the trusted
+local process boundary, not a sandbox against a hostile same-UID agent.
+
 ### Image-heavy lifecycle events
 
 Pi repeats message history in `agent_end.messages` and tool results in `turn_end.toolResults`. Fabric streams past these redundant top-level fields, recording empty arrays in the worker event log. Large accumulated histories therefore do not trip the event-size guard or interrupt completion/retries. Authoritative message/tool events, final text, usage, and Pi's persisted session history are unchanged.

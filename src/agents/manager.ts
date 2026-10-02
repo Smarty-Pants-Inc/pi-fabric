@@ -1259,6 +1259,14 @@ export class AgentManager {
           workerPath: this.#workerPath,
           workerArguments,
           signal,
+          onUnconfirmedExit: (reason) => {
+            const managed = this.#runs.get(id);
+            if (managed) this.#markLost(managed, reason);
+            else {
+              // Cancelled/in-flight launches have no registered owner yet.
+              try { markUnresolvedWorker(runDirectory, reason, { runId: id, transport: adapter.kind }); } catch { /* launch cleanup remains pending */ }
+            }
+          },
           ...(authorize ? { authorize: () => { assertAuthorized(); return true; } } : {}),
         };
         if (this.#closing) throw new Error("Fabric agent manager is closing");
@@ -2420,7 +2428,7 @@ export class AgentManager {
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
       // Relaunch only when the previous worker is gone for certain. A worker that did
       // not stop, or whose transport cannot say, fails the run instead of running twice.
-      if (await managed.transport.isAlive().catch(() => true)) {
+      if (managed.lostContact || managed.transport.lostContact?.() !== undefined || await managed.transport.isAlive().catch(() => true)) {
         const reason = `the previous worker ${previousSession ? `(${previousSession}) ` : ""}did not stop, so it was not relaunched`;
         this.#markLost(managed, reason);                       // it may still use its files
         throw new Error(reason);
@@ -2540,6 +2548,9 @@ export class AgentManager {
         managed.runnerSessionId = record.runnerSessionId;
       }
       if (record && terminalStatuses.has(record.status)) {
+        // A terminal file can race an explicit stop or its tree-helper outcome.
+        // Join the bounded stop before settlement can transfer native admission.
+        if (managed.stopRequested && managed.transport.kind === "process") await managed.transport.stop();
         if (await this.#resumeStopped(managed, record, deadline)) continue;
         // A relaunch that failed is terminal: no fallback launch may run after it.
         if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
@@ -2547,6 +2558,7 @@ export class AgentManager {
         return;
       }
       if (Date.now() >= deadline) {
+        managed.stopRequested = true;
         await managed.transport.stop();
         await this.#waitForTransportExit(managed);
         await this.#noteUnconfirmedExit(managed);
@@ -2634,6 +2646,13 @@ export class AgentManager {
   #settle(managed: ManagedAgent, result: AgentRunResult): void {
     if (managed.settled) return;
     this.#drainLifecycle(managed);
+    const lost = managed.transport.lostContact?.();
+    if (lost) this.#markLost(managed, lost);
+    if (managed.transport.kind === "process" && managed.lostContact) {
+      // Reporting a terminal result is allowed; releasing native admission is not.
+      // An uncertain Windows tree can still contain untracked native descendants.
+      managed.release = () => {};
+    }
     if (!beginAgentSettlement(managed)) return;
     // Images are transport inputs, not retained run artifacts. Startup retries
     // have finished by settlement, so remove the owner-only handoff file for

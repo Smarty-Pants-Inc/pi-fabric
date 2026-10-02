@@ -60,7 +60,7 @@ async function withOwnedWorker(
     const launched = workerArguments === undefined ? undefined : await new ProcessTransport().launch({
       id: "role-test", name: "role-test", cwd: root, workerPath: worker, workerArguments,
     });
-    const handle = launched ? { ...launched, pid: Number(launched.sessionId) } : await spawnDetached(worker, [], root);
+    const handle = launched ? { ...launched, pid: Number(launched.sessionId), lostContact: () => launched.lostContact?.() } : await spawnDetached(worker, [], root);
     await run(handle, root, children[0]!.child as ChildProcess);
   } finally {
     // Assertion failures must not leave a native worker or a mocked kill behind.

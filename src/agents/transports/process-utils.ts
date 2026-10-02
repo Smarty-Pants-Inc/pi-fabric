@@ -258,9 +258,9 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
-  authority?: Pick<AgentTransportLaunch, "signal" | "authorize">,
+  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
-): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean> }> => {
+): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
   const child = spawn(runtime, [workerPath, ...workerArguments], {
@@ -276,27 +276,60 @@ export const spawnDetached = async (
   // ponytail: descendants an exited worker left in its group are not signalled; liveness
   // (and so relaunch) is about the worker itself.
   let exited = false;
-  child.once("exit", () => { exited = true; });
+  let force: ReturnType<typeof setTimeout> | undefined;
+  child.once("exit", () => { exited = true; clearTimeout(force); });
   const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
   let stopping: Promise<void> | undefined;
+  let lost: string | undefined;
   child.unref();
   return {
     pid,
+    lostContact: () => lost,
     stop() {
       return stopping ??= (async () => {
-        if (!exited) {
-          // Windows SIGTERM is a forceful parent-only kill, not a delivered
-          // signal: the worker cannot run its handler to stop native Pi. Join
-          // the owned tree before considering the worker's exit sufficient.
-          if (process.platform === "win32") await terminateWindowsTree(child);
-          else {
-            try { process.kill(-pid, "SIGTERM"); }
-            catch { /* process group already exited */ }
-          }
+        const unconfirmed = (reason: string): void => {
+          if (lost !== undefined) return;
+          lost = reason;
+          try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
+        };
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            (async () => {
+              if (!exited) {
+                // A Windows parent-only kill cannot join its native descendants.
+                // Publish helper uncertainty before its fallback can emit exit.
+                if (process.platform === "win32") await terminateWindowsTree(child, unconfirmed);
+                else {
+                  try { process.kill(-pid, "SIGTERM"); }
+                  catch { /* still require captured native close */ }
+                  // Match the worker's native-child kill grace; allow it to finish
+                  // teardown before escalating the captured, still-live worker.
+                  force = setTimeout(() => {
+                    if (exited) return; // Never signal an exited/reused numeric identity.
+                    // Native Pi can own a separate group. Forced worker exit
+                    // cannot prove that its graceful descendant teardown ran.
+                    unconfirmed("POSIX worker tree termination is unconfirmed after 5000ms grace");
+                    try { process.kill(-pid, "SIGKILL"); }
+                    catch { /* deadline records an unconfirmed exit */ }
+                  }, 5_000);
+                }
+              }
+              // Exit/probe absence alone is not native close. However, a stuck
+              // worker (or unknown Windows tree) must not hang timeout/shutdown.
+              await closed;
+            })(),
+            new Promise<void>(resolve => {
+              deadline = setTimeout(() => {
+                unconfirmed("Owned process worker did not confirm tree/native close within 7000ms");
+                resolve();
+              }, 7_000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(force);
+          clearTimeout(deadline);
         }
-        // Even a previously observed exit is not native close. In particular,
-        // callers must not remove the worker's cwd while its handles are open.
-        await closed;
       })();
     },
     async isAlive() {

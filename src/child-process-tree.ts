@@ -61,7 +61,7 @@ export const terminatePosixGroup = (pgid: number | undefined): Promise<void> =>
  * Parent-only fallback limits damage but cannot confirm descendant termination.
  * Without a successful tree kill, retain an uncertain-tree fence indefinitely.
  */
-export const terminateWindowsTree = (child: ChildProcess): Promise<void> =>
+export const terminateWindowsTree = (child: ChildProcess, onUnconfirmedExit?: (reason: string) => void): Promise<void> =>
   new Promise((resolve) => {
     if (child.pid === undefined) { resolve(); return; }
     let uncertain = false;
@@ -69,7 +69,13 @@ export const terminateWindowsTree = (child: ChildProcess): Promise<void> =>
       try { child.kill("SIGKILL"); } catch { /* The owned child may already have exited. */ }
     };
     const fence = (reason: string): void => {
-      if (!uncertain) { uncertain = true; treeAlarm(reason); }
+      if (!uncertain) {
+        uncertain = true;
+        // Publish the owner-wide debt BEFORE the parent-only fallback can emit exit.
+        // Callback failures must not skip the captured child's damage-limiting kill.
+        try { onUnconfirmedExit?.(`Windows process tree termination is unconfirmed: ${reason}`); } catch { /* keep the tree join pending */ }
+        treeAlarm(reason);
+      }
       directKill();
     };
     let killer: ChildProcess;

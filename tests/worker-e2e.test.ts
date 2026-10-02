@@ -55,14 +55,19 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       const attempts = fs.readFileSync(path.join(dir, "worker-launches.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
       const processes = fs.readFileSync(path.join(dir, "worker-processes.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
       expect(attempts).toHaveLength(1);
-      expect(processes).toHaveLength(2);
-      expect(processes[0].attempt).toBe(attempts[0].attempt);
-      expect(processes[1].attempt).toBe(attempts[0].attempt);
+      // Worker pre-spawn record, then one per-spawn runner obligation (runnerAttempt)
+      // opened before spawnCli and discharged by the matching runner registration.
+      expect(processes).toHaveLength(3);
+      for (const entry of processes) expect(entry.attempt).toBe(attempts[0].attempt);
       expect(processes[0]).not.toHaveProperty("runner");
-      expect(processes[1]).toHaveProperty("runner");
+      expect(processes[0]).not.toHaveProperty("runnerAttempt");
+      expect(processes[1]).not.toHaveProperty("runner");
+      expect(typeof processes[1].runnerAttempt).toBe("string");
+      expect(processes[2]).toHaveProperty("runner");
+      expect(processes[2].runnerAttempt).toBe(processes[1].runnerAttempt);
       if (process.platform !== "linux") {
         expect(processes[0].worker).toBeNull();
-        expect(processes[1].runner).toBeNull();
+        expect(processes[2].runner).toBeNull();
       }
       await expect(manager.cleanup(result.id)).resolves.toEqual({ cleaned: true });
       expect(fs.existsSync(dir)).toBe(false);

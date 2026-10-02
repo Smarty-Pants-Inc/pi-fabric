@@ -2310,6 +2310,7 @@ export class ActorManager {
         let capabilityLease: FabricCapabilityViewLease | undefined;
         let committedRefs: string[] | undefined;
         let preLaunch = true;
+        let workerLaunched = false;
         const preparationAbort = new AbortController();
         try {
           await this.#publishDrainPresence(actor);
@@ -2355,11 +2356,12 @@ export class ActorManager {
           // the native session before handing its path to the process.
           this.#ensurePiSession(actor);
           if (actor.preparing) actor.preparing.phase = "launch";
-          preLaunch = false; // Legitimate admission waits are owned by AgentManager, not this setup deadline.
+          preLaunch = false; // AgentManager bounds model/auth setup after (not during) permit waiting.
           const result = await this.agents.run(
             this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
             (handle) => {
+              workerLaunched = true;
               delete actor.preparing;
               actor.status = "running";
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
@@ -2378,6 +2380,11 @@ export class ActorManager {
                 runId: handle.id, ...(handle.queuePosition !== undefined ? { queuePosition: handle.queuePosition } : {}) };
               void this.#publishPresence(actor).catch(() => undefined);
             },
+            { timeoutMs: this.#preparationTimeoutMs, onPreparing: () => {
+              actor.status = "preparing";
+              actor.preparing = { phase: "launch", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
+              void this.#publishPresence(actor).catch(() => undefined);
+            } },
           );
           runId = result.id;
           // Captured before any check that can throw: a completed run is never parked and
@@ -2510,7 +2517,11 @@ export class ActorManager {
           if (preLaunch && retryPreparation && !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
             preparationAbort.abort(error);
             item.preparationAttempts = (item.preparationAttempts ?? 0) + 1;
+            // Transfer ownership before cleanup can yield: persistence must never see
+            // this activation both in flight and queued (review/astra round 2, #3167).
+            this.#inFlight.delete(actor.id);
             actor.queue.unshift(item);
+            this.#persistQueue(actor.id);
             this.#recordPreparationFailure(actor, error, item);
             retryDrain = true;
             break;
@@ -2530,7 +2541,7 @@ export class ActorManager {
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped);
         } finally {
           if (capabilityLease) {
-            if (preLaunch) await this.#prepare(actor, "capability-release", () => capabilityLease!.release())
+            if (!workerLaunched) await this.#prepare(actor, "capability-release", () => capabilityLease!.release())
               .catch((error: unknown) => this.#recordPreparationFailure(actor, error));
             else await capabilityLease.release().catch(() => undefined);
           }
@@ -3471,10 +3482,15 @@ export class ActorManager {
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
     const inFlight = this.#inFlight.get(actorId);
+    const persistedIds = new Set<string>();
     const items = [
       ...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#overflow.get(actorId) ?? []), ...(this.#parked.get(actorId) ?? []),
     ]
-      .filter((item) => !item.resolve && !item.reject);
+      .filter((item) => {
+        if (item.resolve || item.reject || persistedIds.has(item.id)) return false;
+        persistedIds.add(item.id);
+        return true;
+      });
     const file = this.#ownQueueFile(actor);
     try {
       if (items.length === 0) fs.rmSync(file, { force: true });
@@ -3583,6 +3599,8 @@ export class ActorManager {
         typeof value.id !== "string" || typeof value.source !== "string" || held.has(value.id) ||
         typeof value.createdAt !== "number" || typeof value.activation !== "object" || value.activation === null
       ) continue;
+      // Include this snapshot's accepted IDs too, not only the work held on entry.
+      held.add(value.id);
       const attempts = (typeof value.attempts === "number" ? value.attempts : 0) + 1;
       const provenance = copyFabricProvenance(value.provenance);
       // Old records may still name the launch requester after native-session steering.

@@ -126,6 +126,20 @@ export const effectiveAgentTimeoutMs = (
   );
 };
 
+/** Host-only actor setup budget. Starts after admission and ends before transport launch. */
+export interface AgentLaunchPreparationOptions {
+  timeoutMs: number;
+  onPreparing?: () => void;
+}
+
+export class AgentLaunchPreparationTimeoutError extends Error {
+  readonly code = "FABRIC_AGENT_LAUNCH_PREPARATION_TIMEOUT";
+  constructor(readonly timeoutMs: number) {
+    super(`Agent launch preparation (model/auth) timed out after ${timeoutMs} ms`);
+    this.name = "AgentLaunchPreparationTimeoutError";
+  }
+}
+
 interface AgentParticipantGuidanceRequest {
   model?: string;
   runner: FabricAgentRunner;
@@ -320,6 +334,7 @@ interface QueuedAgent {
   result: Promise<AgentRunResult>;
   resolve(result: AgentRunResult): void;
   pending?: Promise<void>;
+  preparing?: boolean;
   terminal?: AgentRunResult;
   background: boolean;
   completionNotified?: boolean;
@@ -721,19 +736,30 @@ export class AgentManager {
     }
   }
 
-  async #prepareModel(model: string | undefined): Promise<string | undefined> {
+  async #prepareModel(model: string | undefined, signal: AbortSignal = this.#closeAbort.signal, timeoutMs?: number): Promise<string | undefined> {
     if (!this.#preparePiModel) return model;
     const key = model?.trim() || "<session-default>";
-    const existing = this.#piModelPreparations.get(key);
-    if (existing) return existing;
-    const preparation = this.#preparePiModel(model).then((prepared) => {
+    const preparation = this.#piModelPreparations.get(key) ?? Promise.resolve().then(() => this.#preparePiModel!(model)).then((prepared) => {
       if (typeof prepared !== "string") return model;
       return prepared.trim() || model;
     });
     this.#piModelPreparations.set(key, preparation);
+    let timer: NodeJS.Timeout | undefined;
+    let onAbort: (() => void) | undefined;
     try {
-      return await preparation;
+      return await Promise.race([preparation, new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(new Error(this.#closing ? "Fabric agent manager is closing" : "Agent launch preparation aborted"));
+        if (signal.aborted) { onAbort(); return; }
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (timeoutMs !== undefined) {
+          timer = setTimeout(() => reject(new AgentLaunchPreparationTimeoutError(timeoutMs)), timeoutMs);
+        }
+      })]);
     } finally {
+      if (timer) clearTimeout(timer);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+      // An abandoned shared promise must not poison the next admission. Its late
+      // completion is observed by the race but has no path to worker creation.
       if (this.#piModelPreparations.get(key) === preparation) {
         this.#piModelPreparations.delete(key);
       }
@@ -798,9 +824,9 @@ export class AgentManager {
   /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
    */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void): Promise<AgentHandleInfo> {
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
-    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched);
+    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation);
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
@@ -821,7 +847,7 @@ export class AgentManager {
     }
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -905,9 +931,15 @@ export class AgentManager {
         throw new Error("Agent activation no longer authorized");
       }
     };
-    const start = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
+    const start = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try {
-        if (runner === "pi") model = await this.#prepareModel(model);
+        // A permit is no longer a queue wait. Only model/auth preparation is raced;
+        // transport launch and its unknown-worker obligations must never be retried
+        // just because a setup timer expired.
+        const queued = this.#queued.get(id);
+        if (queued) { queued.preparing = true; this.#invalidateUiList(); }
+        preparation?.onPreparing?.();
+        if (runner === "pi") model = await this.#prepareModel(model, signal, preparation?.timeoutMs);
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();
@@ -1261,8 +1293,9 @@ export class AgentManager {
   }
 
   #queuedInfo(queued: QueuedAgent): AgentHandleInfo {
-    const waiting = [...this.#queued.values()].filter((run) => !run.terminal);
-    return structuredClone({ ...queued.info, queuePosition: waiting.indexOf(queued) + 1 });
+    const waiting = [...this.#queued.values()].filter((run) => !run.terminal && !run.preparing);
+    return structuredClone({ ...queued.info,
+      ...(!queued.preparing ? { queuePosition: waiting.indexOf(queued) + 1 } : {}) });
   }
 
   #settleQueued(queued: QueuedAgent, status: "stopped" | "failed", error: string): void {
@@ -1296,10 +1329,11 @@ export class AgentManager {
     authorize?: () => boolean,
     onOutputPrincipalDowngrade?: () => void,
     onQueued?: (handle: AgentHandleInfo) => void,
+    preparation?: AgentLaunchPreparationOptions,
   ): Promise<AgentRunResult> {
-    const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned);
+    const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
     const queued = this.#queued.get(handle.id);
-    if (queued && !queued.terminal) onQueued?.(this.#queuedInfo(queued));
+    if (queued && !queued.terminal && !queued.preparing) onQueued?.(this.#queuedInfo(queued));
     return this.wait(handle.id);
   }
 

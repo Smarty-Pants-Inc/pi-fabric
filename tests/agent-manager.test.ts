@@ -10,6 +10,7 @@ import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import {
   effectiveAgentTimeoutMs,
   AgentManager,
+  AgentLaunchPreparationTimeoutError,
 } from "../src/agents/manager.js";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import * as retentionStorage from "../src/storage/retention.js";
@@ -411,6 +412,57 @@ describe("AgentManager", () => {
       expect(owner.signal.aborted).toBe(false);
       expect(created).toEqual([]);
     } finally { release(); launch.mockRestore(); }
+  });
+
+  it("expires actor launch preparation with a typed error and permits a fresh same-model admission before the old promise resolves", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-")); roots.push(root);
+    let resume!: () => void;
+    const gate = new Promise<void>((resolve) => { resume = resolve; });
+    let calls = 0;
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: async (model) => { if (++calls === 1) await gate; return model; },
+    });
+    managers.push(manager);
+    const launched = vi.fn();
+    try {
+      await expect(manager.spawn({ task: "never launch", model: "test/shared" }, undefined, () => true,
+        undefined, undefined, launched, { timeoutMs: 40 })).rejects.toMatchObject({
+        name: "AgentLaunchPreparationTimeoutError", code: "FABRIC_AGENT_LAUNCH_PREPARATION_TIMEOUT", timeoutMs: 40,
+      });
+      expect(new AgentLaunchPreparationTimeoutError(40)).toBeInstanceOf(Error);
+      expect(manager.runningCount()).toBe(0);
+      expect(fs.readdirSync(root)).toEqual([]);
+      const handle = await manager.spawn({ task: "fresh same model", model: "test/shared" }, undefined, () => true,
+        undefined, undefined, launched, { timeoutMs: 40 });
+      expect(handle.status).toBe("running");
+      expect(calls).toBe(2);
+      await manager.wait(handle.id);
+      resume(); await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(launched).toHaveBeenCalledTimes(1);
+      expect(manager.list().map((run) => run.id)).toEqual([handle.id]);
+    } finally { resume(); }
+  });
+
+  it("ends the actor setup deadline before transport creation and never times out an already launched worker", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-")); roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel: async (model) => model,
+    });
+    managers.push(manager);
+    const launch = ProcessTransport.prototype.launch;
+    const delayed = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return launch.call(this, request);
+    });
+    try {
+      const handle = await manager.spawn({ task: "HANG" }, undefined, () => true, undefined, undefined, undefined, { timeoutMs: 30 });
+      expect(handle.status).toBe("running");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(manager.status(handle.id).status).toBe("running");
+      await manager.stop(handle.id);
+      expect(manager.runningCount()).toBe(0);
+    } finally { delayed.mockRestore(); }
   });
 
   it("cancels an admitted queued run during model preparation without launching its worker", async () => {

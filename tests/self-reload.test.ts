@@ -8,6 +8,7 @@ import {
   SELF_RELOAD_COMMAND,
   activeFabricRoot,
   installSelfReload,
+  reloadTargetUiHold,
   loadedFabricRoot,
 } from "../src/lifecycle/self-reload.js";
 
@@ -99,9 +100,11 @@ describe("installSelfReload", () => {
     if (options.turnProvenance) Object.assign(pi, { hostCapabilities: { turnProvenance: 1 } });
     const selfReload = installSelfReload(pi as never, {
       busy: options.busy ?? (() => 0),
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
       autoReloadConfigured: () => options.configured ?? true,
       moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href,
       settingsPath: settingsPath(),
+      reloadTargetUiHold, // Production adapter: this fake old host intentionally lacks holdState.
       ...(options.halted ? { halted: options.halted } : {}),
     });
     return { old, next, pi, emit, commands, sent, selfReload };
@@ -142,6 +145,7 @@ describe("installSelfReload", () => {
     const fresh = fakePi();
     const reloaded = installSelfReload(fresh.pi as never, {
       busy: () => 0,
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
       autoReloadConfigured: () => true,
       moduleUrl: pathToFileURL(path.join(next, "dist", "index.js")).href,
       settingsPath: settingsPath(),
@@ -223,6 +227,7 @@ describe("installSelfReload", () => {
     const published: Array<{ reason: string; heldForMs: number; target: string }> = [];
     const selfReload = installSelfReload(pi as never, {
       busy: () => 1, // a dev server that never ends
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
       autoReloadConfigured: () => true,
       moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href,
       settingsPath: settingsPath(),
@@ -430,6 +435,7 @@ describe("installSelfReload", () => {
     const dev = fakePi();
     const devReload = installSelfReload(dev.pi as never, {
       busy: () => 0,
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
       autoReloadConfigured: () => true,
       moduleUrl: pathToFileURL(path.join(release("dev"), "dist", "index.js")).href,
       settingsPath: settingsPath(),

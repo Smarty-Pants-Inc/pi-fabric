@@ -5,8 +5,11 @@ merge_queue:
 
 # smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the
 # review. The Astra reviewer queues a ready PR after its success verdict; `hold` and DO NOT LAND
-# titles keep a PR out. Both lists stay equal, so Mergify checks an up-to-date PR in place
-# (smarty-dev#455) instead of rebuilding a draft.
+# titles keep a PR out. queue_conditions require both review verdicts on the reviewed head. Only a
+# PR head carries review statuses, and Mergify's in-place update (merging main into the queued
+# PR, smarty-dev#455) makes a new head that never gets them. So merge_conditions only refuse a
+# failed review, as smarty-dev's .mergify.yml does (smarty-dev#440, #1537), and still require
+# fresh CI on the updated head (smarty-dev#2974).
 queue_rules:
   - name: default
     batch_size: 1
@@ -29,13 +32,9 @@ queue_rules:
       - -draft
       - -label = hold
       - -title ~= (?i)do not land
-      - check-success = review/astra
       - check-success = check (ubuntu-latest)
-      - or:
-          - check-success = review/security
-          - and:
-              - -head ~= ^sync/upstream-
-              - -label = needs-security-pass
+      - -check-failure = review/astra
+      - -check-failure = review/security
 
 # GitHub suspended smarty-agents (2026-09-25); the review agent queues as the write App's bot,
 # which has no collaborator permission (smarty-dev#562). Humans with write access still can.

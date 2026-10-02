@@ -13,6 +13,7 @@ import type {
   AgentRunStatus,
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
+import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
@@ -295,6 +296,20 @@ const main = async (): Promise<void> => {
   fs.mkdirSync(deliveryDirectory, { recursive: true, mode: 0o700 });
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
+  if (options.runner === "pi") {
+    // The manager removes the old status to fence terminal verdicts on relaunch.
+    // History is explicitly handed across that boundary, not a Pi resume target.
+    if (options.runnerSessionIds?.length) record.runnerSessionIds = [...options.runnerSessionIds];
+    // Also accept a matching prior status for a direct worker restart.
+    try {
+      const prior = JSON.parse(fs.readFileSync(options.statusFile, "utf8")) as AgentRunRecord;
+      if (prior.id === options.id) {
+        const ids = [...(record.runnerSessionIds ?? []), ...(Array.isArray(prior.runnerSessionIds) ? prior.runnerSessionIds : []), prior.runnerSessionId]
+          .filter((id): id is string => typeof id === "string" && Boolean(id.trim()));
+        if (ids.length) record.runnerSessionIds = [...new Set(ids)];
+      }
+    } catch { /* first launch or malformed prior status: observe the live child */ }
+  }
   writeRunRecord(options.statusFile, record);
   const emitLifecycle = (
     event: string,
@@ -339,8 +354,14 @@ const main = async (): Promise<void> => {
   if (options.sessionFile) piArguments.push("--session", options.sessionFile);
   else piArguments.push("--no-session");
   if (!options.extensions) piArguments.push("--no-extensions");
+  if (options.residentStartupProbe) {
+    // Explicit Fabric -e still loads. Do not execute unrelated profile hooks,
+    // skills, prompts, context files or compaction merely to decide on rollback.
+    piArguments.push("--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files");
+  }
   const activationWindow = options.inferenceContext === "activation";
   const activationNonce = activationWindow ? randomUUID() : undefined;
+  const residentProbeNonce = options.residentStartupProbe ? randomUUID() : undefined;
   let activationHookPath: string | undefined;
   if (activationWindow) {
     const hookPath = fileURLToPath(new URL(
@@ -357,6 +378,12 @@ const main = async (): Promise<void> => {
   const deliveryHook = fileURLToPath(new URL(
     import.meta.url.endsWith(".ts") ? "./worker/principal-delivery.ts" : "./worker/principal-delivery.js", import.meta.url));
   piArguments.push("-e", deliveryHook);
+  // A session file can contain only a seeded header, which Pi replaces at
+  // startup. --no-session has no file at all. Observe the live SessionManager
+  // instead of guessing either identity from the launch arguments.
+  const sessionIdHook = fileURLToPath(new URL(
+    import.meta.url.endsWith(".ts") ? "./worker/session-id.ts" : "./worker/session-id.js", import.meta.url));
+  piArguments.push("-e", sessionIdHook);
   // smarty-dev#967: a structured Pi run replies through one tool call, never its final text.
   const replyTool = options.replyTool === true && options.runner === "pi" && schema !== undefined;
   const replyFile = replyTool ? path.join(path.dirname(options.statusFile), "reply.json") : undefined;
@@ -439,7 +466,7 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
-  const childEnvironment = { ...process.env };
+  const childEnvironment = options.actorName ? { ...process.env } : taskAgentEnvironment();
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
   if (options.actorId && options.bashTimeoutSeconds !== undefined &&
     Number.isInteger(options.bashTimeoutSeconds) && options.bashTimeoutSeconds >= 0) {
@@ -452,7 +479,6 @@ const main = async (): Promise<void> => {
     detached: process.platform !== "win32",
     env: {
       ...childEnvironment,
-      ...(options.actorName ? {} : { SMARTY_ROLE: "task-agent" }),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
@@ -461,6 +487,8 @@ const main = async (): Promise<void> => {
       // Preserve the selected launcher for Fabric loaded inside this child.
       // Herdr's server environment need not contain the owner's binary pin.
       ...(options.runner === "pi" ? { PI_FABRIC_PI_BINARY: options.piBinary } : {}),
+      PI_FABRIC_RESIDENT_PROBE_WORKER_PID: residentProbeNonce ? String(process.pid) : "",
+      PI_FABRIC_RESIDENT_PROBE_NONCE: residentProbeNonce ?? "",
       PI_FABRIC_ACTIVATION_WORKER_PID: activationWindow ? String(process.pid) : "",
       PI_FABRIC_ACTIVATION_NONCE: activationNonce ?? "",
       PI_FABRIC_ACTIVATION_HOOK: activationHookPath ?? "",
@@ -518,6 +546,9 @@ const main = async (): Promise<void> => {
   let terminalError: string | undefined;
   let sawAgentError = false;
   let retryPending = false;
+  let piSettledSuccessfully = false;
+  let hasFinalText = false;
+  let hasFinalResult = false;
 
   const update = (): void => updateRunRecord(options.statusFile, record);
   let killTimer: NodeJS.Timeout | undefined;
@@ -559,9 +590,28 @@ const main = async (): Promise<void> => {
     recoveryWatchdog.clear();
     if (closeTimer || killTimer) return;
     // RPC EOF requests disposal, but a stuck extension can prevent process exit.
-    closeTimer = setTimeout(() => failStalledChild(
-      `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`,
-    ), KILL_GRACE_MS);
+    closeTimer = setTimeout(() => {
+      const error = `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`;
+      // fabric_reply writes after assistant message_end; inspect the durable
+      // reply now too. Post-drain reply/schema validation remains authoritative.
+      hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
+      if (piSettledSuccessfully && hasFinalResult && modelControl.ready && !terminalStatus &&
+          !terminalError && !sawAgentError && !lostResult) {
+        const warning = `${error}; preserving final result and terminating child`;
+        record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+        appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
+        process.stderr.write(`[pi-fabric] ${warning}\n`);
+        // Persist the result and warning BEFORE signalling the owned group.
+        // Keep the public record running until close drains the streams and
+        // reply/schema validation finishes; terminal records can be collected
+        // immediately by the manager. Forced exit must not erase this result.
+        update();
+        terminalStatus = "completed";
+        killChild();
+      } else {
+        failStalledChild(error);
+      }
+    }, KILL_GRACE_MS);
     closeTimer.unref();
   };
 
@@ -577,6 +627,7 @@ const main = async (): Promise<void> => {
     child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n");
   };
   let activationWindowReady = false;
+  let residentProbeReady = false;
   const modelControl = new PiModelControl(options.id, options.model, thinking, {
     send(frame) {
       if (terminalStatus) return;
@@ -598,6 +649,20 @@ const main = async (): Promise<void> => {
         record.thinking = effectiveThinking as NonNullable<AgentRunRecord["thinking"]>;
       }
       update();
+      // The launcher authorizes this harmless isolated startup test. Exercise
+      // the real worker/Pi/model/extension path, but never prompt a business actor
+      // (or invoke inference/tools) merely to decide whether rollback is safe.
+      if (options.residentStartupProbe) {
+        if (!residentProbeReady) {
+          modelControl.fail("resident Fabric extension did not acknowledge loaded-generation readiness");
+          return;
+        }
+        terminalStatus = "completed";
+        record.text = "resident worker startup verified";
+        appendLog(`${JSON.stringify({ type: "fabric_resident_worker_ready", workerPath: fileURLToPath(import.meta.url), fabricExtensionPath: options.fabricExtensionPath })}\n`);
+        closeChild();
+        return;
+      }
       if (taskProvenance?.principal) sendPiDelivery(task, taskProvenance, "steer", images);
       else child.stdin?.write(`${JSON.stringify({ type: "prompt", message: task, ...(images.length > 0 ? { images } : {}) })}\n`);
     },
@@ -610,7 +675,7 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
-  }, activationWindow);
+  }, activationWindow, options.residentStartupProbe === true);
 
   // Attributed token telemetry. Every usage-bearing child event emits one
   // tokens.usage lifecycle entry identified by this run/actor/runner/depth.
@@ -1004,12 +1069,29 @@ const main = async (): Promise<void> => {
       processClaudeEvent(event);
       return;
     }
+    if (event.type === "fabric_runner_session") {
+      const sessionId = stringField(event.sessionId);
+      if (event.runId === options.id && sessionId && record.runnerSessionId !== sessionId) {
+        record.runnerSessionId = sessionId;
+        record.runnerSessionIds ??= [];
+        if (!record.runnerSessionIds.includes(sessionId)) record.runnerSessionIds.push(sessionId);
+        update();
+      }
+      return;
+    }
     compactControl.observe(event);
     if (activationWindow && event.type === "fabric_activation_window_ready") {
       if (event.runId === options.id && event.nonce === activationNonce &&
           event.policy === "activation" && event.protocol === 1 && event.hook === activationHookPath && !activationWindowReady) {
         activationWindowReady = true;
       } else modelControl.fail("activation window readiness does not match the selected run/policy/hook");
+      return;
+    }
+    if (residentProbeNonce && event.type === "fabric_resident_extension_ready") {
+      if (event.runId === options.id && event.nonce === residentProbeNonce &&
+          event.protocol === 1 && event.extension === options.fabricExtensionPath && !residentProbeReady) {
+        residentProbeReady = true;
+      } else modelControl.fail("resident readiness does not match the selected run/extension/nonce");
       return;
     }
     if (modelControl.observe(event)) return;
@@ -1025,8 +1107,14 @@ const main = async (): Promise<void> => {
     }
     if (!terminalStatus) recoveryWatchdog.observe(event);
     if (event.type === "agent_start") {
-      emitLifecycle("pi.agent_start");
+      emitLifecycle("pi.agent_start", {
+        ...(record.runnerSessionId ? { runnerSessionId: record.runnerSessionId } : {}),
+        ...(record.fabricSessionId ? { fabricSessionId: record.fabricSessionId } : {}),
+      });
       retryPending = false;
+      piSettledSuccessfully = false;
+      hasFinalText = false;
+      hasFinalResult = false;
       // Starting a retry is not proof of acceptance: preserve the error and timer
       // until the provider starts a new assistant response.
       return;
@@ -1109,6 +1197,7 @@ const main = async (): Promise<void> => {
       if (messageRecord.role !== "assistant") return;
       lostResult = undefined;
       const text = extractText(messageRecord);
+      hasFinalText = Boolean(text);
       if (text) {
         record.text = latestRunText(text);
         process.stdout.write(`\n${text}\n`);
@@ -1145,6 +1234,12 @@ const main = async (): Promise<void> => {
     if (event.type === "agent_settled") {
       emitLifecycle("pi.agent_settled");
       if (!retryPending) {
+        // Settlement ends automatic work, not necessarily successfully: native
+        // compaction failures/aborts need not emit an assistant error message.
+        // Older Pi frames omit outcome; retain their existing result checks.
+        piSettledSuccessfully = event.outcome !== "error" && event.outcome !== "aborted";
+        // Tool-only assistant events precede the tool's durable reply write.
+        hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
         // Pull controls that landed with the final stream events before deciding
         // whether this one-shot child can close. A queued compact keeps stdin
         // open until its correlated response and compaction_end are observed.

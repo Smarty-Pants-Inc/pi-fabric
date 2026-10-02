@@ -562,6 +562,12 @@ const failedRecord = (
   error: string,
 ): AgentRunResult => {
   const now = Date.now();
+  const previous = readRecord(managed.statusFile) ?? managed.latestRecord;
+  const progress = managed.observedProgress;
+  const usage = { ...progress.usage };
+  for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) {
+    usage[key] = Math.max(usage[key], previous?.usage[key] ?? 0);
+  }
   return {
     id: managed.id,
     name: managed.name,
@@ -578,11 +584,11 @@ const failedRecord = (
     startedAt: now,
     updatedAt: now,
     finishedAt: now,
-    turns: 0,
-    toolCalls: 0,
+    turns: Math.max(progress.turns, previous?.turns ?? 0),
+    toolCalls: Math.max(progress.toolCalls, previous?.toolCalls ?? 0),
     text: "",
     error,
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    usage,
     ...(managed.model ? { model: managed.model } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
     ...(managed.latestRecord?.admittedModel ? { admittedModel: managed.latestRecord.admittedModel } : {}),
@@ -776,6 +782,9 @@ export class AgentManager {
       // Allocate ownership now; scan only on actual agent use or close.
     }
   }
+
+  /** This runtime's creation host, not a child participant's upstream owner. */
+  get runtimeHostId(): string | undefined { return this.#hostId; }
 
   defaultModel(runner: FabricAgentRunner = this.config.runner): string | undefined {
     return runner === "claude" ? this.config.claude.model
@@ -1059,7 +1068,7 @@ export class AgentManager {
     let routeDispatch: ReturnType<typeof import("./model-route.js")["prepareRouteDispatch"]> | undefined;
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
-      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id);
+      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id, request.routeRecord);
     }
     const startPrepared = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try {
@@ -1224,6 +1233,7 @@ export class AgentManager {
           ...(model ? ["--model", model] : []),
           ...(thinking ? ["--thinking", thinking] : []),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
+          ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
           ...(sessionFile ? ["--session-file", sessionFile] : []),
           ...(request.inferenceContext ? ["--inference-context", request.inferenceContext] : []),
@@ -2241,6 +2251,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.startupAttempts >= AGENT_STARTUP_MAX_ATTEMPTS ||
       managed.settled ||
@@ -2288,6 +2299,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.settled ||
       this.#closing ||

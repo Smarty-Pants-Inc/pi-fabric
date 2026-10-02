@@ -1,3 +1,4 @@
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -17,13 +18,15 @@ afterEach(() => {
 });
 
 describe("review F2: file-data namespace safety", () => {
-  it("fails closed for the Windows override while preserving the OS-temp fallback", () => {
+  it("fails closed when native Windows ACL inspection fails, preserving the unset OS-temp fallback", () => {
     const directory = path.join(sandbox(), "windows-data");
+    vi.spyOn(childProcess, "execFileSync").mockImplementation(() => { throw new Error("ACL inspection unavailable"); });
+    vi.stubEnv("SystemRoot", "C:\\Windows");
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     try {
       Object.defineProperty(process, "platform", { value: "win32" });
-      vi.stubEnv("PI_FABRIC_TMPDIR", directory);
-      expect(() => fabricDataRoot()).toThrow(/PI_FABRIC_TMPDIR.*unsupported on Windows/);
+      vi.stubEnv("PI_FABRIC_TMPDIR", "C:\\private\\windows-data");
+      expect(() => fabricDataRoot()).toThrow(/PI_FABRIC_TMPDIR.*could not prove native Windows ACL/);
       expect(fs.existsSync(directory)).toBe(false);
       vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
       expect(fabricDataRoot()).toBe(os.tmpdir());

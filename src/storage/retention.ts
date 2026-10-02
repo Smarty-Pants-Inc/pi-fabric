@@ -125,7 +125,7 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 // Every file the worker and manager write into a run directory. A missing name made the run
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
-  "task.txt", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
+  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
   "reply.json", "relaunches.jsonl", "route-session.jsonl",
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
@@ -148,6 +148,13 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       const stat = ownedStat(file);
       if (!stat) return false;
       if (stat.isFile() && runFile(name)) continue;
+      if (stat.isDirectory() && name === "deliveries") {
+        // The worker always creates this ingress directory; the native Pi hook
+        // unlinks consumed items. Any remaining item is pending or unknown,
+        // even when it has a known filename or valid JSON: keep the whole run.
+        if (fs.readdirSync(file).length !== 0) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;

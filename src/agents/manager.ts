@@ -135,6 +135,22 @@ export const effectiveAgentTimeoutMs = (
   );
 };
 
+/** Host-only actor setup budget. Starts after admission and ends before transport launch. */
+export interface AgentLaunchPreparationOptions {
+  timeoutMs: number;
+  onPreparing?: () => void;
+}
+
+export class AgentLaunchPreparationTimeoutError extends Error {
+  /** This deadline races model/auth only, never transport launch or worker execution. */
+  readonly launchOutcome = "unlaunched";
+  readonly code = "FABRIC_AGENT_LAUNCH_PREPARATION_TIMEOUT";
+  constructor(readonly timeoutMs: number) {
+    super(`Agent launch preparation (model/auth) timed out after ${timeoutMs} ms`);
+    this.name = "AgentLaunchPreparationTimeoutError";
+  }
+}
+
 interface AgentParticipantGuidanceRequest {
   model?: string;
   runner: FabricAgentRunner;
@@ -336,6 +352,7 @@ interface QueuedAgent {
   result: Promise<AgentRunResult>;
   resolve(result: AgentRunResult): void;
   pending?: Promise<void>;
+  preparing?: boolean;
   terminal?: AgentRunResult;
   background: boolean;
   completionNotified?: boolean;
@@ -527,6 +544,12 @@ const failedRecord = (
   error: string,
 ): AgentRunResult => {
   const now = Date.now();
+  const previous = readRecord(managed.statusFile) ?? managed.latestRecord;
+  const progress = managed.observedProgress;
+  const usage = { ...progress.usage };
+  for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) {
+    usage[key] = Math.max(usage[key], previous?.usage[key] ?? 0);
+  }
   return {
     id: managed.id,
     name: managed.name,
@@ -543,11 +566,11 @@ const failedRecord = (
     startedAt: now,
     updatedAt: now,
     finishedAt: now,
-    turns: 0,
-    toolCalls: 0,
+    turns: Math.max(progress.turns, previous?.turns ?? 0),
+    toolCalls: Math.max(progress.toolCalls, previous?.toolCalls ?? 0),
     text: "",
     error,
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    usage,
     ...(managed.model ? { model: managed.model } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
     ...(managed.latestRecord?.admittedModel ? { admittedModel: managed.latestRecord.admittedModel } : {}),
@@ -742,6 +765,9 @@ export class AgentManager {
     }
   }
 
+  /** This runtime's creation host, not a child participant's upstream owner. */
+  get runtimeHostId(): string | undefined { return this.#hostId; }
+
   defaultModel(runner: FabricAgentRunner = this.config.runner): string | undefined {
     return runner === "claude" ? this.config.claude.model
       : runner === "veda" ? this.config.veda.model : this.config.model;
@@ -767,10 +793,12 @@ export class AgentManager {
     runner: FabricAgentRunner,
     resolvePi?: (model: string) => Promise<string>,
     requiredPin = false,
+    signal: AbortSignal = this.#closeAbort.signal,
+    timeoutMs?: number,
   ): Promise<string | undefined> {
     this.assertModelAllowed(model, runner);
     if (runner === "pi") {
-      const prepared = await this.#prepareModel(model, requiredPin);
+      const prepared = await this.#prepareModel(model, requiredPin, signal, timeoutMs);
       this.assertModelAllowed(prepared, runner);
       return prepared;
     }
@@ -810,14 +838,15 @@ export class AgentManager {
     return prepared;
   }
 
-  async #prepareModel(model: string | undefined, requiredPin = false): Promise<string | undefined> {
+  async #prepareModel(model: string | undefined, requiredPin = false, signal: AbortSignal = this.#closeAbort.signal, timeoutMs?: number): Promise<string | undefined> {
     if (!this.#preparePiModel) return model;
     const key = `${requiredPin ? "route-pin:" : "participant:"}${model?.trim() || "<session-default>"}`;
-    const existing = this.#piModelPreparations.get(key);
-    if (existing) return existing;
     // Ordinary participant admission keeps the host's original one-argument contract.
     // Only required route pins opt in to strict preparation with the second argument.
-    const preparation = (requiredPin ? this.#preparePiModel(model, true) : this.#preparePiModel(model)).then((prepared) => {
+    // Each waiter races its own abort/deadline, even when sharing model preparation.
+    const preparation = this.#piModelPreparations.get(key) ?? Promise.resolve().then(() =>
+      requiredPin ? this.#preparePiModel!(model, true) : this.#preparePiModel!(model),
+    ).then((prepared) => {
       const effective = typeof prepared === "string" ? prepared.trim() || model : model;
       if (requiredPin && effective !== model) {
         throw Object.assign(new Error(`MODEL_ROUTE_PIN_MISMATCH: required ${model}, prepared ${effective}; task was not sent`), {
@@ -827,9 +856,22 @@ export class AgentManager {
       return effective;
     });
     this.#piModelPreparations.set(key, preparation);
+    let timer: NodeJS.Timeout | undefined;
+    let onAbort: (() => void) | undefined;
     try {
-      return await preparation;
+      return await Promise.race([preparation, new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(new Error(this.#closing ? "Fabric agent manager is closing" : "Agent launch preparation aborted"));
+        if (signal.aborted) { onAbort(); return; }
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (timeoutMs !== undefined) {
+          timer = setTimeout(() => reject(new AgentLaunchPreparationTimeoutError(timeoutMs)), timeoutMs);
+        }
+      })]);
     } finally {
+      if (timer) clearTimeout(timer);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+      // An abandoned shared promise must not poison the next admission. Its late
+      // completion is observed by the race but has no path to worker creation.
       if (this.#piModelPreparations.get(key) === preparation) {
         this.#piModelPreparations.delete(key);
       }
@@ -894,9 +936,9 @@ export class AgentManager {
   /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
    */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void): Promise<AgentHandleInfo> {
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
-    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade);
+    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation);
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
@@ -917,7 +959,7 @@ export class AgentManager {
     }
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -1008,11 +1050,17 @@ export class AgentManager {
     let routeDispatch: ReturnType<typeof import("./model-route.js")["prepareRouteDispatch"]> | undefined;
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
-      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id);
+      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id, request.routeRecord);
     }
-    const startPrepared = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
+    const startPrepared = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try {
-        model = await this.prepareModelForAdmission(routePin?.model ?? model, runner, undefined, Boolean(routePin));
+        // A permit is no longer a queue wait. Only model/auth preparation is raced;
+        // transport launch and its unknown-worker obligations must never be retried
+        // just because a setup timer expired.
+        const queued = this.#queued.get(id);
+        if (queued) { queued.preparing = true; this.#invalidateUiList(); }
+        preparation?.onPreparing?.();
+        model = await this.prepareModelForAdmission(routePin?.model ?? model, runner, undefined, Boolean(routePin), signal, preparation?.timeoutMs);
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();
@@ -1167,6 +1215,7 @@ export class AgentManager {
           ...(model ? ["--model", model] : []),
           ...(thinking ? ["--thinking", thinking] : []),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
+          ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
           ...(sessionFile ? ["--session-file", sessionFile] : []),
           ...(request.inferenceContext ? ["--inference-context", request.inferenceContext] : []),
@@ -1296,7 +1345,10 @@ export class AgentManager {
         this.#unregisteredTransports.delete(transport);
         this.#invalidateUiList();
         void this.#monitor(managed, timeoutMs);
-        return this.#handleInfo(managed, "running");
+        const handle = this.#handleInfo(managed, "running");
+        // A queued receipt is not a worker. Notify only after launch and registration.
+        try { onLaunched?.(handle); } catch { /* observers must not undo a launched worker */ }
+        return handle;
       } catch (error) {
         release();
         // An unconfirmed launch may have started a worker that already uses the worktree
@@ -1321,7 +1373,7 @@ export class AgentManager {
         throw error;
       }
     };
-    const start = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
+    const start = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try { return await startPrepared(release, signal); }
       catch (error) {
         // Cover preparation writes and worktree creation as well as transport failures.
@@ -1379,7 +1431,7 @@ export class AgentManager {
         await start(release, signal);
       } catch (error) {
         release?.();
-        this.#settleQueued(queued, signal.aborted ? "stopped" : "failed", error instanceof Error ? error.message : String(error));
+        this.#settleQueued(queued, signal.aborted ? "stopped" : "failed", error);
       }
     })();
     queued.pending = pending;
@@ -1390,15 +1442,19 @@ export class AgentManager {
   }
 
   #queuedInfo(queued: QueuedAgent): AgentHandleInfo {
-    const waiting = [...this.#queued.values()].filter((run) => !run.terminal);
-    return structuredClone({ ...queued.info, queuePosition: waiting.indexOf(queued) + 1 });
+    const waiting = [...this.#queued.values()].filter((run) => !run.terminal && !run.preparing);
+    return structuredClone({ ...queued.info,
+      ...(!queued.preparing ? { queuePosition: waiting.indexOf(queued) + 1 } : {}) });
   }
 
-  #settleQueued(queued: QueuedAgent, status: "stopped" | "failed", error: string): void {
+  #settleQueued(queued: QueuedAgent, status: "stopped" | "failed", error: unknown): void {
     if (queued.terminal) return;
     const now = Date.now();
     const record: AgentRunResult = {
-      ...queued.info, task: queued.task, status, error,
+      ...queued.info, task: queued.task, status,
+      error: error instanceof Error ? error.message : String(error),
+      ...(status === "failed" && error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched"
+        ? { launchPreparationTimeoutMs: error.timeoutMs } : {}),
       startedAt: queued.enqueuedAt, updatedAt: now, finishedAt: now,
       turns: 0, toolCalls: 0, text: "",
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
@@ -1445,9 +1501,12 @@ export class AgentManager {
     onSpawned?: (handle: AgentHandleInfo) => void,
     authorize?: () => boolean,
     onOutputPrincipalDowngrade?: () => void,
+    onQueued?: (handle: AgentHandleInfo) => void,
+    preparation?: AgentLaunchPreparationOptions,
   ): Promise<AgentRunResult> {
-    const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade);
-    onSpawned?.(handle);
+    const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
+    const queued = this.#queued.get(handle.id);
+    if (queued && !queued.terminal && !queued.preparing) onQueued?.(this.#queuedInfo(queued));
     return this.wait(handle.id);
   }
 
@@ -2167,6 +2226,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.startupAttempts >= AGENT_STARTUP_MAX_ATTEMPTS ||
       managed.settled ||
@@ -2214,6 +2274,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.settled ||
       this.#closing ||

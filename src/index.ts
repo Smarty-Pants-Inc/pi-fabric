@@ -2,7 +2,6 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
-import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
@@ -861,6 +860,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const { command, timeout } = event.input as { command?: unknown; timeout?: unknown };
     if (typeof command !== "string") return undefined;
     const { bashGuardRefusal } = await (literalGuard ??= import("./core/literal-bash-guard.js"));
+    const { foregroundWaitRefusal } = await import("./guards/foreground-wait.js");
     // Guard-time host input, not a TMPDIR assignment or expansion in the command being guarded.
     const guardReason = bashGuardRefusal(command, process.env.TMPDIR);
     if (guardReason) return { block: true, reason: guardReason };

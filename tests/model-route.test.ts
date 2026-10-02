@@ -123,6 +123,59 @@ describe("durable route dispatch", () => {
     expect(preparePiModel).toHaveBeenNthCalledWith(3, undefined);
     expect(preparePiModel).toHaveBeenCalledTimes(3);
   });
+  it("bounds routed preparation before launch and admits a fresh strict pin after timeout", async () => {
+    const dir = root();
+    const decision = await decideModelRoute(input, async () => response());
+    let resume!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    let calls = 0;
+    const preparePiModel = vi.fn(async (model: string | undefined, _requiredPin?: boolean) => {
+      if (++calls === 1) await gate;
+      return model;
+    });
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"), preparePiModel,
+    }); managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const onPreparing = vi.fn();
+    try {
+      await expect(manager.spawn({ task: "blocked pin", routeDecision: decision }, undefined, undefined,
+        undefined, undefined, undefined, { timeoutMs: 40, onPreparing })).rejects.toMatchObject({
+        name: "AgentLaunchPreparationTimeoutError", code: "FABRIC_AGENT_LAUNCH_PREPARATION_TIMEOUT", launchOutcome: "unlaunched",
+      });
+      expect(launch).not.toHaveBeenCalled();
+      expect(manager.runningCount()).toBe(0);
+      expect(onPreparing).toHaveBeenCalledTimes(1);
+      const handle = await manager.spawn({ task: "fresh pin", routeDecision: decision }, undefined, undefined,
+        undefined, undefined, undefined, { timeoutMs: 40 });
+      expect((await manager.wait(handle.id)).status).toBe("completed");
+      resume(); await new Promise(resolve => setTimeout(resolve, 80));
+      expect(preparePiModel).toHaveBeenNthCalledWith(1, pin.model, true);
+      expect(preparePiModel).toHaveBeenNthCalledWith(2, pin.model, true);
+      expect(launch).toHaveBeenCalledTimes(1);
+      const outcomes = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n").map(line => JSON.parse(line))
+        .filter(row => row.status);
+      expect(outcomes.map(row => row.status)).toEqual(["failed", "completed"]);
+    } finally { resume(); }
+  });
+  it("applies each strict preparation waiter's deadline to a shared pending promise", async () => {
+    const dir = root();
+    let resume!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    const preparePiModel = vi.fn(async (model: string | undefined, _requiredPin?: boolean) => { await gate; return model; });
+    const manager = new AgentManager(dir, DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"), preparePiModel,
+    }); managers.push(manager);
+    const owner = new AbortController();
+    const first = manager.prepareModelForAdmission(pin.model, "pi", undefined, true, owner.signal);
+    try {
+      await expect(manager.prepareModelForAdmission(pin.model, "pi", undefined, true, undefined, 40))
+        .rejects.toMatchObject({ name: "AgentLaunchPreparationTimeoutError", timeoutMs: 40 });
+      expect(preparePiModel).toHaveBeenCalledTimes(1);
+      resume();
+      await expect(first).resolves.toBe(pin.model);
+    } finally { resume(); await first; }
+  });
   it.each(["startup", "resume"])("R3 refuses a replacement model during %s recovery", async phase => {
     const dir = root();
     const decision = await decideModelRoute(input, async () => response());
@@ -281,6 +334,37 @@ describe("durable route dispatch", () => {
     const rows = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows).toHaveLength(2);
     expect(rows[1]).toMatchObject({ type: "outcome", decisionId: decision.decisionId, status: "completed", admittedModel: pin.model, admittedEffort: pin.effort, tokens: { input: 1, output: 2 } });
+  });
+  it.each(["startup-retry", "resume"])("refuses a substitute model on routed %s when the original pin disappears", async recovery => {
+    const dir = root();
+    const decision = await decideModelRoute(input, async () => response());
+    let preparations = 0;
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true }, {
+      workerPath: path.resolve(recovery === "startup-retry" ? "tests/fixtures/fake-worker-startup-retry.mjs" : "tests/fixtures/fake-worker.mjs"),
+      runRoot: path.join(dir, "runs"),
+      preparePiModel: async () => ++preparations === 1 ? pin.model : "test/sol-similar",
+    }); managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const result = await manager.run({ task: recovery === "startup-retry" ? "Recover startup" : "RESUME_AFTER_STOP", routeDecision: decision, transport: "process" });
+    expect(result.status).not.toBe("completed");
+    expect(result.error).toContain("MODEL_ROUTE_PIN_MISMATCH");
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(preparations).toBe(2);
+    const rows = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows.at(-1)).toMatchObject({ decisionId: decision.decisionId, admittedModel: null });
+  });
+  it.each(["startup-retry", "resume"])("allows routed %s only at the original matching pin", async recovery => {
+    const dir = root();
+    const decision = await decideModelRoute(input, async () => response());
+    const prepared = vi.fn(async () => pin.model);
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true }, {
+      workerPath: path.resolve(recovery === "startup-retry" ? "tests/fixtures/fake-worker-startup-retry.mjs" : "tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"), preparePiModel: prepared,
+    }); managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const result = await manager.run({ task: recovery === "startup-retry" ? "Recover startup" : "RESUME_AFTER_STOP", routeDecision: decision, transport: "process" });
+    expect(result.status).toBe("completed");
+    expect(launch).toHaveBeenCalledTimes(2);
+    for (const [args] of launch.mock.calls) expect(args.workerArguments[args.workerArguments.indexOf("--model") + 1]).toBe(pin.model);
   });
   it("dispatches pin and marks record-failed when durable state cannot be written", async () => {
     const dir = root();

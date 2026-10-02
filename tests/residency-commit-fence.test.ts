@@ -31,6 +31,10 @@ import { ResidencyClient } from "../src/residency/client.js";
 import { runResidentHostFromConfigPath } from "../src/residency/host.js";
 import { abandonResidentRequest, residentDeliveryPrefix, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 
+import { ResidentRequestRetention } from "../src/residency/retention.js";
+import { RESIDENT_REQUEST_RETENTION_MS } from "../src/residency/request-expiry.js";
+import * as requestExpiry from "../src/residency/request-expiry.js";
+
 import { captureDurableExecutionTrace } from "./helpers/durable-execution-trace.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
@@ -316,14 +320,18 @@ describe("resident creation cache boundaries", () => {
     } finally { clock?.mockRestore(); await state.close(); }
   });
 
-  it("retains only the last 256 completed results", { timeout: 20_000 }, async () => {
+  it("retains only the last 256 completed results", { timeout: 60_000 }, async () => {
     const state = await harness(false, undefined, 10_000);
     try {
       const first = await state.client.createActor(actorRequest("before-eviction", "oldest"));
       // Real client/host exchanges with fail-fast requests avoid 256 extra actors/workers.
-      const rejected = await Promise.all(Array.from({ length: 256 }, (_, i) =>
-        state.client.createActor(actorRequest("", `bounded-${i}`)).catch((error: Error) => error)));
-      for (const error of rejected) expect(error).toMatchObject({ message: expect.stringContaining("Invalid Fabric actor name") });
+      // Cache capacity, not transport throughput, is the invariant: bounded batches
+      // keep format-3 acknowledgement I/O from exhausting a burst's client deadline.
+      for (let offset = 0; offset < 256; offset += 32) {
+        const rejected = await Promise.all(Array.from({ length: 32 }, (_, i) =>
+          state.client.createActor(actorRequest("", `bounded-${offset + i}`)).catch((error: Error) => error)));
+        for (const error of rejected) expect(error).toMatchObject({ message: expect.stringContaining("Invalid Fabric actor name") });
+      }
       const next = await state.client.createActor(actorRequest("after-eviction", "oldest"));
       expect(next.id).not.toBe(first.id);
       expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(2);
@@ -826,15 +834,44 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
     ["terminal failure", "in-place", true], ["terminal failure", "in-place", false],
     ["terminal failure", "trajectory", true], ["terminal failure", "explicit", true],
     ["terminal failure", "none", true], ["ordinary success", "in-place", true],
+    ["expired Main", "in-place", true], ["expired Main", "in-place", false],
+    ["expired Main", "trajectory", true], ["expired Main", "none", true],
+    ["handled expiry", "in-place", true], ["handled expiry", "in-place", false],
+    ["collected expiry", "in-place", true],
   ] as const;
   it.each(cases)("preserves %s through %s boundary (switch=%s) in persisted and next model context", async (ending, mode, switchSucceeds) => {
-    const state = await harness(false, undefined, ending === "handled uncertainty" ? 250 : 10_000);
+    const state = await harness(false, undefined, ending === "handled uncertainty" || ending === "handled expiry" ? 250 : 10_000);
     const main = mainProvider(state);
     main.registry.register(new PiToolsProvider(state.root));
     const config = normalizeFabricConfig({ fullCodeMode: true,
       executor: { resultFormat: "json", timeoutMs: 8_000, maxOutputChars: 1_400, memoryLimitBytes: 256 * 1024 * 1024 },
       prewalk: { compactOnReturn: false }, entropy: { compile: false } });
+    if (ending === "expired Main" || ending === "collected expiry") {
+      config.executor.mainMaxTimeoutMs = 1_500;
+      const execute = FabricExecutionService.prototype.execute;
+      vi.spyOn(FabricExecutionService.prototype, "execute").mockImplementation(function (this: FabricExecutionService, options) {
+        return execute.call(this, { ...options, context: { ...options.context!, mode: "rpc" } });
+      });
+    }
+    let originalDecisions: ReturnType<typeof decisionsFor> = [];
+    const expire = () => {
+      originalDecisions = decisionsFor(state);
+      const collector = new ResidentRequestRetention(state.residencyRoot, [state.config.actorRoot, state.config.sessionActorRoot!]);
+      try { collector.sweep(Date.now() + RESIDENT_REQUEST_RETENTION_MS + 10_000, new Set(), 10_000); }
+      finally { collector.close(); }
+    };
+    if (ending === "expired Main" || ending === "collected expiry") {
+      const descriptor = { name: "expire", description: "Advance real retention watermark", risk: "write" as const, inputSchema: { type: "object", properties: {}, additionalProperties: false } };
+      main.registry.register({ name: "probe", description: "real retention", async list() { return [descriptor]; }, async describe() { return descriptor; },
+        async invoke() {
+          if (ending === "collected expiry") await state.client.removeActor(decisionsFor(state)[0]!.id);
+          expire();
+          expect(decisionsFor(state).length).toBe(ending === "collected expiry" ? 0 : 1);
+          return true;
+        } });
+    }
     const execution = new FabricExecutionService(main.registry, config);
+    const executed = vi.spyOn(execution, "execute");
     const faux = fauxProvider({ provider: "test", models: [{ id: "visible" }, { id: "executor" }] });
     const runtime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(state.root, "unused-auth.json") });
     runtime.registerNativeProvider(faux.provider);
@@ -868,10 +905,11 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       return runFabricHandoffAtBoundary(this.prewalk, { executeHandoff: async () => ({ completed: switchSucceeds, status: switchSucceeds ? "completed" : "failed", implementation: "boundary prose ".repeat(200) }) },
         { ...boundaryApi, setModel: async model => switchSucceeds && await boundaryApi.setModel(model) }, pending, result, ctx);
     });
-    if (ending === "handled uncertainty") {
+    if (ending === "handled uncertainty" || ending === "handled expiry") {
       const create = ActorDirectory.prototype.create;
       vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
         const actor = await create.apply(this, args); // Commit REAL host ownership, then delay its response beyond the client wait.
+        if (ending === "handled expiry") expire();
         await delay(900); return actor;
       });
     }
@@ -879,7 +917,8 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
     const mutation = `await pi.write({path:${JSON.stringify(path.join(state.root, "trigger.txt"))},text:"triggered"});`;
     const requests = `await agents.create(${JSON.stringify({ ...args, name: "boundary-one" })});` +
       (ending === "terminal failure" ? `await agents.create(${JSON.stringify({ ...args, name: "boundary-two" })});` : "");
-    const body = mutation + (ending === "handled uncertainty" ? `try { ${requests} } catch {} return "guest handled uncertainty";` : requests +
+    const body = mutation + (ending === "handled uncertainty" || ending === "handled expiry" ? `try { ${requests} } catch {} console.log("guest-large-log" + "log;".repeat(10000)); return "guest handled uncertainty";` : requests +
+      (ending === "expired Main" || ending === "collected expiry" ? `await tools.call({ref:"probe.expire",args:{}}); await new Promise(resolve => setTimeout(resolve,5000));` : "") +
       (mode === "explicit" ? `await agents.handoff({model:${JSON.stringify(`${faux.getModel().provider}/executor`)},task:"reconcile"});` : "") +
       (ending === "terminal failure" ? `throw new Error("terminal boundary cause");` : `return "ordinary handle delivered";`));
     const loader = new DefaultResourceLoader({ cwd: state.root, agentDir: path.join(state.root, "agent"),
@@ -908,7 +947,7 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       expect(result?.role).toBe("toolResult");
       if (result?.role !== "toolResult") throw new Error("Missing native result");
       const text = result.content.filter(block => block.type === "text").map(block => block.text).join("\n");
-      const decisions = decisionsFor(state);
+      const decisions = originalDecisions.length ? originalDecisions : decisionsFor(state);
       if (!decisions.length) throw new Error(`No real commitment: ${text}`);
       const persisted = SessionManager.open(manager.getSessionFile()!).getBranch().find(entry => entry.type === "message" && entry.message.role === "toolResult");
       expect(persisted?.type === "message" && persisted.message).toEqual(result);
@@ -916,18 +955,54 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       // 900 ms with a 250 ms client wait. Resident actorStatus now uses that same
       // serial exchange, so reconcile only after the held request finishes.
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      // Simulate the resumed wall clock for new reconciliation generations, not
+      // the original execution deadline. The expiry watermark never rolls back.
+      const realNow = Date.now.bind(Date);
+      const reconciliationClock = originalDecisions.length ? vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000) : undefined;
       // Reconcile live entities before assertions that deliberately fail on the old head.
-      for (const decision of decisions) {
+      for (const decision of ending === "collected expiry" ? [] : decisions) {
         await waitFor(() => state.participants.get(decision.id)?.ownerHostId === residentHostId(state.config.rootId));
         expect((await main.invoke("agents.actorStatus", { id: decision.id })) as object).toMatchObject({ id: decision.id });
         expect(await main.invoke("agents.stop", { id: decision.id })).toMatchObject({ acknowledged: true });
       }
-      expect(decisions).toHaveLength(ending === "terminal failure" ? 2 : 1);
+      reconciliationClock?.mockRestore();
+      const settled = await executed.mock.results[0]!.value;
+      const evidence = process.env.FABRIC_RESIDENT_EXPIRY_EVIDENCE ?? process.env.PI_FABRIC_BOUNDARY_EVIDENCE;
+      if (evidence) fs.writeFileSync(`${evidence}-${ending.replaceAll(" ", "-")}-${mode}-${switchSucceeds}.json`, JSON.stringify({ ending, mode, switchSucceeds, result, decisions, nextModelText, originalToolText, receipts: settled.residentOutcomes, reconciledOriginal: ending !== "collected expiry" }, null, 2));
+      expect(decisions).toHaveLength(ending === "terminal failure" || ending === "collected expiry" ? 2 : 1);
       expect(fs.readFileSync(path.join(state.root, "trigger.txt"), "utf8")).toBe("triggered");
       expect(pendingCount).toBe(mode === "none" ? 0 : 1);
       expect(claimed).toHaveBeenCalled();
       if (ending === "ordinary success") {
         expect(result.isError).toBe(false); expect(text).not.toContain("ResidentOutcomeUnknownError"); expect(text).toContain('"continued": true');
+      } else if (["expired Main", "handled expiry", "collected expiry"].includes(ending)) {
+        expect(result.isError).toBe(true);
+        expect(result.details).toMatchObject({ success: false });
+        for (const visible of [text, nextModelText]) {
+          expect(visible).toContain("ResidentRequestExpiredError");
+          expect(visible).toMatch(/do not replay or reassign/i);
+          expect(visible).toContain(decisions[0]!.requestId);
+          if (ending === "collected expiry") {
+            expect(visible).toContain("state=expired");
+            expect(visible).toContain("actorId=not yet known, ownerHostId=not yet known");
+            expect(visible).not.toContain("state=abandoned");
+          } else {
+            expect(visible).toContain(decisions[0]!.id);
+            expect(visible).toContain(decisions[0]!.ownerHostId);
+            expect(visible).toContain("state=committed");
+          }
+        }
+        expect(settled.residentOutcomes).toEqual([expect.objectContaining({ requestId: decisions[0]!.requestId,
+          state: ending === "collected expiry" ? "expired" : "committed", expired: true,
+          ...(ending === "collected expiry" ? {} : { id: decisions[0]!.id, ownerHostId: decisions[0]!.ownerHostId }),
+        })]);
+        if (mode !== "none") {
+          const pending = await claimed.mock.results[0]!.value;
+          expect(Object.isFrozen(pending?.executionOutcome?.residentOutcomes)).toBe(true);
+          expect(Object.isFrozen(pending?.executionOutcome?.residentOutcomes[0])).toBe(true);
+        }
+        if (ending !== "handled expiry") expect(text).toContain("MainExecutionCeilingError");
+        expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(ending === "collected expiry" ? 0 : 1);
       } else {
         expect(result.isError).toBe(true);
         expect(result.details).toMatchObject({ success: false });
@@ -937,9 +1012,105 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
         if (nextModelText) assertReceipts(nextModelText, decisions);
         if (mode === "in-place" && switchSucceeds) expect(nextModelText).toBe(text);
       }
-      if (process.env.PI_FABRIC_BOUNDARY_EVIDENCE) fs.writeFileSync(`${process.env.PI_FABRIC_BOUNDARY_EVIDENCE}-${ending.replaceAll(" ", "-")}-${mode}-${switchSucceeds}.json`, JSON.stringify({ ending, mode, switchSucceeds, result, decisions, nextModelText, originalToolText }, null, 2));
-    } finally { await session?.abort(); session?.dispose(); await main.close(); await state.close(); }
+    } finally { vi.restoreAllMocks(); await session?.abort(); session?.dispose(); await main.close(); await state.close(); }
   });
+});
+
+describe("expiry receipt ledger through real Main and nested clients", { timeout: 25_000 }, () => {
+  it.each(["main", "nested"] as const)("%s guest-handled expiry keeps retained live-writer IDs ahead of large output", async caller => {
+    const state = await harness(false, undefined, 250);
+    const main = mainProvider(state, caller);
+    if (caller === "nested") {
+      vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", state.config.rootId);
+      vi.stubEnv("PI_FABRIC_MESH_ROOT", state.config.meshRoot);
+      // Inject only construction: this is the harness's REAL nested filesystem
+      // client with a short exchange budget, not a mocked dispatch or ledger.
+      vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue(state.nested);
+    }
+    const create = ActorDirectory.prototype.create;
+    vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+      const actor = await create.apply(this, args);
+      const collector = new ResidentRequestRetention(state.residencyRoot, [state.config.actorRoot]);
+      try { collector.sweep(Date.now() + RESIDENT_REQUEST_RETENTION_MS + 10_000, new Set(), 10_000); }
+      finally { collector.close(); }
+      await delay(900);
+      return actor;
+    });
+    let artifactPath: string | undefined;
+    try {
+      const run = await registeredExecution(state, main, 5_000);
+      const executed = vi.spyOn(FabricExecutionService.prototype, "execute");
+      const result = await run(`try { await agents.create(${JSON.stringify(requestArgs(state, "create"))}); } catch {} console.log("guest-large-log" + "log;".repeat(10000)); return "guest swallowed expiry";`);
+      const settled = await executed.mock.results[0]!.value;
+      const text = visibleText(result);
+      artifactPath = /saved to: ([^\n]+)\]/.exec(text)?.[1];
+      const decisions = decisionsFor(state);
+      expect(decisions).toHaveLength(1);
+      await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      const realNow = Date.now.bind(Date);
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000);
+      const status = await state.client.actorStatus(decisions[0]!.id);
+      expect(status).toMatchObject({ id: decisions[0]!.id });
+      clock.mockRestore();
+      if (process.env.FABRIC_RESIDENT_EXPIRY_EVIDENCE) fs.writeFileSync(`${process.env.FABRIC_RESIDENT_EXPIRY_EVIDENCE}-handled-expiry-${caller}.json`, JSON.stringify({ result, receipts: settled.residentOutcomes, decisions, status }, null, 2));
+      expect(settled.trace.outcome).toBe("succeeded");
+      expect(settled.residentOutcomes).toEqual([expect.objectContaining({ requestId: decisions[0]!.requestId,
+        state: "committed", expired: true, id: decisions[0]!.id, ownerHostId: decisions[0]!.ownerHostId })]);
+      expect(settled.success).toBe(true); // Guest completion is unchanged; the warning is mandatory.
+      expect(text.startsWith("ResidentRequestExpiredError:")).toBe(true);
+      expect(text).toMatch(/do not replay or reassign/i);
+      const firstLog = text.indexOf("guest-large-log");
+      expect(firstLog).toBeGreaterThan(0);
+      for (const key of ["requestId", "id", "ownerHostId"]) expect(text.indexOf(decisions[0]![key])).toBeLessThan(firstLog);
+      expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
+    } finally {
+      vi.restoreAllMocks();
+      if (artifactPath) fs.rmSync(path.dirname(artifactPath), { recursive: true, force: true });
+      await main.close(); await state.close();
+    }
+  });
+});
+
+describe("host-originated expired replies use the real resident receipt ledger", { timeout: 25_000 }, () => {
+  for (const caller of ["main", "nested"] as const) for (const collected of [false, true]) {
+    it(`${caller} handles an expired replay reply with ${collected ? "collected" : "retained live"} commitment facts`, async () => {
+      const state = await harness(false, undefined, 10_000);
+      const main = mainProvider(state, caller);
+      if (caller === "nested") {
+        vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", state.config.rootId);
+        vi.stubEnv("PI_FABRIC_MESH_ROOT", state.config.meshRoot);
+      }
+      try {
+        const actor = await state.client.createActor({ name: "original-writer", instructions: "Keep one writer", residency: "durable", model: state.model });
+        const original = decisionsFor(state)[0]!;
+        if (collected) await state.client.removeActor(actor.id);
+        const collector = new ResidentRequestRetention(state.residencyRoot, [state.config.actorRoot]);
+        try { collector.sweep(Date.now() + RESIDENT_REQUEST_RETENTION_MS + 10_000, new Set(), 10_000); }
+        finally { collector.close(); }
+        expect(decisionsFor(state)).toHaveLength(collected ? 0 : 1);
+        // Reuse the immutable ORIGINAL negotiated envelope identity. The host
+        // must reject before dispatch; no ledger, decision, or response is mocked.
+        vi.spyOn(requestExpiry, "newResidentRequestId").mockReturnValue(original.requestId);
+        const run = await registeredExecution(state, main, 5_000);
+        const executed = vi.spyOn(FabricExecutionService.prototype, "execute");
+        const result = await run(`try { await agents.create(${JSON.stringify(requestArgs(state, "create"))}); } catch {} return "expired reply handled";`);
+        const settled = await executed.mock.results[0]!.value;
+        const text = visibleText(result);
+        if (process.env.FABRIC_RESIDENT_EXPIRY_EVIDENCE) fs.writeFileSync(`${process.env.FABRIC_RESIDENT_EXPIRY_EVIDENCE}-reply-${caller}-${collected}.json`, JSON.stringify({ original, result, receipts: settled.residentOutcomes, collected }, null, 2));
+        expect(settled.success).toBe(true);
+        expect(settled.residentOutcomes).toEqual([expect.objectContaining({ requestId: original.requestId, expired: true,
+          state: collected ? "expired" : "committed", ...(collected ? {} : { id: original.id, ownerHostId: original.ownerHostId }) })]);
+        expect(text.startsWith("ResidentRequestExpiredError:")).toBe(true);
+        expect(text).toMatch(/do not replay or reassign/i);
+        expect(text).toContain(original.requestId);
+        if (collected) {
+          expect(text).toContain("actorId=not yet known, ownerHostId=not yet known");
+          expect(text).not.toContain("state=abandoned");
+        } else { expect(text).toContain(original.id); expect(text).toContain(original.ownerHostId); }
+        expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(collected ? 0 : 1);
+      } finally { vi.restoreAllMocks(); await main.close(); await state.close(); }
+    });
+  }
 });
 
 describe("round 4 registered fabric_exec committed-output priority", { timeout: 25_000 }, () => {

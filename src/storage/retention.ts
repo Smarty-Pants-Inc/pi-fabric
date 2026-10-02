@@ -88,14 +88,19 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
 };
 /** A terminal external-pane record is not an exit receipt. Share this persistent,
  * tree-wide veto across tracked, recovered and offline cleanup before removing
- * worktrees or files; absence of an unresolved marker never proves pane exit. */
-export const runTreeExitVeto = (directory: string, depth = 0, expired: Deadline = noDeadline): string | undefined => {
+ * worktrees or files; absence of an unresolved marker never proves pane exit.
+ * Ownership retention additionally requires checked process exit for every
+ * descendant, without coupling that proof to cleanup's artifact allowlist. */
+export const runTreeExitVeto = (
+  directory: string, depth = 0, expired: Deadline = noDeadline, requireDescendantExit = false,
+): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
   // initial absence is safe; errors or changes during inspection veto cleanup.
   try { fs.lstatSync(directory); }
   catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : "worker exit is unconfirmed: run-tree inspection failed";
+    return (error as NodeJS.ErrnoException).code === "ENOENT" && !requireDescendantExit
+      ? undefined : "worker exit is unconfirmed: run-tree inspection failed";
   }
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
@@ -110,12 +115,21 @@ export const runTreeExitVeto = (directory: string, depth = 0, expired: Deadline 
     if (record?.transport === "herdr" || record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
     }
+    // A surviving tracked root has its own transport exit evidence. Descendants
+    // have no surviving handles here: reuse the persisted process identities and
+    // processAlive check used by safeRunTree, not settlement or marker absence.
+    if (requireDescendantExit && depth > 0) {
+      const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
+        ? Number(record.sessionId) : undefined;
+      if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return "worker exit is unconfirmed: unknown descendant identity";
+      if (processAlive(pid)) return `its descendant worker may still be running (${directory})`;
+    }
     const nested = path.join(directory, "nested");
     try { fs.lstatSync(nested); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
     if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
     for (const name of fs.readdirSync(nested)) {
-      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired);
+      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requireDescendantExit);
       if (reason) return reason;
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
@@ -148,16 +162,22 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       const stat = ownedStat(file);
       if (!stat) return false;
       if (stat.isFile() && runFile(name)) continue;
+      if (stat.isDirectory() && name === "handoff-session") {
+        // This directory is exclusively populated by Fabric's session fork writer.
+        if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "deliveries") {
         // The worker always creates this ingress directory; the native Pi hook
         // unlinks consumed items. Any remaining item is pending or unknown,
         // even when it has a known filename or valid JSON: keep the whole run.
         if (fs.readdirSync(file).length !== 0) return false;
-        continue;
-      }
-      if (stat.isDirectory() && name === "handoff-session") {
-        // This directory is exclusively populated by Fabric's session fork writer.
-        if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
+        // Only the worker's UUID-addressed private delivery envelopes are ours.
+        // Empty directories are normal; unknown content, links and non-files veto.
+        for (const child of fs.readdirSync(file)) {
+          if (expired() || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/.test(child) ||
+              !ownedStat(path.join(file, child))?.isFile()) return false;
+        }
         continue;
       }
       if (stat.isDirectory() && name === "nested") {

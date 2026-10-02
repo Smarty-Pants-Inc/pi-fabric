@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PI_RECOVERY_TIMEOUT_MS, PiRecoveryWatchdog } from "../src/worker/recovery-watchdog.js";
+import { PI_RECOVERY_MAX_MS, PI_RECOVERY_TIMEOUT_MS, PI_PROVIDER_RESUME_DELAYS_MS, PiRecoveryWatchdog } from "../src/worker/recovery-watchdog.js";
 import { ToolCallStreamGuard } from "../src/worker/tool-call-stream-guard.js";
 import { assistantStreamEvent } from "../src/worker/assistant-stream-event.js";
 
@@ -32,12 +32,73 @@ describe("assistantStreamEvent", () => {
 });
 
 describe("PiRecoveryWatchdog", () => {
+  it("honours the native announced delay plus slack, without counting chatter as progress", () => {
+    const { fail, watchdog } = setup();
+    watchdog.arm("503 server_is_overloaded");
+    watchdog.observe({ type: "auto_retry_start", attempt: 5, maxAttempts: 6, delayMs: 80_000, errorMessage: "503 server_is_overloaded" });
+    vi.advanceTimersByTime(90_000);
+    expect(fail).not.toHaveBeenCalled();
+    watchdog.observe({ type: "agent_start" });
+    vi.advanceTimersByTime(49_999);
+    expect(fail).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fail).toHaveBeenCalledOnce();
+  });
+
+  it("bounds repeated native retry delays and resumed attempts at ten minutes", () => {
+    const { fail, watchdog } = setup();
+    expect(PI_RECOVERY_MAX_MS).toBe(600_000);
+    expect(PI_PROVIDER_RESUME_DELAYS_MS).toEqual([30_000, 60_000, 120_000]);
+    watchdog.arm("overloaded");
+    for (let i = 0; i < 5; i++) {
+      watchdog.observe({ type: "auto_retry_start", delayMs: 160_000 });
+      vi.advanceTimersByTime(100_000);
+      watchdog.observe({ type: "message_start", message: { role: "assistant", content: [] } });
+      watchdog.arm("503 overloaded");
+    }
+    watchdog.observe({ type: "auto_retry_start", delayMs: 160_000 });
+    vi.advanceTimersByTime(99_999);
+    expect(fail).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fail.mock.calls[0]?.[0]).toContain("10-minute bound (600000ms)");
+  });
+
+  it.each([-1, NaN, Infinity, "80000", undefined])("ignores malformed retry delay %s", delayMs => {
+    const { fail, watchdog } = setup();
+    watchdog.arm("overloaded");
+    watchdog.observe({ type: "auto_retry_start", delayMs });
+    vi.advanceTimersByTime(60_000);
+    expect(fail).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the absolute incident cap through accepted response starts and process restarts", () => {
+    const { fail, watchdog } = setup();
+    watchdog.arm("503 server_is_overloaded");
+    watchdog.observe({ type: "message_start", message: { role: "assistant", content: [] } });
+    vi.advanceTimersByTime(PI_RECOVERY_MAX_MS - 1);
+    expect(fail).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fail.mock.calls[0]?.[0]).toContain("503 server_is_overloaded; Pi provider recovery exceeded the 10-minute bound");
+  });
+
+  it("clears the incident budget only when recovery completes", () => {
+    const { watchdog } = setup();
+    watchdog.arm("overloaded");
+    watchdog.observe({ type: "auto_retry_start", delayMs: 500_000 });
+    vi.advanceTimersByTime(500_000);
+    watchdog.suspend();
+    expect(watchdog.remainingMs).toBe(100_000);
+    watchdog.clear();
+    watchdog.arm("new incident");
+    expect(watchdog.remainingMs).toBe(600_000);
+    watchdog.dispose();
+  });
   it.each(["assistantMessageEvent", "event"])("disarms when the retry starts before 70 seconds of silent reasoning (%s)", (field) => {
     const { fail, watchdog } = setup();
     watchdog.arm("cliproxyapi/gpt-6.1-sol: terminated");
     vi.advanceTimersByTime(2_000);
     watchdog.observe({ type: "message_start", message: { role: "assistant", content: [], stopReason: "stop" } });
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(1); // Only the absolute incident cap remains.
     vi.advanceTimersByTime(70_000);
     watchdog.observe({ type: "message_update", [field]: { type: "text_delta", delta: "recovered" } });
     expect(fail).not.toHaveBeenCalled();
@@ -69,6 +130,7 @@ describe("PiRecoveryWatchdog", () => {
       expect(runaway).toHaveBeenCalledTimes(1);
       expect(runaway.mock.calls[0]![0]).toMatchObject(bound === "time"
         ? { elapsedMs: 60_000, bytes: 3 } : { elapsedMs: 0, bytes: 65_536 });
+      watchdog.dispose();
       expect(vi.getTimerCount()).toBe(0);
     }
   });
@@ -128,7 +190,7 @@ describe("PiRecoveryWatchdog", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("does not extend the deadline for repeated errors or retry announcements", () => {
+  it("does not extend the deadline for repeated errors without a delay announcement", () => {
     const { fail, watchdog } = setup();
     watchdog.arm("Error: Terminated");
     for (let i = 0; i < 5; i++) {

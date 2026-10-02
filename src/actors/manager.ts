@@ -2502,26 +2502,31 @@ export class ActorManager {
     const streak = this.#failureStreaks.get(actor.id) ?? { count: 0, notified: false };
     streak.count += 1;
     this.#failureStreaks.set(actor.id, streak);
-    if (streak.notified || streak.count < ACTOR_FAILURE_NOTICE_AFTER) return;
+    // Deterministic budget failures need operator action, not three silent
+    // activations. Existing host reporting bypasses mailbox/silent delivery.
+    const contextOverflow = /Context exceeds window:/i.test(error);
+    if (streak.notified || (!contextOverflow && streak.count < ACTOR_FAILURE_NOTICE_AFTER)) return;
     streak.notified = true;
     const reason = error.split("\n")[0]!.slice(0, 300);
     const text =
       `Fabric host notice: actor ${actor.name} failed its last ${streak.count} activations, so it is not acting on its events. ` +
       `Last error: ${reason}${runId ? ` (run ${runId})` : ""}. ` +
-      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it.`;
+      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it.` +
+      (contextOverflow ? ` This activation was not retried; reduce its input or reset the session on its owning host with agents.resetSession({ id: ${JSON.stringify(actor.name)} }).` : "");
+    const notice: FabricActorMessage = {
+      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
+      source: "fabric-host", createdAt: Date.now(), action: "message", text,
+      ...(contextOverflow ? { data: { reason: "context_window", error, runId } } : {}),
+    };
+    if (contextOverflow) {
+      this.#recordMessage(this.#liveActor(actor), notice);
+      void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
+        text, data: { actorId: actor.id, reason: "context_window", error, runId } }).catch(() => undefined);
+    }
     try {
       this.onDeliver({
         actor: this.#publicInfo(actor),
-        message: {
-          id: randomUUID(),
-          actorId: actor.id,
-          actorName: actor.name,
-          direction: "out",
-          source: "fabric-host",
-          createdAt: Date.now(),
-          action: "message",
-          text,
-        },
+        message: notice,
         // A host alarm: it reaches Main and starts a turn whatever the actor's own delivery.
         delivery: "followUp",
         triggerTurn: true,

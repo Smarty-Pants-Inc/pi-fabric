@@ -1,7 +1,9 @@
 import fs from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import path from "node:path";
+import * as nodeModule from "node:module";
 import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
-import { buildSessionContext, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, convertToLlm, getPackageDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 type AgentMessage = ReturnType<typeof buildSessionContext>["messages"][number];
 
 const isSystem = (message: AgentMessage): boolean => (message as { role?: string }).role === "system";
@@ -76,12 +78,27 @@ function failClosed(error: unknown): never {
 }
 
 /** Loaded only by an explicitly selected actor worker; adds no tools or trust. */
-export default function activationWindow(pi: ExtensionAPI): void {
+export default async function activationWindow(pi: ExtensionAPI): Promise<void> {
   let window: ActivationWindow | undefined;
   try {
     if (String(process.ppid) !== process.env.PI_FABRIC_ACTIVATION_WORKER_PID || !process.env.PI_FABRIC_ACTIVATION_NONCE) {
       throw new Error("Activation window requires the worker launch binding");
     }
+    // Jiti aliases the pi-ai root to compat.js and misresolves static subpaths.
+    // Use the selected host's pure request estimator, not a local heuristic or
+    // another copy of the host/provider/UI barrel. Package lookup supports
+    // hoisted and symlinked installs without requiring a require export.
+    const findPackageJSON = nodeModule.findPackageJSON;
+    let estimatorUrl = "@earendil-works/pi-ai/utils/estimate";
+    if (typeof findPackageJSON === "function") {
+      const hostBase = pathToFileURL(path.join(getPackageDir(), "package.json"));
+      const aiPackage = findPackageJSON("@earendil-works/pi-ai", hostBase);
+      if (!aiPackage) throw new Error("Native request estimator package is missing");
+      estimatorUrl = pathToFileURL(path.join(path.dirname(aiPackage), "dist", "utils", "estimate.js")).href;
+    }
+    // Bun source workers use native package imports (no Jiti root alias) and
+    // do not yet implement findPackageJSON; Node hosts take the bound path above.
+    const { estimateContextTokens } = await import(estimatorUrl) as typeof import("@earendil-works/pi-ai/utils/estimate");
     pi.on("session_start", (_event, ctx) => {
       try {
         const hook = fs.realpathSync(fileURLToPath(import.meta.url));
@@ -117,6 +134,14 @@ export default function activationWindow(pi: ExtensionAPI): void {
       try {
         if (!window) throw new Error("Activation window is not initialized");
         window.verifySystem(buildSessionContext(ctx.sessionManager.getBranch()).messages, event.messages);
+        // Use Pi AI's request estimator, including the effective system/tools and
+        // current tool results, not message count or session bytes. A throw is
+        // swallowed by Pi; failClosed prevents native retries of impossible input.
+        const tokens = estimateContextTokens(convertToLlm(event.messages)).tokens;
+        const limit = ctx.model?.contextWindow;
+        if (limit && tokens > limit) {
+          return failClosed(`Context exceeds window: estimated ${tokens} input tokens, window ${limit}`);
+        }
         return undefined;
       } catch (error) {
         return failClosed(error);

@@ -256,7 +256,10 @@ describe("/fabric command", () => {
     } as unknown as FabricState;
     const context = {
       hasUI,
-      modelRegistry: { getAvailable: () => models },
+      modelRegistry: {
+        getAvailable: () => models,
+        find: (provider: string, id: string) => models.find(model => model.provider === provider && model.id === id),
+      },
       sessionManager: { getSessionId: () => "session-1", getBranch: () => [] },
       ui: { select, custom, setStatus: vi.fn(), notify },
     } as unknown as ExtensionContext;

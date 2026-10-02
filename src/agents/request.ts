@@ -11,7 +11,7 @@ const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
 
 export const normalizeAgentRunRequest = (
   args: Record<string, unknown>,
-  defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; timeoutMs: number; inheritedModel?: {provider: string; id: string}; models?: {aliases?: FabricModelAliases}},
+  defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; timeoutMs: number; inheritedModel?: {provider: string; id: string}; inheritedThinking?: string | undefined; models?: {aliases?: FabricModelAliases}},
   options: {allowCwd?: boolean} = {},
 ): AgentRunRequest => {
   const transport =
@@ -23,29 +23,21 @@ export const normalizeAgentRunRequest = (
     args.transport === "herdr"
       ? args.transport
       : undefined;
-  // An explicit call or actor level always wins; otherwise an alias can carry
-  // the intended effort for the model it selects (e.g. a "cheap" alias that is
-  // both cheaper and shallower), and the global agents.thinking default applies
-  // last, inside the manager.
-  const requestedModel =
-    typeof args.model === "string"
-      ? args.model
-      : typeof defaults.model === "string"
-        ? defaults.model
-        : undefined;
-  const thinking = isFabricThinking(args.thinking)
-    ? args.thinking
-    : aliasThinking(defaults.models?.aliases, requestedModel ?? "");
-  const tools = stringArray(args.tools);
-  const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > defaults.timeoutMs ? args.timeoutMs : undefined;
   const runner =
     args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
       ? args.runner
       : defaults.runner;
-  const inheritedModel =
-    runner === "pi" && !defaults.model && defaults.inheritedModel
-      ? `${defaults.inheritedModel.provider}/${defaults.inheritedModel.id}`
-      : undefined;
+  const explicitModel = typeof args.model === "string" ? args.model.trim() || undefined : undefined;
+  // The caller's admitted Pi binding wins over package/workspace defaults, also in
+  // actor/task processes whose Main target is remote. Never infer from that target.
+  const inheritedModel = runner === "pi" && !explicitModel && defaults.inheritedModel
+    ? `${defaults.inheritedModel.provider}/${defaults.inheritedModel.id}` : undefined;
+  const requestedModel = explicitModel ?? inheritedModel ?? (runner === "pi" ? defaults.model : undefined);
+  const thinking = isFabricThinking(args.thinking) ? args.thinking
+    : inheritedModel && isFabricThinking(defaults.inheritedThinking) ? defaults.inheritedThinking
+    : aliasThinking(defaults.models?.aliases, requestedModel ?? "");
+  const tools = stringArray(args.tools);
+  const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > defaults.timeoutMs ? args.timeoutMs : undefined;
   const kernel = checkedKernel(args.kernel);
   const nice = parseAgentNice(args.nice);
   if (args.recursive === true && args.extensions === false) {
@@ -57,8 +49,8 @@ export const normalizeAgentRunRequest = (
     ...(kernel !== undefined ? { kernel } : {}),
     ...(typeof args.name === "string" ? { name: args.name } : {}),
     ...(transport ? { transport } : {}),
-    ...(typeof args.model === "string"
-      ? { model: args.model }
+    ...(explicitModel
+      ? { model: explicitModel }
       : inheritedModel
         ? { model: inheritedModel }
         : {}),

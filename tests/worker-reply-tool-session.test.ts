@@ -89,7 +89,21 @@ describe.skipIf(!built)("fabric_reply in a real Pi session with Fabric", () => {
       fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })),
       fauxAssistantMessage(fauxToolCall("fabric_reply", { action: "message", message: "Look at #85." })),
     ]);
+    const replyOrder: Array<{ role: string; replyExists: boolean }> = [];
+    const unsubscribe = session.subscribe(event => {
+      if (event.type !== "message_end") return;
+      const message = event.message;
+      if ((message.role === "assistant" && message.content.some(part => part.type === "toolCall" && part.name === "fabric_reply")) ||
+          (message.role === "toolResult" && message.toolName === "fabric_reply")) {
+        replyOrder.push({ role: message.role, replyExists: fs.existsSync(replyFile) });
+      }
+    });
     await session.prompt("an event");
+    unsubscribe();
+    expect(replyOrder).toEqual([
+      { role: "assistant", replyExists: false },
+      { role: "toolResult", replyExists: true },
+    ]);
     const results = session.messages.filter((message) => message.role === "toolResult")
       .map((message) => [(message as { toolName?: string }).toolName, (message as { isError?: boolean }).isError]);
     expect(results).toEqual([["fabric_exec", false], ["fabric_reply", false]]);

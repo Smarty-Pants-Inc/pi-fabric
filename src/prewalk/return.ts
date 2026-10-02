@@ -3,7 +3,8 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { CompactRequestIntent } from "../core/compact-controller.js";
-import { setModelSafely } from "./model-switch.js";
+import { assertPrewalkModelAllowed, setModelSafely, type PrewalkModelPolicy } from "./model-switch.js";
+import { FabricModelDeniedError } from "../core/model-policy.js";
 import { PREWALK_CONTINUE_MESSAGE_TYPE } from "./messages.js";
 import type {
   FabricPrewalkBorrowedMain,
@@ -14,10 +15,37 @@ import type {
 // continuation, restart-safe recovery from the persisted branch, and the
 // settle-on-return path. Session start and /fabric reload run this eagerly, so it
 // stays free of the boundary engine's executor dependencies.
-const modelForReturnKey = (key: string, context: ExtensionContext) => {
-  const separator = key.indexOf("/");
-  if (separator <= 0 || separator === key.length - 1) return undefined;
-  return context.modelRegistry.find(key.slice(0, separator), key.slice(separator + 1));
+const reportReturnRefusal = (context: ExtensionContext, key: string, error: unknown): never => {
+  if (error instanceof FabricModelDeniedError) {
+    context.ui.setStatus("fabric-prewalk", `return refused → ${key}`);
+    context.ui.notify(`Prewalk left Main on the executor: ${error.message}`, "error");
+  }
+  throw error;
+};
+const modelForReturnKey = (key: string, context: ExtensionContext, policy?: PrewalkModelPolicy) => {
+  try {
+    assertPrewalkModelAllowed(key, policy);
+    const separator = key.indexOf("/");
+    if (separator <= 0 || separator === key.length - 1) return undefined;
+    const model = context.modelRegistry.find(key.slice(0, separator), key.slice(separator + 1));
+    if (model) assertPrewalkModelAllowed(`${model.provider}/${model.id}`, policy);
+    return model;
+  } catch (error) {
+    return reportReturnRefusal(context, key, error);
+  }
+};
+const switchReturnModel = async (
+  extension: ExtensionAPI,
+  model: Parameters<ExtensionAPI["setModel"]>[0],
+  context: ExtensionContext,
+  key: string,
+  policy?: PrewalkModelPolicy,
+): Promise<boolean> => {
+  try {
+    return await setModelSafely(extension, model, policy, key);
+  } catch (error) {
+    return reportReturnRefusal(context, key, error);
+  }
 };
 
 const PREWALK_RETURN_COMPACTION_INSTRUCTIONS = [
@@ -26,6 +54,7 @@ const PREWALK_RETURN_COMPACTION_INSTRUCTIONS = [
 ].join(" ");
 
 export interface InPlacePrewalkSettleOptions {
+  policy?: PrewalkModelPolicy;
   // Enabled by default when a compact controller is provided.
   compactOnReturn?: boolean;
   compact?: {
@@ -75,6 +104,7 @@ export const restoreBorrowedInPlaceMain = async (
   controller: PrewalkController,
   extension: ExtensionAPI,
   context: ExtensionContext,
+  policy?: PrewalkModelPolicy,
 ): Promise<boolean> => {
   let borrowed = controller?.borrowedReturn?.();
   let recovered = false;
@@ -97,7 +127,13 @@ export const restoreBorrowedInPlaceMain = async (
   if (currentKey !== undefined && currentKey !== borrowed.executorModel) return false;
   if (currentKey === borrowed.returnModel) return false;
 
-  const model = modelForReturnKey(borrowed.returnModel, context);
+  let model: ReturnType<typeof modelForReturnKey>;
+  try {
+    model = modelForReturnKey(borrowed.returnModel, context, policy);
+  } catch (error) {
+    controller.cancel();
+    throw error;
+  }
   if (!model) {
     context.ui.setStatus("fabric-prewalk", `return failed → ${borrowed.returnModel}`);
     context.ui.notify(
@@ -107,7 +143,13 @@ export const restoreBorrowedInPlaceMain = async (
     return false;
   }
 
-  const restored = await setModelSafely(extension, model);
+  let restored: boolean;
+  try {
+    restored = await switchReturnModel(extension, model, context, borrowed.returnModel, policy);
+  } catch (error) {
+    controller.cancel();
+    throw error;
+  }
   if (!restored) {
     context.ui.setStatus("fabric-prewalk", `return failed → ${borrowed.returnModel}`);
     context.ui.notify(
@@ -131,7 +173,13 @@ export const settleInPlacePrewalk = async (
   const settlement = controller.takeContinuationSettlement(sessionId);
   if (!settlement) return false;
 
-  const model = modelForReturnKey(settlement.returnModel, context);
+  let model: ReturnType<typeof modelForReturnKey>;
+  try {
+    model = modelForReturnKey(settlement.returnModel, context, options?.policy);
+  } catch (error) {
+    controller.cancel();
+    throw error;
+  }
   if (!model) {
     // A failed return is not completion: dropping to the shared cancel path
     // disarms without re-arming while preserving borrowedReturn, so a later
@@ -163,7 +211,13 @@ export const settleInPlacePrewalk = async (
     }
     await options.compact.maybeCommit(context);
   }
-  const restored = await setModelSafely(extension, model);
+  let restored: boolean;
+  try {
+    restored = await switchReturnModel(extension, model, context, settlement.returnModel, options?.policy);
+  } catch (error) {
+    controller.cancel();
+    throw error;
+  }
   if (!restored) {
     // A failed return is not completion: dropping to the shared cancel path
     // disarms without re-arming while preserving borrowedReturn, so a later

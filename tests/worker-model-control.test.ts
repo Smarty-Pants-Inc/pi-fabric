@@ -48,6 +48,17 @@ describe("Pi model admission", () => {
     expect(invalidIo.fail).toHaveBeenCalledWith(expect.stringContaining("--no-auto-compaction"));
   });
 
+  it("requires a correlated startup fence for the resident probe even with the default model", () => {
+    const io = { send: vi.fn(), admitted: vi.fn(), observed: vi.fn(), fail: vi.fn() };
+    const control = new PiModelControl("probe", undefined, undefined, io, false, "strict", true);
+    control.start();
+    expect(io.admitted).not.toHaveBeenCalled();
+    const frame = io.send.mock.calls[0]![0];
+    expect(control.observe({ type: "response", id: "other", command: "get_state", success: true })).toBe(false);
+    expect(io.admitted).not.toHaveBeenCalled();
+    control.observe({ type: "response", id: frame.id, command: "get_state", success: true, data: {} });
+    expect(io.admitted).toHaveBeenCalledOnce();
+  });
   it.each([
     { autoCompactionEnabled: true },
     {},

@@ -460,7 +460,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           await context.reload();
           return;
         }
-        await restoreBorrowedInPlaceMain(state.prewalk, pi, context);
+        await restoreBorrowedInPlaceMain(state.prewalk, pi, context, () => state.config.agents);
         context.ui.notify("Pi Fabric reloaded", "info");
         // initialize() reloads configuration, so an externally edited
         // ui.toolDisplay must re-render existing transcript cards too.
@@ -541,7 +541,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
               state.prewalk.cancel();
               state.prewalkDrift.drop(context.sessionManager.getSessionId());
               context.ui.setStatus("fabric-prewalk", undefined);
-              await restoreBorrowedInPlaceMain(state.prewalk, pi, context);
+              await restoreBorrowedInPlaceMain(state.prewalk, pi, context, () => state.config.agents);
             }
             context.ui.notify(
               `Fabric prewalk ${enabled ? "enabled" : "disabled"} (${saved.scope}: ${saved.path})`,
@@ -559,7 +559,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           state.prewalk.cancel();
           state.prewalkDrift.drop(context.sessionManager.getSessionId());
           context.ui.setStatus("fabric-prewalk", undefined);
-          await restoreBorrowedInPlaceMain(state.prewalk, pi, context);
+          await restoreBorrowedInPlaceMain(state.prewalk, pi, context, () => state.config.agents);
           context.ui.notify("Fabric prewalk cancelled", "info");
           return;
         }

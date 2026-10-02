@@ -31,6 +31,7 @@ export class PiModelControl {
   private readonly requested: string | undefined;
   private readonly thinking: string | undefined;
   private readonly activationWindow: boolean;
+  private readonly startupFence: boolean;
   private readonly io: {
     send(frame: Record<string, unknown>): void;
     admitted(model?: string, thinking?: string): void;
@@ -45,6 +46,7 @@ export class PiModelControl {
     io: PiModelControl["io"],
     activationWindowOrAdmission: boolean | "strict" | "permissive" = false,
     admission: "strict" | "permissive" = "strict",
+    startupFence = false,
   ) {
     // Keep this module executable through Node's native type stripping too;
     // source workers must not rely on transform-only parameter properties.
@@ -54,10 +56,11 @@ export class PiModelControl {
     this.io = io;
     this.activationWindow = activationWindowOrAdmission === true;
     this.#admission = typeof activationWindowOrAdmission === "string" ? activationWindowOrAdmission : admission;
+    this.startupFence = startupFence;
   }
 
   start(): void {
-    if (!this.requested && !this.activationWindow) {
+    if (!this.requested && !this.activationWindow && !this.startupFence) {
       this.ready = true;
       this.io.admitted();
       return;

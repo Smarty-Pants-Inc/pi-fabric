@@ -183,6 +183,9 @@ export interface FabricAgentConfig {
   runner: FabricAgentRunner;
   transport: FabricAgentTransport;
   model?: string;
+  /** Host-only fleet policy; workspace configuration cannot override these keys. */
+  deniedModels: string[];
+  deniedModelReplacement?: string;
   claude: FabricClaudeRunnerConfig;
   veda: FabricVedaRunnerConfig;
   thinking: FabricThinking;
@@ -297,6 +300,8 @@ export interface FabricMeshConfig {
   maxEventBytes: number;
   maxReadEvents: number;
   actorPollMs: number;
+  /** Admission window for commands routed over a mesh bridge, minimum 30 s. */
+  bridgeControlTimeoutMs: number;
   actorQueueLimit: number;
   eventContextChars: number;
   actorContextEntries: number;
@@ -480,6 +485,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     enabled: true,
     runner: "pi",
     transport: "process",
+    deniedModels: [],
     claude: { binary: "claude" },
     veda: { binary: "veda", backend: "agy", persona: "navigator-chat" },
     thinking: DEFAULT_FABRIC_THINKING,
@@ -553,6 +559,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     maxEventBytes: 256 * 1024,
     maxReadEvents: 500,
     actorPollMs: 250,
+    bridgeControlTimeoutMs: 30_000,
     actorQueueLimit: 32,
     eventContextChars: 40_000,
     actorContextEntries: 14,
@@ -886,6 +893,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalkModel = stringValue(prewalk.model);
   const prewalkThinking = isFabricThinking(prewalk.thinking) ? prewalk.thinking : undefined;
   const agentModel = stringValue(agents.model);
+  const deniedModelReplacement = stringValue(agents.deniedModelReplacement)?.trim();
   const claudeBinary = stringValue(claude.binary);
   const claudeModel = stringValue(claude.model);
   const vedaBinary = stringValue(veda.binary);
@@ -1109,6 +1117,10 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       runner: runnerValue(agents.runner, DEFAULT_FABRIC_CONFIG.agents.runner),
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
       ...(agentModel ? { model: agentModel } : {}),
+      deniedModels: [...new Set((Array.isArray(agents.deniedModels) ? agents.deniedModels : [])
+        .filter((model): model is string => typeof model === "string" && !!model.trim())
+        .map((model) => model.trim().toLowerCase()))],
+      ...(deniedModelReplacement ? { deniedModelReplacement } : {}),
       claude: {
         binary: claudeBinary ?? DEFAULT_FABRIC_CONFIG.agents.claude.binary,
         ...(claudeModel ? { model: claudeModel } : {}),
@@ -1283,6 +1295,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.mesh.actorPollMs,
         50,
         10_000,
+      ),
+      bridgeControlTimeoutMs: boundedInteger(
+        mesh.bridgeControlTimeoutMs,
+        DEFAULT_FABRIC_CONFIG.mesh.bridgeControlTimeoutMs,
+        30_000,
+        300_000,
       ),
       actorQueueLimit: boundedInteger(
         mesh.actorQueueLimit,
@@ -1590,15 +1608,19 @@ const resolveFabricConfig = (
   applyEnvironmentOverrides: boolean,
 ): FabricConfig => {
   let merged = structuredClone(DEFAULT_FABRIC_CONFIG) as unknown as Record<string, unknown>;
-  const plans = [
-    planConfigFile(path.join(options.agentDir, "fabric.json")),
-    ...(includeProject
-      ? [planConfigFile(path.join(options.cwd, ".pi", "fabric.json"))]
-      : []),
-  ].filter((plan): plan is FabricConfigFilePlan => plan !== undefined);
-  for (const plan of plans) {
+  const hostPlan = planConfigFile(path.join(options.agentDir, "fabric.json"));
+  const projectPlan = includeProject ? planConfigFile(path.join(options.cwd, ".pi", "fabric.json")) : undefined;
+  for (const plan of [hostPlan, projectPlan]) {
+    if (!plan) continue;
     if (plan.changed) writeJsonAtomic(plan.path, plan.document, plan.source);
-    merged = mergeObjects(merged, plan.document);
+    const document = { ...plan.document };
+    if (plan === projectPlan) {
+      const agents = { ...objectValue(document.agents) };
+      delete agents.deniedModels;
+      delete agents.deniedModelReplacement;
+      document.agents = agents;
+    }
+    merged = mergeObjects(merged, document);
   }
   const inheritedKernel = process.env.PI_FABRIC_KERNEL;
   if (applyEnvironmentOverrides && inheritedKernel !== undefined) {

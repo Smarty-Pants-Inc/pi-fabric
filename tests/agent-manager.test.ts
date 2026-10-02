@@ -1741,6 +1741,40 @@ describe("AgentManager", () => {
   },
   30_000);
 
+  it.each(["terminal record", "settled result"])("joins process stop after a %s is available", async state => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    let release!: () => void;
+    const close = new Promise<void>(resolve => { release = resolve; });
+    const launch = ProcessTransport.prototype.launch;
+    const stop = vi.fn();
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const transport = await launch.call(new ProcessTransport(), request);
+      stop.mockImplementation(async () => { await close; await transport.stop(); });
+      return { ...transport, stop };
+    });
+    try {
+      const handle = await manager.spawn({ task: "HANG while publishing a terminal record", transport: "process" });
+      const statusFile = path.join(manager.runDirectory(handle.id)!, "status.json");
+      await vi.waitFor(() => expect(fs.existsSync(statusFile)).toBe(true), { timeout: 10_000 });
+      const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      writeJsonAtomic(statusFile, { ...record, status: "completed", text: "finished before native close", finishedAt: Date.now() });
+      if (state === "settled result") await manager.wait(handle.id);
+      let joined = false;
+      const stopping = manager.stop(handle.id).then(result => { joined = true; return result; });
+      await Promise.resolve();
+      expect(stop).toHaveBeenCalledOnce();
+      expect(joined, "terminal status is not proof of worker exit").toBe(false);
+      release();
+      expect(await stopping).toMatchObject({ status: "completed", text: "finished before native close" });
+      expect(joined).toBe(true);
+    } finally { release(); spy.mockRestore(); }
+  });
+
   it("never resumes a run an operator stopped, and aborts only unused runs", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

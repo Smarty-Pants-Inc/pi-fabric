@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
+import { terminateWindowsTree } from "../../child-process-tree.js";
 
 export interface ExecFileResult {
   stdout: string;
@@ -276,14 +277,27 @@ export const spawnDetached = async (
   // (and so relaunch) is about the worker itself.
   let exited = false;
   child.once("exit", () => { exited = true; });
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  let stopping: Promise<void> | undefined;
   child.unref();
   return {
     pid,
-    async stop() {
-      if (exited) return;
-      try {
-        process.kill(process.platform === "win32" ? pid : -pid, "SIGTERM");
-      } catch { /* process group already exited */ }
+    stop() {
+      return stopping ??= (async () => {
+        if (!exited) {
+          // Windows SIGTERM is a forceful parent-only kill, not a delivered
+          // signal: the worker cannot run its handler to stop native Pi. Join
+          // the owned tree before considering the worker's exit sufficient.
+          if (process.platform === "win32") await terminateWindowsTree(child);
+          else {
+            try { process.kill(-pid, "SIGTERM"); }
+            catch { /* process group already exited */ }
+          }
+        }
+        // Even a previously observed exit is not native close. In particular,
+        // callers must not remove the worker's cwd while its handles are open.
+        await closed;
+      })();
     },
     async isAlive() {
       if (exited) return false;

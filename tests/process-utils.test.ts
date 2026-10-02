@@ -1,9 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { spawnDetached } from "../src/agents/transports/process-utils.js";
+import { processIsAlive, spawnDetached } from "../src/agents/transports/process-utils.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 
 // Preserve native spawn, but capture its exact ChildProcess before it can close.
@@ -69,7 +70,10 @@ async function withOwnedWorker(
   }
 }
 
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+afterEach(async () => {
+  vi.restoreAllMocks(); vi.unstubAllEnvs();
+  vi.mocked(spawn).mockImplementation((await vi.importActual<typeof import("node:child_process")>("node:child_process")).spawn);
+});
 
 describe("process task role environment (#2998)", () => {
   it.each(["worktree-agent@0123456789ab", undefined])("sets the worker role before exec from parent %s and strips spawner role overrides", async (parentRole) => {
@@ -129,6 +133,72 @@ fs.writeFileSync("env.json", JSON.stringify({role:process.env.SMARTY_ROLE,overri
 });
 
 describe("spawnDetached", () => {
+  it("joins native close even after exit, without signalling a reused PID", async () => {
+    const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn() });
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess);
+    const handle = await spawnDetached("worker.mjs", [], process.cwd());
+    child.emit("exit", 0);
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    let stopped = false;
+    const stopping = handle.stop().then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    expect(kill).not.toHaveBeenCalled();
+    child.emit("close", 0);
+    await stopping;
+    expect(stopped).toBe(true);
+  });
+
+  it.each(["tree-first", "worker-first"])("Windows stop joins both the owned tree helper and worker close (%s)", async order => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn(), kill: vi.fn() });
+    const killer = Object.assign(new EventEmitter(), { pid: 5678, kill: vi.fn() });
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess).mockReturnValueOnce(killer as unknown as ChildProcess);
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      const handle = await spawnDetached("worker.mjs", [], process.cwd());
+      const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+      let stopped = false;
+      const first = handle.stop();
+      expect(handle.stop()).toBe(first); // one owned tree helper, not two
+      const stopping = first.then(() => { stopped = true; });
+      expect(spawn).toHaveBeenLastCalledWith("taskkill", ["/pid", "1234", "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      expect(kill).not.toHaveBeenCalled(); // never force-kill only the parent first
+      if (order === "tree-first") killer.emit("close", 0);
+      else { child.emit("exit", null); child.emit("close", null); }
+      await Promise.resolve(); await Promise.resolve();
+      expect(stopped).toBe(false);
+      if (order === "tree-first") { child.emit("exit", null); child.emit("close", null); }
+      else killer.emit("close", 0);
+      await stopping;
+      expect(stopped).toBe(true);
+      expect(await handle.isAlive()).toBe(false);
+      expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      killer.emit("close", 0); child.emit("close", null);
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
+
+  it("stop returns only after the worker and its native child have exited", async () => {
+    await withOwnedWorker(`import fs from "node:fs";
+import { spawn } from "node:child_process";
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+child.once("spawn", () => fs.writeFileSync("native-pid", String(child.pid)));
+process.on("SIGTERM", () => {
+  child.once("close", () => process.exit(0));
+  child.kill("SIGTERM");
+});`, async (handle, root, child) => {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(root, "native-pid"))).toBe(true), { timeout: 10_000 });
+      const nativePid = Number(fs.readFileSync(path.join(root, "native-pid"), "utf8"));
+      expect(processIsAlive(nativePid)).toBe(true);
+      let closed = false;
+      child.once("close", () => { closed = true; });
+      await handle.stop();
+      expect(closed).toBe(true);
+      expect(processIsAlive(nativePid), "native child must not retain the worker cwd").toBe(false);
+    });
+  });
   // dev-lead review D7 on #26: after the worker exited, its numeric id may name an
   // unrelated process (group); stop and liveness must not act on it.
   it("neither signals nor reports alive a worker id after the worker exited, even if the id is reused", async () => {
@@ -154,8 +224,14 @@ describe("spawnDetached", () => {
       expect(child.signalCode).toBeNull();
       kill.mockImplementation(() => true); // the number now names another process
       expect(await handle.isAlive()).toBe(false);
-      await handle.stop();
+      let stopped = false;
+      const stopping = handle.stop().then(() => { stopped = true; });
+      await Promise.resolve();
+      expect(stopped).toBe(false); // the false probe is not native close
       expect(kill).toHaveBeenCalledTimes(1); // only the first probe; no signal
+      kill.mockRestore();
+      child.kill("SIGTERM");
+      await stopping;
     });
   });
 

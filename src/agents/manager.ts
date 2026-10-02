@@ -1847,10 +1847,16 @@ export class AgentManager {
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
     managed.stopRequested = true;
-    if (managed.settled) return this.wait(id);
+    if (managed.settled) {
+      // A terminal result can be published just before native worker close.
+      // Explicit process stop still owes its caller that exit join.
+      if (managed.transport.kind === "process") await managed.transport.stop();
+      return this.wait(id);
+    }
     managed.background = false;
     const existing = readRecord(managed.statusFile);
     if (existing && terminalStatuses.has(existing.status)) {
+      if (managed.transport.kind === "process") await managed.transport.stop();
       const result = this.#withTransportMetadata(existing, managed) as AgentRunResult;
       this.#settle(managed, result);
       return result;

@@ -29,6 +29,14 @@ Standard output is one JSON array of `FabricParticipantInfo` objects
 ([src/topology/types.ts](../src/topology/types.ts)), sorted by `startedAt`, then `name`, then `id`.
 An empty mesh prints `[]`.
 
+Set a root Main's display/lookup name with Pi's `/name <name>` (for example,
+`/name lucky-ios-lead`). Fabric publishes the trimmed session name in participants and
+`agents.peers()`, and republishes renames on its next presence heartbeat (normally within
+5 seconds). Names follow the actor participant rules: 1–60 ASCII characters, starting
+with a letter or digit, then letters, digits, spaces, `_`, `.`, or `-`; an unset or invalid
+name falls back to `main`. Stable peer labels and participant IDs do not change: names
+are display/lookup aids, never authority.
+
 | Field | Always | Meaning |
 | --- | --- | --- |
 | `id` | yes | Participant id. A root is `session:<session id>`. |

@@ -68,6 +68,8 @@ import { deliveryRoot, projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { canRemoveTerminalRun } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
+import { ResidentRequestRetention } from "./retention.js";
+import { assertResidentRequestNotExpired, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 
 export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 
@@ -155,6 +157,13 @@ const testResidentRequestDelay = async (stage: "before_commit" | "after_commit")
 const atomicWrite = (filePath: string, value: unknown): void => {
   writeJsonAtomic(filePath, value, { space: 2 });
 };
+
+const residentActorRoots = (config: ResidentHostConfig): { project: string; session: string } =>
+  config.sessionActorRoot
+    ? { project: config.actorRoot, session: config.sessionActorRoot }
+    : config.mesh.actorScope === "session"
+      ? { project: path.dirname(config.actorRoot), session: config.actorRoot }
+      : { project: config.actorRoot, session: path.join(config.actorRoot, config.sessionId) };
 
 const readJson = <T>(filePath: string): T | undefined => {
   try {
@@ -247,6 +256,7 @@ export class ResidentHost {
   #started = false;
   #idleSince = Date.now();
   #admissions = 0;
+  readonly #requestRetention: ResidentRequestRetention;
   #handover: ResidentHandoverPlan | undefined;
   #advancingRelease = false;
   #staged = false;
@@ -273,6 +283,8 @@ export class ResidentHost {
     this.#agentsPath = path.join(config.residencyRoot, "agents");
     this.#removalsPath = residentRemovalsPath(config.residencyRoot);
     this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
+    this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
+      [...new Set(Object.values(residentActorRoots(config)))]);
   }
 
   #initialize(): void {
@@ -402,11 +414,7 @@ export class ResidentHost {
     };
     const lineageAlive = (rootId: string): boolean =>
       this.participants.get(rootId) !== undefined;
-    const actorRoots = config.sessionActorRoot
-      ? { project: config.actorRoot, session: config.sessionActorRoot }
-      : config.mesh.actorScope === "session"
-        ? { project: path.dirname(config.actorRoot), session: config.actorRoot }
-        : { project: config.actorRoot, session: path.join(config.actorRoot, config.sessionId) };
+    const actorRoots = residentActorRoots(config);
     this.actors = new ActorDirectory([
       config.sessionId,
       this.identity,
@@ -529,6 +537,7 @@ export class ResidentHost {
         readyAt: now,
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
+        requestExpiry: 1,
         creationIdempotency: 1,
         ...(this.launch ? { releaseRoot: this.launch.spec.releaseRoot, configDigest: this.launch.spec.digest,
           handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
@@ -556,6 +565,7 @@ export class ResidentHost {
     this.#closed = true;
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
+    this.#requestRetention.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
     const actorsClosed = this.actors?.close();
     while (this.#pollingRequests || this.#admissions) await delay(10);
@@ -810,8 +820,26 @@ export class ResidentHost {
       }
     } finally {
       this.#pollingRequests = false;
+      this.#maintainRequests();
       this.#checkIdle();
     }
+  }
+
+  #maintainRequests(): void {
+    const now = Date.now();
+    if (this.#closed || !this.#requestRetention.due(now)) return;
+    const live = this.agents.retentionReferences();
+    for (const id of this.actors.inFlightActorIds()) live.add(id);
+    const stoppedWritersGone = new Set<string>();
+    for (const actor of this.actors.listOwned()) {
+      if (actor.status !== "stopped" || actor.inFlightRun) live.add(actor.id);
+      else if (!live.has(actor.id) && !live.has("*")) stoppedWritersGone.add(actor.id);
+    }
+    for (const removal of this.actors.pendingRemovals()) {
+      live.add(removal.id);
+      if (removal.runId) live.add(removal.runId);
+    }
+    this.#requestRetention.sweep(now, live, 5, stoppedWritersGone);
   }
 
   #checkIdle(): void {
@@ -998,12 +1026,13 @@ export class ResidentHost {
     let response: ResidentCommandResponse;
     try {
       if (
-        (command?.format !== RESIDENT_HOST_FORMAT && command?.format !== RESIDENT_ACTOR_COMMAND_FORMAT) ||
+        (command?.format !== RESIDENT_HOST_FORMAT && command?.format !== RESIDENT_ACTOR_COMMAND_FORMAT && command?.format !== RESIDENT_EXPIRING_COMMAND_FORMAT) ||
         command.rootId !== this.config.rootId ||
         command.requestId !== requestId
       ) {
         throw new Error("Invalid Fabric residency request");
       }
+      assertResidentRequestNotExpired(this.config.residencyRoot, requestId, command.format);
       // Validate the runtime JSON discriminant before any actor lookup/mutation.
       if (!isResidentCommandOperation(command.operation)) {
         throw new ResidentCommandUnsupportedError(`Unsupported Fabric residency command: ${String(command.operation)}`);
@@ -1014,7 +1043,8 @@ export class ResidentHost {
       response = await this.#executeOnce(command);
     } catch (error) {
       response = { format: RESIDENT_HOST_FORMAT, requestId, ok: false, error: errorMessage(error),
-        ...(error instanceof ResidentCommandUnsupportedError ? { errorCode: error.code } : {}), completedAt: Date.now() };
+        ...(error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
+          ? { errorCode: error.code } : {}), completedAt: Date.now() };
     }
     if (response.ok) await testResidentRequestDelay("after_commit");
     const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
@@ -1220,7 +1250,7 @@ export class ResidentHost {
         requestId,
         ok: false,
         error: errorMessage(error),
-        ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError
+        ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
           ? { errorCode: error.code } : {}),
         ...(error instanceof FabricModelDeniedError ? {
           errorCode: error.code, modelDenied: { model: error.model, ...(error.replacement ? { replacement: error.replacement } : {}) },

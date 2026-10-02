@@ -22,7 +22,7 @@ const stat = (start: string) => `${process.pid} (pi (with spaces)) ${["S", "1", 
 const birth = (start?: string) => {
   const read = fs.readFileSync.bind(fs);
   vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
-    if (String(file) === `/proc/${process.pid}/stat`) {
+    if (String(file) === path.join("/proc", String(process.pid), "stat")) {
       if (start === undefined) throw new Error("unavailable birth identity");
       return stat(start);
     }
@@ -37,6 +37,16 @@ describe("observational Main release records", () => {
     fs.writeFileSync(path.join(root, "123", "stat"), stat("9876"));
     expect(processStart(123, root)).toBe("9876");
     expect(processStart(456, root)).toBeUndefined();
+  });
+
+  it("matches the birth fixture under win32 proc path semantics", () => {
+    const join = path.join.bind(path);
+    const win32Join = path.win32.join;
+    vi.spyOn(path, "join").mockImplementation((...parts) =>
+      parts[0] === "/proc" ? win32Join(...parts) : join(...parts));
+    birth("9876");
+    expect(processStart(process.pid)).toBe("9876");
+    expect(fs.readFileSync).toHaveBeenCalledWith(win32Join("/proc", String(process.pid), "stat"), "utf8");
   });
 
   it("atomically records the loaded root, session and birth identity in the selected profile", () => {

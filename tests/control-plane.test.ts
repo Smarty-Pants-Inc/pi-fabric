@@ -29,7 +29,7 @@ const plane = (
   meshRoot: string,
   id: string,
   storeOptions: MeshStoreOptions = {},
-  controlOptions: Pick<FabricControlPlaneOptions, "pollMs" | "acknowledgementTimeoutMs" | "readMirroredOwner"> = {},
+  controlOptions: Pick<FabricControlPlaneOptions, "pollMs" | "acknowledgementTimeoutMs" | "bridgeTimeoutMs" | "readMirroredOwner"> = {},
 ): FabricControlPlane => {
   const value = new FabricControlPlane(
     new MeshStore(meshRoot, 64 * 1024, 1_000, storeOptions),
@@ -169,7 +169,12 @@ describe("FabricControlPlane", () => {
 
     it("names a healthy bridge with a lost ACK without claiming link death or retry safety", async () => {
       const f = await setup(100);
-      const { error } = await settle(f.sender.request("host:owner", "agent:target", "followUp", {}, "identity:owner"));
+      vi.useFakeTimers();
+      const outcome = settle(f.sender.request("host:owner", "agent:target", "followUp", {}, "identity:owner"));
+      await vi.advanceTimersByTimeAsync(45_000);
+      const { error } = await outcome;
+      await f.sender.close();
+      vi.useRealTimers();
       expect(error?.message).toContain("Fabric mesh bridge to remote host forge is not responding for agent:target");
       expect(error?.message).toContain(unknown);
       expect(error?.message).not.toMatch(/lapsed|is down|not run/i);
@@ -193,17 +198,19 @@ describe("FabricControlPlane", () => {
       await f.once(0);
     });
 
-    it.each(["lapse", "abort", "close"] as const)("settles %s during publish without waiting, then cancels the committed command once", async (winner) => {
+    it.each(["lapse", "abort", "close"] as const)("settles %s during publish completion without waiting, then cancels the committed command once", async (winner) => {
       const f = await setup();
       const controller = new AbortController();
       const publish = f.sender.mesh.publish.bind(f.sender.mesh);
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
       vi.spyOn(f.sender.mesh, "publish").mockImplementation(async (input) => {
+        const event = await publish(input);
         if (input.topic === "fabric.control.command" && input.kind === "ask") await gate;
-        return publish(input);
+        return event;
       });
       const outcome = settle(f.sender.requestResult("host:owner", "agent:target", "ask", {}, "identity:owner", { signal: controller.signal }));
+      await vi.waitFor(() => expect(f.sender.mesh.read({ topic: "fabric.control.command" }).some(event => event.kind === "ask")).toBe(true));
       if (winner === "lapse") f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
       if (winner === "abort") controller.abort();
       if (winner === "close") await f.sender.close();
@@ -276,12 +283,14 @@ describe("FabricControlPlane", () => {
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
       vi.spyOn(f.sender.mesh, "publish").mockImplementation(async (input) => {
+        const event = await publish(input);
         if (input.topic === "fabric.control.command" && input.kind === "ask") await gate;
-        return publish(input);
+        return event;
       });
       const outcome = settle(f.sender.requestResult("host:owner", "agent:target", "ask",
         { message: "private", data: { destinationRemoteHost: "ryzen2" } }, "identity:owner",
         { signal: controller.signal, routedRemoteHost }));
+      await vi.waitFor(() => expect(f.sender.mesh.read({ topic: "fabric.control.command" }).some(event => event.kind === "ask")).toBe(true));
       try {
         f.setLease({ remoteHost: "ryzen2", expiresAt: Date.now() + 60_000 });
         controller.abort();
@@ -404,7 +413,7 @@ describe("FabricControlPlane", () => {
   describe("mirrored message admission budget (production path, fake clock)", () => {
     // The transport gate models the mesh lock; request admission, timers, ACK authority,
     // cancellation and log consumption all run through the production control plane.
-    const setup = async (blocked = false, mirror = true, port = true) => {
+    const setup = async (blocked = false, mirror = true, port = true, bridgeTimeoutMs = 30_000) => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-budget-"));
       roots.push(root);
       let lease = mirror ? { remoteHost: "forge", expiresAt: Date.now() + 15_000 } : undefined;
@@ -414,7 +423,7 @@ describe("FabricControlPlane", () => {
         return lease;
       });
       const sender = plane(path.join(root, "mesh"), "host:sender", {}, {
-        acknowledgementTimeoutMs: 5_000,
+        acknowledgementTimeoutMs: 5_000, bridgeTimeoutMs,
         ...(port ? { readMirroredOwner } : {}),
       });
       // Obtain the transport envelope without depending on its private shape.
@@ -466,20 +475,32 @@ describe("FabricControlPlane", () => {
       (value) => ({ value, error: undefined }), (error: Error) => ({ value: undefined, error }),
     );
 
-    it.each(["steer", "followUp"] as const)("settles %s at admission + 9 s during a 10 s lock, even with failed reads", async (operation) => {
+    it.each([[1, 30_000], [60_000, 60_000]])("uses configured bridge window %i, floored to %i ms", async (configured, expected) => {
+      const f = await setup(false, true, true, configured);
+      try {
+        const outcome = f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner");
+        await vi.advanceTimersByTimeAsync(0);
+        const cmd = f.commands()[0]!.data as FabricControlCommand;
+        expect(cmd.deadlineAt! - cmd.requestedAt).toBe(expected);
+        await f.ack();
+        await expect(outcome).resolves.toMatchObject({ acknowledged: true });
+      } finally { await f.dispose(); }
+    });
+
+    it.each(["steer", "followUp"] as const)("settles %s at admission + 45 s during a 46 s lock, even with failed reads", async (operation) => {
       const f = await setup(true);
       try {
         let settled = false;
         const outcome = settle(f.sender.request("host:owner", "agent:target", operation, {}, "identity:owner"))
           .then((value) => { settled = true; return value; });
         f.failReads(); // Still-live 15 s captured lease; no lapse evidence and no readable directory.
-        await vi.advanceTimersByTimeAsync(8_999);
+        await vi.advanceTimersByTimeAsync(44_999);
         expect(settled).toBe(false);
         expect(f.commands()).toHaveLength(0);
         await vi.advanceTimersByTimeAsync(1);
         expect(settled).toBe(true);
         const { error } = await outcome;
-        expect(Date.now() - f.admittedAt).toBe(9_000);
+        expect(Date.now() - f.admittedAt).toBe(45_000);
         expect(error?.constructor).toBe(Error);
         expect(error?.message).toBe("Fabric mesh bridge to remote host forge is not responding for agent:target; the outcome is unknown and it may still be delivered, so a retry can deliver it twice.");
         expect(error).not.toHaveProperty("notRun");
@@ -490,8 +511,9 @@ describe("FabricControlPlane", () => {
         await vi.advanceTimersByTimeAsync(0);
         expect(f.commands().map((event) => event.kind)).toEqual([operation, "cancel"]);
         const [command, cancellation] = f.commands().map((event) => event.data as FabricControlCommand);
-        expect(command).toMatchObject({ requestedAt: f.admittedAt + 10_000, deadlineAt: f.admittedAt + 15_000, destinationRemoteHost: "forge" });
+        expect(command).toMatchObject({ requestedAt: f.admittedAt + 46_000, deadlineAt: f.admittedAt + 76_000, destinationRemoteHost: "forge" });
         expect(cancellation).toMatchObject({ cancelCommandId: command!.commandId, destinationRemoteHost: "forge" });
+        expect(cancellation!.deadlineAt! - cancellation!.requestedAt).toBe(30_000);
         await f.ack(); // Original ACK is too late and cannot revive the settled request.
         expect(await outcome).toEqual({ value: undefined, error });
         await f.sender.close();
@@ -500,7 +522,7 @@ describe("FabricControlPlane", () => {
       } finally { await f.dispose(); }
     });
 
-    it("allows the original ACK inside 9 s despite replacement, and clears the prearmed timer", async () => {
+    it("allows the original ACK inside the bridge budget despite replacement, and clears the prearmed timer", async () => {
       const f = await setup();
       try {
         let settled = false;
@@ -519,11 +541,12 @@ describe("FabricControlPlane", () => {
       } finally { await f.dispose(); }
     });
 
-    it("does not let same-origin renewal extend the 9 s budget", async () => {
+    it("does not let same-origin renewal extend the 45 s bridge budget", async () => {
       const f = await setup();
       try {
+        f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 120_000 });
         const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner"));
-        await vi.advanceTimersByTimeAsync(8_000);
+        await vi.advanceTimersByTimeAsync(44_000);
         f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 60_000 });
         await vi.advanceTimersByTimeAsync(1_000);
         expect((await outcome).error?.message).toContain("is not responding");
@@ -574,7 +597,7 @@ describe("FabricControlPlane", () => {
         await vi.advanceTimersByTimeAsync(0);
         const command = f.commands()[0]!.data as FabricControlCommand;
         expect(command.requestedAt).toBe(f.admittedAt + 10_000);
-        expect(command.deadlineAt).toBe(command.requestedAt + (mode === "ask" || mode === "result-message" ? 60_000 : 5_000));
+        expect(command.deadlineAt).toBe(command.requestedAt + (mode === "ask" || mode === "result-message" ? 60_000 : mirrored ? 30_000 : 5_000));
         if (mode === "legacy") expect(command).not.toHaveProperty("destinationRemoteHost");
         if (mode === "native") expect(command.destinationRemoteHost).toBeNull();
         // Native/stop ACKs after their wire deadline still get the original grace.
@@ -1182,6 +1205,39 @@ describe("FabricControlPlane", () => {
     expect(observe).not.toHaveBeenCalled();
   });
 
+  it("round-trips boolean trigger receipts without inventing a legacy or malformed report", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-trigger-"));
+    roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender");
+    const receiver = plane(path.join(root, "mesh"), "host:receiver");
+    const reports = [true, false, undefined, "true", 1];
+    sender.start(() => ({ accepted: false }));
+    receiver.start(() => ({ accepted: true, triggered: reports.shift() } as never));
+    for (const report of [true, false, undefined, undefined, undefined]) {
+      const receipt = await sender.request("host:receiver", "session:main", "followUp", { message: "hello" });
+      if (report === undefined) expect(receipt).not.toHaveProperty("triggered");
+      else expect(receipt.triggered).toBe(report);
+    }
+  });
+
+  it("round-trips held wake reasons through control ACKs and validates malformed reports", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-backoff-")); roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender");
+    const receiver = plane(path.join(root, "mesh"), "host:receiver");
+    const reason = "provider-backoff until 2026-10-01T08:35:16.663Z";
+    const reports = [
+      { triggered: false, reason }, { triggered: true, reason },
+      { reason }, { triggered: false, reason: 123 }, { triggered: false, reason: "x".repeat(201) },
+    ];
+    sender.start(() => ({ accepted: false }));
+    receiver.start(() => ({ accepted: true, ...reports.shift() } as never));
+    for (const expectedReason of [reason, undefined, undefined, undefined, undefined]) {
+      const receipt = await sender.request("host:receiver", "session:main", "followUp", { message: "held" });
+      if (expectedReason) expect(receipt).toMatchObject({ triggered: false, reason: expectedReason });
+      else expect(receipt).not.toHaveProperty("reason");
+    }
+  });
+
   // smarty-dev#1495: a followUp through the owner reports the target Main's queue, so the
   // sender can switch to steer; a malformed count from the owner is dropped, not passed on.
   it("passes the owner's followUp queue depth to the sender, and drops a malformed one", async () => {
@@ -1606,22 +1662,27 @@ describe("FabricControlPlane", () => {
     await vi.waitFor(() => expect(askAborted).toBe(true));
   });
 
-  it("publishes an immediately cancelled command before its cancellation", async () => {
+  it("fences an immediately cancelled command before mesh admission", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
     const sender = plane(meshRoot, "host:sender");
     const receiver = plane(meshRoot, "host:receiver");
     const publish = sender.mesh.publish.bind(sender.mesh);
+    let release!: () => void, finish!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const finished = new Promise<void>(resolve => { finish = resolve; });
     vi.spyOn(sender.mesh, "publish").mockImplementation(async (input) => {
-      if (input.topic === "fabric.control.command" && input.kind === "ask") {
-        await new Promise((resolve) => setTimeout(resolve, 60));
-      }
-      return publish(input);
+      try {
+        if (input.topic === "fabric.control.command" && input.kind === "ask") await gate;
+        return await publish(input);
+      } finally { finish(); }
     });
     let ownerAborted = false;
+    let ownerEntered = false;
     receiver.start((command, _from, signal) => {
       if (command.operation !== "ask") return { accepted: true };
+      ownerEntered = true;
       return new Promise((resolve) => {
         signal.addEventListener("abort", () => {
           ownerAborted = true;
@@ -1643,12 +1704,11 @@ describe("FabricControlPlane", () => {
     controller.abort();
 
     await expect(request).rejects.toThrow("Remote Fabric request cancelled");
-    await vi.waitFor(() => expect(ownerAborted).toBe(true));
-    const kinds = new MeshStore(meshRoot, 64 * 1024, 1_000)
-      .tail(0, 10)
-      .events.filter((event) => event.topic === "fabric.control.command")
-      .map((event) => event.kind);
-    expect(kinds.indexOf("ask")).toBeLessThan(kinds.indexOf("cancel"));
+    release(); await finished;
+    const commands = new MeshStore(meshRoot, 64 * 1024, 1_000).read({ topic: "fabric.control.command" });
+    expect(commands).toHaveLength(0);
+    expect(ownerAborted).toBe(false);
+    expect(ownerEntered).toBe(false);
   });
 
   it("retains a completed ask outcome through its request deadline", async () => {

@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -457,342 +457,163 @@ describe("modern resident host retirement fence", () => {
   };
 
   for (const scope of ["project", "session"] as const) {
-    it.each(["mesh", "control", "lifecycle", "closing-control"] as const)(`retains %s events across non-critical retirement quiescence in ${scope} scope without cancel/replay`, { timeout: 15_000 }, async (delivery) => {
-      const state = await rootHarness(`retirement-${scope}-${delivery}`);
+    it.each(["mesh", "control", "lifecycle", "closing-control"] as const)(`defers installer drain and keeps %s events serving in ${scope} scope without cancel/replay`, { timeout: 15_000 }, async delivery => {
+      const state = await rootHarness(`deferred-${scope}-${delivery}`);
       const release = nonCriticalRelease(state);
-      const oldController = new AbortController(), newController = new AbortController();
-      let releaseQuiescence!: () => void;
-      const quiescence = new Promise<void>(resolve => { releaseQuiescence = resolve; });
-      let retiring = false;
-      const originalQuiesce = ParticipantDirectory.prototype.quiesce;
-      const quiesce = vi.spyOn(ParticipantDirectory.prototype, "quiesce").mockImplementation(async function (this: ParticipantDirectory) {
-        if (this !== state.participants && !retiring) {
-          retiring = true;
-          await quiescence;
-        }
-        return originalQuiesce.call(this);
-      });
-      let releaseControl!: () => void;
-      const controlGate = new Promise<void>(resolve => { releaseControl = resolve; });
-      let closingControl = false;
-      const originalControlClose = FabricControlPlane.prototype.close;
-      const closeControl = vi.spyOn(FabricControlPlane.prototype, "close").mockImplementation(async function (this: FabricControlPlane) {
-        if (delivery === "closing-control" && this.options.hostId === residentHostId(state.identity.id) && !closingControl) {
-          closingControl = true; await controlGate;
-        }
-        return originalControlClose.call(this);
-      });
-      const admitted = vi.spyOn(AgentManager.prototype, "run");
-      const originalLaunch = ProcessTransport.prototype.launch;
-      const cancelled: string[] = [];
-      const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
-        request.signal?.addEventListener("abort", () => cancelled.push(request.id), { once: true });
-        return originalLaunch.call(this, request);
-      });
-      const oldHost = runResidentHostFromConfigPath(release.configPath, oldController.signal);
-      let newHost: Promise<void> | undefined;
-      const client = new ResidencyClient({ config: release.oldConfig, mesh: state.mesh,
-        participants: state.participants, mainAgent: state.mainAgent });
+      const controller = new AbortController();
+      const running = runResidentHostFromConfigPath(release.configPath, controller.signal);
+      const client = new ResidencyClient({ config: release.oldConfig, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+      const next = new ResidencyClient({ config: release.newConfig, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
       const control = new FabricControlPlane(state.mesh, state.identity, { enabled: true, hostId: state.identity.id, pollMs: 20 });
-      const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants,
-        { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+      const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants, { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
       control.start(async () => ({ accepted: false }));
+      const quiesce = vi.spyOn(ParticipantDirectory.prototype, "quiesce");
+      const closing = vi.spyOn(FabricControlPlane.prototype, "close");
+      const ownerPath = path.join(state.config.residencyRoot, "owner.json");
       try {
-        await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
-        const actor = await client.createActor({ name: "retained event", instructions: "Reply", scope, residency: "durable",
-          topics: ["retirement-fence"], responseMode: "text", delivery: "mailbox", coalesce: false });
+        await waitFor(() => fs.existsSync(ownerPath)); const owner = fs.readFileSync(ownerPath, "utf8");
+        const actor = await client.createActor({ name: "still serving", instructions: "Reply", scope, residency: "durable", topics: ["deferred-release"], responseMode: "text", delivery: "mailbox", coalesce: false });
         const actorRoot = scope === "project" ? state.config.actorRoot : state.config.sessionActorRoot!;
         if (delivery === "lifecycle") {
           await waitFor(() => !!state.participants.get(actor.id, Date.now(), { fresh: true }));
-          await lifecycle.subscribe({ from: state.identity.id, to: actor.id, events: ["pi.agent_end"],
-            delivery: "followUp", triggerTurn: true });
+          await lifecycle.subscribe({ from: state.identity.id, to: actor.id, events: ["pi.agent_end"], delivery: "followUp", triggerTurn: true });
         }
-        release.reload();
-        await waitFor(() => retiring); // onIdle decided; close is held before lifecycle/actors close.
-        if (delivery === "closing-control") {
-          releaseQuiescence();
-          await waitFor(() => closingControl);
-        }
-        if (delivery === "mesh") {
-          await state.mesh.publish({ topic: "retirement-fence", kind: "regression", from: state.identity, text: "LIVE_WITH_PROGRESS consume once" });
-        } else if (delivery === "control" || delivery === "closing-control") {
-          await control.request(residentHostId(state.identity.id), actor.id, "followUp",
-            { message: "LIVE_WITH_PROGRESS consume once" }, residentHostId(state.identity.id));
-        } else {
-          await lifecycle.publish({ source: { id: state.identity.id, name: "main", kind: "root", rootId: state.identity.id, runner: "pi",
-            ownerHostId: state.identity.id, ownerIdentityId: state.identity.id },
-            event: "pi.agent_end", data: { message: "LIVE_WITH_PROGRESS consume once" } });
-        }
-        await waitFor(() => queueItems(actorRoot, actor.id).length === 1);
-        await delay(100); // Give every delivery path time to try to start its drain.
-        expect(admitted).not.toHaveBeenCalled();
-        expect(cancelled).toEqual([]);
-        expect(queueItems(actorRoot, actor.id)[0]?.attempts).toBe(0);
-        releaseQuiescence(); releaseControl();
-        await oldHost;
-        expect(cancelled).toEqual([]);
-        expect(outputs(actorRoot, actor.id)).toHaveLength(0);
-        newHost = runResidentHostFromConfigPath(release.configPath, newController.signal);
+        release.reload(); await next.reconcileRelease();
+        expect(JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "handover-deferred.json"), "utf8")).reason).toBe("Legacy resident host/launcher has no release custody protocol; installer drain required");
+        if (delivery === "mesh") await state.mesh.publish({ topic: "deferred-release", kind: "regression", from: state.identity, text: "consume once" });
+        else if (delivery === "lifecycle") await lifecycle.publish({ source: { id: state.identity.id, name: "main", kind: "root", rootId: state.identity.id, runner: "pi", ownerHostId: state.identity.id, ownerIdentityId: state.identity.id }, event: "pi.agent_end", data: { message: "consume once" } });
+        else await control.request(residentHostId(state.identity.id), actor.id, "followUp", { message: "consume once" }, residentHostId(state.identity.id));
         await waitFor(() => outputs(actorRoot, actor.id).length === 1);
         await waitFor(() => queueItems(actorRoot, actor.id).length === 0);
-        await delay(100);
-        expect(admitted).toHaveBeenCalledTimes(1);
-        expect(outputs(actorRoot, actor.id)).toHaveLength(1);
-        expect(cancelled).toEqual([]);
+        expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+        expect(quiesce).not.toHaveBeenCalled();
+        expect(closing).not.toHaveBeenCalled(); // Former closing-control boundary: no automatic close begins.
       } finally {
-        releaseQuiescence(); releaseControl(); oldController.abort(); newController.abort();
-        await Promise.all([oldHost, newHost]);
-        admitted.mockRestore(); launch.mockRestore(); quiesce.mockRestore(); closeControl.mockRestore();
-        await Promise.all([client.close(), control.close(), lifecycle.close(), state.participants.close()]);
+        controller.abort(); await running;
+        await Promise.all([client.close(), next.close(), control.close(), lifecycle.close(), state.participants.close()]);
+        quiesce.mockRestore(); closing.mockRestore();
       }
     });
 
-    it(`finishes an in-progress ${scope} run naturally before retirement and retains the next activation`, { timeout: 15_000 }, async () => {
-      const state = await rootHarness(`retirement-live-${scope}`);
-      const release = nonCriticalRelease(state);
-      const oldController = new AbortController(), newController = new AbortController();
-      const oldHost = runResidentHostFromConfigPath(release.configPath, oldController.signal);
-      let newHost: Promise<void> | undefined;
-      const client = new ResidencyClient({ config: release.oldConfig, mesh: state.mesh,
-        participants: state.participants, mainAgent: state.mainAgent });
-      const admitted = vi.spyOn(AgentManager.prototype, "run");
-      const retirementChecks = vi.spyOn(AgentManager.prototype, "listForUi");
-      let quiescing = false;
-      let releaseQuiescence!: () => void;
-      const gate = new Promise<void>(resolve => { releaseQuiescence = resolve; });
-      const originalQuiesce = ParticipantDirectory.prototype.quiesce;
-      const quiesce = vi.spyOn(ParticipantDirectory.prototype, "quiesce").mockImplementation(async function (this: ParticipantDirectory) {
-        if (this !== state.participants && !quiescing) {
-          quiescing = true; await gate;
-        }
-        return originalQuiesce.call(this);
-      });
+    it(`finishes an in-progress ${scope} run naturally and serves the next activation while installer drain is deferred`, { timeout: 15_000 }, async () => {
+      const state = await rootHarness(`deferred-live-${scope}`); const release = nonCriticalRelease(state);
+      const controller = new AbortController(); const running = runResidentHostFromConfigPath(release.configPath, controller.signal);
+      const client = new ResidencyClient({ config: release.oldConfig, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+      const next = new ResidencyClient({ config: release.newConfig, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+      const admitted = vi.spyOn(AgentManager.prototype, "run"); const ownerPath = path.join(state.config.residencyRoot, "owner.json");
       try {
-        await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
-        const actor = await client.createActor({ name: "natural completion", instructions: "Reply", scope, residency: "durable",
-          topics: ["retirement-live"], responseMode: "text", delivery: "mailbox", coalesce: false });
+        await waitFor(() => fs.existsSync(ownerPath)); const owner = fs.readFileSync(ownerPath, "utf8");
+        const actor = await client.createActor({ name: "natural completion", instructions: "Reply", scope, residency: "durable", topics: ["deferred-live"], responseMode: "text", delivery: "mailbox", coalesce: false });
         const actorRoot = scope === "project" ? state.config.actorRoot : state.config.sessionActorRoot!;
-        await state.mesh.publish({ topic: "retirement-live", kind: "regression", from: state.identity, text: "LIVE_WITH_PROGRESS" });
+        await state.mesh.publish({ topic: "deferred-live", kind: "regression", from: state.identity, text: "LIVE_WITH_PROGRESS" });
         await waitFor(() => admitted.mock.calls.length === 1);
         const hostAgents = admitted.mock.contexts[0] as AgentManager;
-        await waitFor(() => hostAgents.list().some(run => {
-          if (run.actorId !== actor.id) return false;
-          const directory = hostAgents.runDirectory(run.id);
-          if (!directory) return false;
-          try {
-            const record = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"));
-            return record.status === "running" && record.turns >= 4;
-          } catch { return false; }
-        }));
-        const firstSignal = admitted.mock.calls[0]![1]!;
-        const checked = retirementChecks.mock.calls.length;
-        release.reload();
-        await waitFor(() => retirementChecks.mock.calls.length > checked);
-        expect(quiescing).toBe(false);
-        expect(firstSignal.aborted).toBe(false);
-        const next = await state.mesh.publish({ topic: "retirement-live", kind: "regression", from: state.identity, text: "LIVE_WITH_PROGRESS next activation once" });
-        await waitFor(() => queueItems(actorRoot, actor.id).some(item => item.payload?.id === next.id));
-        await waitFor(() => quiescing);
-        expect(await admitted.mock.results[0]!.value).toMatchObject({ status: "completed" });
-        expect(firstSignal.aborted).toBe(false);
-        expect(admitted).toHaveBeenCalledTimes(1);
-        expect(outputs(actorRoot, actor.id)).toHaveLength(1);
-        releaseQuiescence(); await oldHost;
-        newHost = runResidentHostFromConfigPath(release.configPath, newController.signal);
+        await waitFor(() => hostAgents.list().some(run => run.actorId === actor.id && run.status === "running"));
+        const signal = admitted.mock.calls[0]![1]!;
+        release.reload(); await next.reconcileRelease();
+        expect(JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "handover-deferred.json"), "utf8")).reason).toMatch(/installer drain required/);
+        await state.mesh.publish({ topic: "deferred-live", kind: "regression", from: state.identity, text: "next activation once" });
         await waitFor(() => outputs(actorRoot, actor.id).length === 2);
-        await waitFor(() => queueItems(actorRoot, actor.id).length === 0);
-        await delay(100);
-        expect(admitted).toHaveBeenCalledTimes(2);
-        expect(outputs(actorRoot, actor.id)).toHaveLength(2);
-        expect(firstSignal.aborted).toBe(false);
-      } finally {
-        releaseQuiescence(); oldController.abort(); newController.abort();
-        await Promise.all([oldHost, newHost]);
-        admitted.mockRestore(); retirementChecks.mockRestore(); quiesce.mockRestore();
-        await client.close(); await state.participants.close();
-      }
+        expect(await admitted.mock.results[0]!.value).toMatchObject({ status: "completed" }); expect(signal.aborted).toBe(false);
+        expect(admitted).toHaveBeenCalledTimes(2); expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      } finally { controller.abort(); await running; admitted.mockRestore(); await Promise.all([client.close(), next.close(), state.participants.close()]); }
     });
   }
 });
 
 describe("resident host release recovery regressions", () => {
-  it("does not retire while queued public status hides an active actor drain", async () => {
+  it("defers installer drain while queued public status hides an active actor drain, even after it settles", async () => {
     const state = await rootHarness("queued-active-drain");
-    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
-    const configPath = path.join(state.config.residencyRoot, "config.json");
-    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
-    fs.writeFileSync(configPath, JSON.stringify(state.config));
-    // Publication can say queued, and the worker completed, while retention/queue cleanup
-    // still awaits. The live drain, not either public status, fences shutdown.
-    const owned = vi.spyOn(ActorManager.prototype, "listOwned").mockReturnValue([
-      { status: "queued", residency: "durable" },
-    ] as ReturnType<ActorManager["listOwned"]>);
-    const agents = vi.spyOn(AgentManager.prototype, "listForUi").mockReturnValue([]);
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json"), configPath = path.join(state.config.residencyRoot, "config.json");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true }); fs.writeFileSync(configPath, JSON.stringify(state.config));
+    const owned = vi.spyOn(ActorManager.prototype, "listOwned").mockReturnValue([{ status: "queued", residency: "durable" }] as ReturnType<ActorManager["listOwned"]>);
     const drain = vi.spyOn(ActorManager.prototype, "inFlightCount").mockReturnValue(1);
-    const controller = new AbortController();
-    const host = runResidentHostFromConfigPath(configPath, controller.signal);
+    const controller = new AbortController(); const running = runResidentHostFromConfigPath(configPath, controller.signal);
+    const next = new ResidencyClient({ config: { ...state.config, fabricExtensionPath: "replacement" }, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
-      await waitFor(() => fs.existsSync(ownerPath));
-      const checked = agents.mock.calls.length;
-      fs.writeFileSync(configPath, JSON.stringify({ ...state.config, fabricExtensionPath: "replacement" }));
-      await waitFor(() => agents.mock.calls.length > checked);
-      expect(drain).toHaveBeenCalled();
-      expect(fs.existsSync(ownerPath)).toBe(true);
-      drain.mockReturnValue(0);
-      await host;
-      expect(fs.existsSync(ownerPath)).toBe(false);
-    } finally {
-      controller.abort(); await host;
-      owned.mockRestore(); agents.mockRestore(); drain.mockRestore();
-      await state.participants.close();
-    }
+      await waitFor(() => fs.existsSync(ownerPath)); const owner = fs.readFileSync(ownerPath, "utf8");
+      next.syncPiModels(); await next.reconcileRelease();
+      expect(JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "handover-deferred.json"), "utf8")).reason).toMatch(/installer drain required/);
+      drain.mockReturnValue(0); await delay(150); expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+    } finally { controller.abort(); await running; await next.close(); owned.mockRestore(); drain.mockRestore(); await state.participants.close(); }
   });
 
-  it("refuses a provenance-less live owner when idle cannot be proved", async () => {
-    const state = await rootHarness("legacy-unknown");
-    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
-    fs.writeFileSync(path.join(state.config.residencyRoot, "owner.json"), JSON.stringify({
-      format: 1, hostId: residentHostId(state.identity.id), pid: process.pid, token: "legacy", startedAt: Date.now(), readyAt: Date.now(),
-    }));
-    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants,
-      mainAgent: state.mainAgent, startupTimeoutMs: 50 });
+  it("defers a provenance-less live owner to installer drain without trying to prove idle", async () => {
+    const state = await rootHarness("legacy-unknown"); fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    const owner = { format: 1, hostId: residentHostId(state.identity.id), pid: process.pid, token: "legacy", startedAt: Date.now(), readyAt: Date.now() };
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json"); fs.writeFileSync(ownerPath, JSON.stringify(owner));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, startupTimeoutMs: 50 });
     try {
-      await expect(client.ensureHost()).rejects.toThrow(/draining for release reload/);
-    } finally {
-      await client.close(); await state.participants.close();
-      fs.rmSync(path.join(state.config.residencyRoot, "owner.json")); // This fixture is this test process, never a child.
-    }
+      await client.reconcileRelease();
+      expect(JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "handover-deferred.json"), "utf8")).reason).toBe("Legacy resident host/launcher has no release custody protocol; installer drain required");
+      await expect(client.ensureHost()).resolves.toMatchObject(owner);
+      expect(JSON.parse(fs.readFileSync(ownerPath, "utf8"))).toEqual(owner);
+    } finally { await client.close(); await state.participants.close(); fs.rmSync(ownerPath); }
   });
 
-  it.skipIf(!process.env.TEST_LEGACY_FABRIC_RELEASE || process.platform === "win32")("replaces an actual earlier-release owner with a durable actor and no provenance", { timeout: 40_000 }, async () => {
-    const state = await rootHarness("legacy-release-recovery");
-    const release = process.env.TEST_LEGACY_FABRIC_RELEASE!;
-    const legacyConfig = { ...state.config, fabricExtensionPath: path.join(release, "dist", "index.js") };
-    const configPath = path.join(state.config.residencyRoot, "config.json");
-    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
-    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
-    fs.writeFileSync(configPath, JSON.stringify(legacyConfig));
-    const launcher = await processUtils.spawnDetached(path.join(release, "dist", "residency", "launcher.js"), ["--config", configPath], repo);
+  it.skipIf(!process.env.TEST_LEGACY_FABRIC_RELEASE || process.platform === "win32")("defers an actual earlier-release owner with a durable actor and no provenance to installer drain", { timeout: 40_000 }, async () => {
+    const state = await rootHarness("legacy-release-recovery"); const release = process.env.TEST_LEGACY_FABRIC_RELEASE!;
+    const configPath = path.join(state.config.residencyRoot, "config.json"), ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true }); fs.writeFileSync(configPath, JSON.stringify({ ...state.config, fabricExtensionPath: path.join(release, "dist/index.js") }));
+    const launcher = await processUtils.spawnDetached(path.join(release, "dist/residency/launcher.js"), ["--config", configPath], repo);
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath });
     try {
-      await waitFor(() => fs.existsSync(ownerPath), 15_000);
-      const oldOwner = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
-      expect(oldOwner.fabricExtensionPath).toBeUndefined();
-      // The legacy nested protocol seeds its actor BEFORE the new Main starts. No candidate initialization on the old host.
-      const actor = await new ResidentActorClient(state.config.meshRoot, state.identity.id).createActor({
-        name: "legacy durable subscription", instructions: "Reply", residency: "durable", topics: ["legacy-test"],
-      });
-      client.start();
-      await waitFor(() => {
-        try { return JSON.parse(fs.readFileSync(ownerPath, "utf8")).fabricExtensionPath === state.config.fabricExtensionPath; } catch { return false; }
-      }, 20_000);
-      expect(JSON.parse(fs.readFileSync(ownerPath, "utf8")).pid).not.toBe(oldOwner.pid);
-      await waitFor(() => state.participants.get(actor.id, Date.now(), { fresh: true })?.status === "idle");
-      expect(fs.existsSync(path.join(state.config.actorRoot, actor.id))).toBe(true);
-    } finally {
-      await client.close(); await stopResident(state.config); await launcher.stop();
-      await waitFor(() => !processUtils.processIsAlive(launcher.pid), 5_000);
-      await state.participants.close();
-    }
+      await waitFor(() => fs.existsSync(ownerPath), 15_000); const owner = fs.readFileSync(ownerPath, "utf8");
+      const actor = await new ResidentActorClient(state.config.meshRoot, state.identity.id).createActor({ name: "legacy durable subscription", instructions: "Reply", residency: "durable", topics: ["legacy-test"] });
+      client.start(); await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "handover-deferred.json")));
+      expect(JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "handover-deferred.json"), "utf8")).reason).toMatch(/installer drain required/);
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner); expect(fs.existsSync(path.join(state.config.actorRoot, actor.id))).toBe(true);
+    } finally { await client.close(); await stopResident(state.config); await launcher.stop(); await waitFor(() => !processUtils.processIsAlive(launcher.pid), 5_000); await state.participants.close(); }
   });
 
-  it("keeps reload recovery alive past the drain budget and consumes the parked event once", { timeout: 15_000 }, async () => {
+  it("keeps the critical stale-Main event parked past the startup budget while installer drain is deferred", { timeout: 15_000 }, async () => {
     const state = await rootHarness("long-release-recovery");
-    const profile = path.join(state.root, "profile");
-    const releaseBase = path.join(state.root, "fabric");
-    const releases = path.join(releaseBase, "releases");
-    for (const release of ["old", "new"]) {
-      fs.mkdirSync(path.join(releases, release), { recursive: true });
-      fs.writeFileSync(path.join(releases, release, "package.json"), JSON.stringify({ name: "pi-fabric" }));
-    }
-    fs.mkdirSync(profile);
-    vi.stubEnv("PI_CODING_AGENT_DIR", profile);
+    const profile = path.join(state.root, "profile"), base = path.join(state.root, "fabric"), releases = path.join(base, "releases");
+    for (const name of ["old", "new"]) { fs.mkdirSync(path.join(releases, name), { recursive: true }); fs.writeFileSync(path.join(releases, name, "package.json"), JSON.stringify({ name: "pi-fabric" })); }
+    fs.mkdirSync(profile); vi.stubEnv("PI_CODING_AGENT_DIR", profile);
     const activate = (name: string) => fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify({ packages: [path.join(releases, name)] }));
-    fs.writeFileSync(path.join(releaseBase, "releases-safety.json"), JSON.stringify({ version: 1, releases: {
-      old: { installedAt: "2026-09-30T00:00:00Z" }, new: { installedAt: "2026-09-30T01:00:00Z", safetyCritical: true },
-    } }));
-    activate("old");
-    const oldConfig = { ...state.config, fabricExtensionPath: path.join(releases, "old", "dist", "index.js") };
-    const newConfig = { ...state.config, fabricExtensionPath: path.join(releases, "new", "dist", "index.js") };
-    const configPath = path.join(state.config.residencyRoot, "config.json");
-    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
-    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
-    fs.writeFileSync(configPath, JSON.stringify(oldConfig));
-    const oldController = new AbortController(), newController = new AbortController();
-    const oldHost = runResidentHostFromConfigPath(configPath, oldController.signal);
-    let newHost: Promise<void> | undefined;
+    fs.writeFileSync(path.join(base, "releases-safety.json"), JSON.stringify({ version: 1, releases: { old: { installedAt: "2026-09-30T00:00:00Z" }, new: { installedAt: "2026-09-30T01:00:00Z", safetyCritical: true } } })); activate("old");
+    const oldConfig = { ...state.config, fabricExtensionPath: path.join(releases, "old/dist/index.js") }, newConfig = { ...state.config, fabricExtensionPath: path.join(releases, "new/dist/index.js") };
+    const configPath = path.join(state.config.residencyRoot, "config.json"), ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true }); fs.writeFileSync(configPath, JSON.stringify(oldConfig));
+    const controller = new AbortController(); const running = runResidentHostFromConfigPath(configPath, controller.signal);
     const oldClient = new ResidencyClient({ config: oldConfig, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     const client = new ResidencyClient({ config: newConfig, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, startupTimeoutMs: 50 });
-    // Only replace process boot with an in-process host: the durable worker, queue, guard,
-    // host drain and client retry are real. This keeps the shortened boot budget deterministic.
-    const spawnProcess = processUtils.spawnDetached;
-    const boot = vi.fn();
-    const launch = vi.spyOn(processUtils, "spawnDetached").mockImplementation(async (workerPath, args, cwd) => {
-      if (workerPath === fakeWorker) return spawnProcess(workerPath, args, cwd);
-      boot();
-      newHost = runResidentHostFromConfigPath(configPath, newController.signal);
-      return { pid: process.pid, isAlive: async () => true, stop: async () => { newController.abort(); await newHost; } };
-    });
+    const launch = vi.spyOn(processUtils, "spawnDetached");
     try {
-      await waitFor(() => fs.existsSync(ownerPath));
-      const actor = await oldClient.createActor({ name: "parked after reload", instructions: "Reply", residency: "durable",
-        topics: ["long-drain-test"], responseMode: "text", delivery: "mailbox", coalesce: false });
-      const task = await oldClient.spawnAgent({ task: "LIVE_WITH_PROGRESS", transport: "process", residency: "durable" });
-      await waitFor(() => oldClient.statusAgent(task.id).status === "running");
-      activate("new");
-      const event = await state.mesh.publish({ topic: "long-drain-test", kind: "regression", from: state.identity, text: "consume once" });
+      await waitFor(() => fs.existsSync(ownerPath)); const owner = fs.readFileSync(ownerPath, "utf8");
+      const actor = await oldClient.createActor({ name: "parked after reload", instructions: "Reply", residency: "durable", topics: ["long-drain-test"], responseMode: "text", delivery: "mailbox", coalesce: false });
+      const task = await oldClient.spawnAgent({ task: "LIVE_WITH_PROGRESS", transport: "process", residency: "durable" }); await waitFor(() => oldClient.statusAgent(task.id).status === "running");
+      activate("new"); const event = await state.mesh.publish({ topic: "long-drain-test", kind: "regression", from: state.identity, text: "consume once" });
       const queueDir = path.join(state.config.actorRoot, actor.id);
-      await waitFor(() => fs.readdirSync(queueDir).some(name => name.startsWith("queue-") &&
-        JSON.parse(fs.readFileSync(path.join(queueDir, name), "utf8")).items.some((item: { admissionRefused?: boolean }) => item.admissionRefused)));
-      client.start();
-      await delay(300); // > maximum load-scaled 50ms budget (200ms), while the 1500ms worker lives.
-      expect(oldClient.statusAgent(task.id).status).toBe("running");
-      expect(boot).not.toHaveBeenCalled();
-      await waitFor(() => boot.mock.calls.length === 1);
-      await oldHost;
-      expect(oldClient.statusAgent(task.id).status).toBe("completed");
-      await waitFor(() => {
-        const rows = new ActorRegistryStore(state.config.actorRoot).records();
-        const saved = rows.find(row => row.id === actor.id);
-        return Array.isArray(saved?.messages) && saved.messages.some(message => message.direction === "out" && message.runId);
-      });
-      await delay(200);
-      const saved = new ActorRegistryStore(state.config.actorRoot).records().find(row => row.id === actor.id)!;
-      expect((saved.messages as Array<{ direction: string; runId?: string }>).filter(message => message.direction === "out" && message.runId)).toHaveLength(1);
-      expect(fs.readdirSync(queueDir).filter(name => name.startsWith("queue-")).some(name =>
-        JSON.parse(fs.readFileSync(path.join(queueDir, name), "utf8")).items.some((item: { payload?: { id?: string } }) => item.payload?.id === event.id))).toBe(false);
-      await client.close();
-      await delay(100);
-      expect(boot).toHaveBeenCalledTimes(1); // close does not restart recovery.
-    } finally {
-      await client.close(); oldController.abort(); newController.abort();
-      await Promise.all([oldHost, newHost]); launch.mockRestore();
-      await oldClient.close(); await state.participants.close();
-    }
+      const items = () => fs.readdirSync(queueDir).filter(name => name.startsWith("queue-")).flatMap(name => JSON.parse(fs.readFileSync(path.join(queueDir, name), "utf8")).items) as Array<{ admissionRefused?: boolean; payload?: { id?: string } }>;
+      await waitFor(() => items().some(item => item.admissionRefused)); const launched = launch.mock.calls.length;
+      client.start(); await delay(300);
+      expect(JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "handover-deferred.json"), "utf8")).reason).toMatch(/installer drain required/);
+      await expect(oldClient.waitAgent(task.id)).resolves.toMatchObject({ status: "completed" }); await delay(150);
+      expect(launch).toHaveBeenCalledTimes(launched); expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      expect(items().some(item => item.payload?.id === event.id && item.admissionRefused)).toBe(true);
+      expect((new ActorRegistryStore(state.config.actorRoot).records().find(row => row.id === actor.id)?.messages as FabricActorMessage[]).filter(message => message.direction === "out" && message.runId)).toHaveLength(0);
+      await client.close(); await delay(100); expect(launch).toHaveBeenCalledTimes(launched);
+    } finally { await client.close(); controller.abort(); await running; launch.mockRestore(); await oldClient.close(); await state.participants.close(); }
   });
 });
 
 describe("resident host release recovery", () => {
-  it("drains an obsolete resident host after Main reload even with a durable actor", { timeout: 10_000 }, async () => {
+  it("defers an obsolete resident host with a durable actor to installer drain after Main reload", { timeout: 10_000 }, async () => {
     const state = await rootHarness("release-recovery");
-    const configPath = path.join(state.config.residencyRoot, "config.json");
-    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
-    fs.writeFileSync(configPath, JSON.stringify(state.config));
-    const controller = new AbortController();
-    const running = runResidentHostFromConfigPath(configPath, controller.signal);
+    const configPath = path.join(state.config.residencyRoot, "config.json"), ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true }); fs.writeFileSync(configPath, JSON.stringify(state.config));
+    const controller = new AbortController(); const running = runResidentHostFromConfigPath(configPath, controller.signal);
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    const next = new ResidencyClient({ config: { ...state.config, fabricExtensionPath: path.join(state.root, "new-release/dist/index.js") }, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
-      await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
+      await waitFor(() => fs.existsSync(ownerPath)); const owner = fs.readFileSync(ownerPath, "utf8");
       const actor = await client.createActor({ name: "survives release reload", instructions: "Reply", residency: "durable" });
-      expect(actor.residency).toBe("durable");
-      fs.writeFileSync(configPath, JSON.stringify({ ...state.config, fabricExtensionPath: path.join(state.root, "new-release", "dist", "index.js") }));
-      await waitFor(() => !fs.existsSync(path.join(state.config.residencyRoot, "owner.json")), 1_000);
-      await running;
-      expect(fs.existsSync(path.join(state.config.actorRoot, actor.id))).toBe(true);
-    } finally {
-      controller.abort(); await running;
-      await client.close(); await state.participants.close();
-    }
+      next.syncPiModels(); await next.reconcileRelease(); await delay(150);
+      expect(JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "handover-deferred.json"), "utf8")).reason).toMatch(/installer drain required/);
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner); expect(fs.existsSync(path.join(state.config.actorRoot, actor.id))).toBe(true);
+    } finally { controller.abort(); await running; await Promise.all([client.close(), next.close(), state.participants.close()]); }
   });
 });
 
@@ -1542,6 +1363,52 @@ describe("durable completion receipts", () => {
     }
   });
 
+  it.each([['tmux', 'closed'], ['screen', 'closed'], ['tmux', 'unknown'], ['screen', 'unknown']] as const)("vetoes public durable cleanup of terminal live %s after host %s without an unresolved marker", async (kind, route) => {
+    const state = await rootHarness(`external-cleanup-${kind}-${route}`);
+    const source = path.join(state.root, 'source'); initRepository(source);
+    const seeded = await seedCompletion(state, 'failed');
+    const branch = `pi-fabric/external-${kind}-${seeded.id.slice(0, 8)}`;
+    const worktree = path.join(source, '.pi', 'fabric', 'worktrees', seeded.id);
+    fs.mkdirSync(path.dirname(worktree), { recursive: true });
+    git(source, 'worktree', 'add', '-q', '-b', branch, worktree, 'HEAD');
+    const record = { ...seeded.result, transport: kind, sessionId: 'external-pane', cwd: worktree };
+    fs.writeFileSync(path.join(seeded.runDirectory, 'status.json'), JSON.stringify(record));
+    const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, 'utf8'));
+    fs.writeFileSync(seeded.metadataPath, JSON.stringify({ ...metadata, handle: { ...record, worktree, branch }, worktreeGitRoot: source }));
+    const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
+    fs.mkdirSync(path.dirname(resultPath), { recursive: true }); fs.writeFileSync(resultPath, JSON.stringify(record));
+    // A real live cwd holder substitutes for the external pane, without requiring tmux/screen on CI.
+    const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: worktree, stdio: 'ignore' });
+    const exited = new Promise<void>((resolve, reject) => { worker.once('error', reject); worker.once('close', () => resolve()); });
+    const host = new ResidentHost(state.config);
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    const agents = new AgentManager(repo, { ...state.config.agents, budgetUsd: 0, nice: 19 }, { workerPath: fakeWorker, runRoot: path.join(state.root, "session-runs") });
+    const actors = new ActorManager(state.config.sessionId, state.identity, state.mesh, state.meshConfig, agents, () => {}, { actorRoot: path.join(state.root, "session-actors"), persistent: true });
+    const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants, { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(agents, actors, new GlobalActorRegistry(state.root, 64 * 1024), state.mainAgent, state.participants, undefined, lifecycle, () => false, client);
+    const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "public-external-cleanup", nestedToolCallId: "cleanup", extensionContext: {} as ExtensionContext, update() {} };
+    const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
+    const join = vi.spyOn(AgentManager.prototype, "join");
+    try {
+      await host.start();
+      if (route === 'closed') await host.close();
+      expect(fs.existsSync(path.join(seeded.runDirectory, 'unresolved-worker.json'))).toBe(false);
+      await expect(provider.invoke("cleanup", { id: seeded.id, deleteBranch: true }, context)).rejects.toThrow(/checked.*exit|exit.*unconfirmed/);
+      expect(join).toHaveBeenCalledTimes(route === "unknown" ? 1 : 0);
+      expect(worker.exitCode).toBeNull(); expect(worker.signalCode).toBeNull();
+      expect(cleanup).not.toHaveBeenCalled();
+      for (const file of [seeded.runDirectory, seeded.metadataPath, resultPath, worktree]) expect(fs.existsSync(file)).toBe(true);
+      expect(worktreeBranches(source)).toContain(branch);
+      expect(git(source, 'branch', '--list', branch)).toContain(branch);
+      const decisions = path.join(state.config.residencyRoot, 'decisions');
+      const committed = fs.existsSync(decisions) ? fs.readdirSync(decisions).map(name => JSON.parse(fs.readFileSync(path.join(decisions, name), 'utf8'))).filter(decision => decision.state === 'committed') : [];
+      expect(committed).toEqual([]);
+    } finally {
+      worker.kill("SIGTERM"); await exited; cleanup.mockRestore(); join.mockRestore();
+      await client.close(); await host.close(); await actors.close(); await agents.close(); await lifecycle.close(); await state.participants.close();
+    }
+  }, 15_000);
+
   it("refuses the fallback cleanup of a completed durable run whose nested child is marked", async () => {
     const state = await rootHarness("unresolved-nested-cleanup");
     const seeded = await seedCompletion(state, "completed");
@@ -1742,6 +1609,80 @@ describe("durable completion receipts", () => {
 });
 
 describe.skipIf(!hasResidentHost || process.platform === "win32")("durable participant residency", () => {
+  // Compiled launcher + real resident host/control transport; inference is deliberately fake.
+  // Main supplies the separate native Pi actor acceptance proof for #2726.
+  it("#2726 exposes a busy resident-owned actor and two queued tells through both provider reads", { timeout: 45_000 }, async () => {
+    const state = await rootHarness("resident-live-read");
+    const releasePath = path.join(state.root, "release-first-worker");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    const control = new FabricControlPlane(state.mesh, state.identity, { enabled: true, hostId: state.identity.id, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
+    control.start(() => ({ accepted: false }));
+    const agents = new AgentManager(repo, state.config.agents, { workerPath: fakeWorker, runRoot: path.join(state.root, "passive-runs") });
+    const passive = new ActorDirectory([state.config.sessionId, state.identity, state.mesh, state.meshConfig, agents, () => {},
+      { persistent: true, rootId: state.identity.id, canManageActor: () => false }],
+      { project: state.config.actorRoot, session: state.config.sessionActorRoot! }, "project");
+    const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants, { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(agents, passive, new GlobalActorRegistry(state.root, 64 * 1024), state.mainAgent, state.participants, control, lifecycle, undefined, client);
+    const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "test", nestedToolCallId: "live-read",
+      extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
+    try {
+      client.start();
+      const actor = await client.createActor({ name: "resident live review", instructions: "Reply.", residency: "durable", transport: "process", responseMode: "text", delivery: "mailbox", coalesce: false });
+      const participant = () => state.participants.get(actor.id, undefined, { fresh: true });
+      await control.request(client.hostId, actor.id, "followUp", { message: "settled baseline" }, client.hostId);
+      await waitFor(() => participant()?.status === "idle" && Boolean(passive.status(actor.id).lastRunId));
+      const baseline = passive.status(actor.id);
+      expect(passive.owns(actor.id)).toBe(false);
+      const definition = passive.definition(actor.id);
+      await control.request(client.hostId, actor.id, "followUp", { message: "LIVE_WITH_PROGRESS", data: { fakeWorkerReleasePath: releasePath } }, client.hostId);
+      await waitFor(() => participant()?.status === "running" && participant()?.actorRun !== undefined);
+      const running = participant()!;
+      expect(await provider.invoke("actorStatus", { id: actor.id }, context)).toMatchObject({
+        status: "running", queued: 0, inFlightRun: { id: running.actorRun!.id }, lastRunId: baseline.lastRunId,
+      });
+      expect(await provider.invoke("actors", {}, context)).toContainEqual(expect.objectContaining({
+        id: actor.id, status: "running", queued: 0, inFlightRun: expect.objectContaining({ id: running.actorRun!.id }),
+      }));
+      await control.request(client.hostId, actor.id, "followUp", { message: "queued review one" }, client.hostId);
+      await control.request(client.hostId, actor.id, "followUp", { message: "queued review two" }, client.hostId);
+      await waitFor(() => participant()?.actorQueued === 2);
+      const live = participant()!;
+      expect(live).toMatchObject({ status: "running", ownerHostId: client.hostId, actorQueued: 2,
+        actorRun: { id: running.actorRun!.id } });
+      expect(live.actorMessages).toBeGreaterThan(baseline.messages);
+      expect(passive.status(actor.id)).toMatchObject({ status: "idle", queued: 0, lastRunId: baseline.lastRunId });
+      const single = await provider.invoke("actorStatus", { id: actor.id }, context);
+      const listed = (await provider.invoke("actors", {}, context) as Array<{ id: string }>).find(row => row.id === actor.id);
+      for (const view of [single, listed]) {
+        expect(view).toMatchObject({ id: actor.id, name: actor.name, status: "running", queued: 2,
+          messages: live.actorMessages, lastRunId: baseline.lastRunId, inFlightRun: { id: live.actorRun!.id } });
+      }
+      expect(passive.definition(actor.id)).toEqual(definition);
+      // The real worker cannot finish FIRST until both provider reads above agree.
+      fs.writeFileSync(releasePath, "release\n");
+      await waitFor(() => participant()?.status === "idle" && participant()?.actorQueued === 0 && participant()?.actorRun === undefined);
+      const idleSingle = await provider.invoke("actorStatus", { id: actor.id }, context) as { inFlightRun?: unknown; lastRunId?: string };
+      const idleListed = (await provider.invoke("actors", {}, context) as Array<{ id: string; inFlightRun?: unknown }>).find(row => row.id === actor.id)!;
+      for (const view of [idleSingle, idleListed]) {
+        expect(view).toMatchObject({ status: "idle", queued: 0, messages: participant()!.actorMessages });
+        expect(view.inFlightRun).toBeUndefined();
+      }
+      expect(idleSingle.lastRunId).not.toBe(baseline.lastRunId);
+      expect(idleSingle.lastRunId).not.toBe(running.actorRun!.id);
+      const persisted = new ActorRegistryStore(state.config.actorRoot).records().find(record => record.id === actor.id)!;
+      expect((persisted.messages as FabricActorMessage[]).filter(message => message.direction === "out").map(message => message.text)).toEqual([
+        "fake worker complete", "live attempt 1 complete", "fake worker complete", "fake worker complete",
+      ]);
+      await client.removeActor(actor.id);
+    } finally {
+      // Also release after an assertion failure; host shutdown and root cleanup stay bounded.
+      fs.writeFileSync(releasePath, "release\n");
+      await control.close(); await client.close(); await passive.close(); await agents.close(); await lifecycle.close();
+      await state.participants.close(); await stopResident(state.config);
+      fs.rmSync(releasePath, { force: true });
+    }
+  });
+
   it.skipIf(process.platform !== "linux")("F1 preserves original completion when the compiled resident host's result save fails through graceful close and two restarts", { timeout: 60_000 }, async () => {
     // Real compiled launcher -> real Pi -> compiled resident host; only model inference is fake.
     // STREAM_PREVIEW supplies its own running/terminal records and full text, without fixture edits.
@@ -2468,7 +2409,9 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     const provider = new AgentsProvider(agents, passive, new GlobalActorRegistry(state.root, 64 * 1024),
       state.mainAgent, state.participants, control, lifecycle, undefined, client);
     const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "test", nestedToolCallId: "setter",
-      extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
+      // Main now admits the selector before routing to the resident owner.
+      // Give this root session its actual visible registry, not an empty context.
+      extensionContext: { modelRegistry: { getAvailable: () => state.config.piModels?.available ?? [] } } as unknown as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
     try {
       const actor = await client.createActor({ name: "effective durable", instructions: "Before", residency: "durable", model: "provider/visible", thinking: "low" });
       expect(passive.owns(actor.id)).toBe(false);

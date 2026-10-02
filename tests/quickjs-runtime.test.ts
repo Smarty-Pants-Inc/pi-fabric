@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+import { FabricModelDeniedError } from "../src/core/model-policy.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { transpileFabricCodeWithSourceMap } from "../src/runtime/type-checker.js";
 import * as typeChecker from "../src/runtime/type-checker.js";
@@ -12,6 +13,13 @@ const options = {
 };
 
 describe("QuickJsRuntime", () => {
+  it("review round A3 transfers only the fixed policy code, not arbitrary host error properties", async () => {
+    const errors = [new FabricModelDeniedError("provider/denied"), Object.assign(new Error("spoof"), { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", secret: "must-not-cross" })];
+    for (const error of errors) {
+      const result = await new QuickJsRuntime().execute('try { await agents.spawn({ task: "review" }); } catch (error) { return { name: error.name, code: error.code, secret: error.secret }; }', async () => { throw error; }, options);
+      expect(result.value).toEqual(error instanceof FabricModelDeniedError ? { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" } : { name: "FabricModelDeniedError" });
+    }
+  });
   it("rejects memory limits that overflow the WASM32 size_t", async () => {
     const result = await new QuickJsRuntime().execute(
       "return 1;",
@@ -142,6 +150,106 @@ describe("QuickJsRuntime", () => {
     expect(result.error).toBe("QuickJS log limit must be a nonnegative safe integer");
   });
 
+
+  it("#201 carries only allowlisted Fabric error metadata into the guest", async () => {
+    const result = await new QuickJsRuntime().execute(
+      `try { await agents.followUp({ id: "session:test", message: "hello" }); }
+       catch (error) { return { name: error.name, code: error.code, retryable: error.retryable,
+         secret: error.secret, cause: error.cause, keys: Object.keys(error).sort() }; }`,
+      async () => {
+        const error = new Error("safe message");
+        Object.assign(error, { name: "FabricParticipantNotYetMirroredError",
+          code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: true,
+          secret: "host-secret", cause: { secret: "nested-host-secret" } });
+        throw error;
+      }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "FabricParticipantNotYetMirroredError",
+      code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: true, keys: ["code", "message", "name", "retryable"] });
+  });
+
+  it("preserves host Error names but does not export unvetted codes or accessors as Fabric metadata", async () => {
+    const result = await new QuickJsRuntime().execute(
+      `try { await agents.followUp({ id: "session:test", message: "hello" }); }
+       catch (error) { return { name: error.name, keys: Object.keys(error) }; }`,
+      async () => {
+        const error = new Error("safe message");
+        Object.assign(error, { name: "HostSecretError", code: "HOST_SECRET", secret: "host-secret" });
+        Object.defineProperty(error, "retryable", { get() { throw new Error("accessor must not run"); } });
+        throw error;
+      }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "HostSecretError", keys: ["message", "name"] });
+  });
+
+  it.each([
+    ["FABRIC_PARTICIPANT_NOT_YET_MIRRORED", "FabricParticipantNotYetMirroredError"],
+    ["FABRIC_PARTICIPANT_NON_INTERACTIVE", "FabricParticipantNonInteractiveError"],
+    ["FABRIC_PROJECT_AGENT_UNRESOLVED", "FabricProjectAgentUnresolvedError"],
+    ["FABRIC_PROJECT_AGENT_AMBIGUOUS", "FabricProjectAgentAmbiguousError"],
+    ["FABRIC_PROJECT_LEAD_INVALID", "FabricProjectLeadInvalidError"],
+  ])("preserves vetted %s metadata alongside ordinary host names across repeated calls", async (code, name) => {
+    let call = 0;
+    const result = await new QuickJsRuntime().execute(
+      `const failures = [];
+       for (let i = 0; i < 4; i++) {
+         try { await tools.call({ ref: "demo.error" }); }
+         catch (error) { failures.push({ name: error.name, code: error.code, retryable: error.retryable }); }
+       }
+       return failures;`,
+      async () => {
+        const index = call++;
+        if (index === 3) throw new RangeError("ordinary classification");
+        const error = Object.assign(new Error("vetted classification"), { name, code, retryable: index === 0 });
+        if (index === 2) Object.defineProperty(error, "retryable", { get() { throw new Error("accessor must not run"); } });
+        throw error;
+      }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual([
+      { name, code, retryable: true },
+      { name, code, retryable: false },
+      { name, code },
+      { name: "RangeError" },
+    ]);
+  });
+
+  it("does not export mismatched Fabric classifications, non-string names, or plain-object properties", async () => {
+    let call = 0;
+    const result = await new QuickJsRuntime().execute(
+      `const failures = [];
+       for (let i = 0; i < 3; i++) {
+         try { await tools.call({ ref: "demo.error" }); }
+         catch (error) { failures.push({ name: error.name, code: error.code, retryable: error.retryable, secret: error.secret }); }
+       }
+       return failures;`,
+      async () => {
+        const index = call++;
+        if (index === 0) throw Object.assign(new Error("mismatch"), { name: "RangeError", code: "FABRIC_PROJECT_LEAD_INVALID", retryable: true });
+        if (index === 1) throw Object.assign(new Error("non-string"), { name: 7, code: "FABRIC_PROJECT_LEAD_INVALID", retryable: true });
+        throw { name: "FabricProjectLeadInvalidError", code: "FABRIC_PROJECT_LEAD_INVALID", retryable: true, secret: "not-guest-data" };
+      }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual([{ name: "RangeError" }, { name: "Error" }, { name: "Error" }]);
+  });
+
+  it.each(["bash", "powershell"])("keeps vetted Fabric fields and %s exit metadata together", async (tool) => {
+    const result = await new QuickJsRuntime().execute(
+      `try { await pi.${tool}({ command: "false" }); }
+       catch (error) { return { name: error.name, code: error.code, retryable: error.retryable, exit: error.__fabricBashExit }; }`,
+      async () => {
+        throw Object.assign(classifyPiBashError(new Error("output\n\nCommand exited with code 3")) as Error, {
+          name: "FabricParticipantNotYetMirroredError", code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: false,
+        });
+      }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "FabricParticipantNotYetMirroredError", code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: false,
+      exit: { exitCode: 3, output: "output" } });
+  });
 
   it("runs parallel host calls and returns structured data", async () => {
     const hostCall = vi.fn(async (ref: string, args: Record<string, unknown>) => ({

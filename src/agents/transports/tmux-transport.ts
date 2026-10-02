@@ -36,6 +36,7 @@ export class TmuxTransport implements AgentTransportAdapter {
     ]);
     return {
       kind: this.kind,
+      relaunchable: false, // Query failure is not proof the old pane exited.
       livenessPollIntervalMs: EXTERNAL_TRANSPORT_LIVENESS_POLL_INTERVAL_MS,
       sessionId: session,
       attachCommand: `tmux attach-session -t ${session}`,

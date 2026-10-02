@@ -154,8 +154,6 @@ const raceWithAbort = <T>(
   signal: AbortSignal | undefined,
 ): Promise<T> => {
   if (!signal) return Promise.resolve(operation);
-  if (signal.aborted) return Promise.reject(abortError(signal));
-
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const finish = (callback: () => void): void => {
@@ -165,7 +163,11 @@ const raceWithAbort = <T>(
       callback();
     };
     const onAbort = (): void => finish(() => reject(abortError(signal)));
-    signal.addEventListener("abort", onAbort, { once: true });
+    // The operation may abort synchronously while constructing its promise
+    // (e.g. Monty's startup deadline check). Always observe its later rejection,
+    // even when cancellation has already won the caller-facing race.
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
     Promise.resolve(operation).then(
       (value) => finish(() => resolve(value)),
       (error) => finish(() => reject(error)),

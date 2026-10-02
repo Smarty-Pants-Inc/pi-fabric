@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { authenticateLegacyOwner, legacyProcessStopped, signalLegacyOwner } from "./legacy-retirement.js";
+import { FabricModelDeniedError } from "../core/model-policy.js";
 import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,11 +11,15 @@ import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, 
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
-import { executeFile, spawnDetached } from "../agents/transports/process-utils.js";
+import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
-import { residentProcessAlive } from "./process-identity.js";
+import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import {
+  RESIDENT_HANDOVER_ABI, residentLaunchSpec, handoverActive, handoverPath, handoverOutcomePath,
+  mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
+} from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
-import { hasUnresolvedWorker } from "../storage/retention.js";
+import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
@@ -63,6 +67,7 @@ const startupBudgetMs = (base: number): number => {
   return Math.round(base * Math.min(4, Math.max(1, loadPerCore)));
 };
 const COMMAND_TIMEOUT_MS = 30_000;
+const HANDOVER_WAIT_MS = 180_000;
 const STATUS_POLL_MS = 100;
 const WATCHDOG_INTERVAL_MS = 5_000;
 const WATCHDOG_MAX_BACKOFF_MS = 60_000;
@@ -148,14 +153,15 @@ export class ResidencyClient {
   #deliveryTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #drainingDeliveries = false;
-  #recoveryPending = false;
-  #ensuringHost: Promise<ResidentHostOwner> | undefined;
-  #retiringLegacyToken: string | undefined;
   #closed = false;
   #startingHost: Promise<ResidentHostOwner> | undefined;
   #nextWatchdogAt = 0;
   #watchdogFailures = 0;
   #watchdogWork: string | undefined;
+  readonly #runtimeNonce = randomUUID();
+  #generationRecorded = false;
+  readonly #releaseAbort = new AbortController();
+  readonly #releaseOwners = new Set<string>();
 
   constructor(readonly options: ResidencyClientOptions) {
     this.hostId = residentHostId(options.config.rootId);
@@ -172,13 +178,8 @@ export class ResidencyClient {
   start(): void {
     if (this.#deliveryTimer || this.#closed || !this.options.mainAgent.local) return;
     this.syncPiModels();
-    const owner = this.#liveOwner();
-    this.#recoveryPending = Boolean(owner && owner.fabricExtensionPath !== this.options.config.fabricExtensionPath);
-    // Reload recovery outlives a start budget, but never this client. One attempt at a time.
-    this.#recoverHost();
     this.#deliveryTimer = setInterval(
       () => {
-        this.#recoverHost();
         void this.#drainDeliveries().catch(() => undefined);
         void this.#watchdog().catch(() => undefined);
       },
@@ -186,25 +187,27 @@ export class ResidencyClient {
     );
     this.#deliveryTimer.unref();
     void this.#drainDeliveries().catch(() => undefined);
+    // Every runtime activation, including manual native /reload, reconciles
+    // a live owner. This never starts an empty root or loads an optional engine.
+    void this.reconcileRelease().catch((error) => this.#deferRelease(error));
   }
 
   async close(): Promise<void> {
     this.#closed = true;
+    // Disposing a runtime during native reload/shutdown ends its authority even
+    // while the OS process remains alive. Never invalidate a newer runtime.
+    if (this.#generationRecorded) {
+      try {
+        const recorded = readHandoverJson<ResidentMainGeneration>(mainGenerationPath(this.options.config.residencyRoot));
+        if (recorded?.nonce === this.#runtimeNonce) writeJsonAtomic(mainGenerationPath(this.options.config.residencyRoot),
+          { ...recorded, nonce: `closed:${this.#runtimeNonce}` }, { durable: true });
+      } catch (error) { this.#deferRelease(error); }
+    }
+    this.#releaseAbort.abort();
     if (this.#deliveryTimer) clearInterval(this.#deliveryTimer);
     this.#deliveryTimer = undefined;
-    await this.#ensuringHost?.catch(() => undefined);
     while (this.#drainingDeliveries) await delay(10);
     await this.#startingHost?.catch(() => undefined);
-  }
-
-  /** Direct actor control must not bypass the release gate used by create/spawn. */
-  assertCurrentOwner(hostId: string): void {
-    if (hostId !== this.hostId) return; // Peers/other lineages own their own recovery.
-    const owner = this.#liveOwner();
-    if (this.#closed || owner?.fabricExtensionPath !== this.options.config.fabricExtensionPath) {
-      this.#recoveryPending = true;
-      throw new Error("Fabric resident host is draining for release reload; retry after its running work finishes");
-    }
   }
 
   syncPiModels(): void {
@@ -236,38 +239,22 @@ export class ResidencyClient {
 
   async #startHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
-    if (this.#ensuringHost) return this.#ensuringHost;
-    const attempt = this.#ensureHost();
-    this.#ensuringHost = attempt;
-    try {
-      const owner = await attempt;
-      this.#recoveryPending = false;
-      return owner;
-    } finally {
-      this.#ensuringHost = undefined;
-    }
-  }
-
-  async #ensureHost(): Promise<ResidentHostOwner> {
-    if (this.#closed) throw new Error("Fabric residency client is closed");
     this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
-    let existing = this.#liveOwner();
-    if (existing && existing.fabricExtensionPath !== this.options.config.fabricExtensionPath) {
-      // New hosts observe this config write. Legacy owners need an idle-boundary retirement;
-      // missing provenance is unknown/obsolete, never permission to route new work.
-      this.#recoveryPending = true;
-      const deadline = Date.now() + startupBudgetMs(this.options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS);
-      do {
-        if (this.#closed) throw new Error("Fabric residency client is closed");
-        if (!existing.fabricExtensionPath) await this.#retireLegacyOwner(existing);
-        if (Date.now() >= deadline) throw new Error("Fabric resident host is draining for release reload; retry after its running work finishes");
-        await delay(STATUS_POLL_MS);
-        existing = this.#liveOwner();
-      } while (existing && existing.fabricExtensionPath !== this.options.config.fabricExtensionPath);
-    }
-    if (this.#closed) throw new Error("Fabric residency client is closed");
+    const existing = this.#liveOwner();
     if (existing) return existing;
+    // The detached launcher already owns the exact attempt/fallback. Neither
+    // ensureHost nor the watchdog may become a competing handover executor.
+    const releaseDeadline = Date.now() + HANDOVER_WAIT_MS;
+    while (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) {
+      const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
+      if (this.#closed || state?.phase === "blocked" || Date.now() >= releaseDeadline) {
+        throw new Error("Resident release transaction is in launcher custody; do not start a duplicate");
+      }
+      await delay(STATUS_POLL_MS);
+    }
+    const followed = this.#liveOwner();
+    if (followed) return followed;
     fs.rmSync(this.#errorPath, { force: true });
     const launcher = await spawnDetached(
       this.#hostPath,
@@ -276,6 +263,7 @@ export class ResidencyClient {
     );
     // The budget counts from the launcher's first sign of life (its
     // launcher-started trace), so its own boot does not consume it.
+    const launcherBirth = processStartTime(launcher.pid);
     const budget = startupBudgetMs(this.options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS);
     let deadline = Date.now() + budget;
     let started = false;
@@ -286,9 +274,12 @@ export class ResidencyClient {
         throw new Error("Fabric residency client is closed");
       }
       const owner = this.#liveOwner();
-      if (owner?.fabricExtensionPath === this.options.config.fabricExtensionPath) return owner;
-      const failure = readJson<{ error?: unknown }>(this.#errorPath);
-      if (typeof failure?.error === "string") {
+      if (owner) return owner;
+      const failure = readJson<{ error?: unknown; launcherPid?: number; launcherBirth?: string }>(this.#errorPath);
+      // An exiting prior launcher can race this start after error.json was
+      // cleared. Its root diagnostic is not evidence about our owned attempt.
+      if (typeof failure?.error === "string" && (failure.launcherPid === undefined ||
+          (failure.launcherPid === launcher.pid && failure.launcherBirth === launcherBirth))) {
         await launcher.stop();
         throw new Error(`Fabric resident host failed to start: ${failure.error}`);
       }
@@ -323,79 +314,47 @@ export class ResidencyClient {
     throw new Error(`${launcherExited ? "Launcher exited while starting" : `Timed out after ${budget}ms starting`} Fabric resident host ${this.hostId}. ${diagnostics}`);
   }
 
-  #recoverHost(): void {
-    if (!this.#closed && this.#recoveryPending && !this.#ensuringHost) {
-      void this.ensureHost().catch(() => undefined); // The next lifetime tick retries, even if the owner has gone.
+  /** Host-only Main lifecycle hook; not a guest-selected release path. */
+  async reconcileRelease(): Promise<void> {
+    if (this.#closed || !this.options.mainAgent.local || this.options.mainAgent.id !== this.options.config.rootId) return;
+    const owner = this.#liveOwner();
+    const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
+    // A new runtime must invalidate the old nonce even after A exited or while
+    // B is staged. Business readiness is not the Main generation boundary.
+    if (!owner && !handoverActive(state)) return;
+    const self = this.options.participants.self();
+    if (self.kind !== "root" || self.id !== this.options.config.rootId || self.sessionId !== this.options.config.sessionId) throw new ResidentActorAuthorizationError();
+    const releaseRoot = path.resolve(path.dirname(this.#hostPath), "../..");
+    const main: ResidentMainGeneration = { nonce: this.#runtimeNonce, pid: process.pid,
+      processStartTime: processStartTime(process.pid) ?? "", rootId: this.options.config.rootId,
+      sessionId: this.options.config.sessionId, releaseRoot };
+    if (!this.#generationRecorded) {
+      writeJsonAtomic(mainGenerationPath(this.options.config.residencyRoot), main, { durable: true });
+      this.#generationRecorded = true;
     }
+    if (!owner || handoverActive(state) || this.#releaseOwners.has(owner.token)) return;
+    this.#releaseOwners.add(owner.token);
+    if (owner.releaseRoot === releaseRoot) return;
+    if (owner.handover?.abi !== RESIDENT_HANDOVER_ABI || !owner.commands?.includes("releaseChange")) {
+      this.#deferRelease(new Error("Legacy resident host/launcher has no release custody protocol; installer drain required")); return;
+    }
+    this.#refreshPiModels();
+    // A bundled Main's execPath is Pi, not a JavaScript interpreter. Resolve
+    // on this initiating generation and freeze the same runtime workers use.
+    const runtime = await resolveScriptRuntime({ execPath: process.execPath });
+    const target = residentLaunchSpec(this.options.config, path.join(path.dirname(this.#hostPath), "pi-entry.js"), runtime);
+    if (readHandoverJson(handoverOutcomePath(this.options.config.residencyRoot, target))) return;
+    await this.#command({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "releaseChange",
+      requestId: randomUUID(), rootId: main.rootId, createdAt: Date.now(), main, target,
+      caller: { identity: { id: self.id, name: self.name, kind: "main", sessionId: main.sessionId }, hostId: self.ownerHostId },
+    }, this.#releaseAbort.signal);
   }
 
-  async #retireLegacyOwner(owner: ResidentHostOwner): Promise<void> {
-    if (this.#retiringLegacyToken === owner.token) return;
-    const config = this.options.config;
-    const identity = authenticateLegacyOwner(config, owner);
-    if (!identity || legacyProcessStopped(identity)) return; // Never resume somebody else's stop.
-    const fencePath = path.join(config.residencyRoot, "retirement.lock");
-    const fenceToken = randomUUID();
-    let claimed = false, suspended = false, retired = false;
-    try {
-      // Serialize independent Main clients. An orphaned fence is unknown, not permission to kill.
-      const descriptor = fs.openSync(fencePath, "wx", 0o600);
-      claimed = true;
-      try { fs.writeFileSync(descriptor, JSON.stringify({ token: fenceToken, pid: process.pid })); }
-      finally { fs.closeSync(descriptor); }
-      if (!signalLegacyOwner(config, owner, identity, "SIGSTOP")) return;
-      suspended = true;
-      const deadline = Date.now() + 1000;
-      while (!legacyProcessStopped(identity)) {
-        if (Date.now() >= deadline) return;
-        await delay(10);
-      }
-      // SIGSTOP is the admission fence. Only now inspect authoritative state: participants
-      // can lag a running actor by a second. Busy means abandon this attempt and resume;
-      // the existing activation must finish, never be cancelled for a release reload.
-      for (const directory of [this.#requestsPath, path.join(config.residencyRoot, "processing")]) {
-        if (fs.readdirSync(directory).some(entry => entry.endsWith(".json"))) return;
-      }
-      const participants = this.options.participants.list({ scope: "lineage", includeStale: true, fresh: true })
-        .filter(participant => participant.ownerHostId === this.hostId);
-      if (participants.some(participant => participant.stale || participant.actorRun ||
-        participant.status === "running" || participant.status === "queued")) return;
-      const actorRoots = new Set([config.actorRoot,
-        config.sessionActorRoot ?? path.join(config.actorRoot, config.sessionId)]);
-      const registeredActors = new Set<string>();
-      for (const root of actorRoots) {
-        const registryPath = path.join(root, "actors.json");
-        if (!fs.existsSync(registryPath)) continue;
-        const registry = readJson<{ actors?: Array<{ id: string; rootId?: string; residency?: string; status?: string; inFlightRun?: unknown }> }>(registryPath);
-        if (!Array.isArray(registry?.actors)) return;
-        for (const actor of registry.actors) {
-          if (actor.rootId !== config.rootId || actor.residency !== "durable") continue;
-          registeredActors.add(actor.id);
-          if (!["idle", "stopped"].includes(actor.status ?? "") || actor.inFlightRun) return;
-          const participant = participants.find(candidate => candidate.id === actor.id);
-          if (!participant || !["idle", "stopped"].includes(participant.status)) return;
-          // Includes in-flight/overflow items even before the running registry write lands.
-          for (const entry of fs.readdirSync(path.join(root, actor.id)).filter(name => name.startsWith("queue-") && name.endsWith(".json"))) {
-            const queue = readJson<{ items?: unknown[] }>(path.join(root, actor.id, entry));
-            if (!Array.isArray(queue?.items) || queue.items.length) return;
-          }
-        }
-      }
-      if (participants.some(participant => participant.kind === "actor" && !registeredActors.has(participant.id))) return;
-      for (const entry of fs.readdirSync(this.#agentsPath).filter(entry => entry.endsWith(".json"))) {
-        if (!this.settledAgent(entry.slice(0, -5))) return;
-      }
-      // Do not resume an idle legacy host into a SIGTERM handler: mesh callbacks could win
-      // that race. Terminate WHILE fenced. No live/queued work exists; events arriving after
-      // the fence stay in the durable mesh and the replacement replays them exactly once.
-      if (!legacyProcessStopped(identity)) return;
-      retired = signalLegacyOwner(config, owner, identity, "SIGKILL");
-      if (retired) this.#retiringLegacyToken = owner.token;
-    } catch { /* Unknown state is busy. */ }
-    finally {
-      if (suspended && !retired) signalLegacyOwner(config, owner, identity, "SIGCONT");
-      if (claimed && readJson<{ token?: string }>(fencePath)?.token === fenceToken) fs.rmSync(fencePath, { force: true });
-    }
+  #deferRelease(error: unknown): void {
+    try { writeJsonAtomic(path.join(this.options.config.residencyRoot, "handover-deferred.json"), {
+      at: Date.now(), release: this.options.config.fabricExtensionPath,
+      reason: error instanceof Error ? error.message : String(error),
+    }); } catch { /* Deferred is diagnostic; never permission to exit A. */ }
   }
 
   #refreshPiModels(): void {
@@ -648,9 +607,10 @@ export class ResidencyClient {
     if (!("startedAt" in status) || !terminal(status.status)) {
       throw new Error(`Cannot clean up running durable Fabric agent ${metadata.id}`);
     }
-    if (hasUnresolvedWorker(metadata.runDirectory)) {
+    const exitVeto = runTreeExitVeto(metadata.runDirectory);
+    if (exitVeto) {
       throw new Error(
-        `Cannot clean up durable Fabric agent ${metadata.id}: its worker may still be running ` +
+        `Cannot clean up durable Fabric agent ${metadata.id}: ${exitVeto} ` +
         `(see ${metadata.runDirectory}). Check the worker, then remove its files by hand.`,
       );
     }
@@ -723,6 +683,10 @@ export class ResidencyClient {
           if (!response.ok) {
             if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
             if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
+            if (response.errorCode === "FABRIC_MODEL_DENIED" && typeof response.modelDenied?.model === "string") {
+              throw new FabricModelDeniedError(response.modelDenied.model,
+                typeof response.modelDenied.replacement === "string" ? response.modelDenied.replacement : undefined);
+            }
             throw new Error(response.error ?? "Fabric resident host rejected request");
           }
           if ((command.operation === "spawn" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
@@ -853,6 +817,10 @@ export class ResidencyClient {
     ) {
       return undefined;
     }
+    if (owner.attempt) {
+      const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
+      if (state?.plan.id !== owner.attempt.id || state.phase !== (owner.attempt.kind === "target" ? "complete" : "fallback")) return undefined;
+    }
     return owner;
   }
 
@@ -860,7 +828,11 @@ export class ResidencyClient {
     const now = Date.now();
     if (this.#closed || this.#startingHost || now < this.#nextWatchdogAt || !kernelFenceAvailable()) return;
     this.#nextWatchdogAt = now + WATCHDOG_INTERVAL_MS;
-    if (this.#liveOwner()) return;
+    if (this.#liveOwner()) {
+      void this.reconcileRelease().catch((error) => this.#deferRelease(error));
+      return;
+    }
+    if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) return;
     const work = this.#durableWork();
     if (!work) { this.#watchdogWork = undefined; this.#watchdogFailures = 0; return; }
     const noProgress = work === this.#watchdogWork;
@@ -951,6 +923,7 @@ export class ResidencyClient {
     this.options.mainAgent.deliverAgent({
       from: value.from,
       verification: "mesh", // The authenticated resident-host record was checked above.
+      principal: value.principal,
       message: value.message,
       delivery: value.delivery,
       triggerTurn: value.triggerTurn,

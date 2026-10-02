@@ -9,6 +9,7 @@ import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
+import { MeshProvider } from "../src/providers/mesh-provider.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { CPythonRuntime } from "../src/runtime/cpython-runtime.js";
@@ -31,6 +32,7 @@ import { runResidentHostFromConfigPath } from "../src/residency/host.js";
 import { abandonResidentRequest, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 import { captureDurableExecutionTrace } from "./helpers/durable-execution-trace.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
@@ -118,9 +120,9 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
       for (const [name, previous] of signalListeners) {
         for (const listener of process.listeners(name)) if (!previous.has(listener)) process.removeListener(name, listener);
       }
-      // Host shutdown confirms worker exit, and CPython controls also await guest
-      // close. Windows can still transiently retain a cwd/directory in the OS;
-      // opt into Node's bounded recursive-rm retry rather than masking EBUSY.
+      // Host shutdown confirms resident worker exit. Public CPython cases must
+      // separately confirm guest close: runtime settlement bounds its reap wait.
+      // After those barriers, retry only transient OS cwd/directory retention.
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
     },
   };
@@ -1064,6 +1066,56 @@ describe("round 4 public cleanup-obligation retry cancellation", { timeout: 25_0
   }
 });
 
+describe("invocation-local spawn receipts (#2947)", { timeout: 25_000 }, () => {
+  for (const engine of ["quickjs", "node"] as const) for (const interactiveMain of [false, true]) {
+    it(`${engine} completed followUp does not downgrade earlier spawns or poison later calls (Main=${interactiveMain})`, async () => {
+      const state = await harness(false, undefined, 10_000);
+      const main = mainProvider(state);
+      const controller = new AbortController();
+      main.registry.register(new MeshProvider(state.client.options.mesh, main.actors.identity, state.participants));
+      try {
+        const run = publicExecution(state, main, engine, 5_000, interactiveMain);
+        // Pi can reuse the outer cancellation signal across tool calls. It is
+        // observation authority, not an invocation's mutation receipt ledger.
+        const invoke = (code: string) => run(code, controller.signal);
+        const ids: string[] = [];
+        for (let index = 0; index < 2; index++) {
+          const spawned = await invoke(`return ${publicCall(engine, "spawn", requestArgs(state, "spawn"))};`);
+          expect(spawned.success, spawned.error).toBe(true);
+          expect(spawned.residentOutcomes).toBeUndefined();
+          ids.push((spawned.value as { id: string }).id);
+        }
+        await state.client.waitAgent(ids[0]!);
+        await waitFor(() => !state.participants.get(ids[0]!, undefined, { fresh: true })?.capabilities.includes("followUp"));
+        const rejected = await invoke(`return await agents.followUp({id:"${ids[0]}",message:"too late"});`);
+        expect(rejected.success).toBe(false);
+        expect(rejected.error).toContain("does not support followUp");
+        expect(rejected.error).not.toContain("ResidentOutcomeUnknownError");
+        expect(rejected.residentOutcomes).toBeUndefined();
+        const status = await invoke(`return await agents.status({id:"${ids[0]}"});`);
+        expect(status).toMatchObject({ success: true, value: { id: ids[0], status: "completed" } });
+        expect(status.residentOutcomes).toBeUndefined();
+        const fresh = await invoke(`return ${publicCall(engine, "spawn", requestArgs(state, "spawn"))};`);
+        expect(fresh.success, fresh.error).toBe(true);
+        expect(fresh.residentOutcomes).toBeUndefined();
+        expect(ids).not.toContain((fresh.value as { id: string }).id);
+        const effects = await invoke(`return await Promise.allSettled([
+          agents.followUp({id:${JSON.stringify(state.config.rootId)},message:"acknowledge"}),
+          mesh.publish({topic:"work/receipt-regression",text:"published once"})
+        ]);`);
+        expect(effects.success, effects.error).toBe(true);
+        expect(effects.residentOutcomes).toBeUndefined();
+        expect(effects.value).toEqual([
+          expect.objectContaining({ status: "fulfilled", value: expect.objectContaining({ messageId: "unused" }) }),
+          expect.objectContaining({ status: "fulfilled", value: expect.objectContaining({ sequence: expect.any(Number) }) }),
+        ]);
+        expect(decisionsFor(state).filter(decision => decision.operation === "spawn")).toHaveLength(3);
+        expect(controller.signal.aborted).toBe(false);
+      } finally { controller.abort(); await main.close(); await state.close(); }
+    });
+  }
+});
+
 describe("round 2 public execution receipt contract", { timeout: 25_000 }, () => {
   for (const engine of engines) {
     it(`${engine} public Main ceiling retains committed resident receipts through normalized provider signals`, async () => {
@@ -1128,8 +1180,15 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
   }
   for (const engine of engines) for (const operation of ["spawn", "create"] as const)
     for (const ending of ["abort", "deadline"] as const) for (const before of [true, false]) {
-    it(`${engine} ${operation} ${ending} ${before ? "before" : "after"} commit`, async () => {
+    // Reproduce the Windows import/native-startup overrun on the failed row,
+    // as well as keeping its ordinary execution path. The budget stays 1500 ms.
+    for (const startupDelayMs of engine === "monty" && operation === "create" && ending === "deadline" && !before ? [0, 1_700] : [0])
+    it(`${engine} ${operation} ${ending} ${before ? "before" : "after"} commit${startupDelayMs ? " with slow startup" : ""}`, async () => {
       const state = await harness(before, undefined, 10_000); const main = mainProvider(state);
+      const execute = MontyRuntime.prototype.execute;
+      const startup = startupDelayMs ? vi.spyOn(MontyRuntime.prototype, "execute").mockImplementation(async function (this: MontyRuntime, ...args) {
+        await delay(startupDelayMs); return execute.apply(this, args);
+      }) : undefined;
       const controller = new AbortController();
       if (!before) {
         if (operation === "spawn") {
@@ -1146,11 +1205,18 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
       }
       try {
         const run = publicExecution(state, main, engine);
-        const outcome = run(`return ${publicCall(engine, operation, requestArgs(state, operation))}`, controller.signal);
-        await state.entered.promise;
+        let admitted = false;
+        void state.entered.promise.then(() => { admitted = true; });
+        // This is a commit/cancellation contract, not a native-startup benchmark.
+        // Keep the 1500 ms deadline, but start its clock at the real resident
+        // gate; the helper independently bounds startup and observes early exits.
+        const result = await executeAfterAdmission(
+          signal => run(`return ${publicCall(engine, operation, requestArgs(state, operation))}`, AbortSignal.any([controller.signal, signal])),
+          () => admitted,
+          () => { if (ending === "abort") controller.abort(); },
+        );
+        startup?.mockRestore(); // Reconciliation is an ordinary, fresh invocation.
         const requestId = entries(state.residencyRoot, "processing")[0]!.slice(0, -5);
-        if (ending === "abort") controller.abort();
-        const result = await outcome;
         expect(result.success).toBe(false);
         const decisions = decisionsFor(state);
         expect(decisions).toHaveLength(1);
@@ -1177,9 +1243,55 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
       } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
     });
   }
-  for (const engine of engines) for (const settlesDuringGrace of [false, true]) {
-    it(`${engine} teardown exposes a committed unawaited mutation ${settlesDuringGrace ? "that settles during grace" : "still pending after grace"} rather than false success`, async () => {
+  for (const engine of engines) for (const settlesDuringGrace of [false, true])
+    for (const holdGuestExit of engine === "cpython" && settlesDuringGrace ? [false, true] : [false]) {
+    it(`${engine} teardown exposes a committed unawaited mutation ${settlesDuringGrace ? "that settles during grace" : "still pending after grace"} rather than false success${holdGuestExit ? " with guest exit delayed past reap grace" : ""}`, async () => {
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+      const trace = engine === "cpython" ? await captureDurableExecutionTrace() : undefined;
+      const rm = fs.rmSync.bind(fs);
+      let guest: childProcess.ChildProcess | undefined;
+      let killGuest: (() => void) | undefined;
+      let guestExited = false; let guestClosed = false; let removals = 0;
+      let restoreCleanup: (() => void) | undefined;
+      if (holdGuestExit) {
+        const spawn = vi.mocked(childProcess.spawn).getMockImplementation()!;
+        const kill = process.kill.bind(process);
+        vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+          // Model slow Windows termination, not a held pipe after process exit.
+          if (guest?.pid && pid === -guest.pid && signal === "SIGKILL") return true;
+          return kill(pid, signal);
+        });
+        vi.mocked(childProcess.spawn).mockImplementation(((...args: Parameters<typeof childProcess.spawn>) => {
+          if (Array.isArray(args[1]) && args[1].includes("-I")) {
+            const argv = [...args[1]]; const source = argv.indexOf("-c") + 1;
+            argv[source] = "import atexit, time; atexit.register(time.sleep, 10)\n" + argv[source];
+            args[1] = argv;
+            expect(args[2]?.cwd).toBe(state.root);
+            guest = spawn(...args);
+            guest.once("exit", () => { guestExited = true; });
+            guest.once("close", () => { guestClosed = true; });
+            const terminate = guest.kill.bind(guest);
+            killGuest = () => { terminate("SIGKILL"); };
+            vi.spyOn(guest, "kill").mockReturnValue(true);
+            return guest;
+          }
+          return spawn(...args);
+        }) as typeof childProcess.spawn);
+        const cleanup = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+          if (String(target) === state.root) {
+            removals++;
+            if (!guestExited) {
+              // Linux permits cwd removal. Inject the Windows failure only while
+              // the recorded real child is alive; retries cannot release its cwd.
+              for (let retry = 0; retry <= (options?.maxRetries ?? 0); retry++) kill(guest!.pid!, 0);
+              throw Object.assign(new Error(`Injected Windows EBUSY: live CPython guest ${guest!.pid} holds cwd ${state.root} after ${(options?.maxRetries ?? 0) + 1} attempts`), { code: "EBUSY" });
+            }
+            expect(guestClosed).toBe(true);
+          }
+          return rm(target, options);
+        });
+        restoreCleanup = () => cleanup.mockRestore();
+      }
       const original = ActorDirectory.prototype.create;
       vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
         const actor = await original.apply(this, args); state.entered.resolve(); await state.release.promise; return actor;
@@ -1204,10 +1316,30 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
             ? `${call.replace(/^await /, "")}\nawait tools.call(ref="probe.ready", args={})\nreturn "guest ended"`
             : `void ${call.replace(/^await /, "")}; await tools.call({ref:"probe.ready",args:{}}); return "guest ended";`;
         const result = await run(code); expect(result.success).toBe(false); expect(result.value).toBeUndefined();
+        if (holdGuestExit) {
+          expect(guest?.pid).toBeDefined(); expect(guestExited).toBe(false); expect(guestClosed).toBe(false);
+          expect(process.kill(guest!.pid!, 0)).toBe(true);
+        }
         const decisions = decisionsFor(state); expect(decisions).toHaveLength(1); assertReceipts(result.error, decisions);
         state.release.resolve(); await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
         expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
-      } finally { clearTimeout(releaseTimer); state.release.resolve(); await main.close(); await state.close(); }
+      } finally {
+        clearTimeout(releaseTimer); state.release.resolve();
+        // Hold the actual child beyond both the runtime's 250 ms reap grace and
+        // the harness's 375 ms recursive-rm retry window, then confirm its close.
+        const killTimer = holdGuestExit ? setTimeout(() => killGuest?.(), 1_000) : undefined;
+        try {
+          // A runtime result is not an exit barrier once its bounded reap grace
+          // expires. Observe the owned guest's real close before deleting its cwd.
+          await trace?.waitForGuests();
+          await main.close(); await state.close();
+          if (holdGuestExit) { expect(removals).toBe(1); expect(guestExited).toBe(true); expect(guestClosed).toBe(true); }
+        } finally {
+          clearTimeout(killTimer); killGuest?.(); await trace?.waitForGuests();
+          restoreCleanup?.();
+          if (holdGuestExit) rm(state.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+        }
+      }
     });
   }
   for (const engine of engines) for (const ending of ["abort", "deadline", "failure"] as const) {

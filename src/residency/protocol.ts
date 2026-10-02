@@ -1,4 +1,6 @@
+import type { FabricPrincipal } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
+import type { ResidentReleaseIntent, ResidentLauncherIdentity } from "./handover.js";
 import { recordResidentOutcome, registerCancellationEffect } from "../async-settlement.js";
 import { readFileRetrying } from "../core/atomic-write.js";
 import fs from "node:fs";
@@ -41,6 +43,8 @@ export interface ResidentRequestDecision {
   id?: string;
   operation?: ResidentCommand["operation"];
   ownerHostId?: string;
+  /** Originating requester metadata; never grants mutation authority. */
+  principal?: FabricPrincipal | undefined;
 }
 
 const residentDecisionPath = (residencyRoot: string, requestId: string): string =>
@@ -100,6 +104,7 @@ export const commitResidentRequest = (
 ): void => {
   if (decideResidentRequest(residencyRoot, {
     requestId: command.requestId, state: "committed", operation: command.operation, id, ownerHostId,
+    ...(("caller" in command && command.caller?.principal) ? { principal: command.caller.principal } : {}),
   })) return;
   const decision = readResidentRequestDecision(residencyRoot, command.requestId);
   throw new Error(decision?.state === "abandoned"
@@ -317,6 +322,12 @@ export interface ResidentHostOwner {
   commands?: readonly string[];
   /** New clients must not dispatch mutations to an already-running pre-fence host. */
   requestFence?: 1;
+  /** Attestation from the loaded host, never desired config.json. */
+  releaseRoot?: string;
+  configDigest?: string;
+  handover?: { abi: "fabric-resident-1"; launcher: ResidentLauncherIdentity };
+  /** A staged successor has proved worker startup but admits no business work yet. */
+  attempt?: { id: string; kind: "target" | "fallback" };
 }
 
 interface ResidentSpawnCommand {
@@ -369,6 +380,8 @@ interface ResidentCreateActorCommand {
 export interface ResidentActorCaller {
   identity: MeshIdentity;
   hostId: string;
+  /** Captured host turn provenance, independent of owning-Main authorization. */
+  principal?: FabricPrincipal | undefined;
   /** Frozen optional-tool authority; absence means an unrestricted Main. */
   toolCeiling?: string[];
 }
@@ -428,13 +441,15 @@ export type ResidentCommand =
   | ResidentRemoveActorCommand
   | ResidentCreateActorCommand
   | ResidentActorMutationCommand
-  | ResidentActorStatusCommand;
+  | ResidentActorStatusCommand
+  | (ResidentReleaseIntent & { format: typeof RESIDENT_ACTOR_COMMAND_FORMAT; operation: "releaseChange";
+      requestId: string; rootId: string; createdAt: number });
 
 // The only operations every format-1 host predating command negotiation understood.
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
   ...LEGACY_RESIDENT_COMMANDS, "actors", "actorStatus", "setInstructions", "setModel",
-  "setThinking", "setTools", "setActivationFilter",
+  "setThinking", "setTools", "setActivationFilter", "releaseChange",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>
@@ -442,7 +457,7 @@ export const isResidentCommandOperation = (operation: unknown): operation is Res
 
 export class ResidentCommandUnsupportedError extends Error {
   readonly code = "RESIDENT_COMMAND_UNSUPPORTED" as const;
-  constructor(message = "The owning resident host runs an older release; it is relaunched on the current release at its next idle point; retry then") {
+  constructor(message = "The owning resident host runs an older release; release following requires a handover-capable host and launcher; retry after activation") {
     super(message);
     this.name = "ResidentCommandUnsupportedError";
   }
@@ -468,7 +483,9 @@ export interface ResidentCommandResponse {
   pending?: string;
   cleaned?: boolean;
   error?: string;
-  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED";
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "FABRIC_MODEL_DENIED";
+  /** Allowlisted policy-refusal payload, never arbitrary host Error properties. */
+  modelDenied?: { model: string; replacement?: string };
   completedAt: number;
 }
 
@@ -486,6 +503,7 @@ export interface ResidentAgentMetadata {
 }
 
 export interface ResidentDeliveryRecord {
+  principal?: FabricPrincipal | undefined;
   format: typeof RESIDENT_HOST_FORMAT;
   /** Survives payload truncation; lets Main read the authoritative terminal result. */
   agentCompletionId?: string;

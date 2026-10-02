@@ -4,6 +4,7 @@ import ts from "typescript";
 import { ExecutionDeadline } from "./execution-deadline.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
+import { FabricModelDeniedError } from "../core/model-policy.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
 import { transpileFabricCodeWithSourceMap } from "./type-checker.js";
@@ -23,6 +24,28 @@ export type {
 } from "./kernel.js";
 
 type QuickJsModule = Awaited<ReturnType<typeof newQuickJSWASMModuleFromVariant>>;
+
+// Explicit safe contracts, not Error serialization: never bridge stacks, causes, arbitrary
+// properties or getters. Keep this dependency-free so runtime loading cannot pull in providers.
+const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
+  FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",
+  FABRIC_PROJECT_AGENT_UNRESOLVED: "FabricProjectAgentUnresolvedError",
+  FABRIC_PROJECT_AGENT_AMBIGUOUS: "FabricProjectAgentAmbiguousError",
+  FABRIC_PROJECT_LEAD_INVALID: "FabricProjectLeadInvalidError",
+});
+const guestFabricErrorMetadata = (error: unknown): Record<string, string | boolean> | undefined => {
+  if (!(error instanceof Error)) return undefined;
+  // Preserve only the fixed policy classification, never arbitrary Error fields.
+  if (error instanceof FabricModelDeniedError) return { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
+  const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
+  const name = Object.getOwnPropertyDescriptor(error, "name")?.value;
+  if (typeof code !== "string" || !Object.hasOwn(GUEST_FABRIC_ERROR_NAMES, code) || GUEST_FABRIC_ERROR_NAMES[code] !== name) return undefined;
+  const metadata: Record<string, string | boolean> = { name, code };
+  const retryable = Object.getOwnPropertyDescriptor(error, "retryable")?.value;
+  if (typeof retryable === "boolean") metadata.retryable = retryable;
+  return metadata;
+};
 
 let quickJsModulePromise: Promise<QuickJsModule> | undefined;
 
@@ -1070,14 +1093,32 @@ export class QuickJsRuntime {
                 error instanceof Error ? error.message : String(error),
               );
               try {
-                // Transfer only a host Error's string classification, never its
-                // arbitrary properties or a caller-selected property key.
-                if (error instanceof Error && typeof error.name === "string") {
-                  const nameHandle = context.newString(error.name);
+                const safeMetadata = guestFabricErrorMetadata(error);
+                // Fabric metadata includes its vetted name. Otherwise transfer only
+                // a host Error's string classification, never arbitrary properties
+                // or a caller-selected property key. Each key is assigned once.
+                const name = safeMetadata?.name ?? (error instanceof Error ? error.name : undefined);
+                if (!safeMetadata && typeof name === "string") {
+                  const nameHandle = context.newString(name);
                   try {
                     context.setProp(errorHandle, "name", nameHandle);
                   } finally {
                     nameHandle.dispose();
+                  }
+                }
+                if (safeMetadata) {
+                  for (const [key, value] of Object.entries(safeMetadata)) {
+                    if (typeof value === "boolean") {
+                      // Boolean handles are borrowed context constants, not owned.
+                      context.setProp(errorHandle, key, value ? context.true : context.false);
+                    } else {
+                      const metadata = context.newString(value);
+                      try {
+                        context.setProp(errorHandle, key, metadata);
+                      } finally {
+                        metadata.dispose();
+                      }
+                    }
                   }
                 }
                 const exit = reference === "pi.bash" || reference === "pi.powershell"

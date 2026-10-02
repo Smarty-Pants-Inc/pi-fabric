@@ -341,8 +341,11 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
       fresh.setIdle(true);
       fresh.emit("session_compact_failed", { reason: "manual", aborted: false, errorMessage, willRetry });
       expect(f.sent[0]!.options.triggerTurn).toBe(false);
-      fresh.controller.deliverAgent({ from: sender, message: "later peer", delivery: "followUp" });
-      expect(f.sent.at(-1)!.options.triggerTurn).toBe(!failed);
+      const peer = fresh.controller.deliverAgent({ from: sender, message: "later peer", delivery: "followUp" });
+      expect(peer.triggered).toBe(!failed);
+      expect(f.sent).toHaveLength(failed ? 1 : 2);
+      expect(fresh.controller.queueDepth().pendingFollowUps).toBe(failed ? 1 : 0);
+      if (failed) expect(peer.reason).toMatch(/^provider-backoff until /);
       fresh.controller.closeFollowUpDrain();
       const reloaded = f.main(true, flushMs);
       reloaded.controller.deliverAgent({ from: sender, message: "peer after reload", delivery: "steer" });
@@ -353,6 +356,39 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
       expect(f.sent.at(-1)!.options.triggerTurn).toBe(true);
     },
   );
+
+  it.each([0, 60_000])("a failed compaction delivers reload replay passively but retains a fresh peer wake (flushMs=%s)", async (flushMs) => {
+    const f = await fixture();
+    const old = f.main(true, flushMs);
+    old.controller.prepareReload();
+    const replay = { from: sender, message: "replay", delivery: "steer" as const, deliveryId: "passive-replay" };
+    const replayId = old.controller.deliverAgent(replay).messageId;
+    old.controller.closeFollowUpDrain();
+    const fresh = f.main(false, flushMs);
+    fresh.setIdle(true);
+    fresh.emit("session_compact_failed", { reason: "manual", aborted: false, errorMessage: "provider unavailable" });
+    expect(f.sent.map(item => [item.details.id, item.options])).toEqual([
+      [replayId, { deliverAs: "steer", triggerTurn: false }],
+    ]);
+    const wake = { from: sender, message: "fresh wake", delivery: "followUp" as const, deliveryId: "fresh-wake" };
+    const receipt = fresh.controller.deliverAgent(wake);
+    expect(receipt).toMatchObject({ triggered: false, pendingFollowUps: 1 });
+    expect(receipt.reason).toMatch(/^provider-backoff until /);
+    expect(f.sent).toHaveLength(1);
+    expect(fresh.controller.deliverAgent(replay)).toMatchObject({ duplicate: true });
+    expect(fresh.controller.deliverAgent(wake)).toMatchObject({ duplicate: true });
+    fresh.emit("turn_end", { message: { stopReason: "stop" }, context: { pendingMessages: [] } });
+    fresh.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } });
+    fresh.emit("agent_settled", { outcome: "completed" });
+    expect(f.sent.map(item => [item.details.id, item.options])).toEqual([
+      [replayId, { deliverAs: "steer", triggerTurn: false }],
+      [receipt.messageId, { deliverAs: "followUp", triggerTurn: true }],
+    ]);
+    expect(fresh.controller.queueDepth().pendingFollowUps).toBe(0);
+    fresh.controller.closeFollowUpDrain();
+    f.main(true, flushMs);
+    expect(f.sent).toHaveLength(2);
+  });
 
   it.each([0, 60_000])("a lost direct Pi handoff is reconciled passively at a failed boundary (flushMs=%s)", async (flushMs) => {
     const f = await fixture();
@@ -376,7 +412,7 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
   });
 
   it.each([0, 60_000].flatMap((flushMs) => [false, true].map((ownerHalt) => ({ flushMs, ownerHalt }))))(
-    "a terminal provider failure stays passive until a successful turn, without lifting an owner halt (flushMs=$flushMs, ownerHalt=$ownerHalt)",
+    "a terminal provider failure holds wakes until recovery, without lifting an owner halt (flushMs=$flushMs, ownerHalt=$ownerHalt)",
     async ({ flushMs, ownerHalt }) => {
       const f = await fixture();
       const host = f.main(false, flushMs);
@@ -385,17 +421,30 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
       host.emit("agent_settled", { outcome: "error" });
       host.setIdle(true);
       if (ownerHalt) host.controller.halt();
-      host.controller.deliverAgent({ from: sender, message: "failed provider", delivery: "followUp" });
-      expect(f.sent.at(-1)!.options.triggerTurn).toBe(false);
+      const failed = host.controller.deliverAgent({ from: sender, message: "failed provider", delivery: "followUp" });
+      expect(failed.triggered).toBe(false);
+      expect(f.sent).toHaveLength(ownerHalt ? 1 : 0);
+      expect(host.controller.queueDepth().pendingFollowUps).toBe(ownerHalt ? 0 : 1);
+      if (ownerHalt) expect(f.sent[0]!.options.triggerTurn).toBe(false);
+      else expect(failed.reason).toMatch(/^provider-backoff until /);
       host.emit("agent_start");
       host.emit("input", { source: "extension" });
-      host.controller.deliverAgent({ from: sender, message: "not recovered yet", delivery: "steer" });
-      expect(f.sent.at(-1)!.options.triggerTurn).toBe(false);
+      const waiting = host.controller.deliverAgent({ from: sender, message: "not recovered yet", delivery: "steer" });
+      expect(waiting.triggered).toBe(false);
+      expect(f.sent).toHaveLength(ownerHalt ? 2 : 0);
+      expect(host.controller.queueDepth().pendingFollowUps).toBe(ownerHalt ? 0 : 2);
+      if (ownerHalt) expect(f.sent[1]!.options.triggerTurn).toBe(false);
+      else expect(waiting.reason).toBe(failed.reason);
       host.emit("turn_end", { message: { stopReason: "stop" }, context: { pendingMessages: [] } });
       host.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } });
       host.emit("agent_settled", { outcome: "completed" });
       host.controller.deliverAgent({ from: sender, message: "provider recovered", delivery: "followUp" });
-      expect(f.sent.at(-1)!.options.triggerTurn).toBe(!ownerHalt);
+      expect(f.sent.map(item => item.options)).toEqual([
+        { deliverAs: "followUp", triggerTurn: !ownerHalt },
+        { deliverAs: "steer", triggerTurn: !ownerHalt },
+        { deliverAs: "followUp", triggerTurn: !ownerHalt },
+      ]);
+      expect(host.controller.queueDepth().pendingFollowUps).toBe(0);
     },
   );
 
@@ -682,8 +731,12 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     const now = Date.now() + 120_000;
     const get = f.observer.get.bind(f.observer);
     const known = f.observer.lastKnown.bind(f.observer);
+    const peers = f.observer.peers.bind(f.observer);
     vi.spyOn(f.observer, "get").mockImplementation((id, _now, options) => get(id, now, options));
     vi.spyOn(f.observer, "lastKnown").mockImplementation((id) => known(id, now));
+    // Discovery and admission must observe the same expired lease, including #201's peer hint.
+    vi.spyOn(f.observer, "peers").mockImplementation(() => peers(now));
     await expect(f.sendRouter.routeMessage(identity.id, "too late", undefined, kind)).rejects.toThrow("Unknown Fabric participant");
+    expect(f.mesh().read({ topic: "fabric.control.command", limit: 100 })).toEqual([]);
   });
 });

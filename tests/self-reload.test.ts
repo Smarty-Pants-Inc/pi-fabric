@@ -8,6 +8,7 @@ import {
   SELF_RELOAD_COMMAND,
   activeFabricRoot,
   installSelfReload,
+  reloadTargetUiHold,
   loadedFabricRoot,
 } from "../src/lifecycle/self-reload.js";
 
@@ -113,6 +114,7 @@ describe("installSelfReload", () => {
       autoReloadConfigured: () => options.configured ?? true,
       moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href,
       settingsPath: settingsPath(),
+      reloadTargetUiHold, // Production adapter: this fake old host intentionally lacks holdState.
       ...(options.halted ? { halted: options.halted } : {}),
     });
     return { old, next, pi, emit, commands, sent, selfReload };

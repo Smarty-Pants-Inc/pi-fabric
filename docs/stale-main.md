@@ -28,14 +28,17 @@ work and let it settle, then use `/fabric-release-reload` or `/reload`. The auto
 keeps its existing streaming, prompt, background-work and halt checks. A refusal never stops
 existing workers or substitutes a new worker release.
 
-After a Main reload changes the resident config entry path, its obsolete resident host stops
-taking new commands, drains live runs and exits even if durable subscriptions remain. The
-reloaded Main starts the replacement host on its own release. Recovery retries beyond the startup
-budget until ownership is replaced, and stops when that Main client closes. Legacy owners with
-no immutable release path are unknown, never current: new commands and direct actor messages
-are refused, and the host is retired only after fresh participant and settled-run records prove
-an idle boundary. Unreadable or incomplete work state keeps the refusal in place rather than
-interrupting a run. Refused actor events are parked
+A mutable resident config entry-path change is not release authority: the serving host
+does not fence itself or exit on that change alone. Resident replacement requires a current
+Main intent and attested launcher custody, and main's automatic-recovery safety gate remains
+closed until attempt-owned membership and complete whole-attempt exit receipts exist. Legacy
+or pre-protocol owners are never suspended, sampled, killed or automatically replaced;
+reconciliation records `Legacy resident host/launcher has no release custody protocol; installer
+drain required` in `handover-deferred.json`. Direct actor routing keeps main's serving-owner
+semantics; it does not acquire retirement authority from config. Installer-managed draining
+remains required. Automatic
+retirement is deferred to a follow-up implementing whole-attempt exit receipts, not an idle
+participant or process census. Refused actor events are parked
 in their durable queue (not failed or consumed), then retried by the replacement runtime;
 repeated stale reloads do not exhaust their interrupted-run retry budget. Caller `ask` requests
 still reject immediately so their caller hears the refusal.

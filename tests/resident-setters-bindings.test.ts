@@ -78,7 +78,8 @@ const setup = (queueLimit = 2, realRuns = false) => {
 const routedProvider = (state: ReturnType<typeof setup>, actors: ActorManager, actor: FabricActorInfo, ownRoot: boolean) => {
   const caller = ownRoot ? identity : { id: "session:foreign", name: "Foreign Main", kind: "main" as const, sessionId: "foreign" };
   const callerActors = new ActorManager(caller.sessionId, caller, state.mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, state.agents, () => {}, {
-    actorRoot: state.actorRoot, persistent: true, canManageActor: () => false,
+    // A passive Main must not share the durable owner's mailbox writer lineage.
+    actorRoot: state.actorRoot, persistent: true, claimResidency: "session", canManageActor: () => false,
   });
   managers.push(callerActors);
   const mainFor = (who: typeof identity): FabricMainAgentTarget => ({

@@ -12,7 +12,6 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
-import * as processIdentity from "../src/residency/process-identity.js";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -209,18 +208,30 @@ describe("resident host ownership", () => {
       const binding = vi.spyOn(host.actors, "resolveActivationBinding").mockResolvedValue({ model: "provider/current", thinking: "high" });
       const tell = vi.spyOn(host.actors, "tell").mockReturnValue({ messageId: "accepted" } as ReturnType<typeof host.actors.tell>);
       const ask = vi.spyOn(host.actors, "ask").mockResolvedValue({ id: "accepted" } as Awaited<ReturnType<typeof host.actors.ask>>);
-      const command = { operation, targetId: "actor", commandId: "owner-defaults", message: "keep working", binding: { model: "provider/pinned" }, bindingProvenance: { kind: "owner-defaults" as const, rootId: config.rootId } } as Parameters<typeof handler>[0];
+      const principal = { id: "paul", binding: "voice-call" as const };
+      const command = { operation, principal, targetId: "actor", commandId: "owner-defaults", message: "keep working", binding: { model: "provider/pinned" }, bindingProvenance: { kind: "owner-defaults" as const, rootId: config.rootId } } as Parameters<typeof handler>[0];
       const from = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
       const signal = new AbortController().signal;
-      await expect(handler(command, from, signal)).resolves.toMatchObject({ accepted: true, messageId: "accepted" });
+      await expect(handler(command, from, signal, "mesh")).resolves.toMatchObject({ accepted: true, messageId: "accepted" });
       const options = { overrides: { model: "provider/pinned" } };
-      if (operation === "ask") expect(ask).toHaveBeenCalledWith("actor", "keep working", undefined, signal, options);
+      const provenance = expect.objectContaining({ principal });
+      if (operation === "ask") expect(ask).toHaveBeenCalledWith("actor", "keep working", undefined, signal, { ...options, provenance });
       else {
         expect(binding).toHaveBeenCalledWith("actor", options);
-        expect(tell).toHaveBeenCalledWith("actor", "keep working", undefined, options);
+        expect(tell).toHaveBeenCalledWith("actor", "keep working", undefined, { ...options, provenance });
       }
       await expect(handler(command, { ...from, id: "session:foreign" }, signal)).resolves.toMatchObject({ accepted: false, error: "Invalid actor owner-default binding provenance" });
       expect(operation === "ask" ? ask : tell).toHaveBeenCalledOnce();
+      const { bindingProvenance: _ignored, binding: _pinned, ...resolved } = command;
+      for (const foreignBinding of [undefined, {}, { thinking: "medium" as const }]) {
+        await expect(handler({ ...resolved, ...(foreignBinding ? { binding: foreignBinding } : {}) }, { ...from, id: "session:foreign" }, signal, "bridge")).resolves.toMatchObject({ accepted: true });
+        const foreignOptions = { binding: foreignBinding ?? {} };
+        if (operation === "ask") expect(ask).toHaveBeenLastCalledWith("actor", "keep working", undefined, signal, { ...foreignOptions, provenance });
+        else {
+          expect(binding).toHaveBeenLastCalledWith("actor", foreignOptions);
+          expect(tell).toHaveBeenLastCalledWith("actor", "keep working", undefined, { ...foreignOptions, provenance });
+        }
+      }
     } finally {
       control.mockRestore();
       await host.close();
@@ -240,10 +251,7 @@ describe("resident host ownership", () => {
       expect(fs.existsSync(ownerPath)).toBe(false);
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
-  it.each(["native", "unavailable"] as const)("fences config release changes while retaining late actor delivery for the replacement (birth identity %s)", async (birthIdentity) => {
-    // Windows/macOS have no /proc start ticks; exercise their serialized-owner shape on Linux too.
-    const birth = birthIdentity === "unavailable"
-      ? vi.spyOn(processIdentity, "processStartTime").mockReturnValue(undefined) : undefined;
+  it("never follows mutable config alone without a Main intent and attested launcher custody", async () => {
     const { root, config, host, idle } = fixture();
     const next = path.join(root, "other-package");
     fs.mkdirSync(path.join(next, "dist/residency"), { recursive: true });
@@ -256,12 +264,6 @@ describe("resident host ownership", () => {
       control.mockRestore();
       const ownerPath = path.join(config.residencyRoot, "owner.json");
       const owner = fs.readFileSync(ownerPath, "utf8");
-      const parsedOwner = JSON.parse(owner);
-      expect(parsedOwner).toMatchObject({ fabricExtensionPath: config.fabricExtensionPath });
-      // JSON omits undefined fields, but property access must still preserve optional birth identity.
-      expect(parsedOwner.processStartTime).toBe(processStartTime(process.pid));
-      if (birthIdentity === "unavailable") expect(parsedOwner).not.toHaveProperty("processStartTime");
-      const fence = vi.spyOn(host.actors, "fenceActivations");
       vi.spyOn(host.actors, "listOwned").mockReturnValue([{ residency: "durable", status: "idle", queued: 0 }] as ReturnType<typeof host.actors.listOwned>);
       vi.spyOn(host.actors, "owns").mockReturnValue(true);
       vi.spyOn(host.actors, "status").mockReturnValue({ rootId: config.rootId } as ReturnType<typeof host.actors.status>);
@@ -269,48 +271,12 @@ describe("resident host ownership", () => {
       const tell = vi.spyOn(host.actors, "tell").mockReturnValue({ messageId: "accepted" } as ReturnType<typeof host.actors.tell>);
       fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify({ ...config, fabricExtensionPath: path.join(next, "dist/index.js") }));
       await delay(150);
-      expect(idle).toHaveBeenCalled();
-      expect(fence).toHaveBeenCalled();
+      expect(idle).not.toHaveBeenCalled();
       expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
       await expect(handler({ operation: "followUp", targetId: "actor", commandId: "after-config", message: "keep working" } as Parameters<typeof handler>[0], host.identity, new AbortController().signal)).resolves.toMatchObject({ accepted: true, messageId: "accepted" });
       expect(tell).toHaveBeenCalledOnce();
     } finally {
       control.mockRestore();
-      await host.close();
-      birth?.mockRestore();
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("does not let an unadmitted ASK block retirement control drain", async () => {
-    const { root, config, host, idle } = fixture();
-    let handler!: Parameters<typeof host.control.start>[0];
-    const start = vi.spyOn(FabricControlPlane.prototype, "start").mockImplementation((accept) => { handler = accept; });
-    const cancellation = new AbortController();
-    let admission: ReturnType<typeof handler> | undefined;
-    let closing: Promise<void> | undefined;
-    try {
-      await host.start();
-      start.mockRestore();
-      vi.spyOn(host.actors, "owns").mockReturnValue(true);
-      vi.spyOn(host.actors, "status").mockReturnValue({ rootId: config.rootId } as ReturnType<typeof host.actors.status>);
-      // A fenced ASK can wait for a queued activation, but is not an admitted run.
-      vi.spyOn(host.actors, "ask").mockImplementation(() => new Promise((_resolve, reject) => {
-        cancellation.signal.addEventListener("abort", () => reject(new Error("request cancelled")), { once: true });
-      }));
-      const closeControl = vi.spyOn(host.control, "close").mockImplementation(async () => { cancellation.abort(); });
-      admission = handler({ operation: "ask", targetId: "actor", commandId: "unadmitted", message: "wait for replacement" } as Parameters<typeof handler>[0], host.identity, cancellation.signal);
-      fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify({ ...config, fabricExtensionPath: path.join(root, "replacement/dist/index.js") }));
-      await vi.waitFor(() => expect(idle).toHaveBeenCalled(), { timeout: 1_000 });
-      closing = host.close();
-      await vi.waitFor(() => expect(closeControl).toHaveBeenCalled(), { timeout: 1_000 });
-      await expect(admission).resolves.toMatchObject({ accepted: false, error: "request cancelled" });
-      await closing;
-    } finally {
-      cancellation.abort();
-      await admission;
-      start.mockRestore();
-      await closing;
       await host.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -443,5 +409,57 @@ describe("resident host ownership", () => {
       expect(residentProcessAlive(process.pid, processStartTime(process.pid))).toBe(true);
       expect(residentProcessAlive(process.pid, "0")).toBe(false);
     }
+  });
+});
+
+describe("PR 190 config-only retirement is deferred", () => {
+  const connectMain = (config: ResidentHostConfig, host: ResidentHost) => {
+    const self = host.participants.self();
+    vi.spyOn(host.participants, "self").mockReturnValue({ ...self, kind: "root", id: config.rootId, sessionId: config.sessionId, ownerHostId: config.rootId });
+    return new ResidencyClient({ config, mesh: host.mesh, participants: host.participants,
+      mainAgent: { id: config.rootId, local: true } as FabricMainAgentTarget });
+  };
+
+  it.each(["native", "unavailable"] as const)("defers config release changes to installer drain without fencing (birth identity %s)", async birthIdentity => {
+    const processIdentity = await import("../src/residency/process-identity.js");
+    const birth = birthIdentity === "unavailable" ? vi.spyOn(processIdentity, "processStartTime").mockReturnValue(undefined) : undefined;
+    const { root, config, host, idle } = fixture(); let client: ResidencyClient | undefined;
+    try {
+      await host.start();
+      const ownerPath = path.join(config.residencyRoot, "owner.json"), owner = fs.readFileSync(ownerPath, "utf8");
+      const parsed = JSON.parse(owner);
+      expect(parsed.fabricExtensionPath).toBe(config.fabricExtensionPath);
+      if (birthIdentity === "unavailable") expect(parsed).not.toHaveProperty("processStartTime");
+      const fence = vi.spyOn(host.actors, "fenceActivations");
+      vi.spyOn(host.actors, "listOwned").mockReturnValue([{ residency: "durable", status: "idle", queued: 0 }] as ReturnType<typeof host.actors.listOwned>);
+      client = connectMain({ ...config, fabricExtensionPath: path.join(root, "replacement/dist/index.js") }, host);
+      client.syncPiModels(); await client.reconcileRelease(); await delay(150);
+      expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "handover-deferred.json"), "utf8")).reason).toBe("Legacy resident host/launcher has no release custody protocol; installer drain required");
+      expect(idle).not.toHaveBeenCalled(); expect(fence).not.toHaveBeenCalled();
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+    } finally { await client?.close(); await host.close(); birth?.mockRestore(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("does not cancel an unadmitted ASK or start control drain on mutable config alone", async () => {
+    const { root, config, host, idle } = fixture();
+    let handler!: Parameters<typeof host.control.start>[0];
+    const start = vi.spyOn(FabricControlPlane.prototype, "start").mockImplementation(accept => { handler = accept; });
+    const cancellation = new AbortController();
+    let admission: ReturnType<typeof handler> | undefined; let client: ResidencyClient | undefined;
+    try {
+      await host.start(); start.mockRestore();
+      vi.spyOn(host.actors, "owns").mockReturnValue(true);
+      vi.spyOn(host.actors, "status").mockReturnValue({ rootId: config.rootId } as ReturnType<typeof host.actors.status>);
+      vi.spyOn(host.actors, "ask").mockImplementation(() => new Promise((_resolve, reject) => {
+        cancellation.signal.addEventListener("abort", () => reject(new Error("request cancelled")), { once: true });
+      }));
+      const closeControl = vi.spyOn(host.control, "close");
+      admission = handler({ operation: "ask", targetId: "actor", commandId: "unadmitted", message: "stay on serving owner" } as Parameters<typeof handler>[0], host.identity, cancellation.signal);
+      client = connectMain({ ...config, fabricExtensionPath: path.join(root, "replacement/dist/index.js") }, host);
+      client.syncPiModels(); await client.reconcileRelease(); await delay(150);
+      expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "handover-deferred.json"), "utf8")).reason).toMatch(/installer drain required/);
+      expect(idle).not.toHaveBeenCalled(); expect(closeControl).not.toHaveBeenCalled(); expect(cancellation.signal.aborted).toBe(false);
+      cancellation.abort(); await expect(admission).resolves.toMatchObject({ accepted: false, error: "request cancelled" });
+    } finally { cancellation.abort(); await admission; start.mockRestore(); await client?.close(); await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 });

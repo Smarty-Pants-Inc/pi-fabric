@@ -15,6 +15,20 @@ const directoryChain = (directory: string): string[] => {
   }
 };
 
+describe("atomic pre-encoded payloads", () => {
+  it.each([false, true])("keeps a Uint8Array view's exact bytes with durable=%s", (durable) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-byte-view-"));
+    const target = path.join(root, "payload");
+    const backing = Buffer.from([0xff, 0x00, 0xc3, 0xa9, 0x80, 0xff]);
+    const contents = new Uint8Array(backing.buffer, backing.byteOffset + 1, backing.length - 2);
+    try {
+      writeFileAtomic(target, contents, { durable });
+      expect(fs.readFileSync(target)).toEqual(Buffer.from(contents));
+      expect(fs.readdirSync(root)).toEqual(["payload"]);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
 describe("#180 S4 physical directory ancestry", () => {
   it.skipIf(process.platform === "win32").each(["nested-component", "link-target"].flatMap((chain) =>
     ["target-leaf", "target-ancestor", "alias-parent", "alias-ancestor"].map((barrier) => ({ chain, barrier })),

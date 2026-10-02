@@ -10,7 +10,7 @@ existing events and mirrors root presence. There is no new store or protocol.
   `pr.wake`, when the recipient (`to`) is a live root or host native to the other side.
 - Presence: each side's live native hosts and root participants go into the other side's state at
   the same keys, with `remoteHost: <side name>` and the source identity as `updatedBy`. A mirrored
-  lease lasts one source TTL from the local observation, capped at 15 s, rather than ending at
+  lease lasts one source TTL from the local observation, capped at 15 s. It does not use
   the source's absolute expiry. File-only heartbeats carry their effective renewal time. Presence
   is normally refreshed every 5 s; a lapsed mirror is refreshed and revalidated once before an
   event is refused. A source that stops renewing can remain mirrored for at most twice its TTL
@@ -25,10 +25,15 @@ existing events and mirrors root presence. There is no new store or protocol.
 - Each bridged event keeps its `from`, `to`, `kind` and `text`. It carries
   `data.bridge = {from: <side>, id: <original event id>}`, and an event with a `bridge` field is
   never forwarded again.
-- Per direction the cursor is the last source sequence handled. It is saved in the cursor file,
-  and also after each forwarded event with the destination sequence of that event. On restart the
-  bridge skips the source ids already bridged after that mark, so a crash does not forward an
-  event twice.
+- Per direction the cursor records the last handled source sequence plus a generation-tagged
+  byte offset. Polls tail from that offset rather than depending on shared sequence-read hints.
+  Idle polls read one boundary byte per side and do not rewrite checkpoints or read routing
+  authority. Offsets checkpoint only a fully handled page; each forwarded event still checkpoints
+  its source sequence and destination mark. On restart the bridge skips ids already bridged after
+  that mark, so a crash does not forward an event twice. Old sequence-only cursor files migrate
+  on first use; old v1 agents fall back to sequence reads when they do not advertise tail support.
+  A rewritten log invalidates the offset generation and reconciles by sequence (from the archive
+  when available) before returning to byte tails.
 - The remote is not trusted. An event from it crosses only when all of these are true:
   - its sender is a live native participant or host identity of the remote;
   - no hub record, live or not, uses that id;
@@ -70,6 +75,29 @@ existing events and mirrors root presence. There is no new store or protocol.
   (a missing or non-executable ssh) fails the bridge with a named error and exit status 1.
 - The agent (the remote end) serves only the bridge operations. It applies the allow-list and
   stamps its pinned `--peer` name on everything it writes, whatever the hub sends.
+
+## Control deadlines and retention
+
+Commands addressed to a validated remote participant use `mesh.bridgeControlTimeoutMs` (default
+30,000 ms, configurable from 30,000 to 300,000), or a longer requested timeout. The deadline is
+stamped at publication commit and includes outbound bridge queueing. Senders allow an additional
+15 s for the ACK return leg; mirrored steer/followUp admission waits are bounded by that same
+window plus grace, even if publication blocks or the lease renews. Cancellation uses the bridge
+window too. Native commands keep their existing timeout. A missing ACK or a lapsed mirror cannot
+prove non-delivery: errors say the outcome is unknown and a retry may deliver twice. Only an
+authenticated owner's explicit `notRun` rejection permits the existing bounded message retry.
+
+The live `events.jsonl` already compacts after a publish takes it past 64 MiB, retaining up to
+16 MiB of complete recent lines and incrementing `generation`. This is not an age-based sweep:
+without a new publish an oversized legacy file remains unchanged. Stores with `event-archive.json`
+also keep append-only per-topic/day archives; those have no total size or retention bound here.
+Slow bridges can reconcile removed live events only when that archive is enabled. A proposed
+future archive bound (not implemented) is a minimum acknowledged sequence across registered bridge
+cursors, plus an outage/retention safety margin: delete only sealed segments entirely below that
+floor, and never reset event sequences or log generations. Age/size deletion alone would break
+lagging cursor recovery. A hard byte quota also needs backpressure: if pinned segments prevent
+reclamation, reject new publishes rather than deleting unread history. A permanently offline
+link requires explicit retirement, not silent cursor invalidation.
 
 ## Running it
 

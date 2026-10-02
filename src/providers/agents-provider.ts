@@ -1586,10 +1586,19 @@ export class AgentsProvider implements FabricProvider {
       // may await contended locks after the actor is already runnable/subscribed.
       const command = { format: RESIDENT_HOST_FORMAT, operation: "createActor" as const,
         requestId: randomUUID(), rootId: this.mainAgent.id, request, createdAt: Date.now() };
-      const ownerHostId = this.participants.self().ownerHostId;
+      const creationOwnerHostId = (): string => {
+        // A worker's self() names its upstream owner, not the runtime creating
+        // this actor. AgentManager already holds the host used for publication.
+        // Standalone local Main callers need no participant-directory API.
+        const hostId = this.manager.runtimeHostId ?? (this.mainAgent.local ? this.mainAgent.id : undefined);
+        if (!hostId?.trim()) throw new Error("Local actor creation requires a runtime owner host ID");
+        return hostId;
+      };
       return this.actorManager.create(request, {
-        beforeCommit: checkCommit, checkActive: checkCommit,
+        // Validate ownership before predecessor removal as well as insertion.
+        beforeCommit: () => { checkCommit(); creationOwnerHostId(); }, checkActive: checkCommit,
         onCommit: (id) => {
+          const ownerHostId = creationOwnerHostId();
           const decision = { requestId: command.requestId, state: "committed" as const, id, ownerHostId };
           let outcome: ResidentOutcomeUnknownError | undefined;
           registerCancellationEffect(signal, reason =>

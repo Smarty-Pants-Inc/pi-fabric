@@ -40,6 +40,8 @@ import type {
 } from "../src/topology/types.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { actorParticipantRecord } from "../src/topology/records.js";
 import { AgentsProvider, collectAgentToolPreviewNodes } from "../src/providers/agents-provider.js";
 import type { ResidencyClient } from "../src/residency/client.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
@@ -221,11 +223,57 @@ describe("fleet model policy (#2490)", () => {
     } finally { release(); await done; spy.mockRestore(); }
   });
 
-  it.each((["create", "import"] as const).flatMap(action =>
-    (["registry", "presence"] as const).flatMap(publication =>
-      (["Escape", "deadline", "revocation"] as const).map(ending => [action, publication, ending] as const))))(
-    "F6 #3115 public %s retains committed actor identity during %s publication (%s)", async (action, publication, ending) => {
-      const { provider, actors, globalActors, root, mesh, identity } = setup();
+  it("F6 #3115 standalone Main creation needs no participants.self API", async () => {
+    const { provider, actors, agents } = setup();
+    vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
+    // A minimal topology dependency is sufficient for local creation.
+    delete (provider.participants as Partial<FabricParticipantSource>).self;
+    const actor = await provider.invoke("create", { name: "minimal-topology", instructions: "Review." }, context) as FabricActorInfo;
+    expect(actors.owns(actor.id)).toBe(true);
+    await provider.invoke("remove", { id: actor.id }, context);
+    expect(actors.list()).toEqual([]);
+  });
+
+  it("F6 #3115 missing child creation host fails closed before local commitment", async () => {
+    const { provider, actors, agents, root } = setup([], [], undefined, {
+      identity: { id: "task:worker", name: "worker", kind: "agent" }, mainAgentId: "session:upstream-main",
+    });
+    vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
+    delete (provider.participants as Partial<FabricParticipantSource>).self;
+    await expect(provider.invoke("create", { name: "no-owner", instructions: "Review." }, context))
+      .rejects.toThrow("Local actor creation requires a runtime owner host ID");
+    expect(actors.list()).toEqual([]);
+    expect(fs.existsSync(path.join(root, "actors"))).toBe(false);
+  });
+
+  it("F6 #3115 missing child creation host preserves a stopped predecessor", async () => {
+    const { provider, actors, agents } = setup([], [], undefined, {
+      identity: { id: "actor:worker", name: "worker", kind: "actor" }, mainAgentId: "session:upstream-main",
+    });
+    const previous = await actors.create({ name: "same-name", instructions: "Review." });
+    await actors.stop(previous.id);
+    const before = actors.list();
+    vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
+    await expect(provider.invoke("create", { name: "same-name", instructions: "Replacement." }, context))
+      .rejects.toThrow("Local actor creation requires a runtime owner host ID");
+    expect(actors.list()).toEqual(before);
+    expect(actors.status(previous.id).status).toBe("stopped");
+  });
+
+  it.each((["main", "task", "actor"] as const).flatMap(parent =>
+    (["create", "import"] as const).flatMap(action =>
+      (["registry", "presence"] as const).flatMap(publication =>
+        (["Escape", "deadline", "revocation"] as const).map(ending => [parent, action, publication, ending] as const)))))(
+    "F6 #3115 %s parent public %s retains committed actor identity during %s publication (%s)", async (parent, action, publication, ending) => {
+      const hostId = parent === "main" ? "session:test" : "runtime:child-native-session";
+      const { provider, actors, globalActors, root, mesh, identity } = setup([], [], undefined, parent === "main" ? { ownsRuntime: false } : {
+        ownsRuntime: false,
+        identity: { id: `${parent}:worker`, name: "worker", kind: parent === "task" ? "agent" : "actor", sessionId: "test" },
+        hostId, mainAgentId: "session:upstream-main", selfOwnerHostId: "resident:upstream-main",
+      });
+      const published = new ParticipantDirectory(mesh, { enabled: true, hostId, rootId: provider.mainAgent.id, identity });
+      published.registerSource(() => actors.listOwned().map(actor =>
+        actorParticipantRecord(actor, provider.mainAgent.id, hostId, identity.id, identity.id)));
       const request = { name: "committed-subscriber", instructions: "Review.", topics: ["round4.work"] };
       const args = action === "import" ? { id: globalActors.create(request).id } : request;
       const lock = publication === "registry" ? path.join(root, "actors", "actors.json.lock") : path.join(mesh.root, ".lock");
@@ -270,7 +318,7 @@ describe("fleet model policy (#2490)", () => {
         if (ending === "revocation") registry.revokeProvider("agents");
         const result = await running;
         expect(result.success).toBe(false); expect(result.value).toBeUndefined();
-        expect(result.residentOutcomes).toEqual([expect.objectContaining({ state: "committed", operation: "createActor", entityKind: "actor", id, ownerHostId: identity.id })]);
+        expect(result.residentOutcomes).toEqual([expect.objectContaining({ state: "committed", operation: "createActor", entityKind: "actor", id, ownerHostId: hostId })]);
         expect(result.residentOutcomes![0]!.requestId).toBeTruthy();
         expect(result.error).toContain(id); expect(result.error).toContain("Do not retry or reassign");
         // Cancellation only ended observation. Complete the real publication promise before cleanup.
@@ -278,11 +326,23 @@ describe("fleet model policy (#2490)", () => {
         expect(actors.status(id)).toMatchObject({ id, status: "idle" });
         expect(JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")).actors).toEqual([expect.objectContaining({ id })]);
         expect(mesh.listAll("actors/test/").map(entry => entry.value)).toEqual([expect.objectContaining({ id })]);
+        // Use the same real publication directory as a child runtime, not self()
+        // (which deliberately retains the upstream resident host in these cases).
+        await published.refresh();
+        const actualOwner = published.get(id, undefined, { fresh: true })!.ownerHostId;
+        expect(result.residentOutcomes![0]!.ownerHostId).toBe(actualOwner);
+        if (parent !== "main") expect(actualOwner).not.toBe(provider.participants.self().ownerHostId);
         invocationSpy.mockRestore(); lockSpy.mockRestore(); presenceSpy.mockRestore();
-        if (ending === "revocation") registry.register(provider);
+        // A revoked binding may have closed after publication settled. Real
+        // runtime providers do not own the managers; cleanup uses a new view.
+        if (ending === "revocation") registry.register(new AgentsProvider(
+          provider.manager, provider.actorManager, provider.globalActors, provider.mainAgent,
+          provider.participants, provider.control, provider.lifecycle, undefined, undefined, false,
+        ));
         // The returned receipt supplies the exact public cleanup key; an uncancelled control still returns a handle.
         expect((await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`)).success).toBe(true);
         expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+        await published.refresh(); expect(published.get(id)).toBeUndefined();
         const control = await execute(`return await agents.${action}(${JSON.stringify(args)});`);
         expect(control.success).toBe(true); expect(control.residentOutcomes).toBeUndefined();
         expect(control.value).toMatchObject({ name: request.name, status: "idle" });
@@ -446,6 +506,10 @@ const setup = (
   options?: {
     cwd?: string;
     identity?: MeshIdentity;
+    ownsRuntime?: boolean;
+    hostId?: string;
+    mainAgentId?: string;
+    selfOwnerHostId?: string;
     switchModel?: FabricMainAgentTarget["switchModel"];
     callerThinking?: string;
     modelsConfig?: FabricModelsConfig;
@@ -470,6 +534,7 @@ const setup = (
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
       runRoot: path.join(root, "runs"),
+      hostId: options?.hostId ?? options?.identity?.id ?? "session:test",
       ...(options?.preparePiModel ? { preparePiModel: options.preparePiModel } : {}),
       ...(options?.onBackgroundComplete ? { onBackgroundComplete: options.onBackgroundComplete } : {}),
       ...(options?.onResultConsumed ? { onResultConsumed: options.onResultConsumed } : {}),
@@ -485,8 +550,8 @@ const setup = (
   const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 };
   const mainDeliveries: FabricMainAgentDeliveryRequest[] = [];
   const mainAgent = {
-    id: identity.id,
-    local: true,
+    id: options?.mainAgentId ?? identity.id,
+    local: !options?.mainAgentId,
     matches: (id: string) => id === "main" || id === identity.id,
     info: () => ({
       id: identity.id,
@@ -518,6 +583,7 @@ const setup = (
     actorRoot: path.join(root, "actors"),
     persistent: true,
     mainAgent,
+    rootId: options?.mainAgentId ?? identity.id,
     ...(options?.canManageActor ? { canManageActor: options.canManageActor } : {}),
   });
   actorManagers.push(actors);
@@ -536,7 +602,7 @@ const setup = (
       id: identity.id,
       kind: "root",
       rootId: identity.id,
-      ownerHostId: identity.id,
+      ownerHostId: options?.selfOwnerHostId ?? identity.id,
       ownerIdentityId: identity.id,
       name: "main",
       status: "idle",
@@ -575,7 +641,7 @@ const setup = (
     lifecycle,
     undefined,
     undefined,
-    undefined,
+    options?.ownsRuntime,
     () => options?.modelsConfig ?? DEFAULT_FABRIC_CONFIG.models,
     () => options?.callerThinking,
     options?.routeEvaluate,

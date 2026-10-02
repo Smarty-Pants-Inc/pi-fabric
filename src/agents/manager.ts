@@ -742,6 +742,9 @@ export class AgentManager {
     }
   }
 
+  /** This runtime's creation host, not a child participant's upstream owner. */
+  get runtimeHostId(): string | undefined { return this.#hostId; }
+
   defaultModel(runner: FabricAgentRunner = this.config.runner): string | undefined {
     return runner === "claude" ? this.config.claude.model
       : runner === "veda" ? this.config.veda.model : this.config.model;

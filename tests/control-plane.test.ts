@@ -52,6 +52,35 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
+  it("retries cancellation beyond the production 10-second lock timeout with commit-time ACK timing", { timeout: 25_000 }, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "control-default-lock-")); roots.push(root);
+    // No store timeout override and no ACK override: production defaults are 10s and 5s.
+    const sender = new FabricControlPlane(new MeshStore(path.join(root, "mesh"), 65536, 1000), identity("session:sender"), { enabled: true, hostId: "session:sender" });
+    planes.push(sender);
+    const controller = new AbortController();
+    const observed = sender.requestResult("session:owner", "actor:target", "ask", {}, "session:owner", { signal: controller.signal }).catch(error => error);
+    await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(1));
+    const lock = path.join(sender.mesh.root, ".lock");
+    fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, "owner"), `cancel-test\n${process.pid}\n${Date.now()}\n`);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const abortedAt = Date.now();
+    try {
+      controller.abort();
+      expect(await observed).toMatchObject({ message: expect.stringContaining("cancelled") });
+      await sender.close(); // final retry obligation must survive control-plane closure too
+      await vi.waitFor(() => expect(warn.mock.calls.some(call => String(call[0]).includes("control cancellation: mesh lock timeout"))).toBe(true), { timeout: 12_000, interval: 25 });
+      expect(Date.now() - abortedAt).toBeGreaterThanOrEqual(10_000);
+      const releasedAt = Date.now(); fs.rmSync(lock, { recursive: true });
+      await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command" }).filter(event => event.kind === "cancel")).toHaveLength(1), { timeout: 3_000 });
+      const event = sender.mesh.read({ topic: "fabric.control.command" }).find(event => event.kind === "cancel")!;
+      const command = event.data as FabricControlCommand;
+      expect(command.requestedAt).toBeGreaterThanOrEqual(releasedAt);
+      expect(command.requestedAt).toBe(event.createdAt);
+      expect(command.deadlineAt! - command.requestedAt).toBe(5_000);
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(sender.mesh.read({ topic: "fabric.control.command" }).filter(event => event.kind === "cancel")).toHaveLength(1);
+    } finally { fs.rmSync(lock, { recursive: true, force: true }); warn.mockRestore(); }
+  });
   it.each(["Escape", "ordinary timeout", "forged ceiling", "cloned ceiling", "ceiling without policy"])("still cancels the owner for %s, never from guest ceiling text", async cause => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-ceiling-")); roots.push(root);
     const owner = plane(path.join(root, "mesh"), "session:owner0000");
@@ -876,9 +905,9 @@ describe("FabricControlPlane", () => {
       expect(receive).toHaveBeenCalledTimes(1);
     });
 
-    // review/astra F1 on #67: a detached ask is consumed before it runs, so nothing retries its
-    // acknowledgement; keeping its outcome would grow memory without bound under contention.
-    it("of a detached ask, no outcome is kept: a replay is answered from the store alone", async () => {
+    // A detached ask has passed the cursor: the bounded owned queue retries only its ACK,
+    // not the handler. A later replay still consults the durable claim/outcome.
+    it("of a detached ask, the bounded notification queue retries its outcome without re-execution", async () => {
       const { meshRoot, receive } = await run();
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
       const ask = {
@@ -893,11 +922,11 @@ describe("FabricControlPlane", () => {
       failOnce("publish", (_owner, input: { topic?: string }) => input.topic === "fabric.control.ack");
       await store.publish(ask);
       await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 20 });
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      expect(acks()).toHaveLength(0);                                       // not retried: detached
-      await store.publish(ask);                                             // a replay of the same command
       await vi.waitFor(() => expect(acks()).toHaveLength(1), { timeout: 3_000, interval: 20 });
-      expect(acks()[0]!.data).toMatchObject({ accepted: false, error: expect.stringContaining("indeterminate") });
+      expect(acks()[0]!.data).toMatchObject({ accepted: true });
+      await store.publish(ask); // the retried durable outcome answers a replay too
+      await vi.waitFor(() => expect(acks()).toHaveLength(2), { timeout: 3_000, interval: 20 });
+      expect(acks()[1]!.data).toMatchObject({ accepted: true });
       expect(receive).toHaveBeenCalledTimes(1);
     });
 

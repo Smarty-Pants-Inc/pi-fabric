@@ -65,7 +65,7 @@ import {
 } from "./protocol.js";
 import { deliveryRoot, projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
-import { canRemoveTerminalRun } from "../storage/retention.js";
+import { canRemoveTerminalRun, runTreeExitVeto } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
 import { ResidentRequestRetention } from "./retention.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
@@ -88,7 +88,7 @@ export const sweepResidentRuns = (runsRoot: string, now = Date.now(), budgetMs =
       const run = path.join(runsRoot, entry.name);
       const stat = ownedStat(run);
       if (!stat?.isDirectory() || now - stat.mtimeMs <= RESIDENT_RUN_RETENTION_MS) continue;
-      if (!canRemoveTerminalRun(run, expired) ||
+      if (runTreeExitVeto(run, 0, expired, true) || !canRemoveTerminalRun(run, expired) ||
           !hasPreservedResidentResult(runsRoot, entry.name) || expired()) continue;
       try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
     }

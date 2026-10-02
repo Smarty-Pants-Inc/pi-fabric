@@ -604,12 +604,14 @@ const hostStoppedResult = (result: AgentRunResult, lastEventAt: number | undefin
   return { ...rest, error: `${HOST_STOP_REASON}; last error: ${result.error ?? "none"}; last event: ${lastEvent}` };
 };
 
-const runRootHasUnresolvedWorker = (root: string): boolean => {
+// Settled handles can be evicted while their descendants still use the shared
+// budget. Inspect persisted trees too; marker absence is not checked child exit.
+const runRootHasExitVeto = (root: string): boolean => {
   try {
     return fs.readdirSync(root, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && hasUnresolvedWorker(path.join(root, entry.name)));
-  } catch {
-    return false;
+      .some((entry) => entry.isDirectory() && !!runTreeExitVeto(path.join(root, entry.name), 0, undefined, true));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
 };
 
@@ -2120,7 +2122,7 @@ export class AgentManager {
     // shared budget. Keep the persistent run tree (and its owning actor ID) for
     // the next fenced owner whenever tree-wide exit evidence is incomplete.
     const unresolved = all.some((managed) => managed.lostContact || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) ||
-      [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasUnresolvedWorker(this.#runRoot);
+      [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasExitVeto(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {
       this.#unregisteredTransports.clear();

@@ -26,11 +26,7 @@ export const lockFile = async (file: string, waitSeconds = 120, requireParentDea
   const fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
   try {
     const stat = fs.fstatSync(fd);
-    // Windows exposes no POSIX UID (stat.uid is 0); use the same convention as
-    // records/anchor-export and storage/scratch. Never waive POSIX ownership.
-    if (!stat.isFile() || (process.getuid !== undefined && stat.uid !== process.getuid())) {
-      throw new Error(`${file} is not a regular file owned by this user`);
-    }
+    if (!stat.isFile() || stat.uid !== process.getuid?.()) throw new Error(`${file} is not a regular file owned by this user`);
     const { spawn } = await import("node:child_process");
     const flock = waitSeconds === 0 ? ["flock", "-x", "-n", "3"] : ["flock", "-x", "-w", String(waitSeconds), "3"];
     const run = (argv: string[]) => new Promise<number | null>((resolve, reject) => {

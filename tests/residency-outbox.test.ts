@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -13,7 +13,6 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { launchLog, same, stopAllOwned } from "./helpers/owned-processes.js";
 import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, residentHostId, residentResultPath, type ResidentDeliveryRecord, type ResidentHostConfig } from "../src/residency/protocol.js";
 
-beforeEach(() => installInProcessResidentFence());
 afterEach(() => vi.restoreAllMocks());
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -127,6 +126,8 @@ describe("resident producer durable outbox", () => {
   });
 
   it("retains a completed durable task beyond idle exit and delivers once after host restart", { timeout: 100_000 }, async () => {
+    // Explicit same-process fixture adapter, never the real subprocess watchdog above.
+    installInProcessResidentFence();
     const f = setup();
     const controller = new AbortController();
     let running = runResidentHostFromConfigPath(f.configPath, controller.signal);
@@ -178,6 +179,7 @@ describe("resident producer durable outbox", () => {
   });
 
   it.each([false, true])("replays commit-before-unlink without duplicating an envelope (consumed=%s)", async consumed => {
+    installInProcessResidentFence();
     const f = setup();
     const controller = new AbortController();
     const record: ResidentDeliveryRecord = { format: RESIDENT_HOST_FORMAT, id: "stable-id", rootId: f.config.rootId,

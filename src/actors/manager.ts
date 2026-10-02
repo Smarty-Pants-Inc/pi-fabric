@@ -19,7 +19,7 @@ import {
 import { MeshStore, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
-import { AgentManager } from "../agents/manager.js";
+import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readJsonlPage } from "../log-tail.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
@@ -306,6 +306,8 @@ export class ActorRegistryOwnershipError extends Error {
 
 /** A mesh write is normally bounded at 10s; give each actor setup await its own 30s ceiling. */
 export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
+/** Three preparation requeues, independent of the owner-restoration/drop budget. */
+const ACTOR_PREPARATION_MAX_RETRIES = 3;
 
 export class ActorPreparationError extends Error {
   readonly code: string = "FABRIC_ACTOR_PREPARATION_FAILED";
@@ -2465,6 +2467,11 @@ export class ActorManager {
           if (!this.#canManage(actor.id)) {
             throw new Error(`Fabric actor ownership moved during run: ${actor.id}`);
           }
+          // A failed queue receipt is terminal, but is not an executed activation.
+          // Preserve typed, confirmed-unlaunched evidence before directive/text handling.
+          if (!workerLaunched && result.status === "failed" && result.launchPreparationTimeoutMs !== undefined) {
+            throw new AgentLaunchPreparationTimeoutError(result.launchPreparationTimeoutMs);
+          }
           actor.lastRunId = result.id;
           if (actor.runner === "claude" && result.runnerSessionId) {
             actor.runnerSessionId = result.runnerSessionId;
@@ -2569,16 +2576,19 @@ export class ActorManager {
           }
           // A finite unavailable-model error remains terminal, as before. Only a hung
           // resolver is retried; infrastructure failures have not consumed the activation.
-          const retryPreparation = error instanceof ActorPreparationTimeoutError ||
-            (error instanceof ActorPreparationError && error.phase !== "binding");
-          if (preLaunch && retryPreparation && !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
+          const launchPreparationTimeout = !workerLaunched && error instanceof AgentLaunchPreparationTimeoutError &&
+            error.launchOutcome === "unlaunched";
+          const retryPreparation = launchPreparationTimeout || (preLaunch && (error instanceof ActorPreparationTimeoutError ||
+            (error instanceof ActorPreparationError && error.phase !== "binding")));
+          if (retryPreparation && (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES &&
+            !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
             preparationAbort.abort(error);
             item.preparationAttempts = (item.preparationAttempts ?? 0) + 1;
             // Transfer ownership before cleanup can yield: persistence must never see
             // this activation both in flight and queued (review/astra round 2, #3167).
             this.#inFlight.delete(actor.id);
             actor.queue.unshift(item);
-            this.#persistQueue(actor.id);
+            this.#persistQueue(actor.id, true);
             this.#recordPreparationFailure(actor, error, item);
             retryDrain = true;
             break;
@@ -2595,7 +2605,8 @@ export class ActorManager {
           };
           this.#recordMessage(this.#liveActor(actor), failed);
           item.reject?.(new Error(message));
-          this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped);
+          this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
+            retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0);
         } finally {
           if (capabilityLease) {
             if (!workerLaunched) await this.#prepare(actor, "capability-release", () => capabilityLease!.release())
@@ -2668,12 +2679,13 @@ export class ActorManager {
 
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
-  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean): void {
+  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
     const streak = this.#failureStreaks.get(actor.id) ?? { count: 0, notified: false };
-    streak.count += 1;
+    // Retry exhaustion must still alarm after recreation discarded the in-memory streak.
+    streak.count = Math.max(streak.count + 1, countFloor);
     this.#failureStreaks.set(actor.id, streak);
     if (streak.notified || streak.count < ACTOR_FAILURE_NOTICE_AFTER) return;
     streak.notified = true;

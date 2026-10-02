@@ -141,6 +141,8 @@ export interface AgentLaunchPreparationOptions {
 }
 
 export class AgentLaunchPreparationTimeoutError extends Error {
+  /** This deadline races model/auth only, never transport launch or worker execution. */
+  readonly launchOutcome = "unlaunched";
   readonly code = "FABRIC_AGENT_LAUNCH_PREPARATION_TIMEOUT";
   constructor(readonly timeoutMs: number) {
     super(`Agent launch preparation (model/auth) timed out after ${timeoutMs} ms`);
@@ -1364,7 +1366,7 @@ export class AgentManager {
         await start(release, signal);
       } catch (error) {
         release?.();
-        this.#settleQueued(queued, signal.aborted ? "stopped" : "failed", error instanceof Error ? error.message : String(error));
+        this.#settleQueued(queued, signal.aborted ? "stopped" : "failed", error);
       }
     })();
     queued.pending = pending;
@@ -1380,11 +1382,14 @@ export class AgentManager {
       ...(!queued.preparing ? { queuePosition: waiting.indexOf(queued) + 1 } : {}) });
   }
 
-  #settleQueued(queued: QueuedAgent, status: "stopped" | "failed", error: string): void {
+  #settleQueued(queued: QueuedAgent, status: "stopped" | "failed", error: unknown): void {
     if (queued.terminal) return;
     const now = Date.now();
     const record: AgentRunResult = {
-      ...queued.info, task: queued.task, status, error,
+      ...queued.info, task: queued.task, status,
+      error: error instanceof Error ? error.message : String(error),
+      ...(status === "failed" && error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched"
+        ? { launchPreparationTimeoutMs: error.timeoutMs } : {}),
       startedAt: queued.enqueuedAt, updatedAt: now, finishedAt: now,
       turns: 0, toolCalls: 0, text: "",
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },

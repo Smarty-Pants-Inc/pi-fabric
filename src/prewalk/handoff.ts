@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { FabricModelDeniedError } from "../core/model-policy.js";
 import { fabricHostIdentity, sendFabricMessage } from "../fabric-provenance.js";
 import type {
   ExtensionAPI,
@@ -26,7 +27,7 @@ import {
   type ThinkingTransferInput,
 } from "../agents/thinking-transfer.js";
 import { PREWALK_CONTINUE_MESSAGE_TYPE } from "./messages.js";
-import { setModelSafely } from "./model-switch.js";
+import { assertPrewalkModelAllowed, setModelSafely, type PrewalkModelPolicy } from "./model-switch.js";
 import type {
   FabricPrewalkPlanCheckpoint,
   FabricPrewalkClaim,
@@ -256,10 +257,13 @@ const runInPlacePrewalk = async (
   extension: ExtensionAPI,
   pending: PendingFabricHandoff,
   context: ExtensionContext,
+  policy?: PrewalkModelPolicy,
 ): Promise<Record<string, unknown>> => {
   const modelKey = String(pending.args.model ?? "");
+  assertPrewalkModelAllowed(modelKey, policy);
   context.ui.setStatus("fabric-prewalk", `switching Main → ${modelKey}`);
   const model = modelForKey(modelKey, context);
+  assertPrewalkModelAllowed(`${model.provider}/${model.id}`, policy);
   // Snapshot the pre-switch reasoning channel and branch. In-place handoff
   // cannot rewrite Pi's ground-truth log, so foreign thinking stays
   // unreplayable for the new model; bridge continuity with the bounded digest.
@@ -349,7 +353,13 @@ const runInPlacePrewalk = async (
     };
     sendFabricMessage(extension, continuationMessage, { triggerTurn: false }, () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
   } catch (error) {
-    const restored = await setModelSafely(extension, returnModel);
+    let restored: boolean;
+    try {
+      restored = await setModelSafely(extension, returnModel, policy, returnModelKey);
+    } catch (refusal) {
+      controller.cancel();
+      throw refusal;
+    }
     if (!restored) {
       // Main is stuck on the executor: disarm so the next mutation cannot hand
       // off again, but keep the borrow so a later session start or /fabric
@@ -388,6 +398,7 @@ export const runFabricHandoffAtBoundary = async (
   outerToolResult: AgentToolResultMessage,
   context: ExtensionContext,
   activity?: (update: FabricInvocationActivityUpdate) => void,
+  policy?: PrewalkModelPolicy,
 ): Promise<Record<string, unknown>> => {
   const model = String(pending.args.model ?? "");
   const inPlace = pending.kind === "prewalk-in-place";
@@ -397,7 +408,7 @@ export const runFabricHandoffAtBoundary = async (
   );
   try {
     if (inPlace) {
-      const result = await runInPlacePrewalk(controller, extension, pending, context);
+      const result = await runInPlacePrewalk(controller, extension, pending, context, policy);
       pending.audit.success = true;
       pending.audit.result = result;
       pending.audit.endedAt = Date.now();
@@ -481,7 +492,9 @@ export const runFabricHandoffAtBoundary = async (
     pending.audit.success = false;
     pending.audit.error = message;
     pending.audit.endedAt = Date.now();
-    const failure = { handedOff: false, continued: false, completed: false, status: "failed", error: message };
+    const failure = { handedOff: false, continued: false, completed: false, status: "failed", error: message,
+      ...(error instanceof FabricModelDeniedError ? { errorCode: error.code } : {}),
+    };
     const continuing = !inPlace && queueHandoffFailureContinuation(extension, context, { ...failure, error });
     if (continuing) controller.cancel();
     if (!continuing && pending.kind.startsWith("prewalk-") && !inPlace) {

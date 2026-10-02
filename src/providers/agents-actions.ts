@@ -65,6 +65,11 @@ const runProperties = {
   },
 };
 
+const strictModelProperty = {
+  ...runProperties.model,
+  description: "Pi exact provider/id or model id copied from agents.models({ runner: \"pi\" }), or an exact configured models.aliases name. Selectors requiring closest-match ranking are refused with candidate keys; pass an exact key or configure an alias. Handles report the canonical model. Without host model policy, Claude runtime values and Veda backend models/aliases are forwarded verbatim. Under active policy, Claude aliases must resolve through its native CLI catalog; Veda requires backend pi and an exact visible provider/model (unresolved aliases/defaults are refused).",
+};
+
 const runSchema = {
   type: "object",
   properties: runProperties,
@@ -90,7 +95,7 @@ const actorInvocationProperties = {
   data: {},
   model: {
     ...runProperties.model,
-    description: "Optional model pinned only for this actor activation.",
+    description: "Optional model pinned only for this actor activation. Pi overrides refuse ranked closest matches; use an exact model id or configured alias.",
   },
   thinking: runProperties.thinking,
 };
@@ -107,7 +112,7 @@ const spawnSchema = {
   properties: {
     ...runProperties, residency: residencySchema,
     idempotencyKey: residentIdempotencyKeySchema,
-    model: { ...runProperties.model, description: `${runProperties.model.description} Spawn-only \"auto\" decides and records in shadow mode; the child still runs pinModel/pinThinking.` },
+    model: { ...runProperties.model, description: `${strictModelProperty.description} Spawn-only \"auto\" decides and records in shadow mode; the child still runs pinModel/pinThinking.` },
     routeClass: { type: "string", pattern: "^[a-z][a-z0-9-]{0,63}$", description: "Opt-in auto route class; initially bounded-lookup. Unknown classes are excluded." },
     pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },
     pinThinking: { ...runProperties.thinking, description: "Role's required effort pin; overrides agents.modelRouting.pinThinking. Never inferred from the default medium effort." },
@@ -151,8 +156,8 @@ const handoffSchema = {
     kernel: runProperties.kernel,
     transport: runProperties.transport,
     model: {
-      ...runProperties.model,
-      description: "Explicit Pi provider/id target that will continue the inherited trajectory",
+      ...strictModelProperty,
+      description: "Explicit Pi exact provider/id, model id, or configured alias target that will continue the inherited trajectory. Closest-match selectors are refused with candidate keys.",
     },
     thinking: runProperties.thinking,
     tools: runProperties.tools,
@@ -216,7 +221,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "spawn",
     description:
-      "Start a child agent through Pi or Claude Code and return a handle immediately. For independent launches, await Promise.allSettled and inspect every result so one rejection does not abort pending sibling calls at program exit. Unread detached results are batched at the next safe turn boundary (or wake idle Main) when agents.notifyOnComplete is enabled. wait/join and terminal status acknowledge results and retract pending notifications. Use wait when this program needs the result; do not poll status in a loop.",
+      "Start a child agent through Pi or Claude Code and return a handle immediately. For independent launches, await Promise.allSettled and inspect every result so one rejection does not abort pending sibling calls at program exit. Unread detached results are batched for the immediate spawner at the next safe turn boundary (or wake the idle spawner) when agents.notifyOnComplete is enabled. wait/join and terminal status acknowledge results and retract pending notifications. Use wait when this program needs the result; do not poll status in a loop.",
     inputSchema: spawnSchema,
     risk: "agent",
   },
@@ -271,6 +276,12 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "self",
     description: "Return this caller's intrinsic participant identity in the unified topology",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    risk: "read",
+  },
+  {
+    name: "spawner",
+    description: "Return this child's immediate spawning participant and activation run. Use id: 'spawner' with agents.followUp/steer to reply to it. An actor spawner is NOT the lineage root returned by agents.main; no root fallback when the binding is absent.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     risk: "read",
   },
@@ -416,7 +427,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         idempotencyKey: residentIdempotencyKeySchema,
         runner: runProperties.runner,
         kernel: runProperties.kernel,
-        model: runProperties.model,
+        model: strictModelProperty,
         thinking: runProperties.thinking,
         tools: runProperties.tools,
         transport: runProperties.transport,

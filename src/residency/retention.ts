@@ -3,6 +3,7 @@ import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
 import { compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
+import { hasPreservedResidentResult } from "./preserved-result.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
 import { isResidentCommandOperation, readResidentRequestDecision, type ResidentCommandResponse, type ResidentResponseAcknowledgement } from "./protocol.js";
 
@@ -185,7 +186,11 @@ export class ResidentRequestRetention {
       const metadata = readOwned<{ id?: unknown; handle?: { status?: unknown } }>(path.join(this.root, "agents", `${decision.id}.json`));
       if (metadata !== undefined) {
         if (metadata?.id !== decision.id || !["queued", "running", "completed", "failed", "stopped", "timed_out"].includes(String(metadata.handle?.status))) throw new Error("Unreadable resident agent reference");
-        if (metadata.handle?.status === "queued" || metadata.handle?.status === "running") return false;
+        // Spawn handles are immutable admission snapshots. Only a validated
+        // saved terminal result can supersede their stale running state; live
+        // writers, unresolved trees and cleanup obligations were vetoed above.
+        if ((metadata.handle?.status === "queued" || metadata.handle?.status === "running") &&
+            !hasPreservedResidentResult(path.join(this.root, "runs"), decision.id!)) return false;
       }
     }
     if (decision?.state === "committed" && !["spawn", "foreground", "cleanup"].includes(decision.operation!)) {

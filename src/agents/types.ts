@@ -42,6 +42,13 @@ export interface AgentSessionSeed {
   outerToolResult: AgentToolResultMessage;
 }
 
+export interface AgentSpawner {
+  id: string;
+  kind: "main" | "agent" | "actor";
+  /** The activation that spawned the child; actor identity survives that run ending. */
+  runId?: string;
+}
+
 export interface AgentRunRequest {
   /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
   idempotencyKey?: string;
@@ -129,6 +136,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Immediate caller, distinct from the lineage Main. */
+  spawner?: AgentSpawner;
   /** Requested launch model; model below follows verified state/assistant attribution. */
   requestedModel?: string;
   /** Shadow-route children: model/effort verified at the pre-prompt admission boundary. */
@@ -158,6 +167,8 @@ export interface AgentRunRecord {
   finishedAt?: number;
   currentTool?: string;
   turns: number;
+  /** Actual model output/tool execution, not worker startup or an error-only turn. */
+  inferenceStarted?: boolean;
   toolCalls: number;
   text: string;
   /** How a structured reply arrived: its fabric_reply tool call (smarty-dev#967). */
@@ -174,6 +185,8 @@ export interface AgentRunRecord {
   budget?: FabricBudgetSummary;
   /** Transport identity (e.g. process PID), not the native Pi session. */
   sessionId?: string;
+  /** Linux process birth identity, persisted by the worker to detect PID reuse. */
+  processStartTime?: string;
   /** Latest native runner session; joins Pi gateway session_id to this run. */
   runnerSessionId?: string;
   /** Distinct native Pi sessions observed during this run, in first-seen order. */
@@ -193,6 +206,10 @@ export interface AgentRunRecord {
 }
 
 export interface AgentRunResult extends AgentRunRecord {
+  /** Resolution marker in agents.run results; does not replace the observed model. */
+  via?: string;
+  /** Canonical launch selection when via is present; may differ from the observed model. */
+  selectedModel?: string;
   /** Failed admission only: model/auth timed out before any transport launch was attempted.
    * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
   launchPreparationTimeoutMs?: number;
@@ -200,6 +217,7 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  spawner?: AgentSpawner;
   /** Present on terminal status snapshots when the full log was retained. */
   compactionSkipped?: string;
   id: string;
@@ -252,6 +270,7 @@ export interface AgentWorkerOptions {
   depth: number;
   fullCodeMode: boolean;
   mainAgentId?: string;
+  spawner?: AgentSpawner;
   fabricSessionId?: string;
   extensions: boolean;
   tools: string[];

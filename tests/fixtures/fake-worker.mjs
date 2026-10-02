@@ -17,11 +17,26 @@ const schema = schemaFile ? JSON.parse(fs.readFileSync(schemaFile, "utf8")) : un
 const images = imagesFile ? JSON.parse(fs.readFileSync(imagesFile, "utf8")) : [];
 const task = fs.readFileSync(taskFile, "utf8");
 
+// Publish status like the production worker: write a sibling temp file, then rename it
+// over the status file, so pollers never observe a truncated or half-written record.
+let statusWrites = 0;
+function writeStatus(text) {
+  const temporary = `${statusFile}.${process.pid}.${++statusWrites}.tmp`;
+  fs.writeFileSync(temporary, text);
+  for (let attempt = 0; ; attempt++) {
+    try { fs.renameSync(temporary, statusFile); return; } catch (error) {
+      // Windows can refuse a rename while a reader holds the target open; retry briefly.
+      if (process.platform !== "win32" || attempt >= 50 || !["EPERM", "EACCES", "EBUSY"].includes(error?.code)) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+}
+
 if (task.includes("HANG_WITH_PROGRESS")) {
   // A run that has done work (so an abort detaches it) and never finishes on its own:
   // only a stop or a kill ends it (smarty-dev#1113).
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
-  fs.writeFileSync(statusFile, JSON.stringify({
+  writeStatus(JSON.stringify({
     id: args.get("id"), name: args.get("name"), task, status: "running", runner: args.get("runner") ?? "pi",
     transport: args.get("transport"), cwd: args.get("cwd"), startedAt: Date.now(), updatedAt: Date.now(),
     turns: 3, toolCalls: 1, text: "", exitCode: null, usage: { input: 30, output: 10, cacheRead: task.includes("HANG_WITH_PROGRESS_CACHE") ? 5 : 0, cacheWrite: task.includes("HANG_WITH_PROGRESS_CACHE") ? 7 : 0, cost: 0.001 },
@@ -34,8 +49,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
   // Write a non-terminal "running" status so the AgentManager monitor keeps
   // waiting, then stay alive until the transport kills this process (abort/stop).
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
-  fs.writeFileSync(
-    statusFile,
+  writeStatus(
     JSON.stringify({
       id: args.get("id"),
       name: args.get("name"),
@@ -92,12 +106,11 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     cost: running.usage.cost + delta.cost,
   });
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
-  fs.writeFileSync(statusFile, JSON.stringify(running));
+  writeStatus(JSON.stringify(running));
   await new Promise((resolve) => setTimeout(resolve, 100));
   if (attempt === 1 && task.includes("RESUME_AFTER_STOP")) {
     const stoppedAt = Date.now();
-    fs.writeFileSync(
-      statusFile,
+    writeStatus(
       JSON.stringify({
         ...running,
         status: "stopped",
@@ -113,8 +126,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
   }
   if (attempt === 1) process.exit(3);
   const finishedAt = Date.now();
-  fs.writeFileSync(
-    statusFile,
+  writeStatus(
     JSON.stringify({
       ...running,
       status: "completed",
@@ -155,7 +167,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
       : { input: 40, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.002 },
   };
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
-  fs.writeFileSync(statusFile, JSON.stringify(running));
+  writeStatus(JSON.stringify(running));
   // Opt-in gate carried in the actor task's JSON payload; existing LIVE markers
   // still finish after 1.5 s. A missing release fails rather than hanging forever.
   const releaseMatch = task.match(/"fakeWorkerReleasePath":\s*("(?:\\.|[^"\\])*")/);
@@ -170,8 +182,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     await new Promise((resolve) => setTimeout(resolve, 1_500));
   }
   const finishedAt = Date.now();
-  fs.writeFileSync(
-    statusFile,
+  writeStatus(
     JSON.stringify({
       ...running,
       status: "completed",
@@ -202,7 +213,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
   };
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
-  fs.writeFileSync(statusFile, JSON.stringify(running));
+  writeStatus(JSON.stringify(running));
   fs.writeFileSync(
     logFile,
     `${JSON.stringify({ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: { path: "first.ts" } })}\n`,
@@ -222,7 +233,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
   );
   await new Promise((resolve) => setTimeout(resolve, 300));
   const finishedAt = Date.now();
-  fs.writeFileSync(statusFile, JSON.stringify({
+  writeStatus(JSON.stringify({
     ...running,
     status: "completed",
     updatedAt: finishedAt,
@@ -297,7 +308,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
       lifecycleEvents.map((event) => JSON.stringify(event)).join("\n") + "\n",
     );
   }
-  fs.writeFileSync(statusFile, JSON.stringify(record));
+  writeStatus(JSON.stringify(record));
 
   // Emit a per-run event stream so agents.log / readLog can inspect the run.
   if (logFile) {

@@ -82,7 +82,7 @@ describe("R3 routed session boundaries", () => {
         response.writeHead(200, { "Content-Type": "text/event-stream" });
         const chunk = (delta: unknown, finish_reason: string | null = null) => response.write(`data: ${JSON.stringify({ id: "offline", object: "chat.completion.chunk", created: 1, model: "offline", choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
         if (!tool) {
-          chunk({ role: "assistant", tool_calls: [{ index: 0, id: "cwd-probe", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "cat tracked.txt; printf '\\n'; pwd; printf 'native-marker' > route-marker.txt" }) } }] }); chunk({}, "tool_calls");
+          chunk({ role: "assistant", tool_calls: [{ index: 0, id: "cwd-probe", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "cat tracked.txt; printf '\\n'; pwd; { cygpath -w \"$PWD\" || pwd -W; } 2>/dev/null; printf 'native-marker' > route-marker.txt" }) } }] }); chunk({}, "tool_calls");
         } else { chunk({ role: "assistant", content: String(tool.content) }); chunk({}, "stop"); }
         response.end("data: [DONE]\n\n");
       });
@@ -99,7 +99,13 @@ describe("R3 routed session boundaries", () => {
       const result = await manager.wait(handle.id);
       expect(result, JSON.stringify(result) + (result.logFile ? fs.readFileSync(result.logFile, "utf8").slice(-8000) : "")).toMatchObject({ status: "completed" });
       expect(requests).toHaveLength(2);
-      expect(result.text).toContain("committed-worktree"); expect(result.text).toContain(result.cwd);
+      expect(result.text).toContain("committed-worktree");
+      // Native bash on Windows reports POSIX `pwd` (/tmp/..., /c/...); the same bash's `cygpath -w`
+      // (or MSYS `pwd -W`) adds the Windows spelling. Compare real directory identity, not raw strings.
+      const identity = (directory: string) => { const real = fs.realpathSync.native(directory); return process.platform === "win32" ? real.toLowerCase() : real; };
+      const reportedDirectories = String(result.text).split(/\r?\n/).map(line => line.trim()).filter(line => path.isAbsolute(line) && fs.existsSync(line)).map(identity);
+      expect(reportedDirectories, String(result.text)).toContain(identity(result.cwd));
+      if (process.platform !== "win32") expect(result.text).toContain(result.cwd);
       expect(fs.readFileSync(path.join(result.cwd, "route-marker.txt"), "utf8")).toBe("native-marker");
       expect(fs.existsSync(path.join(repo, "route-marker.txt"))).toBe(false);
       expect(fs.readFileSync(path.join(repo, "tracked.txt"), "utf8")).toBe("dirty-parent");

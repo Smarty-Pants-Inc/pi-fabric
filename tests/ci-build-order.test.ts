@@ -112,7 +112,7 @@ describe("CI source and runner policy (smarty-dev#1246)", () => {
   it("requires Linux, but never post-merge Windows, in both Mergify condition lists", () => {
     const mergify = parse(fs.readFileSync(fileURLToPath(new URL("../.mergify.yml", import.meta.url)), "utf8"));
     const queue = mergify.queue_rules[0];
-    expect(queue.queue_conditions).toEqual(queue.merge_conditions);
+    // Main (smarty-dev#2974) keeps queue_conditions and merge_conditions distinct; both must require Linux and never Windows.
     for (const conditions of [queue.queue_conditions, queue.merge_conditions]) {
       expect(conditions).toContain("check-success = check (ubuntu-latest)");
       expect(conditions).not.toContain("check-success = check (windows-latest)");

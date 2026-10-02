@@ -1,7 +1,7 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { JevRequest, JevResponse } from "../jev/types.js";
-import { formatAge, residentHostId, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
+import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
@@ -80,7 +80,7 @@ import {
 import { resolvePiModel, resolvePiRoutePin, ModelRoutePinError } from "../core/model-refresh.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
-import { mainExecutionCeilingAbortReason, throwIfExecutionExpired, withoutMainExecutionCeiling } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, registerCancellationEffect, throwIfExecutionExpired, withoutMainExecutionCeiling } from "../async-settlement.js";
 import {
   AGENT_WAIT_MAX_MS,
   AgentWaitBoundError,
@@ -327,6 +327,7 @@ const actorRequest = (
     ...(typeof args.coalesce === "boolean" ? { coalesce: args.coalesce } : {}),
     ...(typeof args.coalesceKey === "string" ? { coalesceKey: args.coalesceKey } : {}),
     ...(activationFilter ? { activationFilter } : {}),
+    ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}),
     ...(args.residency === "session" || args.residency === "durable"
       ? { residency: args.residency }
       : {}),
@@ -1581,7 +1582,31 @@ export class AgentsProvider implements FabricProvider {
       extensions,
       ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime(request.pythonRuntime) } : {}),
     };
-    if (request.residency !== "durable") return this.actorManager.create(request, { beforeCommit: checkCommit, checkActive: checkCommit });
+    if (request.residency !== "durable") {
+      // Reuse the host-originated outcome ledger for local actors too: publication
+      // may await contended locks after the actor is already runnable/subscribed.
+      const command = { format: RESIDENT_HOST_FORMAT, operation: "createActor" as const,
+        requestId: randomUUID(), rootId: this.mainAgent.id, request, createdAt: Date.now() };
+      const creationOwnerHostId = (): string => {
+        // A worker's self() names its upstream owner, not the runtime creating
+        // this actor. AgentManager already holds the host used for publication.
+        // Standalone local Main callers need no participant-directory API.
+        const hostId = this.manager.runtimeHostId ?? (this.mainAgent.local ? this.mainAgent.id : undefined);
+        if (!hostId?.trim()) throw new Error("Local actor creation requires a runtime owner host ID");
+        return hostId;
+      };
+      return this.actorManager.create(request, {
+        // Validate ownership before predecessor removal as well as insertion.
+        beforeCommit: () => { checkCommit(); creationOwnerHostId(); }, checkActive: checkCommit,
+        onCommit: (id) => {
+          const ownerHostId = creationOwnerHostId();
+          const decision = { requestId: command.requestId, state: "committed" as const, id, ownerHostId };
+          let outcome: ResidentOutcomeUnknownError | undefined;
+          registerCancellationEffect(signal, reason =>
+            outcome ??= new ResidentOutcomeUnknownError(command, decision, reason, signal));
+        },
+      });
+    }
     // Even the first actor in an empty registry must use the authoritative
     // host's capability check and request fence. A local-create/cede path can
     // publish after cancellation with neither a decision nor a known-ID receipt.

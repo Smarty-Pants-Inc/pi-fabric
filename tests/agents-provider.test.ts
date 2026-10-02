@@ -13,6 +13,7 @@ import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import type { FabricActorDeliveryRequest, FabricActorInfo, FabricActorReadInfo, FabricActorRequest } from "../src/actors/types.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -39,6 +40,8 @@ import type {
 } from "../src/topology/types.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { actorParticipantRecord } from "../src/topology/records.js";
 import { AgentsProvider, collectAgentToolPreviewNodes } from "../src/providers/agents-provider.js";
 import type { ResidencyClient } from "../src/residency/client.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
@@ -131,8 +134,9 @@ describe("fleet model policy (#2490)", () => {
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     const catalog = vi.spyOn(state.agents, "claudeModels");
     try {
-      await expect(state.provider.invoke("spawn", { task: "legacy alias", runner, model: "backend-shortcut", residency: "durable" }, context)).resolves.toMatchObject({ model: "backend-shortcut" });
+      await expect(state.provider.invoke("spawn", { task: "legacy alias", runner, model: "backend-shortcut", residency: "durable", idempotencyKey: "durable-spawn-retry" }, context)).resolves.toMatchObject({ model: "backend-shortcut" });
       expect(spawnAgent).toHaveBeenCalledOnce(); expect(catalog).not.toHaveBeenCalled();
+      expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ idempotencyKey: "durable-spawn-retry" }), undefined);
     } finally { catalog.mockRestore(); }
   });
 
@@ -179,7 +183,7 @@ describe("fleet model policy (#2490)", () => {
     };
     const beforeFiles = snapshot(path.join(root, "actors"));
     const beforePresence = mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 });
-    const beforePresenceKeys = mesh.listAll("actors/presence/").map(entry => entry.key);
+    const beforePresenceKeys = mesh.listAll("actors/test/").map(entry => entry.key);
     let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
     let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
     let finished!: () => void; const done = new Promise<void>(resolve => { finished = resolve; });
@@ -199,12 +203,14 @@ describe("fleet model policy (#2490)", () => {
       await entered;
       if (ending === "Escape") abort.abort(new Error("Escape"));
       if (ending === "revocation") registry.revokeProvider("agents");
-      expect((await running).success).toBe(false);
+      const cancelled = await running;
+      expect(cancelled.success).toBe(false);
+      expect(cancelled.residentOutcomes).toBeUndefined();
       release(); await done;
       expect(actors.list()).toEqual(beforeActors);
       expect(globalActors.list()).toEqual(beforeTemplates);
       expect(snapshot(path.join(root, "actors"))).toEqual(beforeFiles);
-      expect(mesh.listAll("actors/presence/").map(entry => entry.key)).toEqual(beforePresenceKeys);
+      expect(mesh.listAll("actors/test/").map(entry => entry.key)).toEqual(beforePresenceKeys);
       expect(mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 })).toEqual(beforePresence);
       await mesh.publish({ topic: "round3.work", from: state.identity, data: { task: "never activate cancelled actor" } });
       // Allow several real actor-monitor polls; a leaked subscription must not
@@ -217,6 +223,139 @@ describe("fleet model policy (#2490)", () => {
       await expect(provider.invoke(action, args, { ...context, extensionContext: { modelRegistry } as unknown as ExtensionContext })).resolves.toMatchObject({ model: "provider/late" });
     } finally { release(); await done; spy.mockRestore(); }
   });
+
+  it("F6 #3115 standalone Main creation needs no participants.self API", async () => {
+    const { provider, actors, agents } = setup();
+    vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
+    // A minimal topology dependency is sufficient for local creation.
+    delete (provider.participants as Partial<FabricParticipantSource>).self;
+    const actor = await provider.invoke("create", { name: "minimal-topology", instructions: "Review." }, context) as FabricActorInfo;
+    expect(actors.owns(actor.id)).toBe(true);
+    await provider.invoke("remove", { id: actor.id }, context);
+    expect(actors.list()).toEqual([]);
+  });
+
+  it("F6 #3115 missing child creation host fails closed before local commitment", async () => {
+    const { provider, actors, agents, root } = setup([], [], undefined, {
+      identity: { id: "task:worker", name: "worker", kind: "agent" }, mainAgentId: "session:upstream-main",
+    });
+    vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
+    delete (provider.participants as Partial<FabricParticipantSource>).self;
+    await expect(provider.invoke("create", { name: "no-owner", instructions: "Review." }, context))
+      .rejects.toThrow("Local actor creation requires a runtime owner host ID");
+    expect(actors.list()).toEqual([]);
+    expect(fs.existsSync(path.join(root, "actors"))).toBe(false);
+  });
+
+  it("F6 #3115 missing child creation host preserves a stopped predecessor", async () => {
+    const { provider, actors, agents } = setup([], [], undefined, {
+      identity: { id: "actor:worker", name: "worker", kind: "actor" }, mainAgentId: "session:upstream-main",
+    });
+    const previous = await actors.create({ name: "same-name", instructions: "Review." });
+    await actors.stop(previous.id);
+    const before = actors.list();
+    vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
+    await expect(provider.invoke("create", { name: "same-name", instructions: "Replacement." }, context))
+      .rejects.toThrow("Local actor creation requires a runtime owner host ID");
+    expect(actors.list()).toEqual(before);
+    expect(actors.status(previous.id).status).toBe("stopped");
+  });
+
+  it.each((["main", "task", "actor"] as const).flatMap(parent =>
+    (["create", "import"] as const).flatMap(action =>
+      (["registry", "presence"] as const).flatMap(publication =>
+        (["Escape", "deadline", "revocation"] as const).map(ending => [parent, action, publication, ending] as const)))))(
+    "F6 #3115 %s parent public %s retains committed actor identity during %s publication (%s)", async (parent, action, publication, ending) => {
+      const hostId = parent === "main" ? "session:test" : "runtime:child-native-session";
+      const { provider, actors, globalActors, root, mesh, identity } = setup([], [], undefined, parent === "main" ? { ownsRuntime: false } : {
+        ownsRuntime: false,
+        identity: { id: `${parent}:worker`, name: "worker", kind: parent === "task" ? "agent" : "actor", sessionId: "test" },
+        hostId, mainAgentId: "session:upstream-main", selfOwnerHostId: "resident:upstream-main",
+      });
+      const published = new ParticipantDirectory(mesh, { enabled: true, hostId, rootId: provider.mainAgent.id, identity });
+      published.registerSource(() => actors.listOwned().map(actor =>
+        actorParticipantRecord(actor, provider.mainAgent.id, hostId, identity.id, identity.id)));
+      const request = { name: "committed-subscriber", instructions: "Review.", topics: ["round4.work"] };
+      const args = action === "import" ? { id: globalActors.create(request).id } : request;
+      const lock = publication === "registry" ? path.join(root, "actors", "actors.json.lock") : path.join(mesh.root, ".lock");
+      fs.mkdirSync(lock, { recursive: true });
+      fs.writeFileSync(path.join(lock, "owner"), `held-by-F6-test\n${process.pid}\n${Date.now()}\n`);
+      let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
+      let finished!: () => void; const done = new Promise<void>(resolve => { finished = resolve; });
+      const originalLock = ActorRegistryStore.prototype.withLock;
+      const lockSpy = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function<T>(this: ActorRegistryStore, operation: () => T): Promise<T> {
+        const pending = originalLock.call(this, operation) as Promise<T>;
+        if (publication === "registry") enter();
+        return pending;
+      });
+      const originalPut = mesh.put.bind(mesh);
+      const presenceSpy = vi.spyOn(mesh, "put").mockImplementation((...params) => {
+        const pending = originalPut(...params);
+        if (publication === "presence" && params[0].key.startsWith("actors/test/")) enter();
+        return pending;
+      });
+      const invoke = provider.invoke.bind(provider);
+      const invocationSpy = vi.spyOn(provider, "invoke").mockImplementation(async (...params) => {
+        try { return await invoke(...params); } finally { finished(); }
+      });
+      const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
+      config.executor.timeoutMs = ending === "deadline" ? 1_000 : 5_000;
+      const registry = new ActionRegistry(); registry.register(provider);
+      const service = new FabricExecutionService(registry, config); const abort = new AbortController();
+      const execute = (code: string, signal?: AbortSignal) => service.execute({ code, signal, parentToolCallId: "F6-public-guest",
+        context: { ...context.extensionContext, cwd: process.cwd(), hasUI: false } as ExtensionContext, onPartial() {} });
+      const running = execute(`return await agents.${action}(${JSON.stringify(args)});`, abort.signal);
+      try {
+        await Promise.race([entered, running.then(result => { throw new Error(`Guest ended before publication contention: ${result.error}`); })]);
+        const committed = actors.list(); expect(committed).toHaveLength(1);
+        const id = committed[0]!.id;
+        expect(actors.owns(id)).toBe(true);
+        expect(fs.existsSync(path.join(root, "actors", id))).toBe(true);
+        expect(actors.definition(id).topics).toEqual(["round4.work"]);
+        if (publication === "registry") expect(fs.existsSync(path.join(root, "actors", "actors.json"))).toBe(false);
+        else expect(JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")).actors).toEqual([expect.objectContaining({ id })]);
+        expect(mesh.listAll("actors/test/")).toEqual([]);
+        if (ending === "Escape") abort.abort(new Error("Escape"));
+        if (ending === "revocation") registry.revokeProvider("agents");
+        const result = await running;
+        expect(result.success).toBe(false); expect(result.value).toBeUndefined();
+        expect(result.residentOutcomes).toEqual([expect.objectContaining({ state: "committed", operation: "createActor", entityKind: "actor", id, ownerHostId: hostId })]);
+        expect(result.residentOutcomes![0]!.requestId).toBeTruthy();
+        expect(result.error).toContain(id); expect(result.error).toContain("Do not retry or reassign");
+        // Cancellation only ended observation. Complete the real publication promise before cleanup.
+        fs.rmSync(lock, { recursive: true, force: true }); await done;
+        expect(actors.status(id)).toMatchObject({ id, status: "idle" });
+        expect(JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")).actors).toEqual([expect.objectContaining({ id })]);
+        expect(mesh.listAll("actors/test/").map(entry => entry.value)).toEqual([expect.objectContaining({ id })]);
+        // Use the same real publication directory as a child runtime, not self()
+        // (which deliberately retains the upstream resident host in these cases).
+        await published.refresh();
+        const actualOwner = published.get(id, undefined, { fresh: true })!.ownerHostId;
+        expect(result.residentOutcomes![0]!.ownerHostId).toBe(actualOwner);
+        if (parent !== "main") expect(actualOwner).not.toBe(provider.participants.self().ownerHostId);
+        invocationSpy.mockRestore(); lockSpy.mockRestore(); presenceSpy.mockRestore();
+        // A revoked binding may have closed after publication settled. Real
+        // runtime providers do not own the managers; cleanup uses a new view.
+        if (ending === "revocation") registry.register(new AgentsProvider(
+          provider.manager, provider.actorManager, provider.globalActors, provider.mainAgent,
+          provider.participants, provider.control, provider.lifecycle, undefined, undefined, false,
+        ));
+        // The returned receipt supplies the exact public cleanup key; an uncancelled control still returns a handle.
+        expect((await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`)).success).toBe(true);
+        expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+        await published.refresh(); expect(published.get(id)).toBeUndefined();
+        const control = await execute(`return await agents.${action}(${JSON.stringify(args)});`);
+        expect(control.success).toBe(true); expect(control.residentOutcomes).toBeUndefined();
+        expect(control.value).toMatchObject({ name: request.name, status: "idle" });
+        const controlId = (control.value as FabricActorInfo).id;
+        expect((await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`)).success).toBe(true);
+        expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+      } finally {
+        fs.rmSync(lock, { recursive: true, force: true });
+        await running; await done;
+        invocationSpy.mockRestore(); lockSpy.mockRestore(); presenceSpy.mockRestore();
+      }
+    });
 
   it("round 3 F4 public cancellation under the binding lock cannot change a local overlay", async () => {
     const { provider, actors, root } = setup();
@@ -368,6 +507,10 @@ const setup = (
   options?: {
     cwd?: string;
     identity?: MeshIdentity;
+    ownsRuntime?: boolean;
+    hostId?: string;
+    mainAgentId?: string;
+    selfOwnerHostId?: string;
     switchModel?: FabricMainAgentTarget["switchModel"];
     callerThinking?: string;
     modelsConfig?: FabricModelsConfig;
@@ -392,6 +535,7 @@ const setup = (
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
       runRoot: path.join(root, "runs"),
+      hostId: options?.hostId ?? options?.identity?.id ?? "session:test",
       ...(options?.preparePiModel ? { preparePiModel: options.preparePiModel } : {}),
       ...(options?.onBackgroundComplete ? { onBackgroundComplete: options.onBackgroundComplete } : {}),
       ...(options?.onResultConsumed ? { onResultConsumed: options.onResultConsumed } : {}),
@@ -407,8 +551,8 @@ const setup = (
   const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 };
   const mainDeliveries: FabricMainAgentDeliveryRequest[] = [];
   const mainAgent = {
-    id: identity.id,
-    local: true,
+    id: options?.mainAgentId ?? identity.id,
+    local: !options?.mainAgentId,
     matches: (id: string) => id === "main" || id === identity.id,
     info: () => ({
       id: identity.id,
@@ -440,6 +584,7 @@ const setup = (
     actorRoot: path.join(root, "actors"),
     persistent: true,
     mainAgent,
+    rootId: options?.mainAgentId ?? identity.id,
     ...(options?.canManageActor ? { canManageActor: options.canManageActor } : {}),
   });
   actorManagers.push(actors);
@@ -458,7 +603,7 @@ const setup = (
       id: identity.id,
       kind: "root",
       rootId: identity.id,
-      ownerHostId: identity.id,
+      ownerHostId: options?.selfOwnerHostId ?? identity.id,
       ownerIdentityId: identity.id,
       name: "main",
       status: "idle",
@@ -497,7 +642,7 @@ const setup = (
     lifecycle,
     undefined,
     undefined,
-    undefined,
+    options?.ownsRuntime,
     () => options?.modelsConfig ?? DEFAULT_FABRIC_CONFIG.models,
     () => options?.callerThinking,
     options?.routeEvaluate,
@@ -1691,6 +1836,9 @@ describe("AgentsProvider runner support", () => {
     expect(spawnProperties.residency?.enum).toEqual(["session", "durable"]);
     expect(createProperties.residency?.enum).toEqual(["session", "durable"]);
     expect(runProperties).not.toHaveProperty("residency");
+    expect(spawnProperties.idempotencyKey).toMatchObject({ type: "string", minLength: 1, maxLength: 256 });
+    expect(createProperties.idempotencyKey).toEqual(spawnProperties.idempotencyKey);
+    expect(runProperties).not.toHaveProperty("idempotencyKey");
   });
 
   it("exposes actor activation overrides and scoped binding setters", async () => {
@@ -1843,6 +1991,7 @@ describe("AgentsProvider runner support", () => {
         name: "second-durable",
         instructions: "Created via the resident host.",
         residency: "durable",
+        idempotencyKey: "durable-create-retry",
       },
       invocationContext,
     )) as FabricActorInfo;
@@ -1861,7 +2010,7 @@ describe("AgentsProvider runner support", () => {
     expect(imported).toMatchObject({ id: "resident-actor-2", name: "durable-template" });
     expect(createActor).toHaveBeenNthCalledWith(
       1,
-      expect.objectContaining({ name: "second-durable", residency: "durable" }),
+      expect.objectContaining({ name: "second-durable", residency: "durable", idempotencyKey: "durable-create-retry" }),
       invocationContext.signal,
     );
     expect(createActor).toHaveBeenNthCalledWith(

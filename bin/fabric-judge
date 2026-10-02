@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+import { main } from "../dist/judge-cli.js";
+main().then(code => { process.exitCode = code; }, () => { process.exitCode = 2; });

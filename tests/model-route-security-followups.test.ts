@@ -352,6 +352,13 @@ describe("SR-6 real routed worker artifacts are safely retained or collected", (
       expect(JSON.parse(fs.readFileSync(path.join(deliveries, envelopes[0]!), "utf8"))).toMatchObject({ message: "harmless bounded lookup", provenance: { principal: { id: "test-caller", binding: "voice-call" } } });
     }
     await fixture.runtime.shutdown();
+    if (contents === "nonempty") {
+      // Main retains unconsumed ingress, even a known worker-owned envelope.
+      // Prove that veto before simulating the native hook's consumption.
+      expect(expire(fixture)).toEqual({ removedRuns: [], removedRoots: [] });
+      expect(fs.existsSync(run)).toBe(true);
+      fs.unlinkSync(path.join(deliveries, envelopes[0]!));
+    }
     const result = expire(fixture);
     expect(result.removedRuns).toEqual([run]); expect(result.removedRoots).toEqual([fixture.runRoot]);
     expect(fs.existsSync(run)).toBe(false);

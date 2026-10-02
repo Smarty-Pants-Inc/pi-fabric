@@ -152,6 +152,10 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         continue;
       }
       if (stat.isDirectory() && name === "deliveries") {
+        // The worker always creates this ingress directory; the native Pi hook
+        // unlinks consumed items. Any remaining item is pending or unknown,
+        // even when it has a known filename or valid JSON: keep the whole run.
+        if (fs.readdirSync(file).length !== 0) return false;
         // Only the worker's UUID-addressed private delivery envelopes are ours.
         // Empty directories are normal; unknown content, links and non-files veto.
         for (const child of fs.readdirSync(file)) {

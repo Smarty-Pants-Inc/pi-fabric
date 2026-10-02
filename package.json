@@ -37,7 +37,9 @@
   },
   "bin": {
     "fabric-participants": "./bin/fabric-participants",
-    "mesh-bridge": "./bin/mesh-bridge"
+    "fabric-judge": "./bin/fabric-judge",
+    "mesh-bridge": "./bin/mesh-bridge",
+    "fabric-releases": "./bin/fabric-releases"
   },
   "files": [
     "bin/",

@@ -43,8 +43,12 @@ export interface AgentSessionSeed {
 }
 
 export interface AgentRunRequest {
+  /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
+  idempotencyKey?: string;
   /** Host-created shadow decision; never accepted from external argument normalization. */
   routeDecision?: ModelRouteDecision;
+  /** Host-only judgment join; never normalized from public agent arguments. */
+  routeRecord?: { ledger: string; decisionRecorded: boolean };
   /** Host-only resident startup probe: model/extension admission, no prompt or tools. */
   residentStartupProbe?: boolean;
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
@@ -189,6 +193,9 @@ export interface AgentRunRecord {
 }
 
 export interface AgentRunResult extends AgentRunRecord {
+  /** Failed admission only: model/auth timed out before any transport launch was attempted.
+   * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
+  launchPreparationTimeoutMs?: number;
   status: "completed" | "failed" | "stopped" | "timed_out";
 }
 
@@ -255,6 +262,8 @@ export interface AgentWorkerOptions {
   bashTimeoutSeconds?: number;
   fabricExtensionPath?: string;
   routeHeader?: string;
+  /** Host-only bounded judge: no ambient resources, compaction or retry. */
+  judgment?: boolean;
   model?: string;
   thinking?: string;
   systemPrompt?: string;
@@ -307,6 +316,18 @@ export interface AgentTransportLaunch {
   authorize?: () => boolean;
 }
 
+export interface AgentTransportObservationOptions {
+  signal?: AbortSignal;
+  /** Absolute wall-clock deadline in milliseconds; transports may impose a shorter bound. */
+  deadline?: number;
+}
+
+/** Session membership only: neither a terminal UI record nor session absence
+ * proves that its worker (or descendants) exited. Unknown must veto custody. */
+export type AgentTransportObservation =
+  | { state: "alive" | "absent" }
+  | { state: "unknown"; reason: string };
+
 export interface AgentTransportHandle {
   kind: FabricAgentTransport;
   sessionId?: string;
@@ -323,8 +344,10 @@ export interface AgentTransportHandle {
    * relaunches it nor deletes its files. Undefined while contact holds or after a proven exit.
    */
   lostContact?(): string | undefined;
-  isAlive(): Promise<boolean>;
-  stop(): Promise<void>;
+  /** Optional checked session observation; absence alone is NOT a worker exit receipt. */
+  observe?(options?: AgentTransportObservationOptions): Promise<AgentTransportObservation>;
+  isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
+  stop(options?: AgentTransportObservationOptions): Promise<void>;
 }
 
 export interface AgentTransportAdapter {

@@ -17,6 +17,10 @@ const wait = async (check: () => boolean, timeoutMs = 10_000) => {
   const deadline = Date.now() + timeoutMs;
   while (!check()) { if (Date.now() >= deadline) throw new Error("Resident outbox did not recover"); await sleep(25); }
 };
+// The producer and watchdog consume only committed envelopes. Atomic durable writes
+// expose a parseable .json.<pid>.<uuid>.tmp while fsync waits, before the rename.
+const outboxEntries = (outbox: string): string[] =>
+  fs.existsSync(outbox) ? fs.readdirSync(outbox).filter(entry => entry.endsWith(".json")) : [];
 const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-outbox-"));
   const config: ResidentHostConfig = {
@@ -36,6 +40,21 @@ const setup = () => {
 };
 
 describe("resident producer durable outbox", () => {
+  it("waits for a committed envelope instead of selecting its parseable atomic staging file", () => {
+    const f = setup();
+    const committed = "stable-id.json";
+    const staged = `${committed}.${process.pid}.staging.tmp`;
+    try {
+      fs.mkdirSync(f.outbox);
+      fs.writeFileSync(path.join(f.outbox, staged), JSON.stringify({ id: "stable-id", agentCompletionId: "completed-task" }));
+      expect(fs.readdirSync(f.outbox)).toHaveLength(1); // the old wait would succeed
+      expect(outboxEntries(f.outbox)).toEqual([]);
+      fs.renameSync(path.join(f.outbox, staged), path.join(f.outbox, committed));
+      expect(outboxEntries(f.outbox)).toEqual([committed]);
+      expect(fs.existsSync(path.join(f.outbox, staged))).toBe(false);
+      expect(fs.existsSync(path.join(f.outbox, outboxEntries(f.outbox)[0]!))).toBe(true);
+    } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
   it.skipIf(process.platform !== "linux")("F6 live watchdog recovers a sole completed task after locked idle exit exactly once without explicit restart", { timeout: 120_000 }, async () => {
     const f = setup();
     const launches = launchLog(f.root);
@@ -67,8 +86,8 @@ describe("resident producer durable outbox", () => {
       fs.mkdirSync(lock);
       fs.writeFileSync(path.join(lock, "owner"), `resident-test\n${process.pid}\n${Date.now()}\n`);
       await wait(() => fs.existsSync(residentResultPath(f.config.residencyRoot, id)));
-      await wait(() => fs.existsSync(f.outbox) && fs.readdirSync(f.outbox).length === 1);
-      const entry = fs.readdirSync(f.outbox)[0]!;
+      await wait(() => outboxEntries(f.outbox).length === 1);
+      const entry = outboxEntries(f.outbox)[0]!;
       const pending = JSON.parse(fs.readFileSync(path.join(f.outbox, entry), "utf8"));
       expect(pending.agentCompletionId).toBe(id);
       expect(completions).not.toHaveBeenCalled();
@@ -146,8 +165,8 @@ describe("resident producer durable outbox", () => {
       fs.mkdirSync(lock);
       fs.writeFileSync(path.join(lock, "owner"), `resident-test\n${process.pid}\n${Date.now()}\n`);
       await wait(() => fs.existsSync(residentResultPath(f.config.residencyRoot, id)));
-      await wait(() => fs.existsSync(f.outbox) && fs.readdirSync(f.outbox).length === 1);
-      const entry = fs.readdirSync(f.outbox)[0]!;
+      await wait(() => outboxEntries(f.outbox).length === 1);
+      const entry = outboxEntries(f.outbox)[0]!;
       const pending = JSON.parse(fs.readFileSync(path.join(f.outbox, entry), "utf8"));
       expect(pending.agentCompletionId).toBe(id);
       let exited = false;

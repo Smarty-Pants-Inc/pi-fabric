@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readProcessStartIdentity } from "../core/process-identity.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, participantRole, repositoryOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
@@ -165,7 +166,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "repository", "model", "thinking", "parentId"]) ||
+    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "repository", "agentName", "model", "thinking", "parentId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -389,6 +390,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #startedAt = Date.now();
+  readonly #processIdentity = readProcessStartIdentity();
   readonly #heartbeatMs: number;
   readonly #leaseMs: number;
   readonly #localRecords = new Map<string, FabricParticipantRecord>();
@@ -903,7 +905,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
   }
 
-  root(main: FabricMainAgentInfo, interactive = true, sessionName?: string): FabricParticipantRecord {
+  root(main: FabricMainAgentInfo, interactive: boolean | string = true, sessionName?: string): FabricParticipantRecord {
+    // Preserve the named-root call form alongside explicit host interactivity.
+    if (typeof interactive === "string") {
+      sessionName = interactive;
+      interactive = true;
+    }
     const name = sessionName?.trim();
     const role = participantRole();
     const project = main.cwd ? participantProject(main.cwd) : undefined;
@@ -916,6 +923,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ownerHostId: this.options.hostId,
       ownerIdentityId: this.options.identity.id,
       name: name && PARTICIPANT_NAME_PATTERN.test(name) ? name : "main",
+      ...(name ? { agentName: name } : {}),
+      ...(this.#processIdentity ? { processIdentity: this.#processIdentity } : {}),
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",

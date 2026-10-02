@@ -40,6 +40,45 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     return manager.run({ task, transport: "process" });
   };
 
+  it("records the pre-spawn attempt in the real worker and cleans a normally exited owned run", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launch-journal-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: false },
+      { workerPath, piBinary, runRoot: root });
+    managers.push(manager);
+    const before = process.env.FAKE_PI_BEHAVIOR;
+    process.env.FAKE_PI_BEHAVIOR = "success";
+    try {
+      const result = await manager.run({ task: "prove launch correlation", transport: "process", extensions: false });
+      expect(result.status).toBe("completed");
+      const dir = manager.runDirectory(result.id)!;
+      const attempts = fs.readFileSync(path.join(dir, "worker-launches.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const processes = fs.readFileSync(path.join(dir, "worker-processes.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(attempts).toHaveLength(1);
+      // Worker pre-spawn record, then one per-spawn runner obligation (runnerAttempt)
+      // opened before spawnCli and discharged by the matching runner registration.
+      expect(processes).toHaveLength(3);
+      for (const entry of processes) expect(entry.attempt).toBe(attempts[0].attempt);
+      expect(processes[0]).not.toHaveProperty("runner");
+      expect(processes[0]).not.toHaveProperty("runnerAttempt");
+      expect(processes[1]).not.toHaveProperty("runner");
+      expect(typeof processes[1].runnerAttempt).toBe("string");
+      expect(processes[2]).toHaveProperty("runner");
+      expect(processes[2].runnerAttempt).toBe(processes[1].runnerAttempt);
+      if (process.platform !== "linux") {
+        expect(processes[0].worker).toBeNull();
+        expect(processes[2].runner).toBeNull();
+      }
+      await expect(manager.cleanup(result.id)).resolves.toEqual({ cleaned: true });
+      expect(fs.existsSync(dir)).toBe(false);
+      await manager.close();
+      expect(fs.existsSync(root)).toBe(false);
+    } finally {
+      if (before === undefined) delete process.env.FAKE_PI_BEHAVIOR;
+      else process.env.FAKE_PI_BEHAVIOR = before;
+    }
+  });
+
   // Regression for the LocalTerm shim contract: when the manager resolves the
   // child pi binary to the shim (~/.localterm/shims/pi), the shim injects the
   // wired secret env vars into pi's own process.env, and the worker must pass

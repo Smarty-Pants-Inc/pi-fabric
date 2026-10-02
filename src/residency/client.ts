@@ -248,6 +248,8 @@ export class ResidencyClient {
   async #startHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
     this.#refreshPiModels();
+    const root = this.options.participants.get(this.options.config.rootId, undefined, { fresh: true });
+    if (root?.kind === "root" && root.local && root.processIdentity) this.options.config.rootOwner = root;
     atomicWrite(this.#configPath, this.options.config);
     const existing = this.#liveOwner();
     if (existing) return existing;

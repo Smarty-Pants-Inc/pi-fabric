@@ -230,6 +230,8 @@ export interface AgentHandleInfo {
 export interface AgentWorkerOptions {
   residentStartupProbe?: boolean;
   id: string;
+  /** Unique pre-spawn manager journal entry; old/direct launchers may omit it. */
+  launchAttempt?: string;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;

@@ -938,7 +938,8 @@ interface FabricAgentsApi {
   /** Project-independent templates in the global registry. */
   actors(args: { scope: "global" }): Promise<FabricActorTemplate[]>;
   messages(args: { id: string; limit?: number }): Promise<FabricActorMessage[]>;
-  remove(args: { id: string }): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }>;
+  /** Native Main only: successor removes a same-project/name/role durable actor of a proven dead root. */
+  remove(args: { id: string; successor?: boolean }): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }>;
   /** Drop an actor's mailbox history without stopping the actor. */
   clearMessages(args: { id: string }): Promise<FabricActorInfo>;
   /** Start an actor's next run on a fresh Pi session; waits for an in-flight run, keeps the mailbox. */

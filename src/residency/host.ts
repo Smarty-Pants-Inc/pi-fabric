@@ -2,6 +2,7 @@
 
 import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
+import { readProcessIdentity, type ProcessStartIdentity } from "../core/process-identity.js";
 import {
   RESIDENT_HANDOVER_ABI, HANDOVER_DRAIN_MS, exactResidentProcess, assertAutomaticReleaseRecovery,
   residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec,
@@ -17,6 +18,7 @@ interface ResidentHostLaunchContext {
 }
 import { lockFile, FileLockBusy } from "./file-lock.js";
 import { closeWithActors } from "../actors/close-order.js";
+import { readRunProcessEvidence, assertRunProcessesSettled, type RunProcessEvidence } from "../storage/worker-settlement.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -277,6 +279,7 @@ export class ResidentHost {
     this.identity = { id: this.hostId, name: "Fabric resident host", kind: "agent" };
     this.#ownerPath = path.join(config.residencyRoot, "owner.json");
     this.#lockPath = path.join(config.residencyRoot, "host.lock");
+    // start() acquires the asynchronous host fence before initializing managers.
     this.#errorPath = path.join(config.residencyRoot, "error.json");
     this.#requestsPath = path.join(config.residencyRoot, "requests");
     this.#processingPath = path.join(config.residencyRoot, "processing");
@@ -360,6 +363,9 @@ export class ResidentHost {
       });
       return `${resolved.provider}/${resolved.id}`;
     };
+    // A previous clean-close receipt cannot cover work admitted by this host generation.
+    fs.rmSync(path.join(config.residencyRoot, "workers-settled.json"), { force: true });
+    fs.mkdirSync(path.join(config.residencyRoot, "runs"), { recursive: true, mode: 0o700 });
     this.agents = new AgentManager(config.cwd, config.agents, {
       workerPath: config.workerPath,
       fabricExtensionPath: config.fabricExtensionPath,
@@ -526,11 +532,13 @@ export class ResidentHost {
         REQUEST_POLL_MS,
       );
       const now = Date.now();
+      const processIdentity = readProcessIdentity();
       const owner: ResidentHostOwner = {
         format: RESIDENT_HOST_FORMAT,
         hostId: this.hostId,
         pid: process.pid,
         processStartTime: processStartTime(process.pid),
+        ...(processIdentity ? { processIdentity } : {}),
         fabricExtensionPath: this.config.fabricExtensionPath,
         token: this.#token,
         startedAt: now,
@@ -575,8 +583,33 @@ export class ResidentHost {
       await closeWithActors({ close: () => actorsClosed }, () => this.control?.close().catch(() => undefined));
     } finally {
       try {
+        // Preserve positive process evidence before close can delete the resident run tree.
+        // Incomplete/unresolved evidence must never produce a clean-close receipt.
+        let runs: RunProcessEvidence[] | undefined;
+        let unsettled: unknown;
+        try { runs = readRunProcessEvidence(path.join(this.config.residencyRoot, "runs")); } catch (error) { unsettled = error; }
         try {
           await this.agents?.close();
+          // Close can settle tools after the initial capture. Refresh only from retained
+          // durable logs; never upgrade an earlier live-runner snapshot by PID absence.
+          if (runs?.some(run => run.toolSettlement?.state !== "settled") &&
+              fs.existsSync(path.join(this.config.residencyRoot, "runs"))) {
+            try { runs = readRunProcessEvidence(path.join(this.config.residencyRoot, "runs")); }
+            catch (error) { unsettled = error; }
+          }
+          if (runs) {
+            try {
+              assertRunProcessesSettled(runs);
+              writeJsonAtomic(path.join(this.config.residencyRoot, "workers-settled.json"),
+                { format: 1, rootId: this.config.rootId, runs }, { durable: true });
+              fs.rmSync(path.join(this.config.residencyRoot, "workers-unsettled.json"), { force: true });
+            } catch (error) { unsettled = error; }
+          }
+          if (unsettled) {
+            fs.rmSync(path.join(this.config.residencyRoot, "workers-settled.json"), { force: true });
+            writeJsonAtomic(path.join(this.config.residencyRoot, "workers-unsettled.json"),
+              { format: 1, rootId: this.config.rootId, reason: errorMessage(unsettled), ...(runs ? { runs } : {}) }, { durable: true });
+          }
         } finally {
           await this.#backgroundDeliveries.close();
           await this.#flushingDeliveries;
@@ -1294,7 +1327,19 @@ export class ResidentHost {
     }
   }
 
+  #isRetiredMain(): boolean {
+    const file = path.join(this.config.residencyRoot, "retired.json");
+    if (!fs.existsSync(file)) return false;
+    const retired = readJson<{ mainIdentity?: ProcessStartIdentity }>(file);
+    const owner = this.config.rootOwner?.processIdentity;
+    // Missing ownership (or an unreadable marker) cannot authorize a stale launcher.
+    if (!owner || !retired?.mainIdentity) return true;
+    return owner.pid === retired.mainIdentity.pid && owner.startTime === retired.mainIdentity.startTime &&
+      owner.kernelId === retired.mainIdentity.kernelId;
+  }
+
   async #acquireLock(): Promise<void> {
+    if (this.#isRetiredMain()) throw new Error("Fabric resident root was retired by a successor Main");
     fs.mkdirSync(this.config.residencyRoot, { recursive: true, mode: 0o700 });
     if (process.platform === "linux") {
       try { this.#lockFd = await lockFile(this.#lockPath, 0, true); }
@@ -1319,16 +1364,21 @@ export class ResidentHost {
       }
       this.#fallbackLock = true;
     }
+    if (this.#isRetiredMain()) {
+      this.#releaseLock();
+      throw new Error("Fabric resident root was retired by a successor Main");
+    }
     // A pre-flock host may own these diagnostic records without holding our fence.
     // Read BEFORE overwriting; unknown birth identity is not authority to displace it.
-    const records = [readJson<ResidentHostOwner>(this.#lockPath), readJson<ResidentHostOwner>(this.#ownerPath)];
+    const locked = readJson<ResidentHostOwner & { released?: boolean }>(this.#lockPath);
+    const records = [locked?.released === true ? undefined : locked, readJson<ResidentHostOwner>(this.#ownerPath)];
     if (records.some((owner) => owner && owner.pid !== process.pid && residentProcessAlive(owner.pid, owner.processStartTime))) {
       this.#releaseLock();
       throw new ResidentHostAlreadyRunning("Fabric resident host is already running (legacy owner)");
     }
     try {
       fs.ftruncateSync(this.#lockFd, 0);
-      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
+      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid), processIdentity: readProcessIdentity() }));
     } catch (error) { this.#releaseLock(); throw error; }
   }
 
@@ -1340,8 +1390,18 @@ export class ResidentHost {
     if (this.#fallbackLock && readJson<{ token?: string }>(this.#lockPath)?.token === this.#token) {
       fs.rmSync(this.#lockPath, { force: true });
     }
-    fs.closeSync(this.#lockFd);
-    this.#lockFd = undefined;
+    try {
+      if (!this.#fallbackLock && readJson<{ token?: string }>(this.#lockPath)?.token === this.#token) {
+        // Keep main's flock inode stable. A successor must distinguish a closed host's
+        // diagnostics from a live owner, and still acquire this kernel fence itself.
+        fs.ftruncateSync(this.#lockFd, 0);
+        fs.writeSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid,
+          processIdentity: readProcessIdentity(), processStartTime: processStartTime(process.pid), released: true }), 0, "utf8");
+      }
+    } finally {
+      fs.closeSync(this.#lockFd);
+      this.#lockFd = undefined;
+    }
   }
 }
 
@@ -1384,22 +1444,23 @@ const runResidentHost = async (
   const idle = new Promise<void>((resolve) => {
     finishIdle = resolve;
   });
-  const host = new ResidentHost(config, () => finishIdle?.(), modelRegistry, residentHostLaunchContext(config));
-  await host.start();
-  if (signal?.aborted) {
-    await host.close();
-    return;
+  let finishStop!: () => void;
+  const stopped = new Promise<void>((resolve) => { finishStop = resolve; });
+  // Install before startup: a successor may see host.lock while this host is still loading.
+  signal?.addEventListener("abort", finishStop, { once: true });
+  process.once("SIGTERM", finishStop);
+  process.once("SIGINT", finishStop);
+  let host: ResidentHost | undefined;
+  try {
+    host = new ResidentHost(config, () => finishIdle?.(), modelRegistry, residentHostLaunchContext(config));
+    await host.start();
+    if (!signal?.aborted) await Promise.race([idle, stopped]);
+  } finally {
+    signal?.removeEventListener("abort", finishStop);
+    process.removeListener("SIGTERM", finishStop);
+    process.removeListener("SIGINT", finishStop);
+    await host?.close();
   }
-  await Promise.race([
-    idle,
-    new Promise<void>((resolve) => {
-      const finish = (): void => resolve();
-      signal?.addEventListener("abort", finish, { once: true });
-      process.once("SIGTERM", finish);
-      process.once("SIGINT", finish);
-    }),
-  ]);
-  await host.close();
 };
 
 export const runResidentHostFromConfigPath = async (

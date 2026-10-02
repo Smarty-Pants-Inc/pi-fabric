@@ -867,6 +867,7 @@ export class FabricRuntimeState {
             format: RESIDENT_HOST_FORMAT,
             rootId: mainAgentId,
             sessionId,
+            rootOwner: this.#participants.root(mainAgent.info(context), mainAgent.interactive, this.pi.getSessionName?.()),
             cwd: context.cwd,
             projectRoot,
             ...(participantRole() ? { role: participantRole()! } : {}),

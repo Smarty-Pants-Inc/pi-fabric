@@ -13,6 +13,7 @@ import type {
   AgentRunStatus,
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
+import { readProcessIdentity } from "./core/process-identity.js";
 import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { retryableProviderError } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
@@ -298,6 +299,17 @@ const main = async (): Promise<void> => {
   fs.mkdirSync(deliveryDirectory, { recursive: true, mode: 0o700 });
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
+  // Append, never overwrite: retries have distinct workers/runners, and a dead host may
+  // leave any attempt detached. Register this attempt before publishing runnable status.
+  const workerIdentity = readProcessIdentity();
+  const processJournal = path.join(path.dirname(options.statusFile), "worker-processes.jsonl");
+  const recordProcesses = (runner?: unknown, runnerAttempt?: string): void => {
+    fs.appendFileSync(processJournal, JSON.stringify({
+      ...(options.launchAttempt ? { attempt: options.launchAttempt } : {}), worker: workerIdentity ?? null,
+      ...(runnerAttempt ? { runnerAttempt } : {}),
+      ...(runner === undefined ? {} : { runner }) }) + "\n", { encoding: "utf8", mode: 0o600 });
+  };
+  recordProcesses(); // incomplete runner evidence is already durable before spawnCli below
   if (options.runner === "pi") {
     // The manager removes the old status to fence terminal verdicts on relaunch.
     // History is explicitly handed across that boundary, not a Pi resume target.
@@ -510,7 +522,10 @@ const main = async (): Promise<void> => {
   // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
   // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
   const taskEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/task-entry.ts" : "./worker/task-entry.js", import.meta.url));
-  const spawnChild = (): ChildProcess => spawnCli(piRetrySdk ? taskEntryPath : childBinary,
+  const spawnChild = (): ChildProcess => {
+    const runnerAttempt = randomUUID();
+    recordProcesses(undefined, runnerAttempt); // each resume/spawn has its own incomplete obligation
+    const spawned = spawnCli(piRetrySdk ? taskEntryPath : childBinary,
     piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments] : childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
@@ -564,6 +579,9 @@ const main = async (): Promise<void> => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+    recordProcesses(spawned.pid ? readProcessIdentity(spawned.pid) ?? null : null, runnerAttempt);
+    return spawned;
+  };
   let child = spawnChild();
   let childExited = false;
   let piControlLive = false;

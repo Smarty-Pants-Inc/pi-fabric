@@ -149,6 +149,11 @@ export class ActorDirectory extends ActorManager {
   override cleanupObligation(id: string): ReturnType<ActorManager["cleanupObligation"]> {
     return super.cleanupObligation(id) ?? this.#secondary.cleanupObligation(id);
   }
+  override removeSuccessor(...args: Parameters<ActorManager["removeSuccessor"]>): ReturnType<ActorManager["removeSuccessor"]> {
+    if (super.cleanupObligation(args[0])) return super.removeSuccessor(...args);
+    if (this.#secondary.cleanupObligation(args[0])) return this.#secondary.removeSuccessor(...args);
+    return this.#isPrimary(args[0]) ? super.removeSuccessor(...args) : this.#secondary.removeSuccessor(...args);
+  }
   override remove(...args: Parameters<ActorManager["remove"]>): ReturnType<ActorManager["remove"]> {
     // Cleanup obligations route only by exact id, never by name or prefix.
     if (super.cleanupObligation(args[0])) return super.remove(...args);

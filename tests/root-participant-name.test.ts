@@ -29,7 +29,8 @@ describe("root participant session names", () => {
   ])("publishes session name %j as %j without changing identity", (sessionName, expected) => {
     const owner = directory(path.join(os.tmpdir(), "unused-root-name"));
     const original = owner.root(info);
-    expect(owner.root(info, true, sessionName)).toEqual({ ...original, name: expected });
+    expect(owner.root(info, true, sessionName)).toEqual({ ...original, name: expected,
+      ...(sessionName?.trim() ? { agentName: sessionName.trim() } : {}) });
     expect(owner.root(info, false, sessionName)).toMatchObject({ name: expected, kind: "root",
       id: identity.id, rootId: identity.id, ownerHostId: identity.id, ownerIdentityId: identity.id,
       interactive: false, capabilities: ["fabric"] });

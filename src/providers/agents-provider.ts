@@ -389,6 +389,7 @@ export const messageTargetArgs = (
 
 export class AgentsProvider implements FabricProvider {
   readonly #transcripts = new AgentTranscriptReader();
+  readonly #successorRemovals = new Map<string, Promise<unknown>>();
   readonly #toolCeiling = readChildToolAllowlist();
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
@@ -1403,6 +1404,39 @@ export class AgentsProvider implements FabricProvider {
       case "resetSession":
         return this.actorManager.resetSession(String(args.id));
       case "remove": {
+        if (args.successor === true) {
+          // ownsRuntime controls lifecycle cleanup, not authority: native FabricRuntimeState
+          // owns and closes these managers itself. Main authority is fenced below and in preflight.
+          if (args.scope === "global" || !this.mainAgent.local || !this.residency || this.actorManager.identity.kind !== "main") {
+            throw new Error("Successor removal requires the native Main root and a durable project actor");
+          }
+          let id = String(args.id);
+          let actor = this.actorManager.cleanupObligation(id);
+          if (!actor) {
+            try {
+              const target = this.#resolveActorTarget(id);
+              actor = target.actor;
+              id = actor?.id ?? target.participant?.id ?? id;
+            } catch (error) {
+              // Old session-scope registries are outside this Main's directory. Only an exact
+              // full actor id may be looked up there; never guess a foreign alias or name.
+              if (!/^[a-f0-9]{32}$/.test(id)) throw error;
+            }
+          }
+          if (actor) id = actor.id;
+          // An already accepted removal uses the ordinary retry path, never a second claim.
+          if (actor && this.actorManager.owns(id)) return this.actorManager.remove(id);
+          const pending = this.#successorRemovals.get(id);
+          if (pending) return pending;
+          const residency = this.residency;
+          const call = (async () => {
+            const { removeDeadPredecessor } = await import("../residency/successor-removal.js");
+            return removeDeadPredecessor(residency, this.actorManager, id);
+          })();
+          this.#successorRemovals.set(id, call);
+          try { return await call; }
+          finally { if (this.#successorRemovals.get(id) === call) this.#successorRemovals.delete(id); }
+        }
         if (args.scope === "global") return this.globalActors.remove(String(args.id));
         const cleanup = this.actorManager.cleanupObligation(String(args.id));
         if (cleanup) {

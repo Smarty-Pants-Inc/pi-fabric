@@ -89,6 +89,7 @@ import {
   removeEmptyRunRoot,
   type TempRunSweepRequest,
 } from "../storage/retention.js";
+import { hasUnsettledRecordedProcesses, recordWorkerLaunchAttempt } from "../storage/worker-settlement.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
 import { effectiveAgentNice, parseAgentNice } from "./priority.js";
 import {
@@ -607,7 +608,7 @@ const hostStoppedResult = (result: AgentRunResult, lastEventAt: number | undefin
 const runRootHasUnresolvedWorker = (root: string): boolean => {
   try {
     return fs.readdirSync(root, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && hasUnresolvedWorker(path.join(root, entry.name)));
+      .some((entry) => entry.isDirectory() && (hasUnresolvedWorker(path.join(root, entry.name)) || hasUnsettledRecordedProcesses(path.join(root, entry.name))));
   } catch {
     return false;
   }
@@ -947,8 +948,17 @@ export class AgentManager {
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     if (this.#closing) throw new Error("Fabric agent manager is closing");
+    // Fence every transport (including retries) BEFORE it can spawn a detached worker.
+    // A crash after spawn but before worker registration must not reuse an old journal.
+    const statusIndex = request.workerArguments.indexOf("--status-file");
+    const statusFile = request.workerArguments[statusIndex + 1];
+    if (statusIndex < 0 || !statusFile) throw new Error("Missing worker status file for launch evidence");
+    const attempt = randomUUID();
+    recordWorkerLaunchAttempt(path.dirname(statusFile), attempt);
+    // Keep queued activation revocation attached alongside manager-close authority.
     const signal = request.signal ? AbortSignal.any([request.signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
-    const pending = adapter.launch({ ...request, signal });
+    const pending = adapter.launch({ ...request,
+      workerArguments: [...request.workerArguments, "--launch-attempt", attempt], signal });
     this.#launches.add(pending);
     try {
       const transport = await pending;
@@ -1882,7 +1892,7 @@ export class AgentManager {
     if (queued) {
       if (!queued.terminal) throw new Error("Cannot clean up a queued agent");
       const runDirectory = path.join(this.#runRoot, id);
-      if (queued.cleanupPending || hasUnresolvedWorker(runDirectory)) {
+      if (queued.cleanupPending || hasUnresolvedWorker(runDirectory) || hasUnsettledRecordedProcesses(runDirectory)) {
         throw new Error(`Cannot clean up agent ${id}: Fabric lost track of its worker; check ${runDirectory} before removing its files`);
       }
       if (!this.#saveQueuedRouteOutcome(queued)) throw new Error(`Cannot clean up agent ${id}: ${queued.routeSaveFailure}`);
@@ -1897,9 +1907,9 @@ export class AgentManager {
     }
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
-    if (managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) {
+    if (managed.lostContact || hasUnresolvedWorker(managed.runDirectory) || hasUnsettledRecordedProcesses(managed.runDirectory)) {
       throw new Error(
-        `Cannot clean up agent ${id}: Fabric lost track of its worker (${managed.lostContact ?? "see its run directory"}), ` +
+        `Cannot clean up agent ${id}: Fabric lost track of its worker/runner (${managed.lostContact ?? "see its run directory"}), ` +
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
@@ -2116,7 +2126,7 @@ export class AgentManager {
     const alive = await Promise.all(transports.map((transport) =>
       uncheckedExternalExit(transport) ? true :
         this.#transportAliveUntil(transport, observationDeadline).then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
-    const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
+    const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory) || hasUnsettledRecordedProcesses(managed.runDirectory)) ||
       [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasUnresolvedWorker(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {
@@ -2192,7 +2202,9 @@ export class AgentManager {
       await this.#startTempRunSweep();
     }
     const expired = [...this.#runs.values()].filter((managed) => {
-      if (!managed.settled || managed.actorId || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
+      // A terminal worker does not prove its recorded runner or nested runners exited.
+      // Preserve their evidence and handle just as explicit cleanup and close do.
+      if (!managed.settled || managed.actorId || managed.lostContact || hasUnresolvedWorker(managed.runDirectory) || hasUnsettledRecordedProcesses(managed.runDirectory)) return false;
       const record = readRecord(managed.statusFile) ?? managed.latestRecord;
       const finishedAt = record?.finishedAt ?? record?.updatedAt;
       return typeof finishedAt === "number" && now - finishedAt >= this.#retention.oneShotRunMs;

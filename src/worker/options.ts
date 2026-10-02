@@ -62,6 +62,7 @@ export const parseWorkerOptions = (
   argv: readonly string[] = process.argv,
 ): AgentWorkerOptions => {
   const args = argumentMap(argv);
+  const launchAttempt = optional(args, "launch-attempt");
   const model = optional(args, "model");
   const routeHeader = optional(args, "route-header");
   const thinking = optional(args, "thinking");
@@ -171,6 +172,7 @@ export const parseWorkerOptions = (
     taskFile: required(args, "task-file"),
     ...(imagesFile ? { imagesFile } : {}),
     statusFile: required(args, "status-file"),
+    ...(launchAttempt ? { launchAttempt } : {}),
     lifecycleFile: required(args, "lifecycle-file"),
     logFile: required(args, "log-file"),
     ...(schemaFile ? { schemaFile } : {}),

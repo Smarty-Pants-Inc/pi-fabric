@@ -34,6 +34,70 @@ const fixture = () => {
 };
 
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+describe("successor retirement with resident release", () => {
+  it.skipIf(process.platform !== "linux").each(["before", "under"])("rejects a retired root %s the host fence without initializing actors", async (stage) => {
+    const { root, config, host } = fixture();
+    const retired = path.join(config.residencyRoot, "retired.json");
+    const lock = path.join(config.residencyRoot, "host.lock");
+    const exists = fs.existsSync.bind(fs);
+    let checks = 0;
+    const probe = vi.spyOn(fs, "existsSync").mockImplementation((file) => {
+      if (String(file) === retired && ++checks === (stage === "before" ? 1 : 2)) {
+        fs.writeFileSync(retired, JSON.stringify({ format: 1 }));
+      }
+      return exists(file);
+    });
+    try {
+      await expect(host.start()).rejects.toThrow("retired by a successor Main");
+      expect(host.actors).toBeUndefined();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      probe.mockRestore();
+      const fd = await lockFile(lock, 0);
+      fs.closeSync(fd); // Even the post-acquisition refusal releases main's kernel fence.
+    } finally { probe.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform !== "linux")("publishes both ownership identities and saves settlement before releasing the stable inode", async () => {
+    const { root, config, host } = fixture();
+    const lock = path.join(config.residencyRoot, "host.lock");
+    try {
+      await host.start();
+      const owner = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "owner.json"), "utf8"));
+      const diagnostic = JSON.parse(fs.readFileSync(lock, "utf8"));
+      expect(owner.processIdentity).toMatchObject({ pid: process.pid });
+      expect(diagnostic.processIdentity).toEqual(owner.processIdentity);
+      expect(owner.processStartTime).toBe(processStartTime(process.pid));
+      expect(diagnostic.processStartTime).toBe(owner.processStartTime);
+      const inode = fs.statSync(lock).ino;
+      await host.close();
+      expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "workers-settled.json"), "utf8")))
+        .toMatchObject({ format: 1, rootId: config.rootId, runs: [] });
+      expect(fs.statSync(lock).ino).toBe(inode);
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      const fd = await lockFile(lock, 0);
+      fs.closeSync(fd);
+    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform !== "linux")("failed agent close emits no settlement receipt but still releases the host fence", async () => {
+    const { root, config, host } = fixture();
+    try {
+      await host.start();
+      const failure = vi.spyOn(host.agents, "close").mockRejectedValueOnce(new Error("close fault"));
+      await expect(host.close()).rejects.toThrow("close fault");
+      failure.mockRestore();
+      expect(fs.existsSync(path.join(config.residencyRoot, "workers-settled.json"))).toBe(false);
+      const fd = await lockFile(path.join(config.residencyRoot, "host.lock"), 0);
+      fs.closeSync(fd);
+    } finally {
+      await host.agents?.close();
+      await host.participants?.close();
+      await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("resident loaded-path census metadata", () => {
   it("publishes the startup generation rather than a later desired configuration", async () => {
     const { root, config, host } = fixture();

@@ -211,6 +211,66 @@ const hasEquivalentCanonical = (
     JSON.stringify(rehydrated) === JSON.stringify(result);
 };
 
+export interface RunToolSettlement {
+  format: 1;
+  state: "settled" | "in_flight" | "unknown";
+  reason?: string;
+}
+
+/** Settlement is not ancestor-PID absence or terminal status. Reuse the complete,
+ * bounded run-log record reader: only matching execution ends discharge starts.
+ * Unreadable, partial, lossy or changed logs cannot be positive cleanup evidence. */
+export const readRunToolSettlement = (filePath: string, toolCalls?: unknown): RunToolSettlement => {
+  let descriptor: number | undefined;
+  const started = performance.now();
+  const unknown = (reason: string): RunToolSettlement => ({ format: 1, state: "unknown", reason });
+  try {
+    const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+    descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+    const original = fs.fstatSync(descriptor);
+    if (!original.isFile() || fs.realpathSync.native(filePath) !== filePath) return unknown("unsafe tool execution log");
+    if (!original.size || original.size > MAX_TERMINAL_LOG_BYTES) return unknown("missing or over-budget tool execution log");
+    const checkWork = (): void => {
+      if (performance.now() - started >= MAX_TERMINAL_LOG_WORK_MS) throw new Error("tool execution log inspection exceeded work bound");
+    };
+    const pending = new Map<string, string>();
+    let records = 0;
+    let starts = 0;
+    for (const record of logRecords(descriptor, original.size, checkWork)) {
+      if (++records > MAX_TERMINAL_LOG_RECORDS) return unknown("tool execution log inspection exceeded record bound");
+      const event = parseLogRecord(record.bytes);
+      if (!event || typeof event.type !== "string") return unknown("malformed or truncated tool execution log");
+      if (event.type === "worker_warning" && typeof event.warning === "string" && event.warning.startsWith("Dropped an oversized agent event line")) {
+        return unknown("tool execution log contains a dropped event");
+      }
+      if (!["tool_execution_start", "tool_execution_end", "tool_execution_update"].includes(event.type)) continue;
+      if (typeof event.toolCallId !== "string" || !event.toolCallId || typeof event.toolName !== "string" || !event.toolName) {
+        return unknown("missing tool execution identity");
+      }
+      const id = event.toolCallId;
+      if (event.type === "tool_execution_start") {
+        if (pending.has(id)) return unknown(`duplicate in-flight tool execution ${id}`);
+        pending.set(id, event.toolName);
+        starts++;
+      } else {
+        if (pending.get(id) !== event.toolName) return unknown(`unmatched tool execution ${event.type} for ${id}`);
+        if (event.type === "tool_execution_end") pending.delete(id);
+      }
+    }
+    const final = fs.fstatSync(descriptor);
+    const named = fs.lstatSync(filePath);
+    if (final.size !== original.size || final.mtimeMs !== original.mtimeMs || final.ctimeMs !== original.ctimeMs ||
+        named.dev !== original.dev || named.ino !== original.ino || !named.isFile()) return unknown("tool execution log changed during inspection");
+    if (toolCalls !== undefined && (!Number.isSafeInteger(toolCalls) || (toolCalls as number) < 0 || (toolCalls as number) > starts)) {
+      return unknown("tool execution count does not match durable starts");
+    }
+    return pending.size ? { format: 1, state: "in_flight", reason: `${pending.size} in-flight tool execution(s): ${[...pending.keys()].slice(0, 10).join(", ")}` }
+      : { format: 1, state: "settled" };
+  } catch (error) {
+    return unknown(`cannot verify tool execution log: ${error instanceof Error ? error.message : String(error)}`);
+  } finally { if (descriptor !== undefined) fs.closeSync(descriptor); }
+};
+
 export interface RunLogCompaction {
   compacted: number;
   beforeBytes: number;

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import { GUEST_TYPE_DECLARATIONS, guestTypeDeclarations } from "../src/runtime/guest-types.js";
 import {
   normalizeTypeScriptPath,
@@ -6,6 +7,15 @@ import {
 } from "../src/runtime/type-checker.js";
 
 describe("Fabric guest type checker", () => {
+  it("types explicit successor removal and rejects a non-boolean opt-in", () => {
+    expect(AGENTS_ACTION_DESCRIPTORS.find((action) => action.name === "remove")?.inputSchema)
+      .toMatchObject({ properties: { successor: { type: "boolean" } }, required: ["id"], additionalProperties: false });
+    const accepted = typeCheckFabricCode('return agents.remove({ id: "actor-id", successor: true });', GUEST_TYPE_DECLARATIONS, true);
+    expect(accepted.errors).toEqual([]);
+    const rejected = typeCheckFabricCode('return agents.remove({ id: "actor-id", successor: "true" });', GUEST_TYPE_DECLARATIONS, true);
+    expect(rejected.errors.length).toBeGreaterThan(0);
+  });
+
   it("types the advertised systemPrompt on agents.run and durable agents.spawn (#2985)", () => {
     const result = typeCheckFabricCode(`
 await agents.run({ task: "review", systemPrompt: "Use the acceptance checklist" });

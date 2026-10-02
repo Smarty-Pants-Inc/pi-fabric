@@ -13,6 +13,7 @@ import {
   AgentLaunchPreparationTimeoutError,
 } from "../src/agents/manager.js";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
+import { readProcessIdentity } from "../src/core/process-identity.js";
 import * as retentionStorage from "../src/storage/retention.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import {
@@ -788,6 +789,32 @@ describe("AgentManager", () => {
     }
   }, 20_000);
 
+  it.skipIf(process.platform !== "linux")("retains a terminal queued receipt while its recorded runner is still alive", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "failed worker with a live recorded runner", transport: "process" });
+    const runDirectory = path.join(root, queued.id);
+    const identity = readProcessIdentity();
+    expect(identity).toBeDefined();
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementationOnce(async (request) => {
+      const attempt = request.workerArguments[request.workerArguments.indexOf("--launch-attempt") + 1];
+      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "worker-launches.jsonl"), "utf8"))).toEqual({ attempt });
+      fs.writeFileSync(path.join(runDirectory, "status.json"), JSON.stringify({ id: queued.id }));
+      fs.writeFileSync(path.join(runDirectory, "worker-processes.jsonl"), JSON.stringify({ attempt, worker: identity, runner: identity }) + "\n");
+      throw new Error("worker launch failed after runner registration");
+    });
+    await manager.stop(first.id);
+    expect(await manager.wait(queued.id)).toMatchObject({ status: "failed", error: "worker launch failed after runner registration" });
+    await expect(manager.cleanup(queued.id)).rejects.toThrow("lost track of its worker");
+    await manager.close();
+    expect(fs.existsSync(path.join(runDirectory, "worker-processes.jsonl"))).toBe(true);
+  });
+
   it("waits for a cancelled queued worker's confirmed exit before allowing cleanup", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -801,8 +828,13 @@ describe("AgentManager", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const creating = new Promise<void>((resolve) => { ready = resolve; });
     let stoppedAt: number | undefined;
-    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementationOnce(async () => {
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementationOnce(async (request) => {
+      const attempt = request.workerArguments[request.workerArguments.indexOf("--launch-attempt") + 1];
+      expect(attempt).toBeTruthy();
+      expect(JSON.parse(fs.readFileSync(path.join(root, request.id, "worker-launches.jsonl"), "utf8"))).toEqual({ attempt });
+      expect(request.signal?.aborted).toBe(false);
       ready(); await gate;
+      expect(request.signal?.aborted).toBe(true);
       return { kind: "process", stop: async () => { stoppedAt = Date.now(); }, isAlive: async () => stoppedAt === undefined || Date.now() - stoppedAt < 150 };
     });
     try {

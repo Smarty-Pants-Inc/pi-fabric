@@ -5,6 +5,7 @@ import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type 
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
+import { OutputArtifactStore } from "./output-budget.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin } from "./core/model-refresh.js";
@@ -75,6 +76,7 @@ import { RuntimeStateSpeculation } from "./runtime-state-speculation.js";
 import { schemaRefAllowedInEnforce } from "./schema/policy.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "./mesh/store.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "./core/atomic-write.js";
 import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
@@ -206,6 +208,8 @@ export class FabricRuntimeState {
   #records: Promise<RecordsService> | undefined;
   #openRecords: (() => Promise<RecordsService>) | undefined;
   #mesh: MeshStore | undefined;
+  #backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
+  readonly #inboxRetry = new MeshBackgroundRetry("root inbox cursor");
   #identity: MeshIdentity | undefined;
   #mainAgent: MainAgentController | undefined;
   #participants: ParticipantDirectory | undefined;
@@ -229,6 +233,8 @@ export class FabricRuntimeState {
   readonly #builtinComponentNames = new Set<string>();
   readonly componentCatalog = new FabricComponentCatalog();
   readonly activity: FabricActivityStore;
+  #outputArtifacts = new OutputArtifactStore();
+  get outputArtifactWriter(): OutputArtifactStore["write"] { return this.#outputArtifacts.write; }
   #shellJobs = new FabricShellJobStore();
   get shellJobs(): FabricShellJobStore { return this.#shellJobs; }
   readonly prewalk: PrewalkController;
@@ -334,7 +340,11 @@ export class FabricRuntimeState {
    * With `idle`, the batch an idle Main wakes for (smarty-dev#1595), under the wake cooldown.
    */
   async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
-    return idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session);
+    let batch: RootInboxBatch | undefined;
+    await this.#inboxRetry.run(async () => {
+      batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session));
+    });
+    return batch;
   }
 
   /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */
@@ -416,6 +426,7 @@ export class FabricRuntimeState {
     try {
       await this.#closeInternal();
       this.#shellJobs = new FabricShellJobStore();
+      this.#outputArtifacts = new OutputArtifactStore();
     } finally {
       this.#suppressResidentGuidanceSync = false;
     }
@@ -575,6 +586,7 @@ export class FabricRuntimeState {
       path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`),
       this.#config.mesh.followUpStallSeconds,
     );
+    this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#mesh = new MeshStore(
       meshRoot,
       this.#config.mesh.maxEventBytes,
@@ -738,7 +750,7 @@ export class FabricRuntimeState {
       },
       onLifecycle: (event) => {
         const lifecycle = this.#lifecycle;
-        if (lifecycle) void lifecycle.publish(event).catch(() => undefined);
+        if (lifecycle) void lifecycle.publishBackground(event);
       },
       onBackgroundComplete: (result) => completionInbox.enqueue(result),
       onResultConsumed: (id) => {
@@ -1452,7 +1464,8 @@ export class FabricRuntimeState {
     ) return;
     const self = this.#participants.self();
     const metadata = lifecycleMetadata(event, payload);
-    await this.#lifecycle.publish({
+    const lifecycle = this.#lifecycle;
+    await this.#backgroundMesh.enqueue(() => lifecycle.publish({
       source: {
         id: self.id,
         name: self.name,
@@ -1465,7 +1478,7 @@ export class FabricRuntimeState {
       event,
       occurredAt: lifecycleObservedAt(payload),
       ...(metadata !== undefined ? { data: metadata } : {}),
-    });
+    }));
   }
 
   registerExternal(provider: FabricProvider, options: { overwrite?: boolean } = {}): void {
@@ -1528,6 +1541,8 @@ export class FabricRuntimeState {
     await Promise.allSettled([...this.#componentTransitionPublications]);
     await this.#sessionCapabilityLease?.release().catch(() => undefined);
     this.#sessionCapabilityLease = undefined;
+    await this.#backgroundMesh.close();
+    await this.#rootInbox?.close();
     await this.#lifecycle?.close();
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
     // Actor shutdown starts before control drains (an in-flight ask may await an actor).
@@ -1536,6 +1551,7 @@ export class FabricRuntimeState {
     await this.#closeRecords();
     await this.#agents?.close();
     await this.shellJobs.close();
+    await this.#outputArtifacts.close();
     try {
       await this.#registry?.close();
     } finally {
@@ -1587,7 +1603,8 @@ export class FabricRuntimeState {
   /** Best-effort ops event on the mesh, e.g. ops.fabric.reloaded (smarty-dev#2160). */
   publishOpsEvent(topic: string, kind: string, data: Record<string, unknown>): Promise<void> {
     if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return Promise.resolve();
-    return this.#mesh.publish({ topic, kind, from: this.#identity, data }).then(() => undefined, () => undefined);
+    const mesh = this.#mesh, identity = this.#identity;
+    return this.#backgroundMesh.enqueue(() => mesh.publish({ topic, kind, from: identity, data }));
   }
 
   // Publish a best-effort mesh event to the durable `fabric.compact` topic so
@@ -1595,17 +1612,11 @@ export class FabricRuntimeState {
   // Activity-only sessions (mesh disabled) silently skip this.
   #publishCompactEvent(kind: string, data: CompactPendingIntent | CompactLastCommit): void {
     if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return;
-    try {
-      void this.#mesh.publish({
-        topic: "fabric.compact",
-        kind,
-        from: this.#identity,
-        data,
-      });
-    } catch {
-      // Best-effort: a full event log or an oversized payload must not break
-      // the host compaction path.
-    }
+    const mesh = this.#mesh, identity = this.#identity;
+    // publish is async: a synchronous try/catch cannot contain a lock rejection.
+    void this.#backgroundMesh.enqueue(() => mesh.publish({
+      topic: "fabric.compact", kind, from: identity, data,
+    }));
   }
 
   #refreshRepairCatalog(): void {
@@ -1640,7 +1651,10 @@ export class FabricRuntimeState {
     this.#mainAgent?.closeFollowUpDrain();
     await this.shellJobs.close();
     await this.#deactivateRepairs();
-    if (!this.#registry) return;
+    if (!this.#registry) {
+      await this.#outputArtifacts.close();
+      return;
+    }
     await this.#participants?.quiesce().catch(() => undefined);
     this.#stopComponentWatch?.();
     this.#stopComponentWatch = undefined;
@@ -1651,10 +1665,14 @@ export class FabricRuntimeState {
     await Promise.allSettled([...this.#componentTransitionPublications]);
     await this.#sessionCapabilityLease?.release().catch(() => undefined);
     this.#sessionCapabilityLease = undefined;
+    await this.#backgroundMesh.close();
+    await this.#rootInbox?.close();
     await this.#lifecycle?.close();
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
     await this.#closeRecords();
     await this.#agents?.close();
+    // Reinitialization, like shutdown, must drain workers before releasing output artifacts.
+    await this.#outputArtifacts.close();
     const externalNames = new Set(this.#externalProviders.keys());
     try {
       await this.#registry.close(externalNames);

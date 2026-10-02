@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRunResult } from "./types.js";
-import { fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "../fabric-provenance.js";
+import { fabricProvenanceSupported, sendFabricMessage } from "../fabric-provenance.js";
 
 export const AGENT_COMPLETION_MESSAGE_TYPE = "pi-fabric-agent-complete";
 const SUMMARY_CHARS = 4_000;
@@ -57,10 +57,10 @@ export class AgentCompletionInbox {
         this.#suspended = false;
         // Capable Pi drains nextTurn after hooks; legacy Pi needs the hook result.
         let message: CompletionMessage | undefined;
-        this.#flush(value => {
+        this.#flush((value, result) => {
           if (!fabricProvenanceSupported(this.pi)) { message = value; return; }
           sendFabricMessage(this.pi, value, { deliverAs: "nextTurn", triggerTurn: false },
-            () => fabricHostIdentity(ctx.sessionManager.getSessionId()), "actor", "mesh");
+            { id: result.id, name: result.name, kind: "agent" }, "actor", "mesh");
         });
         return message ? { message } : undefined;
       });
@@ -138,29 +138,35 @@ export class AgentCompletionInbox {
     this.#timer.unref?.();
   }
 
-  #flush(deliver: (message: CompletionMessage) => void = (message) =>
-    sendFabricMessage(this.pi, message, { deliverAs: "steer", triggerTurn: true }, () => fabricHostIdentity(this.#context.sessionManager.getSessionId()), "steer", "mesh")): void {
+  #flush(deliver: (message: CompletionMessage, result: Completion) => void = (message, result) =>
+    sendFabricMessage(this.pi, message, { deliverAs: "steer", triggerTurn: true },
+      { id: result.id, name: result.name, kind: "agent" }, "steer", "mesh")): void {
     if (this.#closed || this.#suspended || this.#context.signal?.aborted || !this.#pending.size) return;
     const batch = [...this.#pending.values()].slice(0, 32);
     const perResult = Math.max(0, Math.min(SUMMARY_CHARS, Math.floor(BATCH_CHARS / batch.length) - 320));
-    const content = [
-      "Unread background agent results (batched). Incorporate relevant results into the current task. These are run outcomes, not new user requests. Do not restart completed work or reply merely to acknowledge stale/superseded results. A completed run does not necessarily mean its assignment is complete.",
-      ...batch.map(({ result }) => {
-        const seconds = Math.round(Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt) / 1_000);
-        const summary = [result.error, result.text].filter(Boolean).join("\n");
-        return `Agent ${oneLine(result.name).slice(0, 80)} (${result.id}) ${result.status} after ${seconds}s:\n${clip(summary || "no result", perResult)}`;
-      }),
-    ].join("\n\n");
-    deliver({
-      customType: AGENT_COMPLETION_MESSAGE_TYPE,
-      content,
-      display: false,
-      details: { ids: batch.map(({ result }) => result.id) },
-    });
-    for (const { result, delivered } of batch) {
-      this.#pending.delete(result.id);
-      this.#acknowledged.add(result.id);
-      this.#confirmDelivery(delivered);
+    // One turn has one sender: attribute each local child result separately on capable Pi.
+    // Legacy hosts retain the existing batch. Receipts follow each successful send.
+    const groups = fabricProvenanceSupported(this.pi) ? batch.map(item => [item]) : [batch];
+    for (const group of groups) {
+      const content = [
+        "Unread background agent results (batched). Incorporate relevant results into the current task. These are run outcomes, not new user requests. Do not restart completed work or reply merely to acknowledge stale/superseded results. A completed run does not necessarily mean its assignment is complete.",
+        ...group.map(({ result }) => {
+          const seconds = Math.round(Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt) / 1_000);
+          const summary = [result.error, result.text].filter(Boolean).join("\n");
+          return `Agent ${oneLine(result.name).slice(0, 80)} (${result.id}) ${result.status} after ${seconds}s:\n${clip(summary || "no result", perResult)}`;
+        }),
+      ].join("\n\n");
+      deliver({
+        customType: AGENT_COMPLETION_MESSAGE_TYPE,
+        content,
+        display: false,
+        details: { ids: group.map(({ result }) => result.id) },
+      }, group[0]!.result);
+      for (const { result, delivered } of group) {
+        this.#pending.delete(result.id);
+        this.#acknowledged.add(result.id);
+        this.#confirmDelivery(delivered);
+      }
     }
   }
 }

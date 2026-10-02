@@ -5,6 +5,7 @@ import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import os from "node:os";
+import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
@@ -59,6 +60,7 @@ import type {
   AgentTransportLaunch,
   AgentUsage,
 } from "./types.js";
+import { FOLLOW_UP_RUNNING_TASK_MESSAGE } from "./types.js";
 import { WorktreeManager } from "./worktree-manager.js";
 import { writeHandoffSession } from "./handoff.js";
 import type { FabricCompactionBudget } from "../compaction/hook.js";
@@ -684,7 +686,7 @@ export class AgentManager {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
     this.#managedTempRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT === undefined;
     this.#runRoot =
-      options.runRoot ?? process.env.PI_FABRIC_RUN_ROOT ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-runs-"));
+      options.runRoot ?? process.env.PI_FABRIC_RUN_ROOT ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-"));
     this.#retention = options.retention ?? DEFAULT_FABRIC_CONFIG.retention;
     this.#workerPath =
       options.workerPath ?? fileURLToPath(new URL("../worker.js", import.meta.url));
@@ -1888,7 +1890,17 @@ export class AgentManager {
       }
     }
     fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
-    return { queued: true, messageId };
+    return {
+      queued: true,
+      messageId,
+      ...(entry.type === "follow_up" && record?.status === "running" ? { warning: {
+        code: "FABRIC_FOLLOW_UP_RUNNING_TASK" as const,
+        targetId: managed.id,
+        kind: "agent" as const,
+        status: "running" as const,
+        message: FOLLOW_UP_RUNNING_TASK_MESSAGE,
+      } } : {}),
+    };
   }
 
   /** Non-destructive receipt for a paused resident release boundary. A terminal
@@ -2020,7 +2032,7 @@ export class AgentManager {
    */
   async #startTempRunSweep(): Promise<void> {
     const request: TempRunSweepRequest = {
-      tempRoot: os.tmpdir(),
+      tempRoot: path.dirname(this.#runRoot),
       currentRoot: this.#runRoot,
       orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
       oneShotRunRetentionMs: this.#retention.oneShotRunMs,
@@ -2030,7 +2042,7 @@ export class AgentManager {
       // as every other detached launch does. Resolve before the claim, so a host that cannot run
       // the sweep does not suppress the next attempt for a whole interval.
       const [runtime, ...args] = await scriptSpawnArgs(this.#sweepPath, [JSON.stringify(request)]);
-      if (!claimTempRunSweep(os.tmpdir(), RETENTION_SWEEP_INTERVAL_MS)) return;
+      if (!claimTempRunSweep(request.tempRoot, RETENTION_SWEEP_INTERVAL_MS)) return;
       const child = spawn(runtime!, args, {
         detached: true, stdio: "ignore", windowsHide: true,
       });

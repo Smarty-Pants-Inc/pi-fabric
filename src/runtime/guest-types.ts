@@ -72,6 +72,8 @@ interface FabricAgentRequest {
   cwd?: string;
   worktree?: boolean;
   schema?: Record<string, unknown>;
+  /** Extra child system instructions; supported by session and durable runs. */
+  systemPrompt?: string;
   prompt?: string;
   instructions?: string;
   timeout_ms?: number;
@@ -826,6 +828,14 @@ interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
 type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricMessageDelivery {
+  /** Sender-only: owner observed a running task when it admitted this followUp. Delivery is unchanged. */
+  warning?: {
+    code: "FABRIC_FOLLOW_UP_RUNNING_TASK";
+    targetId: string;
+    kind: "agent";
+    status: "running";
+    message: string;
+  };
   /** Advisory only: unverified ids in sender history; also delivered when admission permits. */
   notice?: string;
   queued: true;

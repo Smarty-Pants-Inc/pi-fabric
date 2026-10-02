@@ -74,7 +74,9 @@ import type { BudgetLedgerState } from "./budget-ledger.js";
 import { readJsonlPage } from "../log-tail.js";
 import {
   canRemoveManagedRunRoot,
+  canRemoveTerminalRun,
   hasUnresolvedWorker,
+  runTreeExitVeto,
   markUnresolvedWorker,
   heartbeatRunRoot,
   markRunRootActive,
@@ -99,6 +101,10 @@ import {
 } from "./constants.js";
 const NESTED_SNAPSHOT_POLL_MS = 500;
 const TRANSPORT_EXIT_GRACE_MS = 1_000;
+// These adapters conflate CLI/socket errors with absent sessions and have no
+// checked exit receipt. Scope-cut release/collection rather than trust false.
+const uncheckedExternalExit = (transport: Pick<AgentTransportHandle, "kind">): boolean =>
+  transport.kind === "tmux" || transport.kind === "screen";
 const MAX_NAME_LENGTH = 60;
 const MAX_UI_TEXT_CHARS = 16_000;
 const MAX_UI_ERROR_CHARS = 8_000;
@@ -1010,6 +1016,7 @@ export class AgentManager {
           ? sessionExportFileFor(sessionExportDir, agentCwd, id, new Date())
           : undefined;
         const workerArguments = [
+          ...(request.residentStartupProbe ? ["--resident-startup-probe", "true"] : []),
           "--id",
           id,
           "--name",
@@ -1211,7 +1218,7 @@ export class AgentManager {
           } catch { /* best effort: the worktree is kept either way */ }
           throw error;
         }
-        if (worktree) await this.#worktrees.cleanup(id, true).catch(() => false);
+        if (worktree && !runTreeExitVeto(runDirectory)) await this.#worktrees.cleanup(id, true).catch(() => false);
         throw error;
       }
     };
@@ -1617,6 +1624,8 @@ export class AgentManager {
       if (queued.cleanupPending || hasUnresolvedWorker(runDirectory)) {
         throw new Error(`Cannot clean up agent ${id}: Fabric lost track of its worker; check ${runDirectory} before removing its files`);
       }
+      const exitVeto = runTreeExitVeto(runDirectory);
+      if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       this.#onResultConsumed?.(id);
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
       if (!this.config.retainRuns) await removeTree(runDirectory);
@@ -1632,8 +1641,10 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
+    const exitVeto = runTreeExitVeto(managed.runDirectory);
+    if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
     if (!this.#canCollect(managed)) {
-      throw new Error(`Cannot clean up agent ${id}: ${managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
+      throw new Error(`Cannot clean up agent ${id}: ${uncheckedExternalExit(managed.transport) ? "external transport has no checked worker exit receipt" : managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
     }
     this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
@@ -1742,6 +1753,61 @@ export class AgentManager {
     return { queued: true, messageId };
   }
 
+  /** Non-destructive receipt for a paused resident release boundary. A terminal
+   * UI record is not a worker exit. Unknown launches or saved trees veto custody.
+   */
+  async checkpointForRelease(deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7): Promise<void> {
+    const obligations = (): boolean => this.#closing || this.#spawns.size > 0 || this.#launches.size > 0 ||
+      this.#queuedStarts.size > 0 || [...this.#queued.values()].some(q => !q.terminal || q.cleanupPending !== undefined);
+    if (obligations()) throw new Error("Agent release quiescence has pending launch/cleanup obligations");
+    const runs = [...this.#runs.values()];
+    if (runs.some(run => !run.settled || run.lostContact || run.settlementSaveFailure || hasUnresolvedWorker(run.runDirectory))) {
+      throw new Error("Agent release quiescence has an unresolved worker/result");
+    }
+    const transports = [...runs.map(run => run.transport), ...this.#unregisteredTransports];
+    if (transports.some(uncheckedExternalExit)) {
+      throw new Error("Agent release quiescence has no checked tmux/screen worker exit contract; retain A and worker files");
+    }
+    // Bound the observation itself, not just the interval between polls.
+    await Promise.all(runs.map(run => this.#waitForTransportExit(run, deadline)));
+    if (runs.some(run => run.lostContact)) throw new Error("Agent release quiescence has an unconfirmed worker exit observation");
+    for (const transport of transports) {
+      if (await this.#transportAliveUntil(transport, deadline) || transport.lostContact?.() !== undefined) {
+        throw new Error("Agent release quiescence cannot confirm worker exit");
+      }
+    }
+    // Check preserved trees from previous hosts too. Reuse the conservative
+    // retention predicate without removing anything. Unknown external transport
+    // identities have no surviving handle, so are deliberately out of scope.
+    const started = performance.now();
+    const expired = () => performance.now() - started > 100;
+    const inspect = (directory: string, tracked: boolean, depth = 0): void => {
+      if (expired() || depth > 32 || !canRemoveTerminalRun(directory, expired)) {
+        throw new Error(`Agent release quiescence has an unresolved run tree: ${directory}`);
+      }
+      if (!tracked) {
+        const record = readRecord(path.join(directory, "status.json"));
+        if (record?.transport !== "process" || typeof record.sessionId !== "string" || !/^\d+$/.test(record.sessionId) || Number(record.sessionId) <= 0) {
+          throw new Error(`Agent release quiescence has unknown worker identity: ${directory}`);
+        }
+      }
+      const nested = path.join(directory, "nested");
+      if (fs.existsSync(nested)) for (const name of fs.readdirSync(nested)) inspect(path.join(nested, name), false, depth + 1);
+    };
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(this.#runRoot, { withFileTypes: true }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || runs.length) throw error;
+      entries = [];
+    }
+    for (const entry of entries) {
+      if (this.#managedTempRoot && entry.name === ".fabric-owner.json") continue;
+      if (!entry.isDirectory()) throw new Error("Agent release quiescence has unknown run-root contents");
+      inspect(path.join(this.#runRoot, entry.name), this.#runs.has(entry.name));
+    }
+    if (obligations()) throw new Error("Agent release quiescence changed while checking workers");
+  }
+
   close(): Promise<void> {
     this.#closing = true;
     this.#closeAbort.abort(new Error("Fabric agent manager is closing"));
@@ -1773,8 +1839,10 @@ export class AgentManager {
     await Promise.allSettled(all.map((managed) => this.#waitForTransportExit(managed)));
     const transports = [...all.map((managed) => managed.transport), ...this.#unregisteredTransports];
     // Lost contact is not an exit: such a worker may still use its files.
+    const observationDeadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7;
     const alive = await Promise.all(transports.map((transport) =>
-      transport.isAlive().then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
+      uncheckedExternalExit(transport) ? true :
+        this.#transportAliveUntil(transport, observationDeadline).then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
     const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
       [...this.#queued.values()].some((queued) => queued.cleanupPending) || runRootHasUnresolvedWorker(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
@@ -1884,6 +1952,7 @@ export class AgentManager {
     };
     // A failed close request can still be followed by a proven exit.
     await bounded(() => transport.stop()).catch(() => undefined);
+    if (uncheckedExternalExit(transport)) return false;
     try {
       while (Date.now() < deadline) {
         const alive = await bounded(() => transport.isAlive());
@@ -1899,8 +1968,8 @@ export class AgentManager {
   // alive) may keep using its files, so the run is marked unresolved (never cleaned up).
   async #noteUnconfirmedExit(managed: ManagedAgent): Promise<void> {
     if (managed.lostContact) return;
-    const lost = managed.transport.lostContact?.();
-    const alive = lost === undefined && await managed.transport.isAlive().catch(() => true);
+    const lost = uncheckedExternalExit(managed.transport) ? "external transport has no checked exit contract" : managed.transport.lostContact?.();
+    const alive = lost === undefined && await this.#transportAliveUntil(managed.transport, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7).catch(() => true);
     if (lost === undefined && !alive) return;
     this.#markLost(managed, lost ?? "the worker did not confirm its exit after it was stopped");
   }
@@ -1916,12 +1985,28 @@ export class AgentManager {
     } catch { /* the in-memory mark still guards this manager */ }
   }
 
-  async #waitForTransportExit(managed: ManagedAgent): Promise<void> {
-    const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7;
-    const pollIntervalMs =
-      managed.transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS;
-    while (Date.now() < deadline && (await managed.transport.isAlive())) {
-      await delay(pollIntervalMs);
+  async #transportAliveUntil(transport: AgentTransportHandle, deadline: number): Promise<boolean> {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("Worker exit observation deadline expired");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([transport.isAlive(), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Worker exit observation timed out")), remaining);
+      })]);
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
+  async #waitForTransportExit(managed: ManagedAgent, outerDeadline = Infinity): Promise<void> {
+    // Never issue a potentially hung query that cannot supply exit proof.
+    if (uncheckedExternalExit(managed.transport)) return;
+    const deadline = Math.min(outerDeadline, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7);
+    const pollIntervalMs = managed.transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS;
+    try {
+      while (Date.now() < deadline && await this.#transportAliveUntil(managed.transport, deadline)) {
+        await delay(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+      }
+    } catch (error) {
+      this.#markLost(managed, error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -2313,6 +2398,7 @@ export class AgentManager {
   }
 
   #canCollect(managed: ManagedAgent): boolean {
+    if (uncheckedExternalExit(managed.transport) || runTreeExitVeto(managed.runDirectory)) return false;
     // Settlement compacts UI caches. Retry only the original full result, never those caches.
     if (managed.settlementSaveFailure &&
         !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) return false;

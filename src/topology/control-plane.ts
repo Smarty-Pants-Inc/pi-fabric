@@ -293,6 +293,7 @@ export class FabricControlPlane {
   #polling: Promise<void> | undefined;
   #closed = false;
   #paused = false;
+  #releasePublicationFailed = false;
   #handler: FabricControlHandler | undefined;
   #seenCleanupAt = 0;
   #legacySeenCleanupAt = Date.now();
@@ -643,6 +644,24 @@ export class FabricControlPlane {
     this.#timer = undefined;
   }
 
+  resume(): void {
+    if (this.#closed || !this.#paused) return;
+    this.#paused = false;
+    this.#timer = setInterval(() => void this.#poll().catch(() => undefined), this.#pollMs);
+    this.#timer.unref();
+    void this.#poll().catch(() => undefined);
+  }
+
+  /** Join through outcome and ACK publication, not merely the host admission counter. */
+  async checkpointForRelease(): Promise<void> {
+    if (!this.#paused) throw new Error("Control release gate is not paused");
+    await this.#polling;
+    await Promise.all([...this.#activeHandlers]);
+    if (this.#activeCommands.size || this.#pending.size || this.#unpublished.size || this.#releasePublicationFailed) {
+      throw new Error("Control release has unsettled publication obligations");
+    }
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     if (this.#timer) clearInterval(this.#timer);
@@ -974,6 +993,7 @@ export class FabricControlPlane {
           ifVersion: claimVersion,
         });
       } catch (error) {
+        this.#releasePublicationFailed = true;
         // A conflict means another owner holds this claim; a lock timeout wrote nothing, and
         // the command has run, so its sender still gets the outcome.
         if (!isLockTimeout(error)) return;
@@ -981,6 +1001,7 @@ export class FabricControlPlane {
       try {
         await this.#publishAcknowledgement(command, acceptance);
       } catch (error) {
+        this.#releasePublicationFailed = true;
         // An "ask" runs detached from the drain, which has consumed it: nothing retries it, so
         // its outcome is not kept (its sender's result wait times out instead).
         if (command.operation !== "ask") {

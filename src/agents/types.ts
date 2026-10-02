@@ -42,6 +42,8 @@ export interface AgentSessionSeed {
 }
 
 export interface AgentRunRequest {
+  /** Host-only resident startup probe: model/extension admission, no prompt or tools. */
+  residentStartupProbe?: boolean;
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
   provenance?: FabricTurnProvenance | undefined;
   task: string;
@@ -213,6 +215,7 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  residentStartupProbe?: boolean;
   id: string;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;

@@ -181,8 +181,8 @@ export class AgentMessageRouter {
     return result;
   }
 
-  /** Only this root's non-owned durable actors can wait out a dead local holder.
-   * Unknown/live holders and unrelated routing errors retain the ordinary failure path. */
+  /** Only this root's non-owned durable actors can wait out a dead or ownerless local lock.
+   * Live/corrupt holders and unrelated routing errors retain the ordinary failure path. */
   async #withDurableRecovery<T>(id: string, operation: () => Promise<T>): Promise<T> {
     let deadline = Date.now() + RESIDENT_MESH_STALE_WINDOW_MS + 10_000;
     for (;;) {
@@ -194,13 +194,32 @@ export class AgentMessageRouter {
         if ((actor?.residency ?? participant?.residency) !== "durable" ||
             (actor && (this.actorManager.owns?.(actor.id) ?? participant?.local)) ||
             !(actor?.rootId === this.residency.options.config.rootId || participant?.ownerHostId === this.residency.hostId)) throw error;
-        let owner: string;
-        try { owner = fs.readFileSync(path.join(this.residency.options.config.meshRoot, ".lock", "owner"), "utf8"); }
-        catch { throw error; }
-        const [, pidText, createdText] = owner.trim().split("\n");
-        const pid = Number(pidText), createdAt = Number(createdText);
-        if (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid) ||
-            !Number.isFinite(createdAt) || createdAt < 0 || createdAt > Date.now()) throw error;
+        const lockPath = path.join(this.residency.options.config.meshRoot, ".lock");
+        const ownerPath = path.join(lockPath, "owner");
+        let owner: string | undefined;
+        let createdAt = Number.NaN;
+        try { owner = fs.readFileSync(ownerPath, "utf8"); }
+        catch (readError) {
+          if (!(readError instanceof Error && "code" in readError && readError.code === "ENOENT")) throw error;
+          // SIGKILL can interrupt legacy mkdir/publication or release, leaving no PID.
+          // Wait for the same directory-mtime stale window MeshStore already enforces;
+          // only MeshStore may reclaim it, with its existing identity checks and fence.
+          try {
+            const stat = fs.lstatSync(lockPath);
+            if (!stat.isDirectory() || fs.existsSync(ownerPath)) throw error;
+            // Date.now/deadline use integer milliseconds. Sub-ms mtime must not
+            // falsely exhaust the final write budget; MeshStore still checks the
+            // full-precision stale age before it reclaims anything.
+            createdAt = Math.floor(stat.mtimeMs);
+          } catch { throw error; }
+        }
+        if (owner !== undefined) {
+          const [, pidText, createdText] = owner.trim().split("\n");
+          const pid = Number(pidText);
+          createdAt = Number(createdText);
+          if (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid)) throw error;
+        }
+        if (!Number.isFinite(createdAt) || createdAt < 0 || createdAt > Date.now()) throw error;
         deadline = Math.min(deadline, createdAt + RESIDENT_MESH_STALE_WINDOW_MS + 10_000);
         const now = Date.now();
         const waitMs = Math.max(100, createdAt + RESIDENT_MESH_STALE_WINDOW_MS - now);

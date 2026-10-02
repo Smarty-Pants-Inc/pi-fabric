@@ -135,7 +135,10 @@ describe("agents provider message routing service boundaries", () => {
     expect(ports.control.request).not.toHaveBeenCalled();
   });
 
-  it.each(["ensure", "route"])("F7 waits through the dead mesh holder stale window on %s failure", async (stage) => {
+  it.each([
+    ["ensure", "dead"], ["route", "dead"], ["ensure", "ownerless"], ["route", "ownerless"],
+    ["ensure", "ownerless-submillisecond"], ["route", "ownerless-submillisecond"],
+  ] as const)("F7 waits through the mesh stale window on %s failure (%s holder)", async (stage, holder) => {
     const ports = routing();
     ports.actors.status.mockReturnValue({ id: "actor", residency: "durable", rootId: "main" } as ReturnType<Ports[1]["status"]>);
     const live: FabricParticipantInfo = { ...participant(), id: "actor", kind: "actor" as const, residency: "durable" as const,
@@ -149,8 +152,17 @@ describe("agents provider message routing service boundaries", () => {
     const failure = Object.assign(new Error("dead mesh holder"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
     vi.useFakeTimers();
     const started = Date.now();
-    fs.mkdirSync(path.join(root, ".lock"));
-    fs.writeFileSync(path.join(root, ".lock", "owner"), `fixture\n2147483647\n${started}\n`);
+    const lockPath = path.join(root, ".lock");
+    fs.mkdirSync(lockPath);
+    if (holder === "dead") fs.writeFileSync(path.join(lockPath, "owner"), `fixture\n2147483647\n${started}\n`);
+    else {
+      const created = started + (holder === "ownerless-submillisecond" ? 0.5 : 0);
+      fs.utimesSync(lockPath, started / 1000, created / 1000);
+      if (holder === "ownerless-submillisecond") {
+        expect(fs.statSync(lockPath).mtimeMs).toBeGreaterThan(started);
+        expect(fs.statSync(lockPath).mtimeMs).toBeLessThan(started + 1);
+      }
+    }
     if (stage === "ensure") ensureActor.mockRejectedValueOnce(failure);
     else ports.control.request.mockRejectedValueOnce(failure);
     ports.control.request.mockResolvedValue({ queued: true, messageId: "recovered" } as Awaited<ReturnType<NonNullable<Ports[4]>["request"]>>);
@@ -162,7 +174,9 @@ describe("agents provider message routing service boundaries", () => {
       await vi.advanceTimersByTimeAsync(2);
       expect(await result).toMatchObject({ value: { queued: true } });
       expect(Date.now() - started).toBeLessThanOrEqual(40_000);
-      // Dead does not mean immediately reclaimable: latency is bounded by the mesh stale window.
+      // The router waits/retries only; MeshStore alone owns reclamation and fencing.
+      expect(fs.existsSync(lockPath)).toBe(true);
+      if (holder !== "dead") expect(fs.existsSync(path.join(lockPath, "owner"))).toBe(false);
     } finally { vi.useRealTimers(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -190,7 +204,7 @@ describe("agents provider message routing service boundaries", () => {
     expect(ports.control.request).toHaveBeenCalledTimes(2);
   });
 
-  it.each(["live", "missing", "malformed", "future", "expired", "wrong-root"])("F7 does not retry an unsafe or exhausted mesh holder (%s)", async (holder) => {
+  it.each(["live", "missing", "malformed", "future", "expired", "wrong-root", "ownerless-future", "ownerless-expired"])("F7 does not retry an unsafe or exhausted mesh holder (%s)", async (holder) => {
     const ports = routing();
     ports.actors.status.mockReturnValue({ id: "actor", residency: "durable", rootId: holder === "wrong-root" ? "other" : "main" } as ReturnType<Ports[1]["status"]>);
     ports.participants.get.mockReturnValue({ ...participant(), id: "actor", kind: "actor", residency: "durable", capabilities: ["followUp"] });
@@ -202,9 +216,12 @@ describe("agents provider message routing service boundaries", () => {
     const failure = Object.assign(new Error("mesh holder timeout"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
     ports.control.request.mockRejectedValue(failure);
     vi.useFakeTimers();
-    fs.mkdirSync(path.join(root, ".lock"));
-    const created = Date.now() + (holder === "future" ? 1_000 : holder === "expired" ? -40_000 : 0);
-    if (holder !== "missing") fs.writeFileSync(path.join(root, ".lock", "owner"),
+    // "missing" means no canonical lock at all, not an existing ownerless directory.
+    if (holder !== "missing") fs.mkdirSync(path.join(root, ".lock"));
+    const created = Date.now() + (holder.endsWith("future") ? 1_000 : holder.endsWith("expired") ? -40_000 : 0);
+    if (holder.startsWith("ownerless")) {
+      fs.utimesSync(path.join(root, ".lock"), new Date(created), new Date(created));
+    } else if (holder !== "missing") fs.writeFileSync(path.join(root, ".lock", "owner"),
       holder === "malformed" ? "unknown" : `fixture\n${holder === "live" ? process.pid : 2147483647}\n${created}\n`);
     try {
       await expect(router.routeMessage("actor", "no retry", undefined, "followUp")).rejects.toBe(failure);

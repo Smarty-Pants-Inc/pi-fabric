@@ -1,3 +1,4 @@
+import { boundAgentSpawner } from "../agents/spawner.js";
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
 import type { ActorManager } from "../actors/manager.js";
@@ -99,6 +100,7 @@ export class AgentMessageRouter {
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
+    readonly spawner = boundAgentSpawner(),
   ) {}
   #get(id: string): FabricParticipantInfo | undefined {
     // Discovery and admission share this directory/root. A cached negative may predate the
@@ -193,6 +195,12 @@ export class AgentMessageRouter {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
+    // Resolve the child's bound target before recovery so retries retain the same
+    // actor ownership/fence checks rather than trying to recover the alias itself.
+    if (id === "spawner") {
+      if (!this.spawner) throw new Error("This worker has no bound Fabric spawner; specify an explicit reply target");
+      id = this.spawner.id;
+    }
     // Capture before routing yields; a queued incoming turn cannot change this send.
     if (context) context = snapshotFabricInvocation(context);
     options = { ...options, principal: context ? invocationFabricPrincipal(context) : undefined };

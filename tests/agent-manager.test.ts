@@ -2189,7 +2189,7 @@ describe("AgentManager", () => {
     });
   });
 
-  it("marks ordinary process children as task agents without replacing actor identity (smarty-dev#2088)", async () => {
+  it("marks ordinary children as task agents while preserving explicitly launched actor identity (#2088, #2643)", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
@@ -2229,12 +2229,12 @@ describe("AgentManager", () => {
       expect(await report("security-review")).toEqual({
         role: null, actorName: "security-review", fabricRole: null,
       });
-      // Actor write attribution stays inherited, but a spawner-only role
-      // override must not hide the ordinary task's role in participant discovery.
+      // A task must not impersonate its spawning actor (#2643) or retain its
+      // spawner-only role override (#2998). Explicit actors retain their own identity.
       vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
       vi.stubEnv("PI_FABRIC_ROLE", "project-agent");
       expect(await report()).toEqual({
-        role: "task-agent", actorName: "parent-actor", fabricRole: null,
+        role: "task-agent", actorName: null, fabricRole: null,
       });
     } finally {
       vi.unstubAllEnvs();

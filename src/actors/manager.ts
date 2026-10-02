@@ -27,6 +27,7 @@ import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/
 import type { ModelRouteDecision } from "../agents/model-route.js";
 
 import { readJsonlPage } from "../log-tail.js";
+import { ActorChildCompletionStore } from "./child-completions.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
@@ -95,6 +96,10 @@ interface ActorQueueItem {
   preparationAttempts?: number;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
   resumed?: boolean;
+  /** Unread outcome retained as context, never as a runnable activation. */
+  deferredHandoff?: boolean;
+  /** Snapshot supplied to this run; only inference may consume it. */
+  handoffContext?: readonly ActorQueueItem[];
 }
 
 import type { FabricKernel } from "../runtime/kernel.js";
@@ -344,6 +349,7 @@ export class ActorManager {
   readonly #parked = new Map<string, ActorQueueItem[]>();
   // Accepted active work (preparing, waiting, or running), retained durably until settlement (#878).
   readonly #inFlight = new Map<string, ActorQueueItem>();
+  readonly #deferredHandoffs = new Map<string, ActorQueueItem[]>();
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
@@ -386,6 +392,7 @@ export class ActorManager {
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
   readonly #logs: ActorLogStore;
+  readonly #childCompletionStores = new Map<string, ActorChildCompletionStore>();
   readonly #acquireCapabilityView:
     | ((
         requirements: readonly FabricCapabilityRequirement[],
@@ -541,6 +548,7 @@ export class ActorManager {
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();
         // Preserve deferred events while halted; fencing remains manager-owned.
+        if (!this.#halted) this.#reconcileChildCompletions();
         return !this.#halted;
       },
       onEvent: (event) => {
@@ -2160,6 +2168,46 @@ export class ActorManager {
     fs.rmSync(this.#actorRoot, { recursive: true, force: true });
   }
 
+  #childCompletionStore(actor: ManagedActor): ActorChildCompletionStore {
+    let store = this.#childCompletionStores.get(actor.sessionFile);
+    if (!store) {
+      store = new ActorChildCompletionStore(actor.sessionFile);
+      this.#childCompletionStores.set(actor.sessionFile, store);
+    }
+    return store;
+  }
+
+  // Once its spawning activation ends, an unread child result belongs to the
+  // actor's next activation. Stopped/removed actors keep the spool; never reroute to Main.
+  #reconcileChildCompletions(): void {
+    if (!this.#persistent || this.#closing) return;
+    for (const actor of this.#actors.values()) {
+      if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) continue;
+      const store = this.#childCompletionStore(actor);
+      for (const { spawner, result } of store.pending({ actorId: actor.id, ...(actor.inFlightRun ? { inFlightRunId: actor.inFlightRun.id } : {}) })) {
+        try {
+          const id = result.id;
+          const existing = [this.#inFlight.get(actor.id), ...actor.queue,
+            ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []),
+            ...(this.#deferredHandoffs.get(actor.id) ?? [])]
+            .some((item) => item?.id === id);
+          if (!existing) {
+            this.#enqueue(actor, "child-completion", {
+              message: `Unread child agent ${result.name} (${id}) ${result.status}:\n${[result.error, result.text].filter(Boolean).join("\n") || "no result"}`,
+              data: { spawner, result, resultFile: store.resultFile(id) },
+            }, { id, deferDrain: true, holdWhenFull: true, ownershipChecked: true });
+          }
+          // Queue write first, receipt second, drain last. A retry between the first
+          // two finds the same deterministic item, including after an owner restart.
+          if (this.#persistQueue(actor.id, true)) {
+            store.acknowledge(id, { handoff: true });
+            this.#ensureDrain(actor);
+          }
+        } catch { /* The actor-addressed file stays pending for the next owner poll. */ }
+      }
+    }
+  }
+
   #enqueue(
     actor: ManagedActor,
     source: string,
@@ -2172,6 +2220,9 @@ export class ActorManager {
       ownershipChecked?: boolean;
       /** A full queue and overflow reject the item instead of recording it dropped. */
       holdWhenFull?: boolean;
+      /** Host-owned deterministic child completion id and write-ahead handoff. */
+      id?: string;
+      deferDrain?: boolean;
     } = {},
   ): ActorQueueItem {
     if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
@@ -2225,7 +2276,7 @@ export class ActorManager {
         `Fabric actor queue limit reached for ${actor.name} (${this.meshConfig.actorQueueLimit})`,
       );
     }
-    const itemId = randomUUID();
+    const itemId = options.id ?? randomUUID();
     const item: ActorQueueItem = {
       id: itemId,
       ...(options.provenance ? { provenance: structuredClone(options.provenance) } : {}),
@@ -2272,7 +2323,7 @@ export class ActorManager {
       data: structuredClone(payload),
     });
     void this.#publishPresence(actor).catch(() => undefined);
-    this.#ensureDrain(actor);
+    if (!options.deferDrain) this.#ensureDrain(actor);
     return item;
   }
 
@@ -2383,6 +2434,12 @@ export class ActorManager {
         const reset = this.#resetAtBoundary(actor);
         if (reset) await reset;
         if (actor.queue.length === 0 || (actor.status as string) === "stopped" || this.#closing) break;
+        // A persisted completion cannot run before its handoff receipt commits.
+        // If receipt I/O failed, even an unrelated new message must not drain it;
+        // the next poll retries the same queued id before opening this gate.
+        const head = actor.queue[0];
+        if (head?.source === "child-completion" &&
+          !this.#childCompletionStore(actor).received(head.id)) break;
         const item = actor.queue.shift();
         this.#refill(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
@@ -2408,6 +2465,7 @@ export class ActorManager {
         let runId: string | undefined;
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
+        let handoffConsumed = false;
         // A run ended by a stop (agents.stop, a signal) is interrupted, not failing.
         let runStopped = false;
         let capabilityLease: FabricCapabilityViewLease | undefined;
@@ -2422,6 +2480,9 @@ export class ActorManager {
             this.#recordStale(actor, item, beforeRun.reason);
             continue;
           }
+          // The current activation is fresh; retained outcomes are labelled context,
+          // not retried activations with rewritten freshness facts.
+          item.handoffContext = this.#deferredHandoffs.get(actor.id)?.slice() ?? [];
           if (actor.requirements.length > 0 && this.#acquireCapabilityView) {
             capabilityLease = await this.#prepare(actor, "capabilities", () => this.#acquireCapabilityView!(
               actor.requirements,
@@ -2500,6 +2561,8 @@ export class ActorManager {
             } },
           );
           runId = result.id;
+          // Error-only turns and a spawned handle do not prove inference consumed context.
+          handoffConsumed = result.inferenceStarted ?? (result.status === "completed" || result.toolCalls > 0);
           // Captured before any check that can throw: a completed run is never parked and
           // rerun, whatever happens to ownership afterwards.
           runCompleted = result.status === "completed";
@@ -2687,7 +2750,8 @@ export class ActorManager {
           delete actor.inFlightRun;
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
-          this.#finishInFlight(actor.id, item);
+          // Failed handoffs wait as context; never obstruct the next runnable item.
+          this.#finishInFlight(actor.id, item, handoffConsumed);
           if (this.#canManage(actor.id)) {
             await this.#publishDrainPresence(actor).catch((error: unknown) => {
               this.#recordPreparationFailure(actor, error);
@@ -2797,6 +2861,11 @@ export class ActorManager {
       task: [
         `Fabric actor message from ${item.source}:`,
         JSON.stringify({ source: item.source, payload: item.payload, id: item.id }, null, 2),
+        ...(item.handoffContext?.length ? [
+          "Unread child outcomes retained from earlier activations (context only, not current activation facts):",
+          JSON.stringify(item.handoffContext.map(({ id, source, payload, activation }) =>
+            ({ id, source, payload, activation })), null, 2),
+        ] : []),
       ].join("\n\n"),
       name: actor.name,
       runner: actor.runner,
@@ -3139,7 +3208,26 @@ export class ActorManager {
     if (this.#closing) return;
     this.#refreshOwnership();
     for (const actor of this.#actors.values()) {
-      if (this.#canManage(actor.id)) this.#logs.pruneRuns(actor, now);
+      if (this.#canManage(actor.id)) {
+        this.#logs.pruneRuns(actor, now);
+        const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
+          ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
+          .filter((item) => item?.source === "child-completion").map((item) => item!.id));
+        for (const handoff of this.#inFlight.get(actor.id)?.handoffContext ?? []) keepIds.add(handoff.id);
+        const store = this.#childCompletionStore(actor);
+        store.prune(this.#logs.retention.actorRunArchiveMs, now, keepIds);
+        // Deferred work shares the archive TTL, rather than exempting stale results
+        // forever. An active inference snapshot is protected until its run ends.
+        const deferred = this.#deferredHandoffs.get(actor.id);
+        if (deferred) {
+          const kept = deferred.filter((item) => fs.existsSync(store.resultFile(item.id)));
+          if (kept.length !== deferred.length) {
+            if (kept.length) this.#deferredHandoffs.set(actor.id, kept);
+            else this.#deferredHandoffs.delete(actor.id);
+            this.#persistQueue(actor.id);
+          }
+        }
+      }
     }
     if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
       void this.#notifications.enqueue(() => reapDeadSessionPresence(this.mesh, this.identity, {
@@ -3150,6 +3238,8 @@ export class ActorManager {
   }
 
   #recordMessage(actor: ManagedActor, message: FabricActorMessage): void {
+    if (message.source === "child-completion" && message.direction === "in" &&
+      actor.messages.some((known) => known.id === message.id && known.direction === "in")) return;
     this.#logs.recordMessage(actor.messages, message);
   }
 
@@ -3616,6 +3706,7 @@ export class ActorManager {
       const inFlight = this.#inFlight.get(actor.id);
       const held = [
         ...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []),
+        ...(this.#deferredHandoffs.get(actor.id) ?? []),
       ];
       if (held.some((item) => !item.resolve && !item.reject)) this.#persistQueue(actor.id);
     }
@@ -3639,6 +3730,7 @@ export class ActorManager {
     const persistedIds = new Set<string>();
     const items = [
       ...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#overflow.get(actorId) ?? []), ...(this.#parked.get(actorId) ?? []),
+      ...(this.#deferredHandoffs.get(actorId) ?? []),
     ]
       .filter((item) => {
         if (item.resolve || item.reject || persistedIds.has(item.id)) return false;
@@ -3662,6 +3754,7 @@ export class ActorManager {
             attempts: item.attempts ?? 0,
             preparationAttempts: item.preparationAttempts ?? 0,
             ...(item === inFlight || item.resumed ? { resumed: true } : {}),
+            ...(item.deferredHandoff ? { deferredHandoff: true } : {}),
           }))];
         } catch (error) {
           if (durable) throw error;                         // a security fence cannot omit an activation
@@ -3684,9 +3777,30 @@ export class ActorManager {
     return true;
   }
 
-  #finishInFlight(actorId: string, item: ActorQueueItem): void {
+  #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean): void {
     if (this.#inFlight.get(actorId) === item) this.#inFlight.delete(actorId);
-    this.#persistQueue(actorId);
+    const actor = this.#actors.get(actorId);
+    const stillPending = actor && [...actor.queue, ...(this.#overflow.get(actorId) ?? []),
+      ...(this.#parked.get(actorId) ?? [])].some((pending) => pending.id === item.id);
+    const context = item.handoffContext ?? [];
+    delete item.handoffContext;
+    const deferred = this.#deferredHandoffs.get(actorId) ?? [];
+    if (actor && item.source === "child-completion" && !consumed && !stillPending &&
+        !deferred.some((pending) => pending.id === item.id)) {
+      // Retain the original facts and full archive outside the runnable FIFO.
+      deferred.push({ ...item, deferredHandoff: true });
+    }
+    const consumedIds = new Set(consumed ? context.map((handoff) => handoff.id) : []);
+    if (item.source === "child-completion" && consumed && !stillPending) consumedIds.add(item.id);
+    const kept = deferred.filter((handoff) => !consumedIds.has(handoff.id));
+    if (kept.length) this.#deferredHandoffs.set(actorId, kept);
+    else this.#deferredHandoffs.delete(actorId);
+    // Commit removal before deleting archives; failed persistence leaves them recoverable.
+    if (this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0) && actor) {
+      for (const id of consumedIds) {
+        try { this.#childCompletionStore(actor).releaseResult(id); } catch { /* The retention sweep retries cleanup. */ }
+      }
+    }
   }
 
   #readQueue(file: string): unknown {
@@ -3745,7 +3859,7 @@ export class ActorManager {
           }
         : activation;
     const held = new Set([
-      ...actor.queue, ...(this.#parked.get(actor.id) ?? []),
+      ...actor.queue, ...(this.#parked.get(actor.id) ?? []), ...(this.#deferredHandoffs.get(actor.id) ?? []),
       ...(this.#inFlight.has(actor.id) ? [this.#inFlight.get(actor.id)!] : []),
     ].map((item) => item.id));
     const restored: ActorQueueItem[] = [];
@@ -3758,8 +3872,10 @@ export class ActorManager {
       ) continue;
       // Include this snapshot's accepted IDs too, not only the work held on entry.
       held.add(value.id);
+      const deferredHandoff = value.source === "child-completion" && value.deferredHandoff === true;
       // A deliberate quiescent release is not a failed attempt at untouched backlog.
-      const attempts = (typeof value.attempts === "number" ? value.attempts : 0) +
+      // Deferred child outcomes remain context-only and never spend restart attempts.
+      const attempts = deferredHandoff ? 0 : (typeof value.attempts === "number" ? value.attempts : 0) +
         (saved.cleanHandover === true && (value as { resumed?: unknown }).resumed !== true ? 0 : 1);
       const provenance = copyFabricProvenance(value.provenance);
       // Old records may still name the launch requester after native-session steering.
@@ -3787,6 +3903,13 @@ export class ActorManager {
         attempts,
         preparationAttempts: counter(value.preparationAttempts),
       } as ActorQueueItem & { attempts: number };
+      if (deferredHandoff) {
+        const deferred = this.#deferredHandoffs.get(actor.id) ?? [];
+        deferred.push({ ...item, deferredHandoff: true });
+        this.#deferredHandoffs.set(actor.id, deferred);
+        held.add(item.id);
+        continue;
+      }
       if (attempts > 3) {
         this.#recordDropped(actor, item, "it was restored after three restarts that did not finish it");
         continue;

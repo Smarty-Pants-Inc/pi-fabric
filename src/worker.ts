@@ -15,6 +15,7 @@ import type {
 import { applyChildPriority } from "./agents/priority.js";
 import { readProcessIdentity } from "./core/process-identity.js";
 import { taskAgentEnvironment } from "./agents/task-environment.js";
+import { retryableProviderError } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
 
@@ -251,7 +252,7 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog, PI_PROVIDER_RESUME_DELAYS_MS, recoveryTimeScale }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
@@ -366,8 +367,25 @@ const main = async (): Promise<void> => {
   const activationSession = activationWindow
     ? new ActivationSession(options.sessionFile!, path.dirname(options.statusFile), options.cwd)
     : undefined;
+  const recoveryScale = recoveryTimeScale();
+  const persistentPiTask = options.runner === "pi" && options.transport === "process" &&
+    !options.actorId && !options.actorName && !options.residentStartupProbe;
+  const piSessionFile = options.sessionFile ?? (persistentPiTask ? path.join(path.dirname(options.statusFile), "session.jsonl") : undefined);
+  let piRetrySdk: string | undefined;
+  // Activation windows stay on the CLI, which owns their process-wide native
+  // compaction fence. The SDK entry customizes only ordinary task retries.
+  if (persistentPiTask && options.inferenceContext !== "activation") {
+    const profileModule = import.meta.url.endsWith(".ts") ? "./worker/retry-profile.ts" : "./worker/retry-profile.js";
+    const { prepareRetryProfile, resolveRetrySdk } = await import(profileModule) as typeof import("./worker/retry-profile.js");
+    if (prepareRetryProfile(options.cwd, path.join(path.dirname(options.statusFile), "pi-agent"), process.env, recoveryScale)) {
+      piRetrySdk = resolveRetrySdk(options.piBinary);
+      // Opaque/custom launchers are a supported fallback, not a degraded run.
+      // Keep profile-selection telemetry separate from result/cleanup warnings.
+      if (!piRetrySdk) appendLog(`${JSON.stringify({ type: "fabric_retry_profile", mode: "launcher", reason: "sdk_unavailable", message: "Selected Pi launcher has no discoverable native SDK; preserving its retry settings and canonical auth path (Fabric same-session recovery remains enabled)" })}\n`);
+    }
+  }
   const piArguments = ["--mode", "rpc"];
-  if (options.sessionFile) piArguments.push("--session", activationSession?.file ?? options.sessionFile);
+  if (piSessionFile) piArguments.push("--session", activationSession?.file ?? piSessionFile);
   else piArguments.push("--no-session");
   if (!options.extensions) piArguments.push("--no-extensions");
   if (options.judgment) piArguments.push("--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-approve", "--no-auto-compaction");
@@ -502,7 +520,11 @@ const main = async (): Promise<void> => {
   }
   // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
   // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
-  const child = spawnCli(childBinary, childArguments, {
+  const taskEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/task-entry.ts" : "./worker/task-entry.js", import.meta.url));
+  const spawnChild = (): ChildProcess => {
+    recordProcesses(); // each resume/spawn is incomplete until its runner is registered
+    const spawned = spawnCli(piRetrySdk ? taskEntryPath : childBinary,
+    piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments] : childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
     env: {
@@ -555,7 +577,17 @@ const main = async (): Promise<void> => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
-  recordProcesses(child.pid ? readProcessIdentity(child.pid) ?? null : null);
+    recordProcesses(spawned.pid ? readProcessIdentity(spawned.pid) ?? null : null);
+    return spawned;
+  };
+  let child = spawnChild();
+  let childExited = false;
+  let piControlLive = false;
+  let retainedPiQueues: { steering: string[]; followUp: string[] } | undefined;
+  let providerResumeAttempts = 0;
+  let resumePrompt = false;
+  let providerAborted = false;
+  let cancelResumeWait: (() => void) | undefined;
   let stderr = "";
   let outputBuffer = "";
   // Veda emits a single JSON document on stdout (progress goes to stderr, and
@@ -563,9 +595,9 @@ const main = async (): Promise<void> => {
   // once the child closes instead of treating stdout as NDJSON lines.
   let vedaOutput = "";
   let vedaParsed: Record<string, unknown> | undefined;
-  const eventProjection = options.runner === "pi" ? new PiEventProjection() : undefined;
-  const outputDecoder = new StringDecoder("utf8");
-  const stderrDecoder = new StringDecoder("utf8");
+  let eventProjection = options.runner === "pi" ? new PiEventProjection() : undefined;
+  let outputDecoder = new StringDecoder("utf8");
+  let stderrDecoder = new StringDecoder("utf8");
   let terminalStatus: AgentRunStatus | undefined;
   // A dropped assistant message_end may hold the run's answer or its error.
   // Until a later assistant message_end is processed, the run must not
@@ -578,11 +610,12 @@ const main = async (): Promise<void> => {
   let piSettledSuccessfully = false;
   let hasFinalText = false;
   let hasFinalResult = false;
+  let producedFinalAnswer = false;
 
   const update = (): void => updateRunRecord(options.statusFile, record);
   let killTimer: NodeJS.Timeout | undefined;
   let closeTimer: NodeJS.Timeout | undefined;
-  const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error));
+  const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error), recoveryScale);
   const toolCallStreamGuard = new ToolCallStreamGuard((error) => {
     if (terminalStatus) return;
     terminalStatus = "failed";
@@ -600,9 +633,12 @@ const main = async (): Promise<void> => {
     recoveryWatchdog.dispose();
     toolCallStreamGuard.dispose();
     if (closeTimer) clearTimeout(closeTimer);
-    terminateChild(child, "SIGTERM");
-    killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
-    killTimer.unref();
+    cancelResumeWait?.();
+    if (!childExited) {
+      terminateChild(child, "SIGTERM");
+      killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
+      killTimer.unref();
+    }
     child.stdin?.end();
   };
   const failStalledChild = (error: string): void => {
@@ -615,8 +651,9 @@ const main = async (): Promise<void> => {
     killChild();
   };
   const closeChild = (): void => {
+    piControlLive = false;
     child.stdin?.end();
-    recoveryWatchdog.clear();
+    recoveryWatchdog.suspend();
     if (closeTimer || killTimer) return;
     // RPC EOF requests disposal, but a stuck extension can prevent process exit.
     closeTimer = setTimeout(() => {
@@ -657,7 +694,7 @@ const main = async (): Promise<void> => {
   };
   let activationWindowReady = false;
   let residentProbeReady = false;
-  const modelControl = new PiModelControl(options.id, options.model, thinking, {
+  const createModelControl = (): InstanceType<typeof PiModelControl> => new PiModelControl(options.id, options.model, thinking, {
     send(frame) {
       if (terminalStatus) return;
       child.stdin?.write(`${JSON.stringify(frame)}\n`);
@@ -700,8 +737,17 @@ const main = async (): Promise<void> => {
         closeChild();
         return;
       }
-      if (taskProvenance?.principal) sendPiDelivery(task, taskProvenance, "steer", images);
-      else child.stdin?.write(`${JSON.stringify({ type: "prompt", message: task, ...(images.length > 0 ? { images } : {}) })}\n`);
+      const message = resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task;
+      if (taskProvenance?.principal) sendPiDelivery(message, taskProvenance, "steer", resumePrompt ? [] : images);
+      else child.stdin?.write(`${JSON.stringify({ type: "prompt", message, ...(!resumePrompt && images.length > 0 ? { images } : {}) })}\n`);
+      piControlLive = true;
+      // Native queues are not stored in the session file. Replay only the last
+      // unconsumed queue snapshot, after this replacement has passed admission.
+      const retained = retainedPiQueues;
+      retainedPiQueues = undefined;
+      for (const text of retained?.steering ?? []) sendPiDelivery(text, undefined, "steer");
+      for (const text of retained?.followUp ?? []) sendPiDelivery(text, undefined, "followUp");
+      pollSteer();
     },
     fail(error) {
       if (terminalStatus) return;
@@ -713,6 +759,7 @@ const main = async (): Promise<void> => {
       killChild();
     },
   }, activationWindow, options.residentStartupProbe === true, Boolean(options.routeHeader));
+  let modelControl = createModelControl();
 
   // Attributed token telemetry. Every usage-bearing child event emits one
   // tokens.usage lifecycle entry identified by this run/actor/runner/depth.
@@ -776,7 +823,7 @@ const main = async (): Promise<void> => {
   };
 
   const { ChildCompactControl } = await loadCompactControl();
-  const compactControl = new ChildCompactControl(options.id, {
+  const createCompactControl = (): InstanceType<typeof ChildCompactControl> => new ChildCompactControl(options.id, {
     send(frame) {
       if (!child.stdin || child.stdin.writableEnded || child.stdin.destroyed) {
         throw new Error("Child Pi stdin closed before compaction could start");
@@ -789,6 +836,8 @@ const main = async (): Promise<void> => {
       update();
     },
   });
+
+  let compactControl = createCompactControl();
 
   // Preemptive per-child token guard. timeoutMs bounds wall time and budgetUsd
   // bounds cost, but a single runaway child can still blow its own context
@@ -1251,7 +1300,9 @@ const main = async (): Promise<void> => {
       if (messageRecord.role !== "assistant") return;
       lostResult = undefined;
       const text = extractText(messageRecord);
-      hasFinalText = Boolean(text);
+      hasFinalText = Boolean(text) && messageRecord.stopReason !== "error" &&
+        messageRecord.stopReason !== "aborted" && messageRecord.stopReason !== "toolUse";
+      producedFinalAnswer ||= hasFinalText;
       if (text) {
         record.text = latestRunText(text);
         process.stdout.write(`\n${text}\n`);
@@ -1266,6 +1317,7 @@ const main = async (): Promise<void> => {
       enforceTokenLimit();
       if ((messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") && !terminalStatus) {
         sawAgentError = true;
+        providerAborted ||= messageRecord.stopReason === "aborted";
         terminalError = assistantError(messageRecord);
         recoveryWatchdog.arm(terminalError);
       } else {
@@ -1292,11 +1344,13 @@ const main = async (): Promise<void> => {
         // compaction failures/aborts need not emit an assistant error message.
         // Older Pi frames omit outcome; retain their existing result checks.
         piSettledSuccessfully = event.outcome !== "error" && event.outcome !== "aborted";
+        providerAborted ||= event.outcome === "aborted";
         // Tool-only assistant events precede the tool's durable reply write.
         hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
         // Pull controls that landed with the final stream events before deciding
         // whether this one-shot child can close. A queued compact keeps stdin
         // open until its correlated response and compaction_end are observed.
+        if (!piSettledSuccessfully) piControlLive = false;
         pollSteer();
         compactControl.childSettled();
       }
@@ -1316,41 +1370,44 @@ const main = async (): Promise<void> => {
     }
   };
 
-  child.stdin?.on("error", () => {});
-  if (options.runner === "claude") {
-    writeClaudeInput("initial", task, images);
-  } else if (options.runner === "veda") {
-    // Veda reads the prompt from stdin when no positional prompt is given.
-    // Mirror its <system_instructions> wrapping so systemPrompt and schema
-    // instructions reach the backend model.
-    const sections: string[] = [];
-    if (options.systemPrompt) {
-      sections.push(`<system_instructions>\n${options.systemPrompt}\n</system_instructions>`);
+  const startChildInput = (): void => {
+    child.stdin?.on("error", () => {});
+    if (options.runner === "claude") {
+      writeClaudeInput("initial", task, images);
+    } else if (options.runner === "veda") {
+      // Veda reads the prompt from stdin when no positional prompt is given.
+      // Mirror its <system_instructions> wrapping so systemPrompt and schema
+      // instructions reach the backend model.
+      const sections: string[] = [];
+      if (options.systemPrompt) {
+        sections.push(`<system_instructions>\n${options.systemPrompt}\n</system_instructions>`);
+      }
+      if (schema) {
+        sections.push(
+          `Your final response must contain only JSON matching this schema, without Markdown fences:\n${schema}`,
+        );
+      }
+      sections.push(task);
+      child.stdin?.write(sections.join("\n\n"));
+      child.stdin?.end();
+    } else {
+      modelControl.start();
     }
-    if (schema) {
-      sections.push(
-        `Your final response must contain only JSON matching this schema, without Markdown fences:\n${schema}`,
-      );
-    }
-    sections.push(task);
-    child.stdin?.write(sections.join("\n\n"));
-    child.stdin?.end();
-  } else {
-    modelControl.start();
-  }
+  };
 
   // Tail a control file (steer.jsonl) the parent appends to and forward each
   // queued command to the child pi over its RPC stdin. This is the fabric
   // steering channel: the orchestrator (or any peer via the mesh relay) can
   // interject a steer / follow_up / queue-mode command between the child's
   // turns without stopping and respawning it, preserving its context. The
-  // poller is best-effort: a closed or ended stdin (settled/stopped child) is
-  // swallowed so a late steer never crashes the worker.
+  // Consume only while the admitted child has writable stdin. During recovery
+  // backoff/startup, the durable cursor stays put for the replacement child.
   let steerOffset = 0;
   let steerRemainder = Buffer.alloc(0);
   let skippingOversizedSteerLine = false;
   const pollSteer = (): void => {
-    if (!options.steerFile || terminalStatus || (options.runner === "pi" && !modelControl.ready)) return;
+    if (!options.steerFile || terminalStatus || (options.runner === "pi" &&
+        (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))) return;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(options.steerFile, "r");
@@ -1499,13 +1556,18 @@ const main = async (): Promise<void> => {
     if (oversized) oversized.chars += text.length;
   };
 
-  child.stdout?.on("data", (chunk: Buffer) => {
-    const decoded = outputDecoder.write(chunk);
+  const recordStderr = (text: string): void => {
+    if (!text) return;
+    appendLog(`${JSON.stringify({ type: "worker_stderr", text })}\n`);
+    process.stderr.write(text);
+    stderr = `${stderr}${text}`.slice(-MAX_STDERR_CHARS);
+  };
+  const consumeOutput = (decoded: string, projected = false): void => {
     if (options.runner === "veda") {
       vedaOutput += decoded;
       return;
     }
-    outputBuffer += eventProjection ? eventProjection.write(decoded) : decoded;
+    outputBuffer += eventProjection && !projected ? eventProjection.write(decoded) : decoded;
     while (true) {
       const newline = outputBuffer.indexOf("\n");
       if (oversized) {
@@ -1535,17 +1597,14 @@ const main = async (): Promise<void> => {
       outputBuffer = outputBuffer.slice(newline + 1);
       processEvent(line);
     }
-  });
-  const recordStderr = (text: string): void => {
-    if (!text) return;
-    appendLog(`${JSON.stringify({ type: "worker_stderr", text })}\n`);
-    process.stderr.write(text);
-    stderr = `${stderr}${text}`.slice(-MAX_STDERR_CHARS);
   };
-  child.stderr?.on("data", (chunk: Buffer) => {
-    recordStderr(stderrDecoder.write(chunk));
-  });
-  child.stderr?.on("error", () => {});
+  const attachChildStreams = (): void => {
+    child.stdout?.on("data", (chunk: Buffer) => consumeOutput(outputDecoder.write(chunk)));
+    child.stderr?.on("data", (chunk: Buffer) => recordStderr(stderrDecoder.write(chunk)));
+    child.stderr?.on("error", () => {});
+  };
+  attachChildStreams();
+  startChildInput();
 
   const timeout = setTimeout(() => {
     if (terminalStatus) return;
@@ -1568,14 +1627,91 @@ const main = async (): Promise<void> => {
   process.once("SIGINT", stop);
   process.once("SIGHUP", stop);
 
-  const exitCode = await new Promise<number | null>((resolve) => {
-    child.once("error", (error) => {
-      terminalStatus = "failed";
-      terminalError = error.message;
-      resolve(null);
+  let exitCode: number | null;
+  while (true) {
+    exitCode = await new Promise<number | null>((resolve) => {
+      child.once("error", (error) => {
+        terminalStatus = "failed";
+        terminalError = error.message;
+        // Wait for close as well: a spawn error still owns its stream handles.
+      });
+      child.once("close", (code) => { childExited = true; piControlLive = false; resolve(code); });
     });
-    child.once("close", (code) => resolve(code));
-  });
+    if (closeTimer) clearTimeout(closeTimer);
+    closeTimer = undefined;
+    if (killTimer) clearTimeout(killTimer);
+    killTimer = undefined;
+    // Drain the failed attempt before deciding whether it can be resumed.
+    if (options.runner === "pi") {
+      consumeOutput(outputDecoder.end());
+      // end() returns already projected text, so do not project it a second time.
+      consumeOutput(eventProjection!.end(), true);
+      if (oversized) finishOversizedEvent();
+      else if (outputBuffer.trim()) processEvent(outputBuffer);
+      outputBuffer = "";
+      recordStderr(stderrDecoder.end());
+      toolCallStreamGuard.clear();
+      if (closeTimer) clearTimeout(closeTimer);
+      closeTimer = undefined;
+    }
+    if (!persistentPiTask || terminalStatus || providerAborted || producedFinalAnswer ||
+        (replyFile && fs.existsSync(replyFile)) || lostResult || !modelControl.ready ||
+        record.compaction?.status === "queued" || record.compaction?.status === "in_flight" ||
+        !piSessionFile || !fs.existsSync(piSessionFile)) break;
+    const errorMessage = terminalError ?? stderr.trim();
+    if (!errorMessage) break;
+    if (!retryableProviderError(errorMessage)) break;
+    recoveryWatchdog.arm(errorMessage);
+    const delayMs = PI_PROVIDER_RESUME_DELAYS_MS[providerResumeAttempts];
+    if (delayMs === undefined) {
+      terminalError = `${errorMessage}; Pi provider recovery exhausted 3 same-session resumes within the 10-minute bound; session retained: ${piSessionFile}`;
+      sawAgentError = true;
+      break;
+    }
+    const waitMs = delayMs * recoveryScale;
+    if (waitMs >= recoveryWatchdog.remainingMs) {
+      terminalError = `${errorMessage}; Pi provider recovery cannot resume within the 10-minute bound (600000ms); session retained: ${piSessionFile}`;
+      sawAgentError = true;
+      break;
+    }
+    recoveryWatchdog.observe({ type: "auto_retry_start", delayMs: waitMs, errorMessage });
+    const resume = { attempt: providerResumeAttempts + 1, maxAttempts: PI_PROVIDER_RESUME_DELAYS_MS.length,
+      delayMs: waitMs, error: errorMessage, sessionFile: piSessionFile };
+    record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-20);
+    update();
+    emitLifecycle("run.resumed", { ...resume, phase: "scheduled" });
+    appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "scheduled" })}\n`);
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, waitMs);
+      cancelResumeWait = () => { clearTimeout(timer); resolve(); };
+    });
+    cancelResumeWait = undefined;
+    if (terminalStatus) break;
+    providerResumeAttempts++;
+    emitLifecycle("run.resumed", { ...resume, phase: "starting" });
+    appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "starting" })}\n`);
+    // --session <exact path> is Pi's noninteractive resume selector. --continue
+    // alone selects the most recent session, which may belong to another task.
+    resumePrompt = true;
+    retainedPiQueues = record.pendingMessages ? {
+      steering: [...record.pendingMessages.steering], followUp: [...record.pendingMessages.followUp],
+    } : undefined;
+    sawAgentError = false;
+    retryPending = false;
+    terminalError = undefined;
+    piSettledSuccessfully = false;
+    stderr = "";
+    activationWindowReady = false;
+    outputDecoder = new StringDecoder("utf8");
+    stderrDecoder = new StringDecoder("utf8");
+    eventProjection = new PiEventProjection();
+    modelControl = createModelControl();
+    compactControl = createCompactControl();
+    child = spawnChild();
+    childExited = false;
+    attachChildStreams();
+    startChildInput();
+  }
 
   if (steerTimer) clearInterval(steerTimer);
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
@@ -1591,11 +1727,10 @@ const main = async (): Promise<void> => {
   if (process.env.PI_FABRIC_INJECT_CRASH === "close") throw new Error("simulated close crash");
   if (options.runner === "veda") {
     vedaOutput += outputDecoder.end();
-  } else {
-    const tail = outputDecoder.end();
-    outputBuffer += eventProjection ? eventProjection.write(tail) + eventProjection.end() : tail;
+  } else if (options.runner !== "pi") {
+    outputBuffer += outputDecoder.end();
   }
-  recordStderr(stderrDecoder.end());
+  if (options.runner !== "pi") recordStderr(stderrDecoder.end());
   if (options.runner === "veda") {
     const trimmed = vedaOutput.trim();
     if (trimmed) {

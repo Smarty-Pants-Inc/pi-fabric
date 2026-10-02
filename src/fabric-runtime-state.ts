@@ -904,6 +904,7 @@ export class FabricRuntimeState {
     const firstSeenAgents = new Map<string, number>();
     if (mainAgent.local) {
       this.#participants.registerSource(() => [
+        // The existing presence heartbeat rereads the Pi name, including renames and clearing.
         this.#participants!.root(mainAgent.info(context), mainAgent.interactive, this.pi.getSessionName?.()),
       ]);
     }

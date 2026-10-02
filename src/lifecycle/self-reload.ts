@@ -40,6 +40,34 @@ export interface ReloadTargetResult {
 export const RELOAD_HELD_NOTICE_MS = 10 * 60_000;
 const RETRY_MS = 5_000;
 
+// These private helpers classify legacy attempt roots; public release selectors live in
+// core/agent-dir so self-reload and the release census share the same cheap startup path.
+const PACKAGE_NAME = "pi-fabric";
+const packageName = (root: string): string | undefined => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as { name?: unknown };
+    return typeof parsed.name === "string" ? parsed.name : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const real = (value: string): string => {
+  try { return fs.realpathSync(value); } catch { return path.resolve(value); }
+};
+
+/** Pre-fix runtimes recorded only roots for Fabric, but canonical JS/TS files for resources. */
+const legacyFabricAttempt = (target: string, releasesDirectory?: string): boolean => {
+  const root = real(target);
+  const name = packageName(root);
+  if (name === PACKAGE_NAME) return true;
+  // A pruned release has no manifest. Recognize only direct, extensionless release roots
+  // beside the Fabric root the profile currently activates, never files or nested entrypoints.
+  if (name || !releasesDirectory || path.dirname(root) !== releasesDirectory || path.extname(root)) return false;
+  try { return fs.statSync(root).isDirectory(); }
+  catch { return !fs.existsSync(root); }
+};
+
 /**
  * Watches the profile settings.json for a different active Fabric release. A turn end costs one
  * stat; the file is read only when its mtime moves. Only a runtime loaded from the release the
@@ -103,6 +131,7 @@ const explicitExtensions = (): string[] => {
 // module but keeps the process and the session id; the next runtime reports what it replaced.
 const HANDOFF = Symbol.for("pi-fabric.self-reload");
 const ATTEMPTS = Symbol.for("pi-fabric.self-reload.attempts");
+const FABRIC_ATTEMPTS = Symbol.for("pi-fabric.self-reload.fabric-attempts");
 interface SelfReloadHandoff { old: string; target: string; owner?: string; resource?: string; reported?: boolean; releaseSlot?: () => void }
 const handoffs = (): Map<string, SelfReloadHandoff> =>
   ((globalThis as Record<symbol, unknown>)[HANDOFF] ??= new Map<string, SelfReloadHandoff>()) as Map<string, SelfReloadHandoff>;
@@ -202,6 +231,8 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     candidate.kind === "fabric" ? "fabric" : `resource:${candidate.resource!}`;
   // Keep exact-target attempts through native reloads, even if a different target was tried later.
   const attempts = ((globalThis as Record<symbol, unknown>)[ATTEMPTS] ??= new Map<string, Set<string>>()) as Map<string, Set<string>>;
+  // Keep the shared set's shape compatible with already-loaded runtimes; only Fabric entries reset.
+  const fabricAttempts = ((globalThis as Record<symbol, unknown>)[FABRIC_ATTEMPTS] ??= new Map<string, Set<string>>()) as Map<string, Set<string>>;
   const attempted = (id: string, candidate: ReloadCandidate): boolean => attemptedSelfReload(id, candidate.target);
   // Escape and failed/aborted runs hold reload until user input, never extension followups.
   let stopped = false;
@@ -262,13 +293,14 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     if (reason) { invalidate(candidate, reason, active.target); return false; }
     return true;
   };
-  const candidateNow = (): ReloadCandidate | undefined => {
+  /** An explicit command retries a consumed target on demand; only automatic requests skip it. */
+  const candidateNow = (explicitRequest = false): ReloadCandidate | undefined => {
     const target = watch?.check();
     if (target && watch) pending.set("fabric", { kind: "fabric", loaded: watch.loaded, target });
     else pending.delete("fabric");
     for (const [key, candidate] of pending) {
       // Consumed targets must not starve another resource after a failed native reload.
-      if (sessionId && attempted(sessionId, candidate)) { pending.delete(key); continue; }
+      if (!explicitRequest && sessionId && attempted(sessionId, candidate)) { pending.delete(key); continue; }
       if (recheck(candidate)) return candidate;
     }
     return undefined;
@@ -432,14 +464,14 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       const auto = mode === "auto";
       // A queued resource command is pinned to this session/target; never retarget a stale command.
       if (token && scheduled?.token !== token) return;
-      const candidate = scheduled?.candidate ?? candidateNow();
+      const candidate = scheduled?.candidate ?? candidateNow(!auto);
       scheduled = undefined;
       // Consuming a command never consumes other pending targets. In particular, a stale
       // pinned target or a failed reload must leave an idle path to the current target.
       // Native session_start/shutdown clears this timer after a successful reload.
       if (auto && contextNow && context.sessionManager.getSessionId() === sessionId) armRetry(context);
       const say = (message: string) => { if (!auto && context.hasUI) context.ui.notify(message, "info"); };
-      if (!candidate || !recheck(candidate)) return say("No newer Fabric release or bound extension target is active.");
+      if (!candidate || !recheck(candidate)) return say("No other Fabric release or bound extension target is active.");
       if (auto && (userHalted() || autoReloadOptedOut(deps.autoReloadConfigured()))) return;
       if (candidate.kind === "resource") {
         if (autoReloadOptedOut(deps.autoReloadConfigured())) return;
@@ -477,11 +509,16 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
         if (candidate.kind === "resource") {
           pending.delete(pendingKey(candidate));
           handoffs().set(id, { old: candidate.loaded, target: candidate.target, owner: candidate.owner!, resource: candidate.resource! });
-        } else rememberSelfReload(id, candidate.loaded, candidate.target);
+        } else {
+          const fabricTried = fabricAttempts.get(id) ?? new Set<string>();
+          fabricTried.add(candidate.target); fabricAttempts.set(id, fabricTried);
+          rememberSelfReload(id, candidate.loaded, candidate.target);
+        }
         // Transfer ownership at session_start, but hold capacity through ensure/re-arm/publish.
         // Shutdown alone must not free it early; an unclaimed native failure releases below.
         handoff = handoffs().get(id)!;
         if (releaseSlot) handoff.releaseSlot = releaseSlot;
+        if (candidate.kind === "fabric") say(`Reloading Fabric ${releaseLabel(candidate.loaded)} -> ${releaseLabel(candidate.target)} (the release the Pi profile activates; it may be older).`);
         await context.reload();
       } finally {
         // A claimed handoff belongs to the new activation, even if native reload resolves early.
@@ -512,6 +549,25 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       if (!unsubscribe) unsubscribe = pi.events?.on(RELOAD_TARGET_TOPIC, receive);
       const done = takeSelfReload(sessionId, reason);
       const loaded = loadedFabricRoot(deps.moduleUrl);
+      // smarty-dev#3324: once a Fabric reload lands, earlier Fabric releases are followable again
+      // (including --restore). Resource targets retain their one-native-attempt-per-session guard,
+      // including failed reloads; an unrelated Fabric takeover must not reset them.
+      if (done && !done.resource && loaded === done.target) {
+        const tried = attempts.get(sessionId);
+        const fabricTried = fabricAttempts.get(sessionId) ?? new Set<string>();
+        // Native reload keeps process-global memory from pre-fix bundles, which never wrote
+        // FABRIC_ATTEMPTS. Migrate their identifiable roots at the first confirmed takeover;
+        // everything else remains a resource guard in the compatible shared set.
+        const parent = path.dirname(loaded);
+        const releasesDirectory = path.basename(parent) === "releases" && activeFabricRoot(settingsPath) === loaded
+          ? parent : undefined;
+        for (const target of tried ?? []) {
+          if (!fabricTried.has(target) && legacyFabricAttempt(target, releasesDirectory)) fabricTried.add(target);
+        }
+        for (const target of fabricTried) tried?.delete(target);
+        if (tried?.size === 0) attempts.delete(sessionId);
+        fabricAttempts.delete(sessionId);
+      }
       if (!loaded || !contextNow) {
         watch = undefined;
         done?.releaseSlot?.();

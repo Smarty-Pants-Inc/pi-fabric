@@ -95,7 +95,7 @@ export class AgentMessageRouter {
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding"> & { owns?: (id: string) => boolean },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
-    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers">>,
+    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
@@ -147,9 +147,37 @@ export class AgentMessageRouter {
       : id;
   }
 
-  /** Use the same exact session-UUID alias resolution as delivery when grouping lifecycle sources. */
+  // Published root names are selectors, never owner authority. Resolve them on the shared
+  // project directory (not just this lineage), then let the existing id-based route revalidate
+  // ownership and capabilities. Exact ids, UUID aliases and local `main` keep precedence.
+  #messageTarget(id: string): string {
+    const target = this.#sessionTarget(id);
+    if (this.mainAgent.matches(target) || this.#get(target) || this.#recentlyLapsedRoot(target)) return target;
+    const matches = this.participants.list?.({ scope: "project", kinds: ["root"], fresh: true })
+      .filter((participant) => participant.name === target) ?? [];
+    if (matches.length > 1) {
+      throw new Error(`Ambiguous Fabric participant: ${id} (${matches.map((participant) => participant.id).sort().join(", ")}); use an exact id`);
+    }
+    const root = matches[0];
+    if (!root) return target;
+    // Do not let a published root name shadow an existing actor name or unique id prefix.
+    // Reuse the actor resolver (including its ambiguity checks), without changing its route.
+    let actorId: string | undefined;
+    try {
+      const { actor, participant } = this.resolveActorTarget(target);
+      actorId = actor?.id ?? participant?.id;
+    } catch (error) {
+      if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
+    }
+    if (actorId) {
+      throw new Error(`Ambiguous Fabric participant: ${id} (actor ${actorId}, root ${root.id}); use an exact id`);
+    }
+    return root.id;
+  }
+
+  /** Use the same target resolution as delivery when grouping lifecycle sources. */
   isLocalMainTarget(id: string): boolean {
-    return this.mainAgent.local && this.mainAgent.matches(this.#sessionTarget(id));
+    return this.mainAgent.local && this.mainAgent.matches(this.#messageTarget(id));
   }
 
   async routeMessage(
@@ -251,7 +279,7 @@ export class AgentMessageRouter {
   ): Promise<FabricAgentMessageResult> {
     context?.signal?.throwIfAborted();
     const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
-    id = this.#sessionTarget(id);
+    id = this.#messageTarget(id);
     const isMain = this.mainAgent.matches(id);
     const remoteRoot = isMain ? undefined : this.#rootRouteSnapshot(id);
     // Project members include peer roots, not just this host's Main and actors.

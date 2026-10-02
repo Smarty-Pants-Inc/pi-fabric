@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { CompletionJournal, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
-
+import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 
 import { throwIfAborted } from "../async-settlement.js";
@@ -31,6 +31,8 @@ import { isMeshLockTimeout } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
+  acknowledgeResidentResponse,
+  residentCommandForOwner,
   ResidentActorAuthorizationError,
   ResidentCommandUnsupportedError,
   assertResidentCommandSupported,
@@ -41,6 +43,7 @@ import {
   ResidentOutcomeUnknownError,
   readResidentRequestDecision,
   registerResidentCancellation,
+  residentRequestExpiredOutcome,
   commitResidentRequest,
   RESIDENT_HOST_FORMAT,
   RESIDENT_ACTOR_COMMAND_FORMAT,
@@ -672,7 +675,7 @@ export class ResidencyClient {
         `(see ${metadata.runDirectory}). Check the worker, then remove its files by hand.`,
       );
     }
-    const command: ResidentCommand = { format: RESIDENT_HOST_FORMAT, operation: "cleanup", requestId: randomUUID(),
+    const command: ResidentCommand = { format: RESIDENT_EXPIRING_COMMAND_FORMAT, operation: "cleanup", requestId: newResidentRequestId(),
       rootId: this.options.config.rootId, id: metadata.id, deleteBranch, createdAt: Date.now() };
     let commitAttempted = false;
     const commit = (): void => {
@@ -710,6 +713,7 @@ export class ResidencyClient {
       fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
       this.#completions.forget(metadata.id);
       this.options.onResultConsumed?.(metadata.id);
+      acknowledgeResidentResponse(this.options.config.residencyRoot, { format: 1, requestId: command.requestId, ok: true, completedAt: Date.now() }, Date.now(), command.format);
       return { cleaned: true };
     } catch (error) {
       if (!commitAttempted) throw error;
@@ -730,6 +734,7 @@ export class ResidencyClient {
     }
     command = prepareResidentCreationCommand(owner, command);
     throwIfAborted(signal);
+    command = residentCommandForOwner(command, owner);
     registerResidentCancellation(signal, this.options.config.residencyRoot, command);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
     try {
@@ -739,8 +744,9 @@ export class ResidencyClient {
         if (signal?.aborted) throw new Error("Fabric residency request was aborted");
         const response = readJson<ResidentCommandResponse>(responsePath);
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
-          fs.rmSync(responsePath, { force: true });
+          if (acknowledgeResidentResponse(this.options.config.residencyRoot, response, Date.now(), command.format)) fs.rmSync(responsePath, { force: true });
           if (!response.ok) {
+            if (response.errorCode === "RESIDENT_REQUEST_EXPIRED") throw new ResidentRequestExpiredError(command.requestId);
             if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
             if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
             if (response.errorCode === "FABRIC_MODEL_DENIED" && typeof response.modelDenied?.model === "string") {
@@ -762,10 +768,12 @@ export class ResidencyClient {
       throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}` +
         ` (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
+      if (error instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.options.config.residencyRoot, command, signal);
       let decision;
       try {
-        decision = abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId);
+        decision = abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId, command.format);
       } catch (fenceError) {
+        if (fenceError instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.options.config.residencyRoot, command, signal);
         // No proven abandonment: never report a safe-to-retry rejection.
         let known;
         try { known = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unreadable fence */ }

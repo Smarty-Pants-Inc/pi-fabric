@@ -129,14 +129,14 @@ describe("Main admits a delivery id durably, once", () => {
       expect(fs.readFileSync(journal, "utf8")).toContain("rec-1");               // durable before the return
       // A second drain of the same record (a failed mesh delete) sends nothing.
       expect(main.deliverAgent({ from: actor, message: "reply", delivery, triggerTurn, deliveryId: "rec-1" }))
-        .toMatchObject({ duplicate: true, messageId: result.messageId });
+        .toMatchObject({ duplicate: true, messageId: result.messageId, triggered: false });
       expect(first.sent).toHaveLength(1);
       // Main dies before Pi appends it to the session (no close). A new controller, same journal.
       const second = fakePi();
       const restarted = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
       restarted.attachFollowUpDrain(busy(entries), 60_000, journal);
       expect(restarted.deliverAgent({ from: actor, message: "reply", delivery, triggerTurn, deliveryId: "rec-1" }))
-        .toMatchObject({ duplicate: true });                                     // admitted, still pending
+        .toMatchObject({ duplicate: true, triggered: false });                   // admitted, still pending
       second.emit("agent_before_settle", boundary([]), busy(entries));           // Pi's queue is empty: lost
       expect(second.sent.map((sent) => sent.message.details.id)).toEqual([result.messageId]);
       expect(second.sent[0]!.message.details.deliveryId).toBe("rec-1");

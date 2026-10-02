@@ -4,7 +4,8 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
-import { normalizeFabricConfig } from "../src/config.js";
+import { normalizeFabricConfig, type FabricAgentConfig } from "../src/config.js";
+import type { FabricThinking } from "../src/thinking.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 
 // A models.json edit reaches the session registry only after refresh(); a spawn that misses
@@ -14,10 +15,16 @@ const withRuntime = async (
   run: (runtime: FabricRuntimeState, refresh: ReturnType<typeof vi.fn>, context: ExtensionContext) => Promise<void>,
   initial: string[] = [],
   aliases: Record<string, string> = {},
+  options: { parentKind?: "actor" | "agent"; thinking?: FabricThinking; agents?: Partial<FabricAgentConfig> } = {},
 ) => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-model-refresh-"));
   vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
   vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));
+  if (options.parentKind) {
+    vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", "session:remote-parent");
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "parent-run");
+    if (options.parentKind === "actor") vi.stubEnv("PI_FABRIC_ACTOR_ID", "parent-actor");
+  }
   const models = [{ provider: "dest", id: "old", name: "Old", contextWindow: 48_000 },
     ...initial.map((id) => ({ provider: "dest", id, name: id, contextWindow: 48_000 }))];
   const refresh = vi.fn(async () => {
@@ -25,7 +32,7 @@ const withRuntime = async (
     for (const id of added) models.push({ provider: "dest", id, name: id, contextWindow: 48_000 });
     return {};
   });
-  const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "off", sendMessage: vi.fn() } as unknown as ExtensionAPI;
+  const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => options.thinking ?? "off", sendMessage: vi.fn() } as unknown as ExtensionAPI;
   const context = {
     cwd, hasUI: false, isProjectTrusted: () => false, isIdle: () => true, hasPendingMessages: () => false,
     model: { provider: "dest", id: "old", contextWindow: 48_000 },
@@ -42,7 +49,7 @@ const withRuntime = async (
     extension: path.resolve("dist/index.js"), worker: path.resolve("tests/fixtures/fake-worker.mjs"), residentHost: path.join(cwd, "unused.mjs"), skills: cwd,
   } });
   try {
-    await runtime.initialize(context, normalizeFabricConfig({ fullCodeMode: false, agents: { enabled: true, budgetUsd: 0 }, mcp: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, models: { aliases }, mesh: { enabled: true }, prewalk: { enabled: false, alwaysRearm: false } }));
+    await runtime.initialize(context, normalizeFabricConfig({ fullCodeMode: false, agents: { enabled: true, budgetUsd: 0, ...options.agents }, mcp: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, models: { aliases }, mesh: { enabled: true }, prewalk: { enabled: false, alwaysRearm: false } }));
     await run(runtime, refresh, context);
   } finally {
     await runtime.shutdown();
@@ -50,6 +57,17 @@ const withRuntime = async (
     fs.rmSync(cwd, { recursive: true, force: true });
   }
 };
+
+it.each(["actor", "agent"] as const)("#2490 inherits the actual %s host binding even when Main is remote and config is denied", async (parentKind) => {
+  await withRuntime([], async (runtime, refresh, context) => {
+    const handle = await invoke(runtime, context, "agents.spawn", { task: "HANG" }) as { id: string; model: string; thinking: string };
+    expect(handle).toMatchObject({ model: "dest/old", thinking: "max" });
+    expect(refresh).not.toHaveBeenCalled();
+    await runtime.agents.stop(handle.id);
+    const actor = await invoke(runtime, context, "agents.create", { name: "nested", instructions: "Review." }) as { id: string };
+    expect(runtime.actors.definition(actor.id)).toMatchObject({ model: "dest/old", thinking: "max" });
+  }, [], {}, { parentKind, thinking: "max", agents: { model: "dest/denied", thinking: "low", deniedModels: ["dest/denied"], deniedModelReplacement: "dest/old" } });
+});
 
 it("spawns with a model added to models.json after one registry refresh", async () => {
   await withRuntime(["fresh"], async (runtime, refresh) => {

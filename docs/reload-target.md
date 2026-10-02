@@ -51,14 +51,19 @@ Refusal reasons include `invalid-request`, `no-active-session`, `missing-path`,
 `auto-reload-disabled` and `already-attempted`.
 A busy or temporary UI hold defers an admitted target; it grants no permission to reload.
 
-A missing safety check fails closed with `unsupported-host:<check>`. The pinned Pi 0.87.0
-lacks `isPromptPending` and `isSettling`. The current public host UI API also lacks a global
-query covering native and extension dialogs, custom UI and external editors. Production wiring
-therefore refuses changed resource targets with `unsupported-host:isPromptPending` on the
-pinned host, or `unsupported-host:global-dialog/editor-hold-query` on hosts with the two input
-checks. A supported host adapter is required before resource auto-adoption can run. Tests model
-that adapter; they do not prove installed host adoption. No UI monkey-patching is used.
+A missing safety check fails closed with `unsupported-host:<check>`. Pi 0.87.0 lacks
+`isPromptPending` and `isSettling`; older hosts without the global UI query refuse changed
+resource targets with `unsupported-host:global-dialog/editor-hold-query` once the two input
+checks are present. Fabric detects the optional `ctx.ui.holdState()` API by capability, not
+version. A host reporting `dialog`, `custom` or `editor` defers the pending target with
+`ui-hold:<kind>` until the hold clears. A query failure refuses resource targets with
+`unsupported-host:ui-hold-query-failed`. No UI monkey-patching is used in the adapter.
 
-Existing Fabric package reload behavior and opt-outs are retained. On a completed native reload,
+Fabric's own package reloads also defer on a supported UI query's hold or failure, including
+at native command execution. Hosts without that API retain legacy Fabric-only behavior.
+Work and UI holds share the existing retry and once-per-continuous-hold notice after ten
+minutes; no new timer or controller is introduced. Existing opt-outs are retained.
+
+On a completed native reload,
 `ops.fabric.reloaded` includes `owner`, `resource` and canonical `target` for a resource request.
 This report describes the native handoff, not an independent loaded-Code enrollment receipt.

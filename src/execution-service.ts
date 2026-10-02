@@ -591,9 +591,14 @@ export class FabricExecutionService {
       ...(mainBudget ? { maximumDeadlineAt: mainBudget.at, maximumDeadlineReason: mainCeilingReason! } : {}),
     }, mainBudget?.startedAt);
     mainBudget?.scheduleDeadline(() => mainCeiling!.abort(mainCeilingReason), true);
-    const programSignal = mainCeiling
-      ? shareCancellationEffects(options.signal ? AbortSignal.any([options.signal, mainCeiling.signal]) : mainCeiling.signal, options.signal)
-      : options.signal ?? new AbortController().signal;
+    // Pi may reuse its outer signal for multiple fabric_exec calls. Forward
+    // cancellation, but own a fresh receipt ledger for this invocation: a
+    // terminal-target followUp failure must not downgrade earlier spawn handles
+    // or contaminate subsequent status/spawn/message calls.
+    const programSignal = AbortSignal.any([
+      ...(options.signal ? [options.signal] : []),
+      ...(mainCeiling ? [mainCeiling.signal] : []),
+    ]);
     // Own a ledger even without an outer signal; successful resident handles can
     // still be discarded by a later service finalization/publication deadline.
     const preserveLateDeadline = (result: FabricSandboxResult): FabricSandboxResult =>

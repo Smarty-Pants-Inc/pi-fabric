@@ -36,7 +36,7 @@ export interface ReloadTargetResult {
   reason: string;
   target: string | null;
 }
-/** A reload held this long by background work is reported once per continuous hold (smarty-dev#2216). */
+/** A reload held this long by work or UI is reported once per continuous hold (smarty-dev#2216). */
 export const RELOAD_HELD_NOTICE_MS = 10 * 60_000;
 const PACKAGE_NAME = "pi-fabric";
 const RETRY_MS = 5_000;
@@ -184,6 +184,16 @@ const hostSettling = (context: ExtensionContext): boolean =>
 const promptPending = (context: ExtensionContext): boolean =>
   (context as { isPromptPending?: () => boolean }).isPromptPending?.() ?? false;
 
+/** Bridge the optional Pi host query without requiring newer host declarations at build time. */
+export const reloadTargetUiHold = (context: ExtensionContext): string | undefined => {
+  const ui = context.ui as ExtensionContext["ui"] & { holdState?: () => "dialog" | "custom" | "editor" | undefined };
+  if (typeof ui?.holdState !== "function") return "unsupported-host:global-dialog/editor-hold-query";
+  try {
+    const hold = ui.holdState();
+    return hold === undefined ? undefined : `ui-hold:${hold}`;
+  } catch { return "unsupported-host:ui-hold-query-failed"; }
+};
+
 export interface SelfReloadDeps {
   /** Task agents this Main started that are still running, plus in-flight runs of actors it hosts. */
   busy(): number;
@@ -199,8 +209,8 @@ export interface SelfReloadDeps {
   halted?(): boolean;
   /**
    * Supported host adapter for GLOBAL dialog, custom UI and external-editor holds.
-   * Undefined means clear; an unsupported-host:* reason fails closed. The pinned Pi host has
-   * no such query. Never substitute a caller's own UI state for the global host state.
+   * Undefined means clear; an unsupported-host:* reason fails resource reloads closed.
+   * Older Pi hosts lack this query. Never substitute caller-local UI state for host state.
    */
   reloadTargetUiHold?(context: ExtensionContext): string | undefined;
 }
@@ -260,6 +270,14 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       if (typeof text !== "string") return "unsupported-host:getEditorText-result";
       if (text.length > 0) return "editor-not-empty";
       return deps.reloadTargetUiHold!(context);
+    } catch { return "unsupported-host:ui-hold-query-failed"; }
+  };
+  // Fabric's own release watch remains compatible with old hosts; a supported query's
+  // hold (or failure) still blocks scheduling and the final native command admission.
+  const fabricHold = (context: ExtensionContext): string | undefined => {
+    try {
+      const hold = deps.reloadTargetUiHold?.(context);
+      return hold === "unsupported-host:global-dialog/editor-hold-query" ? undefined : hold;
     } catch { return "unsupported-host:ui-hold-query-failed"; }
   };
   const invalidate = (candidate: ReloadCandidate, reason: string, target?: string): void => {
@@ -349,13 +367,12 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
   };
   let unsubscribe: (() => void) | undefined = pi.events?.on(RELOAD_TARGET_TOPIC, receive);
   /** An unbounded job can hold reload forever: report it once per continuous hold. */
-  const noteHeld = (context: ExtensionContext, target: string, busy: number): void => {
+  const noteHeld = (context: ExtensionContext, target: string, reason: string): void => {
     const now = Date.now();
     if (held?.target !== target) held = { target, since: now, reported: false };
     const heldForMs = now - held.since;
     if (held.reported || heldForMs < (deps.heldNoticeMs ?? RELOAD_HELD_NOTICE_MS)) return;
     held.reported = true;
-    const reason = `${busy} task agent(s), actor run(s), shell job(s) or Jev run(s) still running`;
     if (context.hasUI) context.ui.notify(`Fabric reload to ${releaseLabel(target)} held ${Math.round(heldForMs / 60_000)} min: ${reason} (stop them or /reload)`, "warning");
     deps.publishHeld?.({ reason, heldForMs, target });
   };
@@ -363,7 +380,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     context.isIdle() && !hostSettling(context) && !promptPending(context);
   const safe = (context: ExtensionContext, candidate: ReloadCandidate): boolean =>
     deps.busy() === 0 && hostIdle(context) && !context.hasPendingMessages()
-    && (candidate.kind === "fabric" || !resourceHold(context));
+    && !(candidate.kind === "fabric" ? fabricHold(context) : resourceHold(context));
   const stopRetry = (): void => {
     if (retry) clearInterval(retry);
     retry = undefined;
@@ -376,14 +393,15 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       held = undefined;
       return true;
     }
-    if (candidate.kind === "resource") {
-      const hold = resourceHold(context);
-      if (hold?.startsWith("unsupported-host:")) { invalidate(candidate, hold, candidate.target); return false; }
-      if (hold || promptPending(context) || !context.isIdle()) return false;
+    const hold = candidate.kind === "resource" ? resourceHold(context) : fabricHold(context);
+    if (candidate.kind === "resource" && hold?.startsWith("unsupported-host:")) {
+      invalidate(candidate, hold, candidate.target); return false;
     }
     const busy = deps.busy();
-    if (busy > 0) noteHeld(context, candidate.target, busy);
+    if (hold || busy > 0) noteHeld(context, candidate.target,
+      hold ?? `${busy} task agent(s), actor run(s), shell job(s) or Jev run(s) still running`);
     else held = undefined;
+    if (hold || (candidate.kind === "resource" && (promptPending(context) || !context.isIdle()))) return false;
     if (busy > 0 || context.hasPendingMessages()) return false;
     if (scheduled) return false; // keep the shared idle retry until the queued command executes
     const globals = globalThis as Record<symbol, unknown>;

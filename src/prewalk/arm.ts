@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricState } from "../fabric-state.js";
+import { assertFabricModelAllowed } from "../core/model-policy.js";
 import { resolveFabricIdentity, sendFabricMessage } from "../fabric-provenance.js";
 import {
   PREWALK_ARMED_MESSAGE_TYPE,
@@ -17,6 +18,11 @@ export const armFabricPrewalkSession = async (
   input: { model: string; task?: string },
 ): Promise<void> => {
   const { prewalk } = state.config;
+  assertFabricModelAllowed(input.model, state.config.agents);
+  const key = input.model.trim();
+  const separator = key.indexOf("/");
+  const target = separator > 0 ? context.modelRegistry?.find(key.slice(0, separator), key.slice(separator + 1)) : undefined;
+  if (target) assertFabricModelAllowed(`${target.provider}/${target.id}`, state.config.agents);
   const sessionId = context.sessionManager.getSessionId();
   state.prewalk.arm({
     model: input.model,

@@ -111,11 +111,12 @@ import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import path from "node:path";
+import { writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
 import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
 import { readStoppedRuns, takeReloadStoppedNotice } from "./agents/stopped-runs.js";
-import { installSelfReload, RELOAD_HELD_TOPIC, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
+import { installSelfReload, reloadTargetUiHold, RELOAD_HELD_TOPIC, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -675,7 +676,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
     // bootstrap() cancels any live arm; the borrowed Main model survives so a
     // new session that inherited the in-place executor can snap back.
-    await restoreBorrowedInPlaceMain(state.prewalk, pi, context);
+    await restoreBorrowedInPlaceMain(state.prewalk, pi, context, () => state.config.agents);
     refreshCodePreviewSettings();
     applyFabricMode();
     // Results of task agents the last reload/shutdown stopped reach the spawner now (smarty-dev#1602).
@@ -689,7 +690,18 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       // until the user's next input.
       context.ui.setStatus(SELF_RELOAD_STATUS, notice);
     }
-    if (stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+    const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
+    const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
+    if (residentProbe && (context.mode !== "rpc" || !process.env.PI_FABRIC_PARENT_RUN)) {
+      throw new Error("resident startup probe requires a bound RPC worker");
+    }
+    if (residentProbe || stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+    if (residentProbe) {
+      // Pi redirects console/stdout during extension startup; the native RPC
+      // descriptor carries a positive ACK only after this generation activated.
+      writeSync(1, `${JSON.stringify({ type: "fabric_resident_extension_ready", protocol: 1,
+        runId: process.env.PI_FABRIC_PARENT_RUN, nonce: probeNonce, extension: FABRIC_EXTENSION_ENTRY_PATH })}\n`);
+    }
     if (selfReloaded) {
       await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
         ...selfReloaded,
@@ -759,6 +771,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
     const sessionId = context.sessionManager.getSessionId();
     const settledInPlace = await settleInPlacePrewalk(state.prewalk, pi, context, {
+      policy: () => state.config.agents,
       compactOnReturn: state.config.prewalk.compactOnReturn,
       compact: state.compact,
     });
@@ -1227,13 +1240,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // Escape's stop-the-world halt of actors or Jev observers (mesh off too); the user's next
     // input lifts it (review/astra on pi-fabric#158, #160).
     halted: () => escapeLatched || state.escapeHalted,
-    // The pinned public Pi UI API cannot query global native/extension dialogs, custom UI or
-    // the external editor. A resource-originated reload MUST fail closed until the host supplies
-    // a supported query covering all of these holds. Fabric's legacy package watch is unchanged.
-    reloadTargetUiHold: () => "unsupported-host:global-dialog/editor-hold-query",
+    // Pi's host-wide hold query covers native/extension dialogs, custom UI and editors.
+    // Old hosts remain fail-closed for resources and retain legacy Fabric-only behavior.
+    reloadTargetUiHold,
   });
 }
 
 export * from "./audit/index.js";
 export * from "./entropy/index.js";
 export * from "./protocol.js";
+export { FabricModelDeniedError } from "./core/model-policy.js";

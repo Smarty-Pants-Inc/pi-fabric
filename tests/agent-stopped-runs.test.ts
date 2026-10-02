@@ -112,7 +112,7 @@ describe("task agents stopped by a reload (smarty-dev#1602)", () => {
       const next = manager();
       const markDelivered = restoreStoppedRuns({
         entries, notifyOnComplete,
-        restore: (runs) => next.restorePreviousRuns(runs),
+        restore: (runs, confirmed) => next.restorePreviousRuns(runs, confirmed),
         enqueue: (run, delivered) => inbox.enqueue(run, delivered),
         appendEntry: (data) => entries.push(entry(data)),
       });

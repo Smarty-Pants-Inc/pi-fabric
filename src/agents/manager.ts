@@ -662,6 +662,8 @@ export class AgentManager {
   readonly #onSettled: ((result: AgentRunResult) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
+  readonly #previousConfirmed = new Map<string, (run: AgentRunResult) => void>();
+  readonly #previousRecoveries = new Set<Promise<void>>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
   readonly #preparePiModel:
     | ((model: string | undefined, requiredPin?: boolean) => Promise<string | void>)
@@ -1710,8 +1712,8 @@ export class AgentManager {
   status(id: string): AgentRunRecord | AgentHandleInfo {
     const queued = this.#queued.get(id);
     if (queued) return queued.terminal ? structuredClone(queued.terminal) : this.#queuedInfo(queued);
-    const previous = this.#previousRuns.get(id);
-    if (previous && !this.#runs.has(id)) return structuredClone(previous);
+    const previous = this.#previousRun(id);
+    if (previous) return previous;
     const managed = this.#requireRun(id);
     const record = managed.settled
       ? readRecord(managed.statusFile) ?? managed.latestRecord
@@ -1781,9 +1783,22 @@ export class AgentManager {
   }
 
   /** Runs a previous runtime of this session stopped; wait/status return them, not Unknown. */
-  restorePreviousRuns(results: AgentRunResult[]): void {
+  restorePreviousRuns(results: AgentRunResult[], confirmed?: (run: AgentRunResult) => void): void {
     for (const result of results) {
-      if (!this.#runs.has(result.id)) this.#previousRuns.set(result.id, structuredClone(result));
+      if (this.#runs.has(result.id)) continue;
+      this.#previousRuns.set(result.id, structuredClone(result));
+      if (!result.terminalPending) continue;
+      if (confirmed) this.#previousConfirmed.set(result.id, confirmed);
+      // Only recovered obligations start an observer. Never relaunch completed effects.
+      const recovery = this.#recoverPreviousRun(result.id).finally(() => this.#previousRecoveries.delete(recovery));
+      this.#previousRecoveries.add(recovery);
+    }
+  }
+
+  async #recoverPreviousRun(id: string): Promise<void> {
+    while (!this.#closing && this.#previousRuns.get(id)?.terminalPending) {
+      try { this.#previousRun(id); } catch { /* retry storage and session handoff only */ }
+      if (this.#previousRuns.get(id)?.terminalPending) await delay(AGENT_STATUS_POLL_INTERVAL_MS);
     }
   }
 
@@ -1796,6 +1811,18 @@ export class AgentManager {
   #previousRun(id: string): AgentRunResult | undefined {
     const previous = this.#runs.has(id) ? undefined : this.#previousRuns.get(id);
     if (!previous) return undefined;
+    if (previous.terminalPending) {
+      const { terminalPending, ...answer } = previous;
+      if (terminalPending.publication) writeRecord(terminalPending.statusFile, answer);
+      const record = confirmTerminalRecord(terminalPending.statusFile);
+      if (record.id !== id) throw new Error(`Terminal record identity changed for ${id}`);
+      // Save the confirmed session record before enabling delivery. An append failure
+      // leaves the original obligation intact for this or the next runtime to retry.
+      this.#previousConfirmed.get(id)?.(answer);
+      this.#previousRuns.set(id, answer);
+      this.#previousConfirmed.delete(id);
+      return structuredClone(answer);
+    }
     return structuredClone(previous);
   }
 
@@ -1807,8 +1834,8 @@ export class AgentManager {
       await queued.pending;
       return queued.result;
     }
-    const previous = this.#previousRuns.get(id);
-    if (previous && !this.#runs.has(id)) return structuredClone(previous);
+    const previous = this.#previousRun(id);
+    if (previous) return previous;
     const managed = this.#requireRun(id);
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
@@ -2048,6 +2075,7 @@ export class AgentManager {
   }
 
   async #close(): Promise<void> {
+    await Promise.allSettled([...this.#previousRecoveries]);
     const queuedAtClose = [...this.#queued.values()].filter((queued) => !queued.terminal);
     this.#uiListeners.clear();
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
@@ -2060,10 +2088,19 @@ export class AgentManager {
       ...queuedAtClose.map((queued) => this.stop(queued.info.id)),
     ]);
     // A reload or shutdown ends these runs; tell the spawner's session (smarty-dev#1602).
-    const results = stopped.flatMap((outcome) =>
-      outcome.status === "fulfilled" ? [hostStoppedResult(outcome.value, lastEventAt.get(outcome.value.id))] : []);
+    const results = stopped.flatMap((outcome, index): AgentRunResult[] => {
+      if (outcome.status === "fulfilled") return [hostStoppedResult(outcome.value, lastEventAt.get(outcome.value.id))];
+      const managed = running[index];
+      const answer = managed?.terminalPublication ?? managed?.terminalConfirmation;
+      if (!managed || !answer) return [];
+      return [{ ...hostStoppedResult(answer, lastEventAt.get(managed.id)),
+        terminalPending: { statusFile: managed.statusFile, publication: !!managed.terminalPublication } }];
+    });
     if (results.length > 0) {
-      try { this.#onStoppedAtClose?.(results); } catch { /* must not block close */ }
+      try { this.#onStoppedAtClose?.(results); } catch (error) {
+        // Do not let runtime teardown discard an obligation with no session handoff.
+        if (results.some(result => result.terminalPending)) throw error;
+      }
     }
     await Promise.allSettled([...this.#spawns]);
     await Promise.allSettled([...this.#queuedStarts]);

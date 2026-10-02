@@ -3,8 +3,9 @@ import type { AgentRunResult } from "./types.js";
 /**
  * Session entry for task agents a reload or shutdown stopped (smarty-dev#1602).
  * The session file outlives the runtime and its temporary run root, so it is the
- * run record the next runtime reads back: `stopped` at close, `delivered` once
- * the spawner received or consumed the result.
+ * run record the next runtime reads back: `stopped` at close (possibly carrying
+ * a terminalPending storage obligation), then a confirmed `stopped` replacement,
+ * and `delivered` once the spawner received or consumed the confirmed result.
  */
 export const STOPPED_AGENTS_ENTRY = "pi-fabric-stopped-agents";
 
@@ -38,7 +39,7 @@ export const readStoppedRuns = (
 export const restoreStoppedRuns = ({ entries, notifyOnComplete, restore, enqueue, appendEntry }: {
   entries: readonly unknown[];
   notifyOnComplete: boolean;
-  restore: (runs: AgentRunResult[]) => void;
+  restore: (runs: AgentRunResult[], confirmed: (run: AgentRunResult) => void) => void;
   enqueue: (run: AgentRunResult, delivered: () => void) => void;
   appendEntry: (data: StoppedAgentsEntryData) => void;
 }): ((id: string) => void) => {
@@ -52,9 +53,13 @@ export const restoreStoppedRuns = ({ entries, notifyOnComplete, restore, enqueue
       appendEntry({ delivered: [id] });
     } catch { /* a stale runtime: the next start delivers it */ }
   };
-  restore(runs);
+  restore(runs, (run) => {
+    appendEntry({ stopped: [run] });
+    if (notifyOnComplete && pending.has(run.id)) enqueue(run, () => markDelivered(run.id));
+  });
   if (notifyOnComplete) {
     for (const run of undelivered) {
+      if (run.terminalPending) continue;
       const id = run.id;
       enqueue(run, () => markDelivered(id));
     }

@@ -9,6 +9,13 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR supersedes its older runs (Light, 05:27Z). Main pushes are never cancelled:
+# each merge keeps its own post-merge result (Option A, smarty-dev#1246), so a main run is its own group
+# (run_id): a shared group would still drop a pending older main run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository

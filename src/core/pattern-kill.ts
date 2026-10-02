@@ -549,6 +549,11 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   const unknownOperand = (pattern: string): boolean =>
     [...pattern.matchAll(REFERENCE)].some((match) => match[1] === "$" && unknown.has(match[2]!)) && MENTIONS_TMP.test(context.root);
 
+  // #325 F7: initial environment bindings are unknown. A live expansion followed by a
+  // parent component can escape even a mktemp-owned path; inspect before resolving it.
+  const expandedParent = (pattern: string): boolean =>
+    [...pattern.matchAll(REFERENCE)].some((match) => /\/\.\.(\/|$)/.test(pattern.slice(match.index! + match[0].length)));
+
   // A known substitution output is a feed, not a known literal path for a later find root.
   const knownSubs = new Set<string>();
   const concrete = (word: Word): boolean => ![...expand(word.pattern).matchAll(REFERENCE)]
@@ -743,12 +748,15 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (DELETERS.has(name)) {
         const end = args.findIndex((arg) => arg.text === "--");
         const operands = args.filter((arg, i) => (end >= 0 && i > end) || (!(arg.text.startsWith("-") && arg.text.length > 1) && (end < 0 || i < end)));
-        if (operands.some((arg) => tmpOperand(arg.pattern) || unknownOperand(arg.pattern)) || xargsTmp) verdict.wipe = true;
+        const recursive = name === "rm" && args.slice(0, end < 0 ? args.length : end)
+          .some((arg) => arg.text === "--recursive" || /^-[^-]*[rR]/.test(arg.text));
+        if (operands.some((arg) => tmpOperand(arg.pattern) || unknownOperand(arg.pattern) ||
+          (recursive && expandedParent(arg.pattern))) || xargsTmp) verdict.wipe = true;
       }
       if (name === "find") {
         const deletes = args.some((arg, i) => arg.text === "-delete" || (["-exec", "-execdir", "-ok", "-okdir"].includes(arg.text) &&
           /(^|[\s/])(rm|unlink|shred)(\s|$)/.test(args.slice(i + 1).map((a) => a.text).join(" ").split(/\s[;+](\s|$)/)[0]!)));
-        if (deletes && (roots.length ? roots.some((root) => tmpOperand(root.pattern)) : tmpGlob(".", cwd))) verdict.wipe = true;
+        if (deletes && (roots.length ? roots.some((root) => tmpOperand(root.pattern) || expandedParent(root.pattern)) : tmpGlob(".", cwd))) verdict.wipe = true;
       }
       // xargs appends its input: from a lookup, `{}` and every positional parameter hold it.
       const xargsFeed = fedByXargs && pipeFeed;
@@ -878,7 +886,8 @@ export function wipesTmp(command: string): boolean {
 
 export const TMP_WIPE_REASON =
   "Blocked (smarty-dev#1998): this deletes by a glob in /tmp or /var/tmp (or /tmp itself), which also " +
-  "deletes other agents' live dirs on a shared host. Record the path when you create it " +
+  "deletes other agents' live dirs on a shared host. Recursive deletion through .. after a path " +
+  "expansion is also refused: the parent is not an owned path. Record the path when you create it " +
   "(`D=$(mktemp -d)`), then delete only your own mktemp -d path by its exact name (\"$D\"), #1508/#1998. " +
   "A glob inside that dir is fine: `rm -f \"$D\"/*.json`.";
 

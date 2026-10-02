@@ -200,6 +200,45 @@ const allowed: Array<[string, string]> = [
   ["F8.08: plain readarray defaults to owned MAPFILE", `readarray < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${MAPFILE[@]}"`],
 ];
 
+// F7 scanner DATA only: inherited variables are deliberately not resolved or executed.
+describe("expanded-parent recursive deletion (#325 F7)", () => {
+  it.each([
+    `rm -rf "$TMPDIR/.."`,
+    `rm -rf \${TMPDIR}/..`,
+    `rm -rf "\${TMPDIR}/.."`,
+    `rm -rf "$TMPDIR/../"`,
+    `rm -rf "$TMPDIR/x/../.."`,
+    `rm -rf "$HOME/.."`,
+    `rm -rf "$HOME/../x"`,
+    `rm -r $(pwd)/..`,
+    "rm -R `pwd`/..",
+    `rm --recursive -- "$TMPDIR/.."`,
+    `d=$(mktemp -d) && rm -rf -- "$d/.."`,
+    `TMPDIR=/home/paul/private; rm -rf "$TMPDIR/.."`,
+    `find "$TMPDIR/.." -delete`,
+  ])("refuses %s", (command) => {
+    expect(wipesTmp(command)).toBe(true);
+    expect(killsByPattern(command)).toBe(false);
+  });
+
+  it.each([
+    `d=$(mktemp -d) && rm -rf -- "$d"`,
+    `rm -rf "$TMPDIR/build"`,
+    `rm -rf ../build`,
+    `echo "$TMPDIR/.."`,
+    `rm -rf '\${TMPDIR}/..'`,
+    String.raw`rm -rf \$TMPDIR/..`,
+    `rm -f "$TMPDIR/.."`,
+    `rm -- -r "$TMPDIR/.."`,
+    `rm -rf ../"$build"`,
+    `rm -rf "$TMPDIR/..build"`,
+    `find "$TMPDIR/build" -delete`,
+  ])("allows %s", (command) => {
+    expect(wipesTmp(command)).toBe(false);
+    expect(killsByPattern(command)).toBe(false);
+  });
+});
+
 describe("tmp-wipe guard (smarty-dev#1998)", () => {
   it.each(refused)("refuses %s", (_label, command) => {
     expect(wipesTmp(command)).toBe(true);

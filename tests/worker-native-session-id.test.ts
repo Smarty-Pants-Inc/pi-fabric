@@ -13,6 +13,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricLifecyclePublishRequest } from "../src/lifecycle/types.js";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
 const first = "01900000-0000-7000-8000-000000000001";
 const latest = "01900000-0000-7000-8000-000000000002";
@@ -248,6 +249,7 @@ describe("native Pi runner session attribution", () => {
   }, 15_000);
 
   it("records resident-host actor native identity in its retained run and lifecycle emission", async () => {
+    installInProcessResidentFence();
     const dir = root();
     const resident: ResidentHostConfig = {
       format: RESIDENT_HOST_FORMAT, rootId: "session:" + parent, sessionId: parent,

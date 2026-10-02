@@ -434,6 +434,50 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(actors.messages(actor.id, 20).filter(message => message.error?.includes("Context exceeds window"))).toHaveLength(1);
   }, TEST_GUARD_MS);
 
+  it.skipIf(!selectedNativeBinary).each(["expand", "shrink"])("3238 admits only the final context after a later context_with_system %s", async mode => {
+    const s = await setup();
+    const extensionDir = path.join(s.dir, "agent", "extensions");
+    fs.mkdirSync(extensionDir);
+    fs.writeFileSync(path.join(extensionDir, "late-transform.ts"), `
+      import fs from 'node:fs';
+      export default function(pi) {
+        pi.on('context_with_system', event => {
+          fs.appendFileSync(${JSON.stringify(path.join(s.dir, "transforms"))}, 'transform\\n');
+          return {messages: ${mode === "expand"
+            ? "[...event.messages, {role:'user', content:'LATE_CONTEXT ' + 'x'.repeat(40_000), timestamp:Date.now()}]"
+            : "event.messages.map(message => message.role === 'user' ? {...message, content:'SMALL_TRANSFORMED_CONTEXT'} : message)"}};
+        });
+      }
+    `);
+    const alarms: Array<{message: {text?: string}}> = [];
+    const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
+    const actors = new ActorManager("late-window-test", {id: "owner", name: "owner", kind: "main", sessionId: "late-window-test"}, mesh,
+      {...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20}, s.manager, request => { alarms.push(request); },
+      {actorRoot: path.join(s.dir, "actors"), persistent: true});
+    managers.push(actors);
+    const actor = await actors.create({name: "late-transform", instructions: "Act.", inferenceContext: "activation",
+      model: "window-test/offline", tools: [], extensions: true, transport: "process", delivery: "mailbox"});
+    const run = vi.spyOn(s.manager, "run");
+    const outcome = actors.ask(actor.id, mode === "expand" ? "SMALL_RAW_CONTEXT" : "LARGE_RAW_CONTEXT " + "x".repeat(80_000));
+    if (mode === "expand") {
+      await expect(outcome).rejects.toThrow(/Context exceeds window/);
+      await actors.close();
+      expect(s.requests).toHaveLength(0);
+      expect(alarms).toHaveLength(1);
+      expect(alarms[0]!.message.text).toContain("Context exceeds window");
+      expect(mesh.read({topic: "ops.owner"}).filter(event => event.kind === "actor.alarm")).toHaveLength(1);
+    } else {
+      await expect(outcome).resolves.toMatchObject({text: "useful current result"});
+      await actors.close();
+      expect(s.requests).toHaveLength(1);
+      expect(JSON.stringify(s.requests)).toContain("SMALL_TRANSFORMED_CONTEXT");
+      expect(JSON.stringify(s.requests)).not.toContain("LARGE_RAW_CONTEXT");
+      expect(alarms).toHaveLength(0);
+    }
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(fs.readFileSync(path.join(s.dir, "transforms"), "utf8")).toBe("transform\n");
+  }, TEST_GUARD_MS);
+
   it.skipIf(!selectedNativeBinary)("blocks native manual compaction before any summary request and retains the full journal", async () => {
     const s = await setup();
     const journal = path.join(s.dir, "actor.jsonl");

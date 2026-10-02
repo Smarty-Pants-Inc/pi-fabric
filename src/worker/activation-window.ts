@@ -2,8 +2,8 @@ import fs from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import * as nodeModule from "node:module";
-import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
-import { buildSessionContext, convertToLlm, getPackageDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getCurrentSystemMessage, type Provider } from "@earendil-works/pi-ai";
+import { buildSessionContext, getPackageDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 type AgentMessage = ReturnType<typeof buildSessionContext>["messages"][number];
 
 const isSystem = (message: AgentMessage): boolean => (message as { role?: string }).role === "system";
@@ -129,22 +129,58 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
         return failClosed(error);
       }
     });
-    // Runs after every context handler, on what reaches the model with its system head.
-    pi.on("context_with_system", (event, ctx) => {
+    // context_with_system is still a transform phase: later handlers can replace
+    // its output. Pi resolves the provider and assembles headers only AFTER all
+    // context transforms and its own convertToLlm/normalization. Decorate that
+    // resolved provider's public dispatch entry points, not a context snapshot.
+    // prepareRequest retains this exact provider across the awaited header hook;
+    // a later provider registration cannot replace the dispatch being admitted.
+    // Reinstall per request so refresh/registration during a transform is covered.
+    // No private host fields, alternate AI runtime, auth or provider composition.
+    const guarded = new WeakSet<Provider>();
+    pi.on("before_provider_headers", (_event, ctx) => {
       try {
-        if (!window) throw new Error("Activation window is not initialized");
-        window.verifySystem(buildSessionContext(ctx.sessionManager.getBranch()).messages, event.messages);
-        // Use Pi AI's request estimator, including the effective system/tools and
-        // current tool results, not message count or session bytes. A throw is
-        // swallowed by Pi; failClosed prevents native retries of impossible input.
-        const tokens = estimateContextTokens(convertToLlm(event.messages)).tokens;
-        const limit = ctx.model?.contextWindow;
-        if (limit && tokens > limit) {
-          return failClosed(`Context exceeds window: estimated ${tokens} input tokens, window ${limit}`);
+        if (!window || !ctx.model) throw new Error("Activation window is not initialized");
+        // A context transform may select a different session model after Pi
+        // captured this request's model. Guard all registered model providers,
+        // not just ctx.model (the live selector), and use the dispatch argument
+        // as the authoritative window below. getAll is the host's loaded snapshot.
+        const providers = new Set(ctx.modelRegistry.getAll().map(model => model.provider));
+        providers.add(ctx.model.provider);
+        const admit = (model: Parameters<Provider["streamSimple"]>[0], context: Parameters<Provider["streamSimple"]>[1]): void => {
+          try {
+            // This is Pi's final converted, normalized request context, including
+            // the effective system/tools and current tool results. Do not estimate
+            // earlier: a raw over-window context may be reduced by a later hook.
+            const tokens = estimateContextTokens(context.messages).tokens;
+            if (tokens > model.contextWindow) {
+              failClosed(`Context exceeds window: estimated ${tokens} input tokens, window ${model.contextWindow}`);
+            }
+            window!.verifySystem(buildSessionContext(ctx.sessionManager.getBranch()).messages, context.messages);
+          } catch (error) {
+            failClosed(error);
+          }
+        };
+        for (const id of providers) {
+          const provider = ctx.modelRegistry.getProvider(id);
+          if (!provider || typeof provider.streamSimple !== "function" || typeof provider.stream !== "function") {
+            throw new Error("Activation window requires native provider dispatch support");
+          }
+          if (guarded.has(provider)) continue;
+          const stream = provider.stream;
+          const streamSimple = provider.streamSimple;
+          provider.stream = (model, context, options) => {
+            admit(model, context);
+            return stream.call(provider, model, context, options);
+          };
+          provider.streamSimple = (model, context, options) => {
+            admit(model, context);
+            return streamSimple.call(provider, model, context, options);
+          };
+          guarded.add(provider);
         }
-        return undefined;
       } catch (error) {
-        return failClosed(error);
+        failClosed(error);
       }
     });
     // Native summarization bypasses the context hook. Never summarize either

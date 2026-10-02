@@ -194,9 +194,12 @@ describe("#180 S4 persisted session namespace durability", () => {
       const result = deliver(value); probe.events.push("acknowledgment"); return result;
     });
     const remove = mesh.delete.bind(mesh);
+    let retirementComplete = false;
     const removed = vi.spyOn(mesh, "delete").mockImplementation(async (value) => {
       if (value.key === key) probe.events.push("source-delete");
-      return remove(value);
+      const result = await remove(value);
+      if (value.key === key) { retirementComplete = true; probe.events.push("source-delete-complete"); }
+      return result;
     });
     const client = new ResidencyClient({ config, mesh, participants: {} as never, mainAgent: state.main });
     try {
@@ -209,10 +212,17 @@ describe("#180 S4 persisted session namespace durability", () => {
       expect(state.sent).toHaveLength(0);
       expect(fs.existsSync(state.journal)).toBe(false);
       probe.recover();
-      await waitFor(() => mesh.get(key) === undefined);
+      await waitFor(() => retirementComplete && mesh.get(key) === undefined);
       const chain = receiptChain(manager, intermediate);
       expect(probe.events.slice(0, chain.length + 1)).toEqual(["session-file", ...chain]);
-      expect(probe.events.slice(chain.length + 1)).toEqual(["acknowledgment", "source-delete"]);
+      const tail = probe.events.slice(chain.length + 1);
+      expect(tail.slice(0, 2)).toEqual(["acknowledgment", "source-delete"]);
+      expect(tail.filter(event => ["acknowledgment", "source-delete", "source-delete-complete"].includes(event)))
+        .toEqual(["acknowledgment", "source-delete", "source-delete-complete"]);
+      // Mesh retirement now awaits an outside-lock group barrier. Its namespace
+      // setup/sync may follow the already-durable session acknowledgment.
+      const meshNamespaces = directoryChain(mesh.root);
+      expect(tail.slice(2).every(event => event === "source-delete-complete" || meshNamespaces.includes(event))).toBe(true);
       expect(delivered.mock.results.filter((result) => result.type === "return")).toHaveLength(1);
       expect(delivered.mock.results.at(-1)).toMatchObject({ value: { duplicate: true } });
       expect(removed.mock.calls.filter(([value]) => value.key === key)).toHaveLength(1);

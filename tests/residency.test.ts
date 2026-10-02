@@ -111,7 +111,7 @@ interface RootHarness {
   config: ResidentHostConfig;
 }
 
-const rootHarness = async (name: string): Promise<RootHarness> => {
+const rootHarness = async (name: string, leaseMs = 300): Promise<RootHarness> => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fabric-${name}-`));
   roots.push(root);
   const meshRoot = path.join(root, "mesh");
@@ -129,7 +129,7 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
     rootId: identity.id,
     identity,
     heartbeatMs: 50,
-    leaseMs: 300,
+    leaseMs,
   });
   participants.registerSource(() => [{
     format: 1,
@@ -348,7 +348,9 @@ describe("resident setter Main authorization", () => {
   });
 
   it("host rejects missing, child, laundered and foreign control identities and above-ceiling tools independently of provider", { timeout: 20_000 }, async () => {
-    const state = await rootHarness("setter-host-auth");
+    // Owning-Main authorization is a success path, not a 300ms lease-expiry
+    // test. Budget the same grouped heartbeat receipts as the setter fixtures.
+    const state = await rootHarness("setter-host-auth", 3_000);
     fs.mkdirSync(state.config.residencyRoot, { recursive: true });
     const configPath = path.join(state.config.residencyRoot, "config.json");
     fs.writeFileSync(configPath, JSON.stringify(state.config));
@@ -1756,6 +1758,12 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(worker).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
       await first;
       await waitFor(() => state.deliveries.length === (queued ? 2 : 1) && participant()?.actorRun === undefined);
+      // Delivery and an older/expired presence view do not imply the final
+      // awaited registry/presence publication has settled. Observe the mailbox.
+      await waitFor(() => {
+        const messages = new ActorRegistryStore(state.config.actorRoot).records().find(record => record.id === actor.id)?.messages as FabricActorMessage[] | undefined;
+        return messages?.filter(message => message.direction === "out").length === (queued ? 2 : 1);
+      });
       const persisted = new ActorRegistryStore(state.config.actorRoot).records().find(record => record.id === actor.id)!;
       expect((persisted.messages as FabricActorMessage[]).filter(message => message.direction === "out")).toHaveLength(queued ? 2 : 1);
       await delay(200);
@@ -2177,7 +2185,11 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
   });
 
   it.each(["session", "project"] as const)("routes root Main durable setters (%s/default), reads instructions back, and persists across host restart", { timeout: 45_000 }, async (scope) => {
-    const state = await rootHarness(`resident-setters-${scope}`);
+    // This success-path routing test is not a lease-expiry test. A 300ms lease
+    // barely exceeds the 250ms busy durability cadence, and can expire while a
+    // heartbeat awaits its post-lock receipt. Keep the short leases in expiry
+    // tests, but allow the grouped barrier plus I/O here (production uses 15s).
+    const state = await rootHarness(`resident-setters-${scope}`, 3_000);
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath });
     const control = new FabricControlPlane(state.mesh, state.identity, { enabled: true, hostId: state.identity.id, pollMs: 20 });
     control.start(() => ({ accepted: false }));

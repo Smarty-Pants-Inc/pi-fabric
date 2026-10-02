@@ -1958,7 +1958,9 @@ describe("ActorManager", () => {
     });
 
     const pending = actors.ask(actor.id, "Inspect later");
-    await waitFor(() => actors.status(actor.id).missingCapabilities?.[0] === "demo.echo");
+    // Status is visible before awaited post-lock mesh publication completes.
+    // Wait for the blocked drain to settle before observing release/retrying.
+    await waitFor(() => actors.status(actor.id).missingCapabilities?.[0] === "demo.echo" && actors.inFlightCount() === 0);
     expect(actors.status(actor.id)).toMatchObject({ status: "queued", queued: 1 });
     expect(release).toHaveBeenCalledOnce();
 

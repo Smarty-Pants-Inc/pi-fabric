@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../src/mesh/store.js";
+import { writeFileAtomic } from "../src/core/atomic-write.js";
 
 const identity: MeshIdentity = { id: "session:encoding", name: "雪😀", kind: "main" };
 const roots: string[] = [];
@@ -186,6 +187,25 @@ describe("MeshStore one-pass entry encoding", () => {
     expect(assertDiskEncoding(directory).readGeneration).not.toBe(marker);
     now += 2001;
     expect(reader.listAll("test/legacy/")[0]?.value).toBe("new");
+  });
+
+  it("authorizes encoding reuse from the recovered checkpoint, not an older matching canonical", async () => {
+    const directory = root();
+    const store = new MeshStore(directory, 64 * 1024, 100);
+    const key = "test/recovered/a";
+    await store.put({ key, value: "old", identity });
+    const file = path.join(directory, "state.json");
+    const oldCanonical = fs.readFileSync(file, "utf8");
+    const changed = JSON.parse(oldCanonical);
+    // A legacy writer may change bytes without changing this entry's revision.
+    changed.entries[key].value = "new";
+    writeFileAtomic(file, stringify(changed));
+    await new MeshStore(directory, 64 * 1024, 100).put({ key: "other/heartbeats/a", value: 1, identity });
+    // Simulate loss of the newer volatile canonical namespace after its ACK.
+    writeFileAtomic(file, oldCanonical);
+    await store.put({ key: "other/heartbeats/b", value: 2, identity });
+    expect(assertDiskEncoding(directory).entries[key]!.value).toBe("new");
+    expect(store.get("other/heartbeats/a", { fresh: true })?.value).toBe(1);
   });
 
   it("enforces the state byte cap on UTF-8 payloads before either file changes", async () => {

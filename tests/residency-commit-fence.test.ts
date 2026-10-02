@@ -631,7 +631,8 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   });
 
   it.each(["main spawn", "main create"] as const)("%s aborted during participant publication retains the confirmed ID", async (kind) => {
-    const state = await harness(false);
+    // Explicit abort after confirmed publication is under test, not setup expiry.
+    const state = await harness(false, undefined, 10_000);
     const original = state.participants.get.bind(state.participants);
     const get = vi.spyOn(state.participants, "get").mockImplementation((id) => id === state.config.rootId ? original(id) : undefined);
     const controller = new AbortController();
@@ -962,7 +963,7 @@ describe("round 4 registered fabric_exec committed-output priority", { timeout: 
       for (const { id } of decisions) {
         await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
         const reconciliation = await run(`return {status:await agents.actorStatus({id:"${id}"}),stop:await agents.stop({id:"${id}"})};`);
-        expect(reconciliation.isError).not.toBe(true);
+        expect(reconciliation.isError, visibleText(reconciliation)).not.toBe(true);
         const record = JSON.parse(visibleText(reconciliation));
         expect(record.status.id).toBe(id); expect(record.stop).toMatchObject({ queued: true, acknowledged: true });
         await waitFor(() => state.participants.get(id)?.status === "stopped");
@@ -1053,6 +1054,9 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
         expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") })]);
       const successful = decisions.find(decision => decision.id === mapped[0].handle.id)!;
       const uncertain = decisions.filter(decision => decision !== successful);
+      // The 700ms deadline above creates the two intentional unknown receipts.
+      // Reconciliation is a success phase and must cover grouped state barriers.
+      state.client.options.commandTimeoutMs = 10_000;
       const reconciled = [];
       for (const { id } of decisions) {
         await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
@@ -1060,7 +1064,7 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
         const reconciliation = await run(python
           ? `return {"status": await agents.actorStatus(id="${id}"), "stop": await agents.stop(id="${id}")}`
           : `return {status:await agents.actorStatus({id:"${id}"}),stop:await agents.stop({id:"${id}"})};`);
-        expect(reconciliation.isError).not.toBe(true);
+        expect(reconciliation.isError, visibleText(reconciliation)).not.toBe(true);
         const record = JSON.parse(visibleText(reconciliation));
         expect(record.status.id).toBe(id); expect(record.stop).toMatchObject({ queued: true, acknowledged: true });
         await waitFor(() => state.participants.get(id)?.status === "stopped");
@@ -1978,7 +1982,10 @@ describe("outcome-unknown cross-process receipt isolation (#3172)", { timeout: 4
     // No injected receipt, synthetic ResidentOutcomeUnknownError or response file.
     const { MeshProvider: ReceiptMeshProvider } = await import("../src/providers/mesh-provider.js");
     const state = await harness(false, undefined, 10_000);
-    const main = mainProvider(state, "main", 500);
+    // Allow grouped durable claim admission before timing out the held handler.
+    // A 500ms budget can expire before admission and trigger the existing safe
+    // notRun retry, rather than the single admitted unknown outcome under test.
+    const main = mainProvider(state, "main", 2_000);
     const mesh = state.client.options.mesh;
     main.registry.register(new ReceiptMeshProvider(mesh, main.actors.identity, state.participants));
     const ownerId = `session:unknown:${path.basename(state.root)}`;

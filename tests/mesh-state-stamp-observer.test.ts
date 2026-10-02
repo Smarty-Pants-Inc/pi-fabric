@@ -285,7 +285,10 @@ it("header EIO permits within-TTL reuse but requires a canonical parse at expiry
   expect(count()).toBe(before);
   now += RUNTIME_MESH_READ_CACHE_MS;
   expect(reader.cachedStateStamp(true)).toBe(stamp);
-  expect(headers.mock.calls).toHaveLength(1);
+  expect(headers.mock.calls.filter(([, buffer]) => buffer.byteLength === 64)).toHaveLength(1);
+  // Recovery also peeks the bounded checkpoint header. Its EIO cannot prevent a
+  // tolerant read-only canonical parse; authoritative mutations still fail closed.
+  expect(headers.mock.calls.filter(([, buffer]) => buffer.byteLength === 128)).toHaveLength(1);
   expect(count()).toBe(before + 1);
   expect(reader.get(key)?.value).toEqual({ owner: "new" });
   expect(reader.cachedStateStamp(true)).toBe(stamp);

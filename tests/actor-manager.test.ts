@@ -94,6 +94,34 @@ afterEach(async () => {
 });
 
 describe("ActorManager fleet model policy (#2490)", () => {
+  it("F6 #3115 registers the actual ID synchronously before local creation effects", async () => {
+    const { actors, root, mesh } = setup(true);
+    let committedId: string | undefined;
+    const actor = await actors.create({ name: "boundary", instructions: "Review." }, {
+      onCommit(id) {
+        committedId = id;
+        expect(actors.list()).toEqual([]);
+        expect(fs.existsSync(path.join(root, "actors", id))).toBe(false);
+        expect(mesh.listAll("actors/test/")).toEqual([]);
+      },
+    });
+    expect(committedId).toBe(actor.id);
+    expect(actors.owns(actor.id)).toBe(true);
+    expect(mesh.listAll("actors/test/").map(entry => entry.value)).toEqual([expect.objectContaining({ id: actor.id })]);
+  });
+
+  it("F6 #3115 fails closed when synchronous commit registration refuses creation", async () => {
+    const { actors, root, mesh } = setup(true);
+    let committedId: string | undefined;
+    await expect(actors.create({ name: "boundary", instructions: "Review." }, {
+      onCommit(id) { committedId = id; throw new Error("receipt registration refused"); },
+    })).rejects.toThrow("receipt registration refused");
+    expect(committedId).toBeTruthy();
+    expect(fs.existsSync(path.join(root, "actors", committedId!))).toBe(false);
+    expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+    expect(fs.existsSync(path.join(root, "actors", "actors.json"))).toBe(false);
+  });
+
   it.each(["hook", "predecessor"] as const)("round 3 F4 rechecks the synchronous invocation fence after %s wait", async wait => {
     const { actors, root, mesh } = setup(true);
     const abort = new AbortController();
@@ -107,12 +135,14 @@ describe("ActorManager fleet model policy (#2490)", () => {
       remove = vi.spyOn(actors, "remove").mockImplementation(async (...args) => { const result = await original(...args); enter(); await held; return result; });
     }
     const check = () => abort.signal.throwIfAborted();
+    const onCommit = vi.fn();
     const pending = actors.create({ name: "fenced", instructions: "Never publish after cancellation.", topics: ["round3.work"] }, {
-      async beforeCommit() { check(); if (wait === "hook") { enter(); await held; } }, checkActive: check,
+      async beforeCommit() { check(); if (wait === "hook") { enter(); await held; } }, checkActive: check, onCommit,
     }).catch(error => error);
     try {
       await entered; abort.abort(new Error("cancelled admission")); release();
       expect(await pending).toMatchObject({ message: "cancelled admission" });
+      expect(onCommit).not.toHaveBeenCalled();
       expect(actors.list().filter(actor => actor.name === "fenced")).toEqual([]);
       const actorRoot = path.join(root, "actors");
       expect(fs.existsSync(actorRoot) ? fs.readdirSync(actorRoot, { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== "bindings") : []).toEqual([]);
@@ -466,11 +496,11 @@ describe("ActorManager presence under a stalled mesh lock", () => {
 const recordRuns = (agents: AgentManager, hold?: () => Promise<void>) => {
   const runs: Array<{ task: string; startedAt: number; finishedAt?: number }> = [];
   const run = agents.run.bind(agents);
-  vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
+  vi.spyOn(agents, "run").mockImplementation(async (request, signal, ...callbacks) => {
     const entry: { task: string; startedAt: number; finishedAt?: number } = { task: request.task, startedAt: Date.now() };
     runs.push(entry);
     try {
-      const result = await run(request, signal);
+      const result = await run(request, signal, ...callbacks);
       await hold?.();
       return result;
     } finally { entry.finishedAt = Date.now(); }
@@ -1498,7 +1528,8 @@ describe("ActorManager", () => {
     const run = vi.spyOn(agents, "run");
     const actor = await actors.create({ name: "window", instructions: "Keep quiet", extensions: false, tools: [], inferenceContext: "activation" });
     const pending = actors.ask(actor.id, "LIVE_WITH_PROGRESS");
-    expect(actors.status(actor.id).status).toBe("running");
+    expect(actors.status(actor.id).status).toBe("preparing");
+    expect(actors.status(actor.id).inFlightRun).toBeUndefined();
     // Change policy during the pre-launch await, not just after spawn.
     await actors.setInferenceContext(actor.id, "full-history");
     await waitFor(() => run.mock.calls.length === 1);
@@ -1871,7 +1902,9 @@ describe("ActorManager", () => {
       expect.any(AbortSignal),
       expect.any(Function),
       expect.any(Function),
+      expect.any(Function),
       expect.any(Function), // durable activation-lineage downgrade fence
+      { timeoutMs: 30_000, onPreparing: expect.any(Function) },
     );
   });
 
@@ -2537,9 +2570,9 @@ describe("ActorManager", () => {
     const { actors, agents } = setup();
     const requests: Array<{ replyTool?: boolean; systemPrompt?: string; schema?: unknown; runner?: string }> = [];
     const run = agents.run.bind(agents);
-    vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
+    vi.spyOn(agents, "run").mockImplementation(async (request, signal, ...callbacks) => {
       requests.push(request as never);
-      return run(request, signal);
+      return run(request, signal, ...callbacks);
     });
     const pi = await actors.create({ name: "advisor", instructions: "Advise.", responseMode: "directive", delivery: "mailbox" });
     await actors.ask(pi.id, "Review this turn");

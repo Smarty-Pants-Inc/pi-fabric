@@ -7,6 +7,8 @@ import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
 import { OutputArtifactStore } from "./output-budget.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
+import { recordMainRelease } from "./lifecycle/release-process.js";
+import { loadedFabricRoot } from "./core/agent-dir.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin } from "./core/model-refresh.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -57,7 +59,8 @@ import {
   ActionRegistry,
   type FabricCapabilityViewLease,
 } from "./core/action-registry.js";
-import { FabricSessionApprovals } from "./core/approval-controller.js";
+import { ApprovalController, FabricSessionApprovals } from "./core/approval-controller.js";
+import { runAbortable } from "./async-settlement.js";
 import { CompactController, type CompactLastCommit, type CompactPendingIntent } from "./core/compact-controller.js";
 import { FabricToolResultProxy } from "./core/tool-result-proxy.js";
 import { FabricExecutionService, type FabricExecutionResult } from "./execution-service.js";
@@ -696,6 +699,7 @@ export class FabricRuntimeState {
     const completionInbox = new AgentCompletionInbox(this.pi, context);
     this.#completionInbox = completionInbox;
     let markStoppedDelivered = (_id: string): void => {};
+    recordMainRelease(sessionId, loadedFabricRoot(import.meta.url));
     this.#agents = new AgentManager(context.cwd, agentConfig, {
       fullCodeMode: this.#config.fullCodeMode,
       kernel: () => this.#config?.executor.kernel ?? "typescript",
@@ -900,7 +904,8 @@ export class FabricRuntimeState {
     const firstSeenAgents = new Map<string, number>();
     if (mainAgent.local) {
       this.#participants.registerSource(() => [
-        this.#participants!.root(mainAgent.info(context), mainAgent.interactive),
+        // The existing presence heartbeat rereads the Pi name, including renames and clearing.
+        this.#participants!.root(mainAgent.info(context), mainAgent.interactive, this.pi.getSessionName?.()),
       ]);
     }
     this.#participants.registerSource(() =>
@@ -934,10 +939,30 @@ export class FabricRuntimeState {
       false,
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
       () => this.pi.getThinkingLevel(),
-      (request, signal) => {
+      (request, signal, invocation) => {
         const owner = routeOwner;
         if (!owner || owner.signal.aborted) throw new Error("Jev routing unavailable");
-        const pending = owner.client.evaluate(request, AbortSignal.any([signal, owner.signal])).catch(error => {
+        const routeSignal = AbortSignal.any([signal, owner.signal]);
+        const pending = (async () => {
+          // agents.spawn approval grants agent work, not Jev network access. Use
+          // the current ordinary jev.evaluate policy before touching credentials.
+          // Ungranted `auto`/`ask` is refused before the approval queue (SR-8/9):
+          // neither classifier work nor a host dialog can be owned by routeSignal.
+          // Record pinned fallback instead; no approval cleanup debt is created.
+          await runAbortable(routeSignal, async () => {
+            const action = await this.#registry!.describe("jev.evaluate", { ...invocation, signal: routeSignal });
+            routeSignal.throwIfAborted();
+            await this.#schema!.authorize(action.ref, invocation.parentToolCallId);
+            routeSignal.throwIfAborted();
+            const approval = new ApprovalController(
+              this.#config!.approvals, invocation.extensionContext, this.sessionApprovals,
+              this.execution.autoApprovalClassifier, undefined, this.execution.brokeredNetwork, true,
+            );
+            await approval.approve(action, request as unknown as Record<string, unknown>);
+          });
+          routeSignal.throwIfAborted();
+          return owner.client.evaluate(request, routeSignal);
+        })().catch(error => {
           if (owner.signal.aborted && !signal.aborted) throw new Error("Jev routing owner retired");
           throw error;
         });
@@ -1069,6 +1094,9 @@ export class FabricRuntimeState {
     await builtins.memory(context, this.#config, sessionId);
     builtins.assertActive(this.#config);
     await this.#mountExecution(context, enforceSchema);
+    // Reload restores accepted activations before provider/directory startup finishes. Re-admit
+    // both actor scopes now, retaining a wake if an early drain is still finalizing (#3167).
+    this.#actors.resumeQueued();
     const inheritedRequirements = inheritedCapabilityRequirements();
     const inheritedDigest = process.env.PI_FABRIC_CAPABILITY_DIGEST;
     const hasInheritedCommit =

@@ -72,6 +72,8 @@ For Localterm, set this in your trusted `fabric.json` (never put the resolved se
 }
 ```
 
+Command-backed credentials are POSIX-only for now: on Windows the command is refused before any process starts (`JevCredentialCommandUnsupportedError`), so use the environment or Pi credential there; model routing then records the pinned fallback. Ponytail follow-up: Windows support needs a persistent owned-tree identity (e.g. a Job Object) so retirement never targets an expired or reused PID.
+
 The command uses argv, not a shell. It runs only when inference needs a key, with a timeout and bounded private output. Successful command credentials are cached until provider reload. Pi credentials are resolved afresh, so login/logout changes are honored. The key is never placed in the guest, request body, browser, or returned diagnostics. HTTP errors expose status codes, not response bodies or headers. Requests use the fixed TypeSafe HTTPS endpoint and reject redirects.
 
 `await jev.status()` reports configuration presence without running the command or making an authentication request. `verified: false` means this status operation did not verify a credential; presence does not prove validity. Missing auth does not prevent deterministic programs from running.

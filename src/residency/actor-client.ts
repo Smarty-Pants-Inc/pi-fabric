@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { ResidentRequestExpiredError } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { throwIfAborted } from "../async-settlement.js";
@@ -8,15 +9,19 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import {
   abandonResidentRequest,
+  acknowledgeResidentResponse,
+  residentCommandForOwner,
   ResidentActorAuthorizationError,
   ResidentCommandUnsupportedError,
   assertResidentCommandSupported,
+  prepareResidentCreationCommand,
   type ResidentHostOwner,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
   ResidentOutcomeUnknownError,
   readResidentRequestDecision,
   registerResidentCancellation,
+  residentRequestExpiredOutcome,
   RESIDENT_HOST_FORMAT,
   RESIDENT_ACTOR_COMMAND_FORMAT,
   residentHostStateNote,
@@ -106,12 +111,14 @@ export class ResidentActorClient {
   }
 
   async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+    const { idempotencyKey, ...creationRequest } = request;
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
+      ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       requestId: randomUUID(),
       rootId: this.#rootId,
-      request,
+      request: creationRequest,
       createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Resident host returned no actor from createActor");
@@ -139,7 +146,9 @@ export class ResidentActorClient {
     if (owner.requestFence !== 1) {
       throw new Error("Root resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
     }
+    command = prepareResidentCreationCommand(owner, command);
     throwIfAborted(signal);
+    command = residentCommandForOwner(command, owner);
     registerResidentCancellation(signal, this.#residencyDir, command);
     fs.mkdirSync(this.#requestsPath, { recursive: true });
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
@@ -150,8 +159,9 @@ export class ResidentActorClient {
         if (signal?.aborted) throw new Error("Resident host actor request was aborted");
         const response = readJson<ResidentCommandResponse>(responsePath);
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
-          fs.rmSync(responsePath, { force: true });
+          if (acknowledgeResidentResponse(this.#residencyDir, response, Date.now(), command.format)) fs.rmSync(responsePath, { force: true });
           if (!response.ok) {
+            if (response.errorCode === "RESIDENT_REQUEST_EXPIRED") throw new ResidentRequestExpiredError(command.requestId);
             if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
             if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
             if (response.errorCode === "FABRIC_MODEL_DENIED" && typeof response.modelDenied?.model === "string") {
@@ -170,10 +180,12 @@ export class ResidentActorClient {
       const note = residentHostStateNote(this.#residencyDir);
       throw new Error(`Timed out waiting for resident host actor response (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
+      if (error instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.#residencyDir, command, signal);
       let decision;
       try {
-        decision = abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId);
+        decision = abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId, command.format);
       } catch (fenceError) {
+        if (fenceError instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.#residencyDir, command, signal);
         let known;
         try { known = readResidentRequestDecision(this.#residencyDir, command.requestId); } catch { /* unreadable fence */ }
         throw new ResidentOutcomeUnknownError(command, known, fenceError, signal);

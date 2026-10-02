@@ -85,8 +85,15 @@ const logFile = (text: string): string => {
 };
 const compactText = (text: string): string => {
   const file = logFile(text);
-  const outcome = compactTerminalRunLog(file, "completed");
+  // Fixtures assert compaction output, not wall time. Multi-MB fixtures can cross
+  // the real 500ms MAX_TERMINAL_LOG_WORK_MS on a loaded CI runner, which correctly
+  // skips compaction and retains the full log; the elapsed bound has its own
+  // clock-driven tests. Freeze the clock here unless a test already drives it.
+  const clock = vi.isMockFunction(performance.now) ? undefined : vi.spyOn(performance, "now").mockReturnValue(0);
+  let outcome: ReturnType<typeof compactTerminalRunLog>;
+  try { outcome = compactTerminalRunLog(file, "completed"); } finally { clock?.mockRestore(); }
   expect(outcome.error).toBeUndefined();
+  expect(outcome.compactionSkipped).toBeUndefined();
   return fs.readFileSync(file, "utf8");
 };
 // Model Windows sharing denial with a REAL external descriptor, then let the
@@ -807,7 +814,12 @@ describe("worker run log", () => {
             fs.closeSync(descriptor!);
             descriptor = undefined;
           }
-          const outcome = compactTerminalRunLog(file, "completed");
+          // This proves native replacement/page retention, not scheduler speed.
+          // Elapsed-work rejection is covered independently by the bound tests.
+          const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+          let outcome: ReturnType<typeof compactTerminalRunLog>;
+          try { outcome = compactTerminalRunLog(file, "completed"); }
+          finally { clock.mockRestore(); }
           expect(outcome.error).toBeUndefined();
           expect(outcome.compactionSkipped).toBeUndefined();
           expect(outcome.compacted).toBe(160);

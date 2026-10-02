@@ -29,7 +29,11 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { runResidentHostFromConfigPath } from "../src/residency/host.js";
-import { abandonResidentRequest, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { abandonResidentRequest, residentDeliveryPrefix, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+
+import { ResidentRequestRetention } from "../src/residency/retention.js";
+import { RESIDENT_REQUEST_RETENTION_MS } from "../src/residency/request-expiry.js";
+import * as requestExpiry from "../src/residency/request-expiry.js";
 
 import { captureDurableExecutionTrace } from "./helpers/durable-execution-trace.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
@@ -124,20 +128,255 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
       // separately confirm guest close: runtime settlement bounds its reap wait.
       // After those barriers, retry only transient OS cwd/directory retention.
       // ponytail: Windows can hold a just-exited guest's cwd for >125 ms on hosted runners (EBUSY,
-      // pi-fabric#215 job 110720930928); use the suite-wide retry budget, as worker-activation-window does.
-      fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      // pi-fabric#215 job 110720930928). The cleanup is awaited async (pi-fabric#290): rmSync's retry
+      // delay blocks the event loop, so this process's own pending handle closes could never finish
+      // between attempts; fs.promises.rm lets the event loop release handles while it retries.
+      await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
     },
   };
 };
 
+describe("resident creation idempotency", () => {
+  for (const kind of ["main create", "nested create", "main spawn"] as const) {
+    let sequence = 0;
+    const create = (state: Awaited<ReturnType<typeof harness>>, idempotencyKey?: string) => {
+      // Unique names avoid actor name admission masking request deduplication.
+      const request = { name: `idempotent-${++sequence}`, residency: "durable" as const, model: state.model,
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }) };
+      return kind === "main spawn"
+        ? state.client.spawnAgent({ ...request, task: "create exactly once", transport: "process" })
+        : (kind === "main create" ? state.client : state.nested).createActor({ ...request, instructions: "create exactly once" });
+    };
+    const count = (state: Awaited<ReturnType<typeof harness>>) => kind === "main spawn"
+      ? state.client.listAgents().length
+      : new ActorRegistryStore(state.config.actorRoot).records().length +
+        new ActorRegistryStore(state.config.sessionActorRoot!).records().length;
+    const holdCreation = (state: Awaited<ReturnType<typeof harness>>) => {
+      let calls = 0;
+      let id = "";
+      if (kind === "main spawn") {
+        const original = AgentManager.prototype.spawn;
+        vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(async function (this: AgentManager, ...args) {
+          const handle = await original.apply(this, args);
+          calls++; id = handle.id; state.entered.resolve(); await state.release.promise;
+          return handle;
+        });
+      } else {
+        const original = ActorDirectory.prototype.create;
+        vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+          const actor = await original.apply(this, args);
+          calls++; id = actor.id; state.entered.resolve(); await state.release.promise;
+          return actor;
+        });
+      }
+      return { calls: () => calls, id: () => id };
+    };
+
+    it(`${kind}: timeout then same-key retry returns the first ID and one registry entry`, { timeout: 20_000 }, async () => {
+      const state = await harness(false);
+      const held = holdCreation(state);
+      try {
+        const first = create(state, "timeout-key").catch((error: Error) => error);
+        await state.entered.promise;
+        const firstId = held.id();
+        await expect(first).resolves.toMatchObject({ name: "ResidentOutcomeUnknownError", id: firstId });
+        state.release.resolve();
+        await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        const retry = await create(state, "timeout-key");
+        expect(retry.id).toBe(firstId);
+        expect(held.calls()).toBe(1);
+        expect(count(state)).toBe(1);
+      } finally { await state.close(); }
+    });
+
+    it(`${kind}: concurrent same-key requests create once`, { timeout: 20_000 }, async () => {
+      const state = await harness(false, undefined, 5_000);
+      const held = holdCreation(state);
+      try {
+        const first = create(state, "concurrent-key");
+        await state.entered.promise;
+        const second = create(state, "concurrent-key");
+        // The actual poller serializes pickup; both callers overlap while mutation is pending.
+        await waitFor(() => entries(state.residencyRoot, "requests").length === 1);
+        const queuedFile = entries(state.residencyRoot, "requests")[0]!;
+        const queued = fs.readFileSync(path.join(state.residencyRoot, "requests", queuedFile), "utf8");
+        expect(JSON.parse(queued)).toMatchObject({ idempotencyKey: "concurrent-key" });
+        expect(JSON.parse(queued).request.idempotencyKey).toBeUndefined();
+        state.release.resolve();
+        const [a, b] = await Promise.all([first, second]);
+        expect(a.id).toBe(b.id);
+        // Replay the retry's own envelope, whose requestId differs from the first.
+        fs.writeFileSync(path.join(state.residencyRoot, "requests", queuedFile), queued);
+        const responsePath = path.join(state.residencyRoot, "responses", queuedFile);
+        await waitFor(() => fs.existsSync(responsePath));
+        expect(JSON.parse(fs.readFileSync(responsePath, "utf8"))).toMatchObject({ ok: true,
+          ...(kind === "main spawn" ? { handle: { id: a.id } } : { actor: { id: a.id } }) });
+        expect(held.calls()).toBe(1);
+        expect(count(state)).toBe(1);
+      } finally { await state.close(); }
+    });
+
+    it(`${kind}: different keys create two`, { timeout: 20_000 }, async () => {
+      const state = await harness(false, undefined, 5_000);
+      try {
+        const a = await create(state, "first-key");
+        const b = await create(state, "second-key");
+        expect(a.id).not.toBe(b.id);
+        expect(count(state)).toBe(2);
+      } finally { await state.close(); }
+    });
+
+    it(`${kind}: omitted keys remain independent calls`, { timeout: 20_000 }, async () => {
+      const state = await harness(false, undefined, 5_000);
+      try {
+        const a = await create(state);
+        const b = await create(state);
+        expect(a.id).not.toBe(b.id);
+        expect(count(state)).toBe(2);
+      } finally { await state.close(); }
+    });
+  }
+});
+
+describe("loaded resident creation capability", () => {
+  for (const kind of ["main create", "nested create", "main spawn"] as const) {
+    const create = (state: Awaited<ReturnType<typeof harness>>, name: string, idempotencyKey?: string) => {
+      const request = { name, model: state.model, residency: "durable" as const,
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }) };
+      return kind === "main spawn"
+        ? state.client.spawnAgent({ ...request, task: "work", transport: "process" })
+        : (kind === "main create" ? state.client : state.nested).createActor({ ...request, instructions: "work" });
+    };
+
+    it(`${kind}: refuses same-key attempts on a running pre-key owner before any publication`, async () => {
+      const state = await harness(false, undefined, 5_000);
+      try {
+        const ownerPath = path.join(state.residencyRoot, "owner.json");
+        const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+        expect(owner).toMatchObject({ requestFence: 1, creationIdempotency: 1 });
+        // Precisely the reachable old-owner handshake: operations and the
+        // abandonment fence exist, but keyed dedup is not implemented.
+        delete owner.creationIdempotency;
+        fs.writeFileSync(ownerPath, JSON.stringify(owner));
+        const before = fs.readFileSync(ownerPath, "utf8");
+        for (const name of ["first-attempt", "retry-attempt"]) {
+          const error = await create(state, name, "old-host-retry").catch(error => error);
+          expect(error).toMatchObject({ name: "ResidentCommandUnsupportedError", code: "RESIDENT_COMMAND_UNSUPPORTED" });
+          expect(error.message).toMatch(/loaded resident host lacks creation idempotency-key support.*No request was dispatched/);
+        }
+        expect(fs.readFileSync(ownerPath, "utf8")).toBe(before);
+        for (const directory of ["requests", "processing", "responses", "decisions", "agents"]) {
+          expect(entries(state.residencyRoot, directory), directory).toEqual([]);
+        }
+        expect(new ActorRegistryStore(state.config.actorRoot).records()).toEqual([]);
+        expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toEqual([]);
+      } finally { await state.close(); }
+    });
+
+    it(`${kind}: omitted keys still dispatch independent unkeyed requests to a pre-key owner`, { timeout: 20_000 }, async () => {
+      const state = await harness(false, undefined, 5_000);
+      const write = fs.renameSync;
+      const envelopes: Array<{ operation: string; idempotencyKey?: string; request: { idempotencyKey?: string } }> = [];
+      try {
+        const ownerPath = path.join(state.residencyRoot, "owner.json");
+        const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+        delete owner.creationIdempotency;
+        fs.writeFileSync(ownerPath, JSON.stringify(owner));
+        vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+          write(source, target);
+          if (path.dirname(String(target)) === path.join(state.residencyRoot, "requests")) {
+            envelopes.push(JSON.parse(fs.readFileSync(target, "utf8")));
+          }
+        });
+        const first = await create(state, "unkeyed-first");
+        const second = await create(state, "unkeyed-second");
+        expect(first.id).not.toBe(second.id);
+        expect(envelopes).toHaveLength(2);
+        for (const envelope of envelopes) {
+          expect(envelope.operation).toBe(kind === "main spawn" ? "spawn" : "createActor");
+          expect(envelope.idempotencyKey).toBeUndefined();
+          expect(envelope.request.idempotencyKey).toBeUndefined();
+        }
+      } finally { vi.restoreAllMocks(); await state.close(); }
+    });
+  }
+});
+
+describe("resident creation cache boundaries", () => {
+  const actorRequest = (name: string, idempotencyKey: string) => ({
+    name, idempotencyKey, instructions: "Work", scope: "session" as const, residency: "durable" as const, model: "test/visible",
+  });
+
+  it("expires completed results after ten minutes", { timeout: 20_000 }, async () => {
+    const state = await harness(false, undefined, 5_000);
+    const realNow = Date.now;
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const first = await state.client.createActor(actorRequest("before-expiry", "expiring"));
+      clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 10 * 60_000 + 1);
+      const next = await state.client.createActor(actorRequest("after-expiry", "expiring"));
+      expect(next.id).not.toBe(first.id);
+      expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(2);
+    } finally { clock?.mockRestore(); await state.close(); }
+  });
+
+  it("retains only the last 256 completed results", { timeout: 60_000 }, async () => {
+    const state = await harness(false, undefined, 10_000);
+    try {
+      const first = await state.client.createActor(actorRequest("before-eviction", "oldest"));
+      // Real client/host exchanges with fail-fast requests avoid 256 extra actors/workers.
+      // Cache capacity, not transport throughput, is the invariant: bounded batches
+      // keep format-3 acknowledgement I/O from exhausting a burst's client deadline.
+      for (let offset = 0; offset < 256; offset += 32) {
+        const rejected = await Promise.all(Array.from({ length: 32 }, (_, i) =>
+          state.client.createActor(actorRequest("", `bounded-${offset + i}`)).catch((error: Error) => error)));
+        for (const error of rejected) expect(error).toMatchObject({ message: expect.stringContaining("Invalid Fabric actor name") });
+      }
+      const next = await state.client.createActor(actorRequest("after-eviction", "oldest"));
+      expect(next.id).not.toBe(first.id);
+      expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(2);
+    } finally { await state.close(); }
+  });
+
+  it("scopes the same key to create versus spawn", { timeout: 20_000 }, async () => {
+    const state = await harness(false, undefined, 5_000);
+    try {
+      const actor = await state.client.createActor(actorRequest("operation-scope", "shared-key"));
+      const agent = await state.client.spawnAgent({ task: "work", residency: "durable", transport: "process", idempotencyKey: "shared-key" });
+      expect(agent.id).not.toBe(actor.id);
+      expect(state.client.listAgents()).toHaveLength(1);
+      expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(1);
+    } finally { await state.close(); }
+  });
+
+  it("replays a post-commit failure with the same committed ID and no second create", { timeout: 20_000 }, async () => {
+    const state = await harness(false, undefined, 5_000);
+    const original = ActorDirectory.prototype.create;
+    let id = "";
+    const create = vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+      const actor = await original.apply(this, args);
+      id = actor.id;
+      throw new Error("fixture response lost after commit");
+    });
+    try {
+      await expect(state.client.createActor(actorRequest("first-failure", "failed-commit")))
+        .rejects.toMatchObject({ name: "ResidentOutcomeUnknownError" });
+      await expect(state.client.createActor(actorRequest("retry-failure", "failed-commit")))
+        .rejects.toMatchObject({ name: "ResidentOutcomeUnknownError", id });
+      expect(create).toHaveBeenCalledOnce();
+      expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(1);
+    } finally { create.mockRestore(); await state.close(); }
+  });
+});
+
 describe("resident fence harness teardown", () => {
   it("retries a transient Windows EBUSY after the resident host has closed", async () => {
     const state = await harness(false);
-    const rm = fs.rmSync.bind(fs);
+    const rm = fs.promises.rm.bind(fs.promises);
     let attempts = 0;
     let cleanupOptions: fs.RmOptions | undefined;
     const busy = Object.assign(new Error("Windows still holds the removed cwd"), { code: "EBUSY" });
-    const cleanup = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    const cleanup = vi.spyOn(fs.promises, "rm").mockImplementation(async (target, options) => {
       if (String(target) !== state.root) return rm(target, options);
       cleanupOptions = options;
       expect(fs.existsSync(path.join(state.residencyRoot, "owner.json"))).toBe(false);
@@ -153,11 +392,11 @@ describe("resident fence harness teardown", () => {
     try {
       await expect(state.close()).resolves.toBeUndefined();
       expect(attempts).toBe(2);
-      expect(cleanupOptions).toMatchObject({ recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      expect(cleanupOptions).toMatchObject({ recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
       expect(fs.existsSync(state.root)).toBe(false);
     } finally {
       cleanup.mockRestore();
-      rm(state.root, { recursive: true, force: true });
+      await rm(state.root, { recursive: true, force: true });
     }
   });
 });
@@ -248,11 +487,15 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
           .toMatchObject({ state: "committed", id: knownId });
         const responsePath = path.join(state.residencyRoot, "responses", `${requestId}.json`);
         expect(JSON.parse(fs.readFileSync(responsePath, "utf8"))).toMatchObject({ ok: true, requestId });
-        // Replay the actual exchange envelope: the immutable commit fence rejects a second mutation.
+        // Replay the actual keyed envelope: return the first result without a second mutation.
+        const envelope = JSON.parse(originalCommand);
+        expect(envelope.idempotencyKey).toEqual(expect.any(String));
+        expect(envelope.request.idempotencyKey).toBeUndefined();
         fs.rmSync(responsePath);
         fs.writeFileSync(path.join(state.residencyRoot, "requests", `${requestId}.json`), originalCommand);
         await waitFor(() => fs.existsSync(responsePath));
-        expect(JSON.parse(fs.readFileSync(responsePath, "utf8"))).toMatchObject({ ok: false, requestId });
+        expect(JSON.parse(fs.readFileSync(responsePath, "utf8"))).toMatchObject({ ok: true, requestId,
+          ...(kind === "main spawn" ? { handle: { id: knownId } } : { actor: { id: knownId } }) });
         expect(creations).toBe(1);
         if (kind === "main spawn") expect(state.client.listAgents()).toHaveLength(1);
         else expect(new ActorRegistryStore(state.config.actorRoot).records().length +
@@ -591,15 +834,44 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
     ["terminal failure", "in-place", true], ["terminal failure", "in-place", false],
     ["terminal failure", "trajectory", true], ["terminal failure", "explicit", true],
     ["terminal failure", "none", true], ["ordinary success", "in-place", true],
+    ["expired Main", "in-place", true], ["expired Main", "in-place", false],
+    ["expired Main", "trajectory", true], ["expired Main", "none", true],
+    ["handled expiry", "in-place", true], ["handled expiry", "in-place", false],
+    ["collected expiry", "in-place", true],
   ] as const;
   it.each(cases)("preserves %s through %s boundary (switch=%s) in persisted and next model context", async (ending, mode, switchSucceeds) => {
-    const state = await harness(false, undefined, ending === "handled uncertainty" ? 250 : 10_000);
+    const state = await harness(false, undefined, ending === "handled uncertainty" || ending === "handled expiry" ? 250 : 10_000);
     const main = mainProvider(state);
     main.registry.register(new PiToolsProvider(state.root));
     const config = normalizeFabricConfig({ fullCodeMode: true,
       executor: { resultFormat: "json", timeoutMs: 8_000, maxOutputChars: 1_400, memoryLimitBytes: 256 * 1024 * 1024 },
       prewalk: { compactOnReturn: false }, entropy: { compile: false } });
+    if (ending === "expired Main" || ending === "collected expiry") {
+      config.executor.mainMaxTimeoutMs = 1_500;
+      const execute = FabricExecutionService.prototype.execute;
+      vi.spyOn(FabricExecutionService.prototype, "execute").mockImplementation(function (this: FabricExecutionService, options) {
+        return execute.call(this, { ...options, context: { ...options.context!, mode: "rpc" } });
+      });
+    }
+    let originalDecisions: ReturnType<typeof decisionsFor> = [];
+    const expire = () => {
+      originalDecisions = decisionsFor(state);
+      const collector = new ResidentRequestRetention(state.residencyRoot, [state.config.actorRoot, state.config.sessionActorRoot!]);
+      try { collector.sweep(Date.now() + RESIDENT_REQUEST_RETENTION_MS + 10_000, new Set(), 10_000); }
+      finally { collector.close(); }
+    };
+    if (ending === "expired Main" || ending === "collected expiry") {
+      const descriptor = { name: "expire", description: "Advance real retention watermark", risk: "write" as const, inputSchema: { type: "object", properties: {}, additionalProperties: false } };
+      main.registry.register({ name: "probe", description: "real retention", async list() { return [descriptor]; }, async describe() { return descriptor; },
+        async invoke() {
+          if (ending === "collected expiry") await state.client.removeActor(decisionsFor(state)[0]!.id);
+          expire();
+          expect(decisionsFor(state).length).toBe(ending === "collected expiry" ? 0 : 1);
+          return true;
+        } });
+    }
     const execution = new FabricExecutionService(main.registry, config);
+    const executed = vi.spyOn(execution, "execute");
     const faux = fauxProvider({ provider: "test", models: [{ id: "visible" }, { id: "executor" }] });
     const runtime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(state.root, "unused-auth.json") });
     runtime.registerNativeProvider(faux.provider);
@@ -633,10 +905,11 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       return runFabricHandoffAtBoundary(this.prewalk, { executeHandoff: async () => ({ completed: switchSucceeds, status: switchSucceeds ? "completed" : "failed", implementation: "boundary prose ".repeat(200) }) },
         { ...boundaryApi, setModel: async model => switchSucceeds && await boundaryApi.setModel(model) }, pending, result, ctx);
     });
-    if (ending === "handled uncertainty") {
+    if (ending === "handled uncertainty" || ending === "handled expiry") {
       const create = ActorDirectory.prototype.create;
       vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
         const actor = await create.apply(this, args); // Commit REAL host ownership, then delay its response beyond the client wait.
+        if (ending === "handled expiry") expire();
         await delay(900); return actor;
       });
     }
@@ -644,7 +917,8 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
     const mutation = `await pi.write({path:${JSON.stringify(path.join(state.root, "trigger.txt"))},text:"triggered"});`;
     const requests = `await agents.create(${JSON.stringify({ ...args, name: "boundary-one" })});` +
       (ending === "terminal failure" ? `await agents.create(${JSON.stringify({ ...args, name: "boundary-two" })});` : "");
-    const body = mutation + (ending === "handled uncertainty" ? `try { ${requests} } catch {} return "guest handled uncertainty";` : requests +
+    const body = mutation + (ending === "handled uncertainty" || ending === "handled expiry" ? `try { ${requests} } catch {} console.log("guest-large-log" + "log;".repeat(10000)); return "guest handled uncertainty";` : requests +
+      (ending === "expired Main" || ending === "collected expiry" ? `await tools.call({ref:"probe.expire",args:{}}); await new Promise(resolve => setTimeout(resolve,5000));` : "") +
       (mode === "explicit" ? `await agents.handoff({model:${JSON.stringify(`${faux.getModel().provider}/executor`)},task:"reconcile"});` : "") +
       (ending === "terminal failure" ? `throw new Error("terminal boundary cause");` : `return "ordinary handle delivered";`));
     const loader = new DefaultResourceLoader({ cwd: state.root, agentDir: path.join(state.root, "agent"),
@@ -673,7 +947,7 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       expect(result?.role).toBe("toolResult");
       if (result?.role !== "toolResult") throw new Error("Missing native result");
       const text = result.content.filter(block => block.type === "text").map(block => block.text).join("\n");
-      const decisions = decisionsFor(state);
+      const decisions = originalDecisions.length ? originalDecisions : decisionsFor(state);
       if (!decisions.length) throw new Error(`No real commitment: ${text}`);
       const persisted = SessionManager.open(manager.getSessionFile()!).getBranch().find(entry => entry.type === "message" && entry.message.role === "toolResult");
       expect(persisted?.type === "message" && persisted.message).toEqual(result);
@@ -681,18 +955,54 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       // 900 ms with a 250 ms client wait. Resident actorStatus now uses that same
       // serial exchange, so reconcile only after the held request finishes.
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      // Simulate the resumed wall clock for new reconciliation generations, not
+      // the original execution deadline. The expiry watermark never rolls back.
+      const realNow = Date.now.bind(Date);
+      const reconciliationClock = originalDecisions.length ? vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000) : undefined;
       // Reconcile live entities before assertions that deliberately fail on the old head.
-      for (const decision of decisions) {
+      for (const decision of ending === "collected expiry" ? [] : decisions) {
         await waitFor(() => state.participants.get(decision.id)?.ownerHostId === residentHostId(state.config.rootId));
         expect((await main.invoke("agents.actorStatus", { id: decision.id })) as object).toMatchObject({ id: decision.id });
         expect(await main.invoke("agents.stop", { id: decision.id })).toMatchObject({ acknowledged: true });
       }
-      expect(decisions).toHaveLength(ending === "terminal failure" ? 2 : 1);
+      reconciliationClock?.mockRestore();
+      const settled = await executed.mock.results[0]!.value;
+      const evidence = process.env.FABRIC_RESIDENT_EXPIRY_EVIDENCE ?? process.env.PI_FABRIC_BOUNDARY_EVIDENCE;
+      if (evidence) fs.writeFileSync(`${evidence}-${ending.replaceAll(" ", "-")}-${mode}-${switchSucceeds}.json`, JSON.stringify({ ending, mode, switchSucceeds, result, decisions, nextModelText, originalToolText, receipts: settled.residentOutcomes, reconciledOriginal: ending !== "collected expiry" }, null, 2));
+      expect(decisions).toHaveLength(ending === "terminal failure" || ending === "collected expiry" ? 2 : 1);
       expect(fs.readFileSync(path.join(state.root, "trigger.txt"), "utf8")).toBe("triggered");
       expect(pendingCount).toBe(mode === "none" ? 0 : 1);
       expect(claimed).toHaveBeenCalled();
       if (ending === "ordinary success") {
         expect(result.isError).toBe(false); expect(text).not.toContain("ResidentOutcomeUnknownError"); expect(text).toContain('"continued": true');
+      } else if (["expired Main", "handled expiry", "collected expiry"].includes(ending)) {
+        expect(result.isError).toBe(true);
+        expect(result.details).toMatchObject({ success: false });
+        for (const visible of [text, nextModelText]) {
+          expect(visible).toContain("ResidentRequestExpiredError");
+          expect(visible).toMatch(/do not replay or reassign/i);
+          expect(visible).toContain(decisions[0]!.requestId);
+          if (ending === "collected expiry") {
+            expect(visible).toContain("state=expired");
+            expect(visible).toContain("actorId=not yet known, ownerHostId=not yet known");
+            expect(visible).not.toContain("state=abandoned");
+          } else {
+            expect(visible).toContain(decisions[0]!.id);
+            expect(visible).toContain(decisions[0]!.ownerHostId);
+            expect(visible).toContain("state=committed");
+          }
+        }
+        expect(settled.residentOutcomes).toEqual([expect.objectContaining({ requestId: decisions[0]!.requestId,
+          state: ending === "collected expiry" ? "expired" : "committed", expired: true,
+          ...(ending === "collected expiry" ? {} : { id: decisions[0]!.id, ownerHostId: decisions[0]!.ownerHostId }),
+        })]);
+        if (mode !== "none") {
+          const pending = await claimed.mock.results[0]!.value;
+          expect(Object.isFrozen(pending?.executionOutcome?.residentOutcomes)).toBe(true);
+          expect(Object.isFrozen(pending?.executionOutcome?.residentOutcomes[0])).toBe(true);
+        }
+        if (ending !== "handled expiry") expect(text).toContain("MainExecutionCeilingError");
+        expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(ending === "collected expiry" ? 0 : 1);
       } else {
         expect(result.isError).toBe(true);
         expect(result.details).toMatchObject({ success: false });
@@ -702,9 +1012,105 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
         if (nextModelText) assertReceipts(nextModelText, decisions);
         if (mode === "in-place" && switchSucceeds) expect(nextModelText).toBe(text);
       }
-      if (process.env.PI_FABRIC_BOUNDARY_EVIDENCE) fs.writeFileSync(`${process.env.PI_FABRIC_BOUNDARY_EVIDENCE}-${ending.replaceAll(" ", "-")}-${mode}-${switchSucceeds}.json`, JSON.stringify({ ending, mode, switchSucceeds, result, decisions, nextModelText, originalToolText }, null, 2));
-    } finally { await session?.abort(); session?.dispose(); await main.close(); await state.close(); }
+    } finally { vi.restoreAllMocks(); await session?.abort(); session?.dispose(); await main.close(); await state.close(); }
   });
+});
+
+describe("expiry receipt ledger through real Main and nested clients", { timeout: 25_000 }, () => {
+  it.each(["main", "nested"] as const)("%s guest-handled expiry keeps retained live-writer IDs ahead of large output", async caller => {
+    const state = await harness(false, undefined, 250);
+    const main = mainProvider(state, caller);
+    if (caller === "nested") {
+      vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", state.config.rootId);
+      vi.stubEnv("PI_FABRIC_MESH_ROOT", state.config.meshRoot);
+      // Inject only construction: this is the harness's REAL nested filesystem
+      // client with a short exchange budget, not a mocked dispatch or ledger.
+      vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue(state.nested);
+    }
+    const create = ActorDirectory.prototype.create;
+    vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+      const actor = await create.apply(this, args);
+      const collector = new ResidentRequestRetention(state.residencyRoot, [state.config.actorRoot]);
+      try { collector.sweep(Date.now() + RESIDENT_REQUEST_RETENTION_MS + 10_000, new Set(), 10_000); }
+      finally { collector.close(); }
+      await delay(900);
+      return actor;
+    });
+    let artifactPath: string | undefined;
+    try {
+      const run = await registeredExecution(state, main, 5_000);
+      const executed = vi.spyOn(FabricExecutionService.prototype, "execute");
+      const result = await run(`try { await agents.create(${JSON.stringify(requestArgs(state, "create"))}); } catch {} console.log("guest-large-log" + "log;".repeat(10000)); return "guest swallowed expiry";`);
+      const settled = await executed.mock.results[0]!.value;
+      const text = visibleText(result);
+      artifactPath = /saved to: ([^\n]+)\]/.exec(text)?.[1];
+      const decisions = decisionsFor(state);
+      expect(decisions).toHaveLength(1);
+      await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      const realNow = Date.now.bind(Date);
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000);
+      const status = await state.client.actorStatus(decisions[0]!.id);
+      expect(status).toMatchObject({ id: decisions[0]!.id });
+      clock.mockRestore();
+      if (process.env.FABRIC_RESIDENT_EXPIRY_EVIDENCE) fs.writeFileSync(`${process.env.FABRIC_RESIDENT_EXPIRY_EVIDENCE}-handled-expiry-${caller}.json`, JSON.stringify({ result, receipts: settled.residentOutcomes, decisions, status }, null, 2));
+      expect(settled.trace.outcome).toBe("succeeded");
+      expect(settled.residentOutcomes).toEqual([expect.objectContaining({ requestId: decisions[0]!.requestId,
+        state: "committed", expired: true, id: decisions[0]!.id, ownerHostId: decisions[0]!.ownerHostId })]);
+      expect(settled.success).toBe(true); // Guest completion is unchanged; the warning is mandatory.
+      expect(text.startsWith("ResidentRequestExpiredError:")).toBe(true);
+      expect(text).toMatch(/do not replay or reassign/i);
+      const firstLog = text.indexOf("guest-large-log");
+      expect(firstLog).toBeGreaterThan(0);
+      for (const key of ["requestId", "id", "ownerHostId"]) expect(text.indexOf(decisions[0]![key])).toBeLessThan(firstLog);
+      expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
+    } finally {
+      vi.restoreAllMocks();
+      if (artifactPath) fs.rmSync(path.dirname(artifactPath), { recursive: true, force: true });
+      await main.close(); await state.close();
+    }
+  });
+});
+
+describe("host-originated expired replies use the real resident receipt ledger", { timeout: 25_000 }, () => {
+  for (const caller of ["main", "nested"] as const) for (const collected of [false, true]) {
+    it(`${caller} handles an expired replay reply with ${collected ? "collected" : "retained live"} commitment facts`, async () => {
+      const state = await harness(false, undefined, 10_000);
+      const main = mainProvider(state, caller);
+      if (caller === "nested") {
+        vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", state.config.rootId);
+        vi.stubEnv("PI_FABRIC_MESH_ROOT", state.config.meshRoot);
+      }
+      try {
+        const actor = await state.client.createActor({ name: "original-writer", instructions: "Keep one writer", residency: "durable", model: state.model });
+        const original = decisionsFor(state)[0]!;
+        if (collected) await state.client.removeActor(actor.id);
+        const collector = new ResidentRequestRetention(state.residencyRoot, [state.config.actorRoot]);
+        try { collector.sweep(Date.now() + RESIDENT_REQUEST_RETENTION_MS + 10_000, new Set(), 10_000); }
+        finally { collector.close(); }
+        expect(decisionsFor(state)).toHaveLength(collected ? 0 : 1);
+        // Reuse the immutable ORIGINAL negotiated envelope identity. The host
+        // must reject before dispatch; no ledger, decision, or response is mocked.
+        vi.spyOn(requestExpiry, "newResidentRequestId").mockReturnValue(original.requestId);
+        const run = await registeredExecution(state, main, 5_000);
+        const executed = vi.spyOn(FabricExecutionService.prototype, "execute");
+        const result = await run(`try { await agents.create(${JSON.stringify(requestArgs(state, "create"))}); } catch {} return "expired reply handled";`);
+        const settled = await executed.mock.results[0]!.value;
+        const text = visibleText(result);
+        if (process.env.FABRIC_RESIDENT_EXPIRY_EVIDENCE) fs.writeFileSync(`${process.env.FABRIC_RESIDENT_EXPIRY_EVIDENCE}-reply-${caller}-${collected}.json`, JSON.stringify({ original, result, receipts: settled.residentOutcomes, collected }, null, 2));
+        expect(settled.success).toBe(true);
+        expect(settled.residentOutcomes).toEqual([expect.objectContaining({ requestId: original.requestId, expired: true,
+          state: collected ? "expired" : "committed", ...(collected ? {} : { id: original.id, ownerHostId: original.ownerHostId }) })]);
+        expect(text.startsWith("ResidentRequestExpiredError:")).toBe(true);
+        expect(text).toMatch(/do not replay or reassign/i);
+        expect(text).toContain(original.requestId);
+        if (collected) {
+          expect(text).toContain("actorId=not yet known, ownerHostId=not yet known");
+          expect(text).not.toContain("state=abandoned");
+        } else { expect(text).toContain(original.id); expect(text).toContain(original.ownerHostId); }
+        expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(collected ? 0 : 1);
+      } finally { vi.restoreAllMocks(); await main.close(); await state.close(); }
+    });
+  }
 });
 
 describe("round 4 registered fabric_exec committed-output priority", { timeout: 25_000 }, () => {
@@ -1278,7 +1684,7 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
     it(`${engine} teardown exposes a committed unawaited mutation ${settlesDuringGrace ? "that settles during grace" : "still pending after grace"} rather than false success${holdGuestExit ? " with guest exit delayed past reap grace" : ""}`, async () => {
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
       const trace = engine === "cpython" ? await captureDurableExecutionTrace() : undefined;
-      const rm = fs.rmSync.bind(fs);
+      const rm = fs.promises.rm.bind(fs.promises);
       let guest: childProcess.ChildProcess | undefined;
       let killGuest: (() => void) | undefined;
       let guestExited = false; let guestClosed = false; let removals = 0;
@@ -1307,7 +1713,7 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
           }
           return spawn(...args);
         }) as typeof childProcess.spawn);
-        const cleanup = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+        const cleanup = vi.spyOn(fs.promises, "rm").mockImplementation(async (target, options) => {
           if (String(target) === state.root) {
             removals++;
             if (!guestExited) {
@@ -1355,8 +1761,9 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
         expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
       } finally {
         clearTimeout(releaseTimer); state.release.resolve();
-        // Hold the actual child beyond both the runtime's 250 ms reap grace and
-        // the harness's 375 ms recursive-rm retry window, then confirm its close.
+        // Hold the actual child beyond the runtime's 250 ms reap grace, then
+        // confirm its close; the injected rm fails while it lives, so the harness
+        // cannot rely on its recursive-rm retry window to outlast a live guest.
         const killTimer = holdGuestExit ? setTimeout(() => killGuest?.(), 1_000) : undefined;
         try {
           // A runtime result is not an exit barrier once its bounded reap grace
@@ -1367,7 +1774,7 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
         } finally {
           clearTimeout(killTimer); killGuest?.(); await trace?.waitForGuests();
           restoreCleanup?.();
-          if (holdGuestExit) rm(state.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+          if (holdGuestExit) await rm(state.root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
         }
       }
     });
@@ -1506,26 +1913,46 @@ describe("round 1 public cancellation contract", () => {
   });
 
   it("abandoned cleanup join preserves completion even when the client timeout writes the fence", { timeout: 15_000 }, async () => {
-    const state = await harness(false, undefined, 200);
+    // Setup is not the timeout under test: a loaded runner may take >200ms to spawn.
+    const state = await harness(false, undefined, 10_000);
+    const workerRelease = path.join(state.root, "release-worker");
     const delivered = vi.spyOn(state.client.options.mainAgent, "deliverAgent");
     const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
+    const clock = vi.spyOn(Date, "now");
     state.client.start();
     try {
-      const handle = await state.client.spawnAgent({ task: "LIVE_WITH_PROGRESS join-only completion", model: state.model });
+      const handle = await state.client.spawnAgent({
+        task: `LIVE_WITH_PROGRESS join-only completion ${JSON.stringify({ fakeWorkerReleasePath: workerRelease })}`,
+        model: state.model,
+      });
+      const joined = deferred();
+      const originalJoin = AgentManager.prototype.join;
+      vi.spyOn(AgentManager.prototype, "join").mockImplementation(async function (this: AgentManager, ...args) {
+        joined.resolve();
+        return originalJoin.apply(this, args);
+      });
+      // Freeze only Date, not timers: the real host must enter its real join before
+      // the client deadline expires, and the worker cannot finish before abandonment.
+      const startedAt = Date.now();
+      clock.mockReturnValue(startedAt);
+      state.client.options.commandTimeoutMs = 200;
       const outcome = state.client.cleanupAgent(handle.id).catch((error: Error) => error);
-      await waitFor(() => entries(state.residencyRoot, "processing").length > 0);
+      await joined.promise;
       const requestId = entries(state.residencyRoot, "processing")[0]!.slice(0, -5);
+      clock.mockReturnValue(startedAt + 200);
       expect((await outcome as Error).message).toContain("Timed out");
       expect(JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", `${requestId}.json`), "utf8")))
         .toMatchObject({ state: "abandoned" });
+      clock.mockRestore();
+      fs.writeFileSync(workerRelease, "");
       await waitFor(() => state.client.settledAgent(handle.id) !== undefined);
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
-      // Delivery polling is independent of host settlement. This bound also lets
-      // the unsafe base complete normally, so the assertion exposes lost delivery.
-      await delay(1_000);
+      await waitFor(() => delivered.mock.calls.some(([delivery]) => (delivery.data as { id?: string })?.id === handle.id));
+      // Wait for durable acknowledgement, not a wall-clock guess about delivery polling.
+      await waitFor(() => state.client.options.mesh.listAll(residentDeliveryPrefix(state.config.rootId)).length === 0);
       expect(delivered.mock.calls.filter(([delivery]) => (delivery.data as { id?: string })?.id === handle.id)).toHaveLength(1);
       expect(cleanup).not.toHaveBeenCalled(); expect(state.client.hasAgent(handle.id)).toBe(true);
-    } finally { await state.close(); }
+    } finally { clock.mockRestore(); fs.writeFileSync(workerRelease, ""); await state.close(); }
   });
 
   it("durable create never enters activation compensation when committed removal would be unknown", async () => {

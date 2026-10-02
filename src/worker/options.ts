@@ -175,6 +175,7 @@ export const parseWorkerOptions = (
     logFile: required(args, "log-file"),
     ...(schemaFile ? { schemaFile } : {}),
     ...(replyTool ? { replyTool: true } : {}),
+    ...(optional(args, "judgment") === "true" ? { judgment: true } : {}),
     cwd: required(args, "cwd"),
     piBinary: required(args, "pi-binary"),
     claudeBinary: required(args, "claude-binary"),

@@ -2177,7 +2177,9 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     const provider = new AgentsProvider(agents, passive, new GlobalActorRegistry(state.root, 64 * 1024),
       state.mainAgent, state.participants, control, lifecycle, undefined, client);
     const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "test", nestedToolCallId: "setter",
-      extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
+      // Main now admits the selector before routing to the resident owner.
+      // Give this root session its actual visible registry, not an empty context.
+      extensionContext: { modelRegistry: { getAvailable: () => state.config.piModels?.available ?? [] } } as unknown as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
     try {
       const actor = await client.createActor({ name: "effective durable", instructions: "Before", residency: "durable", model: "provider/visible", thinking: "low" });
       expect(passive.owns(actor.id)).toBe(false);

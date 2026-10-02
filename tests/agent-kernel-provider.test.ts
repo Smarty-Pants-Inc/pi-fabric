@@ -171,7 +171,8 @@ describe("provider kernel forwarding", () => {
       expect(resident.createActor).toHaveBeenCalledWith(frozen, context.signal);
       expect(actors.create).not.toHaveBeenCalled();
     } else {
-      expect(actors.create).toHaveBeenCalledWith(frozen);
+      // Local creation now carries the invocation commit fence (smarty-dev#2490).
+      expect(actors.create).toHaveBeenCalledWith(frozen, expect.objectContaining({ beforeCommit: expect.any(Function), checkActive: expect.any(Function) }));
       expect(resident.createActor).not.toHaveBeenCalled();
     }
   });
@@ -204,7 +205,7 @@ describe("provider kernel forwarding", () => {
     try {
       manager.config.extensions = false;
       await provider.invoke("create", { name: "actor", instructions: "task", kernel: "python" }, context);
-      expect(actors.create).toHaveBeenCalledWith(expect.objectContaining({ kernel: "python", extensions: true }));
+      expect(actors.create).toHaveBeenCalledWith(expect.objectContaining({ kernel: "python", extensions: true }), expect.objectContaining({ beforeCommit: expect.any(Function), checkActive: expect.any(Function) }));
     } finally { manager.config.extensions = original; }
   });
 

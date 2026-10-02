@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { FabricModelDeniedError } from "../core/model-policy.js";
 import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -682,6 +683,10 @@ export class ResidencyClient {
           if (!response.ok) {
             if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
             if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
+            if (response.errorCode === "FABRIC_MODEL_DENIED" && typeof response.modelDenied?.model === "string") {
+              throw new FabricModelDeniedError(response.modelDenied.model,
+                typeof response.modelDenied.replacement === "string" ? response.modelDenied.replacement : undefined);
+            }
             throw new Error(response.error ?? "Fabric resident host rejected request");
           }
           if ((command.operation === "spawn" && !response.handle) || (command.operation === "createActor" && !response.actor)) {

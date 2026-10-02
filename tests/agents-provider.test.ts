@@ -12,6 +12,7 @@ import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import type { FabricActorDeliveryRequest, FabricActorInfo, FabricActorReadInfo, FabricActorRequest } from "../src/actors/types.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -44,6 +45,7 @@ import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentHostId, residentRoot, ResidentOutcomeUnknownError } from "../src/residency/protocol.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { resolvePiModel } from "../src/core/model-refresh.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
@@ -74,6 +76,9 @@ const usage = {
 };
 
 const visiblePiModels = [
+  { provider: "cliproxyapi", id: "gpt-6.1-sol" },
+  { provider: "cliproxyapi", id: "gpt-6-astra" },
+  { provider: "cliproxyapi", id: "gpt-6-sol" },
   { provider: "anthropic", id: "executor", name: "Executor" },
   { provider: "anthropic", id: "frontier", name: "Frontier" },
   { provider: "provider", id: "project" },
@@ -84,10 +89,266 @@ const visiblePiModels = [
   { provider: "provider", id: "model-b" },
 ];
 
+describe("fleet model policy (#2490)", () => {
+  it.each((["session", "durable"] as const).flatMap(residency => ([
+    ["veda", "backend-shortcut", "explicit"],
+    ["veda", "veda/gpt-6-astra", "configured"],
+    ["veda", "cliproxyapi/not-registered", "explicit"],
+    ["claude", "default", "explicit"],
+    ["claude", "anthropic/default", "configured"],
+    ["claude", "unknown-runtime-alias", "explicit"],
+  ] as const).map(entry => [...entry, residency] as const)))("round 5 F5 refuses %s %s (%s) before %s submission", async (runner, selector, source, residency) => {
+    const state = setup([], [], undefined, { agentsConfig: {
+      runner, deniedModels: ["cliproxyapi/gpt-6-astra", "anthropic/claude-sonnet-test"], budgetUsd: 0,
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", ...(runner === "veda" && source === "configured" ? { model: selector } : {}) },
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, ...(runner === "claude" && source === "configured" ? { model: selector } : {}) },
+    }, modelsConfig: { aliases: { "backend-shortcut": { targets: ["cliproxyapi/gpt-6-astra"] } } } });
+    const spawnAgent = vi.fn(async () => ({ id: "must-not-submit", name: "refused", runner, transport: "process", cwd: process.cwd(), status: "running" }));
+    (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("spawn", { task: "must not submit", residency, transport: "process", ...(source === "explicit" ? { model: selector } : {}) }, context)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      expect(state.agents.list()).toEqual([]); expect(fs.existsSync(path.join(state.root, "runs"))).toBe(false);
+      expect(launch).not.toHaveBeenCalled(); expect(spawnAgent).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); }
+  });
+
+  it.each(["session", "durable"] as const)("round 5 F5 forwards allowed canonical alternate targets for %s admission", async residency => {
+    const state = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: { deniedModels: ["cliproxyapi/gpt-6-astra"], budgetUsd: 0, veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" } } });
+    const spawnAgent = vi.fn(async (request: { model?: string }) => ({ id: "allowed-durable", name: "allowed", runner: "veda", transport: "process", cwd: process.cwd(), status: "running", model: request.model }));
+    (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
+    for (const [runner, model, canonical] of [["veda", "veda/cliproxyapi/gpt-6.1-sol", "cliproxyapi/gpt-6.1-sol"], ["claude", "claude/haiku", "claude-haiku-test"]] as const) {
+      const handle = await state.provider.invoke("spawn", { task: "allowed alternate control", runner, model, residency, transport: "process" }, context) as AgentHandleInfo;
+      expect(handle.model).toBe(canonical);
+      if (residency === "session") expect((await state.agents.wait(handle.id)).status).toBe("completed");
+      else expect(spawnAgent).toHaveBeenLastCalledWith(expect.objectContaining({ runner, model: canonical }), undefined);
+    }
+  });
+
+  it.each(["veda", "claude"] as const)("round 5 F5 preserves no-policy %s aliases for durable submission", async runner => {
+    const state = setup([], [], undefined, { agentsConfig: { deniedModels: [], budgetUsd: 0 } });
+    const spawnAgent = vi.fn(async (request: { model?: string }) => ({ id: "legacy-durable", name: "legacy", runner, transport: "process", cwd: process.cwd(), status: "running", model: request.model }));
+    (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
+    const catalog = vi.spyOn(state.agents, "claudeModels");
+    try {
+      await expect(state.provider.invoke("spawn", { task: "legacy alias", runner, model: "backend-shortcut", residency: "durable" }, context)).resolves.toMatchObject({ model: "backend-shortcut" });
+      expect(spawnAgent).toHaveBeenCalledOnce(); expect(catalog).not.toHaveBeenCalled();
+    } finally { catalog.mockRestore(); }
+  });
+
+  it.each(["session", "durable"] as const)("round 3 F3 refuses an unknown Veda backend default before %s admission", async residency => {
+    const state = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: { runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], veda: { binary: DEFAULT_FABRIC_CONFIG.agents.veda.binary, persona: DEFAULT_FABRIC_CONFIG.agents.veda.persona, backend: "pi" } } });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("spawn", { task: "review", residency }, context)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", message: expect.stringContaining("default") });
+      expect(state.agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(state.root, "runs"))).toBe(false);
+      if (residency === "session") {
+        const allowed = await state.provider.invoke("spawn", { task: "review", model: "veda/cliproxyapi/gpt-6.1-sol", transport: "process" }, context) as AgentHandleInfo;
+        expect((await state.agents.wait(allowed.id)).status).toBe("completed");
+        state.agents.config.veda.model = "veda/cliproxyapi/gpt-6.1-sol";
+        const configured = await state.provider.invoke("spawn", { task: "review", transport: "process" }, context) as AgentHandleInfo;
+        expect((await state.agents.wait(configured.id)).status).toBe("completed");
+      }
+    } finally { launch.mockRestore(); }
+  });
+
+  it.each((["create", "global-create", "import", "session-set", "project-set", "global-set"] as const)
+    .flatMap(operation => (["Escape", "deadline", "revocation"] as const).map(ending => [operation, ending] as const)))("round 3 F4 public cancellation during refresh leaves %s uncommitted (%s)", async (operation, ending) => {
+    const state = setup();
+    const { provider, actors, globalActors, agents, root, mesh } = state;
+    let args: Record<string, unknown> = { name: "late-subscriber", instructions: "Review.", model: "provider/late", topics: ["round3.work"] };
+    const action = operation.endsWith("set") ? "setModel" : operation === "import" ? "import" : "create";
+    if (operation === "global-create") args.scope = "global";
+    if (operation.endsWith("set")) {
+      const target = operation === "global-set"
+        ? globalActors.create({ name: "original", instructions: "Review.", model: "provider/model-a" })
+        : await actors.create({ name: "original", instructions: "Review.", model: "provider/model-a" });
+      args = { id: target.id, model: "provider/late", scope: operation.split("-")[0] };
+    } else if (operation === "import") {
+      const template = globalActors.create({ name: "late-subscriber", instructions: "Review.", model: "provider/late", topics: ["round3.work"] });
+      args = { id: template.id };
+    }
+    const beforeActors = actors.list(); const beforeTemplates = globalActors.list();
+    const snapshot = (directory: string): Record<string, string> => {
+      const result: Record<string, string> = {};
+      const visit = (at: string) => { if (!fs.existsSync(at)) return; for (const entry of fs.readdirSync(at, { withFileTypes: true })) {
+        const file = path.join(at, entry.name); if (entry.isDirectory()) visit(file); else result[path.relative(directory, file)] = fs.readFileSync(file, "utf8");
+      } }; visit(directory); return result;
+    };
+    const beforeFiles = snapshot(path.join(root, "actors"));
+    const beforePresence = mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 });
+    const beforePresenceKeys = mesh.listAll("actors/presence/").map(entry => entry.key);
+    let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
+    let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+    let finished!: () => void; const done = new Promise<void>(resolve => { finished = resolve; });
+    let refreshed = false;
+    const modelRegistry = { getAvailable: () => refreshed ? [...visiblePiModels, { provider: "provider", id: "late" }] : visiblePiModels,
+      async refresh() { enter(); await held; refreshed = true; } };
+    const invoke = provider.invoke.bind(provider);
+    const spy = vi.spyOn(provider, "invoke").mockImplementation(async (...params) => { try { return await invoke(...params); } finally { finished(); } });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
+    if (ending === "deadline") config.executor.timeoutMs = 1_000;
+    const registry = new ActionRegistry(); registry.register(provider);
+    const service = new FabricExecutionService(registry, config);
+    const abort = new AbortController();
+    try {
+      const running = service.execute({ code: `return await agents.${action}(${JSON.stringify(args)});`, signal: abort.signal, parentToolCallId: "round3-cancel",
+        context: { ...context.extensionContext, cwd: process.cwd(), hasUI: false, modelRegistry } as unknown as ExtensionContext, onPartial() {} });
+      await entered;
+      if (ending === "Escape") abort.abort(new Error("Escape"));
+      if (ending === "revocation") registry.revokeProvider("agents");
+      expect((await running).success).toBe(false);
+      release(); await done;
+      expect(actors.list()).toEqual(beforeActors);
+      expect(globalActors.list()).toEqual(beforeTemplates);
+      expect(snapshot(path.join(root, "actors"))).toEqual(beforeFiles);
+      expect(mesh.listAll("actors/presence/").map(entry => entry.key)).toEqual(beforePresenceKeys);
+      expect(mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 })).toEqual(beforePresence);
+      await mesh.publish({ topic: "round3.work", from: state.identity, data: { task: "never activate cancelled actor" } });
+      // Allow several real actor-monitor polls; a leaked subscription must not
+      // start work after the caller has already received cancellation.
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(agents.list()).toEqual([]);
+      expect(mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 })).toEqual(beforePresence);
+      // An uncancelled call using the same now-resolved model remains supported.
+      spy.mockRestore();
+      await expect(provider.invoke(action, args, { ...context, extensionContext: { modelRegistry } as unknown as ExtensionContext })).resolves.toMatchObject({ model: "provider/late" });
+    } finally { release(); await done; spy.mockRestore(); }
+  });
+
+  it("round 3 F4 public cancellation under the binding lock cannot change a local overlay", async () => {
+    const { provider, actors, root } = setup();
+    const actor = await actors.create({ name: "locked", instructions: "Review.", model: "provider/model-a" });
+    await actors.setThinking(actor.id, "low", "session");
+    const bindings = path.join(root, "actors", "bindings");
+    const bindingFile = path.join(bindings, fs.readdirSync(bindings).find(file => file.endsWith(".json"))!);
+    const bytes = fs.readFileSync(bindingFile, "utf8"); const before = actors.status(actor.id);
+    const lock = `${bindingFile}.lock`; fs.mkdirSync(lock);
+    fs.writeFileSync(path.join(lock, "owner"), `held-by-test\n${process.pid}\n${Date.now()}\n`);
+    let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
+    let finished!: () => void; const done = new Promise<void>(resolve => { finished = resolve; });
+    const original = ActorBindingStore.prototype.setModel;
+    const spy = vi.spyOn(ActorBindingStore.prototype, "setModel").mockImplementation(async function (this: ActorBindingStore, ...args) {
+      enter(); try { return await original.apply(this, args); } finally { finished(); }
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
+    const registry = new ActionRegistry(); registry.register(provider);
+    const service = new FabricExecutionService(registry, config); const abort = new AbortController();
+    try {
+      const running = service.execute({ code: `return await agents.setModel({ id: ${JSON.stringify(actor.id)}, model: "provider/model-b" });`, signal: abort.signal,
+        parentToolCallId: "round3-binding-lock", context: { ...context.extensionContext, cwd: process.cwd(), hasUI: false } as ExtensionContext, onPartial() {} });
+      await entered; abort.abort(new Error("Escape")); expect((await running).success).toBe(false);
+      fs.rmSync(lock, { recursive: true, force: true }); await done;
+      expect(fs.readFileSync(bindingFile, "utf8")).toBe(bytes);
+      expect(actors.status(actor.id)).toEqual(before);
+      spy.mockRestore();
+      await expect(provider.invoke("setModel", { id: actor.id, model: "provider/model-b" }, context)).resolves.toMatchObject({ model: "provider/model-b" });
+    } finally { fs.rmSync(lock, { recursive: true, force: true }); await done; spy.mockRestore(); }
+  });
+
+  it.each(["session", "durable"] as const)("review round F1 refuses explicit and default Veda backend selectors before %s submission", async (residency) => {
+    const { provider, agents, root } = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: { runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", model: "veda/cliproxyapi/gpt-6-astra" } } });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      for (const model of ["veda/cliproxyapi/gpt-6-astra", undefined]) {
+        await expect(provider.invoke("spawn", { task: "review", residency, ...(model ? { model } : {}) }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      }
+      expect(agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(root, "runs"))).toBe(false);
+      if (residency === "session") {
+        const control = await provider.invoke("spawn", { task: "review", runner: "veda", model: "veda/cliproxyapi/gpt-6.1-sol", transport: "process" }, context) as AgentHandleInfo;
+        expect((await agents.wait(control.id)).status).toBe("completed");
+      }
+    } finally { launch.mockRestore(); }
+  });
+  it.each(["spawn", "create"] as const)("review round A3 exposes policy code to the public TypeScript guest for %s", async (action) => {
+    const { provider, agents, actors } = setup([], [], undefined, { agentsConfig: { deniedModels: ["cliproxyapi/gpt-6-astra"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" } });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.agents = agents.config;
+    config.approvals.agent = "allow";
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const service = new FabricExecutionService(registry, config);
+    const args = action === "spawn" ? { task: "Review.", model: "cliproxyapi/gpt-6-astra" } : { name: "refused", instructions: "Review.", model: "cliproxyapi/gpt-6-astra" };
+    const result = await service.execute({ code: `try { await agents.${action}(${JSON.stringify(args)}); return { admitted: true }; } catch (error) { return { name: error.name, code: error.code, message: error.message }; }`,
+      signal: undefined, parentToolCallId: "review-round-guest", context: { ...context.extensionContext, cwd: process.cwd(), hasUI: false } as ExtensionContext, onPartial() {},
+    });
+    expect(result.success).toBe(true);
+    expect(result.value).toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", message: expect.stringContaining("#2236") });
+    expect(agents.list()).toEqual([]);
+    expect(actors.list()).toEqual([]);
+  });
+  const policy = { model: "cliproxyapi/gpt-6-astra", thinking: "low" as const, deniedModels: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" };
+  it.each(["actor", "agent"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
+    const { provider, agents, actors } = setup([], [], undefined, {
+      identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
+      agentsConfig: policy, callerThinking: "max",
+    });
+    const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
+    const child = await provider.invoke("spawn", { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", thinking: "max" });
+    await agents.wait(child.id);
+    const actor = await provider.invoke("create", { name: "nested", instructions: "review" }, parentContext) as FabricActorInfo;
+    expect(actors.definition(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", thinking: "max" });
+  });
+  it.each(["spawn", "create"])("%s refuses explicit, alias, inherited and default denied models before creation", async (action) => {
+    const { provider, agents, actors, globalActors } = setup([], [], undefined, { agentsConfig: policy, modelsConfig: { aliases: { review: { targets: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6.1-sol"] } } } });
+    const args = action === "spawn" ? { task: "review" } : { name: "review", instructions: "review" };
+    for (const model of ["cliproxyapi/gpt-6-astra", " CLIPROXYAPI/GPT-6-SOL ", "review", "gpt-6-astra", undefined]) {
+      await expect(provider.invoke(action, { ...args, ...(model ? { model } : {}) }, context)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", message: expect.stringMatching(/#2236.*cliproxyapi\/gpt-6\.1-sol/) });
+    }
+    const inherited = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6-astra" } } as unknown as ExtensionContext };
+    await expect(provider.invoke(action, args, inherited)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    if (action === "create") await expect(provider.invoke(action, { ...args, scope: "global", model: "review" }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(agents.list()).toEqual([]);
+    expect(actors.list()).toEqual([]);
+    expect(globalActors.list()).toEqual([]);
+  });
+  it("refuses denied unavailable keys before registry refresh, fuzzy fallback or durable admission", async () => {
+    const { provider, agents, actors } = setup([], [], undefined, { agentsConfig: policy });
+    const refresh = vi.fn();
+    const noDeniedModels = { ...context, extensionContext: {
+      modelRegistry: { getAvailable: () => [visiblePiModels[0]!], refresh },
+    } as unknown as ExtensionContext };
+    await expect(provider.invoke("spawn", { task: "review", model: "cliproxyapi/gpt-6-astra", residency: "durable" }, noDeniedModels)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    await expect(provider.invoke("create", { name: "review", instructions: "review", model: "cliproxyapi/gpt-6-astra", residency: "durable" }, noDeniedModels)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(refresh).not.toHaveBeenCalled();
+    expect(agents.list()).toEqual([]);
+    expect(actors.list()).toEqual([]);
+  });
+  it.each(["spawn", "create"])("%s admits an allowed explicit override of a denied default", async (action) => {
+    const { provider, agents } = setup([], [], undefined, { agentsConfig: policy });
+    const args = action === "spawn" ? { task: "review", transport: "process" } : { name: "review", instructions: "review" };
+    const result = await provider.invoke(action, { ...args, model: "cliproxyapi/gpt-6.1-sol" }, context) as AgentHandleInfo;
+    expect(result.model).toBe("cliproxyapi/gpt-6.1-sol");
+    if (action === "spawn") await agents.wait(result.id);
+  });
+  it("refuses denied actor setters, global setters and Main switches", async () => {
+    const switchModel = vi.fn(async () => ({ ok: true }));
+    const { provider, actors } = setup([], [], undefined, { agentsConfig: policy, switchModel });
+    const actor = await provider.invoke("create", { name: "review", instructions: "review", model: "cliproxyapi/gpt-6.1-sol" }, context) as FabricActorInfo;
+    const global = await provider.invoke("create", { name: "template", instructions: "review", scope: "global", model: "cliproxyapi/gpt-6.1-sol" }, context) as FabricActorInfo;
+    for (const scope of ["session", "project", "global"]) {
+      await expect(provider.invoke("setModel", { id: scope === "global" ? global.id : actor.id, scope, model: "CLIPROXYAPI/GPT-6-ASTRA" }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    }
+    await expect(provider.invoke("switchModel", { model: "gpt-6-astra" }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(switchModel).not.toHaveBeenCalled();
+    expect(actors.definition(actor.id).model).toBe("cliproxyapi/gpt-6.1-sol");
+  });
+});
+
 const visibleModelRegistry = {
   getAvailable: () => visiblePiModels,
   find: (provider: string, id: string) =>
     visiblePiModels.find((model) => model.provider === provider && model.id === id),
+};
+
+const prepareVisiblePiModel = async (selector: string | undefined): Promise<string> => {
+  const model = await resolvePiModel({ selector, registry: visibleModelRegistry, aliases: {} });
+  return `${model.provider}/${model.id}`;
 };
 
 const context: FabricInvocationContext = {
@@ -108,9 +369,11 @@ const setup = (
     cwd?: string;
     identity?: MeshIdentity;
     switchModel?: FabricMainAgentTarget["switchModel"];
+    callerThinking?: string;
     modelsConfig?: FabricModelsConfig;
     agentsConfig?: Partial<FabricAgentConfig>;
     workerPath?: string;
+    preparePiModel?: (model: string | undefined) => Promise<string | void>;
     writeStalled?: () => Error | undefined;
     onBackgroundComplete?: (result: import("../src/agents/types.js").AgentRunResult) => void;
     onResultConsumed?: (id: string) => void;
@@ -128,6 +391,7 @@ const setup = (
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
       runRoot: path.join(root, "runs"),
+      ...(options?.preparePiModel ? { preparePiModel: options.preparePiModel } : {}),
       ...(options?.onBackgroundComplete ? { onBackgroundComplete: options.onBackgroundComplete } : {}),
       ...(options?.onResultConsumed ? { onResultConsumed: options.onResultConsumed } : {}),
     },
@@ -234,6 +498,7 @@ const setup = (
     undefined,
     undefined,
     () => options?.modelsConfig ?? DEFAULT_FABRIC_CONFIG.models,
+    () => options?.callerThinking,
   );
   return {
     root,

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { build } from "esbuild";
 import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 const primaryEntryPoints = [
   "src/index.ts",
@@ -82,6 +83,16 @@ const lazyEntryPoints = [
 
 const result = await build({
   entryPoints: [...primaryEntryPoints, ...lazyEntryPoints],
+  // Both facades only re-export host metadata. Resolve to their implementation
+  // so empty facade-only chunks do not consume startup graph slots.
+  plugins: [{
+    name: "host-metadata-facades",
+    setup(pluginBuild) {
+      pluginBuild.onResolve({ filter: /\/(?:model-policy|fabric-provenance)\.js$/ }, () => ({
+        path: resolve("src/host-compatibility.ts"),
+      }));
+    },
+  }],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",

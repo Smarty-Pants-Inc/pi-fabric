@@ -31,6 +31,7 @@ import {
   ResidentActorAuthorizationError,
   ResidentCommandUnsupportedError,
   assertResidentCommandSupported,
+  prepareResidentCreationCommand,
   assertResidentActorMain,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
@@ -373,13 +374,15 @@ export class ResidencyClient {
   }
 
   async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+    const { idempotencyKey, ...creationRequest } = request;
     await this.ensureHost();
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
+      ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       requestId: randomUUID(),
       rootId: this.options.config.rootId,
-      request,
+      request: creationRequest,
       createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Fabric resident host returned no actor");
@@ -433,9 +436,11 @@ export class ResidencyClient {
   }
 
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
-    const resolvedRequest = request.cwd === undefined
-      ? request
-      : { ...request, cwd: await awaitAgentCwd(this.options.config.cwd, request.cwd, signal) };
+    // Explicit keys are checked against the loaded owner before dispatch.
+    const { idempotencyKey, ...spawnRequest } = request;
+    const resolvedRequest = spawnRequest.cwd === undefined
+      ? spawnRequest
+      : { ...spawnRequest, cwd: await awaitAgentCwd(this.options.config.cwd, spawnRequest.cwd, signal) };
     // Freeze inherited optional-tool authority before transferring to an existing host.
     const allowedTools = this.#inheritedToolAllowlist;
     const tools = allowedTools === undefined ? undefined
@@ -445,6 +450,7 @@ export class ResidencyClient {
       {
         format: RESIDENT_HOST_FORMAT,
         operation: "spawn",
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
         requestId: randomUUID(),
         rootId: this.options.config.rootId,
         request: { ...resolvedRequest, ...(tools ? { tools } : {}), residency: "durable" },
@@ -674,6 +680,7 @@ export class ResidencyClient {
     if (owner.requestFence !== 1) {
       throw new Error("Fabric resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
     }
+    command = prepareResidentCreationCommand(owner, command);
     throwIfAborted(signal);
     registerResidentCancellation(signal, this.options.config.residencyRoot, command);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
@@ -945,6 +952,7 @@ export class ResidencyClient {
     // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
     this.options.mainAgent.deliverAgent({
       from: value.from,
+      source: value.source,
       // The authenticated resident writer alone does not prove actor authorship: older
       // hosts also write alarms under the actor label. Require positive classification;
       // unclassified/unknown actor records retain routing/display and durable receipts only.

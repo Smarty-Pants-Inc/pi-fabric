@@ -36,6 +36,21 @@ describe("guest agents surface", () => {
     }
   });
 
+  it("followUp advisory types the bounded warning on public message receipts", () => {
+    const result = typeCheckFabricCode(
+      `const receipt = await agents.followUp({ id: "task", message: "later" });
+       const code: "FABRIC_FOLLOW_UP_RUNNING_TASK" | undefined = receipt.warning?.code;
+       const kind: "agent" | undefined = receipt.warning?.kind;
+       const status: "running" | undefined = receipt.warning?.status;
+       const targetId: string | undefined = receipt.warning?.targetId;
+       const message: string | undefined = receipt.warning?.message;
+       const steerWarning = (await agents.steer({ id: "task", message: "now" })).warning;
+       return { code, kind, status, targetId, message, steerWarning };`,
+      GUEST_TYPE_DECLARATIONS, true,
+    );
+    expect(result.errors).toEqual([]);
+  });
+
   it.each(["steer", "followUp", "tell"])("types public %s wake receipts for object and positional Main targets", action => {
     const code = `const object = await agents.${action}({ id: "main", message: "resume" });
       const positional = await agents.${action}("main", "resume");

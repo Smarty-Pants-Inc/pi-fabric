@@ -361,7 +361,19 @@ export interface AgentSteerEntry {
   ts: number;
 }
 
+export const FOLLOW_UP_RUNNING_TASK_MESSAGE = "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.";
+
+/** Sender-only, receiver-time advisory; it does not change followUp delivery. */
+export interface AgentFollowUpRunningWarning {
+  code: "FABRIC_FOLLOW_UP_RUNNING_TASK";
+  targetId: string;
+  kind: "agent";
+  status: "running";
+  message: string;
+}
+
 export interface AgentSteerResult {
+  warning?: AgentFollowUpRunningWarning;
   queued: true;
   messageId: string;
 }

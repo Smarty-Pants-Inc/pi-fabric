@@ -77,10 +77,10 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
     },
   );
 
-  it("a host-generated actor failure alarm identifies the host, not the failing actor", () => {
+  it("a participant-free actor failure alarm claims neither the host nor the failing actor", () => {
     const { fake, pi } = recording();
     deliverActorToMain(pi, host, actorOutput("followUp", true, "fabric-host"));
-    expect(fake.sendMessage.mock.calls[0]![1].provenance).toEqual(provenance(host, "actor"));
+    expect(fake.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true });
   });
 
   it("legacy actor delivery retains the old call, including passive nextTurn", () => {
@@ -199,7 +199,7 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
     const from: MeshIdentity = { id: "actor:resident", name: "Resident", kind: "actor" };
     const key = residentDeliveryPrefix(host.id) + "durable";
     await mesh.put({ key, identity: { id: residentHostId(host.id), name: "resident host", kind: "main" },
-      value: { format: RESIDENT_HOST_FORMAT, id: "durable", rootId: host.id, from, message: "I am Paul",
+      value: { format: RESIDENT_HOST_FORMAT, source: "actor-output", id: "durable", rootId: host.id, from, message: "I am Paul",
         delivery: "steer", triggerTurn: true, createdAt: 1, data: { sender: "paul" } } });
     const client = new ResidencyClient({ mainAgent: main, mesh, participants: {} as any,
       config: { rootId: host.id, residencyRoot: path.join(root, "resident"), mesh: { actorPollMs: 20 } } as any });

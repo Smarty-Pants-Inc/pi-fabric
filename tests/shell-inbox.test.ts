@@ -23,7 +23,8 @@ const harness = () => {
     emit: (name: string, event: unknown = {}) => handlers.get(name)?.(event, ctx) };
 };
 beforeEach(() => vi.useFakeTimers());
-afterEach(async () => { for (const close of cleanups.splice(0)) await close(); vi.useRealTimers(); });
+// Filesystem removal may use nextTick internally; restore real timers before async teardown.
+afterEach(async () => { vi.useRealTimers(); for (const close of cleanups.splice(0)) await close(); });
 
 describe("live shell awareness", () => {
   const project = (h: ReturnType<typeof harness>, messages: unknown[] = []) => h.emit("context", { type: "context", messages });

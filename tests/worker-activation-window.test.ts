@@ -250,14 +250,14 @@ describe("native activation window (offline; opted-in success needs exact native
   const readJournal = (journal: string) => {
     const bytes = fs.readFileSync(journal);
     const entries = bytes.toString("utf8").split("\n").filter(line => line.length > 0)
-      .map(line => JSON.parse(line) as { type: string });
+      .map(line => JSON.parse(line) as { type: string; customType?: string; data?: { scope: string; activationId: string; entry: { type: string } } });
     return { bytes, entries };
   };
-  const expectJournalAppended = (journal: string, before: ReturnType<typeof readJournal>) => {
+  const expectJournalAppended = (journal: string, before: ReturnType<typeof readJournal>, allowCompaction = false) => {
     const after = readJournal(journal);
     expect(after.bytes.subarray(0, before.bytes.length)).toEqual(before.bytes);
     expect(after.entries.slice(0, before.entries.length)).toEqual(before.entries);
-    expect(after.entries.some(entry => entry.type === "compaction")).toBe(false);
+    if (!allowCompaction) expect(after.entries.some(entry => entry.type === "compaction")).toBe(false);
     return after;
   };
   // The run's event log shows how far the worker and child Pi got.
@@ -265,7 +265,7 @@ describe("native activation window (offline; opted-in success needs exact native
     const log = result.logFile && fs.existsSync(result.logFile) ? fs.readFileSync(result.logFile, "utf8") : "";
     return `${JSON.stringify(result)}\n${log.slice(-12_000)}`;
   };
-  const setup = async (toolRounds = 0, oversizedRound = 0) => {
+  const setup = async (toolRounds = 0, oversizedRound = 0, toolTask?: string) => {
     const dir = root();
     const requests: Array<Record<string, any>> = [];
     const server = http.createServer((request, response) => {
@@ -274,8 +274,9 @@ describe("native activation window (offline; opted-in success needs exact native
       request.on("end", () => {
         const payload = JSON.parse(body);
         requests.push(payload);
-        const round = requests.length;
-        const useTool = toolRounds ? round <= toolRounds : payload.tools?.length && !payload.messages.some((m: {role: string}) => m.role === "tool");
+        const round = toolTask ? payload.messages.filter((m: {role: string}) => m.role === "tool").length + 1 : requests.length;
+        const currentTask = JSON.stringify(payload.messages.findLast((m: {role: string}) => m.role === "user"));
+        const useTool = (!toolTask || currentTask?.includes(toolTask)) && (toolRounds ? round <= toolRounds : payload.tools?.length && !payload.messages.some((m: {role: string}) => m.role === "tool"));
         response.writeHead(200, { "Content-Type": "text/event-stream" });
         const chunk = (delta: unknown, finish_reason: string | null = null) => response.write(`data: ${JSON.stringify({
           id: "offline", object: "chat.completion.chunk", created: 1, model: "offline",
@@ -557,9 +558,11 @@ describe("native activation window (offline; opted-in success needs exact native
     const rawMessages = SessionManager.open(path.join(s.dir, "actors", actor.id, "session.jsonl")).getBranch()
       .flatMap(entry => entry.type === "message" ? sessionEntryToContextMessages(entry) : []);
     expect(estimateContextTokens(convertToLlm(rawMessages)).tokens).toBeGreaterThan(8000);
-    const compactions = journal.entries.filter(entry => entry.type === "compaction");
-    expect(compactions.length).toBeGreaterThanOrEqual(2);
-    expect(journal.entries.filter(entry => entry.type === "context_edit").length).toBeGreaterThanOrEqual(2);
+    const localContext = journal.entries.filter(entry => entry.type === "custom" && entry.customType === "fabric-activation-context");
+    expect(localContext.every(entry => entry.data?.scope === "activation" && typeof entry.data.activationId === "string")).toBe(true);
+    expect(localContext.filter(entry => entry.data?.entry.type === "compaction").length).toBeGreaterThanOrEqual(2);
+    expect(localContext.filter(entry => entry.data?.entry.type === "context_edit").length).toBeGreaterThanOrEqual(2);
+    expect(journal.entries.some(entry => entry.type === "compaction" || entry.type === "context_edit")).toBe(false);
     const raw = journal.bytes.toString("utf8");
     expect(raw).toContain("CURRENT_GROWING_ACTIVATION");
     for (let round = 1; round <= (unfittable ? 4 : 5); round++) {
@@ -574,6 +577,49 @@ describe("native activation window (offline; opted-in success needs exact native
       expect(call.tool_calls.some((call: any) => call.id === tool.tool_call_id)).toBe(true);
     }
     expect(JSON.stringify(s.requests.at(-1))).toContain("Compacted tool output");
+    expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
+  }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary)("3238 restores an earlier same-actor sentinel in the real provider request after activation-local compaction", async () => {
+    const s = await setup(5, 0, "CURRENT_COMPACTING_ACTIVATION");
+    const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
+    const actors = new ActorManager("restore-window-test", {id: "owner", name: "owner", kind: "main", sessionId: "restore-window-test"}, mesh,
+      {...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20}, s.manager, () => {},
+      {actorRoot: path.join(s.dir, "actors"), persistent: true});
+    managers.push(actors);
+    const actor = await actors.create({name: "restored", instructions: "Act on each event.", inferenceContext: "full-history",
+      model: "window-test/offline", tools: ["read"], extensions: false, transport: "process", delivery: "mailbox"});
+    const journalFile = path.join(s.dir, "actors", actor.id, "session.jsonl");
+    const sentinel = "ACTIVATION_ONE_SENTINEL: the launch password is violet-orchard-731.";
+    await expect(actors.ask(actor.id, sentinel)).resolves.toMatchObject({text: "useful current result"});
+    expect(s.requests).toHaveLength(1);
+    const before = readJournal(journalFile);
+    await actors.setInferenceContext(actor.id, "activation");
+    await expect(actors.ask(actor.id, "CURRENT_COMPACTING_ACTIVATION")).resolves.toMatchObject({text: "useful current result"});
+    expect(s.requests).toHaveLength(7);
+    expect(JSON.stringify(s.requests.slice(1))).not.toContain(sentinel);
+    expect(JSON.stringify(s.requests.at(-1))).toContain("Compacted tool output"); // Actual in-run compaction, not a synthetic journal.
+    const compacted = expectJournalAppended(journalFile, before, true);
+    expect(compacted.bytes.toString("utf8")).toContain(sentinel);
+
+    // Full raw tool history now legitimately needs a larger model. Avoid an
+    // unrelated native auto-compaction masking the restored-history request.
+    const modelsFile = path.join(s.dir, "agent", "models.json");
+    const models = JSON.parse(fs.readFileSync(modelsFile, "utf8"));
+    models.providers["window-test"].models[0].contextWindow = 128_000;
+    fs.writeFileSync(modelsFile, JSON.stringify(models));
+    await actors.setInferenceContext(actor.id, "full-history");
+    const nextRequest = s.requests.length;
+    await expect(actors.ask(actor.id, "RESTORED_FULL_HISTORY_ACTIVATION_THREE")).resolves.toMatchObject({text: "useful current result"});
+    await actors.close();
+    expect(s.requests).toHaveLength(nextRequest + 1);
+    // HTTP server captured the real serialized provider body, not a context hook.
+    expect(JSON.stringify(s.requests[nextRequest])).toContain(sentinel);
+    expect(JSON.stringify(s.requests[nextRequest])).toContain("CURRENT_COMPACTING_ACTIVATION");
+    expect(JSON.stringify(s.requests[nextRequest])).toContain("RESTORED_FULL_HISTORY_ACTIVATION_THREE");
+    expect(JSON.stringify(s.requests[nextRequest])).toContain(fs.readFileSync(path.join(s.dir, "task-1.txt"), "utf8")); // Local edits do not leak either.
+    expect(compacted.entries.some(entry => entry.type === "compaction" || entry.type === "context_edit")).toBe(false);
+    expectJournalAppended(journalFile, compacted, true);
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
   }, TEST_GUARD_MS);
 

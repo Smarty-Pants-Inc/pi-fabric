@@ -158,11 +158,15 @@ describe("async session pipeline", () => {
     expect(await machineSessionFilesAsync(agentDir, "/repo")).toEqual(files);
     const expectedEvidence = sessionWindowEvidence(files);
     let eventLoopAdvanced = false;
-    const timer = setTimeout(() => {
-      eventLoopAdvanced = true;
-    }, 0);
+    const timer = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        eventLoopAdvanced = true;
+        resolve();
+      }, 0);
+    });
     const evidence = await sessionWindowEvidenceAsync(files);
-    clearTimeout(timer);
+    // Fast filesystem reads can finish before a zero-delay timer becomes due.
+    await timer;
     expect(eventLoopAdvanced).toBe(true);
     expect(evidence).toEqual(expectedEvidence);
     expect(await measureSessionCorpusAsync({ files })).toEqual(measureSessionCorpus({ files }));

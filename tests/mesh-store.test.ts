@@ -607,6 +607,63 @@ describe("MeshStore lock recovery", () => {
     return lockPath;
   };
 
+  it.each(["write", "opened"] as const)("a paused native recoverer cannot detach a default-v1 %s initializer that publishes and enters first", async (phase) => {
+    const store = createStore();
+    const lock = path.join(store.root, ".lock");
+    const ownerPath = path.join(lock, "owner");
+    const children: Array<{ closed: Promise<number | null>; output: () => { stdout: string; stderr: string } }> = [];
+    const start = (role: "initializer" | "recoverer") => {
+      const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-paused-recovery.mjs"), store.root, role, phase], {
+        cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", chunk => { stdout += chunk; });
+      child.stderr.on("data", chunk => { stderr += chunk; });
+      const closed = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+      closed.catch(() => undefined);
+      const captured = { closed, output: () => ({ stdout, stderr }) };
+      children.push(captured);
+      return captured;
+    };
+    const signal = (name: string) => fs.writeFileSync(path.join(store.root, name), "");
+    const ready = async (name: string) => {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(store.root, name))).toBe(true), { timeout: 10_000, interval: 20 });
+    };
+    const initializer = start("initializer");
+    try {
+      await ready("initializer.ready");
+      expect(fs.existsSync(ownerPath)).toBe(phase === "opened");
+      if (phase === "opened") expect(fs.readFileSync(ownerPath, "utf8")).toBe("");
+      const past = new Date(Date.now() - 60_000);
+      fs.utimesSync(lock, past, past);
+      const recoverer = start("recoverer");
+      await ready("recoverer.ready");
+      signal("initializer.go");
+      await ready("initializer.entered"); // actual acquisition validation succeeded; operation remains live
+      const held = JSON.parse(fs.readFileSync(path.join(store.root, "initializer.entered"), "utf8")) as { owner: string; ino: number; dev: number };
+      expect(held.owner.trim().split("\n")).toHaveLength(3); // default wire did not change
+      signal("recoverer.go");
+      expect(await recoverer.closed, recoverer.output().stderr).toBe(0);
+      // Still inside the initializer's synchronous critical section. Baseline detaches
+      // this inode and enters a second operation; neither action is permitted.
+      expect(fs.existsSync(lock), recoverer.output().stdout).toBe(true);
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(held.owner);
+      expect([fs.lstatSync(lock).dev, fs.lstatSync(lock).ino]).toEqual([held.dev, held.ino]);
+      expect(JSON.parse(recoverer.output().stdout.trim())).toMatchObject({ ran: false, timeout: true, boundary: "refused-before-detach" });
+      expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."))).toEqual([]);
+    } finally {
+      signal("initializer.go");
+      signal("recoverer.go");
+      signal("initializer.release");
+      // Join EVERY captured native child's actual close before afterEach removes the root,
+      // including the deliberately failing baseline ordering.
+      const exits = await Promise.all(children.map(async child => ({ code: await child.closed, ...child.output() })));
+      for (const exit of exits) expect(exit.code, exit.stderr).toBe(0);
+    }
+    expect(JSON.parse(initializer.output().stdout.trim())).toMatchObject({ ran: true });
+    expect(fs.existsSync(lock)).toBe(false);
+  }, 30_000);
+
   it.each([["write", 1], ["opened", 1], ["write", 2], ["rename", 2]] as const)("a paused native %s publication (protocol %s) cannot overwrite or enter a live successor", async (phase, lockProtocol) => {
     const store = createStore({ lockTimeoutMs: 1_000, ...(lockProtocol === 2 ? { lockProtocol } : {}) });
     const lock = path.join(store.root, ".lock");
@@ -629,6 +686,14 @@ describe("MeshStore lock recovery", () => {
         fs.writeFileSync(path.join(lock, "legacy-leftover"), "orphan\n");
         const past = new Date(Date.now() - 30_001);
         fs.utimesSync(lock, past, past);
+        // No recorded owner proves that this paused initializer cannot resume.
+        // Production must now refuse the old age-only recovery in BOTH protocols.
+        await expect(store.exclusive(() => { throw new Error("must not recover an unrecorded initializer"); }))
+          .rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+        expect(fs.existsSync(lock)).toBe(true);
+        // Preserve round 4's opposite-order namespace-replacement defense as an
+        // adversarial fixture action, NOT a production ownerless-recovery policy.
+        fs.renameSync(lock, `${lock}.test-detached`);
       }
       await store.exclusive(() => {
         const owner = fs.readFileSync(ownerPath, "utf8");
@@ -652,8 +717,7 @@ describe("MeshStore lock recovery", () => {
         ? { ran: true, refused: false, timeout: false, ownershipLost: false }
         : { ran: false, refused: true, timeout: true, ownershipLost: false });
     const fences = fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."));
-    expect(fences).toHaveLength(phase !== "rename" ? 1 : 0);
-    if (phase === "write") expect(fs.readdirSync(path.join(store.root, fences[0]!))).toContain(".recovery-fence");
+    expect(fences).toHaveLength(0);
     expect(fs.readdirSync(store.root).some(name => name.startsWith(".lock.pending."))).toBe(false);
   });
 
@@ -767,6 +831,27 @@ describe("MeshStore lock recovery", () => {
     const fences = fs.readdirSync(store.root).filter((name) => name.startsWith(".lock.dead."));
     expect(fences).toHaveLength(1);
     expect(fs.readFileSync(path.join(store.root, fences[0]!, "owner"), "utf8")).toContain("recent-dead\n");
+  });
+
+  it("immediately recovers the complete default-v1 receipt of a joined native dead holder", async () => {
+    const store = createStore({ lockTimeoutMs: 100 });
+    const lock = path.join(store.root, ".lock");
+    const child = spawn(process.execPath, ["-e", `
+      const fs = require("node:fs"), path = require("node:path");
+      fs.mkdirSync(process.argv[1]);
+      fs.writeFileSync(path.join(process.argv[1], "owner"), "native-dead\\n" + process.pid + "\\n" + Date.now() + "\\n");
+    `, lock], { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", chunk => { stderr += chunk; });
+    const closed = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    expect(await closed, stderr).toBe(0); // actual native holder exit before recovery
+    const receipt = fs.readFileSync(path.join(lock, "owner"), "utf8");
+    const operation = vi.fn(() => "recovered");
+    await expect(store.exclusive(operation)).resolves.toBe("recovered");
+    expect(operation).toHaveBeenCalledOnce();
+    const fences = fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."));
+    expect(fences).toHaveLength(1);
+    expect(fs.readFileSync(path.join(store.root, fences[0]!, "owner"), "utf8")).toBe(receipt);
   });
 
   it("a paused stale cleaner cannot remove or rename over a successor held by another cleaner", async () => {
@@ -952,6 +1037,20 @@ describe("MeshStore lock recovery", () => {
     expect(fs.existsSync(lock)).toBe(true);
   });
 
+  it.each(["EACCES", "EIO", undefined])("fails closed when the PID death probe fails with %s instead of ESRCH", async (code) => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    const owner = `unknown\n999999999\n${Date.now() - 60_000}\n`;
+    const lock = holdLock(store, owner);
+    vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("unknown probe failure"), { code }); });
+    const operation = vi.fn();
+    const pending = store.exclusive(operation).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await pending).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+  });
+
   it("keeps fresh corrupt records and protects live PIDs even in stale malformed records", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
     const store = createStore({ lockTimeoutMs: 100 });
@@ -978,31 +1077,28 @@ describe("MeshStore lock recovery", () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  it("sweeps an ownerless lock left by a crash older than the stale window", async () => {
-    const store = createStore();
-    const lockPath = holdLock(store);
-    const past = new Date(Date.now() - 60_000);
-    fs.utimesSync(lockPath, past, past);
-
-    const event = await store.publish({ topic: "team.auth", from: identity, text: "recovered" });
-
-    expect(event.sequence).toBe(1);
-    expect(fs.existsSync(lockPath)).toBe(false);
-    const fence = fs.readdirSync(store.root).find((name) => name.startsWith(".lock.dead."));
-    expect(fence).toBeDefined();
-    expect(fs.readdirSync(path.join(store.root, fence!))).toContain(".recovery-fence");
-  });
-
-  it("sweeps a lock whose owner file is corrupt", async () => {
-    const store = createStore();
-    const lockPath = holdLock(store, "not-a-valid-owner");
-    const past = new Date(Date.now() - 60_000);
-    fs.utimesSync(lockPath, past, past);
-
-    const event = await store.publish({ topic: "team.auth", from: identity, text: "recovered" });
-
-    expect(event.sequence).toBe(1);
-    expect(fs.existsSync(lockPath)).toBe(false);
+  it.each([1, 2] as const)("fails closed on old ownerless/torn/corrupt receipts (protocol %s), even with a dead-looking partial PID", async (lockProtocol) => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockProtocol, lockTimeoutMs: 100, staleLockMs: 100 });
+    const receipts = [undefined, "", "not-a-valid-owner", "writing\n999999999", "writing\n999999999\n",
+      "writing\n999999999\n100", "writing\n999999999\ninvalid-time\n", "writing\n999999999\n100\nextra\nextra\n"];
+    for (const owner of receipts) {
+      const lock = holdLock(store, owner);
+      const past = new Date(Date.now() - 60_000);
+      fs.utimesSync(lock, past, past);
+      const before = fs.lstatSync(lock);
+      const operation = vi.fn();
+      const pending = store.exclusive(operation).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await pending).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(operation).not.toHaveBeenCalled();
+      const after = fs.lstatSync(lock);
+      expect([after.dev, after.ino, after.mtimeMs]).toEqual([before.dev, before.ino, before.mtimeMs]);
+      expect(fs.readdirSync(lock)).toEqual(owner === undefined ? [] : ["owner"]);
+      if (owner !== undefined) expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+      expect(fs.readdirSync(store.root).some(name => name.startsWith(".lock.dead."))).toBe(false);
+      fs.rmSync(lock, { recursive: true });
+    }
   });
 
   it("never sweeps a lock owned by a live process and times out instead", async () => {

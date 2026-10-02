@@ -76,6 +76,7 @@ export interface MeshStoreOptions {
   maxStateBytes?: number;
   maxStateTombstones?: number;
   lockTimeoutMs?: number;
+  /** @deprecated Retained for source compatibility; age alone never authorizes recovery. */
   staleLockMs?: number;
   /**
    * Reads (get, list, listAll) reuse the last parsed state for up to this long, even when
@@ -89,7 +90,6 @@ export interface MeshStoreOptions {
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
 const LOCK_TIMEOUT_MS = 10_000;
-const STALE_LOCK_MS = 30_000;
 const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
@@ -164,7 +164,9 @@ const processAlive = (pid: number): boolean => {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return errorCode(error) === "EPERM"; // A process we cannot signal is not a dead holder.
+    // Only the native no-such-process result proves death. Permission denial and
+    // unexpected/unknown probe failures must not authorize detaching a live holder.
+    return errorCode(error) !== "ESRCH";
   }
 };
 
@@ -456,7 +458,6 @@ export class MeshStore {
   readonly #maxStateBytes: number;
   readonly #maxStateTombstones: number;
   readonly #lockTimeoutMs: number;
-  readonly #staleLockMs: number;
   readonly #readCacheMs: number;
   /**
    * Line ends (sequence, offset) that recent read({ after }) scans passed, by rising sequence. A
@@ -510,7 +511,6 @@ export class MeshStore {
       Math.floor(options.maxStateTombstones ?? DEFAULT_MAX_STATE_TOMBSTONES),
     );
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
-    this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
     this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   }
@@ -1583,9 +1583,10 @@ export class MeshStore {
     }
   }
 
-  // Dead holders are recoverable at once; only missing/corrupt records need the stale
-  // directory window. A live PID (including stopped/permission-denied) remains protected,
-  // unless the native platform proves a different incarnation from the optional fourth owner line.
+  // Recover only a complete receipt whose recorded holder is proven dead (or whose
+  // native incarnation is proven different). Missing/torn/corrupt receipts fail closed,
+  // regardless of age: a paused v1 initializer can still publish and enter after our
+  // last comparison. Both protocols may encounter such a canonical v1 directory.
   async #clearStaleLock(ownerPath: string): Promise<boolean> {
     try {
       const stat = fs.lstatSync(this.#lockPath);
@@ -1595,32 +1596,25 @@ export class MeshStore {
         catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
       };
       const owner = readOwner();
-      const [token, pidText, createdText, startText] = owner?.trim().split("\n") ?? [];
+      const fields = owner?.split("\n") ?? [];
+      const [token, pidText, createdText, startText] = fields;
       // An in-flight/torn fourth line is not evidence of PID reuse.
       const recordedStart = owner?.endsWith("\n") ? startText : undefined;
       const pid = Number(pidText);
       const validPid = Number.isSafeInteger(pid) && pid > 0;
-      const validOwner = !!token && validPid && createdText !== undefined &&
+      const validOwner = owner?.endsWith("\n") && (fields.length === 4 || fields.length === 5) &&
+        !!token && validPid && createdText !== undefined &&
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
-      if (validPid && processAlive(pid)) {
-        if (!validOwner || !validProcessIncarnation(recordedStart)) return false;
+      if (!validOwner) return false;
+      if (processAlive(pid)) {
+        if (!validProcessIncarnation(recordedStart)) return false;
         const actualStart = await processIncarnation(pid);
         if (!actualStart || actualStart === recordedStart) return false;
-      } else if (!validOwner && Date.now() - stat.mtimeMs <= this.#staleLockMs) {
-        return false;
       }
       const unchanged = (): boolean => {
         const current = fs.lstatSync(this.#lockPath);
         return current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino && readOwner() === owner;
       };
-      if (!unchanged()) return false;
-      if (owner === undefined) {
-        // An empty orphan must also leave a NONEMPTY fence. Never overwrite an owner;
-        // identity/owner rechecks reject a successor even if this marker raced its mkdir.
-        if (fs.statSync(this.#lockPath).mtimeMs !== stat.mtimeMs) return false;
-        try { fs.writeFileSync(path.join(this.#lockPath, ".recovery-fence"), "1\n", { flag: "wx", mode: 0o600 }); }
-        catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
-      }
       if (!unchanged()) return false;
       const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner ?? ""}`).digest("hex")}`;
       // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner

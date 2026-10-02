@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { AgentFollowUpRunningWarning } from "./agents/types.js";
 import fs from "node:fs";
 import path from "node:path";
 import { readFileRetrying, syncPathNamespace, writeFileAtomic } from "./core/atomic-write.js";
@@ -59,6 +60,8 @@ export interface FabricFollowUpQueueDepth {
 }
 
 export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDepth> {
+  /** Sender-only observation at task admission; delivery is unchanged. */
+  warning?: AgentFollowUpRunningWarning;
   /** Advisory identifier provenance notice; appended to delivered text when admission permits. */
   notice?: string;
   queued: true;

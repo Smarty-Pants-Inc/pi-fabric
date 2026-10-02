@@ -60,6 +60,7 @@ import type {
   AgentTransportLaunch,
   AgentUsage,
 } from "./types.js";
+import { FOLLOW_UP_RUNNING_TASK_MESSAGE } from "./types.js";
 import { WorktreeManager } from "./worktree-manager.js";
 import { writeHandoffSession } from "./handoff.js";
 import type { FabricCompactionBudget } from "../compaction/hook.js";
@@ -1816,7 +1817,17 @@ export class AgentManager {
       }
     }
     fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
-    return { queued: true, messageId };
+    return {
+      queued: true,
+      messageId,
+      ...(entry.type === "follow_up" && record?.status === "running" ? { warning: {
+        code: "FABRIC_FOLLOW_UP_RUNNING_TASK" as const,
+        targetId: managed.id,
+        kind: "agent" as const,
+        status: "running" as const,
+        message: FOLLOW_UP_RUNNING_TASK_MESSAGE,
+      } } : {}),
+    };
   }
 
   /** Non-destructive receipt for a paused resident release boundary. A terminal

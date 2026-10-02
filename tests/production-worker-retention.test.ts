@@ -108,7 +108,18 @@ const makeUnsafe = (run: string, kind: UnsafeKind) => {
 };
 
 // Copy the entire emitted tree, including native session and delivery artifacts.
-const copyRun = (source: string, destination: string) => { fs.cpSync(source, destination, { recursive: true }); return destination; };
+// Each named fixture represents a distinct run, so its status identity must match
+// its directory (as production runs and actor archives do). Keep settlement
+// journals intact so unsafe controls cannot pass merely due to an ID mismatch.
+const copyRun = (source: string, destination: string) => {
+  fs.cpSync(source, destination, { recursive: true });
+  const file = path.join(destination, "status.json");
+  const status = JSON.parse(fs.readFileSync(file, "utf8"));
+  status.id = path.basename(destination);
+  if (typeof status.agentId === "string") status.agentId = status.id;
+  fs.writeFileSync(file, JSON.stringify(status));
+  return destination;
+};
 
 describe("I-2 production-worker ingress retention", () => {
   it.each([false, true])("collects default-root close with principal provenance=%s", async principal => {

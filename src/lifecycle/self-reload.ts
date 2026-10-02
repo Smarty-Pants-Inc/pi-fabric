@@ -310,13 +310,14 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     if (reason) { invalidate(candidate, reason, active.target); return false; }
     return true;
   };
-  const candidateNow = (): ReloadCandidate | undefined => {
+  /** An explicit command retries a consumed target on demand; only automatic requests skip it. */
+  const candidateNow = (explicitRequest = false): ReloadCandidate | undefined => {
     const target = watch?.check();
     if (target && watch) pending.set("fabric", { kind: "fabric", loaded: watch.loaded, target });
     else pending.delete("fabric");
     for (const [key, candidate] of pending) {
       // Consumed targets must not starve another resource after a failed native reload.
-      if (sessionId && attempted(sessionId, candidate)) { pending.delete(key); continue; }
+      if (!explicitRequest && sessionId && attempted(sessionId, candidate)) { pending.delete(key); continue; }
       if (recheck(candidate)) return candidate;
     }
     return undefined;
@@ -480,14 +481,14 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       const auto = mode === "auto";
       // A queued resource command is pinned to this session/target; never retarget a stale command.
       if (token && scheduled?.token !== token) return;
-      const candidate = scheduled?.candidate ?? candidateNow();
+      const candidate = scheduled?.candidate ?? candidateNow(!auto);
       scheduled = undefined;
       // Consuming a command never consumes other pending targets. In particular, a stale
       // pinned target or a failed reload must leave an idle path to the current target.
       // Native session_start/shutdown clears this timer after a successful reload.
       if (auto && contextNow && context.sessionManager.getSessionId() === sessionId) armRetry(context);
       const say = (message: string) => { if (!auto && context.hasUI) context.ui.notify(message, "info"); };
-      if (!candidate || !recheck(candidate)) return say("No newer Fabric release or bound extension target is active.");
+      if (!candidate || !recheck(candidate)) return say("No other Fabric release or bound extension target is active.");
       if (auto && (userHalted() || autoReloadOptedOut(deps.autoReloadConfigured()))) return;
       if (candidate.kind === "resource") {
         if (autoReloadOptedOut(deps.autoReloadConfigured())) return;
@@ -530,6 +531,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
         // Shutdown alone must not free it early; an unclaimed native failure releases below.
         handoff = handoffs().get(id)!;
         if (releaseSlot) handoff.releaseSlot = releaseSlot;
+        if (candidate.kind === "fabric") say(`Reloading Fabric ${releaseLabel(candidate.loaded)} -> ${releaseLabel(candidate.target)} (the release the Pi profile activates; it may be older).`);
         await context.reload();
       } finally {
         // A claimed handoff belongs to the new activation, even if native reload resolves early.
@@ -560,6 +562,10 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       if (!unsubscribe) unsubscribe = pi.events?.on(RELOAD_TARGET_TOPIC, receive);
       const done = takeSelfReload(sessionId, reason);
       const loaded = loadedFabricRoot(deps.moduleUrl);
+      // smarty-dev#3324: attempts only stop a retry loop onto a target that failed to load. Once a
+      // Fabric reload has landed on its target, every earlier target is followable again; otherwise
+      // a --restore to a release this Main once reloaded onto would be ignored forever.
+      if (done && !done.resource && loaded === done.target) attempts.delete(sessionId);
       if (!loaded || !contextNow) {
         watch = undefined;
         done?.releaseSlot?.();

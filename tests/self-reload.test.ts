@@ -450,3 +450,77 @@ describe("installSelfReload", () => {
     expect(main.notices).toEqual([]);
   });
 });
+
+describe("restore to an older release (smarty-dev#3324)", () => {
+  // Each runtime is a fresh module instance loaded from one release; the process-global attempt
+  // memory and handoff survive Pi's native reload exactly like production.
+  const runtime = (root: string) => {
+    const fake = fakePi();
+    const controller = installSelfReload(fake.pi as never, {
+      busy: () => 0, selfReloadConcurrency: () => 0, autoReloadConfigured: () => true,
+      moduleUrl: pathToFileURL(path.join(root, "dist", "index.js")).href, settingsPath: settingsPath(),
+      reloadTargetUiHold,
+    });
+    return { ...fake, controller, command: fake.commands.get(SELF_RELOAD_COMMAND)! };
+  };
+  // A Main that already self-reloaded onto `a` once (the earlier activation of the release that is
+  // later restored), then onto `b`.
+  const history = async (session: string) => {
+    const older = release("c00"), a = release("dd65"), b = release("ab85");
+    activate(older);
+    const context = fakeContext(session, { idle: true, pending: false });
+    let current = runtime(older);
+    current.controller.sessionStart("startup", context as never);
+    for (const [from, to] of [[older, a], [a, b]] as const) {
+      activate(to); current.emit("agent_settled", context);
+      expect(current.sent).toEqual([`/${SELF_RELOAD_COMMAND} auto`]);
+      await current.command.handler("auto", context);
+      current.emit("session_shutdown", context);
+      current = runtime(to);
+      expect(current.controller.sessionStart("reload", context as never))
+        .toEqual({ old: path.basename(from), new: path.basename(to) });
+    }
+    expect(context.reload).toHaveBeenCalledTimes(2);
+    return { a, b, context, current };
+  };
+
+  it("a runtime on the activated release self-reloads back onto the restored older one once idle", async () => {
+    const { a, b, context, current } = await history("s-restore-auto");
+    activate(a); // --restore
+    current.emit("agent_settled", context);
+    expect(current.sent).toEqual([`/${SELF_RELOAD_COMMAND} auto`]);
+    await current.command.handler("auto", context);
+    expect(context.reload).toHaveBeenCalledTimes(3);
+    current.emit("session_shutdown", context);
+    const restored = runtime(a);
+    expect(restored.controller.sessionStart("reload", context as never)).toEqual({ old: "ab85", new: "dd65" });
+    // A later re-activation of the same release is followed again.
+    activate(b); restored.emit("agent_settled", context);
+    expect(restored.sent).toEqual([`/${SELF_RELOAD_COMMAND} auto`]);
+    await restored.command.handler("auto", context);
+    expect(context.reload).toHaveBeenCalledTimes(4);
+    restored.emit("session_shutdown", context);
+  });
+
+  it("the command loads the restored older release on demand and says where it moves", async () => {
+    const { a, context, current } = await history("s-restore-command");
+    activate(a);
+    await current.command.handler("", context);
+    expect(context.reload).toHaveBeenCalledTimes(3);
+    expect(context.notices.at(-1)).toBe("Reloading Fabric ab85 -> dd65 (the release the Pi profile activates; it may be older).");
+    current.emit("session_shutdown", context);
+  });
+
+  it("a runtime loaded from outside the profile still never follows a restore", async () => {
+    const a = release("dd65"), b = release("ab85");
+    activate(b);
+    const dev = runtime(release("dev"));
+    const context = fakeContext("s-restore-dev", { idle: true, pending: false });
+    dev.controller.sessionStart("startup", context as never);
+    activate(a); dev.emit("agent_settled", context);
+    await dev.command.handler("", context);
+    expect(dev.sent).toEqual([]);
+    expect(context.reload).not.toHaveBeenCalled();
+    dev.emit("session_shutdown", context);
+  });
+});

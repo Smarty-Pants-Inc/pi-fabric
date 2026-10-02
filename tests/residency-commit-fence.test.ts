@@ -123,7 +123,9 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
       // Host shutdown confirms resident worker exit. Public CPython cases must
       // separately confirm guest close: runtime settlement bounds its reap wait.
       // After those barriers, retry only transient OS cwd/directory retention.
-      fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+      // Retry asynchronously: rmSync's retry delay blocks the event loop, so this
+      // process's own pending handle closes could never finish between attempts.
+      await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
     },
   };
 };
@@ -360,11 +362,11 @@ describe("resident creation cache boundaries", () => {
 describe("resident fence harness teardown", () => {
   it("retries a transient Windows EBUSY after the resident host has closed", async () => {
     const state = await harness(false);
-    const rm = fs.rmSync.bind(fs);
+    const rm = fs.promises.rm.bind(fs.promises);
     let attempts = 0;
     let cleanupOptions: fs.RmOptions | undefined;
     const busy = Object.assign(new Error("Windows still holds the removed cwd"), { code: "EBUSY" });
-    const cleanup = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    const cleanup = vi.spyOn(fs.promises, "rm").mockImplementation(async (target, options) => {
       if (String(target) !== state.root) return rm(target, options);
       cleanupOptions = options;
       expect(fs.existsSync(path.join(state.residencyRoot, "owner.json"))).toBe(false);
@@ -380,11 +382,11 @@ describe("resident fence harness teardown", () => {
     try {
       await expect(state.close()).resolves.toBeUndefined();
       expect(attempts).toBe(2);
-      expect(cleanupOptions).toMatchObject({ recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+      expect(cleanupOptions).toMatchObject({ recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
       expect(fs.existsSync(state.root)).toBe(false);
     } finally {
       cleanup.mockRestore();
-      rm(state.root, { recursive: true, force: true });
+      await rm(state.root, { recursive: true, force: true });
     }
   });
 });
@@ -1508,7 +1510,7 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
     it(`${engine} teardown exposes a committed unawaited mutation ${settlesDuringGrace ? "that settles during grace" : "still pending after grace"} rather than false success${holdGuestExit ? " with guest exit delayed past reap grace" : ""}`, async () => {
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
       const trace = engine === "cpython" ? await captureDurableExecutionTrace() : undefined;
-      const rm = fs.rmSync.bind(fs);
+      const rm = fs.promises.rm.bind(fs.promises);
       let guest: childProcess.ChildProcess | undefined;
       let killGuest: (() => void) | undefined;
       let guestExited = false; let guestClosed = false; let removals = 0;
@@ -1537,7 +1539,7 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
           }
           return spawn(...args);
         }) as typeof childProcess.spawn);
-        const cleanup = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+        const cleanup = vi.spyOn(fs.promises, "rm").mockImplementation(async (target, options) => {
           if (String(target) === state.root) {
             removals++;
             if (!guestExited) {
@@ -1585,8 +1587,9 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
         expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
       } finally {
         clearTimeout(releaseTimer); state.release.resolve();
-        // Hold the actual child beyond both the runtime's 250 ms reap grace and
-        // the harness's 375 ms recursive-rm retry window, then confirm its close.
+        // Hold the actual child beyond the runtime's 250 ms reap grace, then
+        // confirm its close; the injected rm fails while it lives, so the harness
+        // cannot rely on its recursive-rm retry window to outlast a live guest.
         const killTimer = holdGuestExit ? setTimeout(() => killGuest?.(), 1_000) : undefined;
         try {
           // A runtime result is not an exit barrier once its bounded reap grace
@@ -1597,7 +1600,7 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
         } finally {
           clearTimeout(killTimer); killGuest?.(); await trace?.waitForGuests();
           restoreCleanup?.();
-          if (holdGuestExit) rm(state.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+          if (holdGuestExit) await rm(state.root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
         }
       }
     });

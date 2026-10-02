@@ -395,6 +395,14 @@ describe("Fabric configuration", () => {
     ).toBe(60 * 60 * 1_000);
   });
 
+  it("bounds the configurable bridged command deadline to 30 s through 5 minutes", () => {
+    expect(DEFAULT_FABRIC_CONFIG.mesh.bridgeControlTimeoutMs).toBe(30_000);
+    expect(normalizeFabricConfig({ mesh: { bridgeControlTimeoutMs: 1 } }).mesh.bridgeControlTimeoutMs).toBe(30_000);
+    expect(normalizeFabricConfig({ mesh: { bridgeControlTimeoutMs: 60_000 } }).mesh.bridgeControlTimeoutMs).toBe(60_000);
+    expect(normalizeFabricConfig({ mesh: { bridgeControlTimeoutMs: 999_999 } }).mesh.bridgeControlTimeoutMs).toBe(300_000);
+    expect(normalizeFabricConfig({ mesh: { bridgeControlTimeoutMs: "bad" } }).mesh.bridgeControlTimeoutMs).toBe(30_000);
+  });
+
   it("defaults actor scope to project and validates the value", () => {
     expect(DEFAULT_FABRIC_CONFIG.mesh.actorScope).toBe("project");
     const session = normalizeFabricConfig({ mesh: { actorScope: "session" } });

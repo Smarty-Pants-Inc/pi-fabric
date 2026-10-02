@@ -283,6 +283,7 @@ export class ResidentHost {
       enabled: true,
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
+      bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });

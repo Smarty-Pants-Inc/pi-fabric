@@ -36,6 +36,8 @@ import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mesh/store.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
@@ -232,11 +234,17 @@ export class ResidentHost {
   readonly #responsesPath: string;
   readonly #agentsPath: string;
   readonly #removalsPath: string;
-  readonly #deliveryPrefix: string;
+  readonly #deliveryOutboxPath: string;
+  readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery");
+  #flushingDeliveries: Promise<unknown> | undefined;
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
+  // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
+  readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
+  readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
+  readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
   #idleSince = Date.now();
   #admissions = 0;
@@ -265,7 +273,7 @@ export class ResidentHost {
     this.#responsesPath = path.join(config.residencyRoot, "responses");
     this.#agentsPath = path.join(config.residencyRoot, "agents");
     this.#removalsPath = residentRemovalsPath(config.residencyRoot);
-    this.#deliveryPrefix = residentDeliveryPrefix(config.rootId);
+    this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
   }
 
   #initialize(): void {
@@ -366,7 +374,7 @@ export class ResidentHost {
           includeSlots: false,
         }).appendText || undefined;
       },
-      onLifecycle: (event) => { if (this.lifecycle) this.#trackPublication(this.lifecycle.publish(event)); },
+      onLifecycle: (event) => { if (this.lifecycle) this.#trackPublication(this.lifecycle.publishBackground(event)); },
       onSettled: (result) => {
         // Only public durable task runs: actor activations are cleaned by their actor (review/astra on #136).
         if (result.actorId) return;
@@ -424,6 +432,7 @@ export class ResidentHost {
             actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd)),
           ),
           message.source === "fabric-host" ? undefined : message.principal,
+          message.source === "fabric-host" ? "fabric-host" : "actor-output",
         ));
       },
       {
@@ -502,7 +511,10 @@ export class ResidentHost {
         await this.#probeWorkerStartup();
       }
       this.#requestTimer = setInterval(
-        () => void this.#pollRequests().catch(() => undefined),
+        () => {
+          void this.#backgroundRequests.run(() => this.#pollRequests());
+          void this.#retryDeliveries();
+        },
         REQUEST_POLL_MS,
       );
       const now = Date.now();
@@ -511,11 +523,13 @@ export class ResidentHost {
         hostId: this.hostId,
         pid: process.pid,
         processStartTime: processStartTime(process.pid),
+        fabricExtensionPath: this.config.fabricExtensionPath,
         token: this.#token,
         startedAt: now,
         readyAt: now,
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
+        creationIdempotency: 1,
         ...(this.launch ? { releaseRoot: this.launch.spec.releaseRoot, configDigest: this.launch.spec.digest,
           handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
           ...(this.launch.attempt ? { attempt: this.launch.attempt } : {}) } : {}),
@@ -523,7 +537,13 @@ export class ResidentHost {
       atomicWrite(this.#ownerPath, owner);
       fs.rmSync(this.#errorPath, { force: true });
       // Removals a previous host accepted: their runs ended with it.
-      if (!this.#staged) this.#trackPublication(this.actors.finishPendingRemovals().finally(() => this.#writeRemovals()));
+      if (!this.#staged) {
+      void this.#backgroundDeliveries.enqueue(async () => {
+        await this.actors.finishPendingRemovals();
+        this.#writeRemovals();
+      });
+      void this.#retryDeliveries();
+      }
       await this.#pollRequests();
     } catch (error) {
       await this.close();
@@ -545,8 +565,13 @@ export class ResidentHost {
       await closeWithActors({ close: () => actorsClosed }, () => this.control?.close().catch(() => undefined));
     } finally {
       try {
-        await this.agents?.close();
-        await this.participants?.close().catch(() => undefined);
+        try {
+          await this.agents?.close();
+        } finally {
+          await this.#backgroundDeliveries.close();
+          await this.#flushingDeliveries;
+          await this.participants?.close().catch(() => undefined);
+        }
       } finally { this.#releaseLock(); }
     }
   }
@@ -618,7 +643,8 @@ export class ResidentHost {
       const result = command.operation === "steer"
         ? this.agents.steer(command.targetId, message, command.data, provenance)
         : this.agents.followUp(command.targetId, message, command.data, provenance);
-      return { accepted: true, messageId: result.messageId };
+      return { accepted: true, messageId: result.messageId,
+        ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
         return { accepted: false, error: errorMessage(error) };
@@ -699,14 +725,15 @@ export class ResidentHost {
     agentCompletionId?: string,
     rootId = this.config.rootId,
     principal?: FabricPrincipal,
+    source?: ResidentDeliveryRecord["source"],
   ): Promise<void> {
     const id = randomUUID();
-    const prefix = rootId === this.config.rootId ? this.#deliveryPrefix : residentDeliveryPrefix(rootId);
     const record: ResidentDeliveryRecord = {
       format: RESIDENT_HOST_FORMAT,
       id,
       rootId,
       from,
+      ...(source ? { source } : {}),
       ...(principal ? { principal } : {}),
       delivery,
       triggerTurn,
@@ -715,24 +742,47 @@ export class ResidentHost {
       ...(agentCompletionId ? { agentCompletionId } : {}),
       createdAt: Date.now(),
     };
-    try {
-      await this.mesh.put({
-        key: `${prefix}${id}`,
-        value: record,
-        identity: this.identity,
-        ifVersion: 0,
-      });
-    } catch {
-      await this.mesh.put({
-        key: `${prefix}${id}`,
-        value: {
-          ...record,
-          message: message.slice(0, Math.max(1, this.config.mesh.eventContextChars)),
-          data: { fabricTruncated: true },
-        },
-        identity: this.identity,
-        ifVersion: 0,
-      });
+    // Persist before yielding: AgentManager has already marked this notification sent.
+    // Idle exit/queue pressure must not drop the host's ownership of the handoff.
+    writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record, { durable: true });
+    await this.#retryDeliveries();
+  }
+
+  #retryDeliveries(): Promise<unknown> {
+    if (this.#closed || this.#staged) return Promise.resolve();
+    if (this.#flushingDeliveries) return this.#flushingDeliveries;
+    const flushing = this.#deliveryRetry.run(() => this.#flushDeliveries());
+    this.#flushingDeliveries = flushing;
+    void flushing.finally(() => {
+      if (this.#flushingDeliveries === flushing) this.#flushingDeliveries = undefined;
+    }).catch(() => undefined);
+    return flushing;
+  }
+
+  async #flushDeliveries(): Promise<void> {
+    if (!fs.existsSync(this.#deliveryOutboxPath)) return;
+    for (const entry of fs.readdirSync(this.#deliveryOutboxPath).filter(entry => entry.endsWith(".json")).slice(0, 32)) {
+      const file = path.join(this.#deliveryOutboxPath, entry);
+      const record = readJson<ResidentDeliveryRecord>(file);
+      if (!record || record.format !== RESIDENT_HOST_FORMAT || `${record.id}.json` !== entry) {
+        throw new Error(`Invalid resident delivery outbox item: ${file}`);
+      }
+      const key = `${residentDeliveryPrefix(record.rootId)}${record.id}`;
+      try {
+        await this.mesh.put({ key, value: record, identity: this.identity, ifVersion: 0 });
+      } catch (error) {
+        // A restart after put but before unlink replays the SAME private UUID. A CAS
+        // conflict (including a consumed tombstone) means it was handed off already.
+        if (!(error instanceof Error && error.message.startsWith(`Mesh compare-and-swap failed for ${key}: expected version 0,`))) {
+          if (isMeshLockTimeout(error)) throw error;
+          await this.mesh.put({
+            key, value: { ...record, message: record.message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
+            identity: this.identity, ifVersion: 0,
+          });
+        }
+      }
+      // Only a durable mesh handoff releases ownership. Main journals the stable id.
+      fs.rmSync(file);
     }
   }
 
@@ -871,7 +921,10 @@ export class ResidentHost {
         writeJsonAtomic(this.#ownerPath, servingOwner, { durable: true });
         this.#staged = false;
         this.actors.resumeAfterRelease(); this.control.resume(); this.lifecycle.resume();
-        this.#trackPublication(this.actors.finishPendingRemovals().finally(() => this.#writeRemovals()));
+        this.#trackPublication(this.#backgroundDeliveries.enqueue(async () => {
+          await this.actors.finishPendingRemovals();
+          this.#writeRemovals();
+        }));
         return;
       }
       const plan = this.#handover;
@@ -902,6 +955,12 @@ export class ResidentHost {
       await this.control.checkpointForRelease();
       await this.lifecycle.checkpointForRelease();
       await Promise.all([...this.#publications]);
+      await this.#backgroundDeliveries.checkpointForRelease();
+      await this.#flushingDeliveries;
+      await this.#flushDeliveries();
+      if (fs.existsSync(this.#deliveryOutboxPath) && fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json"))) {
+        throw new Error("Resident release has pending delivery outbox obligations");
+      }
       if (this.#publicationFailed) throw new Error("Resident release has unconfirmed public results/deliveries");
       await this.actors.checkpointForRelease();
       await this.agents.checkpointForRelease(plan.createdAt + HANDOVER_DRAIN_MS);
@@ -952,6 +1011,71 @@ export class ResidentHost {
       if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
         throw new Error(`Fabric residency request ${requestId} was abandoned before commit`);
       }
+      response = await this.#executeOnce(command);
+    } catch (error) {
+      response = { format: RESIDENT_HOST_FORMAT, requestId, ok: false, error: errorMessage(error),
+        ...(error instanceof ResidentCommandUnsupportedError ? { errorCode: error.code } : {}), completedAt: Date.now() };
+    }
+    if (response.ok) await testResidentRequestDelay("after_commit");
+    const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
+    writeJsonAtomic(responsePath, response, { durable: true });
+    // An abandoned caller already left; clean late responses as well as processing files.
+    if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+      fs.rmSync(responsePath, { force: true });
+    }
+    fs.rmSync(filePath, { force: true });
+    this.participants.scheduleRefresh();
+  }
+
+  #pruneCreations(): void {
+    const cutoff = Date.now() - 10 * 60_000;
+    for (const [key, entry] of this.#creations) {
+      if (entry.completedAt !== undefined && entry.completedAt <= cutoff) this.#creations.delete(key);
+    }
+    const completed = [...this.#creations].filter(([, entry]) => entry.completedAt !== undefined);
+    for (const [key] of completed.slice(0, Math.max(0, completed.length - 256))) this.#creations.delete(key);
+    // Never evict an in-flight creation: retries must join the same promise.
+  }
+
+  async #executeOnce(command: ResidentCommand): Promise<ResidentCommandResponse> {
+    if ((command.operation !== "spawn" && command.operation !== "createActor") || command.idempotencyKey === undefined) {
+      return this.#executeRequest(command);
+    }
+    if (typeof command.idempotencyKey !== "string" || !command.idempotencyKey.length || command.idempotencyKey.length > 256) {
+      throw new Error("Resident idempotencyKey must be a string of 1 to 256 characters");
+    }
+    this.#pruneCreations();
+    // Operation-scoped; this host already validates its one root before dispatch.
+    const key = JSON.stringify([command.operation, command.idempotencyKey]);
+    let entry = this.#creations.get(key);
+    if (!entry) {
+      entry = { result: Promise.resolve().then(() => this.#executeRequest(command)) };
+      this.#creations.set(key, entry);
+      const tracked = entry;
+      void tracked.result.then(() => { tracked.completedAt = Date.now(); this.#pruneCreations(); });
+    }
+    const response = await entry.result;
+    if (response.requestId !== command.requestId) {
+      // Cache hits still participate in the caller's existing cancellation fence,
+      // including failures after commit. Replays of a retry receipt are safe too.
+      const original = readResidentRequestDecision(this.config.residencyRoot, response.requestId);
+      if (response.ok || original?.state === "committed") {
+        const id = response.handle?.id ?? response.actor?.id ?? original?.id;
+        if (!id) throw new Error("Resident creation result has no entity ID");
+        const decision = readResidentRequestDecision(this.config.residencyRoot, command.requestId);
+        if (decision?.state !== "committed" || decision.id !== id ||
+          decision.operation !== command.operation || decision.ownerHostId !== this.hostId) {
+          commitResidentRequest(this.config.residencyRoot, command, id, this.hostId);
+        }
+      }
+    }
+    return { ...response, requestId: command.requestId };
+  }
+
+  async #executeRequest(command: ResidentCommand): Promise<ResidentCommandResponse> {
+    const requestId = command.requestId;
+    let response: ResidentCommandResponse;
+    try {
       await testResidentRequestDelay("before_commit");
       const commit = (id: string): void => commitResidentRequest(this.config.residencyRoot, command, id, this.hostId);
       if (command.operation === "releaseChange") {
@@ -966,7 +1090,6 @@ export class ResidentHost {
           command.request.actorName ||
           command.request.meshRoot ||
           command.request.runnerSessionId ||
-          command.request.systemPrompt ||
           command.request.images
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
@@ -1105,15 +1228,7 @@ export class ResidentHost {
         completedAt: Date.now(),
       };
     }
-    if (response.ok) await testResidentRequestDelay("after_commit");
-    const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
-    writeJsonAtomic(responsePath, response, { durable: true });
-    // An abandoned caller already left; clean late responses as well as processing files.
-    if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
-      fs.rmSync(responsePath, { force: true });
-    }
-    fs.rmSync(filePath, { force: true });
-    this.participants.scheduleRefresh();
+    return response;
   }
 
   /** Pending removals for clients' error messages (smarty-dev#2184 item 8). */

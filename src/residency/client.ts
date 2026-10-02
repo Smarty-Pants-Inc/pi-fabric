@@ -23,12 +23,15 @@ import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
+import { MeshBackgroundRetry } from "../core/atomic-write.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
   ResidentActorAuthorizationError,
   ResidentCommandUnsupportedError,
   assertResidentCommandSupported,
+  prepareResidentCreationCommand,
   assertResidentActorMain,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
@@ -153,6 +156,7 @@ export class ResidencyClient {
   #deliveryTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #drainingDeliveries = false;
+  readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup");
   #closed = false;
   #startingHost: Promise<ResidentHostOwner> | undefined;
   #nextWatchdogAt = 0;
@@ -180,13 +184,13 @@ export class ResidencyClient {
     this.syncPiModels();
     this.#deliveryTimer = setInterval(
       () => {
-        void this.#drainDeliveries().catch(() => undefined);
+        void this.#backgroundDelivery.run(() => this.#drainDeliveries());
         void this.#watchdog().catch(() => undefined);
       },
       Math.max(20, this.options.config.mesh.actorPollMs),
     );
     this.#deliveryTimer.unref();
-    void this.#drainDeliveries().catch(() => undefined);
+    void this.#backgroundDelivery.run(() => this.#drainDeliveries());
     // Every runtime activation, including manual native /reload, reconciles
     // a live owner. This never starts an empty root or loads an optional engine.
     void this.reconcileRelease().catch((error) => this.#deferRelease(error));
@@ -368,13 +372,15 @@ export class ResidencyClient {
   }
 
   async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+    const { idempotencyKey, ...creationRequest } = request;
     await this.ensureHost();
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
+      ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       requestId: randomUUID(),
       rootId: this.options.config.rootId,
-      request,
+      request: creationRequest,
       createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Fabric resident host returned no actor");
@@ -428,9 +434,11 @@ export class ResidencyClient {
   }
 
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
-    const resolvedRequest = request.cwd === undefined
-      ? request
-      : { ...request, cwd: await awaitAgentCwd(this.options.config.cwd, request.cwd, signal) };
+    // Explicit keys are checked against the loaded owner before dispatch.
+    const { idempotencyKey, ...spawnRequest } = request;
+    const resolvedRequest = spawnRequest.cwd === undefined
+      ? spawnRequest
+      : { ...spawnRequest, cwd: await awaitAgentCwd(this.options.config.cwd, spawnRequest.cwd, signal) };
     // Freeze inherited optional-tool authority before transferring to an existing host.
     const allowedTools = this.#inheritedToolAllowlist;
     const tools = allowedTools === undefined ? undefined
@@ -440,6 +448,7 @@ export class ResidencyClient {
       {
         format: RESIDENT_HOST_FORMAT,
         operation: "spawn",
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
         requestId: randomUUID(),
         rootId: this.options.config.rootId,
         request: { ...resolvedRequest, ...(tools ? { tools } : {}), residency: "durable" },
@@ -669,6 +678,7 @@ export class ResidencyClient {
     if (owner.requestFence !== 1) {
       throw new Error("Fabric resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
     }
+    command = prepareResidentCreationCommand(owner, command);
     throwIfAborted(signal);
     registerResidentCancellation(signal, this.options.config.residencyRoot, command);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
@@ -860,6 +870,20 @@ export class ResidencyClient {
         }
       }
     }
+    // A terminal task can leave its producer outbox behind at idle exit. The live
+    // client owns recovery even with no durable actors; the fenced host replays
+    // the stable envelope id, not the completed agent.
+    const outbox = path.join(config.residencyRoot, "delivery-outbox");
+    let entries: string[];
+    try { entries = fs.readdirSync(outbox); } catch { entries = []; }
+    for (const entry of entries.filter(entry => entry.endsWith(".json"))) {
+      const record = readJson<ResidentDeliveryRecord>(path.join(outbox, entry));
+      if (record?.format === RESIDENT_HOST_FORMAT && typeof record.id === "string" && `${record.id}.json` === entry &&
+        typeof record.rootId === "string" && typeof record.message === "string" && typeof record.triggerTurn === "boolean" &&
+        (record.delivery === "steer" || record.delivery === "followUp") && record.from && typeof record.from.id === "string") {
+        work.push(`delivery:${record.rootId}:${record.id}`);
+      }
+    }
     return work.length ? JSON.stringify(work.sort()) : undefined;
   }
 
@@ -869,7 +893,11 @@ export class ResidencyClient {
     try {
       const entries = this.options.mesh.listAll(this.#deliveryPrefix);
       for (const entry of entries) {
-        try { await this.#deliver(entry); } catch { /* Retain this source for retry; other senders and steers still drain. */ }
+        try { await this.#deliver(entry); } catch (error) {
+          // The record remains durable. Back off a locked mesh; retain ordinary failed senders
+          // without blocking the other entries in this pass.
+          if (isMeshLockTimeout(error)) throw error;
+        }
       }
     } finally {
       this.#drainingDeliveries = false;
@@ -922,8 +950,11 @@ export class ResidencyClient {
     // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
     this.options.mainAgent.deliverAgent({
       from: value.from,
-      verification: "mesh", // The authenticated resident-host record was checked above.
-      principal: value.principal,
+      // The authenticated resident writer alone does not prove actor authorship: older
+      // hosts also write alarms under the actor label. Require positive classification;
+      // unclassified/unknown actor records retain routing/display and durable receipts only.
+      ...(value.source === "fabric-host" || (value.from.kind === "actor" && value.source !== "actor-output")
+        ? {} : { verification: "mesh" as const, principal: value.principal }),
       message: value.message,
       delivery: value.delivery,
       triggerTurn: value.triggerTurn,

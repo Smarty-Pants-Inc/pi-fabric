@@ -34,7 +34,79 @@ const fixture = () => {
 };
 
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+describe("resident loaded-path census metadata", () => {
+  it("publishes the startup generation rather than a later desired configuration", async () => {
+    const { root, config, host } = fixture();
+    const loaded = config.fabricExtensionPath;
+    try {
+      await host.start();
+      const ownerPath = path.join(config.residencyRoot, "owner.json");
+      const owner = fs.readFileSync(ownerPath, "utf8");
+      expect(JSON.parse(owner)).toMatchObject({ pid: process.pid, fabricExtensionPath: loaded });
+      fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify({
+        ...config, fabricExtensionPath: path.join(root, "replacement", "dist", "index.js"),
+      }));
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      expect(host.config.fabricExtensionPath).toBe(loaded);
+    } finally {
+      await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("resident tracked result preservation", () => {
+  it.each(["native", "win32-injected"] as const)("releases the host fence and closes delivery/participant work even if agent close fails (%s)", async (platformCase) => {
+    const { root, config, host } = fixture();
+    const successor = new ResidentHost(config);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const getuid = Object.getOwnPropertyDescriptor(process, "getuid");
+    let fault: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      if (platformCase === "win32-injected") {
+        Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+        Object.defineProperty(process, "getuid", { configurable: true, writable: true, value: undefined });
+      }
+      await host.start();
+      await expect(successor.start()).rejects.toThrow(/already running/);
+      expect(successor.actors).toBeUndefined();
+      const closeAgents = host.agents.close.bind(host.agents);
+      fault = vi.spyOn(host.agents, "close").mockImplementation(async () => {
+        await closeAgents();
+        throw new Error("fixture agent close failure");
+      });
+      const closeParticipants = vi.spyOn(host.participants, "close");
+      await expect(host.close()).rejects.toThrow("fixture agent close failure");
+      expect(closeParticipants).toHaveBeenCalledOnce();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      const lock = path.join(config.residencyRoot, "host.lock");
+      if (process.platform === "linux") {
+        // Only Linux uses the persistent flock inode; non-Linux uses a record fence.
+        const fd = await lockFile(lock, 0);
+        fs.closeSync(fd);
+      } else {
+        expect(fs.existsSync(lock)).toBe(false);
+      }
+      // Exercise the product's actual fence on every platform, not flock on Windows.
+      await successor.start();
+      expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "owner.json"), "utf8")).pid).toBe(process.pid);
+      await successor.close();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      if (process.platform !== "linux") expect(fs.existsSync(lock)).toBe(false);
+      closeParticipants.mockRestore();
+    } finally {
+      fault?.mockRestore();
+      try {
+        await host.close();
+        await successor.close();
+      } finally {
+        Object.defineProperty(process, "platform", platform);
+        if (getuid) Object.defineProperty(process, "getuid", getuid);
+        else Reflect.deleteProperty(process, "getuid");
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
   it.each(["LARGE_RESULT", "FAIL_DIRECTIVE"])("F1 save failure keeps the worker's %s completion through close and two host/client restarts", async (task) => {
     const { root, config, host: first } = fixture();
     config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
@@ -196,6 +268,32 @@ describe("resident orphan retention", () => {
 });
 
 describe("resident host ownership", () => {
+  it("followUp advisory A2 resident-owned running task ACK and persisted replay preserve the warning", async () => {
+    const { root, config, host } = fixture();
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.piModels = { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" };
+    let sender: FabricControlPlane | undefined;
+    try {
+      await host.start();
+      sender = new FabricControlPlane(host.mesh, { id: "session:sender", name: "Sender", kind: "main" },
+        { enabled: true, hostId: "session:sender", pollMs: 20, acknowledgementTimeoutMs: 2000 });
+      sender.start(() => ({ accepted: false }));
+      const child = await host.agents.spawn({ task: "HANG", transport: "process" });
+      await vi.waitFor(() => expect(fs.existsSync(path.join(host.agents.runDirectory(child.id)!, "status.json"))).toBe(true));
+      const receipt = await sender.request(host.hostId, child.id, "followUp", { message: "later" }, host.identity.id);
+      const warning = { code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: child.id, kind: "agent", status: "running",
+        message: "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion." };
+      const command = host.mesh.read({ topic: "fabric.control.command", limit: 10 })[0]!;
+      await host.mesh.publish({ topic: command.topic, kind: command.kind, from: command.from, to: command.to!, data: command.data });
+      await vi.waitFor(() => expect(host.mesh.read({ topic: "fabric.control.ack", limit: 10 })).toHaveLength(2));
+      const entries = fs.readFileSync(path.join(host.agents.runDirectory(child.id)!, "steer.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(entries).toHaveLength(1); expect(entries[0]).toMatchObject({ type: "follow_up", message: "later" });
+      expect(entries[0]).not.toHaveProperty("warning");
+      for (const ack of host.mesh.read({ topic: "fabric.control.ack", limit: 10 })) expect(ack.data).toMatchObject({ accepted: true, warning });
+      expect(receipt).toEqual({ queued: true, messageId: expect.any(String), routed: "mesh", acknowledged: true, warning });
+    } finally { await sender?.close(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each(["ask", "followUp"] as const)("preserves owner-default provenance through %s admission without pinning resolved defaults", async (operation) => {
     const { root, config, host } = fixture();
     let handler!: Parameters<typeof host.control.start>[0];
@@ -244,7 +342,7 @@ describe("resident host ownership", () => {
     try {
       await host.start();
       const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
-      expect(owner).toMatchObject({ requestFence: 1, commands: expect.arrayContaining(["setModel", "setTools"]), pid: process.pid, hostId: host.hostId });
+      expect(owner).toMatchObject({ requestFence: 1, creationIdempotency: 1, commands: expect.arrayContaining(["setModel", "setTools"]), pid: process.pid, hostId: host.hostId });
       expect(owner.processStartTime).toBe(processStartTime(process.pid));
       expect(residentProcessAlive(owner.pid, owner.processStartTime)).toBe(true);
       await host.close();

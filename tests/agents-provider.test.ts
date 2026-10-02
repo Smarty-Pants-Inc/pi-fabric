@@ -10,7 +10,7 @@ import { deliveryRoot, projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { ActorDirectory } from "../src/actors/directory.js";
@@ -131,8 +131,9 @@ describe("fleet model policy (#2490)", () => {
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     const catalog = vi.spyOn(state.agents, "claudeModels");
     try {
-      await expect(state.provider.invoke("spawn", { task: "legacy alias", runner, model: "backend-shortcut", residency: "durable" }, context)).resolves.toMatchObject({ model: "backend-shortcut" });
+      await expect(state.provider.invoke("spawn", { task: "legacy alias", runner, model: "backend-shortcut", residency: "durable", idempotencyKey: "durable-spawn-retry" }, context)).resolves.toMatchObject({ model: "backend-shortcut" });
       expect(spawnAgent).toHaveBeenCalledOnce(); expect(catalog).not.toHaveBeenCalled();
+      expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ idempotencyKey: "durable-spawn-retry" }), undefined);
     } finally { catalog.mockRestore(); }
   });
 
@@ -371,6 +372,7 @@ const setup = (
     switchModel?: FabricMainAgentTarget["switchModel"];
     callerThinking?: string;
     modelsConfig?: FabricModelsConfig;
+    routeEvaluate?: import("../src/agents/model-route.js").RouteEvaluate;
     agentsConfig?: Partial<FabricAgentConfig>;
     workerPath?: string;
     preparePiModel?: (model: string | undefined) => Promise<string | void>;
@@ -499,6 +501,7 @@ const setup = (
     undefined,
     () => options?.modelsConfig ?? DEFAULT_FABRIC_CONFIG.models,
     () => options?.callerThinking,
+    options?.routeEvaluate,
   );
   return {
     root,
@@ -516,6 +519,103 @@ const setup = (
     actorDeliveries,
   };
 };
+
+describe('model: "auto" spawn routing (#2890)', () => {
+  beforeEach(() => {
+    const host = fs.mkdtempSync(path.join(os.tmpdir(), "route-provider-host-")); roots.push(host);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(host, "agent"));
+  });
+  afterEach(() => vi.unstubAllEnvs());
+  const request = { task: "harmless bounded lookup", model: "auto", routeClass: "bounded-lookup", pinModel: "provider/model-a", pinThinking: "high", protected: false, transport: "process" };
+  it.each(["provider/modle-a", "modle-a", "", "auto"])("R2 refuses unavailable or invalid exact role pin: %s", async pinModel => {
+    const evaluate = vi.fn(async () => { throw new Error("must not infer"); });
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const launch = vi.spyOn(agents, "spawn");
+    await expect(provider.invoke("spawn", { ...request, pinModel }, context)).rejects.toMatchObject({ name: "ModelRoutePinError", code: "MODEL_ROUTE_PIN_UNAVAILABLE" });
+    expect(launch).not.toHaveBeenCalled(); expect(evaluate).not.toHaveBeenCalled();
+  });
+  it.each([
+    { reasoning: false, effort: "high" },
+    { reasoning: true, effort: "max" },
+    { reasoning: true, thinkingLevelMap: { high: null }, effort: "high" },
+  ])("R3 refuses known unsupported pin effort before Jev or spawn: %j", async ({ effort, ...capabilities }) => {
+    const evaluate = vi.fn(async () => { throw new Error("must not infer"); });
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const owner = { ...context, extensionContext: { ...context.extensionContext, modelRegistry: { getAvailable: () => [{ provider: "provider", id: "model-a", ...capabilities }] } } as unknown as ExtensionContext };
+    const launch = vi.spyOn(agents, "spawn");
+    await expect(provider.invoke("spawn", { ...request, pinThinking: effort }, owner)).rejects.toMatchObject({ name: "ModelRouteEffortPinError", code: "MODEL_ROUTE_EFFORT_UNSUPPORTED" });
+    expect(launch).not.toHaveBeenCalled(); expect(evaluate).not.toHaveBeenCalled();
+  });
+  it.each(["provider/model-a", "role"])("enforces the host deny policy on exact and aliased route pins: %s", async pinModel => {
+    const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
+      agentsConfig: { deniedModels: ["provider/model-a"] },
+      modelsConfig: { ...DEFAULT_FABRIC_CONFIG.models, aliases: { role: { targets: ["provider/model-a"] } } } });
+    const launch = vi.spyOn(agents, "spawn");
+    await expect(provider.invoke("spawn", { ...request, pinModel }, context)).rejects.toThrow(/denied/i);
+    expect(launch).not.toHaveBeenCalled(); expect(evaluate).not.toHaveBeenCalled();
+  });
+  it("records shadow choice yet launches the pin and appends actual outcome", async () => {
+    const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
+    const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
+      agentsConfig: { modelRouting: { shadowCandidates: [{ model: "provider/model-b", effort: "medium" }] } } });
+    const handle = await provider.invoke("spawn", { ...request, cwd: root }, context) as AgentHandleInfo & { routeDecision: { model: string } };
+    expect(handle).toMatchObject({ model: "provider/model-a", thinking: "high", routeDecision: { model: "provider/model-b", effort: "medium", reasonCode: "shadow-choice" } });
+    const result = await agents.wait(handle.id);
+    expect(result).toMatchObject({ status: "completed", model: "provider/model-a", thinking: "high" });
+    const rows = fs.readFileSync(path.join(process.env.PI_CODING_AGENT_DIR!, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows).toHaveLength(2); expect(rows[1].decisionId).toBe(rows[0].decisionId);
+    expect(evaluate).toHaveBeenCalledTimes(1);
+  });
+  it.each([true, undefined])("excludes protected/unknown before Jev at the public API: %s", async protectedFlag => {
+    const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
+    const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const args = { ...request, cwd: root }; if (protectedFlag === undefined) delete (args as { protected?: boolean }).protected; else args.protected = protectedFlag;
+    const handle = await provider.invoke("spawn", args, context) as AgentHandleInfo;
+    await agents.wait(handle.id);
+    expect(evaluate).not.toHaveBeenCalled(); expect(handle.model).toBe(request.pinModel);
+  });
+  it.each([null, undefined, ""])("R2 refuses invalid explicit pins rather than substituting role config: %s", async pinModel => {
+    const { provider, agents } = setup([], [], undefined, { agentsConfig: { modelRouting: { pinModel: request.pinModel, pinThinking: "high" } } });
+    const launch = vi.spyOn(agents, "spawn");
+    await expect(provider.invoke("spawn", { ...request, pinModel }, context)).rejects.toMatchObject({ name: "ModelRoutePinError", code: "MODEL_ROUTE_PIN_UNAVAILABLE" });
+    expect(launch).not.toHaveBeenCalled();
+  });
+  it("R2 resolves explicit role aliases only to their exact targets", async () => {
+    const { provider, agents } = setup([], [], undefined, { modelsConfig: { ...DEFAULT_FABRIC_CONFIG.models, aliases: { role: { targets: ["provider/model-a"] } } } });
+    const handle = await provider.invoke("spawn", { ...request, pinModel: "role" }, context) as AgentHandleInfo;
+    expect(handle.model).toBe("provider/model-a"); await agents.wait(handle.id);
+  });
+  it("R2 refreshes a pin miss but remains exact after refresh", async () => {
+    const { provider, agents } = setup();
+    let available = visiblePiModels; const refresh = vi.fn(() => { available = [...visiblePiModels, { provider: "provider", id: "model-a0" }]; });
+    const owner = { ...context, extensionContext: { ...context.extensionContext, modelRegistry: { getAvailable: () => available, refresh } } as unknown as ExtensionContext };
+    const handle = await provider.invoke("spawn", { ...request, pinModel: "provider/model-a0" }, owner) as AgentHandleInfo;
+    expect(handle.model).toBe("provider/model-a0"); expect(refresh).toHaveBeenCalledTimes(1); await agents.wait(handle.id);
+  });
+  it("accepts explicit role-config pins, not inherited/default model or medium effort", async () => {
+    const { root, provider, agents } = setup([], [], undefined, { agentsConfig: { modelRouting: { pinModel: request.pinModel, pinThinking: "high" } } });
+    const { pinModel: _model, pinThinking: _effort, ...args } = request;
+    const handle = await provider.invoke("spawn", { ...args, cwd: root }, context) as AgentHandleInfo;
+    expect(await agents.wait(handle.id)).toMatchObject({ model: request.pinModel, thinking: "high" });
+  });
+  it.each([{ pinModel: undefined }, { pinThinking: undefined }, { runner: "claude" }, { transport: "tmux" }, { residency: "durable" }, { routeClass: "bad/header" }])("rejects unsupported/missing inputs without dispatch: %j", async override => {
+    const { provider, agents } = setup(); const spawn = vi.spyOn(agents, "spawn");
+    await expect(provider.invoke("spawn", { ...request, ...override }, context)).rejects.toThrow();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it.each(["run", "handoff", "create"])("never resolves auto as a fuzzy model outside spawn: %s", async action => {
+    const { provider, agents } = setup(); const spawn = vi.spyOn(agents, "spawn");
+    await expect(provider.invoke(action, { task: "lookup", name: "not-auto", instructions: "lookup", model: "auto" }, context)).rejects.toThrow();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it("leaves explicit model calls unchanged and never asks Jev", async () => {
+    const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const handle = await provider.invoke("spawn", { task: "lookup", model: request.pinModel, thinking: "high", transport: "process" }, context) as AgentHandleInfo;
+    expect(await agents.wait(handle.id)).toMatchObject({ model: request.pinModel, thinking: "high" }); expect(evaluate).not.toHaveBeenCalled();
+  });
+});
 
 describe("provider principal capture (#821)", () => {
   const scoped = () => {
@@ -1445,7 +1545,7 @@ afterEach(async () => {
   await Promise.all(controlPlanes.splice(0).map((control) => control.close()));
   await Promise.all(actorManagers.splice(0).map((manager) => manager.close()));
   await Promise.all(agentManagers.splice(0).map((manager) => manager.close()));
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
@@ -1592,6 +1692,9 @@ describe("AgentsProvider runner support", () => {
     expect(spawnProperties.residency?.enum).toEqual(["session", "durable"]);
     expect(createProperties.residency?.enum).toEqual(["session", "durable"]);
     expect(runProperties).not.toHaveProperty("residency");
+    expect(spawnProperties.idempotencyKey).toMatchObject({ type: "string", minLength: 1, maxLength: 256 });
+    expect(createProperties.idempotencyKey).toEqual(spawnProperties.idempotencyKey);
+    expect(runProperties).not.toHaveProperty("idempotencyKey");
   });
 
   it("exposes actor activation overrides and scoped binding setters", async () => {
@@ -1744,6 +1847,7 @@ describe("AgentsProvider runner support", () => {
         name: "second-durable",
         instructions: "Created via the resident host.",
         residency: "durable",
+        idempotencyKey: "durable-create-retry",
       },
       invocationContext,
     )) as FabricActorInfo;
@@ -1762,7 +1866,7 @@ describe("AgentsProvider runner support", () => {
     expect(imported).toMatchObject({ id: "resident-actor-2", name: "durable-template" });
     expect(createActor).toHaveBeenNthCalledWith(
       1,
-      expect.objectContaining({ name: "second-durable", residency: "durable" }),
+      expect.objectContaining({ name: "second-durable", residency: "durable", idempotencyKey: "durable-create-retry" }),
       invocationContext.signal,
     );
     expect(createActor).toHaveBeenNthCalledWith(

@@ -53,6 +53,8 @@ interface FabricAction {
   effect?: FabricActionEffect;
 }
 interface FabricAgentRequest {
+  /** Deduplicate durable spawns on the same host; reuse for retries within 10 minutes (last 256 results). */
+  idempotencyKey?: string;
   /** Omitted/inherit uses caller executor.kernel; concrete choices require Pi with extensions. */
   kernel?: FabricKernel | "inherit";
   task: string;
@@ -72,6 +74,8 @@ interface FabricAgentRequest {
   cwd?: string;
   worktree?: boolean;
   schema?: Record<string, unknown>;
+  /** Extra child system instructions; supported by session and durable runs. */
+  systemPrompt?: string;
   prompt?: string;
   instructions?: string;
   timeout_ms?: number;
@@ -665,6 +669,8 @@ interface FabricActorActivationSkipRule {
 type FabricActorActivationFilter = Array<"hold" | "never-message-events" | FabricActorActivationSkipRule>;
 type FabricActorValidWhile = (facts: Readonly<FabricActorValidityFacts>) => FabricActorValidityDecision;
 interface FabricActorRequestBase {
+  /** Deduplicate durable creates on the same host; reuse for retries within 10 minutes (last 256 results). */
+  idempotencyKey?: string;
   /** Fixed at creation; ask/tell cannot change language. Global templates resolve inheritance on import. */
   kernel?: FabricKernel | "inherit";
   scope?: "session" | "project" | "global";
@@ -826,6 +832,14 @@ interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
 type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricMessageDelivery {
+  /** Sender-only: owner observed a running task when it admitted this followUp. Delivery is unchanged. */
+  warning?: {
+    code: "FABRIC_FOLLOW_UP_RUNNING_TASK";
+    targetId: string;
+    kind: "agent";
+    status: "running";
+    message: string;
+  };
   /** Advisory only: unverified ids in sender history; also delivered when admission permits. */
   notice?: string;
   queued: true;
@@ -849,7 +863,7 @@ interface FabricAgentsApi {
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
-  spawn(args: FabricAgentRequest): Promise<FabricAgentHandle>;
+  spawn(args: FabricAgentRequest & { routeClass?: string; pinModel?: string; pinThinking?: FabricThinking; protected?: boolean }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
   /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */

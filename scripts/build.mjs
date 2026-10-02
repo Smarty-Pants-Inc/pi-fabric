@@ -9,6 +9,7 @@ const primaryEntryPoints = [
   "src/mesh.ts",
   "src/mesh-bridge.ts",
   "src/participants-cli.ts",
+  "src/releases-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
   "src/jev.ts",
@@ -35,8 +36,10 @@ const primaryEntryPoints = [
 const lazyEntryPoints = [
   "src/core/literal-bash-guard.ts",
   "src/lifecycle/reload-target-profile.ts",
+  "src/lifecycle/reload-slots.ts",
   "src/coordination/unverified-ids.ts",
   "src/core/provider-operations.ts",
+  "src/agents/model-route.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
@@ -146,7 +149,7 @@ const standalone = await build({
 // smarty-dev#2184: the worker loads this timeout-only hook into every Pi actor run, native-tool
 // ones included. Built on its own, without splitting, so it shares no chunk with index.js.
 await build({
-  entryPoints: ["src/guards/actor-bash-hook.ts"],
+  entryPoints: ["src/guards/actor-bash-hook.ts", "src/guards/model-route-hook.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",

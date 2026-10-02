@@ -1,9 +1,12 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
+import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -12,6 +15,8 @@ const CONTROL_SEEN_PREFIX = "topology/control-seen/";
 const HOST_PREFIX = "topology/hosts/";
 const DEFAULT_POLL_MS = 100;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
+// A cancellation owns a separate retry deadline, longer than a production mesh lock wait.
+const CANCELLATION_RETENTION_MS = 60_000;
 const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
@@ -56,6 +61,7 @@ export interface FabricControlCommand {
 }
 
 export interface FabricControlAcceptance {
+  warning?: AgentFollowUpRunningWarning;
   accepted: boolean;
   messageId?: string;
   /** Main requested a new turn at admission; absent on older owners or non-Main targets. */
@@ -84,6 +90,7 @@ class FabricControlRejection extends Error {
 }
 
 export interface FabricControlResult {
+  warning?: AgentFollowUpRunningWarning;
   queued: true;
   messageId: string;
   routed: "mesh";
@@ -123,6 +130,19 @@ const coalescedOf = (source: Record<string, unknown>): { coalesced: true; replac
   source.coalesced === true && typeof source.replacedMessageId === "string" && source.replacedMessageId.length <= 200
     ? { coalesced: true, replacedMessageId: source.replacedMessageId }
     : undefined;
+
+/** Copy only the fixed, bounded owner advisory for this exact pending target. */
+const runningTaskWarningOf = (source: Record<string, unknown>, targetId: string): { warning: AgentFollowUpRunningWarning } | undefined => {
+  const warning = source.warning;
+  if (source.accepted !== true || !isObject(warning) ||
+    warning.code !== "FABRIC_FOLLOW_UP_RUNNING_TASK" || warning.kind !== "agent" || warning.status !== "running" ||
+    typeof warning.targetId !== "string" || !warning.targetId || warning.targetId.length > 200 || warning.targetId !== targetId ||
+    warning.message !== FOLLOW_UP_RUNNING_TASK_MESSAGE || warning.message.length > 256) return undefined;
+  return { warning: {
+    code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: warning.targetId, kind: "agent", status: "running",
+    message: FOLLOW_UP_RUNNING_TASK_MESSAGE,
+  } };
+};
 
 export type FabricControlHandler = (
   command: FabricControlCommand,
@@ -294,6 +314,11 @@ export class FabricControlPlane {
   #timer: NodeJS.Timeout | undefined;
   #mirrorWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
+  readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll");
+  readonly #backgroundNotifications = new MeshBackgroundQueue("control detached ack");
+  // Cancellation may become publishable after close, when an admitted command finally commits.
+  // Its queue owns that final obligation until success/deadline; idle has no timer or resources.
+  readonly #backgroundCancellations = new MeshBackgroundQueue("control cancellation");
   #closed = false;
   #paused = false;
   #releasePublicationFailed = false;
@@ -335,7 +360,7 @@ export class FabricControlPlane {
     if (!this.options.enabled || this.#timer) return;
     this.#closed = false;
     this.#paused = false;
-    this.#timer = setInterval(() => void this.#poll().catch(() => undefined), this.#pollMs);
+    this.#timer = setInterval(() => void this.#backgroundPoll.run(() => this.#poll()), this.#pollMs);
     this.#timer.unref();
   }
 
@@ -385,6 +410,7 @@ export class FabricControlPlane {
       acknowledged: true,
       ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
       ...coalescedOf(acceptance as unknown as Record<string, unknown>),
+      ...runningTaskWarningOf(acceptance as unknown as Record<string, unknown>, targetId),
       ...triggeredOf(acceptance as unknown as Record<string, unknown>),
     };
   }
@@ -448,6 +474,8 @@ export class FabricControlPlane {
       destination.remoteHost = mirroredOwner?.remoteHost ?? (this.options.readMirroredOwner ? null : undefined);
     }
     const destinationRemoteHost = destination.remoteHost;
+    // One budget drives the wire deadline and the sender's ACK timer: mirrored owners
+    // need bridge transit time, while native commands retain the local ACK window.
     const timeoutMs = Math.max(
       this.#pollMs * 4,
       typeof destinationRemoteHost === "string" ? this.#bridgeTimeoutMs : 0,
@@ -543,8 +571,11 @@ export class FabricControlPlane {
       await Promise.race([publishing, acceptance.then(() => undefined)]);
       const acknowledged = await acceptance;
       if (!acknowledged.accepted) {
+        const error = acknowledged.error || "Remote Fabric owner rejected command for " + targetId;
         throw new FabricControlRejection(
-          acknowledged.error || "Remote Fabric owner rejected command for " + targetId,
+          acknowledged.notRun === true && error === CONTROL_COMMAND_EXPIRED
+            ? `${error}; not delivered, safe to resend.`
+            : error,
           acknowledged.notRun === true,
         );
       }
@@ -624,26 +655,31 @@ export class FabricControlPlane {
     }
     if (pending.cancellationPublished) return;
     pending.cancellationPublished = true;
-    const requestedAt = Date.now();
-    await this.mesh.publish({
+    const expiresAt = Date.now() + Math.max(CANCELLATION_RETENTION_MS, 2 * this.#ackTimeoutMs);
+    const cancelCommandId = randomUUID();
+    const cancellation = {
       topic: CONTROL_TOPIC,
       kind: "cancel",
       from: this.identity,
       to: pending.ownerHostId,
-      data: {
+      data: (committedAt: number): FabricControlCommand => ({
         version: 1,
-        commandId: randomUUID(),
+        commandId: cancelCommandId,
         targetId: pending.targetId,
         operation: "cancel",
         cancelCommandId: commandId,
         replyTo: this.options.hostId,
         ...(pending.destinationRemoteHost !== undefined
           ? { destinationRemoteHost: pending.destinationRemoteHost } : {}),
-        requestedAt,
-        deadlineAt: requestedAt + Math.max(this.#ackTimeoutMs,
+        requestedAt: committedAt,
+        deadlineAt: committedAt + Math.max(this.#ackTimeoutMs,
           typeof pending.destinationRemoteHost === "string" ? this.#bridgeTimeoutMs : 0),
-      } satisfies FabricControlCommand,
-    }).catch(() => undefined);
+      }),
+    };
+    await this.#backgroundCancellations.enqueue(() => {
+      if (Date.now() <= expiresAt) return this.mesh.publish(cancellation);
+      return undefined;
+    });
   }
 
   /** Reload: leave new commands unclaimed in the durable mesh log for the next runtime. */
@@ -656,9 +692,9 @@ export class FabricControlPlane {
   resume(): void {
     if (this.#closed || !this.#paused) return;
     this.#paused = false;
-    this.#timer = setInterval(() => void this.#poll().catch(() => undefined), this.#pollMs);
+    this.#timer = setInterval(() => void this.#backgroundPoll.run(() => this.#poll()), this.#pollMs);
     this.#timer.unref();
-    void this.#poll().catch(() => undefined);
+    void this.#backgroundPoll.run(() => this.#poll());
   }
 
   /** Join through outcome and ACK publication, not merely the host admission counter. */
@@ -666,6 +702,8 @@ export class FabricControlPlane {
     if (!this.#paused) throw new Error("Control release gate is not paused");
     await this.#polling;
     await Promise.all([...this.#activeHandlers]);
+    await this.#backgroundNotifications.checkpointForRelease();
+    await this.#backgroundCancellations.checkpointForRelease();
     if (this.#activeCommands.size || this.#pending.size || this.#unpublished.size || this.#releasePublicationFailed) {
       throw new Error("Control release has unsettled publication obligations");
     }
@@ -690,6 +728,7 @@ export class FabricControlPlane {
     await Promise.allSettled(cancellations);
     for (const active of this.#activeCommands.values()) active.controller.abort();
     await Promise.allSettled([...this.#activeHandlers]);
+    await this.#backgroundNotifications.close();
     this.#handler = undefined;
   }
 
@@ -726,7 +765,7 @@ export class FabricControlPlane {
       this.#offset = tail.nextOffset;
       if (tail.events.length < 100) break;
     }
-    await this.#cleanupSeen(Date.now()).catch(() => undefined);
+    await this.#cleanupSeen(Date.now()).catch(rethrowMeshLockTimeout);
   }
 
   #acceptAcknowledgement(event: MeshEvent): void {
@@ -754,6 +793,7 @@ export class FabricControlPlane {
       ...(typeof event.data.messageId === "string" ? { messageId: event.data.messageId } : {}),
       ...queueDepthOf(event.data),
       ...coalescedOf(event.data),
+      ...runningTaskWarningOf(event.data, pending.targetId),
       ...triggeredOf(event.data),
       ...(Object.prototype.hasOwnProperty.call(event.data, "result")
         ? { result: event.data.result }
@@ -986,8 +1026,7 @@ export class FabricControlPlane {
         };
       }
       acceptance = this.#boundedAcceptance(acceptance);
-      try {
-        await this.#seen.put({
+      const saveOutcome = () => this.#seen.put({
           key,
           value: {
             format: 1,
@@ -1001,24 +1040,39 @@ export class FabricControlPlane {
           identity: this.identity,
           ifVersion: claimVersion,
         });
+      try {
+        await saveOutcome();
       } catch (error) {
         this.#releasePublicationFailed = true;
-        // A conflict means another owner holds this claim; a lock timeout wrote nothing, and
-        // the command has run, so its sender still gets the outcome.
+        // A conflict belongs to another owner; a timeout wrote nothing. Preserve the actual
+        // result under the original version fence and retry it without running the handler.
         if (!isLockTimeout(error)) return;
+        void this.#backgroundNotifications.retry(() => {
+          if (Date.now() <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) return saveOutcome();
+          return undefined;
+        }, error);
+      }
+      if (command.operation === "ask") {
+        // Detached asks have already left the poll cursor. Retain just their outcome, never
+        // execute the handler again, and retry the ACK on the owned notification tick.
+        await this.#backgroundNotifications.enqueue(() => {
+          if (Date.now() <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) {
+            return this.#publishAcknowledgement(command, acceptance);
+          }
+          return undefined;
+        });
+        return;
       }
       try {
         await this.#publishAcknowledgement(command, acceptance);
       } catch (error) {
         this.#releasePublicationFailed = true;
-        // An "ask" runs detached from the drain, which has consumed it: nothing retries it, so
-        // its outcome is not kept (its sender's result wait times out instead).
-        if (command.operation !== "ask") {
-          this.#unpublished.set(command.commandId, {
-            acceptance,
-            expiresAt: deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4,
-          });
-        }
+        // Non-detached commands remain at the poll cursor. Keep the actual outcome for
+        // its next pass, rather than executing a handler twice after an ACK lock timeout.
+        this.#unpublished.set(command.commandId, {
+          acceptance,
+          expiresAt: deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4,
+        });
         throw error;
       }
     } finally {
@@ -1030,8 +1084,16 @@ export class FabricControlPlane {
 
   #boundedAcceptance(acceptance: FabricControlAcceptance): FabricControlAcceptance {
     try {
-      if (controlAcceptanceBytes(acceptance) <= this.mesh.maxEventBytes - 2_048) {
+      const budget = this.mesh.maxEventBytes - 2_048;
+      if (controlAcceptanceBytes(acceptance) <= budget) {
         return acceptance;
+      }
+      if (acceptance.accepted && acceptance.warning) {
+        // Admission has already committed the delivery. An optional advisory must
+        // not turn its successful receipt into a refusal (and invite a duplicate
+        // retry). Keep all delivery fields, omitting only the warning if it fits.
+        const { warning: _warning, ...delivery } = acceptance;
+        if (controlAcceptanceBytes(delivery) <= budget) return delivery;
       }
     } catch {
       // Return a bounded rejection below.
@@ -1138,6 +1200,7 @@ export class FabricControlPlane {
           ...(acceptance.messageId ? { messageId: acceptance.messageId } : {}),
           ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
           ...coalescedOf(acceptance as unknown as Record<string, unknown>),
+          ...runningTaskWarningOf(acceptance as unknown as Record<string, unknown>, command.targetId),
           ...triggeredOf(acceptance as unknown as Record<string, unknown>),
           ...(Object.prototype.hasOwnProperty.call(acceptance, "result")
             ? { result: acceptance.result }

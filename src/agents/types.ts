@@ -316,6 +316,18 @@ export interface AgentTransportLaunch {
   authorize?: () => boolean;
 }
 
+export interface AgentTransportObservationOptions {
+  signal?: AbortSignal;
+  /** Absolute wall-clock deadline in milliseconds; transports may impose a shorter bound. */
+  deadline?: number;
+}
+
+/** Session membership only: neither a terminal UI record nor session absence
+ * proves that its worker (or descendants) exited. Unknown must veto custody. */
+export type AgentTransportObservation =
+  | { state: "alive" | "absent" }
+  | { state: "unknown"; reason: string };
+
 export interface AgentTransportHandle {
   kind: FabricAgentTransport;
   sessionId?: string;
@@ -332,8 +344,10 @@ export interface AgentTransportHandle {
    * relaunches it nor deletes its files. Undefined while contact holds or after a proven exit.
    */
   lostContact?(): string | undefined;
-  isAlive(): Promise<boolean>;
-  stop(): Promise<void>;
+  /** Optional checked session observation; absence alone is NOT a worker exit receipt. */
+  observe?(options?: AgentTransportObservationOptions): Promise<AgentTransportObservation>;
+  isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
+  stop(options?: AgentTransportObservationOptions): Promise<void>;
 }
 
 export interface AgentTransportAdapter {

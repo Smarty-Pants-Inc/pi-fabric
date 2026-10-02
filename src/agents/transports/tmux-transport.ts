@@ -3,13 +3,8 @@ import type {
   AgentTransportHandle,
   AgentTransportLaunch,
 } from "../types.js";
-import { EXTERNAL_TRANSPORT_LIVENESS_POLL_INTERVAL_MS } from "../constants.js";
-import {
-  commandAvailable,
-  executeFile,
-  workerCommand,
-} from "./process-utils.js";
-
+import { commandAvailable, workerCommand } from "./process-utils.js";
+import { externalSessionHandle, launchExternalSession } from "./external-session.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 
 const sessionName = (id: string): string => `pi-fabric-${id.slice(0, 12)}`;
@@ -25,34 +20,9 @@ export class TmuxTransport implements AgentTransportAdapter {
     const session = sessionName(request.id);
     const command = await workerCommand(request.workerPath, request.workerArguments);
     assertTransportLaunchAllowed(request);
-    await executeFile("tmux", [
-      "new-session",
-      "-d",
-      "-s",
-      session,
-      "-c",
-      request.cwd,
-      command,
-    ]);
-    return {
-      kind: this.kind,
-      relaunchable: false, // Query failure is not proof the old pane exited.
-      livenessPollIntervalMs: EXTERNAL_TRANSPORT_LIVENESS_POLL_INTERVAL_MS,
-      sessionId: session,
-      attachCommand: `tmux attach-session -t ${session}`,
-      async isAlive() {
-        try {
-          await executeFile("tmux", ["has-session", "-t", session]);
-          return true;
-        } catch {
-          return false;
-        }
-      },
-      async stop() {
-        try {
-          await executeFile("tmux", ["kill-session", "-t", session]);
-        } catch { /* session already exited */ }
-      },
-    };
+    await launchExternalSession(this.kind, session, [
+      "new-session", "-d", "-s", session, "-c", request.cwd, command,
+    ], request.cwd, request.signal);
+    return externalSessionHandle(this.kind, session);
   }
 }

@@ -36,18 +36,29 @@ export class ActivationSession {
     if (header?.type !== "session") throw new Error("Activation session has no native header");
     const ids = new Set(prior.map(entry => entry.id));
     const leaf = prior.filter(entry => entry.type !== "session" && typeof entry.id === "string").at(-1)?.id ?? null;
-    for (const entry of entries) {
+    const retained = entries.map(entry => {
       if (typeof entry.id !== "string" || ids.has(entry.id)) throw new Error("Activation session has invalid or duplicate entry IDs");
       ids.add(entry.id);
-      if (entry.parentId === null) entry.parentId = leaf;
-    }
+      // Native checkpoints/edits apply to an entire linked branch. They are
+      // inference-only in this isolated activation, not durable history policy.
+      // Keep their complete original records as native non-message audit entries:
+      // Pi ignores `custom` in model context but still traverses its ancestry.
+      // No existing journal bytes or genuine full-history compactions change.
+      const durable = entry.type === "compaction" || entry.type === "context_edit"
+        ? { type: "custom", customType: "fabric-activation-context", id: entry.id,
+          parentId: entry.parentId, timestamp: entry.timestamp,
+          data: { scope: "activation", activationId: header.id, entry } }
+        : entry;
+      if (durable.parentId === null) durable.parentId = leaf;
+      return durable;
+    });
     if (!entries.length) {
       fs.unlinkSync(this.file);
       return;
     }
     const prefix = current ? (current.endsWith("\n") ? "" : "\n") : JSON.stringify(header) + "\n";
     fs.mkdirSync(path.dirname(this.journal), { recursive: true, mode: 0o700 });
-    fs.appendFileSync(this.journal, prefix + entries.map(entry => JSON.stringify(entry)).join("\n") + "\n", { mode: 0o600 });
+    fs.appendFileSync(this.journal, prefix + retained.map(entry => JSON.stringify(entry)).join("\n") + "\n", { mode: 0o600 });
     fs.unlinkSync(this.file);
   }
 }

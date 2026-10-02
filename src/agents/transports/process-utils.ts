@@ -12,27 +12,57 @@ export interface ExecFileResult {
 export const executeFile = (
   command: string,
   args: string[],
-  options: { cwd?: string; timeoutMs?: number } = {},
+  options: { cwd?: string; timeoutMs?: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv; killSignal?: NodeJS.Signals } = {},
 ): Promise<ExecFileResult> =>
   new Promise((resolve, reject) => {
-    execFile(
+    if (options.signal?.aborted) {
+      reject(new Error("Command cancelled before execution"));
+      return;
+    }
+    let closed = false;
+    let cancelled = false;
+    let outcome: { error: Error | null; stdout: string; stderr: string } | undefined;
+    const finish = (): void => {
+      if (!closed || !outcome) return;
+      if (outcome.error) {
+        Object.assign(outcome.error, { stdout: outcome.stdout, stderr: outcome.stderr });
+        reject(outcome.error);
+      } else resolve({ stdout: outcome.stdout, stderr: outcome.stderr });
+    };
+    const child = execFile(
       command,
       args,
       {
         encoding: "utf8",
         maxBuffer: 10 * 1024 * 1024,
         ...(options.cwd ? { cwd: options.cwd } : {}),
+        ...(options.env ? { env: options.env } : {}),
         ...(options.timeoutMs ? { timeout: options.timeoutMs } : {}),
+        // Query callers opt into SIGKILL; preserve cooperative termination for
+        // existing mutating commands (for example git releasing its lock files).
+        killSignal: options.killSignal ?? "SIGTERM",
       },
       (error, stdout, stderr) => {
-        if (error) {
-          Object.assign(error, { stdout, stderr });
-          reject(error);
-          return;
-        }
-        resolve({ stdout, stderr });
+        outcome = { error: cancelled ? new Error("Command cancelled during execution") : error, stdout, stderr };
+        finish();
       },
     );
+    // execFile does not forward killSignal to spawn's AbortSignal handler in
+    // supported Node versions. Own cancellation so the selected signal is used,
+    // and settle only after native close (also on Windows).
+    const abort = (): void => {
+      cancelled = true;
+      // Mirror execFile's timeout teardown: inherited pipe handles must not
+      // keep native close pending after the query process itself was killed.
+      child.stdout?.destroy(); child.stderr?.destroy();
+      child.kill(options.killSignal ?? "SIGTERM");
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
+    child.once("close", () => {
+      options.signal?.removeEventListener("abort", abort);
+      closed = true; finish();
+    });
+    if (options.signal?.aborted) abort();
   });
 
 /**

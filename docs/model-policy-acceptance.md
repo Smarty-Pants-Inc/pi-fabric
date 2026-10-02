@@ -36,6 +36,37 @@ entry point as the first argument to compare the original head. On
 public guest catches a denied error without `code`; inheritance itself already
 works. The missing-evidence review finding is not a distinct behavioral bug.
 
+## Local creation cancellation (#3115)
+
+Public session `agents.create` and `agents.import` commit after asynchronous
+validation and predecessor cleanup, immediately before the new actor directory
+and runnable/subscribed state are created. A synchronous commit hook registers
+the allocated actor ID before these effects. Cancellation while registry or
+presence publication is pending returns the existing host-originated
+`residentOutcomes` receipt with `state: "committed"`, `operation: "createActor"`,
+the actor ID and the local `ownerHostId`. The error also names the ID and warns
+against retrying or reassigning the work. Publication may complete after the
+caller's observation ends; reconcile with `agents.actorStatus` and use the known
+ID to stop or remove the actor. Pre-commit cancellation retains safe rejection;
+an uninterrupted call returns its normal actor handle without an uncertainty
+receipt.
+
+The public guest regression in `tests/agents-provider.test.ts` holds real
+registry and mesh locks for create/import, cancels via Escape, deadline and
+provider revocation, and checks receipt identity, eventual publication, public
+cleanup and uninterrupted controls. The regression uses cross-platform
+filesystem locks without a platform skip; native Windows execution remains a
+`windows-latest` CI check. `tests/actor-manager.test.ts` checks the synchronous
+boundary and preservation of the pre-commit fences.
+
+P3's installed-policy adoption is deferred from this source-only fix: applying
+trusted factory policy, replacing fleet resident owners and obtaining an
+independent installed audit require authorized host access outside this lane.
+The installation-only gate below remains required before broad adoption. Owner:
+**fabric-v2** for the reviewed artifact and resident-generation evidence;
+**dev-lead** for trusted factory adoption and the independent audit. The library
+deny-list default remains unchanged. No installed-policy or fleet PASS is claimed.
+
 ## Installation-only owner gate (not satisfied by the offline probe)
 
 Owner: **fabric-v2** for the reviewed Fabric release, **dev-lead** for trusted

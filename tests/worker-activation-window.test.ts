@@ -6,7 +6,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
-import { SessionManager, buildSessionContext, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
+import { SessionManager, buildSessionContext, convertToLlm, sessionEntryToContextMessages, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ActivationWindow } from "../src/worker/activation-window.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
@@ -264,7 +265,7 @@ describe("native activation window (offline; opted-in success needs exact native
     const log = result.logFile && fs.existsSync(result.logFile) ? fs.readFileSync(result.logFile, "utf8") : "";
     return `${JSON.stringify(result)}\n${log.slice(-12_000)}`;
   };
-  const setup = async () => {
+  const setup = async (toolRounds = 0, oversizedRound = 0) => {
     const dir = root();
     const requests: Array<Record<string, any>> = [];
     const server = http.createServer((request, response) => {
@@ -273,14 +274,15 @@ describe("native activation window (offline; opted-in success needs exact native
       request.on("end", () => {
         const payload = JSON.parse(body);
         requests.push(payload);
-        const useTool = payload.tools?.length && !payload.messages.some((m: {role: string}) => m.role === "tool");
+        const round = requests.length;
+        const useTool = toolRounds ? round <= toolRounds : payload.tools?.length && !payload.messages.some((m: {role: string}) => m.role === "tool");
         response.writeHead(200, { "Content-Type": "text/event-stream" });
         const chunk = (delta: unknown, finish_reason: string | null = null) => response.write(`data: ${JSON.stringify({
           id: "offline", object: "chat.completion.chunk", created: 1, model: "offline",
           choices: [{ index: 0, delta, finish_reason }],
         })}\n\n`);
         if (useTool) {
-          chunk({ role: "assistant", tool_calls: [{ index: 0, id: "read-current", type: "function", function: { name: "read", arguments: JSON.stringify({ path: path.join(dir, "task.txt") }) } }] });
+          chunk({ role: "assistant", tool_calls: [{ index: 0, id: toolRounds ? `read-${round}` : "read-current", type: "function", function: { name: "read", arguments: JSON.stringify({ path: path.join(dir, toolRounds ? `task-${round}.txt` : "task.txt") }) } }] });
           chunk({}, "tool_calls");
         } else {
           chunk({ role: "assistant", content: "useful current result" });
@@ -305,6 +307,9 @@ describe("native activation window (offline; opted-in success needs exact native
     const settings = JSON.stringify({ enableInstallTelemetry: false, compaction: { enabled: true, reserveTokens: 1000 } });
     fs.writeFileSync(settingsFile, settings);
     fs.writeFileSync(path.join(dir, "task.txt"), "current tool result");
+    for (let round = 1; round <= toolRounds; round++) {
+      fs.writeFileSync(path.join(dir, `task-${round}.txt`), `ROUND_${round}_FULL_RESULT ` + "x".repeat(round === oversizedRound ? 45_000 : 15_000));
+    }
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     vi.stubEnv("PI_OFFLINE", "1");
     const fabricExtensionPath = path.join(dir, "noop.ts");
@@ -526,6 +531,49 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(stderr).toContain("Compaction is unsupported");
     expect(s.requests).toHaveLength(0);
     expectJournalAppended(journal, before);
+    expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
+  }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary).each([false, true])("3238 compacts mid-run growth in a real activation (unfittable latest batch: %s)", async unfittable => {
+    const s = await setup(5, unfittable ? 4 : 0);
+    const alarms: Array<{message: {text?: string}}> = [];
+    const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
+    const actors = new ActorManager("growing-window-test", {id: "owner", name: "owner", kind: "main", sessionId: "growing-window-test"}, mesh,
+      {...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20}, s.manager, request => { alarms.push(request); },
+      {actorRoot: path.join(s.dir, "actors"), persistent: true});
+    managers.push(actors);
+    const actor = await actors.create({name: "growing", instructions: "Read each requested file; preserve the current result.", inferenceContext: "activation",
+      model: "window-test/offline", tools: ["read"], extensions: false, transport: "process", delivery: "mailbox"});
+    const run = vi.spyOn(s.manager, "run");
+    const outcome = actors.ask(actor.id, "CURRENT_GROWING_ACTIVATION");
+    if (unfittable) await expect(outcome).rejects.toThrow(/Context exceeds window/);
+    else await expect(outcome).resolves.toMatchObject({text: "useful current result"});
+    await actors.close();
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(alarms).toHaveLength(unfittable ? 1 : 0);
+    expect(mesh.read({topic: "ops.owner"}).filter(event => event.kind === "actor.alarm")).toHaveLength(unfittable ? 1 : 0);
+    expect(s.requests).toHaveLength(unfittable ? 4 : 6);
+    const journal = readJournal(path.join(s.dir, "actors", actor.id, "session.jsonl"));
+    const rawMessages = SessionManager.open(path.join(s.dir, "actors", actor.id, "session.jsonl")).getBranch()
+      .flatMap(entry => entry.type === "message" ? sessionEntryToContextMessages(entry) : []);
+    expect(estimateContextTokens(convertToLlm(rawMessages)).tokens).toBeGreaterThan(8000);
+    const compactions = journal.entries.filter(entry => entry.type === "compaction");
+    expect(compactions.length).toBeGreaterThanOrEqual(2);
+    expect(journal.entries.filter(entry => entry.type === "context_edit").length).toBeGreaterThanOrEqual(2);
+    const raw = journal.bytes.toString("utf8");
+    expect(raw).toContain("CURRENT_GROWING_ACTIVATION");
+    for (let round = 1; round <= (unfittable ? 4 : 5); round++) {
+      const full = fs.readFileSync(path.join(s.dir, `task-${round}.txt`), "utf8");
+      expect(raw).toContain(full); // Full original output survives every inference compaction.
+      const next = s.requests[round];
+      if (!next) continue; // Latest oversized result was never dispatched.
+      const tool = next.messages.find((message: any) => message.role === "tool" && message.tool_call_id === `read-${round}`);
+      const text = typeof tool.content === "string" ? tool.content : tool.content.map((part: any) => part.text ?? "").join("");
+      expect(text).toBe(full); // Current batch is not compacted, even at the threshold.
+      const call = next.messages.find((message: any) => message.tool_calls?.some((call: any) => call.id === `read-${round}`));
+      expect(call.tool_calls.some((call: any) => call.id === tool.tool_call_id)).toBe(true);
+    }
+    expect(JSON.stringify(s.requests.at(-1))).toContain("Compacted tool output");
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
   }, TEST_GUARD_MS);
 

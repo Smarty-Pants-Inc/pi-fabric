@@ -249,7 +249,7 @@ describe("agents provider message routing service boundaries", () => {
     Object.assign(participants, { lastKnown: vi.fn((id: string) => id === peer.id ? { participant: peer, lapsedMs: 20_000 } : undefined) });
     control.request.mockResolvedValue({ queued: true, messageId: "delivered", routed: "mesh", acknowledged: true });
     await expect(router.routeMessage(peer.id, "reply", undefined, "followUp")).resolves.toMatchObject({ acknowledged: true, messageId: "delivered" });
-    expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp", { message: "reply", data: undefined }, "owner", { routedRemoteHost: null });
+    expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp", { message: "reply", data: undefined, triggerTurn: true }, "owner", { routedRemoteHost: null });
   });
 
   // review/astra on #44: a worker replies to its own remote Main through the same lookup.
@@ -263,7 +263,7 @@ describe("agents provider message routing service boundaries", () => {
     Object.assign(participants, { lastKnown: vi.fn((id: string) => id === root.id ? { participant: root, lapsedMs: 15_000 } : undefined) });
     control.request.mockResolvedValue({ queued: true, messageId: "to-main", routed: "mesh", acknowledged: true });
     await expect(router.routeMessage(target, "result", undefined, "followUp")).resolves.toMatchObject({ messageId: "to-main" });
-    expect(control.request).toHaveBeenCalledWith("host", root.id, "followUp", { message: "result", data: undefined }, "owner", { routedRemoteHost: null });
+    expect(control.request).toHaveBeenCalledWith("host", root.id, "followUp", { message: "result", data: undefined, triggerTurn: true }, "owner", { routedRemoteHost: null });
   });
 
   it.each(["absent", "rootId", "ownerHostId", "ownerIdentityId", "remoteHost"] as const)("refuses a cached native root when fresh authority changes (%s)", async (change) => {
@@ -429,7 +429,7 @@ describe("agents provider message routing service boundaries", () => {
     const remote = participant();
     participants.get.mockReturnValue(remote);
     await router.routeMessage("main", "first", null, "followUp");
-    expect(control.request).toHaveBeenCalledWith("host", "main", "followUp", { message: "first", data: null }, "owner", { routedRemoteHost: null });
+    expect(control.request).toHaveBeenCalledWith("host", "main", "followUp", { message: "first", data: null, triggerTurn: true }, "owner", { routedRemoteHost: null });
     remote.capabilities = [];
     await expect(router.routeMessage("main", "second", null, "followUp")).rejects.toThrow("does not support followUp");
     expect(control.request).toHaveBeenCalledTimes(1);
@@ -451,7 +451,7 @@ describe("agents provider message routing service boundaries", () => {
     peer.ownerIdentityId = "replacement-owner";
     await router.routeMessage(peer.id, "later observation", undefined, "followUp");
     expect(control.request).toHaveBeenLastCalledWith("replacement-host", peer.id, "followUp",
-      { message: "later observation", data: undefined }, "replacement-owner", { routedRemoteHost: null });
+      { message: "later observation", data: undefined, triggerTurn: true }, "replacement-owner", { routedRemoteHost: null });
     peer.capabilities = [];
     await expect(router.routeMessage(peer.id, "withdrawn", undefined, "followUp")).rejects.toThrow("does not support followUp");
     expect(control.request).toHaveBeenCalledTimes(2);

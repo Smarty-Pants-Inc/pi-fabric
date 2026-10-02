@@ -4,6 +4,15 @@
 
 `forge-ssh-bridge.sh CONFIG.json` is the opt-in real-host proof. Run it on Dev1 against the installed artifacts, **not** a candidate build. It starts one fresh Pi on each host, each at nice 19, and one temporary bridge. It never sends messages to unrelated agents. Evidence is local `results.json`, both fresh RPC streams, and the bridge log. Exit 0 requires all assertions and cleanup to pass.
 
+Cleanup has one 25-second budget, shorter than the real-host wrapper's 30-second
+TERM-to-KILL grace. It reaps authenticated local groups before awaiting remote SSH;
+all remote helper calls have a kill deadline, and the last five seconds are reserved
+for reaping cleanup-created SSH groups (including children retaining their pipes).
+Timeout, ownership, closure, or remote cleanup errors still fail the proof. The Linux
+regression is `bunx vitest run tests/bridge-proof-cleanup.test.ts`: it runs the actual
+wrapper with only its 900-second proof duration shortened, a linked detached bridge
+stand-in, and fake cleanup SSH that stalls and leaves inherited-pipe children.
+
 Before running:
 
 - Both proof hosts must run Linux with Python 3 and the kernel/Python `pidfd_open` and `pidfd_send_signal` APIs. Cleanup binds each signal to a verified process incarnation; it fails closed rather than using a numeric-PID fallback.

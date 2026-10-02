@@ -5,6 +5,7 @@ import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type 
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
+import { OutputArtifactStore } from "./output-budget.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
 import { resolvePiModel } from "./core/model-refresh.js";
@@ -134,6 +135,7 @@ import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type 
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
 import { ResidencyClient } from "./residency/client.js";
+import { isOwnResidentActor } from "./residency/actor-ownership.js";
 import { RESIDENT_HOST_FORMAT, residentRoot } from "./residency/protocol.js";
 import type { FabricRuntimePaths } from "./runtime-paths.js";
 
@@ -227,6 +229,8 @@ export class FabricRuntimeState {
   readonly #builtinComponentNames = new Set<string>();
   readonly componentCatalog = new FabricComponentCatalog();
   readonly activity: FabricActivityStore;
+  #outputArtifacts = new OutputArtifactStore();
+  get outputArtifactWriter(): OutputArtifactStore["write"] { return this.#outputArtifacts.write; }
   #shellJobs = new FabricShellJobStore();
   get shellJobs(): FabricShellJobStore { return this.#shellJobs; }
   readonly prewalk: PrewalkController;
@@ -414,6 +418,7 @@ export class FabricRuntimeState {
     try {
       await this.#closeInternal();
       this.#shellJobs = new FabricShellJobStore();
+      this.#outputArtifacts = new OutputArtifactStore();
     } finally {
       this.#suppressResidentGuidanceSync = false;
     }
@@ -556,6 +561,7 @@ export class FabricRuntimeState {
       context.cwd,
       identity.kind === "main" ? sessionId : undefined,
       context.mode !== "print" && context.mode !== "json",
+      (event) => { void this.publishOpsEvent("fabric.main.wake", "provider-backoff-released", event); },
     );
     this.#mainAgent = mainAgent;
     const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
@@ -601,6 +607,7 @@ export class FabricRuntimeState {
       enabled: this.#config.mesh.enabled,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
+      bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
@@ -661,6 +668,7 @@ export class FabricRuntimeState {
         registry: context.modelRegistry,
         aliases: modelsConfig.aliases,
         defaultModel,
+        policy: agentConfig,
       });
       const model = visiblePiModels().find(
         (candidate) =>
@@ -786,6 +794,7 @@ export class FabricRuntimeState {
             persistent: true,
             mainAgent,
             canManageActor,
+            isOwnResidentActor: (id) => isOwnResidentActor(this.#participants!, id, mainAgentId),
             lineageAlive,
             claimResidency: "session",
             rootId: mainAgentId,
@@ -913,6 +922,7 @@ export class FabricRuntimeState {
       this.#residency,
       false,
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
+      () => this.pi.getThinkingLevel(),
     );
     this.#agentsProvider = agentsProvider;
     this.#control.start((command, from, signal, verification) =>
@@ -1264,6 +1274,7 @@ export class FabricRuntimeState {
       outerToolResult,
       context,
       (update) => this.activity.updateCall(runId, callId, update),
+      () => this.config.agents,
     );
     const succeeded = result.completed === true || result.continued === true;
     const error = typeof result.error === "string" ? result.error : undefined;
@@ -1493,6 +1504,7 @@ export class FabricRuntimeState {
     await this.#closeRecords();
     await this.#agents?.close();
     await this.shellJobs.close();
+    await this.#outputArtifacts.close();
     try {
       await this.#registry?.close();
     } finally {
@@ -1597,7 +1609,10 @@ export class FabricRuntimeState {
     this.#mainAgent?.closeFollowUpDrain();
     await this.shellJobs.close();
     await this.#deactivateRepairs();
-    if (!this.#registry) return;
+    if (!this.#registry) {
+      await this.#outputArtifacts.close();
+      return;
+    }
     await this.#participants?.quiesce().catch(() => undefined);
     this.#stopComponentWatch?.();
     this.#stopComponentWatch = undefined;
@@ -1612,6 +1627,8 @@ export class FabricRuntimeState {
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
     await this.#closeRecords();
     await this.#agents?.close();
+    // Reinitialization, like shutdown, must drain workers before releasing output artifacts.
+    await this.#outputArtifacts.close();
     const externalNames = new Set(this.#externalProviders.keys());
     try {
       await this.#registry.close(externalNames);

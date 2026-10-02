@@ -112,6 +112,10 @@ describe("MainAgentController", () => {
       { deliverAs: "followUp", triggerTurn: true },
     );
 
+    // Without a live ExtensionContext Main cannot observe whether Pi was idle.
+    expect(controller.deliverAgent({ from: { id: "peer", name: "Peer", kind: "main" }, message: "unknown state", delivery: "followUp" }))
+      .not.toHaveProperty("triggered");
+
     const longMessage = "x".repeat(20_000);
     const longData = { body: "y".repeat(20_000) };
     controller.deliverAgent({

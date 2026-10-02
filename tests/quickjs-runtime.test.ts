@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { FabricModelDeniedError } from "../src/core/model-policy.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
+import { MeshLockTimeoutError, MESH_LOCK_TIMEOUT_CODE } from "../src/core/atomic-write.js";
 import { transpileFabricCodeWithSourceMap } from "../src/runtime/type-checker.js";
 import * as typeChecker from "../src/runtime/type-checker.js";
 import { ExecutionDeadline } from "../src/runtime/execution-deadline.js";
@@ -13,6 +14,38 @@ const options = {
 };
 
 describe("QuickJsRuntime", () => {
+  it.each(["native", "renamed", "legacy"])("gives a %s mesh lock timeout its canonical guest name and code, then continues", async (kind) => {
+    const error = kind === "legacy"
+      ? Object.assign(new Error("legacy lock timeout"), { code: MESH_LOCK_TIMEOUT_CODE })
+      : new MeshLockTimeoutError(" held by fixture", 2, 100);
+    if (kind === "renamed") error.name = "cursor-stale";
+    Object.assign(error, { secret: "not-guest-data" });
+    const hostCall = vi.fn(async (reference: string) => {
+      if (reference === "mesh.put") throw error;
+      return ["continued"];
+    });
+    const result = await new QuickJsRuntime().execute(`
+try { await mesh.put({ key: "fixture", value: 1 }); }
+catch (error) {
+  return { name: error.name, code: error.code, message: error.message,
+    isError: error instanceof Error, extra: typeof error.secret, continued: await mesh.read({}) };
+}
+`, hostCall, options);
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "MeshLockTimeoutError", code: MESH_LOCK_TIMEOUT_CODE,
+      message: error.message, isError: true, extra: "undefined", continued: ["continued"] });
+    expect(hostCall.mock.calls.map(([reference]) => reference)).toEqual(["mesh.put", "mesh.read"]);
+  });
+
+  it("preserves a non-lock host Error name without transferring its arbitrary code", async () => {
+    const error = Object.assign(new RangeError("bounded"), { code: "PROVIDER_CODE", secret: "not-guest-data" });
+    const result = await new QuickJsRuntime().execute(`
+try { await tools.call({ ref: "owned.error", args: {} }); }
+catch (error) { return { name: error.name, code: typeof error.code, extra: typeof error.secret }; }
+`, async () => { throw error; }, options);
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "RangeError", code: "undefined", extra: "undefined" });
+  });
   it("review round A3 transfers only the fixed policy code, not arbitrary host error properties", async () => {
     const errors = [new FabricModelDeniedError("provider/denied"), Object.assign(new Error("spoof"), { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", secret: "must-not-cross" })];
     for (const error of errors) {

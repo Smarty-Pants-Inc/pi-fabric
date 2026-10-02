@@ -243,8 +243,14 @@ describe.skipIf(process.platform === "win32")("durable public spawn return addre
     expect(f.mesh.read({ topic: "fabric.control.command" }).filter(event => (event.data as any)?.targetId === KATE)).toHaveLength(0);
   }, 30_000);
 
-  it("refuses absent and forged launch envelopes before commit or worker launch", async () => {
+  it.each([false, true])("refuses absent and forged launch envelopes before commit or worker launch (cached retry: %s)", async cachedRetry => {
     const f = await durableFixture();
+    const idempotencyKey = "caller-bound-retry";
+    if (cachedRetry) {
+      const handle = await f.client.spawnAgent({ task: JSON.stringify({ targets: [] }), residency: "durable",
+        transport: "process", extensions: false, idempotencyKey });
+      expect((await f.client.waitAgent(handle.id)).status).toBe("completed");
+    }
     const self = f.requester.directory.self();
     const caller = { id: self.id, rootId: self.rootId, sessionId: self.sessionId,
       ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind,
@@ -255,6 +261,7 @@ describe.skipIf(process.platform === "win32")("durable public spawn return addre
       const requestId = randomUUID();
       fs.writeFileSync(path.join(f.config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({
         format: RESIDENT_HOST_FORMAT, operation: "spawnBound", requestId, rootId: SPAWNER,
+        ...(cachedRetry ? { idempotencyKey } : {}),
         request: { task: "must not launch", residency: "durable", transport: "process" }, caller: value, createdAt: Date.now(),
       }));
       const responseFile = path.join(f.config.residencyRoot, "responses", `${requestId}.json`);
@@ -262,8 +269,8 @@ describe.skipIf(process.platform === "win32")("durable public spawn return addre
       expect(JSON.parse(fs.readFileSync(responseFile, "utf8"))).toMatchObject({ ok: false, error: expect.stringContaining("absent or forged binding refused") });
       expect(fs.existsSync(path.join(f.config.residencyRoot, "decisions", `${requestId}.json`))).toBe(false);
     }
-    expect(f.host.agents.list()).toHaveLength(0);
-    expect(f.client.listAgents()).toHaveLength(0);
+    expect(f.host.agents.list()).toHaveLength(cachedRetry ? 1 : 0);
+    expect(f.client.listAgents()).toHaveLength(cachedRetry ? 1 : 0);
   }, 30_000);
 
   it("fails closed at public dispatch when no native caller session binding exists", async () => {

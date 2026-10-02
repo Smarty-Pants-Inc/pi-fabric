@@ -196,6 +196,8 @@ export interface FabricActorValidityFacts {
 }
 
 export interface FabricActorRequest {
+  /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
+  idempotencyKey?: string;
   /** Storage and visibility boundary. Defaults to mesh.actorScope for compatibility. */
   scope?: FabricActorStorageScope;
   name: string;

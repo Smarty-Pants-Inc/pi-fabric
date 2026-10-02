@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
+import { confirmedSessionEntries, type SessionReceiptManager } from "../core/session-receipts.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 
 /**
@@ -381,6 +382,17 @@ export class RootInbox {
     return this.options.now?.() ?? Date.now();
   }
 }
+
+/** Persisted sessions must use confirmed file receipts, never Pi's pre-write memory index.
+ * A failed barrier supplies no positive delivery evidence, so shadows remain recoverable. */
+export const confirmedRootInboxSession = (manager: SessionReceiptManager): RootInboxSession => {
+  try {
+    return rootInboxSession(confirmedSessionEntries(manager, (line) =>
+      line.includes(ROOT_INBOX_CUSTOM_TYPE) || line.includes(AGENT_MESSAGE_CUSTOM_TYPE)));
+  } catch {
+    return rootInboxSession([]);
+  }
+};
 
 /** A receipt snapshot of canonical entries; async inbox reads must not retain the history.
  * Batch presence retains its compatibility lookback; delivery identity does not. */

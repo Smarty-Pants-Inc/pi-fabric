@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, syncPathNamespace, writeFileAtomic } from "./core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic } from "./core/atomic-write.js";
+import { withConfirmedSessionFile } from "./core/session-receipts.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
@@ -693,24 +694,9 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Read the complete lines appended to the session file since the last call, in 1 MiB chunks. */
   #indexSessionFile(file: string): void {
-    let fd: number;
-    try {
-      // ponytail: Windows' FlushFileBuffers (fsyncSync) needs a writable handle; this code never writes through it.
-      fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      this.#restartIndex(file);    // not written (or removed): no cached persisted receipt
-      return;
-    }
-    try {
-      const stat = fs.fstatSync(fd);
+    if (!withConfirmedSessionFile(file, (fd, stat) => {
       const size = stat.size;
       const identity = `${stat.dev}:${stat.ino}`;
-      fs.fsyncSync(fd);
-      // Bind every namespace hop (including hidden link targets) to the opened
-      // receipt inode, and recheck the walk after ALL required barriers. Any
-      // uncertain hop retains the journal/source and propagates duplicate retries.
-      syncPathNamespace(file, stat);
       if (this.#source !== file || this.#scanned === undefined || size < this.#scanned || this.#sessionFileIdentity !== identity) {
         this.#restartIndex(file);
       }
@@ -737,9 +723,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         // A partial last line is read again next time, once it is complete.
         this.#scanned = position - carry.reduce((sum, part) => sum + part.length, 0);
       }
-    } finally {
-      fs.closeSync(fd);
-    }
+    })) this.#restartIndex(file); // Not written (or removed): no cached persisted receipt.
   }
 
   /** The followUp ids in Pi's in-memory entry list, persisted or not. */

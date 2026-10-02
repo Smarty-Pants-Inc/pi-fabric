@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -35,7 +35,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
 
   // `wake`: the idle wake ticks every 100 ms with no cooldown (smarty-dev#1595); otherwise it
   // keeps its 15 s default and stays out of these short tests.
-  const start = async (tokensPerSecond = 1_000, wake = false, extra: { extensions?: (root: string) => string[]; warm?: boolean; wakeMs?: string; config?: unknown; optIn?: boolean } = {}) => {
+  const start = async (tokensPerSecond = 1_000, wake = false, extra: { persisted?: boolean; extensions?: (root: string) => string[]; warm?: boolean; wakeMs?: string; config?: unknown; optIn?: boolean } = {}) => {
     if (wake) {
       process.env.PI_FABRIC_INBOX_WAKE_MS = extra.wakeMs ?? "100";
       process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS = "0";
@@ -66,7 +66,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     await loader.reload();
     const { session } = await createAgentSession({
       cwd: root, agentDir, modelRuntime, model: faux.getModel(), resourceLoader: loader,
-      sessionManager: SessionManager.inMemory(root),
+      sessionManager: extra.persisted ? SessionManager.create(root, path.join(root, "sessions")) : SessionManager.inMemory(root),
     });
     sessions.push(session);
     await session.bindExtensions({});
@@ -88,12 +88,64 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       return id;
     };
     // The first turn activates Fabric; its settle starts the inbox at the present.
-    if (extra.warm === false) return { session, faux, inboxMessages, missedWork };
+    if (extra.warm === false) return { session, faux, inboxMessages, missedWork, root, meshRoot, loader, modelRuntime };
     faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })), fauxAssistantMessage("ready")]);
     await session.prompt("start");
     expect(inboxMessages()).toEqual([]);
-    return { session, faux, inboxMessages, missedWork };
+    return { session, faux, inboxMessages, missedWork, root, meshRoot, loader, modelRuntime };
   };
+
+  it("does not cache a failed native session append before its shadow, then delivers once after reload (F5)", async () => {
+    const h = await start(1_000, false, { persisted: true });
+    const { session, faux, root, meshRoot, loader, modelRuntime } = h;
+    const file = session.sessionManager.getSessionFile()!;
+    const backup = `${file}.backup`;
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
+    const key = "topology/inbox/" + createHash("sha256").update(`session:${session.sessionManager.getSessionId()}`).digest("hex").slice(0, 32);
+    const receipts = () => (mesh.get(key, { fresh: true })?.value as { delivered?: unknown[] } | undefined)?.delivered ?? [];
+    const before = receipts();
+    fs.renameSync(file, backup);
+    fs.mkdirSync(file); // Real Pi indexes the entry before appendFileSync fails with EISDIR.
+    try {
+      await expect(session.sendCustomMessage({
+        customType: "pi-fabric-agent-message", content: "native write failed", display: true,
+        details: { id: "failed-native", from: { id: "session:peer" }, data: { key: "retry unseen work" } },
+      }, { triggerTurn: false })).rejects.toThrow();
+      expect(session.sessionManager.getEntries().some(entry => entry.type === "custom_message" &&
+        entry.customType === "pi-fabric-agent-message")).toBe(true);
+    } finally {
+      fs.rmSync(file, { recursive: true });
+      fs.renameSync(backup, file);
+    }
+    // Drain at turn start before the shadow exists. In-memory failed entries are not receipts.
+    faux.setResponses([fauxAssistantMessage("drained before shadow")]);
+    await session.prompt("drain before shadow");
+    expect(receipts()).toEqual(before);
+    expect(fs.readFileSync(file, "utf8")).not.toContain("failed-native");
+    h.missedWork("retry unseen work");
+    await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    session.dispose();
+    await loader.reload();
+    const { session: reloaded } = await createAgentSession({
+      cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+      sessionManager: SessionManager.open(file),
+    });
+    sessions.push(reloaded);
+    await reloaded.bindExtensions({});
+    // Reopened Fabric is lazy until its first real tool call, as at initial startup.
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })),
+      fauxAssistantMessage("recovered work"), fauxAssistantMessage("noted recovery")]);
+    await reloaded.prompt("retry");
+    const inbox = () => reloaded.sessionManager.getEntries().filter(entry => entry.type === "custom_message" && entry.customType === "pi-fabric-inbox");
+    expect(inbox()).toHaveLength(1);
+    expect(JSON.stringify(inbox()[0])).toContain("retry unseen work");
+    expect(receipts().length).toBeGreaterThan(before.length);
+    h.missedWork("retry unseen work"); // A confirmed inbox receipt suppresses the new shadow id.
+    faux.setResponses([fauxAssistantMessage("no duplicate")]);
+    await reloaded.prompt("redelivery");
+    expect(inbox()).toHaveLength(1);
+  }, 60_000);
 
   it("summarises a 20-hour backlog once at turn start without injecting work or chaining turns (#3036)", async () => {
     const { session, faux, inboxMessages, missedWork } = await start();

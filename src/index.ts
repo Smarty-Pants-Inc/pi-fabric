@@ -1,5 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
-import { rootInboxMessage, rootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
+import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
@@ -198,7 +198,7 @@ const settledCompleted = (event: unknown, context: ExtensionContext): boolean =>
 };
 
 // Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
-const inboxHeldBy = (context: ExtensionContext) => rootInboxSession(context.sessionManager.getEntries());
+const inboxHeldBy = (context: ExtensionContext) => confirmedRootInboxSession(context.sessionManager);
 
 /** Expiry is observational: one line, never a triggered continuation. */
 const reportInboxExpiry = (pi: ExtensionAPI, inbox: RootInboxBatch | undefined): void => {

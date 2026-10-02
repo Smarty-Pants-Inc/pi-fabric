@@ -1,11 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { RootInbox, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox, confirmedRootInboxSession, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
 
 const roots: string[] = [];
 const me: MeshIdentity = { id: "session:recipient", name: "recipient", kind: "main" };
@@ -132,6 +133,108 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
       expect(first.events).toHaveLength(1);
       expect((await h.box().next(h.session())).events.map(e => e.id)).toEqual(first.events.map(e => e.id));
     } finally { held.closeFollowUpDrain(); }
+  });
+});
+
+describe("confirmed persisted Main/inbox receipts (review F5)", () => {
+  const persisted = () => {
+    const h = setup();
+    let manager = SessionManager.create(h.root, path.join(h.root, "sessions"));
+    const pi = {
+      on: () => undefined,
+      sendMessage: (message: { customType: string; content: string; display: boolean; details: unknown }) =>
+        manager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details),
+    } as unknown as ExtensionAPI;
+    const main = new MainAgentController(pi, me.id, true, h.root, "persisted");
+    main.attachFollowUpDrain({ isIdle: () => true, hasPendingMessages: () => false, signal: { aborted: false },
+      sessionManager: { getEntries: () => manager.getEntries(), getSessionFile: () => manager.getSessionFile(), isPersisted: () => true },
+    } as unknown as ExtensionContext, 0, path.join(h.root, "persisted-followups.json"));
+    return { ...h, main, manager: () => manager, reload: () => { manager = SessionManager.open(manager.getSessionFile()!); },
+      session: () => confirmedRootInboxSession(manager),
+      followUp: () => main.deliverAgent({ from: peer, message: "native work", delivery: "followUp", data: { key: "work:1" }, triggerTurn: false }),
+      receipts: (inbox: RootInbox) => (h.mesh.get(inbox.key, { fresh: true })?.value as { delivered?: string[] } | undefined)?.delivered ?? [],
+      record: (events: Parameters<typeof rootInboxMessage>[0]) => {
+        const message = rootInboxMessage(events);
+        manager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+      },
+    };
+  };
+
+  it("never promotes failed native appends, retries the shadow after reload and caches only the confirmed retry", async () => {
+    const h = persisted(); const inbox = h.box(); inbox.start();
+    h.manager().appendMessage(fauxAssistantMessage("warm persisted session"));
+    const file = h.manager().getSessionFile()!;
+    const backup = `${file}.backup`;
+    try {
+      fs.renameSync(file, backup); fs.mkdirSync(file);
+      // Injection is below the native in-memory index, at the real session append boundary.
+      expect(() => h.followUp()).toThrow();
+      expect(h.manager().getEntries().filter(entry => entry.type === "custom_message")).toHaveLength(1);
+      fs.rmSync(file, { recursive: true }); fs.renameSync(backup, file);
+      await inbox.next(h.session()); // Drain BEFORE there is a shadow to recover.
+      expect(h.receipts(inbox)).toEqual([]);
+      h.main.closeFollowUpDrain(); h.reload();
+      expect(h.manager().getEntries().filter(entry => entry.type === "custom_message")).toHaveLength(0);
+      const event = await h.publish(); h.advance(1);
+      const retry = h.box();
+      const batch = await retry.next(h.session());
+      expect(batch.events.map(event => event.id)).toEqual([event.id]);
+      expect(h.receipts(retry)).toEqual([]);
+      h.record(batch.events);
+      expect((await retry.next(h.session())).events).toEqual([]);
+      expect(h.receipts(retry).length).toBeGreaterThan(0);
+      await h.publish(); h.advance(1);
+      expect((await h.box().next(h.session())).events).toEqual([]);
+      expect(h.manager().getEntries().filter(entry => entry.type === "custom_message" && entry.customType === "pi-fabric-inbox")).toHaveLength(1);
+    } finally { h.main.closeFollowUpDrain(); }
+  });
+
+  it("keeps deferred first native and inbox writes recoverable until the first assistant confirms them", async () => {
+    const h = persisted(); const inbox = h.box(); inbox.start();
+    try {
+      h.followUp();
+      expect(h.manager().getEntries().filter(entry => entry.type === "custom_message")).toHaveLength(1);
+      expect(fs.existsSync(h.manager().getSessionFile()!)).toBe(false);
+      await inbox.next(h.session());
+      expect(h.receipts(inbox)).toEqual([]);
+      const event = await h.publish(); h.advance(1);
+      const batch = await inbox.next(h.session());
+      expect(batch.events.map(event => event.id)).toEqual([event.id]);
+      h.record(batch.events); // Also deferred: it must NOT commit the pending batch.
+      expect(h.session().holdsBatch([event.id])).toBe(false);
+      expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([event.id]);
+      expect(h.receipts(inbox)).toEqual([]);
+      h.manager().appendMessage(fauxAssistantMessage("first durable write"));
+      expect(h.session().holdsBatch([event.id])).toBe(true);
+      expect((await inbox.next(h.session())).events).toEqual([]);
+      expect(h.receipts(inbox).length).toBeGreaterThan(0);
+      await h.publish(); h.advance(1);
+      expect((await h.box().next(h.session())).events).toEqual([]);
+    } finally { h.main.closeFollowUpDrain(); }
+  });
+
+  it("does not cache an unconfirmed session barrier and rechecks before suppressing confirmed native redelivery", async () => {
+    const h = persisted(); const inbox = h.box(); inbox.start();
+    try {
+      h.followUp(); h.manager().appendMessage(fauxAssistantMessage("persisted"));
+      const fileStat = fs.statSync(h.manager().getSessionFile()!);
+      const sync = fs.fsyncSync.bind(fs);
+      const barrier = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+        const stat = fs.fstatSync(fd);
+        if (stat.dev === fileStat.dev && stat.ino === fileStat.ino) throw new Error("session receipt barrier failed");
+        sync(fd);
+      });
+      try {
+        await inbox.next(h.session());
+        expect(h.receipts(inbox)).toEqual([]);
+      } finally { barrier.mockRestore(); }
+      await inbox.next(h.session());
+      expect(h.receipts(inbox).length).toBeGreaterThan(0);
+      const receipts = h.receipts(inbox);
+      await h.publish(); h.advance(1);
+      expect((await h.box().next(h.session())).events).toEqual([]);
+      expect(h.receipts(inbox)).toEqual(expect.arrayContaining(receipts));
+    } finally { h.main.closeFollowUpDrain(); }
   });
 });
 

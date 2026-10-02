@@ -21,12 +21,8 @@ jobs:
         include:
           - name: check (ubuntu-latest)
             runner: [self-hosted, smarty-linux-x64]
-          - name: check (windows-latest)
-            # Dev3's native i9 runner (group "Smarty Windows CI"), not a hosted image (Paul, smarty-dev#1246).
-            # The check name stays `check (windows-latest)` because the merge rules require it.
-            runner: [self-hosted, Windows, X64, smarty-ci-windows-x64]
     runs-on: ${{ matrix.runner }}
-    steps:
+    steps: &check-steps
       - name: Install Forge base prerequisites
         if: runner.os == 'Linux'
         run: |
@@ -126,3 +122,12 @@ jobs:
           path: ${{ runner.temp }}/fabric-artifact/
           if-no-files-found: error
           retention-days: 7
+
+  windows:
+    # Paul, smarty-dev#1246: Dev3 admits trusted main only; never request it for PR/queue code.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: check (windows-latest)
+    runs-on: [self-hosted, Windows, X64, smarty-ci-windows-x64]
+    timeout-minutes: 30
+    # Share the same build/test order; OS-specific steps retain their existing guards.
+    steps: *check-steps

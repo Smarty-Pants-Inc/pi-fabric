@@ -19,7 +19,6 @@ queue_rules:
       - -title ~= (?i)do not land
       - check-success = review/astra
       - check-success = check (ubuntu-latest)
-      - check-success = check (windows-latest)
       - or:
           - check-success = review/security
           - and:
@@ -32,7 +31,6 @@ queue_rules:
       - -title ~= (?i)do not land
       - check-success = review/astra
       - check-success = check (ubuntu-latest)
-      - check-success = check (windows-latest)
       - or:
           - check-success = review/security
           - and:

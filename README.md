@@ -161,6 +161,16 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 - [Speculative PTC](docs/speculation.md): pre-launching literal read calls while the program streams, with epoch + freshness guarantees.
 - [Skills](docs/skills.md): the core-first invocation policy and user-invoked advanced patterns.
 
+## CI policy
+
+Linux PR checks run on the disposable Forge pool for same-repository source;
+`check (ubuntu-latest)` remains the required PR/merge-queue check. Windows runs
+**post-merge only on trusted `main` pushes**, on the native Dev3 runner, and is
+not a required PR/merge-queue check. Windows-specific PRs need a **recorded native
+Dev3 proof before merge**, provided manually by fabric-v2. A post-merge Windows
+break is fixed or reverted by fabric-v2. This is Paul's Option A decision in
+[smarty-dev#1246](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/1246).
+
 ## Development
 
 ```bash

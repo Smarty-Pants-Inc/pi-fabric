@@ -15,6 +15,7 @@ import type {
 import { applyChildPriority } from "./agents/priority.js";
 import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
+import { ActivationSession } from "./worker/activation-session.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -350,8 +351,12 @@ const main = async (): Promise<void> => {
   const schema = options.schemaFile
     ? fs.readFileSync(options.schemaFile, "utf8")
     : undefined;
+  const activationWindow = options.inferenceContext === "activation";
+  const activationSession = activationWindow
+    ? new ActivationSession(options.sessionFile!, path.dirname(options.statusFile), options.cwd)
+    : undefined;
   const piArguments = ["--mode", "rpc"];
-  if (options.sessionFile) piArguments.push("--session", options.sessionFile);
+  if (options.sessionFile) piArguments.push("--session", activationSession?.file ?? options.sessionFile);
   else piArguments.push("--no-session");
   if (!options.extensions) piArguments.push("--no-extensions");
   if (options.residentStartupProbe) {
@@ -359,7 +364,6 @@ const main = async (): Promise<void> => {
     // skills, prompts, context files or compaction merely to decide on rollback.
     piArguments.push("--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files");
   }
-  const activationWindow = options.inferenceContext === "activation";
   const activationNonce = activationWindow ? randomUUID() : undefined;
   const residentProbeNonce = options.residentStartupProbe ? randomUUID() : undefined;
   let activationHookPath: string | undefined;
@@ -1117,6 +1121,23 @@ const main = async (): Promise<void> => {
         modelControl.observeAssistant(message as Record<string, unknown>);
       }
     }
+    // Context refusal is deterministic for an actor's admitted input. Native
+    // retries cannot make it fit; stop at the first structured failure, also
+    // for full-history actors or a preflight extension that reports an error.
+    const eventMessage = event.type === "message_end" && typeof event.message === "object" && event.message !== null
+      ? event.message as Record<string, unknown> : undefined;
+    const contextError = eventMessage?.stopReason === "error" ? stringField(eventMessage.errorMessage)
+      : event.type === "extension_error" || (event.type === "response" && event.success === false) ? stringField(event.error)
+      : event.type === "auto_retry_start" ? stringField(event.errorMessage) : undefined;
+    if (options.actorId && !terminalStatus && contextError && /Context exceeds window:/i.test(contextError)) {
+      terminalStatus = "failed";
+      terminalError = contextError;
+      record.error = contextError;
+      sawAgentError = true;
+      update();
+      killChild();
+      return;
+    }
     if (!terminalStatus) {
       toolCallStreamGuard.observe(event);
       if (terminalStatus) return;
@@ -1706,6 +1727,12 @@ const main = async (): Promise<void> => {
   if (logCompaction.compactionSkipped || logCompaction.error) {
     record.compactionSkipped = logCompaction.compactionSkipped ??
       `Terminal run-log compaction failed; full log retained: ${logCompaction.error}`;
+  }
+  try {
+    activationSession?.retain();
+  } catch (error) {
+    record.status = "failed";
+    record.error = `${record.error ? record.error + "\n" : ""}Activation journal retention failed: ${String(error)}`;
   }
   writeRunRecord(options.statusFile, record);
   terminalWritten = true;

@@ -82,7 +82,13 @@ export const reapDeadHostRecords = async (
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
   const found = deadHostRecords(mesh, options);
   // Leftovers of per-key lock operations whose process died (security pass S5 on #142).
-  if (typeof mesh.root === "string") sweepParticipantLockLeftovers(mesh.root, 60 * 60 * 1000);
+  if (typeof mesh.root === "string") {
+    const root = mesh.root;
+    // Recovery can restore a detached key lock. A sweep must not unlink its owner
+    // between the detach and the recovery recheck (smarty-dev#2570, P3 sweep).
+    await sweepParticipantLockLeftovers({ root, exclusive: (operation) => mesh.exclusive(operation) }, 60 * 60 * 1000)
+      .catch(() => undefined);
+  }
   if (found.length === 0) return 0;
   const dead = found.filter((item) => !item.file);
   const results = dead.length === 0 ? [] : await mesh.writeBatch({

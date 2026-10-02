@@ -66,8 +66,8 @@ async function setup(network: FabricConfig["approvals"]["network"] = "allow", at
     cwd, signal: undefined, parentToolCallId: "followups-registry", nestedToolCallId: "followups-spawn", extensionContext: context, update() {},
     approve: (action, args) => approval.approve(action, args), audits: [], maxResultChars: 100000,
   };
-  const spawn = async () => {
-    const handle = await runtime.registry.invoke("agents.spawn", { task: "harmless bounded lookup", model: "auto", routeClass: "bounded-lookup", pinModel: pin.model, pinThinking: pin.effort, protected: false, transport: "process" }, invocation) as { id: string; routeDecision: { reasonCode: string; model: string; effort: string } };
+  const spawn = async (signal?: AbortSignal) => {
+    const handle = await runtime.registry.invoke("agents.spawn", { task: "harmless bounded lookup", model: "auto", routeClass: "bounded-lookup", pinModel: pin.model, pinThinking: pin.effort, protected: false, transport: "process" }, { ...invocation, signal }) as { id: string; routeDecision: { reasonCode: string; model: string; effort: string } };
     const result = await runtime.registry.invoke("agents.join", { id: handle.id }, { ...invocation, nestedToolCallId: "followups-join" }) as { id: string; status: string; admittedModel: string; admittedThinking: string };
     expect(result).toMatchObject({ status: "completed", admittedModel: pin.model, admittedThinking: pin.effort });
     const rows = fs.readFileSync(path.join(agentDir, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
@@ -91,37 +91,29 @@ describe("SR-5 shadow routing obeys current ordinary Jev network approval throug
     expect(fixture.context.modelRegistry.getApiKeyForProvider).not.toHaveBeenCalled();
     expect(fixture.http).not.toHaveBeenCalled();
   });
-  it("an unapproved interactive ask records fallback without touching Jev", async () => {
+  it("an unapproved interactive ask records fallback without any queue or dialog work", async () => {
     const fixture = await setup("ask");
-    Object.assign(fixture.context, { hasUI: true });
+    Object.assign(fixture.context, { hasUI: true, mode: "rpc" });
+    const serialize = vi.spyOn(fixture.runtime.sessionApprovals, "serialize");
+    // Even a UI that would grant the entire session must never be consulted.
+    vi.mocked(fixture.context.ui.select).mockResolvedValue("Allow network access for this session");
     const { handle } = await fixture.spawn();
     expect(handle.routeDecision).toMatchObject({ ...pin, reasonCode: "jev-error" });
-    expect(fixture.context.ui.select).toHaveBeenCalledOnce();
+    expect(serialize).not.toHaveBeenCalled(); expect(fixture.context.ui.select).not.toHaveBeenCalled();
+    expect(fixture.runtime.sessionApprovals.approvedRisks.has("network")).toBe(false);
     expect(fixture.evaluate).not.toHaveBeenCalled(); expect(fixture.credentials).not.toHaveBeenCalled(); expect(fixture.http).not.toHaveBeenCalled();
   });
-  it("retirement during approval cannot evaluate later when the stale dialog allows once", async () => {
-    const fixture = await setup("ask"); Object.assign(fixture.context, { hasUI: true });
-    let release!: (choice: string) => void;
-    vi.mocked(fixture.context.ui.select).mockImplementation(() => new Promise<string>(resolve => { release = resolve; }));
-    const spawned = fixture.spawn();
-    let reloaded: Promise<unknown> | undefined;
-    try {
-      await vi.waitFor(() => expect(fixture.context.ui.select).toHaveBeenCalledOnce());
-      reloaded = fixture.runtime.registry.invoke("components.reload", { id: "fabric.provider.jev" }, { ...fixture.invocation, approve: async () => {} });
-      await reloaded;
-      release("Allow once");
-      const { handle } = await spawned;
-      expect(handle.routeDecision).toMatchObject({ ...pin, reasonCode: "jev-error" });
-      expect(fixture.evaluate).not.toHaveBeenCalled(); expect(fixture.credentials).not.toHaveBeenCalled(); expect(fixture.http).not.toHaveBeenCalled();
-    } finally { release?.("Deny"); await Promise.allSettled([spawned, ...(reloaded ? [reloaded] : [])]); }
-  });
-  it("an explicitly authorized ask uses the ordinary allow-once path", async () => {
-    const fixture = await setup("ask"); Object.assign(fixture.context, { hasUI: true });
-    vi.mocked(fixture.context.ui.select).mockResolvedValue("Allow once");
+  it("ask with a network session grant from an ordinary tool still routes without a new dialog", async () => {
+    const fixture = await setup("ask"); Object.assign(fixture.context, { hasUI: true, mode: "rpc" });
+    vi.mocked(fixture.context.ui.select).mockResolvedValue("Allow network access for this session");
+    const action = await fixture.runtime.registry.describe("jev.evaluate", fixture.invocation);
+    await fixture.invocation.approve(action, {});
+    expect(fixture.runtime.sessionApprovals.approvedRisks.has("network")).toBe(true);
+    const serialize = vi.spyOn(fixture.runtime.sessionApprovals, "serialize");
     const { handle } = await fixture.spawn();
     expect(handle.routeDecision).toMatchObject({ ...cheap, reasonCode: "shadow-choice" });
-    expect(fixture.context.ui.select).toHaveBeenCalledOnce(); expect(fixture.evaluate).toHaveBeenCalledOnce(); expect(fixture.http).toHaveBeenCalledOnce();
-    expect(fixture.runtime.sessionApprovals.approvedRisks.has("network")).toBe(false);
+    expect(serialize).not.toHaveBeenCalled(); expect(fixture.context.ui.select).toHaveBeenCalledOnce();
+    expect(fixture.evaluate).toHaveBeenCalledOnce(); expect(fixture.http).toHaveBeenCalledOnce();
   });
   it("retiring the Jev generation cancels routing and joins an uncancellable credential resolver", async () => {
     const fixture = await setup();
@@ -175,6 +167,87 @@ describe("SR-5 shadow routing obeys current ordinary Jev network approval throug
     expect(handle.routeDecision.reasonCode).toBe("jev-error");
     expect(fixture.evaluate).not.toHaveBeenCalled(); expect(fixture.credentials).not.toHaveBeenCalled(); expect(fixture.http).not.toHaveBeenCalled();
   });
+});
+
+describe("SR-9 internal ask scope cut with held ordinary approvals through the real registry", () => {
+  it.each([
+    ["queue", "none"], ["dialog", "none"],
+    ["queue", "caller"], ["dialog", "caller"],
+    ["queue", "deadline"], ["dialog", "deadline"],
+    ["queue", "reload"], ["dialog", "reload"],
+  ] as const)("held %s / %s: no internal queue, dialog, late network grant or Jev work", async (held, boundary) => {
+    const fixture = await setup("ask"); Object.assign(fixture.context, { hasUI: true, mode: "rpc" });
+    let releaseHolder!: () => void;
+    const holderGate = new Promise<void>(resolve => { releaseHolder = resolve; });
+    const select = vi.mocked(fixture.context.ui.select);
+    // Only an unrelated ordinary write dialog may exist. Its eventual session
+    // grant remains valid; there is no internal network dialog to answer late.
+    select.mockImplementation(async () => { await holderGate; return "Allow write access for this session"; });
+    const holder = held === "queue"
+      ? fixture.runtime.sessionApprovals.serialize(() => holderGate)
+      : new ApprovalController({ ...fixture.runtime.config.approvals, write: "ask" }, fixture.context, fixture.runtime.sessionApprovals).approve({
+        ref: "test.write", provider: "test", name: "write", description: "Ordinary write", inputSchema: {}, risk: "write",
+      });
+    if (held === "dialog") await vi.waitFor(() => expect(select).toHaveBeenCalledOnce());
+    const serialize = vi.spyOn(fixture.runtime.sessionApprovals, "serialize");
+    const controller = new AbortController();
+    const dispatch = vi.spyOn(fixture.runtime.agents, "spawn");
+    let routeSignal: AbortSignal | undefined;
+    let releaseDescriptor!: () => void;
+    const descriptorGate = new Promise<void>(resolve => { releaseDescriptor = resolve; });
+    const originalDescribe = fixture.runtime.registry.describe.bind(fixture.runtime.registry);
+    const describe = vi.spyOn(fixture.runtime.registry, "describe").mockImplementation(async (ref, context) => {
+      const action = await originalDescribe(ref, context);
+      if (ref === "jev.evaluate" && boundary !== "none") {
+        routeSignal = context.signal;
+        await descriptorGate;
+      }
+      return action;
+    });
+    const spawned = fixture.spawn(controller.signal).then(value => ({ value }), error => ({ error }));
+    let reloaded: Promise<unknown> | undefined;
+    try {
+      if (boundary !== "none") {
+        await vi.waitFor(() => expect(routeSignal).toBeDefined());
+        if (boundary === "caller") controller.abort(new Error("SR-9 caller cancelled"));
+        else if (boundary === "reload") {
+          reloaded = fixture.runtime.registry.invoke("components.reload", { id: "fabric.provider.jev" }, { ...fixture.invocation, approve: async () => {} });
+          await reloaded;
+        }
+        await vi.waitFor(() => expect(routeSignal!.aborted).toBe(true), { timeout: 3500 });
+      }
+      // The route must settle while the unrelated queue/dialog is still held.
+      const result = await spawned;
+      if ("error" in result) {
+        expect(boundary).toBe("caller"); expect(String(result.error)).toContain("SR-9 caller cancelled");
+        expect(dispatch).not.toHaveBeenCalled();
+      } else {
+        expect(boundary).not.toBe("caller");
+        expect(result.value.handle.routeDecision).toMatchObject({ ...pin, reasonCode: boundary === "deadline" ? "jev-timeout" : "jev-error" });
+      }
+      releaseDescriptor();
+      // Join the actual delayed descriptor/authorization continuation, not just
+      // its cancellation waiter, before checking for late effects.
+      await Promise.allSettled(describe.mock.results.filter(result => result.type === "return").map(result => result.value));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(serialize).not.toHaveBeenCalled();
+      expect(select).toHaveBeenCalledTimes(held === "dialog" ? 1 : 0);
+      expect(fixture.runtime.sessionApprovals.approvedRisks.has("network")).toBe(false);
+      expect(fixture.evaluate).not.toHaveBeenCalled(); expect(fixture.credentials).not.toHaveBeenCalled();
+      expect(fixture.context.modelRegistry.getApiKeyForProvider).not.toHaveBeenCalled(); expect(fixture.http).not.toHaveBeenCalled();
+      releaseHolder(); await holder;
+      // A later ordinary request is not blocked by a phantom internal slot.
+      const drained = vi.fn(async () => {});
+      await fixture.runtime.sessionApprovals.serialize(drained);
+      expect(drained).toHaveBeenCalledOnce();
+      expect(select).toHaveBeenCalledTimes(held === "dialog" ? 1 : 0);
+      expect(fixture.runtime.sessionApprovals.approvedRisks.has("network")).toBe(false);
+      expect(fixture.runtime.sessionApprovals.approvedRisks.has("write")).toBe(held === "dialog");
+    } finally {
+      releaseDescriptor(); releaseHolder();
+      await Promise.allSettled([holder, spawned, ...(reloaded ? [reloaded] : [])]);
+    }
+  }, 15000);
 });
 
 describe("SR-8 internal shadow routing refuses automatic network approval", () => {

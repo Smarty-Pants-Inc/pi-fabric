@@ -90,8 +90,8 @@ export class ApprovalController {
       decision?: FabricAutoApprovalDecision,
     ) => void,
     readonly brokeredNetwork?: (provider: string) => boolean,
-    /** Internal callers whose lifetime cannot own classifier work refuse `auto` (SR-8). */
-    readonly refuseAutomatic = false,
+    /** Internal routing cannot own a classifier or approval dialog: refuse ungranted `auto`/`ask` before queuing. */
+    readonly internalRouting = false,
   ) {}
 
   async approve(
@@ -112,16 +112,22 @@ export class ApprovalController {
       throw new FabricTraceSafeError(`${action.ref} is denied by the Fabric ${action.risk} policy`);
     }
 
+    // A raced route waiter cannot cancel serialize() or the host UI. Do not
+    // acquire a queue slot at all: there must be no stale dialog or late grant
+    // after caller/deadline/owner cancellation (SR-8/SR-9). Existing session
+    // grants retain the same semantics as the ordinary serialized path below.
+    if (this.internalRouting) {
+      if (this.sessionApprovals.approvedRisks.has(action.risk)) return;
+      const kind = mode === "auto" ? "automatic" : "interactive";
+      throw new FabricTraceSafeError(`${action.ref} ${kind} ${action.risk} approval is unsupported for internal routing; explicit allow required`);
+    }
+
     await this.sessionApprovals.serialize(async () => {
       if (this.sessionApprovals.approvedRisks.has(action.risk)) return;
       if (mode !== "auto") {
         await this.#requestApproval(action);
         return;
       }
-      if (this.refuseAutomatic) {
-        throw new FabricTraceSafeError(`${action.ref} automatic ${action.risk} approval is unsupported for internal routing; explicit allow required`);
-      }
-
       let decision: FabricAutoApprovalDecision;
       try {
         decision = await this.classifier.classify(

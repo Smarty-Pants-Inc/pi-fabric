@@ -5,6 +5,7 @@ import http from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { processStartTime } from "../src/residency/process-identity.js";
+import { processAlive } from "../src/storage/scratch.js";
 import { findExecutable } from "../src/agents/transports/process-utils.js";
 import { decideModelRoute } from "../src/agents/model-route.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
@@ -72,6 +73,11 @@ const productionRun = async (principal: boolean, retainRuns = true) => {
   });
   const run = path.dirname(result.logFile!); const runRoot = path.dirname(run); roots.push(runRoot);
   expect(result, JSON.stringify(result)).toMatchObject({ status: "completed", text: "production retention proof", exitCode: 0 });
+  // The manager returns a published terminal result, not an OS exit receipt.
+  // Copies preserve the worker PID, so even a successful archive must stay put
+  // while that PID is live. Confirm exit before using this tree as an expired,
+  // quiescent fixture; never weaken retention's independent live-writer fence.
+  await vi.waitFor(() => expect(processAlive(Number(result.sessionId))).toBe(false), { timeout: 7_000, interval: 50 });
   expect(requests).toHaveLength(1);
   expect(JSON.stringify(requests[0]!.messages.filter(message => message.role === "user"))).toContain(task);
   expect(fs.readdirSync(path.join(run, "deliveries"))).toEqual([]);

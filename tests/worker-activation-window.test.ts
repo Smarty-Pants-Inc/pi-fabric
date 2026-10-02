@@ -327,7 +327,7 @@ describe("native activation window (offline; opted-in success needs exact native
     const log = result.logFile && fs.existsSync(result.logFile) ? fs.readFileSync(result.logFile, "utf8") : "";
     return `${JSON.stringify(result)}\n${log.slice(-12_000)}`;
   };
-  const setup = async () => {
+  const setup = async (api: "openai-completions" | "google-generative-ai" = "openai-completions") => {
     const dir = root();
     const requests: Array<Record<string, any>> = [];
     let requestCount = 0;
@@ -338,6 +338,11 @@ describe("native activation window (offline; opted-in success needs exact native
       request.on("end", () => {
         const payload = JSON.parse(body);
         requests.push(payload);
+        if (api === "google-generative-ai") {
+          response.writeHead(200, { "Content-Type": "text/event-stream" });
+          response.end(`data: ${JSON.stringify({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: "useful current result" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 3, totalTokenCount: 13 } })}\n\n`);
+          return;
+        }
         const useTool = payload.tools?.length && !payload.messages.some((m: {role: string}) => m.role === "tool");
         response.writeHead(200, { "Content-Type": "text/event-stream" });
         const chunk = (delta: unknown, finish_reason: string | null = null) => response.write(`data: ${JSON.stringify({
@@ -361,7 +366,7 @@ describe("native activation window (offline; opted-in success needs exact native
     fs.mkdirSync(agentDir);
     // Fake local credentials only. No model or fleet credential is read.
     fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({ providers: {
-      "window-test": { baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "offline-only", api: "openai-completions", models: [{
+      "window-test": { baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "offline-only", api, models: [{
         id: "offline", name: "offline", reasoning: false, input: ["text"], contextWindow: 8000, maxTokens: 1024,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       }] },
@@ -382,6 +387,136 @@ describe("native activation window (offline; opted-in success needs exact native
     managers.push(manager);
     return { dir, manager, requests, get requestCount() { return requestCount; }, settingsFile, settings };
   };
+
+  it.skipIf(!selectedNativeBinary).each(["google-generative-ai", "google-vertex"].flatMap(api =>
+    ["stream", "streamSimple"].flatMap(method =>
+      ["success", "abort", "snapshot", "expand", "shrink", "non-json", "invalid-control"].map(mode => [api, method, mode])),
+  ))("preserves native Google SDK payload and signal identity: %s %s %s", (api, method, mode) => {
+    const dir = root();
+    const resultFile = path.join(dir, "google-result.json");
+    const sdkCallFile = path.join(dir, "google-sdk-called");
+    const hook = fs.realpathSync(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER
+      ? path.join(path.dirname(path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER)), "worker/activation-window.js")
+      : path.resolve("src/worker/activation-window.ts"));
+    const adapter = path.resolve(path.dirname(nativeBinary), "../../pi-ai/dist/api", `${api}.js`);
+    const child = path.join(dir, "google-dispatch.mjs");
+    fs.writeFileSync(child, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import http from 'node:http';
+      import path from 'node:path';
+      import {findPackageJSON} from 'node:module';
+      import {pathToFileURL} from 'node:url';
+      import hook from ${JSON.stringify(pathToFileURL(hook).href)};
+      import * as native from ${JSON.stringify(pathToFileURL(adapter).href)};
+      const sdkPackage = findPackageJSON('@google/genai', ${JSON.stringify(pathToFileURL(adapter).href)});
+      const {Models} = await import(pathToFileURL(path.join(path.dirname(sdkPackage), 'dist/node/index.mjs')).href);
+      const controller = new AbortController();
+      // If cancellation state is accidentally serialized, this non-JSON graph
+      // fails admission. Its own serializer must never run, either.
+      controller.signal.context = {cycle:controller.signal, big:1n};
+      controller.signal.toJSON = () => {throw new Error('serialized SDK cancellation control')};
+      let observed, sdkCalls = 0, requests = 0, wire, disconnected = false, guardFired = false;
+      // The SDK installs this public method as an instance arrow function. Wrap
+      // that assignment to inspect the EXACT adapter input before SDK transforms.
+      Object.defineProperty(Models.prototype, 'generateContentStream', {configurable:true, set(fn) {
+        Object.defineProperty(this, 'generateContentStream', {value:async params => {
+          assert.equal(params, observed, 'replaced native SDK parameter object');
+          assert.equal(params.config.abortSignal, controller.signal, 'lost native AbortSignal identity');
+          sdkCalls++;
+          fs.writeFileSync(${JSON.stringify(sdkCallFile)}, 'called');
+          return fn(params);
+        }, configurable:true, writable:true});
+      }});
+      let closed;
+      const connectionClosed = new Promise(resolve => {closed = resolve});
+      const server = http.createServer((request, response) => {
+        requests++;
+        let body = '';
+        request.on('data', chunk => {body += chunk});
+        request.on('end', () => {
+          wire = JSON.parse(body);
+          response.once('close', () => {disconnected = true; closed()});
+          if (${JSON.stringify(mode)} === 'abort') {controller.abort(); return}
+          response.writeHead(200, {'Content-Type':'text/event-stream'});
+          response.end('data: ' + JSON.stringify({candidates:[{index:0, content:{role:'model', parts:[{text:'GOOGLE_OK'}]}, finishReason:'STOP'}],
+            usageMetadata:{promptTokenCount:10, candidatesTokenCount:3, totalTokenCount:13}}) + '\\n\\n');
+        });
+      });
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+      const timeout = setTimeout(() => {guardFired = true; controller.abort(); server.closeAllConnections()}, 15_000);
+      try {
+        process.env.PI_FABRIC_ACTIVATION_WORKER_PID = String(process.ppid);
+        process.env.PI_FABRIC_ACTIVATION_NONCE = 'google-nonce';
+        process.env.PI_FABRIC_PARENT_RUN = 'google-test';
+        process.env.PI_FABRIC_ACTIVATION_HOOK = ${JSON.stringify(hook)};
+        const handlers = new Map();
+        await hook({on(name, fn) {handlers.set(name, fn)}});
+        const model = {id:'offline', provider:'google-test', api:${JSON.stringify(api)}, baseUrl:'http://127.0.0.1:' + server.address().port + '/v1',
+          contextWindow:8000, maxTokens:1024, reasoning:false, input:['text'], cost:{input:0, output:0, cacheRead:0, cacheWrite:0}};
+        const provider = {stream:native.stream, streamSimple:native.streamSimple};
+        const ctx = {mode:'rpc', model, sessionManager:{getBranch(){return []}},
+          modelRegistry:{getAll(){return [model]}, getProvider(){return provider}}};
+        await handlers.get('session_start')({}, ctx);
+        await handlers.get('before_provider_headers')({}, ctx);
+        const result = await provider[${JSON.stringify(method)}](model, {messages:[{role:'user', content:${JSON.stringify(mode === "shrink" ? "x".repeat(80_000) : "SMALL_GOOGLE_INPUT")}, timestamp:1}]},
+          {apiKey:'offline-only', signal:controller.signal, maxRetries:0, onPayload:async payload => {
+            observed = payload;
+            assert.equal(payload.config.abortSignal, controller.signal);
+            if (${JSON.stringify(mode)} === 'expand') payload.contents.push({role:'user', parts:[{text:'x'.repeat(40_000)}]});
+            if (${JSON.stringify(mode)} === 'shrink') payload.contents = [{role:'user', parts:[{text:'SMALL_GOOGLE_INPUT'}]}];
+            // An identically named value anywhere else is context, not a control.
+            if (${JSON.stringify(mode)} === 'non-json') payload.config.extra = {abortSignal:controller.signal};
+            if (${JSON.stringify(mode)} === 'invalid-control') payload.config.abortSignal = {aborted:false};
+            if (${JSON.stringify(mode)} === 'snapshot') {
+              let reads = 0;
+              Object.defineProperty(payload, 'contents', {enumerable:true, configurable:true, get() {
+                return [{role:'user', parts:[{text:++reads === 1 ? 'SMALL_GOOGLE_INPUT' : 'x'.repeat(40_000)}]}];
+              }});
+            }
+          }}).result();
+        assert.equal(result.stopReason, ${JSON.stringify(mode === "abort" ? "aborted" : "stop")}, result.errorMessage);
+        assert.equal(sdkCalls, 1);
+        assert.equal(requests, 1);
+        assert.equal(JSON.stringify(wire).includes('abortSignal'), false);
+        assert.equal(JSON.stringify(wire).includes('SMALL_GOOGLE_INPUT'), true);
+        if (${JSON.stringify(mode)} === 'abort') await connectionClosed;
+        else assert.equal(result.content[0].text, 'GOOGLE_OK');
+        assert.equal(guardFired, false, 'request/disconnect ended only because the hang guard fired');
+        fs.writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({sdkCalls, requests, samePayload:true, sameSignal:true,
+          stopReason:result.stopReason, disconnected, wireKeys:Object.keys(wire)}));
+      } finally {
+        clearTimeout(timeout);
+        server.closeAllConnections();
+        await new Promise(resolve => server.close(resolve));
+      }
+    `);
+    const result = spawnSync(process.execPath, [child], {encoding: "utf8", timeout: HANG_GUARD_MS});
+    expect(result.error).toBeUndefined();
+    const refuses = ["expand", "non-json", "invalid-control"].includes(mode);
+    expect(result.status, result.stderr).toBe(refuses ? 78 : 0);
+    if (refuses) {
+      expect(fs.existsSync(sdkCallFile)).toBe(false);
+      expect(fs.existsSync(resultFile)).toBe(false);
+      expect(result.stderr).toContain(mode === "expand" ? "Context exceeds window" : "Fabric activation window failed");
+      return;
+    }
+    expect(JSON.parse(fs.readFileSync(resultFile, "utf8"))).toMatchObject({sdkCalls: 1, requests: 1, samePayload: true, sameSignal: true,
+      stopReason: mode === "abort" ? "aborted" : "stop", ...(mode === "abort" ? {disconnected: true} : {})});
+  }, TEST_GUARD_MS);
+
+  // Astra round 4: the native Google callback receives SDK parameters with a
+  // real config.abortSignal, while the wire body contains only model data.
+  it.skipIf(!selectedNativeBinary)("3238 admits a native Google activation with its normal cancellation control", async () => {
+    const s = await setup("google-generative-ai");
+    const result = await s.manager.run({ task: "CURRENT_GOOGLE_ACTIVATION", model: "window-test/offline", actorId: "google-actor",
+      sessionFile: path.join(s.dir, "actor.jsonl"), inferenceContext: "activation", tools: [], extensions: false, transport: "process" });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    expect(s.requestCount).toBe(1);
+    expect(s.requests).toHaveLength(1);
+    expect(JSON.stringify(s.requests)).toContain("CURRENT_GOOGLE_ACTIVATION");
+    expect(JSON.stringify(s.requests)).not.toContain("abortSignal");
+  }, TEST_GUARD_MS);
 
   it.skipIf(Boolean(selectedNativeBinary))("rejects an old native CLI that ignores the flag even when global compaction is already false", async () => {
     const s = await setup();

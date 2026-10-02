@@ -165,11 +165,39 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             if (!final || typeof final !== "object" || Array.isArray(final)) {
               throw new Error("Activation window requires a JSON provider request object");
             }
-            // Estimate the entire exact wire object: system/messages, tool schemas,
-            // and API-specific context fields, with no stale assistant-usage shortcut.
-            // Counting JSON framing too is deliberately conservative. Non-JSON
-            // payloads fail closed rather than silently dropping unmeasured context.
-            const encoded = JSON.stringify(final, (_key, value: unknown) => {
+            // Google supplies SDK parameters, not wire JSON. Both native Google
+            // APIs put options.signal in config.abortSignal; OpenAI/Anthropic
+            // keep signal/timeout in separate SDK request options and fetch in
+            // client options (qualified native artifact 623f5790). Exclude only
+            // that qualified control path, never arbitrary similarly named data.
+            // Copy before serialization so even a signal's toJSON is not called.
+            const google = model.api === "google-generative-ai" || model.api === "google-vertex";
+            let abortSignal: AbortSignal | undefined;
+            let data = final;
+            if (google) {
+              if (![Object.prototype, null].includes(Object.getPrototypeOf(final))) {
+                throw new Error("Activation window cannot admit a non-JSON provider payload");
+              }
+              const parameters = { ...final } as Record<string, unknown>;
+              const config = parameters.config;
+              if (config !== undefined) {
+                if (!config || typeof config !== "object" || Array.isArray(config) ||
+                    ![Object.prototype, null].includes(Object.getPrototypeOf(config))) {
+                  throw new Error("Activation window requires a JSON Google config object");
+                }
+                const { abortSignal: control, ...fields } = config as Record<string, unknown>;
+                if (control !== undefined && !(control instanceof AbortSignal)) {
+                  throw new Error("Activation window requires a native Google AbortSignal control");
+                }
+                abortSignal = control;
+                parameters.config = fields;
+              }
+              data = parameters;
+            }
+            // Estimate all context-bearing data: system/messages, tool schemas,
+            // and API-specific fields, with no stale assistant-usage shortcut.
+            // JSON framing is conservative; unknown non-JSON data fails closed.
+            const encoded = JSON.stringify(data, (_key, value: unknown) => {
               if (typeof value === "function" || typeof value === "symbol" || typeof value === "bigint" ||
                   (typeof value === "number" && !Number.isFinite(value)) ||
                   (value && typeof value === "object" && !Array.isArray(value) &&
@@ -187,9 +215,28 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             if (tokens > model.contextWindow) {
               failClosed(`Context exceeds window: estimated ${tokens} input tokens, window ${model.contextWindow}`);
             }
-            // Dispatch the admitted JSON snapshot, not handler-owned references or
+            // Ordinary wire payloads dispatch the admitted JSON snapshot, not
             // stateful getters/toJSON that could change at the next serialization.
-            return admitted;
+            if (!google) return admitted;
+            // Stabilize Google's data on the ORIGINAL SDK parameter object. Do
+            // not JSON-clone, freeze or discard the live cancellation control.
+            // Config remains mutable for the SDK's own schema normalization.
+            if (abortSignal !== undefined) {
+              const config = (admitted as Record<string, unknown>).config;
+              if (!config || typeof config !== "object" || Array.isArray(config)) {
+                throw new Error("Activation window lost the Google config object");
+              }
+              Object.defineProperty(config, "abortSignal", {
+                value: abortSignal, enumerable: true, configurable: true, writable: true,
+              });
+            }
+            for (const key of Object.getOwnPropertyNames(final)) {
+              if (!Object.hasOwn(admitted, key) && !Reflect.deleteProperty(final, key)) {
+                throw new Error("Activation window cannot stabilize the Google payload");
+              }
+            }
+            Object.defineProperties(final, Object.getOwnPropertyDescriptors(admitted));
+            return final;
           } catch (error) {
             return failClosed(error);
           }

@@ -2,6 +2,7 @@ import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
 import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
 import ts from "typescript";
 import { ExecutionDeadline } from "./execution-deadline.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
@@ -1093,7 +1094,11 @@ export class QuickJsRuntime {
                 error instanceof Error ? error.message : String(error),
               );
               try {
-                const safeMetadata = guestFabricErrorMetadata(error);
+                // The host-issued lock code wins over a legacy or overridden name.
+                // Both contracts supply only vetted metadata; each key is assigned once.
+                const safeMetadata = isMeshLockTimeout(error)
+                  ? { name: "MeshLockTimeoutError", code: error.code }
+                  : guestFabricErrorMetadata(error);
                 // Fabric metadata includes its vetted name. Otherwise transfer only
                 // a host Error's string classification, never arbitrary properties
                 // or a caller-selected property key. Each key is assigned once.

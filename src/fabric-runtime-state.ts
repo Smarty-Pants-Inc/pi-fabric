@@ -8,7 +8,7 @@ import { closeWithActors } from "./actors/close-order.js";
 import { OutputArtifactStore } from "./output-budget.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
-import { resolvePiModel } from "./core/model-refresh.js";
+import { resolvePiModel, resolvePiRoutePin } from "./core/model-refresh.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -75,6 +75,7 @@ import { RuntimeStateSpeculation } from "./runtime-state-speculation.js";
 import { schemaRefAllowedInEnforce } from "./schema/policy.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "./mesh/store.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "./core/atomic-write.js";
 import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
@@ -206,6 +207,8 @@ export class FabricRuntimeState {
   #records: Promise<RecordsService> | undefined;
   #openRecords: (() => Promise<RecordsService>) | undefined;
   #mesh: MeshStore | undefined;
+  #backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
+  readonly #inboxRetry = new MeshBackgroundRetry("root inbox cursor");
   #identity: MeshIdentity | undefined;
   #mainAgent: MainAgentController | undefined;
   #participants: ParticipantDirectory | undefined;
@@ -336,7 +339,11 @@ export class FabricRuntimeState {
    * With `idle`, the batch an idle Main wakes for (smarty-dev#1595), under the wake cooldown.
    */
   async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
-    return idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session);
+    let batch: RootInboxBatch | undefined;
+    await this.#inboxRetry.run(async () => {
+      batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session));
+    });
+    return batch;
   }
 
   /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */
@@ -578,6 +585,7 @@ export class FabricRuntimeState {
       path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`),
       this.#config.mesh.followUpStallSeconds,
     );
+    this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#mesh = new MeshStore(
       meshRoot,
       this.#config.mesh.maxEventBytes,
@@ -661,15 +669,17 @@ export class FabricRuntimeState {
       };
     };
     // Task agents and actors share one single-flight refresh per registry (smarty-dev#1830).
-    const resolveParticipantPiModel = async (selector?: string) => {
+    const resolveParticipantPiModel = async (selector?: string, requiredPin = false) => {
       const defaultModel = context.model ? `${context.model.provider}/${context.model.id}` : undefined;
-      const resolved = await resolvePiModel({
-        selector,
-        registry: context.modelRegistry,
-        aliases: modelsConfig.aliases,
-        defaultModel,
-        policy: agentConfig,
-      });
+      const resolved = requiredPin
+        ? await resolvePiRoutePin({ selector: selector!, registry: context.modelRegistry, aliases: {} })
+        : await resolvePiModel({
+            selector,
+            registry: context.modelRegistry,
+            aliases: modelsConfig.aliases,
+            defaultModel,
+            policy: agentConfig,
+          });
       const model = visiblePiModels().find(
         (candidate) =>
           String(candidate.provider).toLowerCase() === resolved.provider.toLowerCase() &&
@@ -731,15 +741,15 @@ export class FabricRuntimeState {
           keepRecentTokens: settings.keepRecentTokens,
         };
       },
-      preparePiModel: async (modelKey) => {
-        const resolved = await resolveParticipantPiModel(modelKey);
+      preparePiModel: async (modelKey, requiredPin) => {
+        const resolved = await resolveParticipantPiModel(modelKey, requiredPin);
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
       },
       onLifecycle: (event) => {
         const lifecycle = this.#lifecycle;
-        if (lifecycle) void lifecycle.publish(event).catch(() => undefined);
+        if (lifecycle) void lifecycle.publishBackground(event);
       },
       onBackgroundComplete: (result) => completionInbox.enqueue(result),
       onResultConsumed: (id) => {
@@ -910,6 +920,7 @@ export class FabricRuntimeState {
     );
     this.#agents.subscribeUi(() => this.#participants?.scheduleRefresh());
     this.#actors.subscribe(() => this.#participants?.scheduleRefresh());
+    let routeOwner: { client: import("./jev/client.js").JevClient; signal: AbortSignal; pending: Set<Promise<unknown>> } | undefined;
     const agentsProvider = new AgentsProvider(
       this.#agents,
       this.#actors,
@@ -923,6 +934,17 @@ export class FabricRuntimeState {
       false,
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
       () => this.pi.getThinkingLevel(),
+      (request, signal) => {
+        const owner = routeOwner;
+        if (!owner || owner.signal.aborted) throw new Error("Jev routing unavailable");
+        const pending = owner.client.evaluate(request, AbortSignal.any([signal, owner.signal])).catch(error => {
+          if (owner.signal.aborted && !signal.aborted) throw new Error("Jev routing owner retired");
+          throw error;
+        });
+        owner.pending.add(pending);
+        void pending.then(() => owner.pending.delete(pending), () => owner.pending.delete(pending));
+        return pending;
+      },
     );
     this.#agentsProvider = agentsProvider;
     this.#control.start((command, from, signal, verification) =>
@@ -983,14 +1005,21 @@ export class FabricRuntimeState {
           });
           // A program may pin jev.evaluate itself. Cancel at owner retirement,
           // not only at provider.close(), which waits for those pins to drain.
+          const owner = { client: provider.client, signal: component.signal, pending: new Set<Promise<unknown>>() };
+          routeOwner = owner;
           this.#jevPrograms = provider.manager;
-          const stop = () => { observationHost?.close(); provider.manager.stopAll(); };
+          const stop = () => {
+            if (routeOwner === owner) routeOwner = undefined;
+            observationHost?.close(); provider.manager.stopAll();
+          };
           component.signal.addEventListener("abort", stop, { once: true });
           component.defer(async () => {
             component.signal.removeEventListener("abort", stop);
             observationHost?.close();
             if (this.#jevObservationHost === observationHost) this.#jevObservationHost = undefined;
             if (this.#jevPrograms === provider.manager) this.#jevPrograms = undefined;
+            await Promise.allSettled([...owner.pending]);
+            await owner.client.drainCredentials();
             await provider.manager.close();
           }, { label: "jev-program-owner", kind: "transactional", resources: ["jev:programs"], ordering: "ordered" });
           return provider;
@@ -1420,7 +1449,8 @@ export class FabricRuntimeState {
     ) return;
     const self = this.#participants.self();
     const metadata = lifecycleMetadata(event, payload);
-    await this.#lifecycle.publish({
+    const lifecycle = this.#lifecycle;
+    await this.#backgroundMesh.enqueue(() => lifecycle.publish({
       source: {
         id: self.id,
         name: self.name,
@@ -1433,7 +1463,7 @@ export class FabricRuntimeState {
       event,
       occurredAt: lifecycleObservedAt(payload),
       ...(metadata !== undefined ? { data: metadata } : {}),
-    });
+    }));
   }
 
   registerExternal(provider: FabricProvider, options: { overwrite?: boolean } = {}): void {
@@ -1496,6 +1526,8 @@ export class FabricRuntimeState {
     await Promise.allSettled([...this.#componentTransitionPublications]);
     await this.#sessionCapabilityLease?.release().catch(() => undefined);
     this.#sessionCapabilityLease = undefined;
+    await this.#backgroundMesh.close();
+    await this.#rootInbox?.close();
     await this.#lifecycle?.close();
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
     // Actor shutdown starts before control drains (an in-flight ask may await an actor).
@@ -1556,7 +1588,8 @@ export class FabricRuntimeState {
   /** Best-effort ops event on the mesh, e.g. ops.fabric.reloaded (smarty-dev#2160). */
   publishOpsEvent(topic: string, kind: string, data: Record<string, unknown>): Promise<void> {
     if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return Promise.resolve();
-    return this.#mesh.publish({ topic, kind, from: this.#identity, data }).then(() => undefined, () => undefined);
+    const mesh = this.#mesh, identity = this.#identity;
+    return this.#backgroundMesh.enqueue(() => mesh.publish({ topic, kind, from: identity, data }));
   }
 
   // Publish a best-effort mesh event to the durable `fabric.compact` topic so
@@ -1564,17 +1597,11 @@ export class FabricRuntimeState {
   // Activity-only sessions (mesh disabled) silently skip this.
   #publishCompactEvent(kind: string, data: CompactPendingIntent | CompactLastCommit): void {
     if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return;
-    try {
-      void this.#mesh.publish({
-        topic: "fabric.compact",
-        kind,
-        from: this.#identity,
-        data,
-      });
-    } catch {
-      // Best-effort: a full event log or an oversized payload must not break
-      // the host compaction path.
-    }
+    const mesh = this.#mesh, identity = this.#identity;
+    // publish is async: a synchronous try/catch cannot contain a lock rejection.
+    void this.#backgroundMesh.enqueue(() => mesh.publish({
+      topic: "fabric.compact", kind, from: identity, data,
+    }));
   }
 
   #refreshRepairCatalog(): void {
@@ -1623,6 +1650,8 @@ export class FabricRuntimeState {
     await Promise.allSettled([...this.#componentTransitionPublications]);
     await this.#sessionCapabilityLease?.release().catch(() => undefined);
     this.#sessionCapabilityLease = undefined;
+    await this.#backgroundMesh.close();
+    await this.#rootInbox?.close();
     await this.#lifecycle?.close();
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
     await this.#closeRecords();

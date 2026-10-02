@@ -2100,6 +2100,13 @@ describe("AgentManager", () => {
     };
 
     try {
+      vi.stubEnv("SMARTY_ROLE", "worktree-agent@0123456789ab");
+      vi.stubEnv("PI_FABRIC_ACTOR_NAME", undefined);
+      vi.stubEnv("PI_FABRIC_ROLE", "worktree-agent");
+      expect(await report()).toEqual({ role: "task-agent@0123456789ab", actorName: null, fabricRole: null });
+      expect(await report("security-review")).toEqual({
+        role: "worktree-agent@0123456789ab", actorName: "security-review", fabricRole: "worktree-agent",
+      });
       vi.stubEnv("SMARTY_ROLE", "worktree-agent@abc123");
       vi.stubEnv("PI_FABRIC_ACTOR_NAME", undefined);
       vi.stubEnv("PI_FABRIC_ROLE", undefined);
@@ -2112,12 +2119,12 @@ describe("AgentManager", () => {
       expect(await report("security-review")).toEqual({
         role: null, actorName: "security-review", fabricRole: null,
       });
-      // These inherited identities are deliberately unchanged: the governor prioritizes actors,
-      // and participantRole prioritizes PI_FABRIC_ROLE over SMARTY_ROLE.
+      // Actor write attribution stays inherited, but a spawner-only role
+      // override must not hide the ordinary task's role in participant discovery.
       vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
       vi.stubEnv("PI_FABRIC_ROLE", "project-agent");
       expect(await report()).toEqual({
-        role: "task-agent", actorName: "parent-actor", fabricRole: "project-agent",
+        role: "task-agent", actorName: "parent-actor", fabricRole: null,
       });
     } finally {
       vi.unstubAllEnvs();
@@ -2778,9 +2785,16 @@ describe("AgentManager steering", () => {
     roots.push(root);
     const manager = hangManager(root);
     const handle = await manager.spawn({ task: "HANG", transport: "process" });
-    manager.followUp(handle.id, "then summarize");
+    await waitFor(() => fs.existsSync(path.join(manager.runDirectory(handle.id)!, "status.json")));
+    const receipt = manager.followUp(handle.id, "then summarize");
+    expect(receipt).toEqual({ queued: true, messageId: expect.any(String), warning: {
+      code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: handle.id, kind: "agent", status: "running",
+      message: "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.",
+    } });
     const entries = readSteerFile(manager.runDirectory(handle.id)!);
-    expect(entries[0]).toMatchObject({ type: "follow_up", message: "then summarize" });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ type: "follow_up", message: "then summarize", id: receipt.messageId });
+    expect(entries[0]).not.toHaveProperty("warning");
     await manager.stop(handle.id);
   });
 

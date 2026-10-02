@@ -100,6 +100,7 @@ describe("installSelfReload", () => {
     if (options.turnProvenance) Object.assign(pi, { hostCapabilities: { turnProvenance: 1 } });
     const selfReload = installSelfReload(pi as never, {
       busy: options.busy ?? (() => 0),
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
       autoReloadConfigured: () => options.configured ?? true,
       moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href,
       settingsPath: settingsPath(),
@@ -109,7 +110,7 @@ describe("installSelfReload", () => {
     return { old, next, pi, emit, commands, sent, selfReload };
   };
 
-  it.each([false, true])("keeps Fabric commands untokenized with provenance compatibility (capable=%s)", async turnProvenance => {
+  it.each([false, true])("keeps participant-free Fabric reload commands untokenized and unclaimed (capable=%s)", async turnProvenance => {
     const { next, pi, emit, commands, selfReload } = setup({ turnProvenance });
     const context = fakeContext(`s-fabric-provenance-${turnProvenance}`, { idle: true, pending: false });
     selfReload.sessionStart("startup", context as never);
@@ -117,10 +118,7 @@ describe("installSelfReload", () => {
     emit("agent_settled", context);
     emit("agent_settled", context);
     expect(pi.sendUserMessage).toHaveBeenCalledExactlyOnceWith(`/${SELF_RELOAD_COMMAND} auto`,
-      { expandPromptTemplates: true, ...(turnProvenance ? { provenance: {
-        v: 1, channel: "fabric", sender: { id: `session:${context.sessionManager.getSessionId()}`,
-          name: "main", kind: "main", verified: "mesh" }, via: "followUp",
-      } } : {}) });
+      { expandPromptTemplates: true });
     await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
     expect(context.reload).toHaveBeenCalledTimes(1);
     emit("session_shutdown", context);
@@ -144,6 +142,7 @@ describe("installSelfReload", () => {
     const fresh = fakePi();
     const reloaded = installSelfReload(fresh.pi as never, {
       busy: () => 0,
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
       autoReloadConfigured: () => true,
       moduleUrl: pathToFileURL(path.join(next, "dist", "index.js")).href,
       settingsPath: settingsPath(),
@@ -225,6 +224,7 @@ describe("installSelfReload", () => {
     const published: Array<{ reason: string; heldForMs: number; target: string }> = [];
     const selfReload = installSelfReload(pi as never, {
       busy: () => 1, // a dev server that never ends
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
       autoReloadConfigured: () => true,
       moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href,
       settingsPath: settingsPath(),
@@ -432,6 +432,7 @@ describe("installSelfReload", () => {
     const dev = fakePi();
     const devReload = installSelfReload(dev.pi as never, {
       busy: () => 0,
+      selfReloadConcurrency: () => 0, // legacy behavior; admission is covered separately
       autoReloadConfigured: () => true,
       moduleUrl: pathToFileURL(path.join(release("dev"), "dist", "index.js")).href,
       settingsPath: settingsPath(),

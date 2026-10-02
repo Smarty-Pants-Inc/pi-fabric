@@ -355,11 +355,16 @@ const main = async (): Promise<void> => {
   const persistentPiTask = options.runner === "pi" && options.transport === "process" &&
     !options.actorId && !options.actorName && !options.residentStartupProbe;
   const piSessionFile = options.sessionFile ?? (persistentPiTask ? path.join(path.dirname(options.statusFile), "session.jsonl") : undefined);
-  let piRetryProfile: string | undefined;
-  if (persistentPiTask) {
+  let piRetrySdk: string | undefined;
+  // Activation windows stay on the CLI, which owns their process-wide native
+  // compaction fence. The SDK entry customizes only ordinary task retries.
+  if (persistentPiTask && options.inferenceContext !== "activation") {
     const profileModule = import.meta.url.endsWith(".ts") ? "./worker/retry-profile.ts" : "./worker/retry-profile.js";
-    const { prepareRetryProfile } = await import(profileModule) as typeof import("./worker/retry-profile.js");
-    piRetryProfile = prepareRetryProfile(options.cwd, path.join(path.dirname(options.statusFile), "pi-agent"), process.env, recoveryScale);
+    const { prepareRetryProfile, resolveRetrySdk } = await import(profileModule) as typeof import("./worker/retry-profile.js");
+    if (prepareRetryProfile(options.cwd, path.join(path.dirname(options.statusFile), "pi-agent"), process.env, recoveryScale)) {
+      piRetrySdk = resolveRetrySdk(options.piBinary);
+      if (!piRetrySdk) appendLog(`${JSON.stringify({ type: "worker_warning", warning: "Selected Pi launcher has no discoverable native SDK; preserving its retry settings and canonical auth path (Fabric same-session recovery remains enabled)" })}\n`);
+    }
   }
   const piArguments = ["--mode", "rpc"];
   if (piSessionFile) piArguments.push("--session", piSessionFile);
@@ -497,12 +502,13 @@ const main = async (): Promise<void> => {
   }
   // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
   // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
-  const spawnChild = (): ChildProcess => spawnCli(childBinary, childArguments, {
+  const taskEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/task-entry.ts" : "./worker/task-entry.js", import.meta.url));
+  const spawnChild = (): ChildProcess => spawnCli(piRetrySdk ? taskEntryPath : childBinary,
+    piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments] : childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
     env: {
       ...childEnvironment,
-      ...(piRetryProfile ? { PI_CODING_AGENT_DIR: piRetryProfile } : {}),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
@@ -553,6 +559,8 @@ const main = async (): Promise<void> => {
   });
   let child = spawnChild();
   let childExited = false;
+  let piControlLive = false;
+  let retainedPiQueues: { steering: string[]; followUp: string[] } | undefined;
   let providerResumeAttempts = 0;
   let resumePrompt = false;
   let providerAborted = false;
@@ -620,6 +628,7 @@ const main = async (): Promise<void> => {
     killChild();
   };
   const closeChild = (): void => {
+    piControlLive = false;
     child.stdin?.end();
     recoveryWatchdog.suspend();
     if (closeTimer || killTimer) return;
@@ -704,6 +713,14 @@ const main = async (): Promise<void> => {
       const message = resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task;
       if (taskProvenance?.principal) sendPiDelivery(message, taskProvenance, "steer", resumePrompt ? [] : images);
       else child.stdin?.write(`${JSON.stringify({ type: "prompt", message, ...(!resumePrompt && images.length > 0 ? { images } : {}) })}\n`);
+      piControlLive = true;
+      // Native queues are not stored in the session file. Replay only the last
+      // unconsumed queue snapshot, after this replacement has passed admission.
+      const retained = retainedPiQueues;
+      retainedPiQueues = undefined;
+      for (const text of retained?.steering ?? []) sendPiDelivery(text, undefined, "steer");
+      for (const text of retained?.followUp ?? []) sendPiDelivery(text, undefined, "followUp");
+      pollSteer();
     },
     fail(error) {
       if (terminalStatus) return;
@@ -1289,6 +1306,7 @@ const main = async (): Promise<void> => {
         // Pull controls that landed with the final stream events before deciding
         // whether this one-shot child can close. A queued compact keeps stdin
         // open until its correlated response and compaction_end are observed.
+        if (!piSettledSuccessfully) piControlLive = false;
         pollSteer();
         compactControl.childSettled();
       }
@@ -1338,13 +1356,14 @@ const main = async (): Promise<void> => {
   // steering channel: the orchestrator (or any peer via the mesh relay) can
   // interject a steer / follow_up / queue-mode command between the child's
   // turns without stopping and respawning it, preserving its context. The
-  // poller is best-effort: a closed or ended stdin (settled/stopped child) is
-  // swallowed so a late steer never crashes the worker.
+  // Consume only while the admitted child has writable stdin. During recovery
+  // backoff/startup, the durable cursor stays put for the replacement child.
   let steerOffset = 0;
   let steerRemainder = Buffer.alloc(0);
   let skippingOversizedSteerLine = false;
   const pollSteer = (): void => {
-    if (!options.steerFile || terminalStatus || (options.runner === "pi" && !modelControl.ready)) return;
+    if (!options.steerFile || terminalStatus || (options.runner === "pi" &&
+        (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))) return;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(options.steerFile, "r");
@@ -1572,7 +1591,7 @@ const main = async (): Promise<void> => {
         terminalError = error.message;
         // Wait for close as well: a spawn error still owns its stream handles.
       });
-      child.once("close", (code) => { childExited = true; resolve(code); });
+      child.once("close", (code) => { childExited = true; piControlLive = false; resolve(code); });
     });
     if (closeTimer) clearTimeout(closeTimer);
     closeTimer = undefined;
@@ -1630,6 +1649,9 @@ const main = async (): Promise<void> => {
     // --session <exact path> is Pi's noninteractive resume selector. --continue
     // alone selects the most recent session, which may belong to another task.
     resumePrompt = true;
+    retainedPiQueues = record.pendingMessages ? {
+      steering: [...record.pendingMessages.steering], followUp: [...record.pendingMessages.followUp],
+    } : undefined;
     sawAgentError = false;
     retryPending = false;
     terminalError = undefined;

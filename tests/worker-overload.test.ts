@@ -38,7 +38,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
-const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "disconnect", retry?: Record<string, unknown>) => {
+const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "disconnect" | "controls", retry?: Record<string, unknown>) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-overload-")); roots.push(dir);
   let firstRequestAt = 0;
   const requests: Array<Record<string, any>> = [];
@@ -50,7 +50,7 @@ const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "dis
       if (mode === "disconnect" && requests.length === 1) { response.destroy(); return; }
       const overloaded = mode === "forever" ||
         (mode === "burst" && Date.now() - firstRequestAt < 90_000 * SCALE) ||
-        (mode === "resume" && requests.length === 1);
+        ((mode === "resume" || mode === "controls") && requests.length === 1);
       if (overloaded || mode === "400" || (mode === "429" && requests.length === 1)) {
         response.writeHead(mode === "400" ? 400 : mode === "429" ? 429 : 503, { "Content-Type": "application/json" });
         response.end(JSON.stringify({ error: { message: mode === "400" ? "invalid_request_error: invalid input" : "server_is_overloaded", type: mode === "400" ? "invalid_request_error" : "server_is_overloaded" } }));
@@ -61,8 +61,13 @@ const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "dis
         id: "offline", object: "chat.completion.chunk", created: 1, model: "offline",
         choices: [{ index: 0, delta, finish_reason }],
       })}\n\n`);
-      chunk({ role: "assistant", content: "survived overload" }); chunk({}, "stop");
-      response.end("data: [DONE]\n\n");
+      const finish = () => {
+        chunk({ role: "assistant", content: "survived overload" }); chunk({}, "stop");
+        response.end("data: [DONE]\n\n");
+      };
+      // Keep the resumed turn streaming while native steering/follow-up arrive.
+      if (mode === "controls" && requests.length === 2) setTimeout(finish, 700);
+      else finish();
     });
   });
   servers.push(server);
@@ -130,6 +135,29 @@ describe("real Pi process provider recovery (offline localhost)", () => {
     ]);
     expect(entries(path.join(path.dirname(result.logFile!), "lifecycle.jsonl")).some(event => event.event === "run.resumed")).toBe(true);
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
+  }, 120_000);
+
+  it("delivers steer and followUp queued after scheduled recovery exactly once to the resumed session", async () => {
+    const s = await setup("controls", { maxRetries: 0 }); const handle = await s.spawn();
+    const logFile = path.join(s.dir, "runs", handle.id, "events.jsonl");
+    await until(() => entries(logFile).some(event => event.type === "fabric_provider_resume" && event.phase === "scheduled"));
+    expect(s.manager.steer(handle.id, "RECOVERY_STEER_ONLY_ONCE").queued).toBe(true);
+    expect(s.manager.followUp(handle.id, "RECOVERY_FOLLOW_UP_ONLY_ONCE").queued).toBe(true);
+    // More than two poll ticks while the old child's real stdin is ended.
+    await new Promise(resolve => setTimeout(resolve, 650));
+    expect(entries(logFile).some(event => event.type === "fabric_provider_resume" && event.phase === "starting")).toBe(false);
+    const result = await s.manager.wait(handle.id); evidence("recovery-controls", result);
+    expect(result, explain(result)).toMatchObject({ status: "completed" });
+    expect(result.runnerSessionIds).toHaveLength(1);
+    const journal = entries(path.join(path.dirname(result.logFile!), "session.jsonl"));
+    expect(journal.filter(entry => entry.type === "session")).toHaveLength(1);
+    const users = journal.filter(entry => entry.type === "message" && entry.message?.role === "user")
+      .map(entry => entry.message.content.map((part: any) => part.text ?? "").join(""));
+    for (const text of ["RECOVERY_STEER_ONLY_ONCE", "RECOVERY_FOLLOW_UP_ONLY_ONCE"]) {
+      expect(users.filter(message => message === text), explain(result)).toHaveLength(1);
+      expect(s.requests.some(request => JSON.stringify(request).includes(text))).toBe(true);
+    }
+    expect(events(result).filter(event => event.type === "fabric_provider_resume" && event.phase === "starting")).toHaveLength(1);
   }, 120_000);
 
   it.each(["429", "disconnect"] as const)("resumes a retryable %s with Pi's classification family", async mode => {

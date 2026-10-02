@@ -2,7 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { prepareRetryProfile, PI_TASK_RETRY_SETTINGS } from "../src/worker/retry-profile.js";
+import { pathToFileURL } from "node:url";
+import { prepareRetryProfile, PI_TASK_RETRY_SETTINGS, taskRetrySettings, resolveRetrySdk } from "../src/worker/retry-profile.js";
 import { retryableProviderError } from "../src/worker/provider-error.js";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -17,16 +18,23 @@ const setup = () => {
 };
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 describe("native task retry profile", () => {
-  it("changes only the child's retry settings and retains relative resource meanings", () => {
+  it("changes only the child's in-memory retry settings and keeps the canonical profile", async () => {
     const s = setup(); const before = fs.readFileSync(s.settings, "utf8");
-    expect(prepareRetryProfile(s.cwd, s.target, s.env)).toBe(s.target);
-    const child = JSON.parse(fs.readFileSync(path.join(s.target, "settings.json"), "utf8"));
-    expect(child.retry).toEqual(PI_TASK_RETRY_SETTINGS);
-    expect(child.retry).toEqual({ maxRetries: 6, baseDelayMs: 5000, maxAgentDelayMs: 160000 });
-    expect(child.extensions).toEqual([path.resolve(s.original, "../hooks/one.ts"), "!" + path.resolve(s.original, "hooks/two.ts")]);
-    expect(child.packages).toEqual([path.resolve(s.original, "../package")]);
-    expect(child.sessionDir).toBe("sessions");
-    expect(fs.realpathSync(path.join(s.target, "models.json"))).toBe(path.join(s.original, "models.json"));
+    expect(prepareRetryProfile(s.cwd, s.target, s.env)).toBe(s.original);
+    const binary = path.resolve(process.env.FABRIC_OVERLOAD_TEST_PI_BINARY ?? "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+    const sdkDirectory = resolveRetrySdk(binary)!;
+    expect(sdkDirectory).toBe(path.dirname(binary));
+    const { SettingsManager } = await import(pathToFileURL(path.join(sdkDirectory, "index.js")).href);
+    const main = SettingsManager.create(s.cwd, s.original);
+    const child = SettingsManager.create(s.cwd, s.original);
+    const mainRetry = main.getRetrySettings();
+    child.applyOverrides({ retry: taskRetrySettings() });
+    expect(child.getRetrySettings()).toEqual({ enabled: true, ...PI_TASK_RETRY_SETTINGS });
+    expect(main.getRetrySettings()).toEqual(mainRetry);
+    expect(taskRetrySettings(0.05)).toEqual({ maxRetries: 6, baseDelayMs: 250, maxAgentDelayMs: 8000 });
+    expect(child.getGlobalSettings().extensions).toEqual(["../hooks/one.ts", "!hooks/two.ts"]);
+    expect(child.getGlobalSettings().packages).toEqual(["../package"]);
+    expect(fs.existsSync(s.target)).toBe(false);
     expect(fs.readFileSync(s.settings, "utf8")).toBe(before);
     expect(s.env.PI_CODING_AGENT_DIR).toBe(s.original);
   });
@@ -38,6 +46,50 @@ describe("native task retry profile", () => {
     expect(prepareRetryProfile(s.cwd, s.target, s.env)).toBeUndefined();
     expect(fs.readFileSync(file, "utf8")).toBe(before);
     expect(fs.existsSync(s.target)).toBe(false);
+  });
+  it("serializes Main and task refresh updates through the installed FileAuthStorageBackend", async () => {
+    const s = setup();
+    const mainPath = path.join(s.original, "auth.json");
+    fs.writeFileSync(mainPath, "{}"); // Synthetic stores only; never use the launching profile.
+    const profile = prepareRetryProfile(s.cwd, s.target, s.env) ?? s.original;
+    const binary = path.resolve(process.env.FABRIC_OVERLOAD_TEST_PI_BINARY ?? "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+    const { FileAuthStorageBackend } = await import(pathToFileURL(path.join(path.dirname(binary), "core/auth-storage.js")).href);
+    const main = new FileAuthStorageBackend(mainPath);
+    const task = new FileAuthStorageBackend(path.join(profile, "auth.json"));
+    let release!: () => void;
+    let acquired!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { acquired = resolve; });
+    let mainHeld = false;
+    let overlappingLocks = false;
+    const mainUpdate = main.withLockAsync(async (current: string) => {
+      mainHeld = true; acquired();
+      await held;
+      mainHeld = false;
+      return { result: undefined, next: JSON.stringify({ ...JSON.parse(current), main: true }) };
+    }, { signal: AbortSignal.timeout(5000) });
+    await entered;
+    const taskUpdate = task.withLockAsync(async (current: string) => {
+      overlappingLocks ||= mainHeld;
+      return { result: undefined, next: JSON.stringify({ ...JSON.parse(current), task: true }) };
+    }, { signal: AbortSignal.timeout(5000) });
+    // Hold a real asynchronous refresh long enough for an alias lock to enter.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    release();
+    await Promise.all([mainUpdate, taskUpdate]);
+    const contents = JSON.parse(fs.readFileSync(mainPath, "utf8"));
+    if (process.env.FABRIC_OVERLOAD_TEST_EVIDENCE_DIR) {
+      fs.mkdirSync(process.env.FABRIC_OVERLOAD_TEST_EVIDENCE_DIR, { recursive: true });
+      fs.writeFileSync(path.join(process.env.FABRIC_OVERLOAD_TEST_EVIDENCE_DIR, "auth-lock.json"), JSON.stringify({ binary, overlappingLocks, contents }, null, 2));
+    }
+    expect({ overlappingLocks, contents }).toEqual({ overlappingLocks: false, contents: { main: true, task: true } });
+  });
+  it("never substitutes Fabric's peer SDK for an opaque or missing launcher", () => {
+    const s = setup();
+    const launcher = path.join(s.original, "custom-launcher.js");
+    fs.writeFileSync(launcher, "// custom Pi launcher");
+    expect(resolveRetrySdk(launcher)).toBeUndefined();
+    expect(resolveRetrySdk(path.join(s.cwd, "missing-pi"))).toBeUndefined();
   });
   it("does not mask malformed settings", () => {
     const s = setup(); fs.writeFileSync(s.settings, "{");

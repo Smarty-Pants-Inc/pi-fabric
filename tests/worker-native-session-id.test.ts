@@ -19,7 +19,7 @@ const latest = "01900000-0000-7000-8000-000000000002";
 const parent = "parent-main-session";
 // Source worker, not a dist-dependent skip: these regressions fail on main
 // even before a build, and cover the same spawn/monitor path as dist/worker.js.
-const workerPath = path.resolve("src/worker.ts");
+const workerPath = path.resolve(process.env.FABRIC_NATIVE_SESSION_TEST_WORKER ?? "src/worker.ts");
 const piBinary = path.resolve("tests/fixtures/fake-pi-session-id.mjs");
 const roots: string[] = [];
 const close: (() => Promise<unknown>)[] = [];
@@ -93,6 +93,44 @@ describe("native Pi session hook", () => {
     runnerSession({ on } as unknown as ExtensionAPI);
     expect(on).not.toHaveBeenCalled();
   });
+});
+
+describe("native pending queues across provider recovery", () => {
+  it("replays only unconsumed native steer/followUp queues once after replacement admission", async () => {
+    vi.stubEnv("PI_FABRIC_TEST_RECOVERY_TIME_SCALE", "0.01");
+    const dir = root();
+    const agentDir = path.join(dir, "profile"); fs.mkdirSync(agentDir);
+    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ retry: { maxRetries: 0 } }));
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    const manager = new AgentManager(dir, config, {
+      workerPath, piBinary: path.resolve("tests/fixtures/fake-pi-pending-queues.mjs"), runRoot: path.join(dir, "runs"),
+    });
+    close.push(() => manager.close());
+    const handle = await manager.spawn({ task: "retain native pending queues", model: "queue-test/offline", transport: "process", extensions: false });
+    const runDirectory = manager.runDirectory(handle.id)!;
+    await until(() => manager.status(handle.id).model === "queue-test/offline");
+    expect(manager.steer(handle.id, "NATIVE_PENDING_STEER").queued).toBe(true);
+    expect(manager.followUp(handle.id, "NATIVE_PENDING_FOLLOW_UP").queued).toBe(true);
+    const result = await manager.wait(handle.id);
+    const evidenceDirectory = process.env.FABRIC_OVERLOAD_TEST_EVIDENCE_DIR;
+    if (evidenceDirectory) {
+      fs.mkdirSync(evidenceDirectory, { recursive: true });
+      for (const file of ["queue-inputs.jsonl", "events.jsonl", "status.json"]) {
+        fs.copyFileSync(path.join(runDirectory, file), path.join(evidenceDirectory, "native-pending-" + file));
+      }
+    }
+    expect(result, JSON.stringify(result) + "\n" + fs.readFileSync(result.logFile!, "utf8")).toMatchObject({ status: "completed", text: "queues retained", runnerSessionIds: ["queue-session"] });
+    const inputs = fs.readFileSync(path.join(runDirectory, "queue-inputs.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    for (const [type, message] of [["steer", "NATIVE_PENDING_STEER"], ["follow_up", "NATIVE_PENDING_FOLLOW_UP"]]) {
+      expect(inputs.filter(frame => frame.attempt === 1 && frame.type === type && frame.message === message)).toHaveLength(1);
+      expect(inputs.filter(frame => frame.attempt === 2 && frame.type === type && frame.message === message)).toHaveLength(1);
+    }
+    const resumed = inputs.filter(frame => frame.attempt === 2);
+    const prompt = resumed.findIndex(frame => frame.type === "prompt");
+    expect(prompt).toBeGreaterThan(0); // correlated get_state/set_model admission precedes delivery
+    expect(resumed.slice(0, prompt).some(frame => frame.type === "steer" || frame.type === "follow_up")).toBe(false);
+    expect(fs.readFileSync(path.join(runDirectory, "queue-attempts"), "utf8")).toBe("2");
+  }, 15_000);
 });
 
 describe("native Pi runner session attribution", () => {

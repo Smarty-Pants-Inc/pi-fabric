@@ -800,9 +800,12 @@ const main = async (): Promise<void> => {
       attribution?.model ?? record.model ?? options.model,
       attribution?.provider,
       undefined,
-      // smarty-dev#3327: the Pi journal records this turn too; mark the copy.
-      piSessionFile && journalMessage
-        ? sessionExportHelpers.journalTurnId(activationSession?.file ?? piSessionFile, journalMessage)
+      // Only actor journals are a durable accounting source. Ordinary task
+      // sessions live in the disposable run directory, so their exports must
+      // remain countable. Activation turns are retained under sessionFile, not
+      // the isolated child session that retain() removes at settlement.
+      options.actorId && options.sessionFile && journalMessage
+        ? sessionExportHelpers.journalTurnId(options.sessionFile, journalMessage)
         : undefined,
     );
     lastEmittedUsage.input = snapshot.input;

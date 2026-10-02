@@ -860,6 +860,8 @@ export const createFabricExecTool = (
     },
     async execute(toolCallId, params, signal, onUpdate, context) {
       await state.ensure(context);
+      // Keep this session's writer: a late result must not allocate outside a closed scope.
+      const outputArtifactWriter = state.outputArtifactWriter;
       // prepareArguments joins code arrays / remaps `strings` → `payloads`
       // and quotes unquoted pi path arguments before Pi validates this call;
       // keep the same coercion here for direct internal invocations.
@@ -1019,6 +1021,8 @@ export const createFabricExecTool = (
             recoveryHint ? `\n\n${recoveryHint}` : ""
           }`,
           outputBudget,
+          undefined,
+          outputArtifactWriter,
         );
         return {
           content: [{ type: "text", text: bounded.text }],
@@ -1031,7 +1035,7 @@ export const createFabricExecTool = (
         rawOutput || "(no output)",
         outputBudget,
         fullRawOutput || "(no output)",
-        undefined,
+        outputArtifactWriter,
         residentPriority ? {
           text: residentPriority,
           sections: [

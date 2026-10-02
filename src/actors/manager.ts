@@ -1695,6 +1695,8 @@ export class ActorManager {
       throw new Error("agents.prune refuses the caller's own root");
     }
     if (!this.#persistent || !this.meshConfig.enabled) throw new Error("agents.prune requires durable actor storage");
+    const { assertPruneOwnershipDead } = await import("../topology/prune-ownership.js");
+    assertPruneOwnershipDead(this.mesh.root, request.root);
     const check = () => {
       if (!assertDead && !this.#lineageAlive) throw new Error("Cannot prove lineage dead: no ownership directory");
       assertDead?.();

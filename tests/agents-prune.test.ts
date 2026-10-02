@@ -16,12 +16,16 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
-import { writeHostLease } from "../src/topology/host-leases.js";
+import { writeHostLease, readHostLeases } from "../src/topology/host-leases.js";
+import { ResidentHost } from "../src/residency/host.js";
+import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { residentRoot } from "../src/residency/protocol.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { lockFile } from "../src/residency/file-lock.js";
+import * as residentLocks from "../src/residency/file-lock.js";
+import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 const closers: Array<() => Promise<void>> = [];
 const roots: string[] = [];
@@ -86,7 +90,215 @@ const fixture = async () => {
 };
 
 describe("agents.prune real Fabric path (#2184 item 7)", () => {
-  it("prunes an exited non-project owner, files and discovery, preserving other roots and audit", async () => {
+  const expiredOwner = async (h: Awaited<ReturnType<typeof fixture>>) => {
+    const lease = { id: h.owner.identity.id, rootId: h.owner.identity.id, identityId: h.owner.identity.id,
+      updatedAt: 1, expiresAt: 2 };
+    await h.mesh.put({ key: `topology/hosts/${hash(lease.id)}`, identity: h.owner.identity,
+      value: { format: 1, ...lease, identity: h.owner.identity, startedAt: 1 } });
+    writeHostLease(h.mesh.root, lease);
+    return path.join(h.mesh.root, "host-leases", `${hash(lease.id).slice(0, 32)}.json`);
+  };
+  it.each(["invalid", "invalid-fields", "unreadable", "directory", "cached-renewal"])("F1 refuses unknown %s lease evidence byte-for-byte", async fault => {
+    const h = await fixture(); await h.owner.close();
+    const file = await expiredOwner(h);
+    expect(readHostLeases(h.mesh.root).get(h.owner.identity.id)?.expiresAt).toBe(2);
+    if (fault === "invalid") fs.writeFileSync(file, "{broken");
+    if (fault === "invalid-fields") fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), expiresAt: "expired" }));
+    if (fault === "cached-renewal") {
+      writeHostLease(h.mesh.root, { id: h.owner.identity.id, rootId: h.owner.identity.id,
+        identityId: h.owner.identity.id, updatedAt: Date.now(), expiresAt: Date.now() + 60_000 });
+    }
+    const before = snapshot(h.root);
+    const readFile = fs.readFileSync;
+    const readDir = fs.readdirSync;
+    if (fault === "unreadable" || fault === "cached-renewal") vi.spyOn(fs, "readFileSync").mockImplementation(((at: unknown, ...args: unknown[]) => {
+      if (String(at) === file) throw Object.assign(new Error("fixture EIO lease"), { code: "EIO" });
+      return (readFile as Function)(at, ...args);
+    }) as typeof fs.readFileSync);
+    if (fault === "directory") vi.spyOn(fs, "readdirSync").mockImplementation(((at: unknown, ...args: unknown[]) => {
+      if (String(at) === path.dirname(file)) throw Object.assign(new Error("fixture EACCES leases"), { code: "EACCES" });
+      return (readDir as Function)(at, ...args);
+    }) as typeof fs.readdirSync);
+    for (const dryRun of [true, false]) {
+      const result = await h.run(`return await agents.prune({ root: "session:old-main", dryRun: ${dryRun} });`);
+      expect(result.success, `fault=${fault}, dryRun=${dryRun}`).toBe(false);
+      expect(result.error).toMatch(/cannot prove.*(?:lease|ownership)/i);
+    }
+    vi.restoreAllMocks(); expect(snapshot(h.root)).toEqual(before);
+  });
+  it.skipIf(process.platform !== "linux")("F1 rechecks unknown leases at the registry commit boundary", async () => {
+    const h = await fixture(); await h.owner.close(); const file = await expiredOwner(h);
+    const original = ActorRegistryStore.prototype.withLock;
+    let before: Record<string, string> | undefined;
+    vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function (this: ActorRegistryStore, operation) {
+      return original.call(this, () => {
+        fs.writeFileSync(file, "{bad renewal"); before = snapshot(h.root);
+        return operation();
+      }) as ReturnType<typeof original>;
+    });
+    const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(result.success).toBe(false); expect(result.error).toMatch(/cannot prove.*lease/i);
+    expect(before).toBeDefined();
+    // The registry lock is transient; the already-appended audit is intentionally retained.
+    const after = snapshot(h.root);
+    for (const [file, bytes] of Object.entries(before!)) if (!file.includes("actors.json.lock/")) expect(after[file], file).toBe(bytes);
+  });
+  it.skipIf(process.platform !== "linux")("F2 fences a real resident starting after the initial probe, before lease publication", async () => {
+    const h = await fixture(); await h.owner.close();
+    const config: ResidentHostConfig = { format: RESIDENT_HOST_FORMAT, rootId: h.owner.identity.id, sessionId: "old-main",
+      cwd: h.root, projectRoot: h.root, meshRoot: h.mesh.root, actorRoot: h.owner.actorRoots.project,
+      residencyRoot: residentRoot(h.mesh.root, h.owner.identity.id), fullCodeMode: true,
+      agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh, retention: DEFAULT_FABRIC_CONFIG.retention,
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("dist/index.js"),
+      piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda" };
+    const host = new ResidentHost(config); closers.push(() => host.close());
+    // A starter must contend on the real host lock before actors/participants are initialized.
+    vi.spyOn(ParticipantDirectory.prototype, "start").mockResolvedValue(undefined);
+    const publish = h.mesh.publish.bind(h.mesh); let blocked = false;
+    vi.spyOn(h.mesh, "publish").mockImplementation(async (...args) => {
+      if (args[0].kind === "actor.prune") {
+        try { await host.start(); } catch (error) { expect(String(error)).toMatch(/already running/i); blocked = true; }
+      }
+      return publish(...args);
+    });
+    const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(blocked, "startup must lose the shared fence before loading actors").toBe(true);
+    expect(host.actors).toBeUndefined(); expect(result.success, result.error).toBe(true);
+    expect((result.value as any).removed.actors).toBe(2);
+    // After the prune releases the same persistent inode, a new host loads the committed empty registry.
+    const successor = new ResidentHost(config); closers.push(() => successor.close());
+    await successor.start(); expect(successor.actors.list().some(a => [h.project.id, h.session.id].includes(a.id))).toBe(false);
+    await successor.close();
+  });
+  it.skipIf(process.platform !== "linux")("F3 preserves durable records, files, bindings, removal markers and actor/participant state in a mixed root", async () => {
+    const h = await fixture(); await h.owner.close();
+    const durable = "d".repeat(32); const at = h.owner.actorRoots.project;
+    const store = new ActorRegistryStore(at); const source = store.records()[0]!;
+    const durableRow = { ...source, id: durable, name: "keep-durable", residency: "durable" };
+    await store.withLock(() => store.write([...store.records(), durableRow]));
+    fs.mkdirSync(path.join(at, durable), { recursive: true });
+    fs.writeFileSync(path.join(at, durable, "session.jsonl"), "durable transcript\n");
+    const marker = path.join(at, `removal-${durable}.json`);
+    fs.writeFileSync(marker, JSON.stringify({ id: durable, owner: { rootId: h.owner.identity.id, residency: "durable" } }));
+    const binding = new ActorBindingStore("old-main", at); await binding.setThinking(durable, "high");
+    const actorKey = `actors/old-main/${durable}`;
+    const participantKey = `topology/participants/${hash(durable)}`;
+    await h.mesh.put({ key: actorKey, value: { id: durable, rootId: h.owner.identity.id, residency: "durable" }, identity: h.owner.identity });
+    const actor = { ...h.project, id: durable, name: "keep-durable", residency: "durable" as const };
+    const participant = actorParticipantRecord(actor, h.owner.identity.id, h.owner.identity.id, h.owner.identity.id, h.owner.identity.id);
+    const participantEntry = await h.mesh.put({ key: participantKey, value: participant, identity: h.owner.identity });
+    writeParticipantFile(h.mesh.root, participantEntry);
+    const preservedState = [h.mesh.get(actorKey, { fresh: true }), h.mesh.get(participantKey, { fresh: true })];
+    const bytes = [path.join(at, durable, "session.jsonl"), marker, binding.filePath!, path.join(h.mesh.root, "participants", `${hash(durable)}.json`)].map(file => [file, fs.readFileSync(file, "utf8")] as const);
+    const plan = await h.run('return await agents.prune({ root: "session:old-main", dryRun: true });');
+    expect(plan.success, plan.error).toBe(true); expect((plan.value as any).actors.map((a: any) => a.id)).not.toContain(durable);
+    const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(result.success, result.error).toBe(true); expect((result.value as any).removed.actors).toBe(2);
+    expect(store.records()).toEqual([durableRow]);
+    for (const [file, text] of bytes) expect(fs.readFileSync(file, "utf8"), file).toBe(text);
+    expect([h.mesh.get(actorKey, { fresh: true }), h.mesh.get(participantKey, { fresh: true })]).toEqual(preservedState);
+    expect((await h.run('return await agents.prune({ root: "session:old-main" });')).success).toBe(true);
+  });
+  it.each(["shared-state", "participant-file", "participant-directory"])("F1 refuses unknown %s ownership evidence without changes", async fault => {
+    const h = await fixture(); await h.owner.close();
+    if (fault === "shared-state") fs.writeFileSync(path.join(h.mesh.root, "state.json"), "{damaged");
+    if (fault === "participant-file") fs.writeFileSync(path.join(h.mesh.root, "participants", `${hash(h.owner.identity.id)}.json`), "{damaged");
+    const before = snapshot(h.root); const readDir = fs.readdirSync;
+    if (fault === "participant-directory") vi.spyOn(fs, "readdirSync").mockImplementation(((at: unknown, ...args: unknown[]) => {
+      if (String(at) === path.join(h.mesh.root, "participants")) throw Object.assign(new Error("fixture EIO participants"), { code: "EIO" });
+      return (readDir as Function)(at, ...args);
+    }) as typeof fs.readdirSync);
+    for (const dryRun of [true, false]) {
+      const result = await h.run(`return await agents.prune({ root: "session:old-main", dryRun: ${dryRun} });`);
+      expect(result.success).toBe(false); expect(result.error).toMatch(/cannot prove.*ownership/i);
+    }
+    vi.restoreAllMocks(); expect(snapshot(h.root)).toEqual(before);
+  });
+  it.skipIf(process.platform !== "linux").each(["registry", "actor-state", "removal"])("F1 refuses unknown %s actor ownership byte-for-byte", async fault => {
+    const h = await fixture(); await h.owner.close();
+    if (fault === "registry") {
+      const store = new ActorRegistryStore(h.owner.actorRoots.project);
+      await store.withLock(() => store.write(store.records().map(row => ({ ...row, residency: "unknown" }))));
+    } else if (fault === "actor-state") {
+      await h.mesh.put({ key: `actors/old-main/${h.project.id}`, value: { id: h.project.id, rootId: 42 }, identity: h.owner.identity });
+    } else fs.writeFileSync(path.join(h.owner.actorRoots.project, `removal-${h.project.id}.json`), JSON.stringify({ id: h.project.id }));
+    const dir = residentRoot(h.mesh.root, h.owner.identity.id); fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "host.lock"), ""); // persistent vacant startup fence: refusal must not change its bytes either
+    const before = snapshot(h.root);
+    for (const dryRun of [true, false]) {
+      const result = await h.run(`return await agents.prune({ root: "session:old-main", dryRun: ${dryRun} });`);
+      expect(result.success).toBe(false); expect(result.error).toMatch(/cannot prove.*ownership/i);
+      expect(snapshot(h.root)).toEqual(before);
+    }
+  });
+  it.skipIf(process.platform !== "linux").each(["invalid-lock", "unknown-process"])("F1 refuses %s resident evidence byte-for-byte", async fault => {
+    const h = await fixture(); await h.owner.close(); const dir = residentRoot(h.mesh.root, h.owner.identity.id);
+    fs.mkdirSync(dir, { recursive: true }); const pid = 2_000_000_000;
+    if (fault === "invalid-lock") fs.writeFileSync(path.join(dir, "host.lock"), "{invalid owner");
+    else fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ pid }));
+    const before = snapshot(h.root); const kill = process.kill;
+    if (fault === "unknown-process") vi.spyOn(process, "kill").mockImplementation((id, signal) => {
+      if (id === pid) throw Object.assign(new Error("fixture EIO process probe"), { code: "EIO" });
+      return kill(id, signal);
+    });
+    for (const dryRun of [true, false]) {
+      const result = await h.run(`return await agents.prune({ root: "session:old-main", dryRun: ${dryRun} });`);
+      expect(result.success).toBe(false); expect(result.error).toMatch(/cannot prove.*resident/i);
+    }
+    vi.restoreAllMocks(); expect(snapshot(h.root)).toEqual(before);
+  });
+  it.each(["unsupported-platform", "missing-kernel-fence"])("F2 refuses destructive pruning with %s before creating files", async fault => {
+    const h = await fixture(); await h.owner.close(); const before = snapshot(h.root);
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      if (fault === "unsupported-platform") Object.defineProperty(process, "platform", { ...descriptor, value: "win32" });
+      else vi.spyOn(residentLocks, "kernelFenceAvailable").mockReturnValue(false);
+      const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+      expect(result.success).toBe(false); expect(result.error).toMatch(/cannot prove.*fence unavailable/i);
+      expect(snapshot(h.root)).toEqual(before);
+    } finally { Object.defineProperty(process, "platform", descriptor); }
+  });
+  it.skipIf(process.platform !== "linux")("F2 rechecks resident process ownership after a registry-lock wait", async () => {
+    const h = await fixture(); await h.owner.close();
+    const original = ActorRegistryStore.prototype.withLock;
+    vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function (this: ActorRegistryStore, operation) {
+      return original.call(this, () => {
+        const dir = residentRoot(h.mesh.root, h.owner.identity.id); fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ pid: process.pid, processStartTime: processStartTime(process.pid) }));
+        return operation();
+      }) as ReturnType<typeof original>;
+    });
+    const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(result.success).toBe(false); expect(result.error).toMatch(/resident owner/i);
+    expect(new ActorRegistryStore(h.owner.actorRoots.project).records().map(a => a.id)).toContain(h.project.id);
+    expect(fs.existsSync(path.join(h.owner.actorRoots.project, h.project.id))).toBe(true);
+  });
+  it.skipIf(process.platform !== "linux")("F1 rechecks unknown leases inside the shared-state commit", async () => {
+    const h = await fixture(); await h.owner.close(); const file = await expiredOwner(h);
+    const entry = h.mesh.listAll("actors/", { fresh: true }).find(e => e.key.endsWith(h.project.id))!;
+    const writeBatch = h.mesh.writeBatch.bind(h.mesh);
+    vi.spyOn(h.mesh, "writeBatch").mockImplementation(async options => {
+      if (options.ops.some(op => op.kind === "delete" && op.key.startsWith("actors/"))) fs.writeFileSync(file, "{bad renewal");
+      return writeBatch(options);
+    });
+    const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(result.success).toBe(false); expect(result.error).toMatch(/cannot prove.*lease/i);
+    expect(h.mesh.get(entry.key, { fresh: true })).toEqual(entry);
+  });
+  it.skipIf(process.platform !== "linux")("F3 aborts a session-to-durable scope change under the registry lock", async () => {
+    const h = await fixture(); await h.owner.close(); const original = ActorRegistryStore.prototype.withLock;
+    vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function (this: ActorRegistryStore, operation) {
+      return original.call(this, () => {
+        this.write(this.records().map(row => row.id === h.project.id ? { ...row, residency: "durable" } : row));
+        return operation();
+      }) as ReturnType<typeof original>;
+    });
+    const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(result.success).toBe(false); expect(result.error).toMatch(/ownership changed/i);
+    expect(fs.existsSync(path.join(h.owner.actorRoots.project, h.project.id))).toBe(true);
+    expect(new ActorRegistryStore(h.owner.actorRoots.project).records().find(a => a.id === h.project.id)?.residency).toBe("durable");
+  });
+  it.skipIf(process.platform !== "linux")("prunes an exited non-project owner, files and discovery, preserving other roots and audit", async () => {
     const h = await fixture();
     const oldBinding = new ActorBindingStore("old-main", h.owner.actorRoots.project);
     await oldBinding.setThinking(h.project.id, "low");
@@ -121,7 +333,7 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
     const again = await h.run('return await agents.prune({ root: "session:old-main" });');
     expect(again.success, again.error).toBe(true); expect((again.value as any).removed.actors).toBe(0);
   });
-  it("keeps an actor claimed by a racing adopter under the registry lock", async () => {
+  it.skipIf(process.platform !== "linux")("keeps an actor claimed by a racing adopter under the registry lock", async () => {
     const h = await fixture(); await h.owner.close();
     const original = ActorRegistryStore.prototype.withLock;
     let raced = false;
@@ -148,7 +360,7 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
     const result = await h.run('return await agents.prune({ root: "session:old-main" });');
     expect(result.success).toBe(false); expect(result.error).toMatch(/live lineage/i); expect(snapshot(h.root)).toEqual(before);
   });
-  it("keeps adopted foreign presence and append-only work events under an old session key", async () => {
+  it.skipIf(process.platform !== "linux")("keeps adopted foreign presence and append-only work events under an old session key", async () => {
     const h = await fixture(); await h.owner.close();
     const foreign = `actors/old-main/${"f".repeat(32)}`;
     await h.mesh.put({ key: foreign, value: { id: "f".repeat(32), rootId: "session:winner" }, identity: h.caller.identity });
@@ -158,7 +370,7 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
     expect(h.mesh.get(foreign, { fresh: true })).toBeDefined();
     expect(h.mesh.read({ topic: "fleet.work", limit: 100 }).map(item => item.id)).toContain(event.id);
   });
-  it("never creates an absent resident host lock when probing existing ownership", async () => {
+  it.skipIf(process.platform !== "linux")("never creates an absent resident host lock when probing existing ownership", async () => {
     const h = await fixture(); await h.owner.close();
     const dir = residentRoot(h.mesh.root, h.owner.identity.id);
     fs.mkdirSync(dir, { recursive: true });

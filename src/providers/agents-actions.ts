@@ -757,7 +757,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "prune",
     description:
-      "Plan or remove durable actor records, inbox and state of a proven-dead root. Refuses live owner leases/hosts and the caller's own root. dryRun returns the plan without changes; repeated pruning is safe. Keeps append-only audit history.",
+      "Plan or remove persisted session-residency actors of a proven-dead root; never removes durable-residency actors. Refuses live or unknown owners/leases and the caller's own root. Destructive pruning requires the Linux resident startup fence. dryRun is read-only; retries are safe. Keeps append-only audit history.",
     inputSchema: {
       type: "object",
       properties: { root: { type: "string", minLength: 1 }, dryRun: { type: "boolean" } },

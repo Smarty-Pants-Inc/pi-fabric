@@ -7,6 +7,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const mainLoaded = vi.hoisted(() => vi.fn());
 const routerLoaded = vi.hoisted(() => vi.fn());
 const pruneLoaded = vi.hoisted(() => vi.fn());
+const pruneOwnershipLoaded = vi.hoisted(() => vi.fn());
+vi.mock("../src/topology/prune-ownership.js", async original => {
+  pruneOwnershipLoaded();
+  return original<typeof import("../src/topology/prune-ownership.js")>();
+});
 vi.mock("../src/actors/prune.js", async original => {
   pruneLoaded();
   return original<typeof import("../src/actors/prune.js")>();
@@ -61,6 +66,7 @@ describe("Main replay and route-authority startup boundary", () => {
       mainLoaded.mockClear();
       routerLoaded.mockClear();
       pruneLoaded.mockClear();
+      pruneOwnershipLoaded.mockClear();
       const { default: register } = await import("../src/index.js");
       expect(mainLoaded).not.toHaveBeenCalled();
       expect(routerLoaded).not.toHaveBeenCalled();
@@ -79,6 +85,7 @@ describe("Main replay and route-authority startup boundary", () => {
       expect(mainLoaded).toHaveBeenCalledOnce();
       expect(routerLoaded).toHaveBeenCalledOnce();
       expect(pruneLoaded).not.toHaveBeenCalled();
+      expect(pruneOwnershipLoaded).not.toHaveBeenCalled();
       await state.ensure(context);
       expect(mainLoaded).toHaveBeenCalledOnce();
       expect(routerLoaded).toHaveBeenCalledOnce();

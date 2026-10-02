@@ -40,6 +40,7 @@ const lazyEntryPoints = [
   "src/core/provider-operations.ts",
   "src/actors/prune.ts",
   "src/topology/lineage-liveness.ts",
+  "src/topology/prune-ownership.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/result.ts",

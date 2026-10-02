@@ -727,16 +727,16 @@ Set `scope: "global"` to update a reusable template. In the dashboard, press `y`
 
 ### Pruning a dead actor lineage
 
-A non-project Main can leave durable actors behind after it exits. No other project root is allowed to adopt them, and `agents.remove()` still requires their owner. Use the exact old root ID (not an actor name):
+A non-project Main can leave persisted session-residency actors behind after it exits. No other project root is allowed to adopt them, and `agents.remove()` still requires their owner. Use the exact old root ID (not an actor name):
 
 ```ts
 const plan = await agents.prune({ root: "session:<old-session-id>", dryRun: true });
 const removed = await agents.prune({ root: "session:<old-session-id>" });
 ```
 
-Pruning refuses the caller's own root (including `main`), a live Main or resident host, a live owner lease/process or held resident host lock, and a recent adoption fence. Unknown or write-stalled ownership is not proof of death. It uses the same fresh directory and lease checks as adoption, and rechecks under the registry's adoption lock before deleting. A racing adopter keeps its records and files.
+Pruning refuses the caller's own root (including `main`), a live Main or resident host, a live owner lease/process or held resident host lock, and a recent adoption fence. A strict uncached maintenance probe rejects unreadable, invalid or conflicting lease, shared-state and participant ownership evidence; unknown or write-stalled ownership is never proof of death. Destructive pruning holds the same persistent Linux flock inode as resident startup, even when no lock existed, and refuses on platforms without that fence. Ownership is rechecked under the registry's adoption lock and at state commit boundaries. A racing resident cannot load actors while pruning holds the fence; a racing adopter keeps its records and files.
 
-The result includes `root`, `dryRun`, `actors` (`id`, `name`, `registry`), `files`, `stateKeys`, and actual `removed` counts for actors, files and state keys. `dryRun: true` is read-only and returns zero removed counts. Repeating a completed prune returns an empty plan and zero counts. Only the specified root's durable actor records, mailbox/queue/session directories, removal markers, own session bindings, participant state and root inbox cursor are removed. Other roots and global templates are kept. Append-only mesh events are preserved; a prune is recorded as `actor.prune` on `ops.owner`.
+The result includes `root`, `dryRun`, `actors` (`id`, `name`, `registry`), `files`, `stateKeys`, and actual `removed` counts for actors, files and state keys. `dryRun: true` is read-only and returns zero removed counts. Repeating a completed prune returns an empty plan and zero counts. Only the specified root's session-residency actor records, mailbox/queue/session directories, session removal markers and selected actor/participant state are removed (legacy records without a residency field use the session default). Durable-residency actors, their removal markers, bindings, files and state are never pruned. Own session bindings, root participant state and root inbox cursor are removed only when no excluded actors remain; otherwise shared root metadata is kept. Other roots and global templates are kept. Append-only mesh events are preserved; a prune is recorded as `actor.prune` on `ops.owner`.
 
 ### Fresh actor sessions
 

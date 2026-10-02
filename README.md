@@ -140,7 +140,7 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 
 ## Environment
 
-`PI_FABRIC_TMPDIR`: absolute POSIX directory for Fabric temporary file data (created with mode `0700`); existing roots must be owned by this user, real directories, and not group/world writable. Ancestors must be real directories owned by this user or root, without group/world write access unless sticky. Unsafe paths fail closed without chmod. Windows overrides are rejected pending ACL validation; unset the override to use OS temp. Socket/pipe paths stay unchanged.
+`PI_FABRIC_TMPDIR`: absolute directory for Fabric temporary file data. On POSIX, missing directories are created with mode `0700`; existing roots must be owned by this user, real directories, and not group/world writable. Ancestors must be real directories owned by this user or root, without group/world write access unless sticky. On Windows, the directory and every ancestor must already exist on a local drive, with owners restricted to the current user, LocalSystem, Administrators or TrustedInstaller. Native ACL inspection through Windows PowerShell rejects untrusted write/delete/permission-change grants (including inherited grants), null DACLs, unsupported ACEs and reparse points. UNC/device paths, mapped or substituted drives, and ambiguous Windows names are unsupported. A private child of a permissive drive root is still unsafe. Unsafe or unproven paths fail closed without permission changes or an automatic fallback; unset the override to use OS temp. Socket/pipe paths stay unchanged.
 
 ## Reference
 

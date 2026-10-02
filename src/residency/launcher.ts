@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { observeResidentOwner } from "./launcher-owner.js";
+import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
 import {
@@ -47,8 +48,8 @@ interface OwnedProcess { pid: number; processStartTime: string; ppid: number; st
 interface Attempt {
   spec?: ResidentLaunchSpec;
   child: ChildProcess;
-  exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
-  exited: boolean;
+  native: ResidentChildLifetime;
+  stop?: Promise<void>;
   seenOwner: boolean;
   claimedOwner: boolean;
   closingInput: boolean;
@@ -85,19 +86,30 @@ function ownedAlive(attempt: Attempt): OwnedProcess[] {
  * Neither sampling nor a free host fence proves complete membership/exit.
  * This cleanup must never authorize a fallback after a spawned target.
  */
-async function stopAttempt(attempt: Attempt): Promise<void> {
-  if (process.platform !== "linux") { attempt.child.kill("SIGTERM"); await attempt.exit; return; }
-  captureDescendants(attempt);
-  for (const signal of ["SIGTERM", "SIGKILL"] as const) {
-    for (const row of ownedAlive(attempt).reverse()) {
-      if (processStartTime(row.pid) !== row.processStartTime) throw new Error("Owned successor birth became uncertain");
-      try { process.kill(row.pid, signal); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
-    }
-    const deadline = Date.now() + 5_000;
-    while (ownedAlive(attempt).length && Date.now() < deadline) { captureDescendants(attempt); await delay(50); }
-    if (!ownedAlive(attempt).length) { await attempt.exit; return; }
-  }
-  throw new Error("Owned resident attempt did not exit; fallback is blocked");
+function stopAttempt(attempt: Attempt): Promise<void> {
+  return attempt.stop ??= (async () => {
+    // Sampling is only best-effort descendant cleanup. The direct child must
+    // also be stopped through its native handle, even when its birth could not
+    // be observed. Exclude it from PID-based cleanup and join both operations.
+    const observed = (async () => {
+      if (process.platform !== "linux") return;
+      captureDescendants(attempt);
+      const descendantsAlive = () => ownedAlive(attempt).filter(row => row.pid !== attempt.child.pid);
+      for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+        for (const row of descendantsAlive().reverse()) {
+          if (processStartTime(row.pid) !== row.processStartTime) throw new Error("Owned successor birth became uncertain");
+          try { process.kill(row.pid, signal); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+        }
+        const deadline = Date.now() + 5_000;
+        while (descendantsAlive().length && Date.now() < deadline) { captureDescendants(attempt); await delay(50); }
+        if (!descendantsAlive().length) return;
+      }
+      throw new Error("Observed resident processes did not exit; fallback is blocked");
+    })();
+    const results = await Promise.allSettled([attempt.native.stop(), observed]);
+    // All cleanup has settled before an error is reported to the supervisor.
+    for (const result of results) if (result.status === "rejected") throw result.reason;
+  })();
 }
 
 async function supervise(configPath: string): Promise<void> {
@@ -126,7 +138,7 @@ async function supervise(configPath: string): Promise<void> {
   }
   let current: Attempt | undefined;
   let stopping = false;
-  for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => {
+  for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => {
     stopping = true;
     if (current) void stopAttempt(current).catch((error) => writeFailure(root, error));
   });
@@ -150,17 +162,13 @@ async function supervise(configPath: string): Promise<void> {
         PI_FABRIC_RESIDENT_LAUNCH_TOKEN: process.argv.includes("--launch-token")
           ? process.argv[process.argv.indexOf("--launch-token") + 1] ?? "" : "" },
     });
-    const attempt: Attempt = { ...(spec ? { spec } : {}), child, exit: Promise.resolve({ code: null, signal: null }), exited: false,
+    const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child),
       seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
-    attempt.exit = new Promise((resolve) => {
-      child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
-      child.once("close", (code, signal) => {
-        attempt.exited = true;
-        // #2010: after a clean owned release this directory may already belong
-        // to the next generation. Do not make a late diagnostic mutation there.
-        if (!attempt.seenOwner || code !== 0 || signal) trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });
-        resolve({ code, signal });
-      });
+    child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
+    void attempt.native.exit.then(({ code, signal }) => {
+      // #2010: after a clean owned release this directory may already belong
+      // to the next generation. Do not make a late diagnostic mutation there.
+      if (!attempt.seenOwner || code !== 0 || signal) trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });
     });
     child.once("spawn", () => {
       const birth = child.pid ? processStartTime(child.pid) : undefined;
@@ -196,7 +204,7 @@ async function supervise(configPath: string): Promise<void> {
   };
   const ready = async (attempt: Attempt, plan: ResidentHandoverPlan, spec: ResidentLaunchSpec, kind: "target" | "fallback"): Promise<void> => {
     const deadline = Date.now() + HANDOVER_STARTUP_MS;
-    while (!attempt.exited && !stopping && Date.now() < deadline) {
+    while (!attempt.native.exited && !stopping && Date.now() < deadline) {
       captureDescendants(attempt); observe(attempt);
       if (kind === "target" && !mainGenerationCurrent(root, plan.main)) throw new Error("Main generation lost before terminal release success");
       const owner = readOwner();
@@ -213,7 +221,7 @@ async function supervise(configPath: string): Promise<void> {
       let plan: ResidentHandoverPlan | undefined;
       let custodyFd: number | undefined;
       let inode: fs.Stats | undefined;
-      while (!attempt.exited && !stopping) {
+      while (!attempt.native.exited && !stopping) {
         observe(attempt);
         const state = readHandoverJson<ResidentHandoverState>(handoverPath(root));
         if (!plan && state?.phase === "custody" && ownHandoverPlan(state.plan, readOwner(), launcher, attempt.child.pid)) {
@@ -261,7 +269,7 @@ async function supervise(configPath: string): Promise<void> {
         }
         await delay(50);
       }
-      const exit = await attempt.exit;
+      const exit = await attempt.native.exit;
       if (stopping) { if (custodyFd !== undefined) fs.closeSync(custodyFd); return; }
       if (!plan || !inode) {
         if (!attempt.seenOwner) writeFailure(root, attempt.stderr.trim() || `Pi resident host exited (${exit.signal ?? exit.code ?? "unknown"})`);
@@ -301,8 +309,8 @@ async function supervise(configPath: string): Promise<void> {
               if (custodyFd !== undefined) { fs.closeSync(custodyFd); custodyFd = undefined; }
               // Storage may be unreadable too. Keep the native handle without
               // consulting or rewriting transaction files until it exits.
-              while (!attempt.exited && !stopping) { captureDescendants(attempt); await delay(50); }
-              await attempt.exit; process.exitCode = 1; return;
+              while (!attempt.native.exited && !stopping) { captureDescendants(attempt); await delay(50); }
+              await attempt.native.exit; process.exitCode = 1; return;
             }
             failure = error;
             if (targetAttempted) {
@@ -330,18 +338,20 @@ async function supervise(configPath: string): Promise<void> {
           trace("handover-terminal-uncertain", { transaction: plan.id, kind: "fallback", pid: attempt.child.pid,
             reason: error instanceof Error ? error.message : String(error) });
           if (custodyFd !== undefined) { fs.closeSync(custodyFd); custodyFd = undefined; }
-          while (!attempt.exited && !stopping) { captureDescendants(attempt); await delay(50); }
-          await attempt.exit; process.exitCode = 1; return;
+          while (!attempt.native.exited && !stopping) { captureDescendants(attempt); await delay(50); }
+          await attempt.native.exit; process.exitCode = 1; return;
         }
         // Unknown fence/termination and failed fallback are explicit blocked
         // outcomes. No loop, and no fabricated service success.
-        if (!attempt.exited) await stopAttempt(attempt).catch(() => undefined);
+        await stopAttempt(attempt).catch(() => undefined);
         try { writeHandoverState(root, plan, "blocked", error instanceof Error ? error.message : String(error)); } catch { /* custody retained */ }
         writeFailure(root, error); process.exitCode = 1; return;
       } finally { if (custodyFd !== undefined) { try { fs.closeSync(custodyFd); } catch { /* closed on success */ } } }
     }
   } finally {
-    if (stopping && current && !current.exited) await stopAttempt(current);
+    // A native exit may precede completion of the already-started observed
+    // cleanup. Always join it; never abandon a concurrent shutdown pass.
+    if (stopping && current) await stopAttempt(current);
   }
 }
 

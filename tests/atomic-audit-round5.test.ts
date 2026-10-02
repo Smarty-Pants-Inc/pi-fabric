@@ -181,4 +181,71 @@ describe("#2479 R5 real-path durability regressions", () => {
       expect(recovered).toMatchObject({ file: "beta\n", workspace: { lastOutcome: "committed", lastTransactionId: result.transactionId, generation: 1 }, journal: { status: "committed" } });
     }
   });
+  it.skipIf(process.platform === "win32").each([
+    ["same", "healthy"], ["same", "faulted"], ["other", "healthy"], ["other", "faulted"],
+  ] as const)("F12 successor commit on the %s controller with a %s barrier settles the unconfirmed journal first", async (instance, barrier) => {
+    const cwd = root(), mesh = new MeshStore(path.join(cwd, ".pi", "fabric", "mesh"), 256 * 1024, 500);
+    const config = { ...DEFAULT_FABRIC_CONFIG.schema, mode: "enforce" as const };
+    const controller = new SchemaController(cwd, config, mesh, identity);
+    // A second, already-running controller on the same directory (process-equivalent).
+    const other = new SchemaController(cwd, config, new MeshStore(mesh.root, 256 * 1024, 500), { ...identity, id: "session:round5-other" });
+    const successor = instance === "same" ? controller : other;
+    const context = { cwd, signal: undefined, parentToolCallId: "round5", nestedToolCallId: "nested", extensionContext: { cwd, hasUI: false } as ExtensionContext, update() {} } satisfies FabricInvocationContext;
+    const sha = (text: string) => `sha256:${createHash("sha256").update(text).digest("hex")}`;
+    const state = () => JSON.parse(fs.readFileSync(path.join(mesh.root, "state.json"), "utf8")).entries["schema/workspace"]?.value;
+    fs.writeFileSync(path.join(cwd, "a.txt"), "alpha\n");
+    const first = await controller.hypothesize({ label: "T", summary: "first change", evidence: [{ kind: "file_contains", path: "a.txt", literal: "alpha" }] }, context);
+    const firstCertificate = await controller.verify(String(first.hypothesisId), context);
+    const files = descriptors(), rename = fs.renameSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let fault = false, armed = true;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      rename(source, target);
+      if (armed && String(target) === path.join(mesh.root, "state.durable.json") &&
+          JSON.parse(fs.readFileSync(target, "utf8")).entries["schema/workspace"]?.value.lastOutcome === "committed") fault = !(armed = false);
+    });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fault && files.get(fd) === mesh.root) throw new Error("mesh-root barrier remains unavailable");
+      sync(fd);
+    });
+    const unconfirmed = await controller.commit({ hypothesisId: String(first.hypothesisId), certificate: String(firstCertificate.certificate),
+      operations: [{ kind: "write", path: "a.txt", content: "beta\n", expected: { sha256: sha("alpha\n") } }],
+      postconditions: [{ kind: "file_contains", path: "a.txt", literal: "beta" }],
+    }, context);
+    const T = String(unconfirmed.transactionId);
+    const journalPath = path.join(mesh.root, "schema-transactions", `${T}.json`);
+    expect(unconfirmed).toMatchObject({ outcome: "commit_unconfirmed", generation: 1 });
+    expect(JSON.parse(fs.readFileSync(journalPath, "utf8")).status).toBe("applying");
+    // Clear the fault to obtain a fresh hypothesis and certificate for U.
+    fault = false;
+    const second = await successor.hypothesize({ label: "U", summary: "successor change", evidence: [{ kind: "file_contains", path: "a.txt", literal: "beta" }] }, context);
+    const secondCertificate = await successor.verify(String(second.hypothesisId), context);
+    fault = barrier === "faulted";
+    const commitU = () => successor.commit({ hypothesisId: String(second.hypothesisId), certificate: String(secondCertificate.certificate),
+      operations: [{ kind: "write", path: "a.txt", content: "gamma\n", expected: { sha256: sha("beta\n") } }],
+      postconditions: [{ kind: "file_contains", path: "a.txt", literal: "gamma" }],
+    }, context);
+    let U: string | undefined;
+    if (barrier === "faulted") {
+      await expect(commitU()).rejects.toMatchObject({ code: "schema_commit_blocked", transactionIds: [T] });
+      expect(fs.readFileSync(path.join(cwd, "a.txt"), "utf8")).toBe("beta\n");
+      expect(state()).toMatchObject({ lastOutcome: "committed", lastTransactionId: T, generation: 1 });
+      expect(JSON.parse(fs.readFileSync(journalPath, "utf8")).status).toBe("applying");
+    } else {
+      const result = await commitU();
+      expect(result).toMatchObject({ outcome: "committed", generation: 2 });
+      U = String(result.transactionId);
+      expect(JSON.parse(fs.readFileSync(journalPath, "utf8")).status).toBe("committed");
+    }
+    vi.restoreAllMocks();
+    const child = spawn("bun", [path.resolve("tests/fixtures/atomic-schema-restart.ts"), cwd, T], { stdio: ["ignore", "pipe", "pipe"] });
+    const exited = once(child, "exit");
+    let output = "", errors = "";
+    child.stdout.on("data", chunk => { output += chunk.toString(); });
+    child.stderr.on("data", chunk => { errors += chunk.toString(); });
+    const [code] = await exited;
+    expect(code, errors).toBe(0);
+    const recovered = JSON.parse(output.trim());
+    if (U) expect(recovered).toMatchObject({ file: "gamma\n", workspace: { lastOutcome: "committed", lastTransactionId: U, generation: 2 }, journal: { status: "committed" } });
+    else expect(recovered).toMatchObject({ file: "beta\n", workspace: { lastOutcome: "committed", lastTransactionId: T, generation: 1 }, journal: { status: "committed" } });
+  });
 });

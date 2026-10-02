@@ -28,6 +28,16 @@ import {
 
 const SCHEMA_TOPIC = "fabric.schema";
 const WORKSPACE_KEY = "schema/workspace";
+// Never written: a durable no-op delete is a barrier over the current mesh state.
+const BARRIER_KEY = "schema/commit-barrier";
+
+/** A successor commit refused while an earlier transaction is still `applying`. */
+export class SchemaCommitBlockedError extends Error {
+  readonly code = "schema_commit_blocked";
+  constructor(readonly transactionIds: string[], reason: string) {
+    super(`Schema commit blocked: unresolved transaction ${transactionIds.join(", ")} (${reason}); state left unchanged`);
+  }
+}
 const HYPOTHESIS_PREFIX = "schema/hypothesis/";
 const CERTIFICATE_PREFIX = "schema/certificate/";
 const OUTPUT_LIMIT = 64 * 1024;
@@ -318,6 +328,9 @@ export class SchemaController {
     let committed = false;
     let workspaceCommitGeneration: number | undefined;
     try {
+      // Before a successor may replace the authoritative lastTransactionId, settle any
+      // applying journal under this cross-process lock, or refuse with state unchanged.
+      await this.#settleApplyingJournals();
       const tokenHash = hashToken(input.certificate);
       const certificateEntry = this.mesh.get(`${CERTIFICATE_PREFIX}${tokenHash}`);
       if (!certificateEntry) throw new Error("Unknown Schema certificate");
@@ -859,6 +872,41 @@ export class SchemaController {
       throw error;
     }
     return () => fs.rmSync(this.#lockPath, { force: true });
+  }
+
+  async #settleApplyingJournals(): Promise<void> {
+    const pending: { filePath: string; journal: TransactionJournal }[] = [];
+    for (const name of fs.readdirSync(this.#journalRoot)) {
+      if (!name.endsWith(".json")) continue;
+      const filePath = path.join(this.#journalRoot, name);
+      let journal: TransactionJournal;
+      try {
+        journal = JSON.parse(fs.readFileSync(filePath, "utf8")) as TransactionJournal;
+      } catch (error) {
+        throw new SchemaCommitBlockedError([name.slice(0, -5)], `journal unreadable: ${errorMessage(error)}`);
+      }
+      if (journal.format === 1 && journal.status === "applying") pending.push({ filePath, journal });
+    }
+    if (pending.length === 0) return;
+    const ids = pending.map(({ journal }) => journal.id);
+    let workspace: SchemaWorkspaceRecord | undefined;
+    try {
+      // Confirm the record naming the pending transaction is durable before trusting it.
+      await this.mesh.delete({ key: BARRIER_KEY });
+      workspace = this.mesh.get(WORKSPACE_KEY, { fresh: true })?.value as SchemaWorkspaceRecord | undefined;
+    } catch (error) {
+      throw new SchemaCommitBlockedError(ids, `durability unconfirmed: ${errorMessage(error)}`);
+    }
+    for (const { filePath, journal } of pending) {
+      if (workspace?.lastOutcome !== "committed" || workspace.lastTransactionId !== journal.id) {
+        throw new SchemaCommitBlockedError([journal.id], "workspace record does not name it; restart recovery required");
+      }
+      try {
+        atomicJsonWrite(filePath, { ...journal, status: "committed" });
+      } catch (error) {
+        throw new SchemaCommitBlockedError([journal.id], `journal settlement failed: ${errorMessage(error)}`);
+      }
+    }
   }
 
   #recoverJournals(): void {

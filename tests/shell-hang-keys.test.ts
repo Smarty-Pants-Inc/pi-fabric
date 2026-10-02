@@ -52,7 +52,7 @@ describe("shell hang keys", () => {
     expect(h.input("\u001b")).toBeUndefined(); vi.advanceTimersByTime(100);
     expect(watch.abort.signal.aborted).toBe(true);
     expect(h.job.abort.signal.aborted).toBe(false);
-    h.dispose(); await h.jobs.close();
+    h.dispose(); vi.useRealTimers(); await h.jobs.close();
   });
   it("requires ctrl+b twice within 1s to spill", async () => {
     const h = harness();
@@ -63,6 +63,7 @@ describe("shell hang keys", () => {
     expect(h.job.spilled).toBe(true);
     expect(h.notify).toHaveBeenCalledWith(expect.stringContaining("still running"), "info");
     h.job.abort.abort();
+    vi.useRealTimers();
     await h.jobs.close();
     h.dispose();
   });
@@ -74,6 +75,7 @@ describe("shell hang keys", () => {
     expect(h.input(CTRL_B)).toEqual({ consume: true });
     expect(h.job.spilled).toBe(false);
     h.job.abort.abort();
+    vi.useRealTimers();
     await h.jobs.close();
     h.dispose();
   });
@@ -83,6 +85,7 @@ describe("shell hang keys", () => {
     expect(h.input(CTRL_K)).toEqual({ consume: true });
     expect(h.job.abort.signal.aborted).toBe(true);
     expect(h.notify).toHaveBeenCalledWith(expect.stringContaining("killed waiting shell"), "warning");
+    vi.useRealTimers();
     await h.jobs.close();
     h.dispose();
   });

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 
 /**
@@ -122,6 +123,9 @@ export class RootInbox {
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
   #delivered = new Map<string, number>();
+  readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
+
+  close(): Promise<void> { return this.#notifications.close(); }
 
   constructor(
     readonly mesh: MeshStore,
@@ -164,6 +168,8 @@ export class RootInbox {
         });
         if (events.length || missing.length) {
           state.pending.ids = [...events.map((event) => event.id), ...missing];
+          // Retry a failed pending-cursor save before delivery: in-memory pending alone
+          // is not durable admission, including after a mesh acquisition timeout.
           await this.#save(true);
           return { events, through: state.pending.through, ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) };
         }
@@ -207,10 +213,10 @@ export class RootInbox {
     if (batch.events.length === 0) return batch.skippedStale ? batch : undefined;
     const reason = urgent ? "p0" : "idle";
     this.#wokeAt = this.#now();
-    void this.mesh.publish({
+    void this.#notifications.enqueue(() => this.mesh.publish({
       topic: ROOT_INBOX_WAKE_TOPIC, kind: "idle-wake", from: this.identity,
       data: { count: batch.events.length, reason, ids: batch.events.map((event) => event.id) },
-    }).catch(() => undefined);
+    }));
     return batch;
   }
 

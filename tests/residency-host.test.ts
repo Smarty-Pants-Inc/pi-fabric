@@ -35,6 +35,57 @@ const fixture = () => {
 
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 describe("resident tracked result preservation", () => {
+  it.each(["native", "win32-injected"] as const)("releases the host fence and closes delivery/participant work even if agent close fails (%s)", async (platformCase) => {
+    const { root, config, host } = fixture();
+    const successor = new ResidentHost(config);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const getuid = Object.getOwnPropertyDescriptor(process, "getuid");
+    let fault: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      if (platformCase === "win32-injected") {
+        Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+        Object.defineProperty(process, "getuid", { configurable: true, writable: true, value: undefined });
+      }
+      await host.start();
+      await expect(successor.start()).rejects.toThrow(/already running/);
+      expect(successor.actors).toBeUndefined();
+      const closeAgents = host.agents.close.bind(host.agents);
+      fault = vi.spyOn(host.agents, "close").mockImplementation(async () => {
+        await closeAgents();
+        throw new Error("fixture agent close failure");
+      });
+      const closeParticipants = vi.spyOn(host.participants, "close");
+      await expect(host.close()).rejects.toThrow("fixture agent close failure");
+      expect(closeParticipants).toHaveBeenCalledOnce();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      const lock = path.join(config.residencyRoot, "host.lock");
+      if (process.platform === "linux") {
+        // Only Linux uses the persistent flock inode; non-Linux uses a record fence.
+        const fd = await lockFile(lock, 0);
+        fs.closeSync(fd);
+      } else {
+        expect(fs.existsSync(lock)).toBe(false);
+      }
+      // Exercise the product's actual fence on every platform, not flock on Windows.
+      await successor.start();
+      expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "owner.json"), "utf8")).pid).toBe(process.pid);
+      await successor.close();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      if (process.platform !== "linux") expect(fs.existsSync(lock)).toBe(false);
+      closeParticipants.mockRestore();
+    } finally {
+      fault?.mockRestore();
+      try {
+        await host.close();
+        await successor.close();
+      } finally {
+        Object.defineProperty(process, "platform", platform);
+        if (getuid) Object.defineProperty(process, "getuid", getuid);
+        else Reflect.deleteProperty(process, "getuid");
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
   it.each(["LARGE_RESULT", "FAIL_DIRECTIVE"])("F1 save failure keeps the worker's %s completion through close and two host/client restarts", async (task) => {
     const { root, config, host: first } = fixture();
     config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");

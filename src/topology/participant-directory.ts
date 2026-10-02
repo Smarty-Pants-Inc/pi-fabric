@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, participantRole, repositoryOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
@@ -56,15 +57,13 @@ const CHANGE_REFRESH_MIN_MS = 1_000;
  * (the dashboard, agents.list/status/members of remote agents) show them up to this old.
  */
 const ACTIVITY_REFRESH_MS = 60_000;
-/** Fields a record's `changed` test ignores: timestamps and activity counters. */
+/** Ignore noisy model activity, not actor queue/mailbox state needed for live reads (#2726). */
 const QUIET_FIELDS = {
   updatedAt: undefined,
   currentTool: undefined,
   turns: undefined,
   toolCalls: undefined,
   usage: undefined,
-  actorQueued: undefined,
-  actorMessages: undefined,
 } as const;
 /** How often a host sweeps records of long-dead hosts (smarty-dev#367); the first sweep waits too. */
 const DEAD_HOST_SWEEP_MS = 15 * 60 * 1_000;
@@ -381,6 +380,8 @@ export interface ParticipantDirectoryOptions {
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
 export class ParticipantDirectory implements FabricParticipantSource {
+  readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh");
+  readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #startedAt = Date.now();
   readonly #heartbeatMs: number;
@@ -435,8 +436,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshedAt = Date.now();
     if (this.options.enabled) {
       // Start before the initial publish: its per-key work can contend too. The
-      // timer also retries a failed initial publish so the host can join later.
-      this.#timer = setInterval(() => void this.refresh().catch(() => undefined), this.#heartbeatMs);
+      // timer also retries a failed initial publish so the host can join later,
+      // with background failures contained by the coalescing retry runner.
+      this.#timer = setInterval(() => void this.#backgroundRefresh.run(() => this.refresh(), false), this.#heartbeatMs);
       this.#timer.unref();
     }
     await this.refresh();
@@ -455,7 +457,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const run = (): void => {
       this.#refreshScheduled = false;
       this.#refreshTimer = undefined;
-      void this.#runRefresh(false).catch(() => undefined);
+      void this.#backgroundRefresh.run(() => this.#runRefresh(false), false);
     };
     const wait = this.#changeRefreshAt + CHANGE_REFRESH_MIN_MS - Date.now();
     if (wait <= 0) {
@@ -497,6 +499,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try {
       const committed = await operation;
       if (!committed) return;
+      // An unchanged change-refresh proves nothing about the lock. Only a committed
+      // write/confirmWritable acquisition ends the background path's lock outage.
+      if (this.options.enabled) this.#backgroundRefresh.success();
       this.#refreshedAt = Date.now();
       this.#refreshError = undefined;
       if (full) this.#sweepDeadHosts();
@@ -696,13 +701,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const key = `${id}\0${remoteHost}\0${reason}`;
     if (this.#reportedCollisions.has(key) || this.#reportedCollisions.size >= 1_000) return;
     this.#reportedCollisions.add(key);
-    void this.mesh.publish({
+    void this.#notifications.enqueue(() => this.mesh.publish({
       topic: MIRROR_COLLISION_TOPIC,
       kind: "refused",
       from: this.options.identity,
       text: `Refused mirrored record ${id} from remote host ${remoteHost}: ${reason}`,
       data: { id, remoteHost, reason, ...data },
-    }).catch(() => undefined);
+    }));
   }
 
   /** Validated mirror attribution, including expired leases; fresh and without publishing refusals. */
@@ -929,11 +934,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const now = Date.now();
     if (now - this.#deadHostSweepAt < (reap?.sweepMs ?? DEAD_HOST_SWEEP_MS)) return;
     this.#deadHostSweepAt = now;
-    void reapDeadHostRecords(this.mesh, this.options.identity, {
+    void this.#notifications.enqueue(() => reapDeadHostRecords(this.mesh, this.options.identity, {
       ownHostId: this.options.hostId,
       now,
       ...(reap?.deadAfterMs !== undefined ? { deadAfterMs: reap.deadAfterMs } : {}),
-    }).catch(() => undefined);
+    }));
   }
 
   async quiesce(reason?: string): Promise<void> {
@@ -956,6 +961,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
     await this.#refreshing?.catch(() => undefined);
+    await this.#notifications.close();
     if (!this.options.enabled) return;
     const own = (entry: MeshStateEntry): boolean => {
       const participant = participantFromEntry(entry);

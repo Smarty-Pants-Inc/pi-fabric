@@ -96,6 +96,15 @@ export class ActorMeshMonitor {
     this.schedule();
   }
 
+  /** Checked release receipt; normal best-effort writes are NOT a handover barrier. */
+  checkpointForRelease(): void {
+    if (this.#polling) throw new Error("Actor mesh cursor still polling");
+    if (this.callbacks.cursorPath) {
+      writeJsonAtomic(this.callbacks.cursorPath, { format: 1, ...this.#safeCursor }, { durable: true, space: 2 });
+      this.#persistedCursor = JSON.stringify(this.#safeCursor);
+    }
+  }
+
   close(): void {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);

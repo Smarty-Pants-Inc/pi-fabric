@@ -69,6 +69,29 @@ describe("background mesh retry boundary", () => {
     expect(fail).toHaveBeenCalledOnce(); expect(later).toHaveBeenCalledOnce();
   });
 
+  it("release checkpoints reject pending retries until publication is confirmed", async () => {
+    vi.useFakeTimers(); vi.spyOn(console, "warn").mockImplementation(() => {});
+    const queue = new MeshBackgroundQueue("release");
+    let locked = true;
+    const publish = vi.fn(() => { if (locked) throw busy(); });
+    await queue.enqueue(publish);
+    await expect(queue.checkpointForRelease()).rejects.toThrow("unconfirmed publication");
+    locked = false;
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(queue.checkpointForRelease()).resolves.toBeUndefined();
+    expect(publish).toHaveBeenCalledTimes(2);
+    await queue.close();
+  });
+
+  it("release checkpoints remember permanent publication failures despite later successes", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const queue = new MeshBackgroundQueue("release");
+    await queue.enqueue(() => { throw new Error("broken receipt"); });
+    await queue.enqueue(() => undefined);
+    await expect(queue.checkpointForRelease()).rejects.toThrow("unconfirmed publication");
+    await queue.close();
+  });
+
   it("close cancels pending retries, settles hook admission and fences the in-flight operation", async () => {
     vi.useFakeTimers(); vi.spyOn(console, "warn").mockImplementation(() => {});
     const queue = new MeshBackgroundQueue("events");

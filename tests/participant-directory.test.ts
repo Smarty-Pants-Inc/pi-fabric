@@ -9,6 +9,8 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { actorParticipantRecord } from "../src/topology/records.js";
+import type { FabricActorInfo } from "../src/actors/types.js";
 import { LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -439,7 +441,8 @@ describe("ParticipantDirectory activity counters", () => {
     const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
     await store.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: identityOf("owner") });
     const worker = { status: "running", turns: 0, toolCalls: 0, calls: 0 };
-    // Every read of the source is new activity: the counters and the current tool move.
+    // Every read of the source is new model activity: the counters and the current tool move.
+    // Actor queue/mailbox counts are operational state, covered separately below.
     const alpha = createDirectory(meshRoot, identityOf("alpha"), "session:alpha", () => {
       worker.calls += 1;
       worker.turns += 1;
@@ -453,8 +456,6 @@ describe("ParticipantDirectory activity counters", () => {
           turns: worker.turns,
           toolCalls: worker.toolCalls,
           usage: { input: worker.turns * 10, output: worker.turns, cacheRead: 0, cacheWrite: 0, cost: worker.turns / 100 },
-          actorQueued: worker.calls,
-          actorMessages: worker.calls,
           updatedAt: Date.now(),
         },
       ];
@@ -511,6 +512,69 @@ describe("ParticipantDirectory activity counters", () => {
     expect(alphaBatches()).toBe(carried);
     vi.restoreAllMocks();
     batches.mockRestore();
+  });
+});
+
+// #2726 / Astra F1: queue and mailbox counts are operational state, not model activity.
+// Both provider reads consume this fresh row; their overlay mapping is covered separately in
+// agents-provider.test.ts. Exercise the real mapper, publisher and filesystem reader here.
+describe("ParticipantDirectory actor operational counters", () => {
+  describe.each([
+    { version: 1, hostLeases: "files" },
+    { version: 1, hostLeases: "files", participants: "files" },
+  ])("policy %j", (policy) => {
+    const setup = async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-counters-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const identity: MeshIdentity = { id: "session:owner", name: "main", kind: "main", sessionId: "owner" };
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      await store.put({ key: LIVENESS_POLICY_KEY, value: policy, identity });
+      const actor: FabricActorInfo = {
+        id: "actor:running", scope: "project", name: "running", rootId: identity.id,
+        status: "running", residency: "durable", runner: "pi", events: [], topics: [],
+        delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false,
+        queued: 0, messages: 1, createdAt: 1, updatedAt: 2,
+        inFlightRun: { id: "stable-run", startedAt: 2, ageS: 0 },
+      };
+      // No clock jump, root transition, child or new run can incidentally flush counts.
+      // The heartbeat is a minute away; only the awaited ordinary refreshes publish updates.
+      const timing = { heartbeatMs: 60_000, leaseMs: 120_000 };
+      const owner = createDirectory(meshRoot, identity, identity.id, () => [
+        rootRecord(identity.id, identity.id, "owner"),
+        actorParticipantRecord(actor, identity.id, identity.id, identity.id, identity.id),
+      ], timing);
+      const readerIdentity: MeshIdentity = { id: "session:reader", name: "main", kind: "main", sessionId: "reader" };
+      // A separate store/directory, with no owner-memory shortcut or stubbed get().
+      const reader = createDirectory(meshRoot, readerIdentity, readerIdentity.id, () => [], timing);
+      await owner.start();
+      const read = () => reader.get(actor.id, undefined, { fresh: true });
+      const stable = {
+        id: actor.id, kind: "actor", status: "running", ownerHostId: identity.id,
+        local: false, stale: false, actorRun: { id: "stable-run", startedAt: 2 },
+      };
+      expect(read()).toMatchObject({ ...stable, actorQueued: 0, actorMessages: 1 });
+      // Assert that the requested policy really selected state+file vs file-only publication.
+      expect(store.listAll("topology/participants/", { fresh: true }).length)
+        .toBe(policy.participants === "files" ? 0 : 2);
+      return { actor, owner, read, stable };
+    };
+
+    it.each([
+      { change: "queue/message", counts: [[1, 2], [2, 3]] },
+      { change: "message-only", counts: [[0, 2], [0, 3]] },
+      { change: "queue-only", counts: [[1, 1], [2, 1]] },
+    ])("publishes two successive $change updates on the same running activation", async ({ counts }) => {
+      const { actor, owner, read, stable } = await setup();
+      for (const [queued, messages] of counts) {
+        actor.queued = queued!;
+        actor.messages = messages!;
+        actor.updatedAt += 1;
+        await owner.refresh();
+        // Soft assertions retain evidence for BOTH refreshes even when the first is RED.
+        expect.soft(read()).toMatchObject({ ...stable, actorQueued: queued, actorMessages: messages });
+      }
+    });
   });
 });
 

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+import { FabricModelDeniedError } from "../src/core/model-policy.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { MeshLockTimeoutError, MESH_LOCK_TIMEOUT_CODE } from "../src/core/atomic-write.js";
 import { transpileFabricCodeWithSourceMap } from "../src/runtime/type-checker.js";
@@ -44,6 +45,13 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
 `, async () => { throw error; }, options);
     expect(result.error).toBeUndefined();
     expect(result.value).toEqual({ name: "RangeError", code: "undefined", extra: "undefined" });
+  });
+  it("review round A3 transfers only the fixed policy code, not arbitrary host error properties", async () => {
+    const errors = [new FabricModelDeniedError("provider/denied"), Object.assign(new Error("spoof"), { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", secret: "must-not-cross" })];
+    for (const error of errors) {
+      const result = await new QuickJsRuntime().execute('try { await agents.spawn({ task: "review" }); } catch (error) { return { name: error.name, code: error.code, secret: error.secret }; }', async () => { throw error; }, options);
+      expect(result.value).toEqual(error instanceof FabricModelDeniedError ? { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" } : { name: "FabricModelDeniedError" });
+    }
   });
   it("rejects memory limits that overflow the WASM32 size_t", async () => {
     const result = await new QuickJsRuntime().execute(

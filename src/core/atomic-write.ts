@@ -174,7 +174,7 @@ export const syncDirectoryChain = (directory: string): void => {
 
 export const writeFileAtomic = (
   filePath: string,
-  contents: string,
+  contents: string | Uint8Array,
   options?: AtomicWriteOptions,
 ): void => {
   const directory = path.dirname(filePath);
@@ -378,12 +378,14 @@ export class MeshBackgroundQueue {
   #timer: NodeJS.Timeout | undefined;
   #draining: Promise<void> | undefined;
   #closed = false;
+  #failed = false;
   constructor(label: string, minMs = 100, maxMs = 5_000) { this.#retry = new MeshBackgroundRetry(label, minMs, maxMs); }
 
   enqueue(operation: () => unknown | Promise<unknown>): Promise<void> {
     if (this.#closed) return Promise.resolve();
     // Bounded best-effort notifications. Durable protocol cursors are not stored here.
     if (this.#pending.length >= 1_000) {
+      this.#failed = true;
       console.warn("[pi-fabric] background mesh notification queue full; dropping newest notification");
       return Promise.resolve();
     }
@@ -422,8 +424,15 @@ export class MeshBackgroundQueue {
       const result = await this.#retry.run(item.operation);
       item.attempted();
       if (result === "retry" || result === "skipped") return;
+      if (result === "failed") this.#failed = true;
       this.#pending.shift(); // permanent failures are visible but do not poison later notices
     }
+  }
+
+  /** Admission only waits for a first attempt; release needs a confirmed empty queue. */
+  async checkpointForRelease(): Promise<void> {
+    await this.#draining;
+    if (this.#pending.length || this.#failed) throw new Error("Background mesh release has unconfirmed publication obligations");
   }
 
   async close(): Promise<void> {

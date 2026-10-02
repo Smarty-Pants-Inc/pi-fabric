@@ -95,7 +95,7 @@ const actorInvocationProperties = {
   data: {},
   model: {
     ...runProperties.model,
-    description: "Optional model pinned only for this actor activation.",
+    description: "Optional model pinned only for this actor activation. Pi overrides refuse ranked closest matches; use an exact model id or configured alias.",
   },
   thinking: runProperties.thinking,
 };

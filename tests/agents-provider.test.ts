@@ -1849,12 +1849,15 @@ describe("AgentsProvider runner support", () => {
     const setThinking = await provider.describe("setThinking", context);
     const properties = (descriptor: typeof ask) =>
       (descriptor?.inputSchema as {
-        properties: Record<string, { enum?: string[] }>;
+        properties: Record<string, { enum?: string[]; description?: string }>;
       }).properties;
 
     expect(properties(ask)).toHaveProperty("model");
     expect(properties(ask).thinking?.enum).toContain("xhigh");
     expect(properties(tell)).toHaveProperty("model");
+    for (const descriptor of [ask, tell]) {
+      expect(properties(descriptor).model?.description).toContain("refuse ranked closest matches");
+    }
     expect(properties(setModel).scope?.enum).toEqual(["session", "project", "global"]);
     expect(properties(setThinking).scope?.enum).toEqual(["session", "project", "global"]);
   });
@@ -5321,6 +5324,43 @@ describe("AgentsProvider switchModel", () => {
     expect(activity).toHaveBeenCalledWith(expect.objectContaining({ type: "progress", message: expect.stringContaining('via: "closest"') }));
   });
 
+  it.each(["ask", "tell"] as const)("refuses ranked closest activation overrides for agents.%s without activity", async (action) => {
+    const { provider, actors, agents } = setup();
+    const { activity: _activity, ...invocation } = context;
+    expect(invocation).not.toHaveProperty("activity");
+    const actor = await provider.invoke("create", {
+      name: "strict-activation", instructions: "i", model: "cliproxyapi/gpt-6.1-sol",
+    }, invocation) as FabricActorInfo;
+    const deliver = vi.spyOn(actors, action);
+    const spawn = vi.spyOn(agents, "spawn");
+    try {
+      await expect(provider.invoke(action, {
+        id: actor.id, message: "Do not activate", model: "gpt-sol",
+      }, invocation)).rejects.toThrow(/not an exact model id or configured alias.*Candidates: (?=.*cliproxyapi\/gpt-6-sol\b)(?=.*cliproxyapi\/gpt-6\.1-sol\b)/);
+      expect(deliver).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
+      expect(actors.status(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", status: "idle" });
+    } finally { deliver.mockRestore(); spawn.mockRestore(); }
+  });
+
+  it.each(["ask", "tell"] as const)("keeps exact ids and configured aliases for agents.%s activation overrides without activity", async (action) => {
+    const { provider, actors } = setup([], [], undefined, {
+      modelsConfig: { aliases: { closest: { targets: ["cliproxyapi/gpt-6-sol"] } } },
+    });
+    const { activity: _activity, ...invocation } = context;
+    const actor = await provider.invoke("create", {
+      name: "exact-activation", instructions: "i", model: "cliproxyapi/gpt-6.1-sol",
+    }, invocation) as FabricActorInfo;
+    const deliver = vi.spyOn(actors, action);
+    try {
+      for (const model of ["cliproxyapi/gpt-6-sol", "gpt-6-sol", "closest"]) {
+        await provider.invoke(action, { id: actor.id, message: "PING", model }, invocation);
+        expect(deliver.mock.calls.at(-1)?.at(-1)).toMatchObject({ overrides: { model: "cliproxyapi/gpt-6-sol" } });
+        expect(actors.status(actor.id).model).toBe("cliproxyapi/gpt-6.1-sol");
+      }
+    } finally { deliver.mockRestore(); }
+  });
+
   it.each(["closest", "recent", "latest"])("allows exact marker-name alias %s in public spawn/create", async (name) => {
     const { provider, agents } = setup([], [], undefined, {
       modelsConfig: { aliases: { [name]: { targets: ["cliproxyapi/gpt-6.1-sol"] } } },
@@ -5708,6 +5748,17 @@ describe("own-root resident setters and authoritative status", () => {
     await expect(state.provider.invoke("actors", {}, context)).resolves.toEqual([state.effective]);
     expect(state.actorStatus).toHaveBeenCalledWith(state.actor.id, context.signal);
     roster.mockRestore();
+  });
+
+  it.each(["ask", "tell"] as const)("keeps remote agents.%s model overrides raw for execution-owner resolution without activity", async (action) => {
+    const state = await remoteState();
+    const { activity: _activity, ...base } = context;
+    const getAvailable = vi.fn(() => visiblePiModels);
+    const invocation = { ...base, extensionContext: { modelRegistry: { getAvailable } } as unknown as ExtensionContext };
+    await state.provider.invoke(action, { id: state.actor.id, message: "owner resolves", model: "gpt-sol" }, invocation);
+    const routed = action === "ask" ? state.requestResult.mock.calls : state.request.mock.calls;
+    expect(routed[0]?.[3]).toMatchObject({ binding: { model: "gpt-sol" }, bindingProvenance: { kind: "owner-defaults", rootId: state.identity.id } });
+    expect(getAvailable).not.toHaveBeenCalled();
   });
 
   it("sends only raw own-root ask/tell overrides; steer defaults are not auto-resolved into pins", async () => {

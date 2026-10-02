@@ -604,7 +604,9 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Promise<FabricActorRunBinding> {
     if (runner !== "pi" || !binding.model) return binding;
-    return { ...binding, model: await this.#resolvePiModel(binding.model, context) };
+    // ask/tell receipts do not expose selection provenance; refuse ranked closest picks.
+    // Remote bindings stay raw until their execution owner's admission boundary.
+    return { ...binding, model: (await this.#resolvePiModelSelection(binding.model, context, false)).model };
   }
 
   async list(

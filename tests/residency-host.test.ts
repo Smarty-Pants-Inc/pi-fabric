@@ -496,16 +496,19 @@ describe("resident host ownership", () => {
       await expect(contender.start()).rejects.toThrow(/already running|starting/);
       expect(fs.readFileSync(lock, "utf8")).toBe(live);
     } finally { eio?.mockRestore(); await Promise.all([host.close(), contender.close()]); fs.rmSync(root, { recursive: true, force: true }); }
-    expect(residentProcessAlive(process.pid, "0")).toBe(false);
+    expect(residentProcessAlive(process.pid, "0")).toBe(processStartTime(process.pid) === undefined);
   });
 
-  it("rejects a reused PID but accepts legacy owners without start ticks", () => {
+  it("rejects a proven reused PID but conservatively accepts unknown or legacy owners", () => {
     expect(residentProcessAlive(process.pid)).toBe(true);
     expect(residentProcessAlive(-1)).toBe(false);
-    if (process.platform === "linux") {
-      expect(processStartTime(process.pid)).toMatch(/^\d+$/);
-      expect(residentProcessAlive(process.pid, processStartTime(process.pid))).toBe(true);
+    const start = processStartTime(process.pid);
+    if (start !== undefined) {
+      expect(start).toMatch(/^\d+$/);
+      expect(residentProcessAlive(process.pid, start)).toBe(true);
       expect(residentProcessAlive(process.pid, "0")).toBe(false);
+    } else {
+      expect(residentProcessAlive(process.pid, "0")).toBe(true);
     }
   });
 });

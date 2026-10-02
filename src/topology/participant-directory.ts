@@ -436,9 +436,20 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshedAt = Date.now();
     if (this.options.enabled) {
       // Start before the initial publish: its per-key work can contend too. The
-      // timer also retries a failed initial publish so the host can join later,
-      // with background failures contained by the coalescing retry runner.
-      this.#timer = setInterval(() => void this.#backgroundRefresh.run(() => this.refresh(), false), this.#heartbeatMs);
+      // timer also retries a failed initial publish so the host can join later.
+      this.#timer = setInterval(() => {
+        if (this.#closed) return;
+        // The retry runner coalesces shared publication, not independent liveness.
+        // Renew through per-key waits even when run() skips an in-flight refresh;
+        // shared-lock-only waits still lapse and confirmation still needs its lock.
+        try {
+          if (this.#refreshing && this.#fileWork > 0 && !this.#quiescing) this.#renewFileLease();
+        } catch (error) {
+          this.#backgroundRefresh.failure(error);
+          return;
+        }
+        void this.#backgroundRefresh.run(() => this.refresh(), false);
+      }, this.#heartbeatMs);
       this.#timer.unref();
     }
     await this.refresh();

@@ -32,6 +32,8 @@ export const createRunningRecord = (
   ...(options.fabricSessionId ? { fabricSessionId: options.fabricSessionId } : {}),
   ...(options.kernel ? { kernel: options.kernel } : {}),
   transport: options.transport,
+  // Persist the worker identity so offline retention can prove process scratch exit.
+  ...(options.transport === "process" ? { sessionId: String(process.pid) } : {}),
   cwd: options.cwd,
   ...(options.model ? { model: options.model, requestedModel: options.model } : {}),
   ...(thinking ? { thinking } : {}),

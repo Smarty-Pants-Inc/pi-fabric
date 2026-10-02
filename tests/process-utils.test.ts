@@ -57,7 +57,8 @@ async function withOwnedWorker(
     const worker = path.join(root, "worker.mjs");
     fs.writeFileSync(worker, source);
     const launched = workerArguments === undefined ? undefined : await new ProcessTransport().launch({
-      id: "role-test", name: "role-test", cwd: root, workerPath: worker, workerArguments,
+      id: "role-test", name: "role-test", cwd: root, workerPath: worker,
+      workerArguments: [...workerArguments, "--status-file", path.join(root, "status.json")],
     });
     const handle = launched ? { ...launched, pid: Number(launched.sessionId) } : await spawnDetached(worker, [], root);
     await run(handle, root, children[0]!.child as ChildProcess);
@@ -125,6 +126,28 @@ fs.writeFileSync("env.json", JSON.stringify({role:process.env.SMARTY_ROLE,overri
         role: "review-agent@0123456789ab", override: "review-agent", readClass: "critical",
       });
     }, ["--actor-id", "actor", "--actor-name", "security-review"]);
+  });
+});
+
+describe("process private scratch (#3076)", () => {
+  it.each([{ args: [] }, { args: ["--actor-name", "scratch-review"] }])("overrides TMPDIR only in the task/actor worker environment (%j)", async ({ args }) => {
+    const parentTmpdir = process.env.TMPDIR;
+    const parentTmp = process.env.TMP;
+    const parentTemp = process.env.TEMP;
+    await withOwnedWorker(`import fs from "node:fs";
+import os from "node:os";
+fs.writeFileSync("env.json", JSON.stringify({tmpdir:process.env.TMPDIR,osTmpdir:os.tmpdir(),tmp:process.env.TMP,temp:process.env.TEMP,mode:fs.statSync(process.env.TMPDIR).mode & 0o777}));
+setInterval(() => {}, 1000);`, async (_handle, root) => {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(root, "env.json"))).toBe(true));
+      const report = JSON.parse(fs.readFileSync(path.join(root, "env.json"), "utf8"));
+      expect(report.tmpdir).toBe(path.join(root, "tmp"));
+      expect(report.osTmpdir).toBe(report.tmpdir);
+      if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
+      else expect(report.mode).toBe(0o700);
+      expect(process.env.TMPDIR).toBe(parentTmpdir);
+      expect(process.env.TMP).toBe(parentTmp);
+      expect(process.env.TEMP).toBe(parentTemp);
+    }, args);
   });
 });
 

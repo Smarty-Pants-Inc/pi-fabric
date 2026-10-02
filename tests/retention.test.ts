@@ -106,6 +106,32 @@ describe("safe run roots", () => {
     expect(fs.existsSync(path.join(root, "done"))).toBe(false);
     for (const name of ["pending", "live", "unresolved"]) expect(fs.existsSync(path.join(root, name))).toBe(true);
   });
+  it.each(["closed", "orphan"])("collects arbitrary leftover private scratch in expired %s runs, but vetoes live/unsettled/unsafe trees", kind => {
+    const tempRoot = temporaryDirectory();
+    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + kind);
+    for (const name of ["done", "live", "unsettled", "nested-live", "unknown", "nested-unknown", "unsafe"]) {
+      const directory = path.join(root, name);
+      writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: name === "live" ? String(process.pid) : "2147483647" });
+      const tmp = path.join(directory, "tmp");
+      fs.mkdirSync(path.join(tmp, "compound-suffix"), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(tmp, "compound-suffix", "anything.tmp"), "leftover");
+      if (name === "unsettled") markUnresolvedWorker(directory, "exit unsettled");
+      if (name === "nested-live") writeStatus(path.join(directory, "nested", "child"), {
+        status: "completed", transport: "process", sessionId: String(process.pid), finishedAt: 1,
+      });
+      if (name === "unknown") writeStatus(directory, { status: "completed", transport: "process", finishedAt: 1 });
+      if (name === "nested-unknown") writeStatus(path.join(directory, "nested", "child"), { status: "completed", transport: "process", finishedAt: 1 });
+      if (name === "unsafe") fs.symlinkSync(temporaryDirectory(), path.join(tmp, "linked"), "junction");
+    }
+    fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1,
+      ...(kind === "closed" ? { closedAt: 1, childrenStopped: true } : { orphanedAt: 1 }) }));
+    sweep(tempRoot);
+    expect(fs.existsSync(path.join(root, "done"))).toBe(false);
+    for (const name of ["live", "unsettled", "nested-live", "unknown", "nested-unknown", "unsafe"]) {
+      expect(fs.existsSync(path.join(root, name, "tmp", "compound-suffix", "anything.tmp"))).toBe(true);
+    }
+  });
+
   it("preserves malformed/unmarked ownership and unknown root contents", () => {
     const tempRoot = temporaryDirectory();
     for (const [suffix, owner] of [["bad", {}], ["pid", { pid: "gone", startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }], ["time", { pid: 2147483647, startedAt: 1, heartbeatAt: "old", orphanedAt: 1 }]] as const) {

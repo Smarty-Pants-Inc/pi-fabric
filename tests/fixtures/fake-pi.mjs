@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
 // A stub `pi` binary for the real-worker e2e. The Fabric worker spawns this as
 // the child agent and talks to it over stdin/stdout JSON lines. Behavior is
 // selected with the FAKE_PI_BEHAVIOR env var so the e2e can drive the real
@@ -281,6 +284,21 @@ switch (behavior) {
     emit(event);
     emit({ type: "message_end", message: { role: "assistant", content: "after oversized" } });
     process.stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`, () => process.exit(0));
+    break;
+  }
+  case "run-tmpdir": {
+    const tmpdir = process.env.TMPDIR;
+    const scratch = process.platform === "win32"
+      ? fs.mkdtempSync(path.join(os.tmpdir(), "ordinary-temp-"))
+      : execFileSync("mktemp", [], { encoding: "utf8" }).trim();
+    const report = { tmpdir, osTmpdir: os.tmpdir(), tmp: process.env.TMP, temp: process.env.TEMP,
+      mode: fs.statSync(tmpdir).mode & 0o777, scratch };
+    // Keep concurrent worker runs overlapped; the runner must own separate roots.
+    setTimeout(() => {
+      emit({ type: "message_end", message: { role: "assistant", content: JSON.stringify(report) } });
+      emit({ type: "agent_settled" });
+      process.exit(0);
+    }, 100);
     break;
   }
   case "fabric-session-env":

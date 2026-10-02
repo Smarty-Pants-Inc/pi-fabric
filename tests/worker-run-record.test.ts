@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { applyUsage, extractUsageDelta } from "../src/worker/run-record.js";
-import type { AgentRunRecord } from "../src/agents/types.js";
+import { applyUsage, createRunningRecord, extractUsageDelta } from "../src/worker/run-record.js";
+import type { AgentRunRecord, AgentWorkerOptions } from "../src/agents/types.js";
 
 const baseRecord = (): AgentRunRecord => ({
   id: "id",
@@ -17,6 +17,19 @@ const baseRecord = (): AgentRunRecord => ({
   text: "",
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
   logFile: "/tmp/log",
+});
+
+describe("worker process exit identity", () => {
+  it.each(["process", "tmux"] as const)("persists its own worker PID only for process scratch (%s)", transport => {
+    const options: AgentWorkerOptions = {
+      id: "worker", name: "worker", runner: "pi", transport, cwd: process.cwd(),
+      taskFile: "task.txt", statusFile: "status.json", lifecycleFile: "lifecycle.jsonl", logFile: "events.jsonl",
+      piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda", vedaBackend: "pi", vedaPersona: "worker",
+      timeoutMs: 1000, depth: 0, fullCodeMode: false, extensions: false, tools: [], grantedRisks: [],
+    };
+    const record = createRunningRecord(options, "task", undefined, 1);
+    expect(record.sessionId).toBe(transport === "process" ? String(process.pid) : undefined);
+  });
 });
 
 describe("worker run-record usage", () => {

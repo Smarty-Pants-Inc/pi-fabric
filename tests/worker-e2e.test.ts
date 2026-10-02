@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { markUnresolvedWorker } from "../src/storage/retention.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { directiveSchema } from "../src/actors/manager.js";
@@ -39,6 +40,58 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     managers.push(manager);
     return manager.run({ task, transport: "process" });
   };
+
+  it("gives concurrent real worker/Pi runs distinct private TMPDIRs and removes scratch while retaining logs", async () => {
+    process.env.FAKE_PI_BEHAVIOR = "run-tmpdir";
+    const parentTmpdir = process.env.TMPDIR;
+    const parentTmp = process.env.TMP;
+    const parentTemp = process.env.TEMP;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, maxConcurrent: 2, retainRuns: true }, {
+      workerPath, piBinary, runRoot: root,
+    });
+    managers.push(manager);
+    const results = await Promise.all(["scratch one", "scratch two"].map(task => manager.run({ task, transport: "process" })));
+    const reports = results.map(result => {
+      expect(result.status).toBe("completed");
+      const report = JSON.parse(result.text);
+      const runDirectory = manager.runDirectory(result.id)!;
+      expect(report.tmpdir).toBe(path.join(runDirectory, "tmp"));
+      expect(report.osTmpdir).toBe(report.tmpdir);
+      expect(path.dirname(report.scratch)).toBe(report.tmpdir); // real ordinary mktemp, without -p
+      if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
+      else expect(report.mode).toBe(0o700);
+      expect(fs.existsSync(report.tmpdir)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8")).sessionId).toBe(result.sessionId);
+      expect(fs.existsSync(path.join(runDirectory, "events.jsonl"))).toBe(true);
+      return report;
+    });
+    expect(reports[0].tmpdir).not.toBe(reports[1].tmpdir);
+    expect(process.env.TMPDIR).toBe(parentTmpdir);
+    expect(process.env.TMP).toBe(parentTmp);
+    expect(process.env.TEMP).toBe(parentTemp);
+  });
+
+  it("retains private scratch at run end and manager close when exit custody is unsettled", async () => {
+    process.env.FAKE_PI_BEHAVIOR = "run-tmpdir";
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, retainRuns: false }, {
+      workerPath, piBinary, runRoot: root,
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "scratch with unsettled descendant", transport: "process" }, undefined, handle => {
+      markUnresolvedWorker(manager.runDirectory(handle.id)!, "descendant exit is unsettled");
+    });
+    expect(result.status).toBe("completed");
+    const report = JSON.parse(result.text);
+    expect(fs.existsSync(report.scratch)).toBe(true);
+    await manager.close();
+    expect(fs.existsSync(report.tmpdir)).toBe(true);
+    expect(fs.existsSync(report.scratch)).toBe(true);
+    await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track|still be running/);
+  });
 
   // Regression for the LocalTerm shim contract: when the manager resolves the
   // child pi binary to the shim (~/.localterm/shims/pi), the shim injects the

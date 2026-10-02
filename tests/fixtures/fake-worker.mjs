@@ -259,7 +259,12 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     : undefined;
   const now = Date.now();
   const largeText = task.includes("LARGE_RESULT") ? "x".repeat(100_000) : undefined;
-  const text = largeText ?? (directive && !fail
+  const scratchReport = task.includes("REPORT_RUN_TMPDIR") ? JSON.stringify({
+    tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP,
+    mode: fs.statSync(process.env.TMPDIR).mode & 0o777,
+    scratch: fs.mkdtempSync(path.join(process.env.TMPDIR, "actor-scratch-")),
+  }) : undefined;
+  const text = scratchReport ?? largeText ?? (directive && !fail
     ? JSON.stringify(directive)
     : task.includes("ECHO_MODEL") ? `model ${args.get("model")}` : "fake worker complete");
   const record = {

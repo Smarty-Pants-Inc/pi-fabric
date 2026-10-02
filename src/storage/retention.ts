@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
+import { RUN_TMP_DIRECTORY, safeRunTmpTree } from "./run-scratch.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -160,6 +161,13 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       const stat = ownedStat(file);
       if (!stat) return false;
       if (stat.isFile() && runFile(name)) continue;
+      if (stat.isDirectory() && name === RUN_TMP_DIRECTORY) {
+        // Process-owned scratch may outlive a crash or a failed disposal. The
+        // surrounding run has already passed worker/nested exit custody checks.
+        if (record?.transport !== "process" || pid === undefined ||
+            runTreeExitVeto(root, 0, expired, true) || !safeRunTmpTree(file, expired)) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;

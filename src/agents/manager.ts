@@ -6,6 +6,7 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { fabricDataRoot } from "../storage/temp-root.js";
+import { removeRunTmpDirectory, runTmpDirectory } from "../storage/run-scratch.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
@@ -286,6 +287,10 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   lifecycleOffset: number;
   lifecycleRemainder: Buffer;
   runDirectory: string;
+  /** Join terminal scratch disposal before publishing the settled result. */
+  settlement?: Promise<void>;
+  /** A replacement worker may exist before its transport handle returns. */
+  relaunching?: Promise<boolean>;
   transport: AgentTransportHandle;
   adapter: AgentTransportAdapter;
   launch: AgentTransportLaunch;
@@ -1852,7 +1857,7 @@ export class AgentManager {
     const existing = readRecord(managed.statusFile);
     if (existing && terminalStatuses.has(existing.status)) {
       const result = this.#withTransportMetadata(existing, managed) as AgentRunResult;
-      this.#settle(managed, result);
+      await this.#settle(managed, result);
       return result;
     }
     await managed.transport.stop();
@@ -1873,7 +1878,7 @@ export class AgentManager {
         ? (this.#withTransportMetadata(terminal, managed) as AgentRunResult)
         : failedRecord(managed, "stopped", "Agent stopped");
     if (!terminal || !terminalStatuses.has(terminal.status)) writeRecord(managed.statusFile, record);
-    this.#settle(managed, record);
+    await this.#settle(managed, record);
     return record;
   }
 
@@ -2294,7 +2299,7 @@ export class AgentManager {
       managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.startupAttempts >= AGENT_STARTUP_MAX_ATTEMPTS ||
-      managed.settled ||
+      managed.settled || managed.settlement !== undefined ||
       this.#closing ||
       managed.abortSignal?.aborted ||
       managed.abandoned ||
@@ -2320,7 +2325,7 @@ export class AgentManager {
     if (Date.now() + retryDelayMs >= deadline) return false;
     await this.#waitForTransportExit(managed);
     await delay(retryDelayMs);
-    if (managed.settled || this.#closing || managed.abortSignal?.aborted || managed.abandoned) return false;
+    if (managed.settled || managed.settlement !== undefined || this.#closing || managed.abortSignal?.aborted || managed.abandoned) return false;
     managed.startupAttempts++;
     return this.#relaunch(managed, record);
   }
@@ -2341,7 +2346,7 @@ export class AgentManager {
     if (
       managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
-      managed.settled ||
+      managed.settled || managed.settlement !== undefined ||
       this.#closing ||
       managed.stopRequested ||
       managed.abandoned ||
@@ -2356,7 +2361,7 @@ export class AgentManager {
     if (Date.now() + retryDelayMs >= deadline) return false;
     await this.#waitForTransportExit(managed);
     await delay(retryDelayMs);
-    if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
+    if (managed.settled || managed.settlement !== undefined || this.#closing || managed.stopRequested || managed.abandoned) return false;
     managed.resumeAttempts += 1;
     const { turns, toolCalls, usage } = managed.observedProgress;
     return this.#relaunch(managed, record, {
@@ -2372,6 +2377,17 @@ export class AgentManager {
    * record starts from.
    */
   async #relaunch(
+    managed: ManagedAgent,
+    record: AgentRunRecord,
+    resume?: { task: string; carryOver: AgentRunCarryOver },
+  ): Promise<boolean> {
+    const pending = this.#performRelaunch(managed, record, resume);
+    managed.relaunching = pending;
+    try { return await pending; }
+    finally { delete managed.relaunching; }
+  }
+
+  async #performRelaunch(
     managed: ManagedAgent,
     record: AgentRunRecord,
     resume?: { task: string; carryOver: AgentRunCarryOver },
@@ -2411,7 +2427,7 @@ export class AgentManager {
       const previousSession = managed.transport.sessionId;
       await managed.transport.stop().catch(() => undefined);
       await this.#waitForTransportExit(managed);
-      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
+      if (managed.settled || managed.settlement !== undefined || this.#closing || managed.stopRequested || managed.abandoned) return false;
       // Relaunch only when the previous worker is gone for certain. A worker that did
       // not stop, or whose transport cannot say, fails the run instead of running twice.
       if (await managed.transport.isAlive().catch(() => true)) {
@@ -2451,12 +2467,12 @@ export class AgentManager {
         }
       }
       fs.rmSync(managed.statusFile, { force: true });
-      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
+      if (managed.settled || managed.settlement !== undefined || this.#closing || managed.stopRequested || managed.abandoned) return false;
       managed.transport = await this.#launchTransport(managed.adapter, managed.launch);
       this.#unregisteredTransports.delete(managed.transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
       delete managed.relaunchFailure;
-      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) {
+      if (managed.settled || managed.settlement !== undefined || this.#closing || managed.stopRequested || managed.abandoned) {
         // A stop (or an abandonment, #2184 8b) landed while the relaunch was in flight.
         // Release the child we just started so it cannot outlive the monitor and the
         // stop path can publish its terminal record.
@@ -2537,7 +2553,7 @@ export class AgentManager {
         if (await this.#resumeStopped(managed, record, deadline)) continue;
         // A relaunch that failed is terminal: no fallback launch may run after it.
         if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
-        this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
+        await this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
         return;
       }
       if (Date.now() >= deadline) {
@@ -2550,7 +2566,7 @@ export class AgentManager {
           terminalStatuses.has(completed.status) &&
           completed.status !== "stopped"
         ) {
-          this.#settle(
+          await this.#settle(
             managed,
             this.#withTransportMetadata(completed, managed) as AgentRunResult,
           );
@@ -2559,7 +2575,7 @@ export class AgentManager {
         if (managed.lastRetriedTransportFailure) {
           // The deadline fired mid-retry: the root cause is the dead transport
           // we were recovering from, not runaway wall time. Report that failure.
-          this.#settle(
+          await this.#settle(
             managed,
             this.#withTransportMetadata(
               managed.lastRetriedTransportFailure,
@@ -2574,7 +2590,7 @@ export class AgentManager {
           `Agent timed out after ${timeoutMs}ms`,
         );
         writeRecord(managed.statusFile, timedOut);
-        this.#settle(managed, timedOut);
+        await this.#settle(managed, timedOut);
         return;
       }
       const livenessPollIntervalMs =
@@ -2596,7 +2612,7 @@ export class AgentManager {
                 `Lost track of the worker: ${lost}. Fabric does not relaunch it or delete its files.`,
               );
               writeRecord(managed.statusFile, failed);
-              this.#settle(managed, failed);
+              await this.#settle(managed, failed);
               return;
             }
             const logSummary = summarizeRunLog(managed.runDirectory, 8);
@@ -2614,7 +2630,7 @@ export class AgentManager {
             }
             const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
             writeRecord(managed.statusFile, settled);
-            this.#settle(managed, settled);
+            await this.#settle(managed, settled);
             return;
           }
         } else {
@@ -2625,8 +2641,24 @@ export class AgentManager {
     }
   }
 
-  #settle(managed: ManagedAgent, result: AgentRunResult): void {
+  #settle(managed: ManagedAgent, result: AgentRunResult): Promise<void> {
+    return managed.settlement ??= this.#finishSettlement(managed, result);
+  }
+
+  async #finishSettlement(managed: ManagedAgent, result: AgentRunResult): Promise<void> {
     if (managed.settled) return;
+    // A terminal status is not a worker exit. Retries have ended; join the process
+    // before disposing scratch, even when retainRuns keeps the logs and result.
+    if (managed.transport.kind === "process" && fs.existsSync(runTmpDirectory(managed.runDirectory))) {
+      // A stop can race a replacement whose handle has not returned yet. Its
+      // relaunch path sees settlement, stops that child and hands back custody.
+      await managed.relaunching;
+      await this.#waitForTransportExit(managed);
+      await this.#noteUnconfirmedExit(managed);
+      if (!managed.lostContact && !runTreeExitVeto(managed.runDirectory, 0, undefined, true)) {
+        await removeRunTmpDirectory(managed.runDirectory).catch(() => undefined); // retention retries leftovers
+      }
+    }
     this.#drainLifecycle(managed);
     if (!beginAgentSettlement(managed)) return;
     // Images are transport inputs, not retained run artifacts. Startup retries

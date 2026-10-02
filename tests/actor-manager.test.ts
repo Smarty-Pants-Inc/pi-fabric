@@ -2508,6 +2508,25 @@ describe("ActorManager", () => {
     expect(listener).toHaveBeenCalledTimes(beforeUnsubscribedUpdate);
   });
 
+  it("allocates and disposes separate private scratch for every process actor activation", async () => {
+    const { actors, agents, root } = setup(false, undefined, undefined, undefined, {}, { retainRuns: true });
+    const actor = await actors.create({ name: "scratch-reviewer", instructions: "REPORT_RUN_TMPDIR", responseMode: "text", transport: "process" });
+    const reports: Array<{ tmpdir: string; scratch: string }> = [];
+    for (const message of ["first review", "second review"]) {
+      const reply = await actors.ask(actor.id, `REPORT_RUN_TMPDIR ${message}`);
+      const report = JSON.parse(reply.text!);
+      expect(report.tmpdir).toBe(path.join(root, "runs", reply.runId!, "tmp"));
+      if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
+      else expect(report.mode).toBe(0o700);
+      expect(path.dirname(report.scratch)).toBe(report.tmpdir);
+      expect(fs.existsSync(report.tmpdir)).toBe(false);
+      reports.push(report);
+      await waitFor(() => actors.status(actor.id).status === "idle");
+    }
+    expect(reports[0]!.tmpdir).not.toBe(reports[1]!.tmpdir);
+    expect(agents.list()).toEqual([]);
+  });
+
   it("keeps a persistent actor identity and processes direct mailbox messages", async () => {
     const { actors, agents } = setup();
     const actor = await actors.create({

@@ -585,8 +585,10 @@ Actor status distinguishes accepted work from a worker: `preparing` reports boun
 `inFlightRun` and `running`. Each actor-side pre-launch await has a 30-second deadline,
 independent of the run timeout and legitimate permit waiting. A timeout logs
 `ActorPreparationTimeoutError` (`FABRIC_ACTOR_PREPARATION_TIMEOUT`) with the phase,
-returns the unlaunched activation to its durable queue with `attempts` incremented, and
-re-arms dispatch after a one-second backoff. Infrastructure rejections use
+returns the unlaunched activation to its durable queue with `preparationAttempts` incremented,
+not the execution/restart `attempts` counter, and re-arms dispatch after a one-second backoff.
+Each activation allows three preparation requeues; a further retryable preparation failure
+reaches terminal exhaustion instead of requeuing again. Infrastructure rejections use
 `ActorPreparationError` (`FABRIC_ACTOR_PREPARATION_FAILED`); finite unavailable-model
 errors still fail the activation. A timed-out presence publisher remains serialized and
 owes the latest state, but drains do not keep joining the same stalled mesh write.

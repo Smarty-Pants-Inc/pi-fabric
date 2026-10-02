@@ -3,13 +3,19 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { cancellationError } from "../src/async-settlement.js";
+import { ResidencyClient } from "../src/residency/client.js";
+import { ResidentActorClient } from "../src/residency/actor-client.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ResidentHost } from "../src/residency/host.js";
 import * as expiry from "../src/residency/request-expiry.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
-import { acknowledgeResidentResponse, abandonResidentRequest, commitResidentRequest, readResidentRequestDecision, residentHostStateNote, residentCommandForOwner, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { acknowledgeResidentResponse, abandonResidentRequest, commitResidentRequest, readResidentRequestDecision, registerResidentCancellation, residentHostId, residentRoot, residentHostStateNote, residentCommandForOwner, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 const roots: string[] = [];
-afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+const nativePlatform = process.platform;
+afterEach(() => { Object.defineProperty(process, "platform", { value: nativePlatform }); vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const root = () => { const value = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-request-retention-")); roots.push(value); return value; };
 const write = (root: string, dir: string, id: string, value: unknown) => {
   fs.mkdirSync(path.join(root, dir), { recursive: true, mode: 0o700 });
@@ -75,7 +81,8 @@ describe("bounded resident request retention", () => {
     expect(() => commitResidentRequest(dir, { ...command, requestId: expiry.newResidentRequestId(now) }, "new", "host")).toThrow(/expiry/i);
     expect(residentHostStateNote(dir)).toMatch(/expiry.*unreadable/i);
   });
-  it("retries the durable barrier when an earlier watermark rename was visible but its sync failed", () => {
+  it.each([...new Set([nativePlatform, "win32"])] as NodeJS.Platform[])("retries the platform durable barrier before collection, including after restart (%s)", (platform) => {
+    Object.defineProperty(process, "platform", { value: platform });
     const dir = root(); const command = seed(dir, old);
     let renamed = false;
     const rename = fs.renameSync;
@@ -85,13 +92,17 @@ describe("bounded resident request retention", () => {
       if (args[1] === path.join(dir, "request-expiry.json")) renamed = true;
     });
     const syncFault = vi.spyOn(fs, "fsyncSync").mockImplementation((...args) => {
-      if (renamed) throw new Error("directory barrier unavailable");
+      // Windows has no directory fsync: fail its applicable pre-rename file
+      // barrier instead. Unix retains the published-but-not-durable rename race.
+      if (platform === "win32" ? fs.fstatSync(args[0]).isFile() : renamed) {
+        throw new Error(platform === "win32" ? "file barrier unavailable" : "directory barrier unavailable");
+      }
       return sync(...args);
     });
     sweep(dir, now);
-    expect(renamed).toBe(true);
+    expect(renamed).toBe(platform !== "win32");
     expect(exists(dir, "decisions", command.requestId)).toBe(true);
-    // A new collector observes the published value, but must not trust its durability.
+    // A new collector retries the file barrier on Windows, or the visible-but-unsynced Unix rename.
     sweep(dir, now);
     expect(exists(dir, "decisions", command.requestId)).toBe(true);
     expect(exists(dir, "responses", command.requestId)).toBe(true);
@@ -120,6 +131,74 @@ describe("bounded resident request retention", () => {
     const link = fs.linkSync;
     vi.spyOn(fs, "linkSync").mockImplementation((...args) => { sweep(dir, now); return link(...args); });
     expect(() => commitResidentRequest(dir, command, "duplicate", "host")).toThrow(/expired/i);
+  });
+  it.each(["abandonment", "cancellation"] as const)("rejects expired %s after collection vacates a committed fence during its CAS", (kind) => {
+    const dir = root(); const command = seed(dir, old);
+    const link = fs.linkSync;
+    vi.spyOn(fs, "linkSync").mockImplementation((...args) => {
+      sweep(dir, now);
+      expect(exists(dir, "decisions", command.requestId)).toBe(false);
+      // Exchange files published after collection must not be removed as safe abandonment.
+      write(dir, "requests", command.requestId, command);
+      write(dir, "responses", command.requestId, { late: true });
+      return link(...args);
+    });
+    let error: unknown;
+    if (kind === "cancellation") {
+      const controller = new AbortController();
+      registerResidentCancellation(controller.signal, dir, command);
+      error = cancellationError(controller.signal, new Error("ordinary cancellation"));
+    } else {
+      try { abandonResidentRequest(path.join(dir, "requests"), path.join(dir, "responses"), command.requestId, 3); }
+      catch (caught) { error = caught; }
+    }
+    expect(error).toBeInstanceOf(expiry.ResidentRequestExpiredError);
+    expect(error).toMatchObject({ code: "RESIDENT_REQUEST_EXPIRED" });
+    expect((error as Error).message).toMatch(/do not replay or reassign/);
+    expect(exists(dir, "acknowledgements", command.requestId)).toBe(false);
+    expect(exists(dir, "requests", command.requestId)).toBe(true);
+    expect(exists(dir, "responses", command.requestId)).toBe(true);
+  });
+  it.each(["main", "nested"] as const)("%s client reports expired, not ordinary timeout, when collection wins the abandonment CAS race", async (kind) => {
+    const dir = root(); const rootId = "session:expiry-race"; const meshRoot = path.join(dir, "mesh");
+    const residencyRoot = residentRoot(meshRoot, rootId);
+    fs.mkdirSync(residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(residencyRoot, "owner.json"), JSON.stringify({ format: 1, hostId: residentHostId(rootId), pid: process.pid, requestFence: 1, requestExpiry: 1, commands: ["removeActor"] }));
+    const config: ResidentHostConfig = {
+      format: 1, rootId, sessionId: "expiry-race", cwd: dir, projectRoot: dir, meshRoot, actorRoot: path.join(dir, "actors"), residencyRoot,
+      fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh, retention: DEFAULT_FABRIC_CONFIG.retention,
+      workerPath: "unused", fabricExtensionPath: "unused", piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
+    };
+    const mesh = new MeshStore(meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    const participants = new ParticipantDirectory(mesh, { enabled: false, hostId: rootId, rootId, identity: { id: rootId, name: "main", kind: "main" } });
+    const main = new ResidencyClient({ config, mesh, participants, commandTimeoutMs: 0,
+      mainAgent: { id: rootId, local: true, matches: id => id === rootId, info: () => { throw new Error("unused"); }, deliverAgent: () => { throw new Error("unused"); } } });
+    const nested = new ResidentActorClient(meshRoot, rootId, 0);
+    let requestId = "";
+    const clock = vi.spyOn(Date, "now").mockReturnValue(old);
+    const rename = fs.renameSync; const link = fs.linkSync;
+    vi.spyOn(fs, "renameSync").mockImplementation((...args) => {
+      rename(...args);
+      if (path.dirname(String(args[1])) !== path.join(residencyRoot, "requests")) return;
+      const command = JSON.parse(fs.readFileSync(args[1], "utf8")) as ResidentCommand;
+      requestId = command.requestId;
+      expect(command.format).toBe(3);
+      commitResidentRequest(residencyRoot, command, "entity", "host");
+      acknowledgeResidentResponse(residencyRoot, { format: 1, requestId, ok: true, completedAt: old }, old, 3);
+      fs.rmSync(args[1]); // Simulate an already completed, consumed exchange with a lost reply.
+      clock.mockRestore();
+    });
+    vi.spyOn(fs, "linkSync").mockImplementation((...args) => {
+      if (JSON.parse(fs.readFileSync(args[0], "utf8")).state === "abandoned") {
+        sweep(residencyRoot, now);
+        expect(exists(residencyRoot, "decisions", requestId)).toBe(false);
+      }
+      return link(...args);
+    });
+    try {
+      await expect((kind === "main" ? main : nested).removeActor("entity")).rejects.toMatchObject({ code: "RESIDENT_REQUEST_EXPIRED" });
+      expect(exists(residencyRoot, "acknowledgements", requestId)).toBe(false);
+    } finally { await main.close(); await participants.close(); }
   });
   it("resumes a budgeted scan without starving later entries", () => {
     const dir = root(); const commands = Array.from({ length: 40 }, () => seed(dir, old));

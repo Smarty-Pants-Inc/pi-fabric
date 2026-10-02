@@ -138,6 +138,10 @@ export const abandonResidentRequest = (
   decideResidentRequest(root, { requestId, state: "abandoned",
     ...(requestFormat === RESIDENT_EXPIRING_COMMAND_FORMAT ? { requestFormat: RESIDENT_EXPIRING_COMMAND_FORMAT } : {}),
   });
+  // Collection can durably expire this generation and remove a committed fence
+  // between our precheck and CAS. A replacement abandonment is not proof that
+  // the original work never committed: fail before acknowledgement or unlink.
+  assertResidentRequestNotExpired(root, requestId);
   const decision = readResidentRequestDecision(root, requestId)!;
   if (decision.state === "abandoned") {
     acknowledgeResidentResponse(root, { format: 1, requestId, ok: false, completedAt: Date.now() }, Date.now(), requestFormat);

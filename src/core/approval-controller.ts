@@ -90,6 +90,8 @@ export class ApprovalController {
       decision?: FabricAutoApprovalDecision,
     ) => void,
     readonly brokeredNetwork?: (provider: string) => boolean,
+    /** Internal callers whose lifetime cannot own classifier work refuse `auto` (SR-8). */
+    readonly refuseAutomatic = false,
   ) {}
 
   async approve(
@@ -115,6 +117,9 @@ export class ApprovalController {
       if (mode !== "auto") {
         await this.#requestApproval(action);
         return;
+      }
+      if (this.refuseAutomatic) {
+        throw new FabricTraceSafeError(`${action.ref} automatic ${action.risk} approval is unsupported for internal routing; explicit allow required`);
       }
 
       let decision: FabricAutoApprovalDecision;

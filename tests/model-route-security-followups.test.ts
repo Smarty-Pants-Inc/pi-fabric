@@ -5,7 +5,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig, type FabricConfig } from "../src/config.js";
-import { ApprovalController } from "../src/core/approval-controller.js";
+import { ApprovalController, FabricSessionApprovals } from "../src/core/approval-controller.js";
+import { FabricAutoApprovalClassifier } from "../src/core/auto-approval-classifier.js";
 import type { FabricRegistryInvocationContext } from "../src/core/action-registry.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { registerFabricPrincipalCapture } from "../src/fabric-provenance.js";
@@ -24,7 +25,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-async function setup(network: FabricConfig["approvals"]["network"] = "allow", attributed = false, jev?: { credentialCommand: string[] }) {
+async function setup(network: FabricConfig["approvals"]["network"] = "allow", attributed = false, jev?: { credentialCommand: string[] }, approvalModel?: string) {
   expect(fs.existsSync(workerPath), "Build the real worker before running these regressions").toBe(true);
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-followups-")); roots.push(cwd);
   const runRoot = path.join(cwd, FABRIC_RUN_ROOT_PREFIX + "followups");
@@ -49,7 +50,7 @@ async function setup(network: FabricConfig["approvals"]["network"] = "allow", at
     ui: { setStatus: vi.fn(), notify: vi.fn(), select: vi.fn(async () => undefined) },
   } as unknown as ExtensionContext;
   const config = normalizeFabricConfig({
-    fullCodeMode: true, approvals: { agent: "allow", read: "allow", network }, ...(jev ? { jev } : {}),
+    fullCodeMode: true, approvals: { agent: "allow", read: "allow", network, ...(approvalModel ? { model: approvalModel } : {}) }, ...(jev ? { jev } : {}),
     agents: { enabled: true, retainRuns: true, extensions: false, timeoutMs: 5000, modelRouting: { shadowCandidates: [cheap] } },
     mcp: { enabled: false, cache: { enabled: false } }, mesh: { enabled: false }, memory: { enabled: false }, records: { enabled: false }, residency: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false },
   });
@@ -176,6 +177,35 @@ describe("SR-5 shadow routing obeys current ordinary Jev network approval throug
   });
 });
 
+describe("SR-8 internal shadow routing refuses automatic network approval", () => {
+  const userTurn = [{ type: "message", message: { role: "user", content: "please run a harmless bounded lookup" } }];
+  it.each([false, true])("network auto + Jev approval model + user evidence (hasUI %s) records pinned fallback with zero classifier, credential or HTTP work", async hasUI => {
+    const classify = vi.spyOn(FabricAutoApprovalClassifier.prototype, "classify");
+    const fixture = await setup("auto", false, undefined, "pi-fabric/typesafe/jev-latest");
+    Object.assign(fixture.context, { hasUI });
+    Object.assign(fixture.context.sessionManager, { getBranch: () => userTurn });
+    expect(fixture.runtime.config.approvals).toMatchObject({ network: "auto", model: "pi-fabric/typesafe/jev-latest" });
+    const { handle, rows } = await fixture.spawn();
+    expect(handle.routeDecision).toMatchObject({ ...pin, reasonCode: "jev-error" });
+    expect(rows[0]).toMatchObject({ ...pin, shadowChoice: pin, reasonCode: "jev-error" });
+    expect(classify).not.toHaveBeenCalled();
+    expect(fixture.context.ui.select).not.toHaveBeenCalled();
+    expect(fixture.evaluate).not.toHaveBeenCalled(); expect(fixture.credentials).not.toHaveBeenCalled();
+    expect(fixture.context.modelRegistry.getApiKeyForProvider).not.toHaveBeenCalled();
+    expect(fixture.http).not.toHaveBeenCalled();
+  });
+  it("the ordinary auto-approval classifier is unchanged for normal tool calls under the same policy", async () => {
+    const fixture = await setup("auto", false, undefined, "pi-fabric/typesafe/jev-latest");
+    const classifier = { classify: vi.fn(async () => ({ decision: "allow" as const, reason: "test", model: "stub" })) } as unknown as FabricAutoApprovalClassifier;
+    const action = await fixture.runtime.registry.describe("jev.evaluate", fixture.invocation);
+    await new ApprovalController(fixture.runtime.config.approvals, fixture.context, new FabricSessionApprovals(), classifier).approve(action, {});
+    expect(classifier.classify).toHaveBeenCalledOnce();
+    await expect(new ApprovalController(fixture.runtime.config.approvals, fixture.context, new FabricSessionApprovals(), classifier, undefined, undefined, true).approve(action, {}))
+      .rejects.toThrow(/automatic network approval is unsupported for internal routing/);
+    expect(classifier.classify).toHaveBeenCalledOnce();
+  });
+});
+
 describe("SR-7 Windows command-backed credential scope cut through the real registry", () => {
   const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
   const original = JevCredentials.prototype.resolve;
@@ -194,6 +224,13 @@ describe("SR-7 Windows command-backed credential scope cut through the real regi
     return { fixture, marker };
   }
   afterEach(() => { Object.defineProperty(process, "platform", platform); });
+  it("status reports a command-only credential as unsupported on Windows without resolving it", () => {
+    const credentials = new JevCredentials(["credential-helper"], {}, undefined);
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    expect(credentials.status()).toMatchObject({ configured: true, source: "command" });
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    expect(credentials.status()).toEqual({ configured: false, source: "command-unsupported", verified: false });
+  });
   it("command-only credentials record the pinned fallback with zero spawns and zero Jev HTTP", async () => {
     const { fixture, marker } = await windowsFixture("");
     const { handle, rows } = await fixture.spawn();

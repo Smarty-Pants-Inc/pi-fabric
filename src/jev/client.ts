@@ -41,8 +41,8 @@ export class JevCredentials {
     return undefined;
   }
   status() {
-    const source = this.providerAuth?.configured() ? "pi" : this.#envCredential() ? "environment" : this.command.length ? "command" : "missing";
-    return { configured: source !== "missing", source, verified: false };
+    const source = this.providerAuth?.configured() ? "pi" : this.#envCredential() ? "environment" : !this.command.length ? "missing" : process.platform === "win32" ? "command-unsupported" : "command";
+    return { configured: source !== "missing" && source !== "command-unsupported", source, verified: false };
   }
   async resolve(signal: AbortSignal): Promise<string> {
     signal.throwIfAborted();

@@ -942,6 +942,8 @@ export class FabricRuntimeState {
         const pending = (async () => {
           // agents.spawn approval grants agent work, not Jev network access. Use
           // the current ordinary jev.evaluate policy before touching credentials.
+          // `auto` is refused (SR-8): the classifier would run outside routeSignal
+          // and the route owner, so record the pinned fallback instead.
           await runAbortable(routeSignal, async () => {
             const action = await this.#registry!.describe("jev.evaluate", { ...invocation, signal: routeSignal });
             routeSignal.throwIfAborted();
@@ -949,7 +951,7 @@ export class FabricRuntimeState {
             routeSignal.throwIfAborted();
             const approval = new ApprovalController(
               this.#config!.approvals, invocation.extensionContext, this.sessionApprovals,
-              this.execution.autoApprovalClassifier, undefined, this.execution.brokeredNetwork,
+              this.execution.autoApprovalClassifier, undefined, this.execution.brokeredNetwork, true,
             );
             await approval.approve(action, request as unknown as Record<string, unknown>);
           });

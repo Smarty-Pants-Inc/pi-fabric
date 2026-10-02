@@ -15,7 +15,7 @@ describe("Jev transport and credentials", () => {
     expect(new JevCredentials(["does-not-exist"], {}).status().source).toBe("command");
     await expect(new JevCredentials([], {}).resolve(signal())).rejects.toThrow("unavailable");
   });
-  it("never exposes credential command stdout/stderr on failure", async () => {
+  it.skipIf(process.platform === "win32")("never exposes credential command stdout/stderr on failure", async () => {
     const c = new JevCredentials([process.execPath,"-e","console.error('FAKE_SECRET');process.exit(1)"], {});
     await expect(c.resolve(signal())).rejects.toThrow(/^Jev credential resolver failed$/);
   });

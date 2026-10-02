@@ -1,56 +1,49 @@
-import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { JevClient, JevCredentials } from "../src/jev/client.js";
+import { JevClient, JevCredentialCommandUnsupportedError, JevCredentials } from "../src/jev/client.js";
 import { DEFAULT_JEV_CONFIG } from "../src/jev/config.js";
 const { spawn } = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock("node:child_process", () => ({ spawn }));
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
-const fakeChild = (pid: number) => Object.assign(new EventEmitter(), {
-  pid, kill: vi.fn(), stdout: new EventEmitter(), stderr: new EventEmitter(),
-});
+const signal = () => new AbortController().signal;
+const request = { state: { text: "offline" }, questions: { yes: { type: "noul" as const, instructions: "Offline?" } } };
 afterEach(() => {
   Object.defineProperty(process, "platform", platform);
-  vi.useRealTimers(); vi.restoreAllMocks(); vi.clearAllMocks();
+  vi.restoreAllMocks(); vi.clearAllMocks();
 });
 
-describe("SR-7 Windows credential retirement through the real tree helper", () => {
-  const cases = (["cancel", "parent error event", "early error", "early success"] as const).flatMap(terminal =>
-    (["spawn failure", "error", "nonzero", "timeout"] as const).map(failure => ({ terminal, failure })));
-  it.each(cases)("$terminal / $failure cannot discharge the owned-tree obligation", async ({ terminal, failure }) => {
-    vi.useFakeTimers();
+// SR-7 scope cut: Windows has no persistent owned-tree identity for a command
+// tree (ponytail: Job Object follow-up), so the command is refused pre-spawn.
+describe("SR-7 Windows refuses command-backed credentials before spawning", () => {
+  it("rejects with a typed reason, spawns nothing and owes no retirement", async () => {
     Object.defineProperty(process, "platform", { ...platform, value: "win32" });
-    const alarm = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
-    const child = fakeChild(1234); const killer = fakeChild(5678);
-    spawn.mockReturnValueOnce(child);
-    if (failure === "spawn failure") spawn.mockImplementationOnce(() => { throw new Error("FAKE_SECRET"); });
-    else spawn.mockReturnValueOnce(killer);
-    const credentials = new JevCredentials(["offline-credential-fixture"], {});
+    const credentials = new JevCredentials(["offline-credential-fixture", "FAKE_SECRET"], {});
     const client = new JevClient(DEFAULT_JEV_CONFIG, undefined, credentials);
-    const controller = new AbortController();
-    const pending = credentials.resolve(controller.signal).then(value => value, error => String(error));
-    child.stdout.emit("data", Buffer.from("offline-key\n"));
-    child.stderr.emit("data", Buffer.from("FAKE_SECRET"));
-    if (terminal === "cancel") controller.abort();
-    if (terminal === "parent error event") child.emit("error", new Error("FAKE_SECRET"));
-    // A pipe-independent descendant can still be alive after this parent close.
-    child.emit("close", terminal === "early success" ? 0 : 7);
-    expect(await pending).toBe(terminal === "early success" ? "offline-key" : "Error: Jev credential resolver failed");
-    expect(spawn).toHaveBeenNthCalledWith(2, "taskkill", ["/pid", "1234", "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-    let retired = false;
-    void client.drainCredentials().then(() => { retired = true; });
-    if (failure === "error") killer.emit("error", new Error("FAKE_SECRET"));
-    if (failure === "timeout") {
-      await vi.advanceTimersByTimeAsync(1000);
-      expect(killer.kill).toHaveBeenCalledWith("SIGKILL");
-    }
-    // An error or timeout cannot be undone by a late successful helper close.
-    if (failure !== "spawn failure") killer.emit("close", failure === "nonzero" ? 1 : 0);
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(retired, "parent-only fallback and helper close must not claim the descendant was joined").toBe(false);
-    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
-    expect(alarm).toHaveBeenCalledOnce();
-    expect(alarm).toHaveBeenCalledWith(expect.stringContaining("retirement remains pending"), { code: "FABRIC_PROCESS_TREE_UNCONFIRMED" });
-    expect(alarm.mock.calls[0]![0]).not.toContain("FAKE_SECRET");
-    expect(vi.getTimerCount()).toBe(0);
+    const error = await credentials.resolve(signal()).then(() => undefined, (e: unknown) => e);
+    expect(error).toBeInstanceOf(JevCredentialCommandUnsupportedError);
+    expect(error).toMatchObject({ code: "JEV_CREDENTIAL_COMMAND_UNSUPPORTED", message: "Jev credential command unsupported on Windows; use the environment or Pi credential" });
+    expect(String(error)).not.toContain("FAKE_SECRET");
+    expect(spawn).not.toHaveBeenCalled();
+    await client.drainCredentials(); // no obligation was ever created
+  });
+  it("evaluate makes zero Jev HTTP calls when only a command is configured", async () => {
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const fetcher = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
+    const client = new JevClient(DEFAULT_JEV_CONFIG, fetcher, new JevCredentials(["offline-credential-fixture"], {}));
+    await expect(client.evaluate(request, signal())).rejects.toBeInstanceOf(JevCredentialCommandUnsupportedError);
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it("environment and Pi-stored credentials still resolve on Windows without a spawn", async () => {
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    expect(await new JevCredentials(["offline-credential-fixture"], { TYPESAFE_API_KEY: " offline-env-key " }).resolve(signal())).toBe("offline-env-key");
+    const pi = { configured: () => true, resolve: vi.fn(async () => "offline-pi-key") };
+    expect(await new JevCredentials(["offline-credential-fixture"], {}, pi).resolve(signal())).toBe("offline-pi-key");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it("POSIX still spawns the command in its own detached group", async () => {
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    spawn.mockImplementationOnce(() => { throw new Error("FAKE_SECRET"); });
+    await expect(new JevCredentials(["offline-credential-fixture", "--flag"], {}).resolve(signal())).rejects.toThrow(/^Jev credential resolver failed$/);
+    expect(spawn).toHaveBeenCalledWith("offline-credential-fixture", ["--flag"], { detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
   });
 });

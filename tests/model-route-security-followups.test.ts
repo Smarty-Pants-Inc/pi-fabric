@@ -24,7 +24,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-async function setup(network: FabricConfig["approvals"]["network"] = "allow", attributed = false) {
+async function setup(network: FabricConfig["approvals"]["network"] = "allow", attributed = false, jev?: { credentialCommand: string[] }) {
   expect(fs.existsSync(workerPath), "Build the real worker before running these regressions").toBe(true);
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-followups-")); roots.push(cwd);
   const runRoot = path.join(cwd, FABRIC_RUN_ROOT_PREFIX + "followups");
@@ -49,7 +49,7 @@ async function setup(network: FabricConfig["approvals"]["network"] = "allow", at
     ui: { setStatus: vi.fn(), notify: vi.fn(), select: vi.fn(async () => undefined) },
   } as unknown as ExtensionContext;
   const config = normalizeFabricConfig({
-    fullCodeMode: true, approvals: { agent: "allow", read: "allow", network },
+    fullCodeMode: true, approvals: { agent: "allow", read: "allow", network }, ...(jev ? { jev } : {}),
     agents: { enabled: true, retainRuns: true, extensions: false, timeoutMs: 5000, modelRouting: { shadowCandidates: [cheap] } },
     mcp: { enabled: false, cache: { enabled: false } }, mesh: { enabled: false }, memory: { enabled: false }, records: { enabled: false }, residency: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false },
   });
@@ -173,6 +173,52 @@ describe("SR-5 shadow routing obeys current ordinary Jev network approval throug
     const { handle } = await fixture.spawn();
     expect(handle.routeDecision.reasonCode).toBe("jev-error");
     expect(fixture.evaluate).not.toHaveBeenCalled(); expect(fixture.credentials).not.toHaveBeenCalled(); expect(fixture.http).not.toHaveBeenCalled();
+  });
+});
+
+describe("SR-7 Windows command-backed credential scope cut through the real registry", () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const original = JevCredentials.prototype.resolve;
+  async function windowsFixture(envKey: string) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-win32-cmd-")); roots.push(dir);
+    const marker = path.join(dir, "spawned");
+    const credentialCommand = [process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(marker)}, "x"); console.log("offline-command-key")`];
+    const fixture = await setup("allow", false, { credentialCommand });
+    vi.stubEnv("TYPESAFE_API_KEY", envKey);
+    vi.mocked(fixture.context.modelRegistry.getApiKeyForProvider!).mockResolvedValue(undefined);
+    // Force win32 only for credential resolution: worker dispatch stays native.
+    fixture.credentials.mockImplementation(function (this: JevCredentials, signal: AbortSignal) {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      return original.call(this, signal).finally(() => Object.defineProperty(process, "platform", platform));
+    });
+    return { fixture, marker };
+  }
+  afterEach(() => { Object.defineProperty(process, "platform", platform); });
+  it("command-only credentials record the pinned fallback with zero spawns and zero Jev HTTP", async () => {
+    const { fixture, marker } = await windowsFixture("");
+    const { handle, rows } = await fixture.spawn();
+    expect(handle.routeDecision).toMatchObject({ ...pin, reasonCode: "jev-error" });
+    expect(rows[0]).toMatchObject({ ...pin, reasonCode: "jev-error" });
+    expect(fixture.credentials).toHaveBeenCalledOnce();
+    await expect(fixture.credentials.mock.results[0]!.value).rejects.toThrow(/unsupported on Windows/);
+    expect(fs.existsSync(marker), "the credential command must never start on Windows").toBe(false);
+    expect(fixture.http).not.toHaveBeenCalled();
+  });
+  it("an environment credential is still used on Windows even with a command configured", async () => {
+    const { fixture, marker } = await windowsFixture("offline-env-key");
+    const { handle } = await fixture.spawn();
+    expect(handle.routeDecision).toMatchObject({ ...cheap, reasonCode: "shadow-choice" });
+    expect(fixture.http).toHaveBeenCalledOnce();
+    const [, init] = fixture.http.mock.calls[0] as unknown as [string, RequestInit];
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer offline-env-key");
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+  it.skipIf(process.platform === "win32")("control: on POSIX the same command fixture really runs and routes", async () => {
+    const { fixture, marker } = await windowsFixture("");
+    fixture.credentials.mockImplementation(function (this: JevCredentials, signal: AbortSignal) { return original.call(this, signal); });
+    const { handle } = await fixture.spawn();
+    expect(handle.routeDecision).toMatchObject({ ...cheap, reasonCode: "shadow-choice" });
+    expect(fs.existsSync(marker)).toBe(true);
   });
 });
 

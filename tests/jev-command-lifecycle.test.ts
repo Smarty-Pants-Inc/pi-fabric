@@ -4,7 +4,9 @@ import { JevClient, JevCredentials } from "../src/jev/client.js";
 import { DEFAULT_JEV_CONFIG } from "../src/jev/config.js";
 import { alive, commandFixture, credentialRequest, credentialResponse, delay } from "./jev-command-test-helpers.js";
 
-describe("SR-7 real credential-command lifetime", () => {
+// Command-backed credentials are POSIX-only: Windows refuses before spawning
+// (see tests/jev-command-tree-failure.test.ts).
+describe.skipIf(process.platform === "win32")("SR-7 real credential-command lifetime", () => {
   it.skipIf(process.platform === "win32").each(["caller", "request deadline"] as const)("%s cancellation stays prompt but drain waits for forced tree exit", async cancellation => {
     const fixture = commandFixture(cancellation === "caller");
     const credentials = new JevCredentials(fixture.command, {});

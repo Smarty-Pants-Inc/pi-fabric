@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { terminatePosixGroup, terminateWindowsTree } from "../child-process-tree.js";
+import { terminatePosixGroup } from "../child-process-tree.js";
 import { runAbortable } from "../async-settlement.js";
 import type { FabricJevConfig } from "./config.js";
 import type { JevRequest, JevResponse } from "./types.js";
@@ -9,6 +9,18 @@ import { checkRequest, checkResponse, jsonText } from "./validation.js";
 export interface JevCredentialSource {
   configured(): boolean;
   resolve(signal: AbortSignal): Promise<string | undefined>;
+}
+/** Command-backed credentials need a persistent owned-tree identity to retire
+ * safely. POSIX has one (the detached process group); Windows does not yet, so
+ * the command is refused before any process starts.
+ * ponytail: Windows support needs a retained owned-tree identity (e.g. a Job Object).
+ */
+export class JevCredentialCommandUnsupportedError extends Error {
+  readonly code = "JEV_CREDENTIAL_COMMAND_UNSUPPORTED";
+  constructor() {
+    super("Jev credential command unsupported on Windows; use the environment or Pi credential");
+    this.name = "JevCredentialCommandUnsupportedError";
+  }
 }
 export class JevCredentials {
   #cached: string | undefined;
@@ -46,13 +58,16 @@ export class JevCredentials {
     if (this.#cached) return this.#cached;
     const [file, ...args] = this.command;
     if (!file) throw new Error(`Jev credentials unavailable: set ${this.envKeys.join(" or ")} or configure jev.credentialCommand`);
+    // No spawn, hence no unowned tree to retire, on a platform without a
+    // persistent owned-tree identity (SR-7). Pi/environment paths ran above.
+    if (process.platform === "win32") throw new JevCredentialCommandUnsupportedError();
     const secret = await new Promise<string>((resolve, reject) => {
       let child: ChildProcess;
       try {
         // execFile does NOT support detached. spawn an argv command (no shell)
         // in its own POSIX group so stopping descendants cannot hit the host.
         child = spawn(file, args, {
-          detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+          detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
         });
       } catch {
         reject(new Error("Jev credential resolver failed"));
@@ -63,8 +78,7 @@ export class JevCredentials {
       // nothing about pipe-independent descendants in this detached group.
       const pgid = child.pid;
       let treeStop: Promise<void> | undefined;
-      const stopTree = (): Promise<void> => treeStop ??= process.platform === "win32"
-        ? terminateWindowsTree(child) : terminatePosixGroup(pgid);
+      const stopTree = (): Promise<void> => treeStop ??= terminatePosixGroup(pgid);
       let joined!: () => void;
       const obligation = new Promise<void>(resolve => { joined = resolve; });
       this.#pendingCommands.add(obligation);
@@ -99,7 +113,7 @@ export class JevCredentials {
         if (code !== 0 || stopping) reject(new Error("Jev credential resolver failed"));
         else resolve(Buffer.concat(stdout).toString("utf8").trim());
         // Both parent close (exit + streams) AND whole-tree confirmation are
-        // required. An uncertain Windows tree deliberately never discharges it.
+        // required. An uncertain group deliberately never discharges it.
         void tree.then(joined);
       });
       signal.addEventListener("abort", stop, { once: true });

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -95,6 +96,66 @@ afterEach(async () => {
 });
 
 describe("actor session rotation safety (smarty-dev#2847)", () => {
+  it("#2479 R3 F6 does not treat ENOENT from archive confirmation as an absent source", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "archive missing namespace", instructions: "Work.", residency: "durable" });
+    await actors.ask(actor.id, "first");
+    const prior = ["20000101T000000000Z", "20000102T000000000Z", "20000103T000000000Z"].map(stamp => `${actor.sessionFile}.${stamp}.bak`);
+    for (const file of prior) fs.copyFileSync(actor.sessionFile!, file);
+    const namespace = atomic.syncPathNamespace;
+    const confirmation = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+      if (file.startsWith(`${actor.sessionFile}.`) && file.endsWith(".bak")) throw Object.assign(new Error("archive namespace disappeared"), { code: "ENOENT" });
+      namespace(file, inode);
+    });
+    try {
+      await expect(actors.resetSession(actor.id)).rejects.toThrow("archive namespace disappeared");
+      expect(fs.existsSync(actor.sessionFile!)).toBe(false);
+      expect(prior.every(file => fs.existsSync(file))).toBe(true);
+    } finally { confirmation.mockRestore(); }
+  });
+  it.each(["reset", "repair"] as const)("#2479 R3 F6 confirms complete preserved session contents before %s replacement or pruning", async (kind) => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: `archive ${kind}`, instructions: "Work.", residency: "durable", transport: "process" });
+    await actors.ask(actor.id, "first");
+    if (kind === "repair") fs.writeFileSync(actor.sessionFile!, "headerless latest append\n");
+    const contents = fs.readFileSync(actor.sessionFile!, "utf8"), events: string[] = [], descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), rename = fs.renameSync.bind(fs), rm = fs.rmSync.bind(fs);
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { events.push(`sync:${descriptors.get(fd)}`); sync(fd); });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { events.push(`rename:${to}`); rename(from, to); });
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => { if (String(file).endsWith(".bak")) events.push(`prune:${file}`); rm(file, options); });
+    if (kind === "reset") await actors.resetSession(actor.id);
+    else await actors.ask(actor.id, "recover");
+    const archiveEvent = events.find(event => event.startsWith(`rename:${actor.sessionFile}.`) && event.endsWith(".bak"))!;
+    expect(archiveEvent).toBeDefined();
+    const archive = archiveEvent.slice("rename:".length), archiveAt = events.indexOf(archiveEvent), headerAt = events.indexOf(`rename:${actor.sessionFile}`);
+    const fileBarrier = events.findIndex(event => event === `sync:${actor.sessionFile}` || event === `sync:${archive}`);
+    expect(fileBarrier).toBeGreaterThanOrEqual(0);
+    expect(fileBarrier).toBeLessThan(headerAt);
+    const pruneAt = events.findIndex(event => event.startsWith("prune:"));
+    if (pruneAt >= 0) expect(fileBarrier).toBeLessThan(pruneAt);
+    if (process.platform !== "win32") expect(events.slice(archiveAt + 1, headerAt)).toContain(`sync:${path.dirname(actor.sessionFile!)}`);
+    expect(fs.readFileSync(archive, "utf8")).toBe(contents);
+  });
+  it("#2479 syncs the archived namespace before publishing a replacement session header", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "archive audit", instructions: "Work.", residency: "durable" });
+    await actors.ask(actor.id, "first");
+    const events: string[] = [], descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), rename = fs.renameSync.bind(fs);
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { events.push(`sync:${descriptors.get(fd)}`); sync(fd); });
+    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { events.push(`rename:${to}`); rename(from, to); });
+    const writer = vi.spyOn(atomic, "writeJsonAtomic");
+    try {
+      await actors.resetSession(actor.id);
+      const archive = events.findIndex(event => event.startsWith(`rename:${actor.sessionFile}.`) && event.endsWith(".bak"));
+      const header = events.indexOf(`rename:${actor.sessionFile}`);
+      expect(archive).toBeGreaterThanOrEqual(0);
+      if (process.platform !== "win32") expect(events.slice(archive + 1, header)).toContain(`sync:${path.dirname(actor.sessionFile!)}`);
+      expect(writer.mock.calls.find(([file]) => file === actor.sessionFile)?.[2]?.durable).toBe(true);
+    } finally { opened.mockRestore(); synced.mockRestore(); renamed.mockRestore(); writer.mockRestore(); }
+  });
   it("defers rotation during an in-flight run, preserves its appends, and atomically seeds the next session", async () => {
     const { actors, runs, hold } = setup();
     const actor = await actors.create({ name: "durable", instructions: "Work.", residency: "durable", transport: "process" });

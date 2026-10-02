@@ -55,11 +55,30 @@ export const createRunningRecord = (
 export const writeRunRecord = (filePath: string, record: AgentRunRecord): void => {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const temporaryPath = `${filePath}.${process.pid}.tmp`;
-  fs.writeFileSync(temporaryPath, JSON.stringify(record, null, 2), {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  renameWithRetry(temporaryPath, filePath);
+  // Progress is disposable; terminal results precede completion delivery/consumption.
+  const durable = ["completed", "failed", "stopped", "timed_out"].includes(record.status);
+  try {
+    const fd = fs.openSync(temporaryPath, "w", 0o600);
+    try {
+      fs.writeFileSync(fd, JSON.stringify(record, null, 2), "utf8");
+      if (durable) fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    renameWithRetry(temporaryPath, filePath);
+    // Keep this native-source worker boundary self-contained (see below).
+    if (durable && process.platform !== "win32") {
+      const synced = new Set<string>();
+      for (const parent of [path.resolve(path.dirname(filePath)), fs.realpathSync(path.dirname(filePath))]) {
+        for (let directory = parent; ; directory = path.dirname(directory)) {
+          if (!synced.has(directory)) {
+            const fd = fs.openSync(directory, "r");
+            try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+            synced.add(directory);
+          }
+          if (directory === path.dirname(directory)) break;
+        }
+      }
+    }
+  } finally { fs.rmSync(temporaryPath, { force: true }); }
 };
 
 // Windows transiently rejects rename() with EPERM/EACCES/EEXIST/EBUSY while

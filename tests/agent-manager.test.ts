@@ -13,6 +13,7 @@ import {
 } from "../src/agents/manager.js";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import * as retentionStorage from "../src/storage/retention.js";
+import * as atomic from "../src/core/atomic-write.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import {
   clearOwnedBudgetEnv,
@@ -246,6 +247,18 @@ describe("AgentManager fleet model admission (#2490)", () => {
 });
 
 describe("AgentManager", () => {
+  it("#2479 persists manager terminal status before settling a stopped run", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-durable-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "HANG", transport: "process" });
+    const write = vi.spyOn(atomic, "writeJsonAtomic");
+    await manager.stop(handle.id);
+    const calls = write.mock.calls.filter(([target, value]) => target.endsWith("status.json") && (value as AgentRunRecord).status === "stopped");
+    expect(calls.length).toBeGreaterThan(0);
+    for (const [, , options] of calls) expect(options?.durable).toBe(true);
+  });
   it("F1 tracked retention retries the full failed save before collection, without pinning session or actor runs", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-save-fault-"));
     roots.push(root);

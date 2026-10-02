@@ -2,15 +2,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { spawn } from "node:child_process";
 import { lockFile } from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
+import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
-import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { RESIDENT_HOST_FORMAT, residentRoot, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -35,6 +37,63 @@ const fixture = () => {
 
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 describe("resident tracked result preservation", () => {
+  it.each(["processing", "requests"] as const)("#2479 R3 F4 retries the failed %s pickup barrier in the same live host before mutation or ack", async (failedDirectory) => {
+    const { root, config, host } = fixture();
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    const requestId = "pickup-retry", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    let unavailable = true, failures = 0;
+    const actualNamespace = atomic.syncPathNamespace;
+    const barrier = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+      if (file === (failedDirectory === "processing" ? processing : path.join(config.residencyRoot, "requests"))) {
+        if (unavailable) { failures++; throw new Error("pickup barrier unavailable"); }
+      }
+      actualNamespace(file, inode);
+    });
+    let create: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await host.start();
+      create = vi.spyOn(host.actors, "create");
+      fs.writeFileSync(path.join(config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({ format: 1, requestId, operation: "createActor", rootId: config.rootId, createdAt: Date.now(), request: { name: "pickup retry", instructions: "Work", residency: "durable" } }));
+      for (let n = 0; failures === 0 && n < 100; n++) await delay(10);
+      expect(failures).toBeGreaterThan(0);
+      expect(fs.existsSync(processing)).toBe(true);
+      await delay(120);
+      expect(create).not.toHaveBeenCalled();
+      expect(fs.existsSync(response)).toBe(false);
+      unavailable = false;
+      for (let n = 0; !fs.existsSync(response) && n < 400; n++) await delay(10);
+      expect(fs.existsSync(response)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(response, "utf8"))).toMatchObject({ ok: true, requestId });
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(processing)).toBe(false);
+    } finally { barrier.mockRestore(); create?.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+  }, 15_000);
+  it("#2479 requests durable config, requests, metadata, responses, saved results and consumption receipts", async () => {
+    const { root, config } = fixture();
+    config.residencyRoot = residentRoot(config.meshRoot, config.rootId);
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.agents = { ...config.agents, budgetUsd: 0 };
+    config.piModels = { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" };
+    const host = new ResidentHost(config, vi.fn());
+    let client: ResidencyClient | undefined;
+    const write = vi.spyOn(atomic, "writeJsonAtomic");
+    try {
+      await host.start();
+      client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+      await new ResidentActorClient(config.meshRoot, config.rootId).actors(AbortSignal.timeout(5_000));
+      const handle = await client.spawnAgent({ task: "audit", transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
+      await host.agents.wait(handle.id, { timeoutMs: 5_000 });
+      await client.waitAgent(handle.id, AbortSignal.timeout(5_000));
+      for (const name of ["config.json", "requests", "agents", "responses", "results"]) {
+        const calls = write.mock.calls.filter(([file]) => file.startsWith(config.residencyRoot) && (name.endsWith(".json") ? file.endsWith(name) : file.includes(`${path.sep}${name}${path.sep}`)));
+        expect(calls.length, name).toBeGreaterThan(0);
+        for (const [, , options] of calls) expect(options?.durable, name).toBe(true);
+      }
+      const receipts = write.mock.calls.filter(([, value]) => typeof value === "object" && value !== null && "completionConsumedAt" in value);
+      expect(receipts.length).toBeGreaterThan(0);
+    } finally { await client?.close(); await host.close(); write.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 15_000);
   it.each(["native", "win32-injected"] as const)("releases the host fence and closes delivery/participant work even if agent close fails (%s)", async (platformCase) => {
     const { root, config, host } = fixture();
     const successor = new ResidentHost(config);

@@ -49,7 +49,7 @@ import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore } from "./registry-store.js";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 
@@ -301,6 +301,13 @@ export class ActorRegistryOwnershipError extends Error {
   }
 }
 
+class ActorQueueDurabilityError extends Error {
+  constructor(actorId: string) {
+    super(`Fabric actor queue durability failed for ${actorId}; retry`);
+    this.name = "ActorQueueDurabilityError";
+  }
+}
+
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
   readonly #failureStreaks = new Map<string, { count: number; notified: boolean }>();
@@ -381,6 +388,8 @@ export class ActorManager {
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
+  // Visible restored images are not receipts until their queue barrier succeeds.
+  readonly #restoredDeliveries = new Map<string, Set<string>>();
   #closing = false;
   #releasePaused = false;
   readonly #closeGraceMs: number;
@@ -490,6 +499,7 @@ export class ActorManager {
         if (this.#releasePaused) return false;
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();
+        this.#scheduleRestoreParked(); // Retry restoration/prelaunch barriers on the existing poll.
         // Preserve deferred events while halted; fencing remains manager-owned.
         return !this.#halted;
       },
@@ -1018,16 +1028,21 @@ export class ActorManager {
       .filter((name) => name.startsWith(prefix) && name.endsWith(".bak") && !name.includes(".orphan-noheader"));
     let bytes = 0;
     let archived: string | null = null;
+    let sourceFound = false;
     try {
       bytes = fs.statSync(file).size;
+      sourceFound = true;
       const stamp = new Date().toISOString().replace(/[-:.]/g, "");
       // A same-millisecond archive takes a suffix above every one kept for its stamp. A gap
       // that pruning left must not be reused: the new name would sort oldest and be pruned.
       const taken = listBackups().map(order).filter(([other]) => other === stamp).map(([, n]) => n);
       archived = taken.length === 0 ? `${file}.${stamp}.bak` : `${file}.${stamp}-${Math.max(...taken) + 1}.bak`;
-      fs.renameSync(file, archived);
+      this.#preserveSession(file, archived);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // Only an absent source at the initial stat means there is nothing to
+      // preserve. Namespace ENOENT after rename is a failed confirmation, not
+      // permission to publish a replacement or prune dependent history.
+      if (sourceFound || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       archived = null;
     }
     const backups = listBackups()
@@ -1056,6 +1071,18 @@ export class ActorManager {
     });
   }
 
+  /** Preserve the complete native append inode before replacement/pruning can depend on it. */
+  #preserveSession(file: string, archived: string): void {
+    if (!this.#persistent) { fs.renameSync(file, archived); return; }
+    const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
+    try {
+      const inode = fs.fstatSync(fd);
+      fs.fsyncSync(fd);
+      fs.renameSync(file, archived);
+      syncPathNamespace(archived, inode);
+    } finally { fs.closeSync(fd); }
+  }
+
   // A native Pi header is tiny; never read the multi-megabyte transcript just to validate it.
   #hasSessionHeader(file: string): boolean {
     const fd = fs.openSync(file, "r");
@@ -1081,7 +1108,7 @@ export class ActorManager {
         if (this.#hasSessionHeader(actor.sessionFile)) return;
         const stamp = new Date().toISOString().replace(/[-:.]/g, "");
         archived = `${actor.sessionFile}.${stamp}.${randomUUID()}.orphan-noheader.bak`;
-        fs.renameSync(actor.sessionFile, archived);
+        this.#preserveSession(actor.sessionFile, archived);
       }
       writeJsonAtomic(actor.sessionFile, {
         type: "session", version: 3, id: randomUUID(),
@@ -2099,12 +2126,14 @@ export class ActorManager {
     const resolving = this.#resolvedRunBinding(actor, unresolved);
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const createdAt = Date.now();
+    const previousSequence = actor.latestActivationSequence;
     const sequence = ++actor.latestActivationSequence;
     if (options.coalesceKey) {
       // Parked work (waiting for ownership, or restored after a restart) coalesces too (smarty-dev#1065).
       const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
         .find((item) => item.coalesceKey === options.coalesceKey);
       if (existing) {
+        const previous = { ...existing };
         existing.payload = structuredClone(payload);
         existing.provenance = options.provenance ? structuredClone(options.provenance) : undefined;
         if (options.images && options.images.length > 0) {
@@ -2117,7 +2146,13 @@ export class ActorManager {
         existing.binding = binding;
         existing.bindingMode = bindingMode;
         existing.bindingVersion = 2;
-        this.#persistQueue(actor.id);
+        const persisted = this.#persistQueue(actor.id);
+        if (this.#persistent && !existing.resolve && !existing.reject && !persisted) {
+          Object.assign(existing, previous);
+          if (!previous.images) delete existing.images;
+          actor.latestActivationSequence = previousSequence;
+          throw new ActorQueueDurabilityError(actor.id);
+        }
         this.#ensureDrain(actor);
         return existing;
       }
@@ -2162,7 +2197,15 @@ export class ActorManager {
     } else {
       actor.queue.push(item);
     }
-    this.#persistQueue(actor.id);
+    const persisted = this.#persistQueue(actor.id);
+    if (this.#persistent && callerless && !persisted) {
+      // No drain or delivery-memory entry can consume a failed admission. Restore
+      // the in-memory queue too, so replay does not manufacture a duplicate item.
+      const waiting = actor.queue.includes(item) ? actor.queue : this.#overflow.get(actor.id)!;
+      waiting.splice(waiting.indexOf(item), 1);
+      actor.latestActivationSequence = previousSequence;
+      throw new ActorQueueDurabilityError(actor.id);
+    }
     if (!this.#inFlight.has(actor.id)) actor.status = "queued";
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
@@ -2200,6 +2243,7 @@ export class ActorManager {
     ) {
       return;
     }
+    if (this.#restoredDeliveries.has(actor.id) && !this.#persistQueue(actor.id)) return;
     actor.draining = true;
     this.#draining.set(actor.id, actor);
     const drain = this.#drain(actor);
@@ -2243,17 +2287,7 @@ export class ActorManager {
         delete actor.lastError;
         const abortController = new AbortController();
         actor.abortController = abortController;
-        await this.#publishPresence(actor);
-        const beforeRun = await this.#validity(actor, item);
-        if (!beforeRun.valid) {
-          this.#recordStale(actor, item, beforeRun.reason);
-          this.#finishInFlight(actor.id, item);
-          delete actor.abortController;
-          actor.status = actor.queue.length > 0 ? "queued" : "idle";
-          actor.updatedAt = Date.now();
-          await this.#publishPresence(actor);
-          continue;
-        }
+        let prelaunchConfirmed = false;
         let runId: string | undefined;
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
@@ -2262,6 +2296,15 @@ export class ActorManager {
         let capabilityLease: FabricCapabilityViewLease | undefined;
         let committedRefs: string[] | undefined;
         try {
+          // Presence is now durable registry I/O. It and validity must share the
+          // activation's caller settlement and in-flight/controller cleanup.
+          await this.#publishPresence(actor);
+          const beforeRun = await this.#validity(actor, item);
+          if (!beforeRun.valid) {
+            this.#recordStale(actor, item, beforeRun.reason);
+            continue;
+          }
+          prelaunchConfirmed = true;
           if (actor.requirements.length > 0 && this.#acquireCapabilityView) {
             capabilityLease = await this.#acquireCapabilityView(
               actor.requirements,
@@ -2436,6 +2479,13 @@ export class ActorManager {
             this.#scheduleRestoreParked();
             continue;
           }
+          if (!prelaunchConfirmed && !item.resolve && !item.reject) {
+            // Admission succeeded but no worker launched. Keep callerless work
+            // for a later poll instead of retiring it or spinning on the outage.
+            this.#inFlight.delete(actor.id); // Park one copy, not both in-flight and parked images.
+            this.#park(actor, [item], message);
+            break;
+          }
           actor.lastError = message;
           const failed: FabricActorMessage = {
             id: randomUUID(),
@@ -2472,7 +2522,11 @@ export class ActorManager {
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           this.#finishInFlight(actor.id, item);
-          if (this.#canManage(actor.id)) await this.#publishPresence(actor);
+          if (this.#canManage(actor.id)) {
+            const presence = this.#publishPresence(actor);
+            if (prelaunchConfirmed) await presence;
+            else await presence.catch(() => undefined); // Original error already settled/parked.
+          }
         }
       }
     } finally {
@@ -2858,6 +2912,9 @@ export class ActorManager {
       if (event.from.id === actor.id && !addressed) continue;
       if (!this.#canManageCached(actor.id)) continue;
       const delivery = `${actor.id}\0${event.id}`;
+      if (this.#restoredDeliveries.get(actor.id)?.has(delivery) && !this.#persistQueue(actor.id)) {
+        throw new ActorQueueDurabilityError(actor.id);
+      }
       if (this.#delivered.has(delivery)) continue;
       try {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
@@ -2881,6 +2938,9 @@ export class ActorManager {
           this.#delivered.delete(this.#delivered.values().next().value!);
         }
       } catch (error) {
+        // Persistence failures hold the replay boundary for ALL topics, not just fleet work.
+        // The monitor restores the consumed prefix on a throwing dispatch.
+        if (error instanceof ActorQueueDurabilityError) throw error;
         // A stopped actor or other failure skips the event, as before; a full queue defers it.
         if (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached")) full = true;
       }
@@ -3384,7 +3444,7 @@ export class ActorManager {
 
   // Returns whether this lineage's file now holds the actor's work. Only then are the predecessor
   // files it took over deleted (review/astra F5 on #79): a failed write keeps them for the next load.
-  #persistQueue(actorId: string, durable = false, release = false): boolean {
+  #persistQueue(actorId: string, durable = true, release = false): boolean {
     if (!this.#persistent || this.#closing) return false;
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
@@ -3396,7 +3456,10 @@ export class ActorManager {
     const file = this.#ownQueueFile(actor);
     const cleanHandover = release || this.#releasePaused;
     try {
-      if (items.length === 0 && !cleanHandover) fs.rmSync(file, { force: true });
+      if (items.length === 0 && !cleanHandover) {
+        fs.rmSync(file, { force: true });
+        if (fs.existsSync(path.dirname(file))) syncPathNamespace(path.dirname(file));
+      }
       else {
       const records = items.flatMap((item) => {
         try {
@@ -3424,10 +3487,19 @@ export class ActorManager {
       }
     } catch (error) {
       if (release) throw error;
-      return false;                                         // best-effort; memory still runs the work
+      return false;                                         // ingress must not acknowledge this work
     }
-    for (const source of this.#takenOver.get(actorId) ?? []) if (source !== file) fs.rmSync(source, { force: true });
+    try {
+      for (const source of this.#takenOver.get(actorId) ?? []) if (source !== file) {
+        fs.rmSync(source, { force: true });
+        syncPathNamespace(path.dirname(source)); // Retired predecessor work must not resurrect.
+      }
+    } catch { return false; } // Retain the takeover obligation for a retry.
     this.#takenOver.delete(actorId);
+    if (durable) {
+      for (const delivery of this.#restoredDeliveries.get(actorId) ?? []) this.#delivered.add(delivery);
+      this.#restoredDeliveries.delete(actorId);
+    }
     return true;
   }
 
@@ -3540,12 +3612,20 @@ export class ActorManager {
       const eventId = value.source.startsWith("mesh:") && typeof value.payload === "object" && value.payload !== null
         ? (value.payload as { id?: unknown }).id : undefined;
       if (typeof eventId === "string") {
-        if (this.#delivered.has(`${actor.id}\0${eventId}`)) continue;
-        this.#delivered.add(`${actor.id}\0${eventId}`);
+        const delivery = `${actor.id}\0${eventId}`;
+        if (this.#delivered.has(delivery) || this.#restoredDeliveries.get(actor.id)?.has(delivery)) continue;
+        const pending = this.#restoredDeliveries.get(actor.id) ?? new Set<string>();
+        pending.add(delivery);
+        this.#restoredDeliveries.set(actor.id, pending);
       }
       restored.push(item);
     }
-    if (restored.length > 0) this.#parked.set(actor.id, [...restored, ...(this.#parked.get(actor.id) ?? [])]);
+    if (restored.length > 0) {
+      this.#parked.set(actor.id, [...restored, ...(this.#parked.get(actor.id) ?? [])]);
+      // Host/direct callerless restoration owes the same launch barrier even
+      // when there is no mesh delivery ID to acknowledge.
+      if (!this.#restoredDeliveries.has(actor.id)) this.#restoredDeliveries.set(actor.id, new Set());
+    }
     this.#persistQueue(actor.id);
   }
 
@@ -4030,6 +4110,7 @@ export class ActorManager {
       for (const [id, items] of [...this.#parked]) {
         const actor = this.#actors.get(id);
         if (!actor || actor.status === "stopped" || !this.#canManageCached(id)) continue;
+        if (this.#restoredDeliveries.has(id) && !this.#persistQueue(id)) continue;
         this.#parked.delete(id);
         actor.queue.unshift(...items);
         this.#mergeCoalesced(actor);                            // a returning item may duplicate a queued one

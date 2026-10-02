@@ -84,7 +84,7 @@ export const hasUnresolvedWorker = (runDirectory: string, depth = 0, expired: De
 };
 export const markUnresolvedWorker = (runDirectory: string, reason: string, details: Record<string, unknown> = {}): void => {
   fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
-  writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details });
+  writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details }, { durable: true });
 };
 /** A terminal external-pane record is not an exit receipt. Share this persistent,
  * tree-wide veto across tracked, recovered and offline cleanup before removing

@@ -1506,12 +1506,14 @@ describe("round 1 public cancellation contract", () => {
   });
 
   it("abandoned cleanup join preserves completion even when the client timeout writes the fence", { timeout: 15_000 }, async () => {
-    const state = await harness(false, undefined, 200);
+    // Setup must cover durable admission. Only cleanup is the 200ms timeout under test.
+    const state = await harness(false, undefined, 10_000);
     const delivered = vi.spyOn(state.client.options.mainAgent, "deliverAgent");
     const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
     state.client.start();
     try {
       const handle = await state.client.spawnAgent({ task: "LIVE_WITH_PROGRESS join-only completion", model: state.model });
+      state.client.options.commandTimeoutMs = 200;
       const outcome = state.client.cleanupAgent(handle.id).catch((error: Error) => error);
       await waitFor(() => entries(state.residencyRoot, "processing").length > 0);
       const requestId = entries(state.residencyRoot, "processing")[0]!.slice(0, -5);
@@ -1529,7 +1531,9 @@ describe("round 1 public cancellation contract", () => {
   });
 
   it("durable create never enters activation compensation when committed removal would be unknown", async () => {
-    const state = await harness(false, undefined, 200); const main = mainProvider(state);
+    // This success-path request must cover core admission's durable registry/queue barriers.
+    // Timeout/abandonment cases above retain their intentionally short deadlines.
+    const state = await harness(false, undefined, 1_000); const main = mainProvider(state);
     const activationFailure = new Error("injected activation failure");
     const ensure = vi.spyOn(state.client, "ensureActor").mockImplementation(async (id) => {
       await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));

@@ -515,7 +515,7 @@ const summarizeRunLog = (runDirectory: string, lines: number): string => {
 };
 
 const writeRecord = (filePath: string, record: AgentRunRecord): void => {
-  writeJsonAtomic(filePath, record, { space: 2 });
+  writeJsonAtomic(filePath, record, { space: 2, durable: true });
 };
 
 const failedRecord = (

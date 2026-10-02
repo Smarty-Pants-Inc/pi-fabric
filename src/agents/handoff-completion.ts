@@ -9,11 +9,15 @@ export const queueHandoffCompletion = (
   extension: ExtensionAPI,
   args: Record<string, unknown>,
   result: Record<string, unknown>,
-  host: MeshIdentity | (() => MeshIdentity),
 ): void => {
   // Delivery is best-effort: a queue failure must not change the executor outcome.
   try {
     const agent = result.agent as Record<string, unknown> | undefined;
+    // The local handoff runner returns the originating child's identity. A launch
+    // failure (or a result without that identity) is an internal notice: no claim.
+    const from: MeshIdentity | undefined = typeof agent?.id === "string" && agent.id.trim()
+      ? { id: agent.id, kind: "agent", name: typeof agent.name === "string" ? agent.name : "" }
+      : undefined;
     const name = String(agent?.name ?? args.name ?? "Trajectory executor");
     const model = String(agent?.model ?? args.model ?? "unknown model");
     const status = String(result.status ?? "failed");
@@ -37,7 +41,7 @@ export const queueHandoffCompletion = (
         display: true,
         details: { displayText, status, model, agent, completed: result.completed === true },
       },
-      { deliverAs: "followUp", triggerTurn: true }, host, "followUp", "mesh",
+      { deliverAs: "followUp", triggerTurn: true }, from, "followUp", "mesh",
     );
   } catch {
     // The authoritative result remains available in the handoff tool result.

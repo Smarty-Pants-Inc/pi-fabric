@@ -41,6 +41,7 @@ const lazyEntryPoints = [
   "src/actors/prune.ts",
   "src/topology/lineage-liveness.ts",
   "src/topology/prune-ownership.ts",
+  "src/agents/model-route.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
@@ -149,7 +150,7 @@ const standalone = await build({
 // smarty-dev#2184: the worker loads this timeout-only hook into every Pi actor run, native-tool
 // ones included. Built on its own, without splitting, so it shares no chunk with index.js.
 await build({
-  entryPoints: ["src/guards/actor-bash-hook.ts"],
+  entryPoints: ["src/guards/actor-bash-hook.ts", "src/guards/model-route-hook.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",

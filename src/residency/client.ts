@@ -23,6 +23,8 @@ import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
+import { MeshBackgroundRetry } from "../core/atomic-write.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
@@ -153,6 +155,7 @@ export class ResidencyClient {
   #deliveryTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #drainingDeliveries = false;
+  readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup");
   #closed = false;
   #startingHost: Promise<ResidentHostOwner> | undefined;
   #nextWatchdogAt = 0;
@@ -180,13 +183,13 @@ export class ResidencyClient {
     this.syncPiModels();
     this.#deliveryTimer = setInterval(
       () => {
-        void this.#drainDeliveries().catch(() => undefined);
+        void this.#backgroundDelivery.run(() => this.#drainDeliveries());
         void this.#watchdog().catch(() => undefined);
       },
       Math.max(20, this.options.config.mesh.actorPollMs),
     );
     this.#deliveryTimer.unref();
-    void this.#drainDeliveries().catch(() => undefined);
+    void this.#backgroundDelivery.run(() => this.#drainDeliveries());
     // Every runtime activation, including manual native /reload, reconciles
     // a live owner. This never starts an empty root or loads an optional engine.
     void this.reconcileRelease().catch((error) => this.#deferRelease(error));
@@ -862,6 +865,20 @@ export class ResidencyClient {
         }
       }
     }
+    // A terminal task can leave its producer outbox behind at idle exit. The live
+    // client owns recovery even with no durable actors; the fenced host replays
+    // the stable envelope id, not the completed agent.
+    const outbox = path.join(config.residencyRoot, "delivery-outbox");
+    let entries: string[];
+    try { entries = fs.readdirSync(outbox); } catch { entries = []; }
+    for (const entry of entries.filter(entry => entry.endsWith(".json"))) {
+      const record = readJson<ResidentDeliveryRecord>(path.join(outbox, entry));
+      if (record?.format === RESIDENT_HOST_FORMAT && typeof record.id === "string" && `${record.id}.json` === entry &&
+        typeof record.rootId === "string" && typeof record.message === "string" && typeof record.triggerTurn === "boolean" &&
+        (record.delivery === "steer" || record.delivery === "followUp") && record.from && typeof record.from.id === "string") {
+        work.push(`delivery:${record.rootId}:${record.id}`);
+      }
+    }
     return work.length ? JSON.stringify(work.sort()) : undefined;
   }
 
@@ -871,7 +888,11 @@ export class ResidencyClient {
     try {
       const entries = this.options.mesh.listAll(this.#deliveryPrefix);
       for (const entry of entries) {
-        try { await this.#deliver(entry); } catch { /* Retain this source for retry; other senders and steers still drain. */ }
+        try { await this.#deliver(entry); } catch (error) {
+          // The record remains durable. Back off a locked mesh; retain ordinary failed senders
+          // without blocking the other entries in this pass.
+          if (isMeshLockTimeout(error)) throw error;
+        }
       }
     } finally {
       this.#drainingDeliveries = false;

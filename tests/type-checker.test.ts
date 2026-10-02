@@ -15,6 +15,14 @@ describe("Fabric guest type checker", () => {
     const rejected = typeCheckFabricCode('return agents.remove({ id: "actor-id", successor: "true" });', GUEST_TYPE_DECLARATIONS, true);
     expect(rejected.errors.length).toBeGreaterThan(0);
   });
+
+  it("types the advertised systemPrompt on agents.run and durable agents.spawn (#2985)", () => {
+    const result = typeCheckFabricCode(`
+await agents.run({ task: "review", systemPrompt: "Use the acceptance checklist" });
+return await agents.spawn({ task: "review", residency: "durable", systemPrompt: "Use the acceptance checklist" });
+`, GUEST_TYPE_DECLARATIONS);
+    expect(result.errors).toEqual([]);
+  });
   it("types explicit opt-in shell monitors and generic task controls", () => {
     const result = typeCheckFabricCode(`
 const result = await pi.bash({cmd: "watch", description: "Watch CI", monitor: {delivery: "ui", match: "CI:", intervalMs: 5000, timeoutMs: 300000}});

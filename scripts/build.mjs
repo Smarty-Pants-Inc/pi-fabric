@@ -33,7 +33,9 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/core/literal-bash-guard.ts",
   "src/lifecycle/reload-target-profile.ts",
+  "src/lifecycle/reload-slots.ts",
   "src/coordination/unverified-ids.ts",
   "src/core/provider-operations.ts",
   "src/agents/claude-cli.ts",

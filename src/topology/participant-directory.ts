@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { readProcessStartIdentity } from "../core/process-identity.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, participantRole, repositoryOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
@@ -380,6 +381,8 @@ export interface ParticipantDirectoryOptions {
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
 export class ParticipantDirectory implements FabricParticipantSource {
+  readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh");
+  readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #startedAt = Date.now();
   readonly #processIdentity = readProcessStartIdentity();
@@ -442,7 +445,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // publish fails (for example a contended mesh lock at startup), keep
       // retrying so this host joins the mesh once the lock clears instead of
       // staying invisible until the next restart.
-      this.#timer = setInterval(() => void this.refresh().catch(() => undefined), this.#heartbeatMs);
+      this.#timer = setInterval(() => void this.#backgroundRefresh.run(() => this.refresh(), false), this.#heartbeatMs);
       this.#timer.unref();
     }
     if (initialError) throw initialError;
@@ -461,7 +464,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const run = (): void => {
       this.#refreshScheduled = false;
       this.#refreshTimer = undefined;
-      void this.#runRefresh(false).catch(() => undefined);
+      void this.#backgroundRefresh.run(() => this.#runRefresh(false), false);
     };
     const wait = this.#changeRefreshAt + CHANGE_REFRESH_MIN_MS - Date.now();
     if (wait <= 0) {
@@ -500,6 +503,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try {
       const committed = await operation;
       if (!committed) return;
+      // An unchanged change-refresh proves nothing about the lock. Only a committed
+      // write/confirmWritable acquisition ends the background path's lock outage.
+      if (this.options.enabled) this.#backgroundRefresh.success();
       this.#refreshedAt = Date.now();
       this.#refreshError = undefined;
       if (full) this.#sweepDeadHosts();
@@ -699,13 +705,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const key = `${id}\0${remoteHost}\0${reason}`;
     if (this.#reportedCollisions.has(key) || this.#reportedCollisions.size >= 1_000) return;
     this.#reportedCollisions.add(key);
-    void this.mesh.publish({
+    void this.#notifications.enqueue(() => this.mesh.publish({
       topic: MIRROR_COLLISION_TOPIC,
       kind: "refused",
       from: this.options.identity,
       text: `Refused mirrored record ${id} from remote host ${remoteHost}: ${reason}`,
       data: { id, remoteHost, reason, ...data },
-    }).catch(() => undefined);
+    }));
   }
 
   /** Validated mirror attribution, including expired leases; fresh and without publishing refusals. */
@@ -939,11 +945,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const now = Date.now();
     if (now - this.#deadHostSweepAt < (reap?.sweepMs ?? DEAD_HOST_SWEEP_MS)) return;
     this.#deadHostSweepAt = now;
-    void reapDeadHostRecords(this.mesh, this.options.identity, {
+    void this.#notifications.enqueue(() => reapDeadHostRecords(this.mesh, this.options.identity, {
       ownHostId: this.options.hostId,
       now,
       ...(reap?.deadAfterMs !== undefined ? { deadAfterMs: reap.deadAfterMs } : {}),
-    }).catch(() => undefined);
+    }));
   }
 
   async quiesce(reason?: string): Promise<void> {
@@ -966,6 +972,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
     await this.#refreshing?.catch(() => undefined);
+    await this.#notifications.close();
     if (!this.options.enabled) return;
     const own = (entry: MeshStateEntry): boolean => {
       const participant = participantFromEntry(entry);

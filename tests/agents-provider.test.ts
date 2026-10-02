@@ -1544,7 +1544,7 @@ afterEach(async () => {
   await Promise.all(controlPlanes.splice(0).map((control) => control.close()));
   await Promise.all(actorManagers.splice(0).map((manager) => manager.close()));
   await Promise.all(agentManagers.splice(0).map((manager) => manager.close()));
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {

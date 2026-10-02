@@ -1,4 +1,5 @@
-import { execFile } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { terminatePosixGroup } from "../child-process-tree.js";
 import { runAbortable } from "../async-settlement.js";
 import type { FabricJevConfig } from "./config.js";
 import type { JevRequest, JevResponse } from "./types.js";
@@ -9,8 +10,22 @@ export interface JevCredentialSource {
   configured(): boolean;
   resolve(signal: AbortSignal): Promise<string | undefined>;
 }
+/** Command-backed credentials need a persistent owned-tree identity to retire
+ * safely. POSIX has one (the detached process group); Windows does not yet, so
+ * the command is refused before any process starts.
+ * ponytail: Windows support needs a retained owned-tree identity (e.g. a Job Object).
+ */
+export class JevCredentialCommandUnsupportedError extends Error {
+  readonly code = "JEV_CREDENTIAL_COMMAND_UNSUPPORTED";
+  constructor() {
+    super("Jev credential command unsupported on Windows; use the environment or Pi credential");
+    this.name = "JevCredentialCommandUnsupportedError";
+  }
+}
 export class JevCredentials {
   #cached: string | undefined;
+  /** Command close obligations outlive caller-facing cancellation/results. */
+  readonly #pendingCommands = new Set<Promise<void>>();
   constructor(
     readonly command: readonly string[],
     private readonly env: NodeJS.ProcessEnv = process.env,
@@ -26,8 +41,8 @@ export class JevCredentials {
     return undefined;
   }
   status() {
-    const source = this.providerAuth?.configured() ? "pi" : this.#envCredential() ? "environment" : this.command.length ? "command" : "missing";
-    return { configured: source !== "missing", source, verified: false };
+    const source = this.providerAuth?.configured() ? "pi" : this.#envCredential() ? "environment" : !this.command.length ? "missing" : process.platform === "win32" ? "command-unsupported" : "command";
+    return { configured: source !== "missing" && source !== "command-unsupported", source, verified: false };
   }
   async resolve(signal: AbortSignal): Promise<string> {
     signal.throwIfAborted();
@@ -43,17 +58,74 @@ export class JevCredentials {
     if (this.#cached) return this.#cached;
     const [file, ...args] = this.command;
     if (!file) throw new Error(`Jev credentials unavailable: set ${this.envKeys.join(" or ")} or configure jev.credentialCommand`);
+    // No spawn, hence no unowned tree to retire, on a platform without a
+    // persistent owned-tree identity (SR-7). Pi/environment paths ran above.
+    if (process.platform === "win32") throw new JevCredentialCommandUnsupportedError();
     const secret = await new Promise<string>((resolve, reject) => {
-      execFile(file, args, { encoding: "utf8", timeout: 5_000, maxBuffer: 16_384, signal, windowsHide: true }, (error, stdout) => {
-        // Never propagate subprocess errors: they can contain stdout/stderr secrets.
-        if (error) reject(new Error("Jev credential resolver failed"));
-        else resolve(stdout.trim());
+      let child: ChildProcess;
+      try {
+        // execFile does NOT support detached. spawn an argv command (no shell)
+        // in its own POSIX group so stopping descendants cannot hit the host.
+        child = spawn(file, args, {
+          detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch {
+        reject(new Error("Jev credential resolver failed"));
+        return;
+      }
+      let stopping = false;
+      // Capture ownership before an early parent exit. A close event says
+      // nothing about pipe-independent descendants in this detached group.
+      const pgid = child.pid;
+      let treeStop: Promise<void> | undefined;
+      const stopTree = (): Promise<void> => treeStop ??= terminatePosixGroup(pgid);
+      let joined!: () => void;
+      const obligation = new Promise<void>(resolve => { joined = resolve; });
+      this.#pendingCommands.add(obligation);
+      void obligation.then(() => this.#pendingCommands.delete(obligation));
+      const stdout: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      const stop = (): void => {
+        if (stopping) return;
+        stopping = true;
+        // Never propagate subprocess errors/output, including on cancellation.
+        reject(new Error("Jev credential resolver failed"));
+        void stopTree();
+      };
+      const deadline = setTimeout(stop, 5_000);
+      child.stdout!.on("data", (chunk: Buffer) => {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > 16_384) stop();
+        else if (!stopping) stdout.push(chunk);
       });
+      child.stderr!.on("data", (chunk: Buffer) => {
+        stderrBytes += chunk.length;
+        if (stderrBytes > 16_384) stop();
+      });
+      child.once("error", stop);
+      child.once("close", (code) => {
+        clearTimeout(deadline);
+        signal.removeEventListener("abort", stop);
+        // Always stop and join the owned tree, including spontaneous successful
+        // or failed parent exit before cancellation/deadline initiated cleanup.
+        const tree = stopTree();
+        if (code !== 0 || stopping) reject(new Error("Jev credential resolver failed"));
+        else resolve(Buffer.concat(stdout).toString("utf8").trim());
+        // Both parent close (exit + streams) AND whole-tree confirmation are
+        // required. An uncertain group deliberately never discharges it.
+        void tree.then(joined);
+      });
+      signal.addEventListener("abort", stop, { once: true });
+      if (signal.aborted) stop();
     });
     signal.throwIfAborted();
     if (!secret || /[\r\n]/.test(secret)) throw new Error("Jev credential resolver returned an invalid credential");
     this.#cached = secret;
     return secret;
+  }
+  async drainCommands(): Promise<void> {
+    while (this.#pendingCommands.size) await Promise.allSettled([...this.#pendingCommands]);
   }
   clear(): void { this.#cached = undefined; }
 }
@@ -115,6 +187,7 @@ export class JevClient {
   }
   async drainCredentials(): Promise<void> {
     while (this.#pendingCredentials.size) await Promise.allSettled([...this.#pendingCredentials]);
+    await this.credentials.drainCommands();
   }
   close(): void { this.credentials.clear(); }
 }

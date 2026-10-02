@@ -29,7 +29,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { runResidentHostFromConfigPath } from "../src/residency/host.js";
-import { abandonResidentRequest, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { abandonResidentRequest, residentDeliveryPrefix, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 import { captureDurableExecutionTrace } from "./helpers/durable-execution-trace.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
@@ -1742,26 +1742,46 @@ describe("round 1 public cancellation contract", () => {
   });
 
   it("abandoned cleanup join preserves completion even when the client timeout writes the fence", { timeout: 15_000 }, async () => {
-    const state = await harness(false, undefined, 200);
+    // Setup is not the timeout under test: a loaded runner may take >200ms to spawn.
+    const state = await harness(false, undefined, 10_000);
+    const workerRelease = path.join(state.root, "release-worker");
     const delivered = vi.spyOn(state.client.options.mainAgent, "deliverAgent");
     const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
+    const clock = vi.spyOn(Date, "now");
     state.client.start();
     try {
-      const handle = await state.client.spawnAgent({ task: "LIVE_WITH_PROGRESS join-only completion", model: state.model });
+      const handle = await state.client.spawnAgent({
+        task: `LIVE_WITH_PROGRESS join-only completion ${JSON.stringify({ fakeWorkerReleasePath: workerRelease })}`,
+        model: state.model,
+      });
+      const joined = deferred();
+      const originalJoin = AgentManager.prototype.join;
+      vi.spyOn(AgentManager.prototype, "join").mockImplementation(async function (this: AgentManager, ...args) {
+        joined.resolve();
+        return originalJoin.apply(this, args);
+      });
+      // Freeze only Date, not timers: the real host must enter its real join before
+      // the client deadline expires, and the worker cannot finish before abandonment.
+      const startedAt = Date.now();
+      clock.mockReturnValue(startedAt);
+      state.client.options.commandTimeoutMs = 200;
       const outcome = state.client.cleanupAgent(handle.id).catch((error: Error) => error);
-      await waitFor(() => entries(state.residencyRoot, "processing").length > 0);
+      await joined.promise;
       const requestId = entries(state.residencyRoot, "processing")[0]!.slice(0, -5);
+      clock.mockReturnValue(startedAt + 200);
       expect((await outcome as Error).message).toContain("Timed out");
       expect(JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", `${requestId}.json`), "utf8")))
         .toMatchObject({ state: "abandoned" });
+      clock.mockRestore();
+      fs.writeFileSync(workerRelease, "");
       await waitFor(() => state.client.settledAgent(handle.id) !== undefined);
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
-      // Delivery polling is independent of host settlement. This bound also lets
-      // the unsafe base complete normally, so the assertion exposes lost delivery.
-      await delay(1_000);
+      await waitFor(() => delivered.mock.calls.some(([delivery]) => (delivery.data as { id?: string })?.id === handle.id));
+      // Wait for durable acknowledgement, not a wall-clock guess about delivery polling.
+      await waitFor(() => state.client.options.mesh.listAll(residentDeliveryPrefix(state.config.rootId)).length === 0);
       expect(delivered.mock.calls.filter(([delivery]) => (delivery.data as { id?: string })?.id === handle.id)).toHaveLength(1);
       expect(cleanup).not.toHaveBeenCalled(); expect(state.client.hasAgent(handle.id)).toBe(true);
-    } finally { await state.close(); }
+    } finally { clock.mockRestore(); fs.writeFileSync(workerRelease, ""); await state.close(); }
   });
 
   it("durable create never enters activation compensation when committed removal would be unknown", async () => {

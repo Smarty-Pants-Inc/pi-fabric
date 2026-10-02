@@ -10,6 +10,7 @@ import {
   runTreeExitVeto,
   markUnresolvedWorker,
   pruneActorRunArchives,
+  compactTerminalRunEvents,
   RUN_ROOT_SWEEP_MARKER,
   sweepTempRunRoots,
 } from "../src/storage/retention.js";
@@ -167,6 +168,105 @@ describe("safe run roots", () => {
     writeStatus(nested, { status: "running", transport: "process", sessionId: String(process.pid) });
     expect(sweep(tempRoot).removedRoots).toEqual([]);
     expect(fs.existsSync(nested)).toBe(true);
+  });
+});
+
+describe("terminal run event log retention", () => {
+  const log = Buffer.from(Array.from({ length: 12000 }, (_, sequence) =>
+    JSON.stringify({ sequence, text: "🙂".repeat(24) }) + "\n").join(""));
+  const make = (runs: string, id: string, record: Record<string, unknown>) => {
+    const dir = path.join(runs, id);
+    writeStatus(dir, record);
+    fs.writeFileSync(path.join(dir, "events.jsonl"), log);
+    fs.writeFileSync(path.join(dir, "reply.json"), '{"text":"keep this result"}');
+    return dir;
+  };
+
+  it.each(["completed", "failed", "stopped", "timed_out"])("bounds an old %s archive to the default tail, keeps status/reply and never rewrites it twice", (status) => {
+    const runsDirectory = path.join(temporaryDirectory(), "actors", "project", "a", "runs");
+    const dir = make(runsDirectory, "old", { status, finishedAt: DAY });
+    const statusBefore = fs.readFileSync(path.join(dir, "status.json"));
+    const replyBefore = fs.readFileSync(path.join(dir, "reply.json"));
+    const options = { runsDirectory, retentionMs: 7 * DAY, now: 3 * DAY };
+    const rename = vi.spyOn(fs, "renameSync");
+    const read = vi.spyOn(fs, "readSync");
+    try {
+      expect(pruneActorRunArchives(options)).toEqual([]);
+      const compacted = fs.readFileSync(path.join(dir, "events.jsonl"));
+      expect(compacted.length).toBeLessThanOrEqual(256 * 1024);
+      expect(compacted.length).toBeGreaterThan(250 * 1024);
+      const newline = compacted.indexOf(0x0a);
+      expect(JSON.parse(compacted.subarray(0, newline).toString())).toMatchObject({ fabricTruncated: true });
+      const tail = compacted.subarray(newline + 1);
+      expect(tail.equals(log.subarray(log.length - tail.length))).toBe(true);
+      const lines = tail.toString().trim().split("\n").map(line => JSON.parse(line));
+      expect(lines.at(-1).sequence).toBe(11999);
+      expect(lines[0].sequence).toBeGreaterThan(0);
+      expect(fs.readFileSync(path.join(dir, "status.json"))).toEqual(statusBefore);
+      expect(fs.readFileSync(path.join(dir, "reply.json"))).toEqual(replyBefore);
+      expect(read.mock.calls.length).toBeGreaterThan(0);
+      expect(read.mock.calls.every(call => call[1].byteLength <= 256 * 1024)).toBe(true);
+      expect(rename).toHaveBeenCalledTimes(1);
+      const stat = fs.statSync(path.join(dir, "events.jsonl"));
+      expect(pruneActorRunArchives(options)).toEqual([]);
+      expect(fs.statSync(path.join(dir, "events.jsonl")).ino).toBe(stat.ino);
+      expect(fs.statSync(path.join(dir, "events.jsonl")).mtimeMs).toBe(stat.mtimeMs);
+      expect(rename).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(path.join(dir, "events.jsonl")).equals(compacted)).toBe(true);
+    } finally { rename.mockRestore(); read.mockRestore(); }
+  });
+
+  it("leaves large live, queued, unknown, young and lastRunId-retained archives byte-for-byte", () => {
+    const runsDirectory = temporaryDirectory();
+    const dirs = [
+      make(runsDirectory, "live", { status: "running", finishedAt: DAY }),
+      make(runsDirectory, "queued", { status: "queued", finishedAt: DAY }),
+      make(runsDirectory, "unknown", { status: "unknown", finishedAt: DAY }),
+      make(runsDirectory, "young", { status: "completed", finishedAt: 3 * DAY - HOUR }),
+      make(runsDirectory, "latest", { status: "failed", finishedAt: DAY }),
+    ];
+    expect(pruneActorRunArchives({ runsDirectory, latestRunId: "latest", retentionMs: 7 * DAY, now: 3 * DAY })).toEqual([]);
+    for (const dir of dirs) expect(fs.readFileSync(path.join(dir, "events.jsonl")).equals(log)).toBe(true);
+  });
+
+  it.each(["unresolved", "live pid", "external pane", "unknown contents", "nested live", "symlink", "hardlink"])("reuses the %s safety veto before compaction", (kind) => {
+    const runs = temporaryDirectory();
+    const dir = make(runs, "old", { status: "completed", finishedAt: DAY,
+      ...(kind === "live pid" ? { transport: "process", sessionId: String(process.pid) } : {}),
+      ...(kind === "external pane" ? { transport: "tmux" } : {}),
+    });
+    if (kind === "unresolved") markUnresolvedWorker(dir, "unknown exit");
+    if (kind === "unknown contents") fs.writeFileSync(path.join(dir, "unknown.txt"), "unknown");
+    if (kind === "nested live") writeStatus(path.join(dir, "nested", "child"), { status: "running" });
+    const file = path.join(dir, "events.jsonl");
+    if (kind === "symlink") { const target = path.join(runs, "target"); fs.renameSync(file, target); fs.symlinkSync(target, file); }
+    if (kind === "hardlink") fs.linkSync(file, path.join(runs, "alias"));
+    expect(compactTerminalRunEvents(dir, { now: 3 * DAY })).toBe(false);
+    expect(fs.readFileSync(file).equals(log)).toBe(true);
+  });
+
+  it("honors custom age/cap and a zero budget, and drops an oversized final line without corrupt JSON", () => {
+    const dir = make(temporaryDirectory(), "old", { status: "completed", finishedAt: DAY });
+    expect(compactTerminalRunEvents(dir, { now: 3 * DAY, terminalRunEventsAgeMs: 3 * DAY })).toBe(false);
+    expect(compactTerminalRunEvents(dir, { now: 3 * DAY, expired: () => true })).toBe(false);
+    expect(fs.readFileSync(path.join(dir, "events.jsonl")).equals(log)).toBe(true);
+    expect(compactTerminalRunEvents(dir, { now: 3 * DAY, terminalRunEventsMaxBytes: 1024 })).toBe(true);
+    expect(fs.statSync(path.join(dir, "events.jsonl")).size).toBeLessThanOrEqual(1024);
+    fs.writeFileSync(path.join(dir, "events.jsonl"), JSON.stringify({ huge: "x".repeat(10000) }) + "\n");
+    expect(compactTerminalRunEvents(dir, { now: 3 * DAY, terminalRunEventsMaxBytes: 1024 })).toBe(true);
+    const lines = fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").trim().split("\n");
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!)).toMatchObject({ fabricTruncated: true });
+  });
+
+  it("leaves the original log intact and removes its temporary file when atomic rename fails", () => {
+    const dir = make(temporaryDirectory(), "old", { status: "completed", finishedAt: DAY });
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => { throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); });
+    try {
+      expect(compactTerminalRunEvents(dir, { now: 3 * DAY })).toBe(false);
+      expect(fs.readFileSync(path.join(dir, "events.jsonl")).equals(log)).toBe(true);
+      expect(fs.readdirSync(dir).sort()).toEqual(["events.jsonl", "reply.json", "status.json"]);
+    } finally { rename.mockRestore(); }
   });
 });
 

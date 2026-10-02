@@ -405,6 +405,9 @@ describe("FabricSettingsComponent", () => {
     expect(lines).toContain("Actor run archives");
     expect(lines).toContain("7d");
     expect(lines).toContain("session.jsonl");
+    expect(lines).toContain("Terminal event log age");
+    expect(lines).toContain("Terminal event log tail");
+    expect(lines).toContain("256 KiB");
   });
 
   it("presents the Tool display row in the UI settings section", () => {

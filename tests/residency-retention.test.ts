@@ -8,7 +8,7 @@ import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { ResidentHost } from "../src/residency/host.js";
+import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
 import * as expiry from "../src/residency/request-expiry.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { acknowledgeResidentResponse, abandonResidentRequest, commitResidentRequest, readResidentRequestDecision, registerResidentCancellation, residentHostId, residentRoot, residentHostStateNote, residentCommandForOwner, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -32,6 +32,80 @@ const seed = (root: string, time: number, acknowledged = true) => {
 };
 const sweep = (root: string, now: number, live = new Set<string>()) => new ResidentRequestRetention(root).sweep(now, live, 10_000);
 const exists = (root: string, dir: string, id: string) => fs.existsSync(path.join(root, dir, `${id}.json`));
+
+describe("resident terminal event retention", () => {
+  const day = 24 * 60 * 60 * 1000;
+  const now = 4 * day;
+  const log = Buffer.from(Array.from({ length: 15000 }, (_, sequence) => JSON.stringify({ sequence, text: "🙂".repeat(10) }) + "\n").join(""));
+  const make = (dir: string, id: string, status: string, finishedAt = day) => {
+    const run = path.join(dir, "runs", id);
+    fs.mkdirSync(run, { recursive: true });
+    fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status, finishedAt }));
+    fs.writeFileSync(path.join(run, "events.jsonl"), log);
+    fs.writeFileSync(path.join(run, "reply.json"), '{"text":"keep reply"}');
+    return run;
+  };
+
+  it("uses the existing streaming sweep to bound terminal residency runs, preserving results, latest references and idempotency", () => {
+    const dir = root();
+    const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
+    const compacted = ["completed", "failed", "stopped", "timed_out"].map(status => make(dir, status, status));
+    const preserved = [make(dir, "live", "running"), make(dir, "queued", "queued"), make(dir, "unknown", "unknown"),
+      make(dir, "young", "completed", now - 1000), make(dir, "latest", "failed"), make(dir, "held", "completed")];
+    write(dir, "results", "completed", { text: "keep saved result" });
+    const result = fs.readFileSync(path.join(dir, "results", "completed.json"));
+    const statuses = compacted.map(run => fs.readFileSync(path.join(run, "status.json")));
+    const retention = new ResidentRequestRetention(dir, [actorRoot], { terminalRunEventsMaxBytes: 128 * 1024 });
+    // A wildcard from the budget-limited request-reference scan cannot starve the
+    // run phase: terminal/exit safety is independently checked for every candidate.
+    retention.sweep(now, new Set(["*", "held"]), 10000);
+    const bounded = compacted.map(run => fs.readFileSync(path.join(run, "events.jsonl")));
+    for (const [index, run] of compacted.entries()) {
+      const tail = bounded[index]!;
+      expect(tail.length).toBeLessThanOrEqual(128 * 1024);
+      expect(JSON.parse(tail.subarray(0, tail.indexOf(0x0a)).toString())).toMatchObject({ fabricTruncated: true });
+      const events = tail.subarray(tail.indexOf(0x0a) + 1);
+      expect(events.equals(log.subarray(log.length - events.length))).toBe(true);
+      expect(JSON.parse(events.toString().trim().split("\n").at(-1)!)).toMatchObject({ sequence: 14999 });
+      expect(fs.readFileSync(path.join(run, "status.json"))).toEqual(statuses[index]);
+      expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep reply"}');
+    }
+    for (const run of preserved) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+    expect(fs.readFileSync(path.join(dir, "results", "completed.json"))).toEqual(result);
+    const rename = vi.spyOn(fs, "renameSync");
+    retention.sweep(now + 60001, new Set(["held"]), 10000);
+    expect(rename.mock.calls.some(call => String(call[1]).endsWith("events.jsonl"))).toBe(false);
+    for (const [index, run] of compacted.entries()) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(bounded[index]!)).toBe(true);
+    retention.close();
+  });
+
+  it("also bounds explicitly retained runs at fenced startup and protects persisted lastRunId from cleanup", () => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
+    const old = make(dir, "old", "completed");
+    const latest = make(dir, "latest", "failed");
+    for (const run of [old, latest]) fs.utimesSync(run, day / 1000, day / 1000);
+    const runs = path.join(dir, "runs");
+    expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot], retainRuns: true })).toEqual([]);
+    expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+    expect(fs.existsSync(path.join(old, "status.json"))).toBe(true);
+    expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
+    fs.utimesSync(old, day / 1000, day / 1000);
+    expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot] })).toEqual([old]);
+    expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
+  });
+
+  it("fails closed for unreadable actor lastRunId references, and honors custom age", () => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: 123 }] });
+    const run = make(dir, "old", "completed");
+    new ResidentRequestRetention(dir, [actorRoot]).sweep(now, new Set(), 10000);
+    expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+    new ResidentRequestRetention(dir, [], { terminalRunEventsAgeMs: 7 * day }).sweep(now, new Set(), 10000);
+    expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+  });
+});
 
 describe("bounded resident request retention", () => {
   const now = Date.now();

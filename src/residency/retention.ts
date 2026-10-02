@@ -2,11 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
+import { compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
 import { isResidentCommandOperation, readResidentRequestDecision, type ResidentCommandResponse, type ResidentResponseAcknowledgement } from "./protocol.js";
 
 const SAMPLE_INTERVAL_MS = 60_000;
-const directories = ["acknowledgements", "decisions", "responses"] as const;
+const directories = ["acknowledgements", "decisions", "responses", "runs"] as const;
 const time = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 const absent = (file: string): boolean => {
   try { fs.lstatSync(file); return false; }
@@ -39,7 +40,11 @@ export class ResidentRequestRetention {
   #expiredBefore = 0;
   #now = 0;
   #health = { entries: 0, bytes: 0, unknown: 0, legacy: 0, collected: 0, sampledAt: 0, error: "" };
-  constructor(readonly root: string, readonly actorRoots: readonly string[] = []) {}
+  constructor(
+    readonly root: string,
+    readonly actorRoots: readonly string[] = [],
+    readonly retention: TerminalRunEventsRetention = {},
+  ) {}
 
   due(now = Date.now()): boolean { return this.#scanning || now >= this.#nextSample; }
 
@@ -57,7 +62,9 @@ export class ResidentRequestRetention {
       catch { this.#expiredBefore = 0; this.#health.error = "expiry fence unreadable or could not be advanced; collection disabled"; }
     }
     const started = performance.now();
-    while (performance.now() - started < budgetMs) {
+    const expired = () => performance.now() - started >= budgetMs;
+    let retainedRuns: Set<string> | undefined;
+    while (!expired()) {
       const kind = directories[this.#index];
       if (kind === undefined) {
         this.#scanning = false; this.#nextSample = now + SAMPLE_INTERVAL_MS;
@@ -76,6 +83,17 @@ export class ResidentRequestRetention {
       catch { this.#health.unknown++; this.close(); this.#index++; continue; }
       if (!entry) { this.close(); this.#index++; continue; }
       const file = path.join(directory, entry.name);
+      if (kind === "runs") {
+        // The request-proof wildcard is not an exit receipt for any particular run.
+        // Inspect each run with the shared ownership/terminal/tree-exit veto instead;
+        // a budget-truncated reference scan must not starve compaction of a large fleet.
+        retainedRuns ??= retainedActorRunIds(this.actorRoots);
+        if (entry.isDirectory() && !liveIds.has(entry.name) &&
+            !retainedRuns.has("*") && !retainedRuns.has(entry.name)) {
+          compactTerminalRunEvents(file, { ...this.retention, now, expired });
+        }
+        continue;
+      }
       const id = entry.name.endsWith(".json") ? entry.name.slice(0, -5) : "";
       let unknown = false;
       try {

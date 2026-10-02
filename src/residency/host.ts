@@ -66,7 +66,7 @@ import {
 } from "./protocol.js";
 import { deliveryRoot, projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
-import { canRemoveTerminalRun } from "../storage/retention.js";
+import { canRemoveTerminalRun, compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
 import { ResidentRequestRetention } from "./retention.js";
 import { assertResidentRequestNotExpired, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
@@ -117,23 +117,31 @@ const hasPreservedResidentResult = (runsRoot: string, id: string): boolean => {
 };
 
 /** Called under the host fence, before constructing the manager: every existing run is untracked. */
-export const sweepResidentRuns = (runsRoot: string, now = Date.now(), budgetMs = 100): string[] => {
+export const sweepResidentRuns = (
+  runsRoot: string, now = Date.now(), budgetMs = 100,
+  options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean } = {},
+): string[] => {
   const removed: string[] = [];
   if (!ownedStat(runsRoot)?.isDirectory()) return removed;
   const started = performance.now();
   const expired = () => performance.now() - started >= budgetMs;
+  const retained = retainedActorRunIds(options.actorRoots ?? []);
+  if (retained.has("*")) return removed;
   let directory: fs.Dir;
   try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
   try {
     let entry: fs.Dirent | null;
     while (!expired() && (entry = directory.readSync())) {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory() || retained.has(entry.name)) continue;
       const run = path.join(runsRoot, entry.name);
       const stat = ownedStat(run);
-      if (!stat?.isDirectory() || now - stat.mtimeMs <= RESIDENT_RUN_RETENTION_MS) continue;
-      if (!canRemoveTerminalRun(run, expired) ||
-          !hasPreservedResidentResult(runsRoot, entry.name) || expired()) continue;
-      try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
+      if (!stat?.isDirectory()) continue;
+      if (!options.retainRuns && now - stat.mtimeMs > RESIDENT_RUN_RETENTION_MS &&
+          canRemoveTerminalRun(run, expired) && hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
+        try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
+      } else {
+        compactTerminalRunEvents(run, { ...options, now, expired });
+      }
     }
   } finally { directory.closeSync(); }
   return removed;
@@ -285,7 +293,7 @@ export class ResidentHost {
     this.#removalsPath = residentRemovalsPath(config.residencyRoot);
     this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
     this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
-      [...new Set(Object.values(residentActorRoots(config)))]);
+      [...new Set(Object.values(residentActorRoots(config)))], config.retention);
   }
 
   #initialize(): void {
@@ -478,7 +486,11 @@ export class ResidentHost {
     await this.#acquireLock();
     this.#started = true;
     try {
-      if (!this.config.agents.retainRuns) sweepResidentRuns(path.join(this.config.residencyRoot, "runs"));
+      sweepResidentRuns(path.join(this.config.residencyRoot, "runs"), Date.now(), 100, {
+        ...this.config.retention,
+        actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
+        retainRuns: this.config.agents.retainRuns,
+      });
       this.#initialize();
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
@@ -832,6 +844,7 @@ export class ResidentHost {
     for (const id of this.actors.inFlightActorIds()) live.add(id);
     const stoppedWritersGone = new Set<string>();
     for (const actor of this.actors.listOwned()) {
+      if (actor.lastRunId) live.add(actor.lastRunId);
       if (actor.status !== "stopped" || actor.inFlightRun) live.add(actor.id);
       else if (!live.has(actor.id) && !live.has("*")) stoppedWritersGone.add(actor.id);
     }

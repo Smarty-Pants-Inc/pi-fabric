@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
@@ -326,10 +326,93 @@ export const sweepTempRunRoots = (options: {
   return result;
 };
 
+/** Full persisted latest-run references, shared by resident startup and streaming retention.
+ * An unreadable registry is a wildcard veto, never proof that a lastRunId is absent. */
+export const retainedActorRunIds = (actorRoots: readonly string[]): Set<string> => {
+  const refs = new Set<string>();
+  try {
+    for (const root of actorRoots) {
+      try { fs.lstatSync(root); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      if (!ownedStat(root)?.isDirectory()) throw new Error("Unsafe actor root");
+      const file = path.join(root, "actors.json");
+      try { fs.lstatSync(file); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      const registry = readJson<{ actors?: Array<{ id?: unknown; lastRunId?: unknown }> }>(file);
+      if (!Array.isArray(registry?.actors)) throw new Error("Unreadable actor registry");
+      for (const actor of registry.actors) {
+        if (!actor || typeof actor.id !== "string" ||
+            (actor.lastRunId !== undefined && typeof actor.lastRunId !== "string")) throw new Error("Unknown actor run reference");
+        if (actor.lastRunId) refs.add(actor.lastRunId);
+      }
+    }
+  } catch { refs.add("*"); }
+  return refs;
+};
+
+export interface TerminalRunEventsRetention {
+  terminalRunEventsAgeMs?: number;
+  terminalRunEventsMaxBytes?: number;
+}
+
+const EVENT_TAIL_MARKER = Buffer.from('{"fabricTruncated":true,"reason":"terminal run event retention"}\n');
+
+/** Compact only an owned, safely terminal run. Read a bounded suffix, keep complete JSONL
+ * lines, and atomically replace only events.jsonl; status/reply/result remain byte-for-byte.
+ * The marker counts against the byte cap. A single oversized final event may leave only
+ * the marker rather than a corrupt JSON fragment. Already bounded logs are never rewritten.
+ * Callers retain their ownership/latest-run vetoes before entering this shared predicate. */
+export const compactTerminalRunEvents = (
+  directory: string,
+  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline } = {},
+): boolean => {
+  const now = options.now ?? Date.now();
+  const ageMs = options.terminalRunEventsAgeMs ?? 24 * 60 * 60 * 1_000;
+  const maxBytes = options.terminalRunEventsMaxBytes ?? 256 * 1024;
+  const expired = options.expired ?? noDeadline;
+  if (!Number.isSafeInteger(ageMs) || ageMs < 0 || !Number.isSafeInteger(maxBytes) ||
+      maxBytes < EVENT_TAIL_MARKER.length || expired() || !ownedStat(directory)?.isDirectory()) return false;
+  const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
+  if (!record?.status || !TERMINAL_STATUSES.has(record.status) ||
+      now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
+  const file = path.join(directory, "events.jsonl");
+  const stat = ownedStat(file);
+  if (!stat?.isFile() || stat.size <= maxBytes || !canRemoveTerminalRun(directory, expired)) return false;
+  try {
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    let tail: Buffer;
+    try {
+      const opened = fs.fstatSync(fd);
+      if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size ||
+          opened.mtimeMs !== stat.mtimeMs) return false;
+      // One look-behind byte lets an exactly aligned final line survive the boundary.
+      const length = maxBytes - EVENT_TAIL_MARKER.length + 1;
+      tail = Buffer.alloc(length);
+      let read = 0;
+      while (read < length) {
+        if (expired()) return false;
+        const count = fs.readSync(fd, tail, read, length - read, stat.size - length + read);
+        if (count === 0) return false;
+        read += count;
+      }
+    } finally { fs.closeSync(fd); }
+    const newline = tail.indexOf(0x0a);
+    const retained = newline < 0 ? Buffer.alloc(0) : tail.subarray(newline + 1);
+    const checked = ownedStat(file);
+    if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
+        checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
+        !canRemoveTerminalRun(directory, expired) || expired()) return false;
+    writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained]));
+    return true;
+  } catch { return false; }
+};
+
 export const pruneActorRunArchives = (options: {
   runsDirectory: string;
   latestRunId?: string;
   retentionMs: number;
+  terminalRunEventsAgeMs?: number;
+  terminalRunEventsMaxBytes?: number;
   now?: number;
 }): string[] => {
   const now = options.now ?? Date.now();
@@ -342,7 +425,10 @@ export const pruneActorRunArchives = (options: {
     const directory = path.join(options.runsDirectory, entry.name);
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
     if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false)) continue;
-    if (now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < options.retentionMs) continue;
+    if (now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < options.retentionMs) {
+      compactTerminalRunEvents(directory, { ...options, now });
+      continue;
+    }
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
   return removed;

@@ -78,6 +78,18 @@ const makeHarness = (
 };
 
 describe("armFabricPrewalkSession", () => {
+  it.each(["manual", "auto"] as const)("review round A1 refuses denied raw and canonical models before %s arm", async (entry) => {
+    for (const selector of ["cliproxyapi/gpt-6-astra", "provider/alias"]) {
+      const h = makeHarness({ model: selector });
+      h.state.config.agents.deniedModels = ["cliproxyapi/gpt-6-astra"];
+      h.context.modelRegistry = { find: () => ({ provider: "cliproxyapi", id: "gpt-6-astra" }) } as unknown as ExtensionContext["modelRegistry"];
+      const arm = () => entry === "auto" ? autoArmFabricPrewalk(h.state, h.context, h.pi) : armFabricPrewalkSession(h.state, h.context, h.pi, { model: selector });
+      await expect(arm()).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      expect(h.prewalk.status().state).toBe("idle");
+      expect(h.sendMessage).not.toHaveBeenCalled();
+      expect(h.captureBaseline).not.toHaveBeenCalled();
+    }
+  });
   it.each(["manual", "auto"] as const)("does not demand a rejected plan when the gate is disabled (%s)", async (entry) => {
     const h = makeHarness({ model: "anthropic/executor", requirePlan: false });
     if (entry === "auto") await autoArmFabricPrewalk(h.state, h.context, h.pi);

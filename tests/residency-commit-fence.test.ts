@@ -10,6 +10,7 @@ import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
+import { MeshProvider } from "../src/providers/mesh-provider.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { CPythonRuntime } from "../src/runtime/cpython-runtime.js";
@@ -1083,6 +1084,56 @@ describe("round 4 public cleanup-obligation retry cancellation", { timeout: 25_0
         controller.abort(); state.release.resolve(); failing?.mockRestore(); vi.unstubAllEnvs();
         await main.close(); await state.close();
       }
+    });
+  }
+});
+
+describe("invocation-local spawn receipts (#2947)", { timeout: 25_000 }, () => {
+  for (const engine of ["quickjs", "node"] as const) for (const interactiveMain of [false, true]) {
+    it(`${engine} completed followUp does not downgrade earlier spawns or poison later calls (Main=${interactiveMain})`, async () => {
+      const state = await harness(false, undefined, 10_000);
+      const main = mainProvider(state);
+      const controller = new AbortController();
+      main.registry.register(new MeshProvider(state.client.options.mesh, main.actors.identity, state.participants));
+      try {
+        const run = publicExecution(state, main, engine, 5_000, interactiveMain);
+        // Pi can reuse the outer cancellation signal across tool calls. It is
+        // observation authority, not an invocation's mutation receipt ledger.
+        const invoke = (code: string) => run(code, controller.signal);
+        const ids: string[] = [];
+        for (let index = 0; index < 2; index++) {
+          const spawned = await invoke(`return ${publicCall(engine, "spawn", requestArgs(state, "spawn"))};`);
+          expect(spawned.success, spawned.error).toBe(true);
+          expect(spawned.residentOutcomes).toBeUndefined();
+          ids.push((spawned.value as { id: string }).id);
+        }
+        await state.client.waitAgent(ids[0]!);
+        await waitFor(() => !state.participants.get(ids[0]!, undefined, { fresh: true })?.capabilities.includes("followUp"));
+        const rejected = await invoke(`return await agents.followUp({id:"${ids[0]}",message:"too late"});`);
+        expect(rejected.success).toBe(false);
+        expect(rejected.error).toContain("does not support followUp");
+        expect(rejected.error).not.toContain("ResidentOutcomeUnknownError");
+        expect(rejected.residentOutcomes).toBeUndefined();
+        const status = await invoke(`return await agents.status({id:"${ids[0]}"});`);
+        expect(status).toMatchObject({ success: true, value: { id: ids[0], status: "completed" } });
+        expect(status.residentOutcomes).toBeUndefined();
+        const fresh = await invoke(`return ${publicCall(engine, "spawn", requestArgs(state, "spawn"))};`);
+        expect(fresh.success, fresh.error).toBe(true);
+        expect(fresh.residentOutcomes).toBeUndefined();
+        expect(ids).not.toContain((fresh.value as { id: string }).id);
+        const effects = await invoke(`return await Promise.allSettled([
+          agents.followUp({id:${JSON.stringify(state.config.rootId)},message:"acknowledge"}),
+          mesh.publish({topic:"work/receipt-regression",text:"published once"})
+        ]);`);
+        expect(effects.success, effects.error).toBe(true);
+        expect(effects.residentOutcomes).toBeUndefined();
+        expect(effects.value).toEqual([
+          expect.objectContaining({ status: "fulfilled", value: expect.objectContaining({ messageId: "unused" }) }),
+          expect.objectContaining({ status: "fulfilled", value: expect.objectContaining({ sequence: expect.any(Number) }) }),
+        ]);
+        expect(decisionsFor(state).filter(decision => decision.operation === "spawn")).toHaveLength(3);
+        expect(controller.signal.aborted).toBe(false);
+      } finally { controller.abort(); await main.close(); await state.close(); }
     });
   }
 });

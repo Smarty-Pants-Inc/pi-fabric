@@ -102,7 +102,9 @@ describe.skipIf(!fs.existsSync(legacyHost))("real B70 mixed-release resident com
         expect(queues(), operation).toEqual(before.queues);
         expect(fs.statSync(requests).mtimeMs, operation).toBe(requestTime);
         expect(result, operation).toMatchObject({ name: "ResidentCommandUnsupportedError", code: "RESIDENT_COMMAND_UNSUPPORTED" });
-        expect(result.message, operation).toMatch(/older release.*next idle point.*retry/i);
+        // A legacy binary cannot be taught launcher custody by desired config.
+        // Refusal must not promise an automatic next-idle-point upgrade.
+        expect(result.message, operation).toMatch(/older release.*handover-capable host and launcher.*retry after activation/i);
       }
     } finally {
       await main.close(); await stop(child, () => output); await participants.close();

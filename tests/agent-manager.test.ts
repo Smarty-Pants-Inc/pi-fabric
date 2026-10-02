@@ -123,6 +123,131 @@ const expectUnconfirmedClose = async (manager: AgentManager) => {
   await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
   managers.splice(managers.indexOf(manager), 1);
 };
+describe("AgentManager fleet model admission (#2490)", () => {
+  it.each([
+    ["veda", "backend-shortcut", "explicit"],
+    ["veda", "veda/gpt-6-astra", "configured"],
+    ["veda", "cliproxyapi/not-registered", "explicit"],
+    ["claude", "default", "explicit"],
+    ["claude", "anthropic/default", "configured"],
+    ["claude", "unknown-runtime-alias", "explicit"],
+  ] as const)("round 5 F5 refuses unresolved/denied %s %s (%s) before a saturated queue", async (runner, selector, source) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-f5-manager-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model === "cliproxyapi/gpt-6.1-sol" ? model : "cliproxyapi/gpt-6-astra");
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1,
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", ...(runner === "veda" && source === "configured" ? { model: selector } : {}) },
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, ...(runner === "claude" && source === "configured" ? { model: selector } : {}) },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
+    const occupied = await manager.spawn({ task: "HANG", model: "cliproxyapi/gpt-6.1-sol", transport: "process" });
+    manager.config.deniedModels = ["cliproxyapi/gpt-6-astra", "anthropic/claude-sonnet-test"];
+    const before = fs.readdirSync(root); const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const beforeCommit = vi.fn();
+    try {
+      await expect(manager.spawn({ task: "must not queue", runner, ...(source === "explicit" ? { model: selector } : {}) }, undefined, undefined, beforeCommit)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      expect(manager.list().map(agent => agent.id)).toEqual([occupied.id]);
+      expect(fs.readdirSync(root)).toEqual(before);
+      expect(launch).not.toHaveBeenCalled(); expect(beforeCommit).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); await manager.stop(occupied.id); }
+  });
+
+  it("round 5 F5 forwards authoritative allowed concrete Veda and Claude alias targets", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-f5-controls-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: ["cliproxyapi/gpt-6-astra"],
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
+    const veda = await manager.run({ task: "allowed concrete", runner: "veda", model: "veda/cliproxyapi/gpt-6.1-sol", transport: "process" });
+    expect(veda).toMatchObject({ status: "completed", model: "cliproxyapi/gpt-6.1-sol" });
+    expect(preparePiModel).toHaveBeenCalledWith("cliproxyapi/gpt-6.1-sol");
+    const claude = await manager.run({ task: "allowed alias", runner: "claude", model: "claude/haiku", transport: "process" });
+    expect(claude).toMatchObject({ status: "completed", model: "claude-haiku-test" });
+  });
+
+  it.each(["missing-resolver", "void-resolver", "other-backend", "unresolved-catalog"] as const)("round 5 F5 refuses targets without authoritative proof (%s)", async mode => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-f5-proof-")); roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: ["cliproxyapi/gpt-6-astra"],
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: mode === "other-backend" ? "agy" : "pi" },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      ...(mode !== "missing-resolver" ? { preparePiModel: async () => {} } : {}),
+    }); managers.push(manager);
+    const catalog = vi.spyOn(manager, "claudeModels").mockResolvedValue([{ value: "shortcut", resolvedModel: "shortcut", resolvedModelKnown: false, displayName: "Shortcut", description: "No native target" }]);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "no proof", runner: mode === "unresolved-catalog" ? "claude" : "veda", model: mode === "unresolved-catalog" ? "shortcut" : "cliproxyapi/gpt-6.1-sol" })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      expect(manager.list()).toEqual([]); expect(launch).not.toHaveBeenCalled(); expect(fs.readdirSync(root)).toEqual([]);
+    } finally { launch.mockRestore(); catalog.mockRestore(); }
+  });
+
+  it.each(["veda", "claude"] as const)("round 5 F5 leaves %s backend aliases unchanged with no policy", async runner => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-f5-no-policy-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [] }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
+    const catalog = vi.spyOn(manager, "claudeModels");
+    try {
+      expect(await manager.run({ task: "legacy alias", runner, model: "backend-shortcut", transport: "process" })).toMatchObject({ status: "completed", model: "backend-shortcut" });
+      expect(preparePiModel).not.toHaveBeenCalled(); expect(catalog).not.toHaveBeenCalled();
+    } finally { catalog.mockRestore(); }
+  });
+
+  it("round 3 F3 rejects unknown Veda defaults before queue admission and preserves allowed configured default", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-default-policy-")); roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], budgetUsd: 0,
+      veda: { binary: DEFAULT_FABRIC_CONFIG.agents.veda.binary, persona: DEFAULT_FABRIC_CONFIG.agents.veda.persona, backend: "pi" },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel: async model => model }); managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "backend default must not launch" })).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      expect(manager.list()).toEqual([]); expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root).filter(entry => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
+      manager.config.veda.model = "veda/cliproxyapi/gpt-6.1-sol";
+      expect((await manager.run({ task: "allowed configured default", transport: "process" })).status).toBe("completed");
+      expect(launch).toHaveBeenCalledOnce();
+    } finally { launch.mockRestore(); }
+  });
+
+  it.each([
+    ["veda", "veda/cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-astra"],
+    ["claude", "claude/denied-backend", "denied-backend"],
+    ["claude", "anthropic/denied-backend", "denied-backend"],
+  ] as const)("review round F1 denies normalized %s selector %s before queue admission", async (runner, selector, denied) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-policy-runner-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner, deniedModels: [denied], budgetUsd: 0, maxConcurrent: 1,
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, ...(runner === "claude" ? { model: selector } : {}) },
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", ...(runner === "veda" ? { model: selector } : {}) },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel: async model => model, claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs") });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      for (const model of [selector, undefined]) {
+        await expect(manager.spawn({ task: "HANG", ...(model ? { model } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      }
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root).filter((entry) => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
+      const allowed = await manager.run({ task: "allowed control", model: runner === "veda" ? "veda/cliproxyapi/gpt-6.1-sol" : "claude/haiku", transport: "process" });
+      expect(allowed.status).toBe("completed");
+      expect(launch).toHaveBeenCalledTimes(1);
+    } finally { launch.mockRestore(); }
+  });
+  it.each(["explicit", "default", "resolved"])("refuses a denied %s before creating a child", async (source) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-policy-"));
+    roots.push(root);
+    const denied = "cliproxyapi/gpt-6-astra";
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, ...(source === "default" ? { model: denied } : {}), deniedModels: [denied], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: async (model) => source === "resolved" ? denied : model,
+    });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "review", ...(source === "explicit" ? { model: " CLIPROXYAPI/GPT-6-ASTRA " } : {}) })).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", model: denied, replacement: "cliproxyapi/gpt-6.1-sol" });
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root).filter((entry) => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
+    } finally { launch.mockRestore(); }
+  });
+});
 
 describe("AgentManager", () => {
   it("F1 tracked retention retries the full failed save before collection, without pinning session or actor runs", async () => {
@@ -1831,9 +1956,11 @@ describe("AgentManager", () => {
     });
     expect(native.status).toBe("completed");
     // --no-extensions disables Fabric/discovery, not explicitly installed host helpers.
-    // Principal delivery stays available for later admitted steering without widening tools.
+    // Principal delivery and native session observation remain installed host helpers;
+    // neither widens the child's tools nor enables Fabric/discovery.
     expect(JSON.parse(native.text).extensionPaths).toEqual([
       path.resolve("src/worker/principal-delivery.ts"),
+      path.resolve("src/worker/session-id.ts"),
     ]);
     expect(JSON.parse(native.text)).toMatchObject({
       extensions: false,

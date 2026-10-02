@@ -23,6 +23,15 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each(["steer", "followUp", "tell"])("types public %s wake receipts for object and positional Main targets", action => {
+    const code = `const object = await agents.${action}({ id: "main", message: "resume" });
+      const positional = await agents.${action}("main", "resume");
+      const triggered: Array<boolean | undefined> = [object.triggered, positional.triggered];
+      const reasons: Array<string | undefined> = [object.reason, positional.reason];
+      return { triggered, reasons };`;
+    expect(typeCheckFabricCode(code, GUEST_TYPE_DECLARATIONS, true).errors).toEqual([]);
+  });
+
   it("types the FIFO position on a queued spawn receipt", () => {
     const result = typeCheckFabricCode(
       `const handle = await agents.spawn({ task: "work" });
@@ -33,6 +42,36 @@ describe("guest agents surface", () => {
     );
     expect(result.errors).toEqual([]);
   });
+  it.each(["run", "wait", "join", "spawn"] as const)("types the optional terminal-compaction diagnostic on agents.%s", (method) => {
+    const args = method === "run" || method === "spawn" ? '{ task: "work" }' : '{ id: "child" }';
+    for (const fullCodeMode of [false, true]) {
+      const declarations = guestTypeDeclarations(fullCodeMode);
+      const code = `const result = await agents.${method}(${args});
+        const skipped: string | undefined = result.compactionSkipped;
+        const omitted: Pick<typeof result, "compactionSkipped"> = {};
+        return { skipped, omitted, status: result.status };`;
+      // Include type-correctness diagnostics: a missing public property is TS2339.
+      expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+      const wrongType = `${code}\nconst invalid: boolean = result.compactionSkipped;`;
+      expect(typeCheckFabricCode(wrongType, declarations, true).errors.map((error) => error.message))
+        .toEqual([expect.stringContaining("not assignable to type 'boolean'")]);
+    }
+  });
+
+  it.each(["completed", "failed", "stopped", "timed_out"])("preserves %s status with a skipped-compaction diagnostic through public results", async (status) => {
+    const snapshot = { status, compactionSkipped: "Terminal run-log compaction skipped; full log retained" };
+    const result = await new QuickJsRuntime().execute(
+      `const run = await agents.run({ task: "work" });
+       const wait = await agents.wait({ id: "child" });
+       const join = await agents.join({ id: "child" });
+       return { run, wait, join };`,
+      async () => snapshot,
+      { timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024 },
+    );
+    expect(result.terminationReason).toBe("completed");
+    expect(result.value).toEqual({ run: snapshot, wait: snapshot, join: snapshot });
+  });
+
   it("binds every implemented action in the TypeScript prelude", () => {
     const agents = slice(GUEST_SETUP, "globalThis.agents = Object.freeze({", "\n});");
     const bound = names(agents, /^ {2}"?([A-Za-z_$][\w$]*)"?:/gm);

@@ -31,6 +31,22 @@ must set `protected: true` for review, security, audit, named passes and all
 before Jev. Protection is a caller-supplied trusted-state snapshot, **not an
 authenticated label oracle**. No prompt-based override or cheaper live route exists.
 
+## Classes on every run record
+
+Every new task, actor activation and handoff records `routeClass` and
+`routeClassSource: "explicit" | "derived"`, independently of shadow routing. An
+explicit caller/actor class wins. Otherwise host facts yield `actor:review` for
+`*-review-astra`, `actor:security` for `*-security-astra`, `actor:status-groom` for
+`supervisor`/`*-supervisor`, `actor:other` for other actors,
+`task:<runner>:<resolved transport>` for tasks, or `handoff` for handoffs. Queued
+task receipts use the requested transport until launch resolves it; portable
+hosted tasks use `task:pi:hosted`. Task text
+is never classification input. The existing `protected` true/false snapshot is
+retained; omitted protection stays unknown. These are history fields, not routing
+permission: derived classes, handoffs, review/security and protected work never
+opt into routing, and all existing shadow-only gates/pins remain unchanged.
+Legacy records are not backfilled.
+
 ## Pins and finite candidates
 
 Both pins are required. Call fields take precedence over dedicated role settings

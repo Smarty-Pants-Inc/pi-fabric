@@ -706,7 +706,8 @@ describe('model: "auto" spawn routing (#2890)', () => {
     const handle = await provider.invoke("spawn", { ...request, cwd: root }, context) as AgentHandleInfo & { routeDecision: { model: string } };
     expect(handle).toMatchObject({ model: "provider/model-a", thinking: "high", routeDecision: { model: "provider/model-b", effort: "medium", reasonCode: "shadow-choice" } });
     const result = await agents.wait(handle.id);
-    expect(result).toMatchObject({ status: "completed", model: "provider/model-a", thinking: "high" });
+    expect(result).toMatchObject({ status: "completed", model: "provider/model-a", thinking: "high",
+      routeClass: "bounded-lookup", routeClassSource: "explicit", protected: false });
     const rows = fs.readFileSync(path.join(process.env.PI_CODING_AGENT_DIR!, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows).toHaveLength(2); expect(rows[1].decisionId).toBe(rows[0].decisionId);
     expect(evaluate).toHaveBeenCalledTimes(1);
@@ -752,6 +753,26 @@ describe('model: "auto" spawn routing (#2890)', () => {
     const { provider, agents } = setup(); const spawn = vi.spyOn(agents, "spawn");
     await expect(provider.invoke(action, { task: "lookup", name: "not-auto", instructions: "lookup", model: "auto" }, context)).rejects.toThrow();
     expect(spawn).not.toHaveBeenCalled();
+  });
+  it.each(["spawn", "run"] as const)("records a plain %s as a derived task class without Jev", async action => {
+    const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
+    const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const value = await provider.invoke(action, { task: "review security actor:status-groom", name: "supervisor",
+      transport: "process", protected: true }, context) as AgentHandleInfo;
+    expect(value).toMatchObject({ routeClass: "task:pi:process", routeClassSource: "derived", protected: true });
+    const result = await agents.wait(value.id);
+    expect(result).toMatchObject({ routeClass: "task:pi:process", routeClassSource: "derived", protected: true, status: "completed" });
+    expect(JSON.parse(fs.readFileSync(path.join(root, "runs", value.id, "status.json"), "utf8")))
+      .toMatchObject({ routeClass: "task:pi:process", routeClassSource: "derived", protected: true });
+    expect(evaluate).not.toHaveBeenCalled();
+  });
+  it.each(["spawn", "run"] as const)("preserves an explicit history class on non-auto %s without routing", async action => {
+    const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const value = await provider.invoke(action, { task: "security", routeClass: "custom-review",
+      routeClassSource: "derived", model: request.pinModel, transport: "process", protected: false }, context) as AgentHandleInfo;
+    expect(await agents.wait(value.id)).toMatchObject({ routeClass: "custom-review", routeClassSource: "explicit", protected: false, model: request.pinModel });
+    expect(evaluate).not.toHaveBeenCalled();
   });
   it("leaves explicit model calls unchanged and never asks Jev", async () => {
     const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
@@ -2468,8 +2489,8 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("list", {}, context)).resolves.toBeInstanceOf(Array);
   });
 
-  it("defers explicit handoff until the finalized outer Fabric result", async () => {
-    const { provider, root } = setup();
+  it.each([undefined, "handoff-review"])("defers handoff until the finalized outer Fabric result and records its class: %s", async routeClass => {
+    const { provider, root, agents } = setup();
     const source = SessionManager.create(process.cwd(), path.join(root, "source-session"));
     source.appendMessage({
       role: "user",
@@ -2521,6 +2542,8 @@ describe("AgentsProvider runner support", () => {
       model: "anthropic/executor",
       task: "Finish the implementation and verify it.",
       transport: "process",
+      protected: true,
+      ...(routeClass !== undefined ? { routeClass } : {}),
     };
 
     await expect(provider.invoke("handoff", args, handoffContext)).resolves.toMatchObject({
@@ -2564,6 +2587,10 @@ describe("AgentsProvider runner support", () => {
       implementation: "fake worker complete",
       agent: { model: "anthropic/executor" },
     });
+    const expectedClass = { routeClass: routeClass ?? "handoff", routeClassSource: routeClass !== undefined ? "explicit" : "derived", protected: true };
+    expect(agents.status(result.agent.id)).toMatchObject(expectedClass);
+    expect(JSON.parse(fs.readFileSync(path.join(root, "runs", result.agent.id, "status.json"), "utf8")))
+      .toMatchObject(expectedClass);
     expect(updates).toContainEqual(expect.stringContaining("caller is waiting"));
     expect(updates).toContainEqual(expect.stringContaining("completed implementation"));
     const task = fs.readFileSync(

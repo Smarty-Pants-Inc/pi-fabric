@@ -2809,6 +2809,8 @@ export class ActorManager {
       systemPrompt: this.#systemPrompt(actor),
       actorId: actor.id,
       actorName: actor.name,
+      ...(actor.routeClass !== undefined ? { routeClass: actor.routeClass } : {}),
+      ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(capabilityRequirements
         ? { capabilityRequirements: [...capabilityRequirements] }
         : {}),

@@ -1320,12 +1320,16 @@ describe("durable completion receipts", () => {
   it("reports a run with no record, no run directory and no live host as failed, and a live run as running", async () => {
     const state = await rootHarness("lost-terminal-record");
     const seeded = await seedCompletion(state, "running");
+    const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8"));
+    const runClass = { routeClass: "custom-review", routeClassSource: "explicit", protected: true };
+    Object.assign(metadata.handle, runClass);
+    fs.writeFileSync(seeded.metadataPath, JSON.stringify(metadata));
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
       fs.rmSync(path.join(seeded.runDirectory, "status.json"));
       expect(client.statusAgent(seeded.id).status).toBe("running");
       fs.rmSync(path.join(state.config.residencyRoot, "runs"), { recursive: true, force: true });
-      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "failed", error: expect.stringMatching(/record lost/) });
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "failed", error: expect.stringMatching(/record lost/), ...runClass });
       expect((await client.waitAgent(seeded.id, AbortSignal.timeout(2_000))).status).toBe("failed");
     } finally {
       await client.close();

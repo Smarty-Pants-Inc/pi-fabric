@@ -53,6 +53,10 @@ interface FabricAction {
   effect?: FabricActionEffect;
 }
 interface FabricAgentRequest {
+  /** Explicit run-history class; does not opt a non-auto task into routing. */
+  routeClass?: string;
+  /** Trusted protection snapshot; omitted remains unknown. */
+  protected?: boolean;
   /** Deduplicate durable spawns on the same host; reuse for retries within 10 minutes (last 256 results). */
   idempotencyKey?: string;
   /** Omitted/inherit uses caller executor.kernel; concrete choices require Pi with extensions. */
@@ -90,6 +94,8 @@ interface FabricHandoffFacts {
 }
 type FabricHandoffPredicate = (facts: Readonly<FabricHandoffFacts>) => boolean;
 interface FabricHandoffRequest {
+  routeClass?: string;
+  protected?: boolean;
   kernel?: FabricKernel | "inherit";
   model: string;
   task?: string;
@@ -255,6 +261,9 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  routeClass?: string;
+  routeClassSource?: "explicit" | "derived";
+  protected?: boolean;
   /** Present on terminal status snapshots when the full log was retained. */
   compactionSkipped?: string;
   /** One-based FIFO admission position; present only while queued. */
@@ -869,7 +878,7 @@ interface FabricAgentsApi {
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
-  spawn(args: FabricAgentRequest & { routeClass?: string; pinModel?: string; pinThinking?: FabricThinking; protected?: boolean }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
+  spawn(args: FabricAgentRequest & { pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
   /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */

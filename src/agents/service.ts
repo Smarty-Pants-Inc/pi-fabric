@@ -21,7 +21,7 @@ type Entry = {
 };
 const copy = <T>(value: T): T => structuredClone(value);
 const publicRecord = (record: AgentServiceRecord): AgentPublicRecord => {
-  const keys = ["id", "rootId", "parentId", "depth", "generation", "name", "task", "status", "runner", "kernel", "cwd", "model", "thinking", "recursive", "startedAt", "updatedAt", "finishedAt", "currentTool", "turns", "toolCalls", "text", "value", "error", "usage", "sessionId"] as const;
+  const keys = ["routeClass", "routeClassSource", "protected", "id", "rootId", "parentId", "depth", "generation", "name", "task", "status", "runner", "kernel", "cwd", "model", "thinking", "recursive", "startedAt", "updatedAt", "finishedAt", "currentTool", "turns", "toolCalls", "text", "value", "error", "usage", "sessionId"] as const;
   return copy(Object.fromEntries(keys.filter((key) => record[key] !== undefined).map((key) => [key, record[key]]))) as AgentPublicRecord;
 };
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
@@ -334,6 +334,11 @@ export class AgentService {
           ...(request.model ? {model: request.model} : {}), ...(request.thinking ? {thinking: request.thinking} : {}),
           ...(request.cwd !== undefined ? {cwd: request.cwd} : {}), ...(request.recursive !== undefined ? {recursive: request.recursive} : {}),
         };
+        // Portable execution uses the trusted hosted port, not a local transport or task text.
+        record.routeClass = request.routeClass ?? "task:pi:hosted";
+        record.routeClassSource = request.routeClass !== undefined ? "explicit" : "derived";
+        if (typeof request.protected === "boolean") record.protected = request.protected;
+        else delete record.protected;
         delete record.finishedAt; delete record.error; delete record.value; delete record.currentTool;
         const entry: Entry = previous ?? {request, record, lifecycle: idle(), controller};
         entry.request = copy(request); entry.record = record; entry.controller = controller;

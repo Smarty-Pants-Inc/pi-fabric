@@ -31,6 +31,8 @@ const runProperties = {
     description:
       "Pi provider/id copied from agents.models({ runner: \"pi\" }), a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties). Reuse returned keys; never infer version numbers from agent names. Exact keys win; near-miss IDs resolve to the closest visible model on the same provider. Handles report the canonical model. Without host model policy, Claude runtime values and Veda backend models/aliases are forwarded verbatim. Under active policy, Claude aliases must resolve through its native CLI catalog; Veda requires backend pi and an exact visible provider/model (unresolved aliases/defaults are refused).",
   },
+  routeClass: { type: "string", pattern: "^[a-z][a-z0-9-]{0,63}$", description: "Explicit run-history class. Record-only unless spawn also requests model: auto; auto permits bounded-lookup or status-groom only." },
+  protected: { type: "boolean", description: "Trusted issue/PR protection snapshot, never task text: true for review/security/audit/named passes/needs-security-pass; false only for known-clear state. Omitted stays unknown and excluded from routing." },
   persona: {
     type: "string",
     description: "Veda persona name for this run, such as frontend, reviewer, worker, or a custom persona.",
@@ -108,10 +110,8 @@ const spawnSchema = {
     ...runProperties, residency: residencySchema,
     idempotencyKey: residentIdempotencyKeySchema,
     model: { ...runProperties.model, description: `${runProperties.model.description} Spawn-only \"auto\" decides and records in shadow mode; the child still runs pinModel/pinThinking.` },
-    routeClass: { type: "string", pattern: "^[a-z][a-z0-9-]{0,63}$", description: "Opt-in auto route class: bounded-lookup or status-groom. Unknown classes are excluded." },
     pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },
     pinThinking: { ...runProperties.thinking, description: "Role's required effort pin; overrides agents.modelRouting.pinThinking. Never inferred from the default medium effort." },
-    protected: { type: "boolean", description: "Caller supplies from trusted issue/PR state, never task text: true for review, security, audit, named passes or needs-security-pass; false only for known clear state. Omitted/unknown is excluded before Jev." },
   },
 };
 
@@ -155,6 +155,8 @@ const handoffSchema = {
       description: "Explicit Pi provider/id target that will continue the inherited trajectory",
     },
     thinking: runProperties.thinking,
+    routeClass: runProperties.routeClass,
+    protected: runProperties.protected,
     tools: runProperties.tools,
     timeoutMs: runProperties.timeoutMs,
     extensions: runProperties.extensions,

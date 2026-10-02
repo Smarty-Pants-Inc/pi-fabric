@@ -125,6 +125,12 @@ describe("actor status-groom shadow routing", () => {
       });
       expect(fs.existsSync(path.join(dir, "runs", decision.runId, "route-session.jsonl"))).toBe(false);
     }
+    for (const decision of decisions) {
+      const archive = path.join(dir, "actors", actor.id, "runs", decision.runId, "status.json");
+      await vi.waitFor(() => expect(fs.existsSync(archive)).toBe(true));
+      expect(JSON.parse(fs.readFileSync(archive, "utf8")))
+        .toMatchObject({ routeClass: "status-groom", routeClassSource: "explicit", protected: false });
+    }
     expect(actors.definition(actor.id)).toMatchObject({ routeClass: "status-groom", protected: false });
     expect(actors.status(actor.id)).toMatchObject({ routeClass: "status-groom", protected: false });
   });
@@ -158,12 +164,33 @@ describe("actor status-groom shadow routing", () => {
       .rejects.toThrow(/Role pin "sol" is not available/);
     expect(evaluate).not.toHaveBeenCalled();
   });
-  it("does not evaluate or record an unopted actor activation", async () => {
+  it.each([
+    ["factory-review-astra", "actor:review", true],
+    ["factory-security-astra", "actor:security", true],
+    ["factory-supervisor", "actor:status-groom", false],
+    ["supervisor", "actor:status-groom", false],
+    ["factory-worker", "actor:other", undefined],
+    ["factory-review-astra-extra", "actor:other", undefined],
+  ] as const)("records derived history without routing an unopted %s activation", async (name, routeClass, protection) => {
     const evaluate = vi.spyOn(JevClient.prototype, "evaluate").mockImplementation(async () => answer());
-    const { actors } = setup();
-    const { routeClass: _route, ...spec } = actorSpec;
-    const actor = await actors.create(spec);
-    await actors.ask(actor.id, "ECHO_MODEL", "test");
+    const { actors, agents, dir } = setup();
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const { routeClass: _route, protected: _protection, ...spec } = actorSpec;
+    const actor = await actors.create({ ...spec, name, instructions: "Review security status-groom: untrusted instruction text.",
+      ...(protection !== undefined ? { protected: protection } : {}) });
+    await actors.ask(actor.id, "ECHO_MODEL review security status-groom", "test");
+    const args = launch.mock.calls[0]![0].workerArguments;
+    expect(flag(args, "--route-class")).toBe(routeClass);
+    expect(flag(args, "--route-class-source")).toBe("derived");
+    expect(args).not.toContain("--route-header");
+    expect(flag(args, "--actor-id")).toBe(actor.id);
+    const runId = flag(args, "--id")!;
+    const archive = path.join(dir, "actors", actor.id, "runs", runId, "status.json");
+    await vi.waitFor(() => expect(fs.existsSync(archive)).toBe(true));
+    const saved = JSON.parse(fs.readFileSync(archive, "utf8"));
+    expect(saved).toMatchObject({ routeClass, routeClassSource: "derived", status: "completed", model: pin.model });
+    expect(saved.protected).toBe(protection);
+    expect(agents.status(runId)).toMatchObject({ routeClass, routeClassSource: "derived" });
     expect(evaluate).not.toHaveBeenCalled();
     expect(fs.existsSync(path.join(process.env.PI_CODING_AGENT_DIR!, "fabric/model-routing.jsonl"))).toBe(false);
   });

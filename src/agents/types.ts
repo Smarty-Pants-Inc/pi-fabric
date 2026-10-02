@@ -42,7 +42,18 @@ export interface AgentSessionSeed {
   outerToolResult: AgentToolResultMessage;
 }
 
+/** Record-only host classification; it never grants permission to route. */
+export interface AgentRunRouteMetadata {
+  routeClass: string;
+  routeClassSource: "explicit" | "derived";
+  /** Trusted caller protection snapshot; absent means unknown, never known-clear. */
+  protected?: boolean;
+}
+
 export interface AgentRunRequest {
+  /** Explicit history class; routing still requires a separately prepared decision. */
+  routeClass?: string;
+  protected?: boolean;
   /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
   idempotencyKey?: string;
   /** Host-created shadow decision; never accepted from external argument normalization. */
@@ -129,6 +140,10 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Always populated for new runs; optional for legacy records. */
+  routeClass?: string;
+  routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
+  protected?: boolean;
   /** Requested launch model; model below follows verified state/assistant attribution. */
   requestedModel?: string;
   /** Shadow-route children: model/effort verified at the pre-prompt admission boundary. */
@@ -200,6 +215,9 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  routeClass?: string;
+  routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
+  protected?: boolean;
   /** Present on terminal status snapshots when the full log was retained. */
   compactionSkipped?: string;
   id: string;
@@ -228,6 +246,10 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  /** Host-created record metadata, independent of the route header/decision. */
+  routeClass?: string;
+  routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
+  protected?: boolean;
   residentStartupProbe?: boolean;
   id: string;
   runner: FabricAgentRunner;

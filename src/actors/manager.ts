@@ -3312,9 +3312,47 @@ export class ActorManager {
     };
   }
 
+  /** Missing rows revoke previously persisted objects, including this very same root.
+   * A new local actor has no persisted root yet; unknown evidence proves no revocation. */
+  #readActorRecords(): Array<Record<string, unknown> & { id: string }> {
+    let parsed: unknown;
+    try { parsed = this.#registry.read(); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const records = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as { actors?: unknown }).actors : undefined;
+    if (!Array.isArray(records) || records.some(row => typeof row !== "object" || row === null || Array.isArray(row) || typeof row.id !== "string")) {
+      throw new Error("Cannot prove actor registry rows: invalid registry");
+    }
+    return records as Array<Record<string, unknown> & { id: string }>;
+  }
+
+  #forgetMissingActors(records: readonly { id: string }[]): void {
+    const present = new Set(records.map(row => row.id));
+    for (const [id, actor] of this.#actors) {
+      if (!this.#persistedRoots.has(id) || present.has(id)) continue;
+      // Forget BEFORE draining/aborting: later queue/presence writers must not recreate files.
+      this.#actors.delete(id);
+      this.#ownership.delete(id);
+      this.#locallyCreated.delete(id);
+      this.#persistedRoots.delete(id);
+      this.#registryIds?.delete(id);
+      this.#markOwnershipAbort(actor);
+      actor.abortController?.abort();
+      const error = new Error(`Fabric actor ${id} was removed from its registry`);
+      for (const item of [...this.#takeQueued(actor), ...this.#takeParked(id)]) item.reject?.(error);
+      for (const waiter of this.#pendingResets.get(id) ?? []) waiter.reject(error);
+      this.#pendingResets.delete(id);
+    }
+  }
+
   async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean }): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     await this.#registry.withLock(() => {
+      const records = this.#readActorRecords();
+      this.#forgetMissingActors(records);
       // Finalization fences reloads and serialization, but only this save's explicit ids
       // are authorized to revoke: their own durable write-ahead markers already exist.
       // Preserve every other finalizer's current registry row, prepared or not.
@@ -3322,7 +3360,7 @@ export class ActorManager {
         !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id),
       );
       const replaced = new Set([...removedIds, ...owned.map((actor) => actor.id)]);
-      const preserved = this.#registry.records().filter((record) => !replaced.has(record.id));
+      const preserved = records.filter((record) => !replaced.has(record.id));
       const actors = [...preserved, ...owned.map((actor) => this.#serializedActor(actor))];
       this.#registry.write(actors, { durable: removedIds.size > 0 || options?.durable === true });
       this.#registryFingerprint = this.#registry.fingerprint();
@@ -3341,7 +3379,9 @@ export class ActorManager {
   #syncActorsFromRegistry(): void {
     if (!this.#persistent || this.#closing || this.#reloadingOwnership) return;
     const fingerprint = this.#registry.fingerprint();
-    if (!fingerprint || fingerprint === this.#registryFingerprint) return;
+    if (fingerprint === this.#registryFingerprint) return;
+    // Unknown/corrupt evidence is not a removal; a valid missing row is.
+    try { this.#forgetMissingActors(this.#readActorRecords()); } catch { return; }
     this.#registryFingerprint = fingerprint;
     const ownsAny = [...this.#actors.keys()].some((id) => this.#ownershipDecision(id));
     if (!ownsAny) {
@@ -3920,6 +3960,7 @@ export class ActorManager {
   #ownershipDecision(id: string): boolean {
     if (this.#ceded.has(id)) return false;
     const actor = this.#actors.get(id);
+    if (!actor) return false;
     const decision = this.#canManageActor?.(id);
 
     // The participant directory is authoritative when it has a live opinion.

@@ -6,6 +6,7 @@ import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type 
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
+import { acquireNativeMainStartupFence } from "./residency/main-startup-fence.js";
 import { OutputArtifactStore } from "./output-budget.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import { recordMainRelease } from "./lifecycle/release-process.js";
@@ -796,49 +797,63 @@ export class FabricRuntimeState {
       extensionContext: context,
       update() {},
     });
-    this.#actors = new ActorDirectory([
-      fabricSessionId,
-      identity,
-      this.#mesh,
-      enforceSchema ? { ...this.#config.mesh, enabled: false } : this.#config.mesh,
-      this.#agents,
-      request => deliverActorToMain(this.pi, identity, request),
-      ownsPersistentActorRegistry
-        ? {
-            persistent: true,
-            mainAgent,
-            canManageActor,
-            isOwnResidentActor: (id) => isOwnResidentActor(this.#participants!, id, mainAgentId),
-            lineageAlive,
-            claimResidency: "session",
-            rootId: mainAgentId,
-            project: participantProject(context.cwd),
-            role: participantRole(),
-            retention: this.#config.retention,
-            maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
-            acquireCapabilityView: acquireActorCapabilityView,
-            // A /reload or restart of this session resumes its actors' mesh stream where the
-            // last runtime stopped, so events published in between still reach them
-            // (smarty-dev#472). A longer downtime replays only its last minutes.
-            meshCursorPath: path.join(actorRoots.session, "mesh-cursor.json"),
-            meshReplayAgeMs: MAIN_ACTOR_MESH_REPLAY_MS,
-          }
-        : {
-            persistent: false,
-            mainAgent,
-            canManageActor,
-            lineageAlive,
-            claimResidency: "session",
-            rootId: mainAgentId,
-            project: participantProject(context.cwd),
-            role: participantRole(),
-            retention: this.#config.retention,
-            maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
-            acquireCapabilityView: acquireActorCapabilityView,
-          },
-    ], actorRoots, this.#config.mesh.actorScope);
+    // Publish Main ownership before any manager loads/schedules persisted actors. A
+    // resumed root either wins this fence, or loads only prune's committed registry.
+    const releaseMainStartup = ownsPersistentActorRegistry
+      ? await acquireNativeMainStartupFence(meshRoot, mainAgentId)
+      : undefined;
+    try {
+      if (mainAgent.local) {
+        this.#participants.registerSource(() => [
+          this.#participants!.root(mainAgent.info(context), mainAgent.interactive),
+        ]);
+      }
+      // An initial publication failure must not leave unfenced loaded actors behind.
+      if (ownsPersistentActorRegistry) await this.#participants.start();
+      this.#actors = new ActorDirectory([
+        fabricSessionId,
+        identity,
+        this.#mesh,
+        enforceSchema ? { ...this.#config.mesh, enabled: false } : this.#config.mesh,
+        this.#agents,
+        request => deliverActorToMain(this.pi, identity, request),
+        ownsPersistentActorRegistry
+          ? {
+              persistent: true,
+              mainAgent,
+              canManageActor,
+              isOwnResidentActor: (id) => isOwnResidentActor(this.#participants!, id, mainAgentId),
+              lineageAlive,
+              claimResidency: "session",
+              rootId: mainAgentId,
+              project: participantProject(context.cwd),
+              role: participantRole(),
+              retention: this.#config.retention,
+              maxSessionBytes: this.#config.actors.maxSessionBytes,
+              resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
+              acquireCapabilityView: acquireActorCapabilityView,
+              // A /reload or restart of this session resumes its actors' mesh stream where the
+              // last runtime stopped, so events published in between still reach them
+              // (smarty-dev#472). A longer downtime replays only its last minutes.
+              meshCursorPath: path.join(actorRoots.session, "mesh-cursor.json"),
+              meshReplayAgeMs: MAIN_ACTOR_MESH_REPLAY_MS,
+            }
+          : {
+              persistent: false,
+              mainAgent,
+              canManageActor,
+              lineageAlive,
+              claimResidency: "session",
+              rootId: mainAgentId,
+              project: participantProject(context.cwd),
+              role: participantRole(),
+              retention: this.#config.retention,
+              maxSessionBytes: this.#config.actors.maxSessionBytes,
+              resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
+              acquireCapabilityView: acquireActorCapabilityView,
+            },
+      ], actorRoots, this.#config.mesh.actorScope);
+    } finally { releaseMainStartup?.(); }
     // A removal this Main accepted behind a run that its restart ended (a same-name create) is
     // finished here, as a resident host does at start; ownership limits it to this Main's actors.
     if (ownsPersistentActorRegistry) void this.#actors.finishPendingRemovals().catch(() => undefined);
@@ -902,11 +917,6 @@ export class FabricRuntimeState {
         })
       : undefined;
     const firstSeenAgents = new Map<string, number>();
-    if (mainAgent.local) {
-      this.#participants.registerSource(() => [
-        this.#participants!.root(mainAgent.info(context), mainAgent.interactive),
-      ]);
-    }
     this.#participants.registerSource(() =>
       agentParticipantRecords(
         this.#agents!.listForUi(),
@@ -958,7 +968,8 @@ export class FabricRuntimeState {
     this.#control.start((command, from, signal, verification) =>
       agentsProvider.acceptControl(command, from, signal, verification));
     try {
-      await this.#participants.start();
+      if (ownsPersistentActorRegistry) await this.#participants.refresh();
+      else await this.#participants.start();
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.warn(

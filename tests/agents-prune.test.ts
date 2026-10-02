@@ -3,11 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
@@ -33,6 +35,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   for (const close of closers.splice(0).reverse()) await close();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  vi.unstubAllEnvs();
 });
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const snapshot = (root: string): Record<string, string> => {
@@ -89,7 +92,155 @@ const fixture = async () => {
   return { root, mesh, owner, caller, project, session, run };
 };
 
+const nativeResume = (h: Awaited<ReturnType<typeof fixture>>) => {
+  vi.stubEnv("PI_CODING_AGENT_DIR", path.join(h.root, "agent"));
+  vi.stubEnv("PI_FABRIC_PROJECT_ROOT", h.root);
+  vi.stubEnv("PI_FABRIC_MESH_ROOT", h.mesh.root);
+  const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "off", sendMessage: vi.fn() } as unknown as ExtensionAPI;
+  const context = { cwd: h.root, hasUI: false, isProjectTrusted: () => true, isIdle: () => true,
+    hasPendingMessages: () => false, modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn() },
+    sessionManager: { getSessionId: () => "old-main", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined },
+    ui: { setStatus: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+  const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: {
+    extension: path.resolve("tests/fixtures/fake-worker.mjs"), worker: path.resolve("tests/fixtures/fake-worker.mjs"),
+    residentHost: path.resolve("tests/fixtures/fake-worker.mjs"), skills: h.root } });
+  closers.push(() => runtime.shutdown());
+  const config = normalizeFabricConfig({ fullCodeMode: true, mesh: { enabled: true, actorPollMs: 60_000 },
+    mcp: { enabled: false, cache: { enabled: false } }, memory: { enabled: false }, jev: { enabled: false },
+    agents: { enabled: false }, residency: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false } });
+  return { runtime, start: () => runtime.initialize(context, config) };
+};
+const deferred = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+};
+
 describe("agents.prune real Fabric path (#2184 item 7)", () => {
+  it.skipIf(process.platform !== "linux")("F7 exact-root native resume waits for prune, loads post-prune rows and cannot resurrect them", async () => {
+    const h = await fixture();
+    await h.owner.close();
+    const store = new ActorRegistryStore(h.owner.actorRoots.project);
+    const durable = { ...store.records().find(row => row.id === h.project.id)!, id: "d".repeat(32), name: "durable-control", residency: "durable" };
+    const unrelated = { ...durable, id: "e".repeat(32), name: "unrelated-control", residency: "session", rootId: h.caller.identity.id };
+    await store.withLock(() => store.write([...store.records(), durable, unrelated]));
+    for (const [at, id] of [[h.owner.actorRoots.project, h.project.id], [h.owner.actorRoots.session, h.session.id],
+      [h.owner.actorRoots.project, durable.id], [h.caller.actorRoots.project, unrelated.id]]) {
+      fs.mkdirSync(path.join(at!, id!), { recursive: true });
+      fs.writeFileSync(path.join(at!, id!, "session.jsonl"), `transcript-${id}\n`);
+    }
+    const resume = nativeResume(h);
+    const leaseEntered = deferred(), releaseLease = deferred(), startupReached = deferred();
+    const scheduleRefresh = ParticipantDirectory.prototype.scheduleRefresh;
+    vi.spyOn(ParticipantDirectory.prototype, "scheduleRefresh").mockImplementation(function (this: ParticipantDirectory) {
+      if (this.options.hostId !== h.owner.identity.id) scheduleRefresh.call(this);
+    });
+    const originalStart = ParticipantDirectory.prototype.start;
+    vi.spyOn(ParticipantDirectory.prototype, "start").mockImplementation(async function (this: ParticipantDirectory) {
+      if (this.options.hostId === h.owner.identity.id) { leaseEntered.resolve(); startupReached.resolve(); await releaseLease.promise; }
+      return originalStart.call(this);
+    });
+    const originalLock = residentLocks.lockFile;
+    vi.spyOn(residentLocks, "lockFile").mockImplementation(async (...args) => {
+      if (args[0].endsWith("/main-start.lock") && args[1] !== 0) startupReached.resolve();
+      return originalLock(...args);
+    });
+    let starting: Promise<void> | undefined;
+    let loadedDuringPrune = false;
+    const publish = h.mesh.publish.bind(h.mesh);
+    vi.spyOn(h.mesh, "publish").mockImplementation(async (...args) => {
+      if (args[0].kind === "actor.prune") {
+        starting = resume.start();
+        await startupReached.promise;
+        try { loadedDuringPrune = resume.runtime.actors.list().some(a => a.id === h.project.id || a.id === h.session.id); } catch { /* correctly fenced before construction */ }
+      }
+      return publish(...args);
+    });
+    try {
+      const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+      await leaseEntered.promise;
+      releaseLease.resolve(); await starting;
+      expect(loadedDuringPrune, "native Main must contend before loading its old ownership root").toBe(false);
+      expect(result.success, result.error).toBe(true);
+      expect((result.value as any).removed.actors).toBe(2);
+      // A subsequent real registry write must not merge back objects loaded before deletion.
+      await resume.runtime.actors.create({ name: "post-prune-control", instructions: "New work.", scope: "session" });
+      if (resume.runtime.actors.list().some(a => a.id === h.project.id)) await resume.runtime.actors.setInstructions(h.project.id, "Must not resurrect.");
+      const ids = [...store.records(), ...new ActorRegistryStore(h.owner.actorRoots.session).records()].map(row => row.id);
+      expect(ids).not.toContain(h.project.id); expect(ids).not.toContain(h.session.id);
+      expect(resume.runtime.actors.list().map(a => a.id)).not.toContain(h.project.id);
+      expect(resume.runtime.actors.list().map(a => a.id)).not.toContain(h.session.id);
+      for (const [id, text] of [[durable.id, `transcript-${durable.id}\n`], [unrelated.id, `transcript-${unrelated.id}\n`]]) {
+        expect(fs.readFileSync(path.join(h.owner.actorRoots.project, id!, "session.jsonl"), "utf8")).toBe(text);
+        expect(ids).toContain(id);
+      }
+      expect(fs.existsSync(path.join(h.owner.actorRoots.project, h.project.id))).toBe(false);
+      expect(fs.existsSync(path.join(h.owner.actorRoots.session, h.session.id))).toBe(false);
+    } finally { releaseLease.resolve(); await starting; }
+  });
+
+  it.skipIf(process.platform !== "linux")("F7 native resume with delayed first lease excludes prune before any actor file deletion", async () => {
+    const h = await fixture(); await h.owner.close();
+    const resume = nativeResume(h);
+    const leaseEntered = deferred(), releaseLease = deferred();
+    const scheduleRefresh = ParticipantDirectory.prototype.scheduleRefresh;
+    vi.spyOn(ParticipantDirectory.prototype, "scheduleRefresh").mockImplementation(function (this: ParticipantDirectory) {
+      if (this.options.hostId !== h.owner.identity.id) scheduleRefresh.call(this);
+    });
+    const originalStart = ParticipantDirectory.prototype.start;
+    vi.spyOn(ParticipantDirectory.prototype, "start").mockImplementation(async function (this: ParticipantDirectory) {
+      if (this.options.hostId === h.owner.identity.id) { leaseEntered.resolve(); await releaseLease.promise; }
+      return originalStart.call(this);
+    });
+    const starting = resume.start();
+    try {
+      await leaseEntered.promise;
+      const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/live.*(?:startup|host lock)/i);
+      expect(fs.existsSync(path.join(h.owner.actorRoots.project, h.project.id))).toBe(true);
+      expect(fs.existsSync(path.join(h.owner.actorRoots.session, h.session.id))).toBe(true);
+    } finally { releaseLease.resolve(); await starting; }
+    expect(resume.runtime.actors.listOwned().map(a => a.id)).toEqual(expect.arrayContaining([h.project.id, h.session.id]));
+  });
+  it.skipIf(process.platform !== "linux")("F7 native Main can resume while its resident lifetime host.lock remains held", async () => {
+    const h = await fixture(); await h.owner.close();
+    const dir = residentRoot(h.mesh.root, h.owner.identity.id);
+    fs.mkdirSync(dir, { recursive: true });
+    const fd = await lockFile(path.join(dir, "host.lock"), 0, true);
+    try {
+      const resume = nativeResume(h); await resume.start();
+      expect(resume.runtime.actors.listOwned().map(a => a.id)).toEqual(expect.arrayContaining([h.project.id, h.session.id]));
+      await expect(lockFile(path.join(dir, "host.lock"), 0, true)).rejects.toBeInstanceOf(residentLocks.FileLockBusy);
+      const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+      expect(result.success).toBe(false);
+      expect(fs.existsSync(path.join(h.owner.actorRoots.project, h.project.id))).toBe(true);
+      expect(fs.existsSync(path.join(h.owner.actorRoots.session, h.session.id))).toBe(true);
+    } finally { fs.closeSync(fd); }
+  });
+
+  it.skipIf(process.platform !== "linux")("F7 failed first native lease publication loads no actors and releases its startup fence", async () => {
+    const h = await fixture(); await h.owner.close();
+    const before = [h.owner.actorRoots.project, h.owner.actorRoots.session].map(at => fs.readFileSync(path.join(at, "actors.json"), "utf8"));
+    const resume = nativeResume(h);
+    vi.spyOn(ParticipantDirectory.prototype, "start").mockRejectedValue(new Error("fixture initial lease EIO"));
+    await expect(resume.start()).rejects.toThrow("fixture initial lease EIO");
+    expect(() => resume.runtime.actors).toThrow(/not initialized/);
+    expect([h.owner.actorRoots.project, h.owner.actorRoots.session].map(at => fs.readFileSync(path.join(at, "actors.json"), "utf8"))).toEqual(before);
+    const fd = await lockFile(path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-start.lock"), 0, true, false);
+    fs.closeSync(fd);
+  });
+
+  it.skipIf(process.platform !== "linux")("F7 native Linux startup never skips the fence on an unavailable per-process capability probe", async () => {
+    const h = await fixture(); await h.owner.close();
+    vi.spyOn(residentLocks, "kernelFenceAvailable").mockReturnValue(false);
+    const originalLock = residentLocks.lockFile;
+    const locked = vi.spyOn(residentLocks, "lockFile").mockImplementation(originalLock);
+    const resume = nativeResume(h); await resume.start();
+    expect(locked).toHaveBeenCalledWith(path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-start.lock"), 120, true);
+    expect(resume.runtime.actors.listOwned().map(a => a.id)).toEqual(expect.arrayContaining([h.project.id, h.session.id]));
+  });
+
   const expiredOwner = async (h: Awaited<ReturnType<typeof fixture>>) => {
     const lease = { id: h.owner.identity.id, rootId: h.owner.identity.id, identityId: h.owner.identity.id,
       updatedAt: 1, expiresAt: 2 };
@@ -223,7 +374,8 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
       await h.mesh.put({ key: `actors/old-main/${h.project.id}`, value: { id: h.project.id, rootId: 42 }, identity: h.owner.identity });
     } else fs.writeFileSync(path.join(h.owner.actorRoots.project, `removal-${h.project.id}.json`), JSON.stringify({ id: h.project.id }));
     const dir = residentRoot(h.mesh.root, h.owner.identity.id); fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "host.lock"), ""); // persistent vacant startup fence: refusal must not change its bytes either
+    fs.writeFileSync(path.join(dir, "host.lock"), "");
+    fs.writeFileSync(path.join(dir, "main-start.lock"), ""); // persistent vacant startup fence: refusal must not change its bytes either
     const before = snapshot(h.root);
     for (const dryRun of [true, false]) {
       const result = await h.run(`return await agents.prune({ root: "session:old-main", dryRun: ${dryRun} });`);
@@ -376,6 +528,7 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
   it.skipIf(process.platform !== "linux")("F5 establishes the durable receipt barrier before the first destructive operation", async () => {
     const h = await fixture(); await h.owner.close(); const dir = residentRoot(h.mesh.root, h.owner.identity.id);
     fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "host.lock"), "");
+    fs.writeFileSync(path.join(dir, "main-start.lock"), "");
     const before = snapshot(h.root); const fsync = fs.fsyncSync; let injected = false;
     vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
       if (fs.readlinkSync(`/proc/self/fd/${fd}`).includes("/prune.json.")) {
@@ -390,6 +543,7 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
   it.skipIf(process.platform !== "linux").each(["root", "registry", "residency", "malformed"])("F5 refuses %s prune receipt ambiguity without deleting anything", async fault => {
     const h = await fixture(); await h.owner.close(); const dir = residentRoot(h.mesh.root, h.owner.identity.id);
     fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "host.lock"), "");
+    fs.writeFileSync(path.join(dir, "main-start.lock"), "");
     const receipt = { format: 1, rootId: fault === "root" ? "session:foreign" : h.owner.identity.id, meshRoot: h.mesh.root,
       actors: [{ at: fault === "registry" ? path.join(h.root, "foreign-registry") : h.owner.actorRoots.project,
         id: h.project.id, residency: fault === "residency" ? "durable" : "session" }],
@@ -579,6 +733,7 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
       value: actorParticipantRecord(h.project, winner, winner, h.caller.identity.id, h.caller.identity.id) });
     const dir = residentRoot(h.mesh.root, h.owner.identity.id); fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, "host.lock"), "");
+    fs.writeFileSync(path.join(dir, "main-start.lock"), "");
     fs.writeFileSync(path.join(dir, "prune.json"), JSON.stringify({ format: 1, rootId: h.owner.identity.id, meshRoot: h.mesh.root,
       actors: [{ at, id: h.project.id, residency: "session" }],
       removed: { actors: fault === "revoked" ? [`${at}/${h.project.id}`] : [], files: [], stateKeys: [] } }));

@@ -93,6 +93,46 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("ActorManager prune revocation (#2184 F7)", () => {
+  it.each(["created", "resumed"] as const)("does not resurrect a missing same-root row from a %s actor at the locked merge", async mode => {
+    const h = setup(true, () => undefined, undefined, undefined, { actorPollMs: 60_000 });
+    const actor = await h.actors.create({ name: "revoked", instructions: "Old work." });
+    const control = await h.actors.create({ name: "preserved", instructions: "Keep." });
+    let manager = h.actors;
+    if (mode === "resumed") {
+      await manager.close();
+      manager = new ActorManager("test", h.identity, h.mesh, h.meshConfig, h.agents, () => {}, {
+        persistent: true, actorRoot: path.join(h.root, "actors"), rootId: h.identity.id,
+        claimResidency: "session", canManageActor: () => undefined });
+      actorManagers.push(manager);
+      await manager.setInstructions(actor.id, "Loaded before prune.");
+    }
+    const store = new ActorRegistryStore(path.join(h.root, "actors"));
+    const original = ActorRegistryStore.prototype.withLock;
+    let revoked = false;
+    vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function (this: ActorRegistryStore, operation) {
+      return original.call(this, () => {
+        if (!revoked) {
+          revoked = true;
+          this.write(this.records().filter(row => row.id !== actor.id));
+          fs.rmSync(path.join(h.root, "actors", actor.id), { recursive: true, force: true });
+        }
+        return operation();
+      }) as ReturnType<typeof original>;
+    });
+    await manager.setInstructions(actor.id, "Must not republish erased work.");
+    expect(revoked).toBe(true);
+    expect(store.records().map(row => row.id)).toEqual([control.id]);
+    expect(manager.list().map(row => row.id)).toEqual([control.id]);
+    expect(() => manager.owns(actor.id)).toThrow(/Unknown Fabric actor/);
+    expect(fs.existsSync(path.join(h.root, "actors", actor.id))).toBe(false);
+    // The newly-created-row path must still work, without treating its first save as removal.
+    const fresh = await manager.create({ name: "fresh", instructions: "New work." });
+    expect(store.records().map(row => row.id)).toEqual(expect.arrayContaining([control.id, fresh.id]));
+    vi.restoreAllMocks();
+  });
+});
+
 describe("ActorManager fleet model policy (#2490)", () => {
   it.each(["hook", "predecessor"] as const)("round 3 F4 rechecks the synchronous invocation fence after %s wait", async wait => {
     const { actors, root, mesh } = setup(true);

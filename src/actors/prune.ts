@@ -7,6 +7,7 @@ import { residentRoot } from "../residency/protocol.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { assertPruneOwnershipDead } from "../topology/prune-ownership.js";
 import { FileLockBusy, kernelFenceAvailable, lockFile } from "../residency/file-lock.js";
+import { nativeMainStartupLock } from "../residency/main-startup-fence.js";
 import { ActorRegistryStore } from "./registry-store.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -44,7 +45,14 @@ const residentFence = async <T>(mesh: MeshStore, root: string, dryRun: boolean,
   const unknown = (reason: string): never => { throw new Error(`Cannot prove lineage ${root} dead: ${reason}`); };
   const refuse = (): never => { throw new Error(`Cannot prune live lineage ${root}: resident owner/host lock is live`); };
   let fd: number | undefined;
+  let mainFd: number | undefined;
+  const mainLocked = nativeMainStartupLock(mesh.root, root);
   const checkOwner = () => {
+    if (mainFd !== undefined) {
+      const held = fs.fstatSync(mainFd);
+      const current = fs.lstatSync(mainLocked);
+      if (!current.isFile() || current.dev !== held.dev || current.ino !== held.ino) unknown("native Main startup fence changed");
+    }
     if (fd !== undefined) {
       const held = fs.fstatSync(fd);
       const current = fs.lstatSync(locked);
@@ -85,8 +93,22 @@ const residentFence = async <T>(mesh: MeshStore, root: string, dryRun: boolean,
     try { fd = await lockFile(locked, 0, true, !dryRun); }
     catch (error) { if (error instanceof FileLockBusy) refuse(); throw error; }
   }
-  try { checkOwner(); return await operation(checkOwner); }
-  finally { if (fd !== undefined) fs.closeSync(fd); }
+  try {
+    // Resident hosts keep host.lock for their lifetime. Native Main startup uses
+    // this second, short fence so it can resume beside its live resident host.
+    if (!dryRun || (exists(mainLocked) && process.platform === "linux")) {
+      if (!kernelFenceAvailable()) unknown("native Main kernel fence unavailable");
+      try { mainFd = await lockFile(mainLocked, 0, true, !dryRun); }
+      catch (error) {
+        if (error instanceof FileLockBusy) throw new Error(`Cannot prune live lineage ${root}: native Main startup is live`);
+        throw error;
+      }
+    }
+    checkOwner(); return await operation(checkOwner);
+  } finally {
+    if (mainFd !== undefined) fs.closeSync(mainFd);
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 };
 
 /** Rare explicit maintenance path, loaded only at agents.prune first use. */

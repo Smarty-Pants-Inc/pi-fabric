@@ -43,6 +43,8 @@ export interface AgentSessionSeed {
 }
 
 export interface AgentRunRequest {
+  /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
+  idempotencyKey?: string;
   /** Host-created shadow decision; never accepted from external argument normalization. */
   routeDecision?: ModelRouteDecision;
   /** Host-only resident startup probe: model/extension admission, no prompt or tools. */

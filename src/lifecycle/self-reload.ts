@@ -88,6 +88,18 @@ export const activeFabricRoot = (settingsPath: string): string | undefined => {
 
 export const releaseLabel = (root: string): string => path.basename(root);
 
+/** Pre-fix runtimes recorded only roots for Fabric, but canonical JS/TS files for resources. */
+const legacyFabricAttempt = (target: string, releasesDirectory?: string): boolean => {
+  const root = real(target);
+  const name = packageName(root);
+  if (name === PACKAGE_NAME) return true;
+  // A pruned release has no manifest. Recognize only direct, extensionless release roots
+  // beside the Fabric root the profile currently activates, never files or nested entrypoints.
+  if (name || !releasesDirectory || path.dirname(root) !== releasesDirectory || path.extname(root)) return false;
+  try { return fs.statSync(root).isDirectory(); }
+  catch { return !fs.existsSync(root); }
+};
+
 /**
  * Watches the profile settings.json for a different active Fabric release. A turn end costs one
  * stat; the file is read only when its mtime moves. Only a runtime loaded from the release the
@@ -574,7 +586,17 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       // including failed reloads; an unrelated Fabric takeover must not reset them.
       if (done && !done.resource && loaded === done.target) {
         const tried = attempts.get(sessionId);
-        for (const target of fabricAttempts.get(sessionId) ?? []) tried?.delete(target);
+        const fabricTried = fabricAttempts.get(sessionId) ?? new Set<string>();
+        // Native reload keeps process-global memory from pre-fix bundles, which never wrote
+        // FABRIC_ATTEMPTS. Migrate their identifiable roots at the first confirmed takeover;
+        // everything else remains a resource guard in the compatible shared set.
+        const parent = path.dirname(loaded);
+        const releasesDirectory = path.basename(parent) === "releases" && activeFabricRoot(settingsPath) === loaded
+          ? parent : undefined;
+        for (const target of tried ?? []) {
+          if (!fabricTried.has(target) && legacyFabricAttempt(target, releasesDirectory)) fabricTried.add(target);
+        }
+        for (const target of fabricTried) tried?.delete(target);
         if (tried?.size === 0) attempts.delete(sessionId);
         fabricAttempts.delete(sessionId);
       }

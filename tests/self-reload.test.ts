@@ -484,6 +484,58 @@ describe("restore to an older release (smarty-dev#3324)", () => {
     return { a, b, context, current };
   };
 
+  const legacyState = (session: string, targets: string[], handoff: { old: string; target: string; owner?: string; resource?: string }) => {
+    const globals = globalThis as Record<symbol, unknown>;
+    const attempts = globals[Symbol.for("pi-fabric.self-reload.attempts")] as Map<string, Set<string>>;
+    attempts.set(session, new Set(targets));
+    (globals[Symbol.for("pi-fabric.self-reload.fabric-attempts")] as Map<string, Set<string>>).delete(session);
+    ((globals[Symbol.for("pi-fabric.self-reload")] ??= new Map()) as Map<string, unknown>).set(session, handoff);
+    return attempts;
+  };
+
+  it("classifies inherited package roots and pruned release roots, never resource entrypoints", () => {
+    const a = release("dd65"), b = release("ab85"), unrelated = release("code", "smarty-code");
+    const alias = path.join(dir, "fabric-alias"); fs.symlinkSync(a, alias, "junction");
+    const pruned = path.join(dir, "releases", "c00cccc");
+    const nested = path.join(pruned, "dist", "index.js");
+    const resource = path.join(dir, "releases", "failed.js");
+    const missingResource = path.join(dir, "releases", "failed.ts");
+    fs.writeFileSync(resource, "export default () => {};\n");
+    activate(b);
+    const current = runtime(b), session = "s-legacy-roots";
+    const attempts = legacyState(session, [a, alias, b, pruned, unrelated, nested, resource, missingResource], { old: a, target: b });
+    const context = fakeContext(session, { idle: true, pending: false });
+    expect(current.controller.sessionStart("reload", context as never)).toEqual({ old: "dd65", new: "ab85" });
+    expect(attempts.get(session)).toEqual(new Set([unrelated, nested, resource, missingResource]));
+    current.emit("session_shutdown", context);
+  });
+
+  it.each(["startup", "wrong-root", "resource"])("does not migrate legacy guards without confirmed Fabric takeover (%s)", mode => {
+    const a = release("dd65"), b = release("ab85");
+    activate(b);
+    const current = runtime(b), session = `s-legacy-unconfirmed-${mode}`;
+    const resource = path.join(a, "dist", "index.js");
+    const targets = [a, b, resource];
+    const attempts = legacyState(session, targets, { old: a, target: mode === "wrong-root" ? a : b,
+      ...(mode === "resource" ? { resource, owner: "test-resource" } : {}) });
+    const context = fakeContext(session, { idle: true, pending: false });
+    current.controller.sessionStart(mode === "startup" ? "startup" : "reload", context as never);
+    expect(attempts.get(session)).toEqual(new Set(targets));
+    current.emit("session_shutdown", context);
+  });
+
+  it("does not infer pruned release roots from a directory outside the active profile", () => {
+    const a = release("dd65"), b = release("ab85");
+    const pruned = path.join(dir, "releases", "c00cccc");
+    activate(a);
+    const current = runtime(b), session = "s-legacy-outside";
+    const attempts = legacyState(session, [a, b, pruned], { old: a, target: b });
+    const context = fakeContext(session, { idle: true, pending: false });
+    current.controller.sessionStart("reload", context as never);
+    expect(attempts.get(session)).toEqual(new Set([pruned]));
+    current.emit("session_shutdown", context);
+  });
+
   it("a runtime on the activated release self-reloads back onto the restored older one once idle", async () => {
     const { a, b, context, current } = await history("s-restore-auto");
     activate(a); // --restore

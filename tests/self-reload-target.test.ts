@@ -403,6 +403,55 @@ describe("reload-target v1 adversarial admission", () => {
     expect(s.sent).toHaveLength(2);
     expect(s.context.reload).toHaveBeenCalledTimes(2);
   });
+  it.each(["auto", "command"])("migrates pre-fix Fabric attempts on takeover so restore follows (%s), not failed resources", async mode => {
+    vi.useFakeTimers();
+    const s = setup();
+    const session = s.context.sessionManager.getSessionId();
+    const fabricNext = entry("fabric-next", "pi-fabric");
+    const attemptsKey = Symbol.for("pi-fabric.self-reload.attempts");
+    const fabricKey = Symbol.for("pi-fabric.self-reload.fabric-attempts");
+    const handoffKey = Symbol.for("pi-fabric.self-reload");
+    const globals = globalThis as Record<symbol, unknown>;
+    const attempts = globals[attemptsKey] as Map<string, Set<string>>;
+    const fabricAttempts = globals[fabricKey] as Map<string, Set<string>>;
+    const handoffs = globals[handoffKey] as Map<string, unknown>;
+    const oldRoot = path.dirname(s.fabric), nextRoot = path.dirname(fabricNext);
+    // This is the exact pre-fix shape: Fabric and failed resource targets share one set;
+    // no entry exists in the new Fabric-only subset, and the old runtime admitted the handoff.
+    attempts.set(session, new Set([oldRoot, nextRoot, s.next, s.fabric]));
+    fabricAttempts.delete(session);
+    handoffs.set(session, { old: oldRoot, target: nextRoot });
+    const profile = (fabric: string, resource: string) => {
+      const previous = fs.statSync(s.settingsPath).mtimeMs;
+      fs.writeFileSync(s.settingsPath, JSON.stringify({ packages: [fabric], extensions: [resource] }));
+      fs.utimesSync(s.settingsPath, new Date(previous + 1000), new Date(previous + 1000));
+    };
+    s.emit("session_shutdown"); profile(nextRoot, s.loaded);
+    const fresh = installSelfReload(s.pi as never, { ...s.deps, moduleUrl: pathToFileURL(fabricNext).href });
+    expect(fresh.sessionStart("reload", s.context as never)).toEqual({ old: "fabric", new: "fabric-next" });
+    expect(attempts.get(session)).toEqual(new Set([s.next, s.fabric]));
+    await s.bind(); profile(nextRoot, s.next);
+    expect(await s.request(s.next)).toMatchObject({ accepted: false, reason: "already-attempted", target: s.next });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(s.sent).toHaveLength(0); expect(s.context.reload).not.toHaveBeenCalled();
+
+    // Restoring the old release now follows automatically, or via the explicit command.
+    profile(oldRoot, s.loaded);
+    if (mode === "auto") {
+      s.emit("agent_settled");
+      expect(s.sent).toEqual([`/${SELF_RELOAD_COMMAND} auto`]);
+      await s.execute();
+    } else await s.execute(`/${SELF_RELOAD_COMMAND}`);
+    expect(s.context.reload).toHaveBeenCalledTimes(1);
+    s.emit("session_shutdown");
+    const restored = installSelfReload(s.pi as never, s.deps);
+    expect(restored.sessionStart("reload", s.context as never)).toEqual({ old: "fabric-next", new: "fabric" });
+    await s.bind(); profile(oldRoot, s.next);
+    expect(await s.request(s.next)).toMatchObject({ accepted: false, reason: "already-attempted", target: s.next });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(s.sent).toHaveLength(mode === "auto" ? 1 : 0);
+    expect(s.context.reload).toHaveBeenCalledTimes(1);
+  });
   it("profile exclusions and empty package manifests are never treated as selected resources", async () => {
     const s = setup(); s.activate(s.loaded, [`-${s.loaded}`]);
     expect(await s.request()).toMatchObject({ accepted: false, reason: "outside-profile" });

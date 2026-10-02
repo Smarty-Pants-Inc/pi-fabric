@@ -275,6 +275,8 @@ export interface FabricMeshConfig {
   maxEventBytes: number;
   maxReadEvents: number;
   actorPollMs: number;
+  /** Admission window for commands routed over a mesh bridge, minimum 30 s. */
+  bridgeControlTimeoutMs: number;
   actorQueueLimit: number;
   eventContextChars: number;
   actorContextEntries: number;
@@ -517,6 +519,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     maxEventBytes: 256 * 1024,
     maxReadEvents: 500,
     actorPollMs: 250,
+    bridgeControlTimeoutMs: 30_000,
     actorQueueLimit: 32,
     eventContextChars: 40_000,
     actorContextEntries: 14,
@@ -1194,6 +1197,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.mesh.actorPollMs,
         50,
         10_000,
+      ),
+      bridgeControlTimeoutMs: boundedInteger(
+        mesh.bridgeControlTimeoutMs,
+        DEFAULT_FABRIC_CONFIG.mesh.bridgeControlTimeoutMs,
+        30_000,
+        300_000,
       ),
       actorQueueLimit: boundedInteger(
         mesh.actorQueueLimit,

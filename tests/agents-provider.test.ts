@@ -875,9 +875,16 @@ describe("Main remote ASK observation ownership", () => {
         // v1 bridges bind ACK targets to Main roots, not actor ids. The command
         // still reaches the real owner; prove stop via authoritative activation
         // state, then bound the unsupported actor ACK observation separately.
-        await senderControl.request(ownerId, actor.id, "stop", {}, ownerId, { timeoutMs: 500, routedRemoteHost: "remote-machine" }).catch(error => {
-          expect(error.message).toContain("the outcome is unknown");
-        });
+        // A bridged deadline cannot be shortened below 30 s. Bound this deliberately
+        // unsupported actor ACK with explicit observation cancellation, not a short deadline.
+        const stopController = new AbortController();
+        const stopping = senderControl.request(ownerId, actor.id, "stop", {}, ownerId,
+          { timeoutMs: 500, routedRemoteHost: "remote-machine", signal: stopController.signal }).catch(error => {
+            expect(error.message).toContain("cancelled");
+          });
+        await waitFor(() => !owner.actors.status(actor.id).inFlightRun);
+        stopController.abort();
+        await stopping;
       } else await sender.provider.stopParticipant(actor.id);
       stopObservation.abort(new Error("stop observation finished"));
       await again;

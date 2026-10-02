@@ -2604,6 +2604,10 @@ export class AgentManager {
         if (!alive) {
           firstObservedDeadAt ??= livenessCheckedAt;
           if (livenessCheckedAt - firstObservedDeadAt >= TRANSPORT_EXIT_GRACE_MS) {
+            // Worker close can precede the Windows tree-helper outcome. As
+            // with a terminal file, join a requested stop before settlement
+            // may release native admission or make this run collectible.
+            if (managed.stopRequested && managed.transport.kind === "process") await managed.transport.stop();
             const lost = managed.transport.lostContact?.();
             if (lost) {
               // Not an exit: never relaunched, retried or cleaned up automatically.

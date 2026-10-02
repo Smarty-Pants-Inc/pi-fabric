@@ -24,6 +24,92 @@ afterEach(() => {
 // No real workers or descendants: taskkill and the captured worker are native-event mocks.
 // The unconfirmed native descendant intentionally has no Fabric status/identity file.
 describe("Windows tree-stop owner custody (#360 security R1)", () => {
+  it.each(["confirmed", "timeout"] as const)("joins a pending tree stop before dead-worker settlement when polling overtakes the helper (%s)", async outcome => {
+    vi.useFakeTimers();
+    vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-tree-pending-"));
+    const worker = Object.assign(new EventEmitter(), { pid: 2147483647, unref: vi.fn(), kill: vi.fn() });
+    const killer = Object.assign(new EventEmitter(), { pid: 2147483646, kill: vi.fn() });
+    let exited = false;
+    vi.mocked(spawn).mockReturnValueOnce(worker as unknown as ChildProcess).mockReturnValueOnce(killer as unknown as ChildProcess);
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      if (exited) throw Object.assign(new Error("worker absent"), { code: "ESRCH" });
+      return true;
+    });
+    const manager = new AgentManager(process.cwd(), {
+      ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 60_000, maxConcurrent: 1, retainRuns: false, budgetUsd: 0,
+    }, { runRoot: root, workerPath: path.join(root, "mock-worker.mjs") });
+    // Hold only the helper's timeout continuation. Its timer becomes overdue,
+    // but the earlier monitor poll gets to run before that callback is serviced.
+    const schedule = globalThis.setTimeout;
+    let helperTimeout: (() => void) | undefined;
+    let helperOverdue = false;
+    let timerSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let stopping: Promise<unknown> | undefined;
+    let waiting: Promise<unknown> | undefined;
+    let closing: Promise<void> | undefined;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      const handle = await manager.spawn({ task: "work already produced", transport: "process" });
+      const run = manager.runDirectory(handle.id)!;
+      const record: AgentRunRecord = {
+        id: handle.id, name: handle.name, task: "work already produced", status: "running", runner: "pi",
+        transport: "process", sessionId: String(worker.pid), cwd: process.cwd(), startedAt: Date.now(), updatedAt: Date.now(),
+        turns: 1, toolCalls: 1, text: "progress", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      };
+      fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(record));
+      await vi.advanceTimersByTimeAsync(100); // monitor observes real progress
+      timerSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) => {
+        if (delay === 1_000 && !helperTimeout) {
+          helperTimeout = () => callback(...args);
+          return schedule(() => { helperOverdue = true; }, delay);
+        }
+        return schedule(callback, delay, ...args);
+      });
+      stopping = manager.stop(handle.id);
+      exited = true; worker.emit("exit", 0); worker.emit("close", 0);
+      let reported = false;
+      waiting = manager.wait(handle.id).then(() => { reported = true; });
+      await vi.advanceTimersByTimeAsync(1_350);
+      expect(helperOverdue).toBe(true);
+      expect(reported, "dead-worker reporting must join the outstanding tree stop").toBe(false);
+      expect(hasUnresolvedWorker(run), "uncertainty callback has not run yet").toBe(false);
+      expect(manager.retentionReferences().has(handle.id)).toBe(true);
+      expect(canRemoveTerminalRun(run)).toBe(false);
+      await expect(manager.checkpointForRelease()).rejects.toThrow(/unresolved/);
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/running/);
+      const next = await manager.spawn({ task: "capacity probe", transport: "process" });
+      expect(next.status, "pending tree join retains its one native admission permit").toBe("queued");
+      let closed = false;
+      closing = manager.close().then(() => { closed = true; });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(closed, "close must not skip a run whose tree stop is pending").toBe(false);
+      expect(fs.existsSync(run)).toBe(true);
+      if (outcome === "confirmed") killer.emit("close", 0);
+      else { helperTimeout!(); killer.emit("close", 0); }
+      helperTimeout = undefined; // A confirmed/failed helper no longer has a pending callback.
+      await vi.advanceTimersByTimeAsync(10_000);
+      await Promise.all([stopping, waiting, closing]);
+      expect(reported).toBe(true); expect(closed).toBe(true);
+      expect(spawn, "pending join cannot launch a replacement").toHaveBeenCalledTimes(2);
+      if (outcome === "timeout") {
+        expect(hasUnresolvedWorker(run)).toBe(true);
+        expect(manager.retentionReferences().has(handle.id)).toBe(true);
+        expect(canRemoveTerminalRun(run)).toBe(false);
+        await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
+        expect(fs.existsSync(run)).toBe(true);
+      } else expect(fs.existsSync(run)).toBe(false);
+    } finally {
+      timerSpy?.mockRestore();
+      helperTimeout?.(); killer.emit("close", 0); worker.emit("exit", 0); worker.emit("close", 0);
+      Object.defineProperty(process, "platform", platform);
+      await vi.advanceTimersByTimeAsync(20_000);
+      await Promise.allSettled([stopping, waiting, closing]);
+      await manager.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(["error", "terminal-before-error", "resume-error", "nonzero", "timeout", "spawn-throw", "confirmed"] as const)(
     "fences all owner-release paths until tree exit is confirmed (%s)", async outcome => {
       vi.useFakeTimers();

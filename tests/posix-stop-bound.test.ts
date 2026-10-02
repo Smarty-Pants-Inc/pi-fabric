@@ -3,6 +3,8 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { launchLog, same, stopOwned, type Owned } from "./helpers/owned-processes.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { spawnDetached } from "../src/agents/transports/process-utils.js";
@@ -38,13 +40,13 @@ describe.skipIf(process.platform === "win32")("POSIX stop deadline (#360 Astra R
     try {
       expect(kill).toHaveBeenCalledWith(-child.pid, "SIGTERM");
       if (mode === "exit-without-close") child.emit("exit", 0);
-      await vi.advanceTimersByTimeAsync(4_999);
+      await vi.advanceTimersByTimeAsync(5_999);
       expect(kill).not.toHaveBeenCalledWith(-child.pid, "SIGKILL");
       await vi.advanceTimersByTimeAsync(1);
       if (mode === "alive") expect(kill).toHaveBeenCalledWith(-child.pid, "SIGKILL");
       else expect(kill).not.toHaveBeenCalledWith(-child.pid, "SIGKILL");
       vi.setSystemTime(new Date(0)); // Deadline is a native timer, not adjustable wall time.
-      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(1_000);
       expect(stopped, "native-close join has a finite deadline").toBe(true);
       expect(handle.lostContact()).toMatch(/unconfirmed|did not confirm/);
       expect(unconfirmed).toHaveBeenCalledOnce();
@@ -99,6 +101,83 @@ describe.skipIf(process.platform === "win32")("POSIX stop deadline (#360 Astra R
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it.each(["stop", "deadline", "close"] as const)("lets the real worker join its separate TERM-ignoring native group before %s completes", async action => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-stop-order-"));
+    const nativePath = path.join(root, "native.mjs");
+    const workerPath = path.join(root, "worker.mjs");
+    // Execute the production worker, but delay its TERM delivery to reproduce
+    // ordinary scheduling latency before its own five-second child grace starts.
+    fs.writeFileSync(workerPath, `const once = process.once;
+process.once = function(event, listener) {
+  return once.call(this, event, event === "SIGTERM" ? (...args) => setTimeout(() => listener(...args), 200) : listener);
+};
+await import(${JSON.stringify(pathToFileURL(path.resolve("dist/worker.js")).href)});`);
+    fs.writeFileSync(nativePath, String.raw`import fs from "node:fs";
+process.on("SIGTERM", () => fs.writeFileSync("native-term", "ignored"));
+process.stdin.resume();
+setInterval(() => {}, 1000);
+process.stdout.write(JSON.stringify({type:"agent_start"}) + "\n");
+process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",content:"native progress"}}) + "\n");
+fs.writeFileSync("native-ready", String(process.pid));`);
+    const launches = launchLog(root);
+    // This log is exclusive to this fixture. Use the child's own launch
+    // receipt rather than a wall-clock start window (which can drift under load).
+    const nativeLaunch = (): Owned | undefined => fs.existsSync(launches.file)
+      ? fs.readFileSync(launches.file, "utf8").trim().split("\n").map(line => JSON.parse(line) as Owned)
+        .find(entry => entry.argv[0] === nativePath)
+      : undefined;
+    for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
+    const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    let child: ChildProcess | undefined;
+    let closed: Promise<void> | undefined;
+    vi.mocked(spawn).mockImplementation((...args: Parameters<typeof spawn>) => {
+      child = actual.spawn(...args);
+      closed = new Promise(resolve => child!.once("close", () => resolve()));
+      return child;
+    });
+    const manager = new AgentManager(root, {
+      ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: action === "deadline" ? 10_000 : 60_000,
+      maxConcurrent: 1, retainRuns: false, budgetUsd: 0, sessionExport: false,
+    }, { runRoot: path.join(root, "runs"), workerPath, piBinary: nativePath });
+    let native: Owned | undefined;
+    try {
+      const handle = await manager.spawn({ task: "native progress", transport: "process", extensions: false });
+      const run = manager.runDirectory(handle.id)!;
+      await vi.waitFor(() => expect(fs.existsSync(path.join(root, "native-ready"))).toBe(true), { timeout: 10_000 });
+      const nativePid = Number(fs.readFileSync(path.join(root, "native-ready"), "utf8"));
+      native = nativeLaunch();
+      expect(native, "native records its owned launch identity").toBeDefined();
+      expect(native!.pid).toBe(nativePid);
+      expect(same(native!), "native launch identity is still live before stop").toBe(true);
+      expect(nativePid).not.toBe(child!.pid);
+      // The live child leads a detached group distinct from the worker's.
+      expect(process.kill(-nativePid, 0)).toBe(true);
+      const started = performance.now();
+      if (action === "stop") expect((await manager.stop(handle.id)).status).toBe("stopped");
+      else if (action === "deadline") expect((await manager.wait(handle.id)).status).toBe("timed_out");
+      else await manager.close();
+      expect(performance.now() - started).toBeLessThan(action === "deadline" ? 25_000 : 10_000);
+      await closed;
+      expect(fs.existsSync(path.join(root, "native-term")), "native ignored TERM before KILL escalation").toBe(true);
+      expect(same(native!), "native child must exit, not merely its worker").toBe(false);
+      expect(child!.signalCode, "worker must finish the child-close sequence cooperatively").toBeNull();
+      expect(hasUnresolvedWorker(run)).toBe(false);
+      if (action !== "close") await expect(manager.checkpointForRelease()).resolves.toBeUndefined();
+      await manager.close();
+      expect(fs.existsSync(run)).toBe(false);
+    } finally {
+      // Revalidate native launch identity before cleanup; reap it while its
+      // owning worker is alive, then join the exact captured worker instance.
+      native ??= nativeLaunch();
+      if (native) await stopOwned(native, 0, 5_000);
+      if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await closed;
+      await manager.close();
+      if (native) expect(same(native), "fixture must leave no native child running").toBe(false);
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    }
+  }, 40_000);
 
   it.each(["stop", "deadline", "close"] as const)("escalates a real TERM-ignoring worker and completes %s", async action => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-term-ignore-"));

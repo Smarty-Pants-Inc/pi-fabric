@@ -303,16 +303,17 @@ export const spawnDetached = async (
                 else {
                   try { process.kill(-pid, "SIGTERM"); }
                   catch { /* still require captured native close */ }
-                  // Match the worker's native-child kill grace; allow it to finish
-                  // teardown before escalating the captured, still-live worker.
+                  // The worker gives its separately grouped native child 5000ms.
+                  // Leave another second for TERM delivery, child KILL/close,
+                  // and worker exit before escalating the still-live worker.
                   force = setTimeout(() => {
                     if (exited) return; // Never signal an exited/reused numeric identity.
                     // Native Pi can own a separate group. Forced worker exit
                     // cannot prove that its graceful descendant teardown ran.
-                    unconfirmed("POSIX worker tree termination is unconfirmed after 5000ms grace");
+                    unconfirmed("POSIX worker tree termination is unconfirmed after 6000ms grace");
                     try { process.kill(-pid, "SIGKILL"); }
                     catch { /* deadline records an unconfirmed exit */ }
-                  }, 5_000);
+                  }, 6_000);
                 }
               }
               // Exit/probe absence alone is not native close. However, a stuck

@@ -4,6 +4,8 @@ import type { ResidentReleaseIntent, ResidentLauncherIdentity } from "./handover
 import { recordResidentOutcome, registerCancellationEffect } from "../async-settlement.js";
 import { readFileRetrying } from "../core/atomic-write.js";
 import fs from "node:fs";
+import { writeJsonAtomic } from "../core/atomic-write.js";
+import { assertResidentRequestNotExpired, newResidentRequestId, residentRequestGeneration, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import path from "node:path";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricModelAliases, FabricModelCandidate } from "../core/model-resolution.js";
@@ -39,6 +41,8 @@ export const sleepUnlessAborted = (ms: number, signal?: AbortSignal): Promise<vo
 export interface ResidentRequestDecision {
   requestId: string;
   state: "abandoned" | "committed";
+  /** Only format-3 requests are eligible for generation collection. */
+  requestFormat?: 3;
   /** Allocated before the first mutation, even if publication is still pending. */
   id?: string;
   operation?: ResidentCommand["operation"];
@@ -102,10 +106,17 @@ export const commitResidentRequest = (
   id: string,
   ownerHostId: string,
 ): void => {
+  assertResidentRequestNotExpired(residencyRoot, command.requestId, command.format);
   if (decideResidentRequest(residencyRoot, {
     requestId: command.requestId, state: "committed", operation: command.operation, id, ownerHostId,
+    ...(command.format === RESIDENT_EXPIRING_COMMAND_FORMAT ? { requestFormat: RESIDENT_EXPIRING_COMMAND_FORMAT } : {}),
     ...(("caller" in command && command.caller?.principal) ? { principal: command.caller.principal } : {}),
-  })) return;
+  })) {
+    // A collector may advance expiry between the precheck and hard-link CAS.
+    // Once it deletes a fence the watermark is already durable: recheck before mutation.
+    assertResidentRequestNotExpired(residencyRoot, command.requestId, command.format);
+    return;
+  }
   const decision = readResidentRequestDecision(residencyRoot, command.requestId);
   throw new Error(decision?.state === "abandoned"
     ? `Fabric residency request ${command.requestId} was abandoned before commit`
@@ -121,11 +132,20 @@ export const abandonResidentRequest = (
   requestsPath: string,
   responsesPath: string,
   requestId: string,
+  requestFormat?: number,
 ): ResidentRequestDecision => {
   const root = path.dirname(requestsPath);
-  decideResidentRequest(root, { requestId, state: "abandoned" });
+  assertResidentRequestNotExpired(root, requestId);
+  decideResidentRequest(root, { requestId, state: "abandoned",
+    ...(requestFormat === RESIDENT_EXPIRING_COMMAND_FORMAT ? { requestFormat: RESIDENT_EXPIRING_COMMAND_FORMAT } : {}),
+  });
+  // Collection can durably expire this generation and remove a committed fence
+  // between our precheck and CAS. A replacement abandonment is not proof that
+  // the original work never committed: fail before acknowledgement or unlink.
+  assertResidentRequestNotExpired(root, requestId);
   const decision = readResidentRequestDecision(root, requestId)!;
   if (decision.state === "abandoned") {
+    acknowledgeResidentResponse(root, { format: 1, requestId, ok: false, completedAt: Date.now() }, Date.now(), requestFormat);
     for (const directory of [requestsPath, responsesPath]) {
       try {
         fs.rmSync(path.join(directory, `${requestId}.json`), { force: true });
@@ -171,6 +191,25 @@ export class ResidentOutcomeUnknownError extends Error {
   }
 }
 
+/** Expiry forbids replay but never proves rejection. Read retained live fences
+ * even below the watermark; collection eligibility and outcome are independent.
+ * A collected (or unreadable) fence preserves expiry without inventing an ID. */
+export const residentRequestExpiredOutcome = (
+  residencyRoot: string, command: ResidentCommand, signal?: AbortSignal,
+): ResidentRequestExpiredError => {
+  let decision: ResidentRequestDecision | undefined;
+  try { decision = readResidentRequestDecision(residencyRoot, command.requestId); } catch { /* unknown fence */ }
+  const committed = decision?.state === "committed" ? decision : undefined;
+  const operation = committed?.operation ?? command.operation;
+  return new ResidentRequestExpiredError(command.requestId, {
+    requestId: command.requestId, state: committed ? "committed" : "expired", expired: true,
+    operation,
+    entityKind: ["spawn", "foreground", "cleanup"].includes(operation) ? "agent" : "actor",
+    ...(committed?.id ? { id: committed.id } : {}),
+    ...(committed?.ownerHostId ? { ownerHostId: committed.ownerHostId } : {}),
+  }, signal);
+};
+
 /** Install before request publication; outer abort races can now settle the same fence. */
 export const registerResidentCancellation = (
   signal: AbortSignal | undefined,
@@ -179,13 +218,14 @@ export const registerResidentCancellation = (
 ): void => {
   // A committed receipt is immutable. Reuse its first error instead of nesting
   // already-formatted uncertainty again at each enclosing cancellation gate.
-  let committedOutcome: ResidentOutcomeUnknownError | undefined;
+  let committedOutcome: ResidentOutcomeUnknownError | ResidentRequestExpiredError | undefined;
   registerCancellationEffect(signal, (reason) => {
     if (committedOutcome) return committedOutcome;
     let decision: ResidentRequestDecision | undefined;
     try {
-      decision = abandonResidentRequest(path.join(residencyRoot, "requests"), path.join(residencyRoot, "responses"), command.requestId);
+      decision = abandonResidentRequest(path.join(residencyRoot, "requests"), path.join(residencyRoot, "responses"), command.requestId, command.format);
     } catch (error) {
+      if (error instanceof ResidentRequestExpiredError) return committedOutcome = residentRequestExpiredOutcome(residencyRoot, command, signal);
       try { decision = readResidentRequestDecision(residencyRoot, command.requestId); } catch { /* unreadable fence */ }
       return new ResidentOutcomeUnknownError(command, decision, error, signal);
     }
@@ -238,6 +278,14 @@ export const residentHostStateNote = (residencyRoot: string, now = Date.now()): 
         `${typeof command.id === "string" ? ` of ${command.id}` : ""} for ${formatAge(age)}; this request waits behind it`);
     }
   } catch { /* nothing in process */ }
+  try {
+    const health = JSON.parse(fs.readFileSync(path.join(residencyRoot, "request-retention.json"), "utf8")) as {
+      entries?: number; bytes?: number; unknown?: number; legacy?: number; error?: string;
+    };
+    if (typeof health.entries === "number" && typeof health.bytes === "number") {
+      notes.push(`residency retention: ${health.entries} entries, ${health.bytes} bytes, unknown=${health.unknown ?? 0}, legacy=${health.legacy ?? 0}${health.error ? `; ${health.error}` : ""}`);
+    }
+  } catch { /* no completed capacity sample yet */ }
   return notes.join("; ");
 };
 
@@ -322,6 +370,8 @@ export interface ResidentHostOwner {
   commands?: readonly string[];
   /** New clients must not dispatch mutations to an already-running pre-fence host. */
   requestFence?: 1;
+  /** Generation format 3 with durable expiry; absent on older fenced hosts. */
+  requestExpiry?: 1;
   /** Operation-scoped retry keys implemented by this loaded host, not desired config. */
   creationIdempotency?: 1;
   /** Attestation from the loaded host, never desired config.json. */
@@ -438,7 +488,7 @@ interface ResidentActorStatusCommand {
   createdAt: number;
 }
 
-export type ResidentCommand =
+type LegacyResidentCommand =
   | ResidentSpawnCommand
   | ResidentCleanupCommand
   | ResidentForegroundCommand
@@ -448,6 +498,15 @@ export type ResidentCommand =
   | ResidentActorStatusCommand
   | (ResidentReleaseIntent & { format: typeof RESIDENT_ACTOR_COMMAND_FORMAT; operation: "releaseChange";
       requestId: string; rootId: string; createdAt: number });
+
+type ExpiringResidentCommand<T> = T extends unknown ? Omit<T, "format"> & { format: typeof RESIDENT_EXPIRING_COMMAND_FORMAT } : never;
+export type ResidentCommand = LegacyResidentCommand | ExpiringResidentCommand<LegacyResidentCommand>;
+
+/** Preserve older host compatibility without collecting its legacy requests. */
+export const residentCommandForOwner = (command: ResidentCommand, owner: ResidentHostOwner): ResidentCommand =>
+  owner.requestExpiry === 1 && command.format !== RESIDENT_EXPIRING_COMMAND_FORMAT
+    ? { ...command, format: RESIDENT_EXPIRING_COMMAND_FORMAT, requestId: newResidentRequestId() }
+    : command;
 
 // The only operations every format-1 host predating command negotiation understood.
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
@@ -503,11 +562,33 @@ export interface ResidentCommandResponse {
   pending?: string;
   cleaned?: boolean;
   error?: string;
-  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "FABRIC_MODEL_DENIED";
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED";
   /** Allowlisted policy-refusal payload, never arbitrary host Error properties. */
   modelDenied?: { model: string; replacement?: string };
   completedAt: number;
 }
+
+export interface ResidentResponseAcknowledgement {
+  format: 1;
+  requestFormat: 3;
+  requestId: string;
+  completedAt: number;
+  acknowledgedAt: number;
+  pending?: string;
+}
+
+/** Persist consumption BEFORE unlinking a response; absence alone proves nothing. */
+export const acknowledgeResidentResponse = (root: string, response: ResidentCommandResponse, now = Date.now(), requestFormat?: number): boolean => {
+  if (requestFormat !== RESIDENT_EXPIRING_COMMAND_FORMAT || residentRequestGeneration(response.requestId) === undefined || response.errorCode === "RESIDENT_REQUEST_EXPIRED") return true;
+  try {
+    const acknowledgement: ResidentResponseAcknowledgement = {
+      format: 1, requestFormat: RESIDENT_EXPIRING_COMMAND_FORMAT, requestId: response.requestId, completedAt: response.completedAt, acknowledgedAt: now,
+      ...(response.pending ? { pending: response.pending } : {}),
+    };
+    writeJsonAtomic(path.join(root, "acknowledgements", `${response.requestId}.json`), acknowledgement);
+    return true;
+  } catch { return false; } // Success remains success; retain the unacknowledged exchange.
+};
 
 export interface ResidentAgentMetadata {
   format: typeof RESIDENT_HOST_FORMAT;

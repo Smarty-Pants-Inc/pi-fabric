@@ -144,6 +144,22 @@ describe("literal-only signal and recursive-delete guard", () => {
   ])("refuses ANSI-C decoded separators/letters in opaque receivers: %s", command => {
     expect(bashGuardRefusal(command, tmpdir)).toBe(OPAQUE_REASON);
   });
+  // Astra round-3 F1: $' and escaped NUL are literal inside double quotes, but the
+  // substitutions are live. Quote-blind decoding must not erase their protected evidence.
+  // Scanner-only DATA: none of these signal/delete strings are dispatched to a shell.
+  it.each(["\\000", "\\x00", "\\u0000", "\\U00000000", "\\c@"].flatMap(nul => [
+    `echo "$'x${nul} $(p\\kill worker)'"`,
+    `echo "$'x${nul} $(r\\m -rf /outside)'"`,
+    `echo "$'x${nul} \`p\\kill worker\`'"`,
+    `echo "$'x${nul} \`r\\m -rf /outside\`'"`,
+  ]))("refuses protected evidence after literal double-quoted NUL spelling: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBe(OPAQUE_REASON);
+  });
+  it.each(["\\000", "\\x00", "\\u0000", "\\U00000000", "\\c@"].map(nul =>
+    `echo "$'x${nul} y'"`,
+  ))("allows quoted literal NUL prose without protected evidence: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBeUndefined();
+  });
   // Astra round-2 F1: outer quotes must not hide nested ANSI-C decoding, and NUL ends the segment.
   // These signal/delete witnesses are scanner DATA only, never commands to execute.
   it.each([

@@ -226,8 +226,9 @@ const OPAQUE_RECEIVERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "mksh", "b
 
 /**
  * Rewrites every $'...' occurrence, including inside outer quotes and substitutions, so
- * `$'pkill\tworker'` scans as `pkill<TAB>worker`. Over-decoding literal text is conservative.
- * NUL truncates the segment as in Bash; `ok` is false for unmodelled escapes or missing closure.
+ * `$'pkill\tworker'` scans as `pkill<TAB>worker`. This quote-blind rewrite can discard live
+ * text when a literal $' occurs inside double quotes, so the caller also scans the original.
+ * NUL truncates the decoded segment; `ok` is false for unmodelled escapes or missing closure.
  */
 function decodeAnsiC(source: string): { text: string; ok: boolean } {
   let out = "", ok = true;
@@ -296,14 +297,17 @@ export function bashGuardRefusal(command: string, tmpdir: string | undefined): s
   const execution = /\$\(|`|[<>]\(|\$['"]|\\\r?\n|<</.test(command);
   const unprovedQuoting = words.some(word => /['"\\]/.test(word.text));
   if (execution || unprovedQuoting) {
-    // Decode ANSI-C $'...' first: Bash turns \t, \x20, \040, \u0020 ... into separators, so a
-    // stripped-backslash scan would join `pkill\tworker` into an unprotected token.
+    // Decoding exposes ANSI-C separators, but quote-blind NUL truncation can erase live text
+    // inside double quotes. Scan BOTH the original and decoded text: decoding may add refusals,
+    // never remove protected evidence from the original quote/backslash-removal scan.
     const ansi = decodeAnsiC(command);
     if (!ansi.ok && opaqueReceiver(words)) return OPAQUE_REASON;
-    // Scan the whole de-quoted text, including substitution bodies. This is lexical evidence,
-    // not execution/expansion interpretation; remove continuations so pki\\\nll stays visible.
-    const dequoted = protectedTokens(ansi.text.replace(/\$(['"])/g, "$1").replace(/\\\r?\n|['"\\]/g, ""), readOnlyFind);
-    if (dequoted.signal || dequoted.deletion) return OPAQUE_REASON;
+    // Whole-text lexical evidence includes substitution bodies, not execution interpretation.
+    // Remove continuations as a unit so fragmented protected names remain visible.
+    for (const source of [command, ansi.text]) {
+      const dequoted = protectedTokens(source.replace(/\$(['"])/g, "$1").replace(/\\\r?\n|['"\\]/g, ""), readOnlyFind);
+      if (dequoted.signal || dequoted.deletion) return OPAQUE_REASON;
+    }
   }
   // Ponytail: variable-assembled receivers ($a$b) remain an accepted limit of this mistake guard.
   // Opaque syntax alone is not a protected command or an unrelated-command DATA grant.

@@ -55,11 +55,16 @@ Evidence exposed only by the opaque quote/escape scan uses a separate reason:
 **“Opaque command refused: a protected signal/delete token is visible after
 removing quotes or escapes; use a supported literal command.”** It does not ask
 for a recorded PID when an opaque deletion spelling triggered the guard.
-Before that scan, every ANSI-C `$'...'` occurrence is decoded, including inside
-`$(...)`, backticks and outer double quotes (literal text may be conservatively
-over-decoded), using Bash escapes (`\t \n \v \f \r \a \b \e \E \\ \' \" \?`,
-`\xHH`, `\NNN`, `\uHHHH`, `\UHHHHHHHH`, `\cX`), with a decoded NUL truncating
-that segment and scanning continuing after its closing quote as in Bash.
+The opaque scan checks both the original text, with only quote/backslash removal
+and no ANSI-C decoding or truncation, and an ANSI-C decoded copy. Either scan's
+protected evidence refuses. The decoded copy rewrites every `$'...'` occurrence,
+including inside `$(...)`, backticks and outer double quotes, using Bash escapes
+(`\t \n \v \f \r \a \b \e \E \\ \' \" \?`, `\xHH`, `\NNN`, `\uHHHH`,
+`\UHHHHHHHH`, `\cX`), with a decoded NUL truncating that segment and scanning
+continuing after its closing quote. This quote-blind rewrite can discard live text:
+`$'` inside double quotes is literal, while a following substitution can still run.
+The original scan preserves that evidence. Decoding and truncation may add refusals;
+they cannot remove a refusal established by the original scan.
 An undecoded escape or an unterminated `$'` beside an opaque receiver (`bash`/`sh`,
 `eval`, `env`, `xargs`, `ssh` and similar wrappers) refuses with the opaque reason.
 Protected lexical basenames are detected by a **forward token scan**, not a
@@ -97,6 +102,10 @@ For the launcher side, see smarty-role's per-session TMPDIR in smarty-dev#3232.
   commands and literal DATA; field regressions for org-note appends, quoted Light
   variables, Python heredocs, printf/SSH pipes and assignment expansion. Protected
   fragments in scripts/substitutions still refuse with accurate opaque diagnostics.
+  Astra round-3 F1 covers literal `$'` in double quotes before live escaped signal/delete
+  substitutions and backticks, with octal, hex, Unicode and control NUL spellings.
+  Quoted NUL prose without protected tokens, nested ANSI-C and actual-NUL cases remain
+  covered as scanner-only DATA.
   Org and Light 07:09-07:10Z cases cover a bounded read-only find list, rg pipeline
   and list, Unicode text bodies, and unchanged destructive find refusals.
   Playful-org field repros from smarty-dev#3230 (blind supervisor on main

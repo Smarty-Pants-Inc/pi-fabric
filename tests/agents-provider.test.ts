@@ -3725,6 +3725,42 @@ describe("#2726 resident actor live read views", () => {
     return (action === "actors" ? (result as FabricActorReadInfo[]).find(row => row.id === state.actor.id) : result) as FabricActorReadInfo;
   };
 
+  it.each([
+    ["actorStatus", "preparing"], ["actorStatus", "waiting"],
+    ["actors", "preparing"], ["actors", "waiting"],
+  ] as const)("#3307 %s preserves %s diagnostics without resident RPC and clears old receipts", async (action, status) => {
+    const state = await passiveState();
+    const resident = vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue(undefined);
+    try {
+      const preparing = {
+        phase: status === "waiting" ? "waiting" : "binding", startedAt: Date.now() - 5_000,
+        ageS: 0, attempts: 2,
+        ...(status === "waiting" ? { runId: "admission-receipt", queuePosition: 0 } : {}),
+      };
+      const { actorRun: _run, ...owner } = state.live;
+      const live = { ...owner, status, actorPreparing: preparing };
+      state.setLive(live);
+      const view = await read(state, action);
+      expect(view).toMatchObject({ status, queued: 2, messages: 7,
+        preparing: { ...preparing, ageS: expect.any(Number) } });
+      expect(view.preparing!.ageS).toBeGreaterThanOrEqual(5);
+      expect(view.inFlightRun).toBeUndefined();
+
+      // A passive snapshot must not retain diagnostics absent from the fresh owner.
+      const oldView = { ...state.actor, status, preparing };
+      const actorStatus = vi.spyOn(state.passive, "status").mockReturnValue(oldView);
+      const actors = vi.spyOn(state.passive, "list").mockReturnValue([oldView]);
+      try {
+        for (const current of [{ ...owner, status: "idle" }, { ...live, stale: true }, undefined]) {
+          state.setLive(current);
+          const cleared = await read(state, action);
+          expect(cleared.status).toBe(current && !current.stale ? "idle" : "unknown");
+          expect(cleared.preparing).toBeUndefined();
+        }
+      } finally { actorStatus.mockRestore(); actors.mockRestore(); }
+    } finally { resident.mockRestore(); }
+  });
+
   it.each(["actorStatus", "actors"] as const)("%s reads fresh running owner counts, then clears the settled run on idle", async action => {
     const state = await passiveState();
     const definition = state.passive.definition(state.actor.id);

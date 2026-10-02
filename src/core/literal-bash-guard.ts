@@ -2,9 +2,10 @@ import { posix } from "node:path";
 
 export const SIGNAL_REASON = "Signal refused: use the PID you recorded (literal integer PIDs only).";
 export const DELETE_REASON = "Recursive delete refused: delete only inside your own TMPDIR using literal absolute paths.";
+export const OPAQUE_REASON = "Opaque command refused: a protected signal/delete token is visible after removing quotes or escapes; use a supported literal command.";
 
 type Word = { text: string; literal: boolean };
-type Split = { words: Word[]; simple: boolean };
+type Split = { words: Word[]; simple: boolean; list: string[] | undefined };
 const SIGNALS = new Set(["kill", "pkill", "killall", "killall5"]);
 // A head AND its flags need inert proof. Unknown options never confer DATA credit.
 const DATA_FLAGS: Record<string, readonly string[]> = {
@@ -30,7 +31,8 @@ function split(source: string): Split {
   const words: Word[] = [];
   const opaqueInput = source.includes("<<");
   let text = "", started = false, literal = true, simple = true;
-  let quote = "";
+  let quote = "", listStart = 0, listOnly = true;
+  const list: string[] = [];
   const end = (): void => {
     if (started) words.push({ text, literal });
     text = ""; started = false; literal = true;
@@ -54,8 +56,14 @@ function split(source: string): Split {
       continue;
     }
     if (c === " " || c === "\t") { end(); continue; }
-    // Do not guess command boundaries, heredoc syntax, redirects, or continuation semantics.
-    if ("\n\r;&|()<>".includes(c)) { end(); simple = false; continue; }
+    // Only plain semicolon lists are candidates for the fixed read-only find proof.
+    // Other shell grammar, heredocs, redirects and continuations get no list grant.
+    if ("\n\r;&|()<>".includes(c)) {
+      end(); simple = false;
+      if (c === ";") { list.push(source.slice(listStart, i)); listStart = i + 1; }
+      else listOnly = false;
+      continue;
+    }
     if (c === "#" && !started && !opaqueInput) {
       while (i + 1 < source.length && source[i + 1] !== "\n") i++;
       continue;
@@ -74,11 +82,12 @@ function split(source: string): Split {
   }
   if (quote) { simple = false; literal = false; }
   end();
-  return { words, simple };
+  list.push(source.slice(listStart));
+  return { words, simple, list: listOnly ? list : undefined };
 }
 
 /** One forward pass: each lexical token/basename is considered once, without path backtracking. */
-function protectedTokens(source: string): { signal: boolean; deletion: boolean } {
+function protectedTokens(source: string, readOnlyFind = false): { signal: boolean; deletion: boolean } {
   let signal = false, deletion = false, start = 0, slash = -1;
   for (let i = 0; i <= source.length; i++) {
     const c = source[i];
@@ -88,7 +97,7 @@ function protectedTokens(source: string): { signal: boolean; deletion: boolean }
       // The attached env -S spelling is lexical evidence, not an argv/receiver interpreter.
       const token = source.slice(Math.max(start, slash + 1), i).replace(/^-[A-Za-z]*S/, "");
       signal ||= SIGNALS.has(token);
-      deletion ||= DELETES.has(token);
+      deletion ||= DELETES.has(token) && !(readOnlyFind && token === "find");
     }
     start = i + 1; slash = -1;
   }
@@ -98,7 +107,7 @@ function protectedTokens(source: string): { signal: boolean; deletion: boolean }
 const FIND_VALUES = new Set(["-type", "-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-size", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-user", "-group", "-uid", "-gid", "-perm", "-links", "-inum", "-maxdepth", "-mindepth"]);
 const FIND_FLAGS = new Set(["-H", "-L", "-P", "-print", "-print0", "-empty", "-readable", "-writable", "-executable", "-true", "-false", "-depth", "-mount", "-xdev", "-prune", "-ls"]);
 
-function literalFileMaintenance(words: Word[]): boolean {
+function literalFileMaintenance(words: Word[], boundedPatterns = false): boolean {
   const args = words.slice(1).map(word => word.text);
   if (words[0]?.text === "rm") {
     let i = 0;
@@ -106,7 +115,11 @@ function literalFileMaintenance(words: Word[]): boolean {
     if (args[i] === "--") i++;
     return i < args.length && args.slice(i).every(arg => arg.length > 0 && !arg.startsWith("-") && !/[$`*?\[\]{}~\r\n]/.test(arg));
   }
-  if (words[0]?.text !== "find" || args.some(arg => /[$`*?\[\]{}~\r\n]/.test(arg))) return false;
+  if (words[0]?.text !== "find") return false;
+  const depth = args.indexOf("-maxdepth");
+  const patterns = boundedPatterns && depth >= 0 && /^[0-9]+$/.test(args[depth + 1] ?? "");
+  if (args.some((arg, i) => /[$`{}~\r\n]/.test(arg)
+    || (/[*?\[\]]/.test(arg) && !(patterns && ["-name", "-iname", "-path", "-ipath"].includes(args[i - 1] ?? ""))))) return false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     if (FIND_FLAGS.has(arg)) continue;
@@ -153,6 +166,21 @@ function literalData(words: Word[], simple: boolean): boolean {
   return head === "git" && words.length === 2 && ["log", "status", "diff"].includes(words[1]!.text);
 }
 
+/** A fixed literal maintenance list only discounts find, never other protected tokens. */
+function readOnlyFindList(list: string[] | undefined): boolean {
+  if (!list || list.length < 2) return false;
+  let hasFind = false;
+  for (const source of list) {
+    const { words, simple } = split(source);
+    if (!simple || words.length === 0 || words.some(word => !word.literal)) return false;
+    if (/^\s*find(?:\s|$)/.test(source)) {
+      if (!literalFileMaintenance(words, true)) return false;
+      hasFind = true;
+    } else if (!literalData(words, simple)) return false;
+  }
+  return hasFind;
+}
+
 function literalKill(words: Word[]): boolean {
   if (words[0]?.text !== "kill" || words.some(word => !word.literal)) return false;
   const args = words.slice(1).map(word => word.text);
@@ -186,28 +214,102 @@ function literalRm(words: Word[], tmpdir: string | undefined): boolean {
   return recursive && index < words.length && words.slice(index).every(word => ownPath(word.text, tmpdir));
 }
 
+const ANSI_SIMPLE: Record<string, string> = {
+  t: "\t", n: "\n", v: "\v", f: "\f", r: "\r", a: "\x07", b: "\b", e: "\x1b", E: "\x1b",
+  "\\": "\\", "'": "'", '"': '"', "?": "?",
+};
+const ANSI_RUNS: Record<string, RegExp> = { x: /^[0-9A-Fa-f]{1,2}/, u: /^[0-9A-Fa-f]{1,4}/, U: /^[0-9A-Fa-f]{1,8}/ };
+// Wrapper heads whose argv can become another command; an undecodable $'...' refuses there.
+const OPAQUE_RECEIVERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "mksh", "busybox", "eval", "exec", "env",
+  "xargs", "sudo", "doas", "su", "ssh", "nohup", "setsid", "timeout", "nice", "stdbuf", "command", "builtin",
+  "watch", "source", ".", "parallel", "script"]);
+
+/**
+ * Rewrites every $'...' occurrence, including inside outer quotes and substitutions, so
+ * `$'pkill\tworker'` scans as `pkill<TAB>worker`. This quote-blind rewrite can discard live
+ * text when a literal $' occurs inside double quotes, so the caller also scans the original.
+ * NUL truncates the decoded segment; `ok` is false for unmodelled escapes or missing closure.
+ */
+function decodeAnsiC(source: string): { text: string; ok: boolean } {
+  let out = "", ok = true;
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i]!;
+    if (c !== "$" || source[i + 1] !== "'") { out += c; continue; }
+    let closed = false, truncated = false;
+    const append = (value: string): void => {
+      if (value === "\0") truncated = true;
+      if (!truncated) out += value;
+    };
+    for (i += 2; i < source.length; i++) {
+      const d = source[i]!;
+      if (d === "'") { closed = true; break; }
+      if (d !== "\\") { append(d); continue; }
+      const e = source[++i];
+      if (e === undefined) break;
+      if (Object.hasOwn(ANSI_SIMPLE, e)) { append(ANSI_SIMPLE[e]!); continue; }
+      const run = Object.hasOwn(ANSI_RUNS, e) ? ANSI_RUNS[e]!.exec(source.slice(i + 1)) : null;
+      if (run) {
+        const code = Number.parseInt(run[0], 16);
+        if (code > 0x10ffff) { ok = false; continue; }
+        append(String.fromCodePoint(code)); i += run[0].length; continue;
+      }
+      const octal = /^[0-7]{1,3}/.exec(source.slice(i));
+      if (octal) { append(String.fromCharCode(Number.parseInt(octal[0], 8) & 0xff)); i += octal[0].length - 1; continue; }
+      if (e === "c" && i + 1 < source.length) {
+        const x = source[++i]!;
+        if (x === "\\" && source[i + 1] === "\\") i++; // Bash spells control-backslash as \c\\.
+        append(String.fromCharCode(x.toUpperCase().charCodeAt(0) & 0x1f)); continue;
+      }
+      ok = false; append(`\\${e}`); // Bash keeps unknown escapes literally; refusal decides below.
+    }
+    if (!closed) ok = false;
+  }
+  return { text: out, ok };
+}
+
+function opaqueReceiver(words: Word[]): boolean {
+  // Outer double quotes can keep a substitution body in one word; look for lexical wrappers too.
+  return words.some(word => word.text.split(/[\s;|&()<>"'`=]+/).some(token =>
+    OPAQUE_RECEIVERS.has(token.slice(token.lastIndexOf("/") + 1))));
+}
+
 /**
  * Scope cut from PR166: only one literal kill or recursive rm command can receive an allowance.
- * Outside the fixed inert-head grant, visible protected tokens and opaque execution refuse.
+ * Outside the fixed inert-head grant, visible protected tokens refuse, including fragmented
+ * spellings in opaque execution/quoting.
  * No safety bytes, executor semantics or parent effects are inferred. This is a mistake guard,
  * not a sandbox: aliases, custom script files, other languages and dynamic names are not proved.
  */
 export function bashGuardRefusal(command: string, tmpdir: string | undefined): string | undefined {
-  const { words, simple } = split(command);
-  if (literalData(words, simple) || (simple && literalKill(words)) || (simple && literalRm(words, tmpdir))) return undefined;
-  const raw = protectedTokens(command);
+  const { words, simple, list } = split(command);
+  if (literalData(words, simple)
+    || (simple && /^\s*kill(?:\s|$)/.test(command) && literalKill(words))
+    || (simple && /^\s*rm(?:\s|$)/.test(command) && literalRm(words, tmpdir))) return undefined;
+  const readOnlyFind = readOnlyFindList(list);
+  const raw = protectedTokens(command, readOnlyFind);
   let signal = raw.signal, deletion = raw.deletion;
   for (const word of words) {
-    const found = protectedTokens(word.text);
+    const found = protectedTokens(word.text, readOnlyFind);
     signal ||= found.signal; deletion ||= found.deletion;
   }
-  // No executor denylist: live substitutions/process substitutions/backticks and unsupported
-  // script quoting cannot prove absence of a fragmented protected receiver. Do not decode them.
-  const execution = /\$\(|`|[<>]\(|\$['"]|\\\r?\n|<</.test(command);
-  const unprovedQuoting = words.some(word => /['"\\]/.test(word.text));
   if (signal) return SIGNAL_REASON;
   if (deletion) return DELETE_REASON;
-  if (execution || unprovedQuoting) return SIGNAL_REASON;
-  // No visible protected token or opaque execution. This is not an unrelated-command DATA grant.
+  const execution = /\$\(|`|[<>]\(|\$['"]|\\\r?\n|<</.test(command);
+  const unprovedQuoting = words.some(word => /['"\\]/.test(word.text));
+  if (execution || unprovedQuoting) {
+    // Decoding exposes ANSI-C separators, but quote-blind NUL truncation can erase live text
+    // inside double quotes. Scan BOTH the original and decoded text: decoding may add refusals,
+    // never remove protected evidence from the original quote/backslash-removal scan.
+    const ansi = decodeAnsiC(command);
+    if (!ansi.ok && opaqueReceiver(words)) return OPAQUE_REASON;
+    // Whole-text lexical evidence includes substitution bodies, not execution interpretation.
+    // Remove continuations as a unit so fragmented protected names remain visible.
+    for (const source of [command, ansi.text]) {
+      const dequoted = protectedTokens(source.replace(/\$(['"])/g, "$1").replace(/\\\r?\n|['"\\]/g, ""), readOnlyFind);
+      if (dequoted.signal || dequoted.deletion) return OPAQUE_REASON;
+    }
+  }
+  // Ponytail: variable-assembled receivers ($a$b) remain an accepted limit of this mistake guard.
+  // Opaque syntax alone is not a protected command or an unrelated-command DATA grant.
   return undefined;
 }

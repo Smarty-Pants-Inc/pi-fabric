@@ -223,6 +223,57 @@ describe.each([false, true])("cross-root participant name routing (filesOnly=%s)
     });
   }, 30_000);
 
+  describe.each(["tell", "steer", "followUp"] as const)("actor/root selectors for agents.%s", (action) => {
+    it.each(["actor-only", "same-name", "actor-prefix", "root-only"] as const)("routes or refuses %s before publication", async (scenario) => {
+      await acrossRoots(filesOnly, async ({ owner, reviewer, duplicate, ownerId, reviewerId }) => {
+        // Keep the real ActorDirectory/ActorManager name and unique-prefix resolver.
+        // Intercept only mailbox delivery so no worker is started by these routing tests.
+        const actor = await reviewer.runtime.actors.create({
+          name: scenario === "same-name" ? "lucky-ios-lead" : "lane-worker",
+          instructions: "Routing regression; do not start a worker.", runner: "pi",
+        });
+        expect(actor.status).toBe("idle");
+        const tell = vi.spyOn(reviewer.runtime.actors, "tell")
+          .mockReturnValue({ queued: true, messageId: "actor-mailbox" });
+        const selector = scenario === "actor-prefix" ? actor.id.slice(0, 8)
+          : scenario === "actor-only" ? actor.name : "lucky-ios-lead";
+        if (scenario === "actor-prefix") {
+          owner.rename(selector);
+          await vi.waitFor(async () => expect(await reviewer.invoke("agents.members", { kinds: ["root"] }))
+            .toEqual(expect.arrayContaining([expect.objectContaining({ id: ownerId, name: selector })])),
+          { timeout: 8000, interval: 100 });
+        }
+        expect(reviewer.runtime.actors.status(scenario === "root-only" ? actor.name : selector).id).toBe(actor.id);
+        const publish = vi.spyOn(reviewer.runtime.mesh, "publish");
+        const commandsBefore = reviewer.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 });
+        const text = `${scenario} ${action}`;
+        const result = reviewer.invoke(`agents.${action}`, { id: selector, message: text });
+        if (scenario === "same-name" || scenario === "actor-prefix") {
+          const failure = await result.catch((error: unknown) => error);
+          expect(failure).toBeInstanceOf(Error);
+          expect((failure as Error).message).toContain(`Ambiguous Fabric participant: ${selector}`);
+          expect((failure as Error).message).toContain(actor.id);
+          expect((failure as Error).message).toContain(ownerId);
+          expect(publish).not.toHaveBeenCalled();
+          expect(reviewer.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual(commandsBefore);
+          expect(tell).not.toHaveBeenCalled();
+          expect(owner.sendMessage).not.toHaveBeenCalled();
+        } else if (scenario === "actor-only") {
+          await expect(result).resolves.toMatchObject({ routed: "local", queued: true, messageId: "actor-mailbox" });
+          expect(tell).toHaveBeenCalledExactlyOnceWith(actor.id, text, undefined, expect.any(Object));
+          expect(publish).not.toHaveBeenCalled();
+          expect(owner.sendMessage).not.toHaveBeenCalled();
+        } else {
+          await expect(result).resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+          received(owner, reviewerId, text, action === "tell" ? "followUp" : action);
+          expect(tell).not.toHaveBeenCalled();
+        }
+        expect(reviewer.sendMessage).not.toHaveBeenCalled();
+        expect(duplicate.sendMessage).not.toHaveBeenCalled();
+      });
+    }, 20_000);
+  });
+
   it("refuses duplicate live root names with both ids, without publishing or delivering to either", async () => {
     await acrossRoots(filesOnly, async ({ owner, reviewer, duplicate, ownerId, duplicateId, reviewerId }) => {
       duplicate.rename("lucky-ios-lead");

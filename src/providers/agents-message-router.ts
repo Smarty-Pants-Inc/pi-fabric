@@ -158,7 +158,21 @@ export class AgentMessageRouter {
     if (matches.length > 1) {
       throw new Error(`Ambiguous Fabric participant: ${id} (${matches.map((participant) => participant.id).sort().join(", ")}); use an exact id`);
     }
-    return matches[0]?.id ?? target;
+    const root = matches[0];
+    if (!root) return target;
+    // Do not let a published root name shadow an existing actor name or unique id prefix.
+    // Reuse the actor resolver (including its ambiguity checks), without changing its route.
+    let actorId: string | undefined;
+    try {
+      const { actor, participant } = this.resolveActorTarget(target);
+      actorId = actor?.id ?? participant?.id;
+    } catch (error) {
+      if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
+    }
+    if (actorId) {
+      throw new Error(`Ambiguous Fabric participant: ${id} (actor ${actorId}, root ${root.id}); use an exact id`);
+    }
+    return root.id;
   }
 
   /** Use the same target resolution as delivery when grouping lifecycle sources. */

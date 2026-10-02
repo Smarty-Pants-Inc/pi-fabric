@@ -3,14 +3,14 @@ import { vi } from "vitest";
 import * as fileLock from "../../src/residency/file-lock.js";
 
 /**
- * Explicit test adapter for isolated, same-process hosts only. Windows/macOS
- * durable residency is unsupported without flock; do NOT put a PID-file fallback
- * in product code or skip commit/abandonment coverage on those CI platforms.
+ * Explicit test adapter for isolated, same-process POSIX hosts without flock.
+ * Windows host tests use the real exclusive-create claim; durable Windows
+ * residency/automatic crash recovery remains unsupported.
  * Linux tests still exercise the real kernel fence by default. Closing the exact
  * descriptor releases the test claim, just as host death/close releases flock.
  */
 export const installInProcessResidentFence = (force = false): void => {
-  if (!force && process.platform === "linux" && process.getuid?.() !== undefined) return;
+  if (!force && (process.platform === "win32" || (process.platform === "linux" && process.getuid?.() !== undefined))) return;
   if (vi.isMockFunction(fileLock.lockFile)) return;
   const held = new Map<string, number>();
   const close = fs.closeSync.bind(fs);

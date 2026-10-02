@@ -234,6 +234,7 @@ export class ResidentHost {
   actors!: ActorDirectory;
   lifecycle!: LifecycleBroker;
   #lockFd: number | undefined;
+  #exclusiveCreateLock = false;
   readonly #ownerPath: string;
   readonly #lockPath: string;
   readonly #errorPath: string;
@@ -1296,6 +1297,9 @@ export class ResidentHost {
 
   async #acquireLock(): Promise<void> {
     fs.mkdirSync(this.config.residencyRoot, { recursive: true, mode: 0o700 });
+    // Windows has no flock helper. Retain main's exclusive-create host claim,
+    // without PID-based stale unlinking or pretending it is a kernel fence.
+    if (process.platform === "win32") { this.#acquireWindowsLock(); return; }
     // Only an inode we created, or one previously established by this protocol,
     // is safe to adopt. A dead legacy PID cannot exclude a reclaimer that already
     // committed to unlinking that inode. Empty/torn legacy startup records prove even less.
@@ -1311,6 +1315,27 @@ export class ResidentHost {
     }
     try { await this.#establishLockInode(); }
     finally { fs.closeSync(establishmentFd); }
+  }
+
+  /** Legacy Windows primitive: an atomic claim, not automatic crash recovery. */
+  #acquireWindowsLock(): void {
+    const existing = readJson<ResidentHostOwner>(this.#ownerPath);
+    if (existing && residentProcessAlive(existing.pid, existing.processStartTime)) {
+      throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
+    }
+    try { this.#lockFd = fs.openSync(this.#lockPath, "wx", 0o600); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        // Never unlink a stale/empty claim: a delayed starter or legacy
+        // reclaimer may still own it. Windows recovery requires a verified drain.
+        throw new ResidentHostAlreadyRunning("Fabric resident host is already running or has a legacy/uncertain startup record; verify drain before removing it");
+      }
+      throw error;
+    }
+    this.#exclusiveCreateLock = true;
+    try {
+      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
+    } catch (error) { this.#releaseLock(); throw error; }
   }
 
   /** Called only while holding the immutable first-claim establishment guard. */
@@ -1357,11 +1382,16 @@ export class ResidentHost {
 
   #releaseLock(): void {
     if (this.#lockFd === undefined) return;
-    // Remove our publication while holding the fence; never unlink its inode on any platform.
+    // Remove our publication while holding the claim. POSIX never unlinks its
+    // immutable kernel-fence inode; Windows removes only its token-owned claim.
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
     if (owner?.token === this.#token) fs.rmSync(this.#ownerPath, { force: true });
+    const removeClaim = this.#exclusiveCreateLock && readJson<{ token?: string }>(this.#lockPath)?.token === this.#token;
     fs.closeSync(this.#lockFd);
     this.#lockFd = undefined;
+    // Close before unlinking for Windows file-sharing semantics. Contenders
+    // still cannot claim the existing path between close and this synchronous rm.
+    if (removeClaim) fs.rmSync(this.#lockPath, { force: true });
   }
 }
 

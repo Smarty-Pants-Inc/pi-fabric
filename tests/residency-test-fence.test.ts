@@ -1,6 +1,5 @@
 import * as childProcess from "node:child_process";
 import fs from "node:fs";
-import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -77,42 +76,18 @@ describe("lockFile safety without POSIX UIDs", () => {
   });
 });
 
-describe("Windows lockFile validation", () => {
-  it.each([true, false])("uses Windows file access rather than an unavailable POSIX UID, but still checks regular files (regular=%s)", async regular => {
+describe("Windows lockFile boundary", () => {
+  it("never spawns flock or creates a POSIX lock on Windows", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-windows-file-"));
     const file = path.join(root, "host-fence-establish.lock");
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-    const getuid = Object.getOwnPropertyDescriptor(process, "getuid");
-    Object.defineProperty(process, "getuid", { configurable: true, writable: true, value: undefined });
-    const fstat = fs.fstatSync.bind(fs);
-    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number) => {
-      const stat = fstat(fd); stat.uid = 0; stat.isFile = () => regular; return stat;
-    }) as typeof fs.fstatSync);
-    const spawn = vi.mocked(childProcess.spawn).mockImplementation(() => {
-      const child = new EventEmitter();
-      queueMicrotask(() => child.emit("exit", 0));
-      return child as childProcess.ChildProcess;
-    });
+    const spawn = vi.mocked(childProcess.spawn);
     spawn.mockClear();
-    const close = vi.spyOn(fs, "closeSync");
-    let fd: number | undefined;
     try {
-      if (regular) {
-        fd = await lockFile(file, 0);
-        expect(spawn).toHaveBeenCalledOnce();
-        expect(spawn.mock.calls[0]?.[0]).toBe("flock");
-        expect(close).not.toHaveBeenCalled(); // caller still owns the lock descriptor
-      } else {
-        await expect(lockFile(file, 0)).rejects.toThrow(/not a regular file owned/);
-        expect(spawn).not.toHaveBeenCalled();
-        expect(close).toHaveBeenCalledOnce();
-      }
-    } finally {
-      if (fd !== undefined) fs.closeSync(fd);
-      if (getuid) Object.defineProperty(process, "getuid", getuid);
-      else Reflect.deleteProperty(process, "getuid");
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+      await expect(lockFile(file, 0)).rejects.toThrow(/POSIX flock is unavailable on Windows/);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(fs.existsSync(file)).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 });
 describe("unsupported native residency versus in-process test contract", () => {
@@ -136,36 +111,75 @@ describe("unsupported native residency versus in-process test contract", () => {
     }
   });
 
-  it.skipIf(process.platform !== "linux")("product Windows start with no POSIX UID fails closed before managers and owner publication", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-windows-unsupported-"));
+  it("Windows host fence excludes a second holder without POSIX UIDs or spawning flock, then admits a successor", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-windows-claim-"));
     const config: ResidentHostConfig = {
-      format: 1, rootId: "session:unsupported", sessionId: "unsupported", cwd: root, projectRoot: root,
+      format: 1, rootId: "session:windows", sessionId: "windows", cwd: root, projectRoot: root,
       meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
       fullCodeMode: false, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
       retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: "unused", fabricExtensionPath: "unused", piBinary: "unused", claudeBinary: "unused", vedaBinary: "unused",
     };
-    const host = new ResidentHost(config);
+    const first = new ResidentHost(config);
+    const second = new ResidentHost(config);
+    const successor = new ResidentHost(config);
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-    const getuid = Object.getOwnPropertyDescriptor(process, "getuid")!;
+    const getuid = Object.getOwnPropertyDescriptor(process, "getuid");
     Object.defineProperty(process, "getuid", { configurable: true, writable: true, value: undefined });
-    const fstat = fs.fstatSync.bind(fs);
-    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number) => {
-      const stat = fstat(fd); stat.uid = 0; return stat;
-    }) as typeof fs.fstatSync);
     const spawn = vi.mocked(childProcess.spawn).mockImplementation(() => {
-      throw Object.assign(new Error("flock unavailable"), { code: "ENOENT" });
+      throw Object.assign(new Error("flock must never spawn on Windows"), { code: "ENOENT" });
     });
+    const lock = path.join(config.residencyRoot, "host.lock");
     try {
-      await expect(host.start()).rejects.toThrow("flock unavailable");
-      expect(spawn).toHaveBeenCalledOnce();
-      expect(spawn.mock.calls[0]?.[0]).toBe("flock");
-      expect(host.actors).toBeUndefined();
-      expect(host.agents).toBeUndefined();
-      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      const starts = await Promise.allSettled([first.start(), second.start()]);
+      expect(starts[0]!.status).toBe("fulfilled");
+      expect(starts[1]!.status).toBe("rejected");
+      if (starts[1]!.status === "rejected") expect(starts[1]!.reason.constructor.name).toBe("ResidentHostAlreadyRunning");
+      expect(second.actors).toBeUndefined();
+      expect(second.agents).toBeUndefined();
+      expect(spawn).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(config.residencyRoot, "host-fence-establish.lock"))).toBe(false);
+      expect(fs.existsSync(path.join(config.residencyRoot, "host-fence.json"))).toBe(false);
+      const claim = fs.readFileSync(lock, "utf8");
+      await second.close();
+      expect(fs.readFileSync(lock, "utf8")).toBe(claim);
+      await first.close();
+      expect(fs.existsSync(lock)).toBe(false);
+      await successor.start();
+      expect(spawn).not.toHaveBeenCalled();
+      await successor.close();
+      expect(fs.existsSync(lock)).toBe(false);
     } finally {
-      await host.close();
-      Object.defineProperty(process, "getuid", getuid);
+      await Promise.all([first.close(), second.close(), successor.close()]);
+      if (getuid) Object.defineProperty(process, "getuid", getuid);
+      else Reflect.deleteProperty(process, "getuid");
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it.each(["", "{", "null", JSON.stringify({ pid: -1, token: "legacy-dead" })])(
+    "Windows host refuses an uncertain existing claim (%j) instead of reclaiming it", async record => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-windows-legacy-"));
+      const config: ResidentHostConfig = {
+        format: 1, rootId: "session:windows", sessionId: "windows", cwd: root, projectRoot: root,
+        meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
+        fullCodeMode: false, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh,
+        retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: "unused", fabricExtensionPath: "unused", piBinary: "unused", claudeBinary: "unused", vedaBinary: "unused",
+      };
+      fs.mkdirSync(config.residencyRoot);
+      const lock = path.join(config.residencyRoot, "host.lock");
+      fs.writeFileSync(lock, record);
+      const host = new ResidentHost(config);
+      vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+      const spawn = vi.mocked(childProcess.spawn);
+      spawn.mockClear();
+      try {
+        await expect(host.start()).rejects.toThrow(/legacy\/uncertain.*verify drain/);
+        expect(host.actors).toBeUndefined();
+        expect(host.agents).toBeUndefined();
+        expect(fs.readFileSync(lock, "utf8")).toBe(record);
+        expect(spawn).not.toHaveBeenCalled();
+        expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    },
+  );
 });

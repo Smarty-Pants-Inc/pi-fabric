@@ -225,9 +225,7 @@ describe("resident tracked result preservation", () => {
       if (platformCase === "win32-injected") {
         Object.defineProperty(process, "platform", { ...platform, value: "win32" });
         Object.defineProperty(process, "getuid", { configurable: true, writable: true, value: undefined });
-        // Explicit non-Linux test hosts use the same-process fence adapter;
-        // production still requires the shared kernel fence and fails closed.
-        installInProcessResidentFence();
+        // Exercise the product Windows exclusive-create claim, not the POSIX adapter.
       }
       await host.start();
       await expect(successor.start()).rejects.toThrow(/already running/);
@@ -242,17 +240,18 @@ describe("resident tracked result preservation", () => {
       expect(closeParticipants).toHaveBeenCalledOnce();
       expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
       const lock = path.join(config.residencyRoot, "host.lock");
-      // The current fence keeps its inode on every platform. Native Linux
-      // exercises flock; the injected unsupported host uses the explicit adapter.
-      expect(fs.existsSync(lock)).toBe(true);
-      const fd = await lockFile(lock, 0);
-      fs.closeSync(fd);
-      // Both native and adapted fences must admit a successor only after close.
+      const windows = process.platform === "win32";
+      expect(fs.existsSync(lock)).toBe(!windows);
+      if (!windows) {
+        const fd = await lockFile(lock, 0);
+        fs.closeSync(fd);
+      }
+      // Both kernel and exclusive-create claims admit a successor only after close.
       await successor.start();
       expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "owner.json"), "utf8")).pid).toBe(process.pid);
       await successor.close();
       expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
-      expect(fs.existsSync(lock)).toBe(true);
+      expect(fs.existsSync(lock)).toBe(!windows);
       closeParticipants.mockRestore();
     } finally {
       fault?.mockRestore();

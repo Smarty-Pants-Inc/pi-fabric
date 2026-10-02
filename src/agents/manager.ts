@@ -2610,6 +2610,12 @@ export class AgentManager {
         if (await this.#resumeStopped(managed, record, deadline)) continue;
         // A relaunch that failed is terminal: no fallback launch may run after it.
         if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
+        // Terminal publication may precede a worker's final native-session flush.
+        // Give normal process exit a bounded observation window before stop():
+        // on Windows SIGTERM is destructive, not a cooperative flush request.
+        if (managed.transport.kind === "process") {
+          await this.#waitForTransportExit(managed, Date.now() + TRANSPORT_EXIT_GRACE_MS);
+        }
         await this.#drainExecution(managed);
         this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
         return;

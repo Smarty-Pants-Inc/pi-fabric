@@ -21,7 +21,7 @@ import {
 import { MeshStore, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
-import { AgentManager } from "../agents/manager.js";
+import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readJsonlPage } from "../log-tail.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
@@ -80,6 +80,10 @@ interface ActorQueueItem {
   bindingVersion?: 2;
   resolve?: (message: FabricActorMessage) => void;
   reject?: (error: Error) => void;
+  /** Owner restorations without settlement; only #restoreQueue consumes this budget. */
+  attempts?: number;
+  /** Unlaunched preparation failures, independent of the crash/drop budget (#3167). */
+  preparationAttempts?: number;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
   resumed?: boolean;
 }
@@ -138,7 +142,8 @@ interface ManagedActor {
   createdAt: number;
   updatedAt: number;
   lastRunId?: string;
-  /** The run in flight, known from its spawn (smarty-dev#2184 item 8). */
+  /** Setup/admission is separate from a launched worker (smarty-dev#3167). */
+  preparing?: { phase: string; startedAt: number; attempts: number; runId?: string; queuePosition?: number };
   inFlightRun?: { id: string; startedAt: number };
   /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
   removal?: { requestedAt: number; runId?: string; runStartedAt?: number };
@@ -308,12 +313,33 @@ class ActorQueueDurabilityError extends Error {
   }
 }
 
+/** A mesh write is normally bounded at 10s; give each actor setup await its own 30s ceiling. */
+export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
+/** Three preparation requeues, independent of the owner-restoration/drop budget. */
+const ACTOR_PREPARATION_MAX_RETRIES = 3;
+
+export class ActorPreparationError extends Error {
+  readonly code: string = "FABRIC_ACTOR_PREPARATION_FAILED";
+  constructor(readonly actorId: string, readonly phase: string, cause: unknown) {
+    super(`Actor ${actorId} preparation (${phase}): ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "ActorPreparationError";
+  }
+}
+
+export class ActorPreparationTimeoutError extends ActorPreparationError {
+  override readonly code = "FABRIC_ACTOR_PREPARATION_TIMEOUT";
+  constructor(actorId: string, phase: string, readonly timeoutMs: number) {
+    super(actorId, phase, new Error(`timed out after ${timeoutMs} ms`));
+    this.name = "ActorPreparationTimeoutError";
+  }
+}
+
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
   readonly #failureStreaks = new Map<string, { count: number; notified: boolean }>();
   /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
   readonly #parked = new Map<string, ActorQueueItem[]>();
-  // smarty-dev#878: the item each actor is running, persisted with its queue until the run ends.
+  // Accepted active work (preparing, waiting, or running), retained durably until settlement (#878).
   readonly #inFlight = new Map<string, ActorQueueItem>();
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
@@ -377,6 +403,13 @@ export class ActorManager {
   readonly #pendingPresence = new Set<string>();
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
+  /** A timed-out write stays serialized; drains need not join that same stalled chain again. */
+  readonly #stalledPresence = new Set<string>();
+  readonly #drainRetries = new Map<string, NodeJS.Timeout>();
+  /** A wake received during an active finalizer must survive until that drain releases. */
+  readonly #drainRearms = new Set<string>();
+  readonly #preparationTimeoutMs: number;
+  readonly #preparationRetryMs: number;
   readonly #presenceQueued = new Set<string>();
   readonly #presenceRetries = new Map<string, MeshBackgroundRetry>();
   readonly #notifications = new MeshBackgroundQueue("actor notification/reap");
@@ -433,6 +466,9 @@ export class ActorManager {
       meshCursorPath?: string;
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
+      /** Per-await preparation deadline; independent of model/run and permit wait timeouts. */
+      preparationTimeoutMs?: number;
+      preparationRetryMs?: number;
       /** First backoff of a failed accepted-removal cleanup (tests shorten it). */
       removalRetryMs?: number;
       /** With meshCursorPath: on resume, replay only events newer than this (ms). */
@@ -511,6 +547,8 @@ export class ActorManager {
     });
     this.#meshMonitor.start();
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
+    this.#preparationTimeoutMs = Math.max(1, options.preparationTimeoutMs ?? ACTOR_PREPARATION_TIMEOUT_MS);
+    this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 1_000);
     this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
     // Presence entries this runtime wrote for actors it no longer knows (a remove whose
     // delete never landed) are orphans: reap them once at start.
@@ -525,9 +563,21 @@ export class ActorManager {
   retryCapabilityWaiters(): void {
     queueMicrotask(() => {
       for (const actor of this.#actors.values()) {
-        if (actor.missingCapabilities && actor.queue.length > 0) this.#ensureDrain(actor);
+        if ((actor.missingCapabilities || actor.preparing?.phase === "capabilities") &&
+          (actor.queue.length > 0 || this.#inFlight.has(actor.id))) this.#requestDrain(actor);
       }
     });
+  }
+
+  /** Re-admit restored work after the host's providers and ownership directory are ready. */
+  resumeQueued(): void {
+    if (this.#closing || this.#halted) return;
+    this.#syncActorsFromRegistry();
+    this.#refreshOwnership();
+    this.#scheduleRestoreParked();
+    for (const actor of this.#actors.values()) {
+      if (actor.queue.length > 0 || this.#inFlight.has(actor.id)) this.#requestDrain(actor);
+    }
   }
 
   /**
@@ -1002,9 +1052,12 @@ export class ActorManager {
       waiters?.forEach((waiter) => waiter.reject(failure));
       return undefined;
     }
-    return this.#publishPresence(live).then(
+    return this.#publishDrainPresence(live).then(
       () => waiters?.forEach((waiter) => waiter.resolve(this.#publicInfo(this.#liveActor(live)))),
-      (error: unknown) => waiters?.forEach((waiter) => waiter.reject(error instanceof Error ? error : new Error(String(error)))),
+      (error: unknown) => {
+        this.#recordPreparationFailure(live, error);
+        waiters?.forEach((waiter) => waiter.reject(error instanceof Error ? error : new Error(String(error))));
+      },
     );
   }
 
@@ -2046,6 +2099,9 @@ export class ActorManager {
     if (this.#closing) return;
     this.#closing = true;
     this.#meshMonitor.close();
+    for (const timer of this.#drainRetries.values()) clearTimeout(timer);
+    this.#drainRetries.clear();
+    this.#drainRearms.clear();
     if (this.#presenceTimer) clearTimeout(this.#presenceTimer);
     this.#presenceTimer = undefined;
     // Let presence writes already in flight finish before the runtime goes.
@@ -2230,9 +2286,18 @@ export class ActorManager {
    * starts a fresh drain — preventing a queued item from being stranded with
    * no drain to process it (the "stuck at queue:1" race).
    */
+  #requestDrain(actor: ManagedActor): void {
+    if (this.#closing || this.#halted || actor.status === "stopped" || !this.#canManageCached(actor.id)) return;
+    // Catalog installation and reload recovery can race the old drain's awaited cleanup.
+    // Remember that wake rather than relying on another mesh event or user turn to arrive.
+    if (this.#draining.has(actor.id)) this.#drainRearms.add(actor.id);
+    this.#ensureDrain(actor);
+  }
+
   #ensureDrain(actor: ManagedActor): void {
     if (
       actor.draining ||
+      this.#drainRetries.has(actor.id) ||
       // One activation at a time per actor session, even across a registry reload that
       // replaced the object an older drain still runs on (smarty-dev#442).
       this.#draining.has(actor.id) ||
@@ -2254,7 +2319,62 @@ export class ActorManager {
     drain.then(release, release);
   }
 
+  async #prepare<T>(actor: ManagedActor, phase: string, operation: () => T | Promise<T>, onLate?: (value: T) => void): Promise<T> {
+    if (actor.preparing) actor.preparing.phase = phase;
+    let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    const pending = Promise.resolve().then(operation).then((value) => {
+      if (timedOut) onLate?.(value);
+      return value;
+    });
+    try {
+      return await Promise.race([pending, new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new ActorPreparationTimeoutError(actor.id, phase, this.#preparationTimeoutMs));
+        }, this.#preparationTimeoutMs);
+      })]);
+    } catch (error) {
+      throw error instanceof ActorPreparationError ? error : new ActorPreparationError(actor.id, phase, error);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async #publishDrainPresence(actor: ManagedActor): Promise<void> {
+    if (!this.#canManage(actor.id)) return;
+    this.#emitChange();
+    await this.#prepare(actor, "registry", () => this.#saveActors());
+    // Do not break presence serialization or retry a late write out of order. Once a join
+    // timed out, the pending publisher still owes the latest state, but is not launch authority.
+    if (this.#stalledPresence.has(actor.id) && this.#presenceChains.has(actor.id)) {
+      void this.#writePresence(actor.id);
+      return;
+    }
+    this.#stalledPresence.delete(actor.id);
+    try {
+      await this.#prepare(actor, "presence", () => this.#writePresence(actor.id));
+    } catch (error) {
+      if (error instanceof ActorPreparationTimeoutError) this.#stalledPresence.add(actor.id);
+      throw error;
+    }
+  }
+
+  #recordPreparationFailure(actor: ManagedActor, error: unknown, item?: ActorQueueItem): void {
+    const message = error instanceof Error ? error.message : String(error);
+    actor.lastError = message;
+    this.#recordMessage(this.#liveActor(actor), {
+      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
+      source: item?.source ?? "preparation", createdAt: Date.now(), error: message,
+      data: { errorType: error instanceof Error ? error.name : "Error",
+        ...(error instanceof ActorPreparationError ? { code: error.code, phase: error.phase } : {}),
+        ...(item ? { itemId: item.id, attempts: item.preparationAttempts ?? 0 } : {}) },
+    });
+    this.#noteFailedActivation(actor, message, undefined, false);
+  }
+
   async #drain(actor: ManagedActor): Promise<void> {
+    let retryDrain = false;
     try {
       while (
         actor.queue.length > 0 &&
@@ -2277,12 +2397,13 @@ export class ActorManager {
           this.#recordFiltered(actor, item, filteredBy);
           this.#persistQueue(actor.id);
           actor.status = actor.queue.length > 0 ? "queued" : "idle";
-          await this.#publishPresence(actor);
+          await this.#publishDrainPresence(actor);
           continue;
         }
         this.#inFlight.set(actor.id, item);
         const inferenceContext = actor.inferenceContext;
-        actor.status = "running";
+        actor.status = "preparing";
+        actor.preparing = { phase: "presence", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
         actor.updatedAt = Date.now();
         delete actor.lastError;
         const abortController = new AbortController();
@@ -2295,21 +2416,24 @@ export class ActorManager {
         let runStopped = false;
         let capabilityLease: FabricCapabilityViewLease | undefined;
         let committedRefs: string[] | undefined;
+        let preLaunch = true;
+        let workerLaunched = false;
+        const preparationAbort = new AbortController();
         try {
-          // Presence is now durable registry I/O. It and validity must share the
-          // activation's caller settlement and in-flight/controller cleanup.
-          await this.#publishPresence(actor);
-          const beforeRun = await this.#validity(actor, item);
+          // Durable registry I/O and validity share caller settlement/cleanup,
+          // with #258's per-await preparation bounds.
+          await this.#publishDrainPresence(actor);
+          const beforeRun = await this.#prepare(actor, "validity", () => this.#validity(actor, item));
           if (!beforeRun.valid) {
             this.#recordStale(actor, item, beforeRun.reason);
             continue;
           }
           prelaunchConfirmed = true;
           if (actor.requirements.length > 0 && this.#acquireCapabilityView) {
-            capabilityLease = await this.#acquireCapabilityView(
+            capabilityLease = await this.#prepare(actor, "capabilities", () => this.#acquireCapabilityView!(
               actor.requirements,
-              abortController.signal,
-            );
+              AbortSignal.any([abortController.signal, preparationAbort.signal]),
+            ), (lateLease) => { void lateLease.release().catch(() => undefined); });
             if (!capabilityLease.satisfied || !capabilityLease.view) {
               actor.missingCapabilities = [...capabilityLease.missing];
               delete actor.capabilityDigest;
@@ -2317,7 +2441,7 @@ export class ActorManager {
               this.#inFlight.delete(actor.id);
               actor.status = "queued";
               actor.updatedAt = Date.now();
-              await this.#publishPresence(actor);
+              // The bounded finally publication also covers an unsatisfied capability view.
               break;
             }
             delete actor.missingCapabilities;
@@ -2336,15 +2460,20 @@ export class ActorManager {
           // A miss fails this activation with the resolver's error (ask rejects, lastError set).
           // Foreign caller views are already resolved: missing fields must reach the
           // runner/config fallback, never the owner's private session binding.
-          const launchBinding = await this.#resolvedRunBinding(actor, item.bindingMode === "resolved"
-            ? item.binding : this.#runBinding(actor, item.binding));
+          const launchBinding = await this.#prepare(actor, "binding", () => this.#resolvedRunBinding(actor, item.bindingMode === "resolved"
+            ? item.binding : this.#runBinding(actor, item.binding)));
           // Admission is held, but no child writer has launched yet. Repair/create
           // the native session before handing its path to the process.
           this.#ensurePiSession(actor);
+          if (actor.preparing) actor.preparing.phase = "launch";
+          preLaunch = false; // AgentManager bounds model/auth setup after (not during) permit waiting.
           const result = await this.agents.run(
             this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
             (handle) => {
+              workerLaunched = true;
+              delete actor.preparing;
+              actor.status = "running";
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
               void this.#publishPresence(actor).catch(() => undefined);
             },
@@ -2355,6 +2484,17 @@ export class ActorManager {
               actor.status !== "stopped" && this.#actors.has(actor.id) &&
               this.#actors.get(actor.id)?.status !== "stopped" && this.#ownershipDecision(actor.id),
             () => this.#downgradeOutputPrincipal(actor, item),
+            (handle) => {
+              actor.status = "waiting";
+              actor.preparing = { phase: "waiting", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0,
+                runId: handle.id, ...(handle.queuePosition !== undefined ? { queuePosition: handle.queuePosition } : {}) };
+              void this.#publishPresence(actor).catch(() => undefined);
+            },
+            { timeoutMs: this.#preparationTimeoutMs, onPreparing: () => {
+              actor.status = "preparing";
+              actor.preparing = { phase: "launch", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
+              void this.#publishPresence(actor).catch(() => undefined);
+            } },
           );
           runId = result.id;
           // Captured before any check that can throw: a completed run is never parked and
@@ -2377,6 +2517,11 @@ export class ActorManager {
           }
           if (!this.#canManage(actor.id)) {
             throw new Error(`Fabric actor ownership moved during run: ${actor.id}`);
+          }
+          // A failed queue receipt is terminal, but is not an executed activation.
+          // Preserve typed, confirmed-unlaunched evidence before directive/text handling.
+          if (!workerLaunched && result.status === "failed" && result.launchPreparationTimeoutMs !== undefined) {
+            throw new AgentLaunchPreparationTimeoutError(result.launchPreparationTimeoutMs);
           }
           actor.lastRunId = result.id;
           if (actor.runner === "claude" && result.runnerSessionId) {
@@ -2479,10 +2624,33 @@ export class ActorManager {
             this.#scheduleRestoreParked();
             continue;
           }
-          if (!prelaunchConfirmed && !item.resolve && !item.reject) {
-            // Admission succeeded but no worker launched. Keep callerless work
-            // for a later poll instead of retiring it or spinning on the outage.
-            this.#inFlight.delete(actor.id); // Park one copy, not both in-flight and parked images.
+          // A finite unavailable-model error remains terminal, as before. Only a hung
+          // resolver is retried; infrastructure failures have not consumed the activation.
+          const launchPreparationTimeout = !workerLaunched && error instanceof AgentLaunchPreparationTimeoutError &&
+            error.launchOutcome === "unlaunched";
+          // A finite durable-admission failure must reject an ASK immediately (F10).
+          // Callerless accepted work and timed-out preparation retain #258's retry budget.
+          const finiteAdmissionFailure = !prelaunchConfirmed && !(error instanceof ActorPreparationTimeoutError);
+          const retryPreparation = launchPreparationTimeout || (preLaunch && (error instanceof ActorPreparationTimeoutError ||
+            (error instanceof ActorPreparationError && error.phase !== "binding")) &&
+            !(finiteAdmissionFailure && (item.resolve || item.reject)));
+          if (retryPreparation && (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES &&
+            !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
+            preparationAbort.abort(error);
+            item.preparationAttempts = (item.preparationAttempts ?? 0) + 1;
+            // Transfer ownership before cleanup can yield: persistence must never see
+            // this activation both in flight and queued (review/astra round 2, #3167).
+            this.#inFlight.delete(actor.id);
+            actor.queue.unshift(item);
+            this.#persistQueue(actor.id, true);
+            this.#recordPreparationFailure(actor, error, item);
+            retryDrain = true;
+            break;
+          }
+          if (finiteAdmissionFailure && !item.resolve && !item.reject) {
+            // A durable registry outage is not authority to retire accepted work.
+            // After bounded retries, retain one parked copy for a later poll (F10).
+            this.#inFlight.delete(actor.id);
             this.#park(actor, [item], message);
             break;
           }
@@ -2498,9 +2666,14 @@ export class ActorManager {
           };
           this.#recordMessage(this.#liveActor(actor), failed);
           item.reject?.(new Error(message));
-          this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped);
+          this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
+            retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0);
         } finally {
-          await capabilityLease?.release().catch(() => undefined);
+          if (capabilityLease) {
+            if (!workerLaunched) await this.#prepare(actor, "capability-release", () => capabilityLease!.release())
+              .catch((error: unknown) => this.#recordPreparationFailure(actor, error));
+            else await capabilityLease.release().catch(() => undefined);
+          }
           // Retain a durable copy of the run's event log + status in the
           // actor's directory so agents.log / /fabric log can inspect what the
           // actor sent to and received from its model, even after a successful
@@ -2518,17 +2691,22 @@ export class ActorManager {
             await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
           }
           delete actor.abortController;
+          delete actor.preparing;
           delete actor.inFlightRun;
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           this.#finishInFlight(actor.id, item);
           if (this.#canManage(actor.id)) {
-            const presence = this.#publishPresence(actor);
-            if (prelaunchConfirmed) await presence;
-            else await presence.catch(() => undefined); // Original error already settled/parked.
+            await this.#publishDrainPresence(actor).catch((error: unknown) => {
+              this.#recordPreparationFailure(actor, error);
+              retryDrain = true;
+            });
           }
         }
       }
+    } catch (error) {
+      this.#recordPreparationFailure(actor, error);
+      retryDrain = true;
     } finally {
       // Mark the drain inactive the moment its loop exits (or throws) so a
       // concurrent #ensureDrain observes `draining === false` and starts a
@@ -2545,18 +2723,30 @@ export class ActorManager {
       if (this.#draining.get(actor.id) === actor) this.#draining.delete(actor.id);
       // A reload may have moved this actor's queue to a new object while this drain ran.
       const live = this.#actors.get(actor.id);
-      if (live && (live !== actor || resetAtExit) && live.queue.length > 0) queueMicrotask(() => this.#ensureDrain(live));
+      const rearm = this.#drainRearms.delete(actor.id);
+      if (live && live.queue.length > 0) {
+        if (retryDrain && !this.#closing && live.status !== "stopped") {
+          const timer = setTimeout(() => {
+            this.#drainRetries.delete(live.id);
+            const current = this.#actors.get(live.id);
+            if (current) this.#ensureDrain(current);
+          }, this.#preparationRetryMs);
+          timer.unref();
+          this.#drainRetries.set(live.id, timer);
+        } else if (live !== actor || resetAtExit || rearm) queueMicrotask(() => this.#ensureDrain(live));
+      }
     }
   }
 
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
-  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean): void {
+  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
     const streak = this.#failureStreaks.get(actor.id) ?? { count: 0, notified: false };
-    streak.count += 1;
+    // Retry exhaustion must still alarm after recreation discarded the in-memory streak.
+    streak.count = Math.max(streak.count + 1, countFloor);
     this.#failureStreaks.set(actor.id, streak);
     // Deterministic budget failures need operator action, not three silent
     // activations. Existing host reporting bypasses mailbox/silent delivery.
@@ -3454,10 +3644,15 @@ export class ActorManager {
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
     const inFlight = this.#inFlight.get(actorId);
+    const persistedIds = new Set<string>();
     const items = [
       ...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#overflow.get(actorId) ?? []), ...(this.#parked.get(actorId) ?? []),
     ]
-      .filter((item) => !item.resolve && !item.reject);
+      .filter((item) => {
+        if (item.resolve || item.reject || persistedIds.has(item.id)) return false;
+        persistedIds.add(item.id);
+        return true;
+      });
     const file = this.#ownQueueFile(actor);
     const cleanHandover = release || this.#releasePaused;
     try {
@@ -3475,7 +3670,8 @@ export class ActorManager {
             ...(item.provenance ? { provenance: item.provenance } : {}),
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
-            attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
+            attempts: item.attempts ?? 0,
+            preparationAttempts: item.preparationAttempts ?? 0,
             ...(item === inFlight || item.resumed ? { resumed: true } : {}),
           }))];
         } catch (error) {
@@ -3580,6 +3776,8 @@ export class ActorManager {
         typeof value.id !== "string" || typeof value.source !== "string" || held.has(value.id) ||
         typeof value.createdAt !== "number" || typeof value.activation !== "object" || value.activation === null
       ) continue;
+      // Include this snapshot's accepted IDs too, not only the work held on entry.
+      held.add(value.id);
       // A deliberate quiescent release is not a failed attempt at untouched backlog.
       const attempts = (typeof value.attempts === "number" ? value.attempts : 0) +
         (saved.cleanHandover === true && (value as { resumed?: unknown }).resumed !== true ? 0 : 1);
@@ -3607,6 +3805,7 @@ export class ActorManager {
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
         ...((value as { resumed?: unknown }).resumed === true ? { resumed: true } : {}),
         attempts,
+        preparationAttempts: counter(value.preparationAttempts),
       } as ActorQueueItem & { attempts: number };
       if (attempts > 3) {
         this.#recordDropped(actor, item, "it was restored after three restarts that did not finish it");
@@ -3692,7 +3891,12 @@ export class ActorManager {
       // against a rendered role without reading the registry file (smarty-dev#918).
       instructionsDigest: createHash("sha256").update(actor.instructions).digest("hex"),
       instructionsLength: actor.instructions.length,
-      status: actor.status,
+      status: actor.status === "stopped" ? "stopped" : actor.preparing
+        ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status,
+      ...(actor.preparing ? { preparing: { ...actor.preparing,
+        ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),
+        ...(actor.preparing.runId ? { queuePosition: this.agents.status(actor.preparing.runId).queuePosition } : {}),
+      } } : {}),
       runner: actor.runner,
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),

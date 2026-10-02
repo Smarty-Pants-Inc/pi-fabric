@@ -40,7 +40,7 @@ const world = (actorQueueLimit: number) => {
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const tasks: Array<{ actor: string; task: string }> = [];
   const run = agents.run.bind(agents);
-  vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
+  vi.spyOn(agents, "run").mockImplementation(async (request, signal, ...callbacks) => {
     tasks.push({ actor: request.actorName ?? "", task: request.task });
     if (request.task.includes("BLOCK")) {                         // until release(), or the run is aborted
       await new Promise<void>((resolve) => {
@@ -49,7 +49,7 @@ const world = (actorQueueLimit: number) => {
         signal?.addEventListener("abort", () => resolve(), { once: true });
       });
     }
-    return run(request, signal);
+    return run(request, signal, ...callbacks);
   });
   const manager = () => {
     const value = new ActorManager("test", identity, mesh,
@@ -75,7 +75,9 @@ describe("actor queue overflow", () => {
     const write = vi.spyOn(atomic, "writeJsonAtomic");
     try {
       await w.mesh.publish({ topic: "team.direct", to: actor.id, from, text: "BLOCK work" });
-      await waitFor(() => actors.status(actor.id).status === "running");
+      // The injected BLOCK await is pre-launch, not a worker in flight (#258).
+      await waitFor(() => actors.status(actor.id).status === "preparing");
+      expect(actors.status(actor.id).inFlightRun).toBeUndefined();
       await w.mesh.publish({ topic: "team.events", from, text: "ev-1" });
       await waitFor(() => actors.status(actor.id).queued === 1);
       const calls = write.mock.calls.filter(([file]) => /^queue-.+.json$/.test(path.basename(file)));
@@ -117,7 +119,8 @@ describe("actor queue overflow", () => {
     const actors = w.manager();
     const slow = await actors.create({ name: "slow", instructions: "Supervise.", topics: ["team.events"], responseMode: "text", coalesce: false });
     await w.mesh.publish({ topic: "team.direct", to: slow.id, from, text: "BLOCK slow's long run" });
-    await waitFor(() => actors.status(slow.id).status === "running");
+    // BLOCK pauses the injected run before a worker launches.
+    await waitFor(() => actors.status(slow.id).status === "preparing");
     const controller = new AbortController();
     const cancelled = actors.ask(slow.id, "a caller's request", undefined, controller.signal).catch((error: Error) => error.message);
     await waitFor(() => actors.status(slow.id).queued === 1);
@@ -137,7 +140,8 @@ describe("actor queue overflow", () => {
     const actors = w.manager();
     const slow = await actors.create({ name: "slow", instructions: "Supervise.", topics: ["team.events"], responseMode: "text", coalesce: false });
     await w.mesh.publish({ topic: "team.direct", to: slow.id, from, text: "BLOCK slow's long run" });
-    await waitFor(() => actors.status(slow.id).status === "running");
+    // BLOCK pauses the injected run before a worker launches.
+    await waitFor(() => actors.status(slow.id).status === "preparing");
     for (let n = 1; n <= 12; n++) await w.mesh.publish({ topic: "team.events", from, text: `ev-${n}` });
     await waitFor(() => actors.messages(slow.id).filter((message) => message.error?.startsWith("Dropped")).length === 3, 10_000);
     expect(actors.status(slow.id).queued).toBe(9);                // 1 queued and 8 in its overflow

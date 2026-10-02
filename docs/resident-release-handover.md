@@ -31,6 +31,16 @@ claim the old failed-B recovery matrix applies to this head. B failure and Main
 loss *after B spawn* are unreachable on this policy: no B attempt is authorized.
 Use the existing explicit installer drain/exit-proof path to change releases.
 
+Launcher shutdown tracks its directly spawned child through native process exit.
+A missing Linux birth observation cannot suppress native TERM/KILL, and inherited
+pipes cannot substitute for an exit receipt. Repeated shutdown signals share one
+cleanup pass; the finalizer joins observed cleanup even after the direct child
+exits. TERM and KILL each have a five-second wait. This hardening applies on
+Windows too, where descendant sampling is unavailable. Native-child receipts
+prove only that child exited. They do not establish attempt membership, prove
+helper exit or authorize fallback. Detached/reparented helpers and supervisor
+crash containment remain part of #3103's boundary work.
+
 ## Retained protocol primitives
 
 1. Each Main runtime publishes a birth-bound, nonce-qualified intent. Native

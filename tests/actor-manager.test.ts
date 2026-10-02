@@ -466,11 +466,11 @@ describe("ActorManager presence under a stalled mesh lock", () => {
 const recordRuns = (agents: AgentManager, hold?: () => Promise<void>) => {
   const runs: Array<{ task: string; startedAt: number; finishedAt?: number }> = [];
   const run = agents.run.bind(agents);
-  vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
+  vi.spyOn(agents, "run").mockImplementation(async (request, signal, ...callbacks) => {
     const entry: { task: string; startedAt: number; finishedAt?: number } = { task: request.task, startedAt: Date.now() };
     runs.push(entry);
     try {
-      const result = await run(request, signal);
+      const result = await run(request, signal, ...callbacks);
       await hold?.();
       return result;
     } finally { entry.finishedAt = Date.now(); }
@@ -1540,7 +1540,8 @@ describe("ActorManager", () => {
     const run = vi.spyOn(agents, "run");
     const actor = await actors.create({ name: "window", instructions: "Keep quiet", extensions: false, tools: [], inferenceContext: "activation" });
     const pending = actors.ask(actor.id, "LIVE_WITH_PROGRESS");
-    expect(actors.status(actor.id).status).toBe("running");
+    expect(actors.status(actor.id).status).toBe("preparing");
+    expect(actors.status(actor.id).inFlightRun).toBeUndefined();
     // Change policy during the pre-launch await, not just after spawn.
     await actors.setInferenceContext(actor.id, "full-history");
     await waitFor(() => run.mock.calls.length === 1);
@@ -1913,7 +1914,9 @@ describe("ActorManager", () => {
       expect.any(AbortSignal),
       expect.any(Function),
       expect.any(Function),
+      expect.any(Function),
       expect.any(Function), // durable activation-lineage downgrade fence
+      { timeoutMs: 30_000, onPreparing: expect.any(Function) },
     );
   });
 
@@ -2579,9 +2582,9 @@ describe("ActorManager", () => {
     const { actors, agents } = setup();
     const requests: Array<{ replyTool?: boolean; systemPrompt?: string; schema?: unknown; runner?: string }> = [];
     const run = agents.run.bind(agents);
-    vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
+    vi.spyOn(agents, "run").mockImplementation(async (request, signal, ...callbacks) => {
       requests.push(request as never);
-      return run(request, signal);
+      return run(request, signal, ...callbacks);
     });
     const pi = await actors.create({ name: "advisor", instructions: "Advise.", responseMode: "directive", delivery: "mailbox" });
     await actors.ask(pi.id, "Review this turn");

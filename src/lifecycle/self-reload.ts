@@ -1,10 +1,10 @@
 import fs from "node:fs";
-import { fabricHostIdentity, sendFabricUserMessage } from "../fabric-provenance.js";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resolveAgentDir } from "../core/agent-dir.js";
+import { activeFabricRoot, loadedFabricRoot, releaseLabel, resolveAgentDir, SELF_RELOAD_COMMAND } from "../core/agent-dir.js";
 import type { ResourceBinding } from "./reload-target-profile.js";
+// Preserve the self-reload module's public selector API for callers and tests.
+export { activeFabricRoot, loadedFabricRoot, releaseLabel, SELF_RELOAD_COMMAND } from "../core/agent-dir.js";
 
 // smarty-dev#2160: a Main loaded from one Fabric release reloads itself when the Pi profile's
 // settings.json activates another. The installer swaps the one `packages` entry that is Fabric
@@ -12,7 +12,6 @@ import type { ResourceBinding } from "./reload-target-profile.js";
 // pattern, so any profile works.
 
 export const AUTO_RELOAD_OPT_OUT_ENV = "PI_FABRIC_NO_AUTO_RELOAD";
-export const SELF_RELOAD_COMMAND = "fabric-release-reload";
 export const RELOADED_TOPIC = "ops.fabric.reloaded";
 export const SELF_RELOAD_STATUS = "fabric-reload";
 export const RELOAD_HELD_TOPIC = "ops.fabric.reload_held";
@@ -39,55 +38,7 @@ export interface ReloadTargetResult {
 }
 /** A reload held this long by work or UI is reported once per continuous hold (smarty-dev#2216). */
 export const RELOAD_HELD_NOTICE_MS = 10 * 60_000;
-const PACKAGE_NAME = "pi-fabric";
 const RETRY_MS = 5_000;
-
-const packageName = (root: string): string | undefined => {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as { name?: unknown };
-    return typeof parsed.name === "string" ? parsed.name : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
-const real = (value: string): string => {
-  try { return fs.realpathSync(value); } catch { return path.resolve(value); }
-};
-
-/** The Fabric package root this code loaded from: the nearest pi-fabric package.json above it. */
-export const loadedFabricRoot = (moduleUrl: string): string | undefined => {
-  let directory: string;
-  try { directory = path.dirname(fileURLToPath(moduleUrl)); } catch { return undefined; }
-  for (;;) {
-    if (packageName(directory) === PACKAGE_NAME) return real(directory);
-    const parent = path.dirname(directory);
-    if (parent === directory) return undefined;
-    directory = parent;
-  }
-};
-
-/** The local Fabric package the profile's settings.json activates, if exactly one. */
-export const activeFabricRoot = (settingsPath: string): string | undefined => {
-  let packages: unknown;
-  try {
-    packages = (JSON.parse(fs.readFileSync(settingsPath, "utf8")) as { packages?: unknown }).packages;
-  } catch {
-    return undefined;
-  }
-  if (!Array.isArray(packages)) return undefined;
-  const base = path.dirname(settingsPath);
-  const roots = packages.flatMap((entry) => {
-    const source = typeof entry === "string" ? entry : (entry as { source?: unknown } | null)?.source;
-    if (typeof source !== "string" || /^(npm|git|https?):/.test(source)) return [];
-    const expanded = source.startsWith("~/") ? path.join(process.env.HOME ?? "", source.slice(2)) : source;
-    const root = path.resolve(base, expanded);
-    return packageName(root) === PACKAGE_NAME ? [real(root)] : [];
-  });
-  return roots.length === 1 ? roots[0] : undefined;
-};
-
-export const releaseLabel = (root: string): string => path.basename(root);
 
 /**
  * Watches the profile settings.json for a different active Fabric release. A turn end costs one
@@ -431,7 +382,8 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     globals[commandSequenceKey] = sequence;
     const token = candidate.kind === "resource" ? `resource-${sequence}` : "";
     scheduled = { candidate, token };
-    sendFabricUserMessage(pi, `/${SELF_RELOAD_COMMAND} auto${token ? ` ${token}` : ""}`, () => fabricHostIdentity(context.sessionManager.getSessionId()), "followUp", { expandPromptTemplates: true }, "mesh");
+    // Fabric-internal reload scheduling has no participant sender (#2636).
+    pi.sendUserMessage(`/${SELF_RELOAD_COMMAND} auto${token ? ` ${token}` : ""}`, { expandPromptTemplates: true });
     return true;
   };
 

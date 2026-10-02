@@ -1,13 +1,20 @@
 import { randomUUID } from "node:crypto";
+import type { AgentFollowUpRunningWarning } from "./agents/types.js";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, syncPathNamespace, writeFileAtomic } from "./core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic } from "./core/atomic-write.js";
+import { withConfirmedSessionFile } from "./core/session-receipts.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
 
 const MAIN_AGENT_ALIAS = "main";
+// Pi can report idle while a prompt's preflight still runs. Sending a followUp then puts it
+// in Pi's native queue, behind later followUps flushed as steers by this drain (#754).
+// Older hosts do not expose this optional capability.
+const promptPending = (ctx: ExtensionContext): boolean =>
+  "isPromptPending" in ctx && typeof ctx.isPromptPending === "function" && ctx.isPromptPending() === true;
 
 export { retainRootRegistration, forgetRetainedRootRegistration, releaseRetainedRootRegistrations } from "./topology/root-registration-retention.js";
 
@@ -40,6 +47,8 @@ export interface FabricMainAgentDeliveryRequest {
   from: MeshIdentity;
   /** Recorded admission only; absence (including old bridges) makes no sender claim. */
   verification?: "mesh" | "bridge";
+  /** Producer-owned resident classification, carried through durable admission; never request.data. */
+  source?: "actor-output" | "fabric-host" | undefined;
   /** Host-owned envelope metadata, never request.data. */
   principal?: FabricPrincipal | undefined;
   message: string;
@@ -61,6 +70,8 @@ export interface FabricFollowUpQueueDepth {
 }
 
 export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDepth> {
+  /** Sender-only observation at task admission; delivery is unchanged. */
+  warning?: AgentFollowUpRunningWarning;
   /** Advisory identifier provenance notice; appended to delivered text when admission permits. */
   notice?: string;
   queued: true;
@@ -163,9 +174,16 @@ export const followUpCoalesceKey = (data: unknown): string | undefined => {
   return typeof key === "string" && key.length > 0 && key.length <= 200 ? key : undefined;
 };
 
+/** Resident alarms historically used actor labels. Their durable receipt alone proves no authorship. */
+const mainSenderClaimAllowed = (sender: MeshIdentity, deliveryId: unknown, source: unknown): boolean =>
+  source !== "fabric-host" && !(sender.kind === "actor" && typeof deliveryId === "string" &&
+    deliveryId.startsWith("resident:") && source !== "actor-output");
+
 interface HeldAgentMessage {
   id: string;
   from: MeshIdentity;
+  /** Resident producer evidence, retained even on hosts without Pi provenance support. */
+  source?: FabricMainAgentDeliveryRequest["source"];
   /** Original verified admission, journalled before acknowledgement; never a Pi receipt stamp. */
   provenance?: FabricTurnProvenance | undefined;
   message: string;
@@ -302,6 +320,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #closed = false;
   #reloading = false;
   #wake: ReturnType<typeof setInterval> | undefined;
+  #preflightWake: ReturnType<typeof setInterval> | undefined;
   #operation: AbortSignal | undefined;
   #offOperationAbort: (() => void) | undefined;
   // Keep the veto signal through both settlement notifications, including late owner aborts.
@@ -410,9 +429,11 @@ export class MainAgentController implements FabricMainAgentTarget {
     const item: HeldAgentMessage = {
       id: randomUUID(),
       from: sender,
-      ...(request.verification === "mesh" || request.verification === "bridge" ? {
+      ...((request.verification === "mesh" || request.verification === "bridge") &&
+        mainSenderClaimAllowed(sender, deliveryId, request.source) ? {
         provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, request.verification, request.principal),
       } : {}),
+      ...(request.source === "actor-output" || request.source === "fabric-host" ? { source: request.source } : {}),
       message,
       sentAt: Date.now(),
       ...(request.data === undefined ? {} : { data: serializableData(request.data) }),
@@ -488,11 +509,13 @@ export class MainAgentController implements FabricMainAgentTarget {
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
       if (providerHeld) this.#scheduleProviderWake();
+      else if (this.#context && promptPending(this.#context)) this.#wakeAfterPreflight();
       else if (this.#context?.isIdle()) {
         const canTrigger = !this.#halted && !this.#providerBackoffActive() && !this.#context?.signal?.aborted;
         this.#release(true);
         triggered = canTrigger && this.#sent.includes(item);
       }
+
     } else if (deliveryId !== undefined) {
       // A sent message may wait in Pi's volatile queue (prompt preflight, a settle): it stays in
       // the journal until the session holds it, and a restart replays it (#confirm, #replay).
@@ -695,24 +718,9 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Read the complete lines appended to the session file since the last call, in 1 MiB chunks. */
   #indexSessionFile(file: string): void {
-    let fd: number;
-    try {
-      // ponytail: Windows' FlushFileBuffers (fsyncSync) needs a writable handle; this code never writes through it.
-      fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      this.#restartIndex(file);    // not written (or removed): no cached persisted receipt
-      return;
-    }
-    try {
-      const stat = fs.fstatSync(fd);
+    if (!withConfirmedSessionFile(file, (fd, stat) => {
       const size = stat.size;
       const identity = `${stat.dev}:${stat.ino}`;
-      fs.fsyncSync(fd);
-      // Bind every namespace hop (including hidden link targets) to the opened
-      // receipt inode, and recheck the walk after ALL required barriers. Any
-      // uncertain hop retains the journal/source and propagates duplicate retries.
-      syncPathNamespace(file, stat);
       if (this.#source !== file || this.#scanned === undefined || size < this.#scanned || this.#sessionFileIdentity !== identity) {
         this.#restartIndex(file);
       }
@@ -739,9 +747,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         // A partial last line is read again next time, once it is complete.
         this.#scanned = position - carry.reduce((sum, part) => sum + part.length, 0);
       }
-    } finally {
-      fs.closeSync(fd);
-    }
+    })) this.#restartIndex(file); // Not written (or removed): no cached persisted receipt.
   }
 
   /** The followUp ids in Pi's in-memory entry list, persisted or not. */
@@ -838,17 +844,19 @@ export class MainAgentController implements FabricMainAgentTarget {
           }
           // A policy this runtime cannot read is dropped: the item is then released as a held
           // followUp, as before policies were journalled.
-          const { deliverAs, triggerTurn, supersedes, provenance, ...rest } = item;
+          const { deliverAs, triggerTurn, supersedes, provenance, source, ...rest } = item;
           const via = provenance?.via;
           const verified = provenance?.sender?.verified;
           items.push({
             ...rest, from: sender,
             // Only a recorded admission method permits a claim. Old journals (native or
             // bridged) are UNKNOWN; payload fields and a missing bridge marker prove nothing.
-            ...(verified === "mesh" || verified === "bridge" ? {
+            ...((verified === "mesh" || verified === "bridge") &&
+              mainSenderClaimAllowed(sender, item.deliveryId, source) ? {
               provenance: fabricTurnProvenance(sender, via === "steer" || via === "followUp" || via === "actor" || via === "replay"
                 ? via : deliverAs === "steer" ? "steer" : "followUp", verified, provenance?.principal),
             } : {}),
+            ...(source === "actor-output" || source === "fabric-host" ? { source } : {}),
             ...(Array.isArray(supersedes) ? { supersedes: supersedes.filter((id) => typeof id === "string") } : {}),
             ...(DIRECT_DELIVERIES.has(deliverAs) && typeof triggerTurn === "boolean" ? { deliverAs, triggerTurn } : {}),
           });
@@ -1090,7 +1098,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   #drainActive(): boolean {
     return this.#context !== undefined &&
       ((this.#providerReleaseUntil !== undefined && this.#held.length > 0) ||
-        (!this.#closed && (this.#held.length > 0 || this.#context.isIdle() === false)));
+        (!this.#closed && (this.#held.length > 0 || this.#context.isIdle() === false || promptPending(this.#context))));
+
   }
 
   /**
@@ -1201,6 +1210,22 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#wake.unref?.();
   }
 
+  #wakeAfterPreflight(): void {
+    // Handled input and failed validation clear isPromptPending without any run/settle
+    // event. Observe that completion only after admission is journalled. If a run starts,
+    // leave FIFO delivery to its boundaries; halt/reload/close cancel this waiter too.
+    if (this.#preflightWake) return;
+    this.#preflightWake = setInterval(() => {
+      const ctx = this.#context;
+      // A no-run preflight may also leave an async compaction handler finishing. Busy
+      // alone is not proof of agent_start; that event explicitly cancels this waiter.
+      if (ctx && (promptPending(ctx) || !ctx.isIdle())) return;
+      if (ctx) this.#release(true); // #send retains owner/provider vetoes.
+      else this.#stopWake();
+    }, 25);
+    this.#preflightWake.unref?.();
+  }
+
   #stopOperation(): void {
     // Retiring a compaction signal must not cancel a scheduled provider retry.
     if (this.#wake) clearInterval(this.#wake);
@@ -1255,16 +1280,24 @@ export class MainAgentController implements FabricMainAgentTarget {
   #stopProviderWake(): void {
     if (this.#providerWake) clearTimeout(this.#providerWake);
     this.#providerWake = undefined;
+
   }
 
   #stopWake(): void {
     if (this.#wake) clearInterval(this.#wake);
+    if (this.#preflightWake) clearInterval(this.#preflightWake);
     this.#wake = undefined;
+    this.#preflightWake = undefined;
     this.#stopProviderWake();
+
   }
 
   #release(triggerTurn: boolean, closing = false): void {
     if (this.#reloading) return;
+    if (!closing && this.#context && promptPending(this.#context)) {
+      this.#wakeAfterPreflight();
+      return;
+    }
     if (!closing && this.#providerAttemptInFlight && !this.#halted && !this.#context?.signal?.aborted) return;
     // An error settle must not downgrade a held wake into passive Pi context forever.
     if (!closing && this.#providerFailed && !this.#halted && !this.#context?.signal?.aborted &&

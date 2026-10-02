@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawnDetached } from "../src/agents/transports/process-utils.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 
 // Preserve native spawn, but capture its exact ChildProcess before it can close.
 vi.mock("node:child_process", async (importOriginal) => {
@@ -41,6 +42,7 @@ async function cleanupOwnedRoot(root: string, children: OwnedChild[]) {
 async function withOwnedWorker(
   source: string,
   run: (handle: Awaited<ReturnType<typeof spawnDetached>>, root: string, child: ChildProcess) => Promise<void>,
+  workerArguments?: string[],
 ) {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
   const children: OwnedChild[] = [];
@@ -54,7 +56,10 @@ async function withOwnedWorker(
   try {
     const worker = path.join(root, "worker.mjs");
     fs.writeFileSync(worker, source);
-    const handle = await spawnDetached(worker, [], root);
+    const launched = workerArguments === undefined ? undefined : await new ProcessTransport().launch({
+      id: "role-test", name: "role-test", cwd: root, workerPath: worker, workerArguments,
+    });
+    const handle = launched ? { ...launched, pid: Number(launched.sessionId) } : await spawnDetached(worker, [], root);
     await run(handle, root, children[0]!.child as ChildProcess);
   } finally {
     // Assertion failures must not leave a native worker or a mocked kill behind.
@@ -64,7 +69,64 @@ async function withOwnedWorker(
   }
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+
+describe("process task role environment (#2998)", () => {
+  it.each(["worktree-agent@0123456789ab", undefined])("sets the worker role before exec from parent %s and strips spawner role overrides", async (parentRole) => {
+    vi.stubEnv("SMARTY_ROLE", parentRole);
+    vi.stubEnv("PI_FABRIC_ROLE", "worktree-agent");
+    vi.stubEnv("SMARTY_READ_CLASS", "critical");
+    vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
+    vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", "session:parent");
+    vi.stubEnv("PI_FABRIC_SESSION_ID", "parent-session");
+    const expectedRole = parentRole ? "task-agent@0123456789ab" : "task-agent";
+    const source = `import fs from "node:fs";
+fs.writeFileSync("env.json", JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => [
+  "SMARTY_ROLE", "PI_FABRIC_ROLE", "SMARTY_READ_CLASS", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_MAIN_AGENT_ID", "PI_FABRIC_SESSION_ID"
+].includes(key)))));
+setInterval(() => {}, 1000);`;
+    await withOwnedWorker(source, async (handle, root) => {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(root, "env.json"))).toBe(true));
+      expect(JSON.parse(fs.readFileSync(path.join(root, "env.json"), "utf8"))).toEqual({
+        SMARTY_ROLE: expectedRole, PI_FABRIC_ACTOR_NAME: "parent-actor",
+        PI_FABRIC_MAIN_AGENT_ID: "session:parent", PI_FABRIC_SESSION_ID: "parent-session",
+      });
+      if (process.platform === "linux") {
+        const entries = fs.readFileSync(`/proc/${handle.pid}/environ`, "utf8").split("\0");
+        expect(entries).toContain(`SMARTY_ROLE=${expectedRole}`);
+        expect(entries.some(entry => entry.startsWith("PI_FABRIC_ROLE=") || entry.startsWith("SMARTY_READ_CLASS="))).toBe(false);
+      }
+      expect(process.env.SMARTY_ROLE).toBe(parentRole);
+      expect(process.env.PI_FABRIC_ROLE).toBe("worktree-agent");
+      expect(process.env.SMARTY_READ_CLASS).toBe("critical");
+    }, ["--name", "--actor-name"]); // A flag-shaped value is not an explicit actor.
+  });
+
+  it("does not relabel generic detached launches such as a resident host", async () => {
+    vi.stubEnv("SMARTY_ROLE", "project-agent@0123456789ab");
+    vi.stubEnv("PI_FABRIC_ROLE", "project-agent");
+    await withOwnedWorker(`import fs from "node:fs";
+fs.writeFileSync("env.json", JSON.stringify({role:process.env.SMARTY_ROLE,override:process.env.PI_FABRIC_ROLE}));`, async (_handle, root) => {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(root, "env.json"))).toBe(true));
+      expect(JSON.parse(fs.readFileSync(path.join(root, "env.json"), "utf8"))).toEqual({
+        role: "project-agent@0123456789ab", override: "project-agent",
+      });
+    });
+  });
+
+  it("retains explicit actor role and attribution at the process boundary", async () => {
+    vi.stubEnv("SMARTY_ROLE", "review-agent@0123456789ab");
+    vi.stubEnv("PI_FABRIC_ROLE", "review-agent");
+    vi.stubEnv("SMARTY_READ_CLASS", "critical");
+    await withOwnedWorker(`import fs from "node:fs";
+fs.writeFileSync("env.json", JSON.stringify({role:process.env.SMARTY_ROLE,override:process.env.PI_FABRIC_ROLE,readClass:process.env.SMARTY_READ_CLASS}));`, async (_handle, root) => {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(root, "env.json"))).toBe(true));
+      expect(JSON.parse(fs.readFileSync(path.join(root, "env.json"), "utf8"))).toEqual({
+        role: "review-agent@0123456789ab", override: "review-agent", readClass: "critical",
+      });
+    }, ["--actor-id", "actor", "--actor-name", "security-review"]);
+  });
+});
 
 describe("spawnDetached", () => {
   // dev-lead review D7 on #26: after the worker exited, its numeric id may name an

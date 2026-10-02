@@ -10,7 +10,7 @@ export class ChildProcessCloseBarrier {
     let resolve!: () => void;
     // IPC-only Node guests have no stdio handles to drain. Their runtime removes
     // even Node's internal disconnect listener, so ChildProcess.close may never
-    // emit. Actual exit is the correct barrier for those guests; require close
+    // emit. Actual exit plus disconnected IPC is their barrier; require close
     // for children with real stdio (including CPython) and detached workers.
     const barrier: "exit" | "close" = child.channel && child.stdio.every(stream => stream === null) ? "exit" : "close";
     const entry = { child, barrier, released: false,
@@ -19,10 +19,14 @@ export class ChildProcessCloseBarrier {
     // Observe emission, not a removable listener: NodeProcessRuntime intentionally
     // removes all listeners when its result settles. No behavior or deadlines change.
     const emit = child.emit;
+    let exited = false;
     child.emit = function (event: string | symbol, ...args: unknown[]) {
       try { return emit.call(this, event, ...args); }
       finally {
-        if (event === entry.barrier) {
+        if (event === "exit") exited = true;
+        const released = entry.barrier === "close" ? event === "close"
+          : exited && !child.connected && (event === "exit" || event === "disconnect");
+        if (released) {
           entry.released = true;
           child.emit = emit;
           resolve();

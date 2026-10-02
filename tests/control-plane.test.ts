@@ -52,6 +52,72 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
+  it.each([false, true])("only sheds an optional warning, not delivery fields or an oversized core (oversized=%s)", async oversized => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-advisory-budget-")); roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const make = (id: string) => {
+      const value = new FabricControlPlane(new MeshStore(meshRoot, 2300, 1000), identity(id), {
+        enabled: true, hostId: id, pollMs: 20, acknowledgementTimeoutMs: 1000,
+      });
+      planes.push(value); return value;
+    };
+    const owner = make("host:owner"), sender = make("host:sender");
+    const delivery = { accepted: true, messageId: "accepted", triggered: false, reason: "held",
+      pendingFollowUps: 1, oldestAgeS: 2, coalesced: true as const, replacedMessageId: "previous",
+      ...(oversized ? { result: "x".repeat(300) } : {}),
+    };
+    owner.start(() => ({ ...delivery, warning: {
+      code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: "agent:target", kind: "agent", status: "running",
+      message: "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.",
+    } }));
+    sender.start(() => ({ accepted: false }));
+    const outcome = sender.request("host:owner", "agent:target", "followUp", { message: "later" });
+    if (oversized) await expect(outcome).rejects.toThrow("Fabric control result exceeds 2300 mesh event bytes");
+    else await expect(outcome).resolves.toEqual({ queued: true, messageId: delivery.messageId, routed: "mesh", acknowledged: true,
+      triggered: false, reason: "held", pendingFollowUps: 1, oldestAgeS: 2, coalesced: true, replacedMessageId: "previous" });
+    const ack = sender.mesh.read({ topic: "fabric.control.ack", limit: 10 })[0]!.data;
+    expect(ack).toMatchObject(oversized ? { accepted: false, error: "Fabric control result exceeds 2300 mesh event bytes" } : delivery);
+    expect(ack).not.toHaveProperty("warning");
+  });
+
+  it("followUp advisory A6 validates incoming ACKs without changing success or retrying", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-followup-ack-")); roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender");
+    sender.start(() => ({ accepted: false }));
+    const valid = {
+      code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: "agent:target", kind: "agent", status: "running",
+      message: "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.",
+    };
+    // Publish directly: exercise the sender's parser independently of owner-side serialization.
+    const variants = [undefined, null, "warning", [], {},
+      { ...valid, code: "other" }, { ...valid, kind: "main" }, { ...valid, status: "completed" },
+      { ...valid, message: "sender-supplied text" }, { ...valid, message: "x".repeat(257) },
+      { ...valid, targetId: "agent:other" }, { ...valid, targetId: "x".repeat(201) },
+      { ...valid, targetId: 42 }, valid, { ...valid, privateData: "must not leak" }];
+    for (const [index, warning] of variants.entries()) {
+      const outcome = sender.request("host:owner", "agent:target", "followUp", { message: "later" });
+      await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(index + 1));
+      const command = sender.mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!.data as { commandId: string };
+      await sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:owner"), to: "host:sender",
+        data: { version: 1, commandId: command.commandId, targetId: "agent:target", accepted: true, messageId: "accepted", ...(warning === undefined ? {} : { warning }) } });
+      expect(await outcome).toEqual({ queued: true, messageId: "accepted", routed: "mesh", acknowledged: true,
+        ...(index >= variants.length - 2 ? { warning: valid } : {}) });
+    }
+    expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(variants.length);
+    // A matching target still has to satisfy the bound; mismatch alone must not cover this check.
+    for (const length of [200, 201]) {
+      const targetId = "x".repeat(length);
+      const outcome = sender.request("host:owner", targetId, "followUp", { message: "later" });
+      await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(variants.length + length - 199));
+      const command = sender.mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!.data as { commandId: string };
+      await sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:owner"), to: "host:sender",
+        data: { version: 1, commandId: command.commandId, targetId, accepted: true, messageId: "bounded", warning: { ...valid, targetId } } });
+      expect(await outcome).toEqual({ queued: true, messageId: "bounded", routed: "mesh", acknowledged: true,
+        ...(length === 200 ? { warning: { ...valid, targetId } } : {}) });
+    }
+    expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(variants.length + 2);
+  });
+
   it("retries cancellation beyond the production 10-second lock timeout with commit-time ACK timing", { timeout: 25_000 }, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "control-default-lock-")); roots.push(root);
     // No store timeout override and no ACK override: production defaults are 10s and 5s.
@@ -122,6 +188,34 @@ describe("FabricControlPlane", () => {
     await vi.waitFor(() => expect(aborted).toHaveBeenCalledOnce(), { timeout: 2_000 });
     expect(sender.mesh.read({ topic: "fabric.control.command", limit: 20 }).filter(event => event.kind === "cancel")).toHaveLength(0);
   });
+  it("keeps the production local deadline at 5 s and does not run a command arriving just after it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-local-deadline-"));
+    roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender", {}, { acknowledgementTimeoutMs: 5_000 });
+    const receiver = plane(path.join(root, "mesh"), "host:receiver", {}, { acknowledgementTimeoutMs: 5_000 });
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const receive = vi.fn(() => ({ accepted: true }));
+    const outcome = sender.request("host:receiver", "agent:target", "stop").catch((error: Error) => error);
+    try {
+      sender.start(() => ({ accepted: false }));
+      await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(1));
+      const command = sender.mesh.read({ topic: "fabric.control.command" })[0]!.data as FabricControlCommand;
+      expect(command.deadlineAt).toBe(command.requestedAt + 5_000);
+      now = command.requestedAt + 5_001;
+      receiver.start(receive);
+      expect(await outcome).toMatchObject({ message: "Fabric control command expired; not delivered, safe to resend." });
+      expect(receive).not.toHaveBeenCalled();
+      expect(sender.mesh.read({ topic: "fabric.control.ack" })[0]!.data)
+        .toMatchObject({ accepted: false, error: "Fabric control command expired", notRun: true });
+      expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(1);
+    } finally {
+      await sender.close(); await receiver.close();
+      await outcome;
+      clock.mockRestore();
+    }
+  });
+
   describe("pending mirrored owners", () => {
     const setup = async (timeoutMs = 1_000) => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-mirror-"));
@@ -503,6 +597,35 @@ describe("FabricControlPlane", () => {
     const settle = <T>(promise: Promise<T>) => promise.then(
       (value) => ({ value, error: undefined }), (error: Error) => ({ value: undefined, error }),
     );
+
+    it.each(["steer", "followUp", "stop"] as const)("reports a proven expired mirrored %s as not delivered and safe to resend", async (operation) => {
+      const f = await setup();
+      try {
+        f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 120_000 });
+        const outcome = settle(f.sender.request("host:owner", "agent:target", operation, {}, "identity:owner"));
+        // Messages retain their existing single notRun retry; stop never retries.
+        const attempts = operation === "stop" ? 1 : 2;
+        for (let attempt = 0; attempt < attempts; attempt++) {
+          await vi.advanceTimersByTimeAsync(0);
+          const command = f.commands().filter((event) => event.kind !== "cancel")[attempt]!.data as FabricControlCommand;
+          expect(command.deadlineAt).toBe(command.requestedAt + 30_000);
+          await vi.advanceTimersByTimeAsync(30_001);
+          await f.sender.mesh.publish({
+            topic: "fabric.control.ack", kind: "rejected", from: identity("identity:owner"), to: "host:sender",
+            data: { version: 1, commandId: command.commandId, targetId: "agent:target", accepted: false,
+              error: "Fabric control command expired", notRun: true, bridge: { from: "forge" } },
+          });
+          await vi.advanceTimersByTimeAsync(20);
+        }
+        const { error } = await outcome;
+        expect(error?.message).toBe("Fabric control command expired; not delivered, safe to resend.");
+        expect(error?.message).not.toContain("outcome is unknown");
+        expect(error).toHaveProperty("notRun", true);
+        expect(f.commands().map((event) => event.kind)).toEqual(Array(attempts).fill(operation));
+        await f.sender.close();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally { await f.dispose(); }
+    });
 
     it.each([[1, 30_000], [60_000, 60_000]])("uses configured bridge window %i, floored to %i ms", async (configured, expected) => {
       const f = await setup(false, true, true, configured);
@@ -2050,7 +2173,7 @@ describe("FabricControlPlane", () => {
 
     it("does not retry a command that is not a message", async () => {
       const { error, receive, commands } = await run("stop");
-      expect(error?.message).toBe("Fabric control command expired");
+      expect(error?.message).toBe("Fabric control command expired; not delivered, safe to resend.");
       expect(commands).toHaveLength(1);
       expect(receive).not.toHaveBeenCalled();
     }, 15_000);

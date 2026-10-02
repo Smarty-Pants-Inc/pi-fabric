@@ -1058,6 +1058,51 @@ describe("AgentManager", () => {
     ).toBe("2");
   });
 
+  it.skipIf(process.platform === "win32")("3238 pins the first Pi artifact across a startup retry when its launcher symlink moves", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launch-pin-"));
+    roots.push(root);
+    const launcher = path.join(root, "pi.mjs");
+    const qualified = path.join(root, "qualified.mjs");
+    const oldPi = path.join(root, "old.mjs");
+    fs.writeFileSync(qualified, `
+      import fs from 'node:fs';
+      if (fs.readlinkSync(${JSON.stringify(launcher)}) === ${JSON.stringify(qualified)}) {
+        fs.unlinkSync(${JSON.stringify(launcher)});
+        fs.symlinkSync(${JSON.stringify(oldPi)}, ${JSON.stringify(launcher)});
+      }
+      console.log(JSON.stringify({hostCapabilities:{turnProvenance:1}}));
+    `);
+    fs.writeFileSync(oldPi, "console.log(JSON.stringify({hostCapabilities:{}}));\n");
+    fs.symlinkSync(qualified, launcher);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), piBinary: launcher, runRoot: root,
+    });
+    managers.push(manager);
+    const result = await manager.run({task: "Recover pinned Pi startup", transport: "process"});
+    expect(result, JSON.stringify(result)).toMatchObject({status: "completed", text: "startup retry recovered"});
+    const attempts = fs.readFileSync(path.join(manager.runDirectory(result.id)!, "pi-launches.jsonl"), "utf8")
+      .trim().split("\n").map(line => JSON.parse(line));
+    expect(attempts).toEqual([
+      {binary: qualified, turnProvenance: 1}, {binary: qualified, turnProvenance: 1},
+    ]);
+    expect(fs.readlinkSync(launcher)).toBe(oldPi);
+  }, 30_000);
+
+  it.each(["window before first turn", "window after work"])("3238 never relaunches a window refusal despite retryable transport/auth diagnostics: %s", async task => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-window-terminal-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const result = await manager.run({task, actorId: "window-actor", transport: "process"});
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("Context exceeds window:");
+    const directory = manager.runDirectory(result.id)!;
+    expect(fs.readFileSync(path.join(directory, "startup-attempts"), "utf8")).toBe("1");
+    expect(fs.existsSync(path.join(directory, "relaunches.jsonl"))).toBe(false);
+  }, 30_000);
+
   it("does not retry deterministic failures before the first turn", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -2048,6 +2093,13 @@ describe("AgentManager", () => {
     };
 
     try {
+      vi.stubEnv("SMARTY_ROLE", "worktree-agent@0123456789ab");
+      vi.stubEnv("PI_FABRIC_ACTOR_NAME", undefined);
+      vi.stubEnv("PI_FABRIC_ROLE", "worktree-agent");
+      expect(await report()).toEqual({ role: "task-agent@0123456789ab", actorName: null, fabricRole: null });
+      expect(await report("security-review")).toEqual({
+        role: "worktree-agent@0123456789ab", actorName: "security-review", fabricRole: "worktree-agent",
+      });
       vi.stubEnv("SMARTY_ROLE", "worktree-agent@abc123");
       vi.stubEnv("PI_FABRIC_ACTOR_NAME", undefined);
       vi.stubEnv("PI_FABRIC_ROLE", undefined);
@@ -2060,12 +2112,12 @@ describe("AgentManager", () => {
       expect(await report("security-review")).toEqual({
         role: null, actorName: "security-review", fabricRole: null,
       });
-      // These inherited identities are deliberately unchanged: the governor prioritizes actors,
-      // and participantRole prioritizes PI_FABRIC_ROLE over SMARTY_ROLE.
+      // Actor write attribution stays inherited, but a spawner-only role
+      // override must not hide the ordinary task's role in participant discovery.
       vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
       vi.stubEnv("PI_FABRIC_ROLE", "project-agent");
       expect(await report()).toEqual({
-        role: "task-agent", actorName: "parent-actor", fabricRole: "project-agent",
+        role: "task-agent", actorName: "parent-actor", fabricRole: null,
       });
     } finally {
       vi.unstubAllEnvs();
@@ -2726,9 +2778,16 @@ describe("AgentManager steering", () => {
     roots.push(root);
     const manager = hangManager(root);
     const handle = await manager.spawn({ task: "HANG", transport: "process" });
-    manager.followUp(handle.id, "then summarize");
+    await waitFor(() => fs.existsSync(path.join(manager.runDirectory(handle.id)!, "status.json")));
+    const receipt = manager.followUp(handle.id, "then summarize");
+    expect(receipt).toEqual({ queued: true, messageId: expect.any(String), warning: {
+      code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: handle.id, kind: "agent", status: "running",
+      message: "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.",
+    } });
     const entries = readSteerFile(manager.runDirectory(handle.id)!);
-    expect(entries[0]).toMatchObject({ type: "follow_up", message: "then summarize" });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ type: "follow_up", message: "then summarize", id: receipt.messageId });
+    expect(entries[0]).not.toHaveProperty("warning");
     await manager.stop(handle.id);
   });
 

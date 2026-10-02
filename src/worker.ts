@@ -13,7 +13,9 @@ import type {
   AgentRunStatus,
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
+import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
+import { ActivationSession } from "./worker/activation-session.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -349,8 +351,12 @@ const main = async (): Promise<void> => {
   const schema = options.schemaFile
     ? fs.readFileSync(options.schemaFile, "utf8")
     : undefined;
+  const activationWindow = options.inferenceContext === "activation";
+  const activationSession = activationWindow
+    ? new ActivationSession(options.sessionFile!, path.dirname(options.statusFile), options.cwd)
+    : undefined;
   const piArguments = ["--mode", "rpc"];
-  if (options.sessionFile) piArguments.push("--session", options.sessionFile);
+  if (options.sessionFile) piArguments.push("--session", activationSession?.file ?? options.sessionFile);
   else piArguments.push("--no-session");
   if (!options.extensions) piArguments.push("--no-extensions");
   if (options.residentStartupProbe) {
@@ -358,7 +364,6 @@ const main = async (): Promise<void> => {
     // skills, prompts, context files or compaction merely to decide on rollback.
     piArguments.push("--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files");
   }
-  const activationWindow = options.inferenceContext === "activation";
   const activationNonce = activationWindow ? randomUUID() : undefined;
   const residentProbeNonce = options.residentStartupProbe ? randomUUID() : undefined;
   let activationHookPath: string | undefined;
@@ -407,6 +412,15 @@ const main = async (): Promise<void> => {
       import.meta.url,
     ));
     if (!fs.existsSync(hookPath)) throw new Error("Actor bash timeout hook is missing");
+    piArguments.push("-e", hookPath);
+  }
+  if (options.runner === "pi" && options.routeHeader) {
+    const hookPath = fileURLToPath(new URL(
+      import.meta.url.endsWith(".ts") ? "./guards/model-route-hook.ts" : "./guards/model-route-hook.js",
+      import.meta.url,
+    ));
+    if (!fs.existsSync(hookPath)) throw new Error("Model route header hook is missing");
+    // Explicit -e is loaded even with --no-extensions: attribution is not optional.
     piArguments.push("-e", hookPath);
   }
   const piTools = replyTool ? [...options.tools, "fabric_reply"] : options.tools;
@@ -465,8 +479,11 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
-  const childEnvironment = { ...process.env };
+  const childEnvironment = options.actorName ? { ...process.env } : taskAgentEnvironment();
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
+  // A nested explicit-model task must never inherit its parent's route attribution.
+  delete childEnvironment.PI_FABRIC_ROUTE_HEADER;
+  if (options.routeHeader) childEnvironment.PI_FABRIC_ROUTE_HEADER = options.routeHeader;
   if (options.actorId && options.bashTimeoutSeconds !== undefined &&
     Number.isInteger(options.bashTimeoutSeconds) && options.bashTimeoutSeconds >= 0) {
     childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S = String(options.bashTimeoutSeconds);
@@ -478,7 +495,6 @@ const main = async (): Promise<void> => {
     detached: process.platform !== "win32",
     env: {
       ...childEnvironment,
-      ...(options.actorName ? {} : { SMARTY_ROLE: "task-agent" }),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
@@ -648,6 +664,10 @@ const main = async (): Promise<void> => {
       if (["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(effectiveThinking ?? "")) {
         record.thinking = effectiveThinking as NonNullable<AgentRunRecord["thinking"]>;
       }
+      if (options.routeHeader) {
+        if (record.model) record.admittedModel = record.model;
+        if (record.thinking) record.admittedThinking = record.thinking;
+      }
       update();
       // The launcher authorizes this harmless isolated startup test. Exercise
       // the real worker/Pi/model/extension path, but never prompt a business actor
@@ -675,7 +695,7 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
-  }, activationWindow, options.residentStartupProbe === true);
+  }, activationWindow, options.residentStartupProbe === true, Boolean(options.routeHeader));
 
   // Attributed token telemetry. Every usage-bearing child event emits one
   // tokens.usage lifecycle entry identified by this run/actor/runner/depth.
@@ -1100,6 +1120,23 @@ const main = async (): Promise<void> => {
       if (typeof message === "object" && message !== null && !Array.isArray(message)) {
         modelControl.observeAssistant(message as Record<string, unknown>);
       }
+    }
+    // Context refusal is deterministic for an actor's admitted input. Native
+    // retries cannot make it fit; stop at the first structured failure, also
+    // for full-history actors or a preflight extension that reports an error.
+    const eventMessage = event.type === "message_end" && typeof event.message === "object" && event.message !== null
+      ? event.message as Record<string, unknown> : undefined;
+    const contextError = eventMessage?.stopReason === "error" ? stringField(eventMessage.errorMessage)
+      : event.type === "extension_error" || (event.type === "response" && event.success === false) ? stringField(event.error)
+      : event.type === "auto_retry_start" ? stringField(event.errorMessage) : undefined;
+    if (options.actorId && !terminalStatus && contextError && /Context exceeds window:/i.test(contextError)) {
+      terminalStatus = "failed";
+      terminalError = contextError;
+      record.error = contextError;
+      sawAgentError = true;
+      update();
+      killChild();
+      return;
     }
     if (!terminalStatus) {
       toolCallStreamGuard.observe(event);
@@ -1690,6 +1727,12 @@ const main = async (): Promise<void> => {
   if (logCompaction.compactionSkipped || logCompaction.error) {
     record.compactionSkipped = logCompaction.compactionSkipped ??
       `Terminal run-log compaction failed; full log retained: ${logCompaction.error}`;
+  }
+  try {
+    activationSession?.retain();
+  } catch (error) {
+    record.status = "failed";
+    record.error = `${record.error ? record.error + "\n" : ""}Activation journal retention failed: ${String(error)}`;
   }
   writeRunRecord(options.statusFile, record);
   terminalWritten = true;

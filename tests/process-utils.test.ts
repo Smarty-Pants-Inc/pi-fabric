@@ -18,6 +18,20 @@ type OwnedChild = {
   closed: Promise<void>;
 };
 
+function ownedIsExecuting(owned: { pid: number; started: string }): boolean {
+  // Birth identity and state must come from the same snapshot: after stop(),
+  // /proc can disappear between same(owned) and a second read of stat.
+  try {
+    const stat = fs.readFileSync(`/proc/${owned.pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+    return owned.started !== "" && fields[19] === owned.started && !["Z", "X"].includes(fields[0]!);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ESRCH") return false;
+    throw error; // An unknown snapshot must not make a strict exit assertion pass.
+  }
+}
+
 async function cleanupOwnedRoot(root: string, children: OwnedChild[]) {
   for (const { child, closed } of children) {
     // Use the owned native instance, never the handle's artificial death latch
@@ -67,6 +81,41 @@ async function withOwnedWorker(
 }
 
 afterEach(() => vi.restoreAllMocks());
+
+describe.skipIf(process.platform !== "linux")("owned execution snapshot", () => {
+  const owned = { pid: 123, started: "456" };
+  const stat = (state = "S", started = owned.started) =>
+    `${owned.pid} (owned (worker)) ${[state, ...Array<string>(18).fill("0"), started].join(" ")}`;
+
+  it("samples birth and state once even when a second read would encounter ENOENT", () => {
+    const read = vi.spyOn(fs, "readFileSync").mockReturnValueOnce(stat()).mockImplementation(() => {
+      throw Object.assign(new Error("process disappeared after the snapshot"), { code: "ENOENT" });
+    });
+    expect(ownedIsExecuting(owned)).toBe(true);
+    expect(read).toHaveBeenCalledExactlyOnceWith(`/proc/${owned.pid}/stat`, "utf8");
+  });
+
+  it.each(["ENOENT", "ESRCH"])("reports gone when the snapshot fails with %s", (code) => {
+    vi.spyOn(fs, "readFileSync").mockImplementation(() => { throw Object.assign(new Error(code), { code }); });
+    expect(ownedIsExecuting(owned)).toBe(false);
+  });
+
+  it.each(["Z", "X"])("does not report an owned %s process as executing", (state) => {
+    vi.spyOn(fs, "readFileSync").mockReturnValue(stat(state));
+    expect(ownedIsExecuting(owned)).toBe(false);
+  });
+
+  it("does not report a reused pid as owned execution", () => {
+    vi.spyOn(fs, "readFileSync").mockReturnValue(stat("S", "457"));
+    expect(ownedIsExecuting(owned)).toBe(false);
+  });
+
+  it.each(["EACCES", "EIO"])("does not mistake an unknown %s snapshot for exit", (code) => {
+    const error = Object.assign(new Error(code), { code });
+    vi.spyOn(fs, "readFileSync").mockImplementation(() => { throw error; });
+    expect(() => ownedIsExecuting(owned)).toThrow(error);
+  });
+});
 
 describe("spawnDetached", () => {
   // dev-lead review D7 on #26: after the worker exited, its numeric id may name an
@@ -135,11 +184,7 @@ describe("spawnDetached", () => {
       const pid = Number(fs.readFileSync(path.join(root, "child.pid"), "utf8"));
       const owned = { pid, started: startTime(pid) };
       expect(owned.started).not.toBe("");
-      const executing = () => {
-        if (!same(owned)) return false;
-        const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-        return !["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]!);
-      };
+      const executing = () => ownedIsExecuting(owned);
       try {
         expect(await handle.isAlive()).toBe(true); // capture the child's birth while leader lives
         fs.writeFileSync(path.join(root, "exit-now"), "exit");
@@ -242,7 +287,7 @@ describe("spawnDetached", () => {
       await vi.waitFor(() => expect(fs.existsSync(path.join(root, "detached-ready"))).toBe(true));
       const pid = Number(fs.readFileSync(path.join(root, "detached.pid"), "utf8"));
       const owned = { pid, started: startTime(pid) };
-      const live = () => same(owned) && !["Z", "X"].includes(fs.readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]!.split(" ")[0]!);
+      const live = () => ownedIsExecuting(owned);
       try {
         expect(await handle.isAlive()).toBe(true); // birth anchored before reparenting
         fs.writeFileSync(path.join(root, "exit-now"), "exit");

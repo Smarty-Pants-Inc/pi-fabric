@@ -1,3 +1,4 @@
+import type { ModelRouteDecision } from "./model-route.js";
 import type { FabricTurnProvenance } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type {
@@ -44,6 +45,8 @@ export interface AgentSessionSeed {
 export interface AgentRunRequest {
   /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
   idempotencyKey?: string;
+  /** Host-created shadow decision; never accepted from external argument normalization. */
+  routeDecision?: ModelRouteDecision;
   /** Host-only resident startup probe: model/extension admission, no prompt or tools. */
   residentStartupProbe?: boolean;
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
@@ -126,6 +129,9 @@ export interface AgentCompactionStatus {
 export interface AgentRunRecord {
   /** Requested launch model; model below follows verified state/assistant attribution. */
   requestedModel?: string;
+  /** Shadow-route children: model/effort verified at the pre-prompt admission boundary. */
+  admittedModel?: string;
+  admittedThinking?: FabricThinking;
   id: string;
   name: string;
   task: string;
@@ -250,6 +256,7 @@ export interface AgentWorkerOptions {
   nice?: number;
   bashTimeoutSeconds?: number;
   fabricExtensionPath?: string;
+  routeHeader?: string;
   model?: string;
   thinking?: string;
   systemPrompt?: string;

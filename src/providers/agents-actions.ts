@@ -104,7 +104,15 @@ const residentIdempotencyKeySchema = {
 
 const spawnSchema = {
   ...runSchema,
-  properties: { ...runProperties, residency: residencySchema, idempotencyKey: residentIdempotencyKeySchema },
+  properties: {
+    ...runProperties, residency: residencySchema,
+    idempotencyKey: residentIdempotencyKeySchema,
+    model: { ...runProperties.model, description: `${runProperties.model.description} Spawn-only \"auto\" decides and records in shadow mode; the child still runs pinModel/pinThinking.` },
+    routeClass: { type: "string", pattern: "^[a-z][a-z0-9-]{0,63}$", description: "Opt-in auto route class; initially bounded-lookup. Unknown classes are excluded." },
+    pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },
+    pinThinking: { ...runProperties.thinking, description: "Role's required effort pin; overrides agents.modelRouting.pinThinking. Never inferred from the default medium effort." },
+    protected: { type: "boolean", description: "Caller supplies from trusted issue/PR state, never task text: true for review, security, audit, named passes or needs-security-pass; false only for known clear state. Omitted/unknown is excluded before Jev." },
+  },
 };
 
 const handoffCompactionSchema = {

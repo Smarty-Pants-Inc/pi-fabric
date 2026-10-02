@@ -34,6 +34,7 @@ import type {
 } from "./topology/types.js";
 import {
   resolveFabricIdentity,
+  releaseRetainedRootRegistrations,
   type FabricAgentMessageDelivery,
   type FabricAgentMessageResult,
   type FabricMainAgentInfo,
@@ -72,6 +73,7 @@ export class FabricState {
   #kernelReloadRequired = false;
 
   #cwd: string | undefined;
+  #sessionId: string | undefined;
   #generation = 0;
   #everActivated = false;
   // Set by shutdown(), cleared by the next session_start's bootstrap(). A tool call that
@@ -185,6 +187,7 @@ export class FabricState {
     this.#shutDown = false;
     const generation = ++this.#generation;
     this.#cwd = context.cwd;
+    this.#sessionId = context.sessionManager.getSessionId();
     // A failed config load must not leak the previous session's configuration
     // into this one: clear before the read so bootstrapped stays false and
     // presentation falls back to the safe default until a load succeeds.
@@ -436,7 +439,7 @@ export class FabricState {
     if (this.#shutDown) throw new Error("Pi Fabric is shut down for this session (reload or session replacement); retry in the new session");
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(options: { preserveRootRegistration?: boolean; sessionId?: string } = {}): Promise<void> {
     this.#shutDown = true;
     const generation = ++this.#generation;
     const activation = this.#activation;
@@ -446,12 +449,17 @@ export class FabricState {
     const runtime = this.#runtime;
     this.#runtime = undefined;
     try {
-      await runtime?.shutdown();
+      await runtime?.shutdown(options);
       await this.#managedHost?.close();
+      const sessionId = options.sessionId ?? this.#sessionId;
+      if (!options.preserveRootRegistration && sessionId) {
+        await releaseRetainedRootRegistrations(sessionId);
+      }
     } finally {
       if (generation === this.#generation) {
         this.#config = undefined;
         this.#cwd = undefined;
+        this.#sessionId = undefined;
         this.#externalProviders.clear();
         this.#externalComponents.clear();
         this.#everActivated = false;

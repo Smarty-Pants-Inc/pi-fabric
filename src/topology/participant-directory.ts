@@ -162,7 +162,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "model", "thinking", "parentId"]) ||
+    !optionalStrings(value, ["sessionId", "rootRegistrationOwnerId", "cwd", "label", "role", "project", "model", "thinking", "parentId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -854,7 +854,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
   }
 
-  root(main: FabricMainAgentInfo): FabricParticipantRecord {
+  root(main: FabricMainAgentInfo, sessionName?: string, rootRegistrationOwnerId?: string): FabricParticipantRecord {
     const role = participantRole();
     return {
       format: 1,
@@ -863,7 +863,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: main.id,
       ownerHostId: this.options.hostId,
       ownerIdentityId: this.options.identity.id,
-      name: "main",
+      name: sessionName?.trim() || "main",
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",
@@ -871,6 +871,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ...(main.cwd ? { cwd: main.cwd, project: participantProject(main.cwd) } : {}),
       ...(role ? { role } : {}),
       ...(main.sessionId ? { sessionId: main.sessionId } : {}),
+      ...(rootRegistrationOwnerId ? { rootRegistrationOwnerId } : {}),
       ...(main.model ? { model: main.model } : {}),
       ...(main.thinking ? { thinking: main.thinking } : {}),
       startedAt: main.startedAt ?? this.#startedAt,

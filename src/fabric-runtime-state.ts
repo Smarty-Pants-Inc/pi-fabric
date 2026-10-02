@@ -78,6 +78,7 @@ import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
+import { RootRegistrationGuard } from "./topology/root-registration.js";
 import type {
   FabricParticipantInfo,
   FabricParticipantListOptions,
@@ -205,6 +206,9 @@ export class FabricRuntimeState {
   #identity: MeshIdentity | undefined;
   #mainAgent: MainAgentController | undefined;
   #participants: ParticipantDirectory | undefined;
+  #rootRegistration: RootRegistrationGuard | undefined;
+  #registeredRootName: string | undefined;
+  #unsubscribeRootName: (() => void) | undefined;
   #control: FabricControlPlane | undefined;
   #lifecycle: LifecycleBroker | undefined;
   #residency: ResidencyClient | undefined;
@@ -410,7 +414,8 @@ export class FabricRuntimeState {
   async initialize(context: ExtensionContext, bootstrapConfig?: FabricConfig): Promise<void> {
     this.#suppressResidentGuidanceSync = true;
     try {
-      await this.#closeInternal();
+      await this.#closeInternal(Boolean(this.#rootRegistration &&
+        this.#rootRegistration.sessionId === context.sessionManager.getSessionId()));
       this.#shellJobs = new FabricShellJobStore();
     } finally {
       this.#suppressResidentGuidanceSync = false;
@@ -562,22 +567,65 @@ export class FabricRuntimeState {
       (configuredMeshRoot
         ? path.resolve(projectRoot, configuredMeshRoot)
         : path.join(projectRoot, ".pi", "fabric", "mesh"));
-    // Held followUps are journalled per session under the mesh root until the session holds them.
-    mainAgent.attachFollowUpDrain(
-      context,
-      followUpDrainSupported() ? this.#config.mesh.followUpFlushMs : 0,
-      path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`),
-      this.#config.mesh.followUpStallSeconds,
-    );
     this.#mesh = new MeshStore(
       meshRoot,
       this.#config.mesh.maxEventBytes,
       this.#config.mesh.maxReadEvents,
       { readCacheMs: RUNTIME_MESH_READ_CACHE_MS },
     );
+    // A copied name or native session must not acquire another root's inbox/actor lineage.
+    // This admission precedes even the followUp journal, and failures are not swallowed by
+    // the participant publisher's ordinary mesh-lock retry path below.
+    if (identity.kind === "main" && this.#config.mesh.enabled) {
+      // Read-only observer: never start or close it (either would publish/remove ownership).
+      const observerId = `admission:${sessionId}`;
+      const publishedRoots = new ParticipantDirectory(this.#mesh, {
+        enabled: true, hostId: observerId, rootId: observerId,
+        identity: { id: observerId, name: "admission", kind: "main", sessionId },
+      });
+      if (this.#rootRegistration && this.#rootRegistration.mesh.root !== this.#mesh.root) {
+        await this.#rootRegistration.close();
+        this.#rootRegistration = undefined;
+      }
+      const rootRegistration = this.#rootRegistration ??= new RootRegistrationGuard(this.#mesh, {
+        publishedRoots: () => publishedRoots.list({ scope: "project", kinds: ["root"], fresh: true }),
+        onUnknownNameOwnership: warning => {
+          console.warn(`[pi-fabric] ${warning}`);
+          if (context.hasUI) context.ui.notify(warning, "warning");
+        },
+      });
+      const claimName = async (): Promise<void> => {
+        const name = this.pi.getSessionName?.()?.trim() || undefined;
+        await rootRegistration.claim({ sessionId, rootId: mainAgentId, fabricSessionId, name });
+        this.#registeredRootName = name;
+        this.#participants?.scheduleRefresh();
+      };
+      const alert = (error: unknown): void => {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.error(`[pi-fabric] ${detail}`);
+        if (context.hasUI) context.ui.notify(detail, "error");
+      };
+      try { await claimName(); } catch (error) { alert(error); throw error; }
+      this.#unsubscribeRootName = this.pi.on?.("session_info_changed", async () => {
+        try { await claimName(); } catch (error) { alert(error); }
+      });
+    } else if (this.#rootRegistration) {
+      // A same-session configuration refresh disabled mesh/root ownership.
+      await this.#rootRegistration.close();
+      this.#rootRegistration = undefined;
+      this.#registeredRootName = undefined;
+    }
+    // Held followUps are journalled only after root admission. A rejected name change keeps
+    // the last admitted alias, rather than starting to consume another root's named mailbox.
+    mainAgent.attachFollowUpDrain(
+      context,
+      followUpDrainSupported() ? this.#config.mesh.followUpFlushMs : 0,
+      this.#config.mesh.enabled ? path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`) : undefined,
+      this.#config.mesh.followUpStallSeconds,
+    );
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
-      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.pi.getSessionName?.() ?? ""])
+      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.#registeredRootName ?? ""])
       : undefined;
     // The idle wake reads this inbox on a timer: its start boundary is now, not its first read.
     this.#rootInbox?.start();
@@ -895,7 +943,7 @@ export class FabricRuntimeState {
     const firstSeenAgents = new Map<string, number>();
     if (mainAgent.local) {
       this.#participants.registerSource(() => [
-        this.#participants!.root(mainAgent.info(context)),
+        this.#participants!.root(mainAgent.info(context), this.#registeredRootName, this.#rootRegistration?.ownerId),
       ]);
     }
     this.#participants.registerSource(() =>
@@ -1009,7 +1057,8 @@ export class FabricRuntimeState {
       const mesh = this.#mesh;
       const recordsIdentity = identity;
       const root = identity.kind === "main" && mainAgent.local;
-      const recordsNames = () => [mainAgentId, this.pi.getSessionName?.() ?? ""];
+      const recordsNames = () => [mainAgentId, this.#rootRegistration
+        ? this.#registeredRootName ?? "" : this.pi.getSessionName?.() ?? ""];
       this.#openRecords = () => {
         this.#records ??= import("./records/service.js").then(({ RecordsService }) => RecordsService.open({
           config: recordsConfig,
@@ -1456,7 +1505,9 @@ export class FabricRuntimeState {
     await this.#componentLoader?.settle();
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(options: { preserveRootRegistration?: boolean } = {}): Promise<void> {
+    this.#unsubscribeRootName?.();
+    this.#unsubscribeRootName = undefined;
     this.#completionInbox?.close();
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
@@ -1484,6 +1535,9 @@ export class FabricRuntimeState {
       await this.#registry?.close();
     } finally {
       await this.#participants?.close();
+      await this.#rootRegistration?.close({ preserve: options.preserveRootRegistration === true });
+      this.#rootRegistration = undefined;
+      this.#registeredRootName = undefined;
     }
     this.#registry = undefined;
     this.#config = undefined;
@@ -1571,7 +1625,9 @@ export class FabricRuntimeState {
     await repairs?.flush();
   }
 
-  async #closeInternal(): Promise<void> {
+  async #closeInternal(preserveRootRegistration = false): Promise<void> {
+    this.#unsubscribeRootName?.();
+    this.#unsubscribeRootName = undefined;
     this.#completionInbox?.close();
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
@@ -1599,6 +1655,13 @@ export class FabricRuntimeState {
       await this.#registry.close(externalNames);
     } finally {
       await this.#participants?.close();
+      // Reinitialization closes engines/mailboxes, not the live native session. Keep its
+      // admission continuously held and re-claim with the same guard after config reload.
+      if (!preserveRootRegistration) {
+        await this.#rootRegistration?.close();
+        this.#rootRegistration = undefined;
+        this.#registeredRootName = undefined;
+      }
     }
     this.#registry = undefined;
     this.#execution = undefined;

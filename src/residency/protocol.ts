@@ -364,12 +364,16 @@ export interface ResidentHostOwner {
   token: string;
   startedAt: number;
   readyAt: number;
+  /** The immutable entry path this owner actually loaded, not the mutable config selector. */
+  fabricExtensionPath?: string;
   /** Commands supported by this running binary; absent on pre-negotiation hosts. */
   commands?: readonly string[];
   /** New clients must not dispatch mutations to an already-running pre-fence host. */
   requestFence?: 1;
   /** Generation format 3 with durable expiry; absent on older fenced hosts. */
   requestExpiry?: 1;
+  /** Operation-scoped retry keys implemented by this loaded host, not desired config. */
+  creationIdempotency?: 1;
   /** Attestation from the loaded host, never desired config.json. */
   releaseRoot?: string;
   configDigest?: string;
@@ -381,6 +385,7 @@ export interface ResidentHostOwner {
 interface ResidentSpawnCommand {
   format: typeof RESIDENT_HOST_FORMAT;
   operation: "spawn";
+  idempotencyKey?: string;
   requestId: string;
   rootId: string;
   request: AgentRunRequest;
@@ -418,6 +423,7 @@ interface ResidentRemoveActorCommand {
 interface ResidentCreateActorCommand {
   format: typeof RESIDENT_HOST_FORMAT;
   operation: "createActor";
+  idempotencyKey?: string;
   requestId: string;
   rootId: string;
   request: FabricActorRequest;
@@ -529,6 +535,22 @@ export const assertResidentCommandSupported = (owner: ResidentHostOwner, operati
   }
 };
 
+/** Fence explicit retry keys before publication; keep unkeyed calls compatible with older hosts. */
+export const prepareResidentCreationCommand = (owner: ResidentHostOwner, command: ResidentCommand): ResidentCommand => {
+  if (command.operation !== "spawn" && command.operation !== "createActor") return command;
+  if (owner.creationIdempotency !== 1) {
+    if (command.idempotencyKey !== undefined) {
+      throw new ResidentCommandUnsupportedError(
+        "The loaded resident host lacks creation idempotency-key support; activate a compatible resident host before retrying with the same key. No request was dispatched.",
+      );
+    }
+    return command;
+  }
+  // One key per call, held in the envelope for any transport replay. Generate it
+  // only after negotiation, so an unkeyed call can still use a pre-key host.
+  return { ...command, idempotencyKey: command.idempotencyKey ?? randomUUID() };
+};
+
 export interface ResidentCommandResponse {
   format: typeof RESIDENT_HOST_FORMAT;
   requestId: string;
@@ -582,6 +604,9 @@ export interface ResidentAgentMetadata {
 }
 
 export interface ResidentDeliveryRecord {
+  /** Producer-owned classification. Only actor-output admits an actor sender; absent or
+   * unknown classifications (including older/retained records) keep the label but no claim. */
+  source?: "actor-output" | "fabric-host";
   principal?: FabricPrincipal | undefined;
   format: typeof RESIDENT_HOST_FORMAT;
   /** Survives payload truncation; lets Main read the authoritative terminal result. */

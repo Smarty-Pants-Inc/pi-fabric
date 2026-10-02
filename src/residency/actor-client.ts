@@ -14,6 +14,7 @@ import {
   ResidentActorAuthorizationError,
   ResidentCommandUnsupportedError,
   assertResidentCommandSupported,
+  prepareResidentCreationCommand,
   type ResidentHostOwner,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
@@ -110,12 +111,14 @@ export class ResidentActorClient {
   }
 
   async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+    const { idempotencyKey, ...creationRequest } = request;
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
+      ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       requestId: randomUUID(),
       rootId: this.#rootId,
-      request,
+      request: creationRequest,
       createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Resident host returned no actor from createActor");
@@ -143,6 +146,7 @@ export class ResidentActorClient {
     if (owner.requestFence !== 1) {
       throw new Error("Root resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
     }
+    command = prepareResidentCreationCommand(owner, command);
     throwIfAborted(signal);
     command = residentCommandForOwner(command, owner);
     registerResidentCancellation(signal, this.#residencyDir, command);

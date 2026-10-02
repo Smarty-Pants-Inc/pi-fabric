@@ -9,10 +9,26 @@ describe("handoff completion message", () => {
     const sendMessage = vi.fn();
     queueHandoffCompletion({ sendMessage } as unknown as ExtensionAPI,
       { model: "provider/executor" },
-      { completed: true, status: "completed", implementation },
-      { id: "session:test", name: "main", kind: "main" });
+      { completed: true, status: "completed", implementation });
     return sendMessage.mock.calls[0]![0];
   };
+
+  it.each([undefined, {}, { id: "" }, { id: 123 }])("capable report with unknown child %j makes no sender claim", agent => {
+    const sendMessage = vi.fn();
+    queueHandoffCompletion({ sendMessage, hostCapabilities: { turnProvenance: 1 } } as unknown as ExtensionAPI,
+      { name: "Paul", model: "provider/executor" }, { completed: false, status: "failed", agent });
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true });
+  });
+
+  it("capable child report without a name never borrows the requested name", () => {
+    const sendMessage = vi.fn();
+    queueHandoffCompletion({ sendMessage, hostCapabilities: { turnProvenance: 1 } } as unknown as ExtensionAPI,
+      { name: "Paul" }, { completed: true, status: "completed", agent: { id: "child" } });
+    expect(sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true,
+      provenance: { v: 1, channel: "fabric", sender: { id: "child", kind: "agent", verified: "mesh" }, via: "followUp" },
+    });
+  });
 
   it("preserves structured conclusions and handles missing output honestly", () => {
     expect(send({ checks: ["passed"], pr: "https://example.com/pull/42" }).content)

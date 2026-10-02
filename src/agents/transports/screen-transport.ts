@@ -28,6 +28,7 @@ export class ScreenTransport implements AgentTransportAdapter {
     );
     return {
       kind: this.kind,
+      relaunchable: false, // Query failure is not proof the old session exited.
       livenessPollIntervalMs: EXTERNAL_TRANSPORT_LIVENESS_POLL_INTERVAL_MS,
       sessionId: session,
       attachCommand: `screen -r ${session}`,

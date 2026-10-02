@@ -86,6 +86,38 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
   fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
   writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details });
 };
+/** A terminal external-pane record is not an exit receipt. Share this persistent,
+ * tree-wide veto across tracked, recovered and offline cleanup before removing
+ * worktrees or files; absence of an unresolved marker never proves pane exit. */
+export const runTreeExitVeto = (directory: string, depth = 0, expired: Deadline = noDeadline): string | undefined => {
+  if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
+  // A previously removed tree has no worker files left to collect. Only this
+  // initial absence is safe; errors or changes during inspection veto cleanup.
+  try { fs.lstatSync(directory); }
+  catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : "worker exit is unconfirmed: run-tree inspection failed";
+  }
+  try {
+    if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
+    if (fs.existsSync(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
+    const statusFile = path.join(directory, "status.json");
+    const record = readJson<RunRecordSummary>(statusFile);
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
+    if (fs.existsSync(statusFile) && !record) return "worker exit is unconfirmed: unreadable run record";
+    if (record?.transport === "tmux" || record?.transport === "screen") {
+      return `${record.transport} transport has no checked worker exit receipt (${directory})`;
+    }
+    const nested = path.join(directory, "nested");
+    try { fs.lstatSync(nested); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+    if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
+    for (const name of fs.readdirSync(nested)) {
+      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired);
+      if (reason) return reason;
+    }
+  } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
+};
 const recordAgeReference = (record: RunRecordSummary, fallback: number): number =>
   time(record.finishedAt) ? record.finishedAt : time(record.updatedAt) ? record.updatedAt : fallback;
 // Every file the worker and manager write into a run directory. A missing name made the run
@@ -98,7 +130,7 @@ const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-eve
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
-  if (hasUnresolvedWorker(root, 0, expired)) return false;
+  if (runTreeExitVeto(root, 0, expired)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;

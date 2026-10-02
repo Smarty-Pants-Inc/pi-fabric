@@ -30,6 +30,7 @@ export class PiModelControl {
   private readonly requested: string | undefined;
   private readonly thinking: string | undefined;
   private readonly activationWindow: boolean;
+  private readonly startupFence: boolean;
   private readonly requiredPin: boolean;
   private readonly io: {
     send(frame: Record<string, unknown>): void;
@@ -44,6 +45,7 @@ export class PiModelControl {
     thinking: string | undefined,
     io: PiModelControl["io"],
     activationWindow = false,
+    startupFence = false,
     requiredPin = false,
   ) {
     // Keep this module executable through Node's native type stripping too;
@@ -53,11 +55,12 @@ export class PiModelControl {
     this.thinking = thinking;
     this.io = io;
     this.activationWindow = activationWindow;
+    this.startupFence = startupFence;
     this.requiredPin = requiredPin;
   }
 
   start(): void {
-    if (!this.requested && !this.activationWindow) {
+    if (!this.requested && !this.activationWindow && !this.startupFence) {
       this.ready = true;
       this.io.admitted();
       return;

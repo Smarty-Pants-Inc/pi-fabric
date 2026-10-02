@@ -134,6 +134,7 @@ import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type 
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
 import { ResidencyClient } from "./residency/client.js";
+import { isOwnResidentActor } from "./residency/actor-ownership.js";
 import { RESIDENT_HOST_FORMAT, residentRoot } from "./residency/protocol.js";
 import type { FabricRuntimePaths } from "./runtime-paths.js";
 
@@ -556,6 +557,7 @@ export class FabricRuntimeState {
       context.cwd,
       identity.kind === "main" ? sessionId : undefined,
       context.mode !== "print" && context.mode !== "json",
+      (event) => { void this.publishOpsEvent("fabric.main.wake", "provider-backoff-released", event); },
     );
     this.#mainAgent = mainAgent;
     const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
@@ -601,6 +603,7 @@ export class FabricRuntimeState {
       enabled: this.#config.mesh.enabled,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
+      bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
@@ -663,6 +666,7 @@ export class FabricRuntimeState {
             registry: context.modelRegistry,
             aliases: modelsConfig.aliases,
             defaultModel,
+            policy: agentConfig,
           });
       const model = visiblePiModels().find(
         (candidate) =>
@@ -788,6 +792,7 @@ export class FabricRuntimeState {
             persistent: true,
             mainAgent,
             canManageActor,
+            isOwnResidentActor: (id) => isOwnResidentActor(this.#participants!, id, mainAgentId),
             lineageAlive,
             claimResidency: "session",
             rootId: mainAgentId,
@@ -916,6 +921,7 @@ export class FabricRuntimeState {
       this.#residency,
       false,
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
+      () => this.pi.getThinkingLevel(),
       (request, signal) => {
         const owner = routeOwner;
         if (!owner || owner.signal.aborted) throw new Error("Jev routing unavailable");
@@ -1282,6 +1288,7 @@ export class FabricRuntimeState {
       outerToolResult,
       context,
       (update) => this.activity.updateCall(runId, callId, update),
+      () => this.config.agents,
     );
     const succeeded = result.completed === true || result.continued === true;
     const error = typeof result.error === "string" ? result.error : undefined;

@@ -7,6 +7,7 @@ import {
   markRunRootActive,
   markRunRootClosed,
   hasUnresolvedWorker,
+  runTreeExitVeto,
   markUnresolvedWorker,
   pruneActorRunArchives,
   RUN_ROOT_SWEEP_MARKER,
@@ -35,6 +36,32 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("shared run-tree exit veto", () => {
+  it("refuses malformed records and failed nested inspection rather than inferring exit", () => {
+    const run = temporaryDirectory();
+    const status = path.join(run, "status.json"); fs.writeFileSync(status, "{broken");
+    expect(runTreeExitVeto(run)).toMatch(/exit is unconfirmed/);
+    fs.writeFileSync(status, JSON.stringify({ status: "completed", transport: "process" }));
+    const nested = path.join(run, "nested"); fs.mkdirSync(nested);
+    const readdir = fs.readdirSync;
+    const fault = vi.spyOn(fs, "readdirSync").mockImplementation((...args: Parameters<typeof readdir>) => {
+      if (String(args[0]) === nested) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      return readdir(...args);
+    });
+    try { expect(runTreeExitVeto(run)).toMatch(/inspection failed/); }
+    finally { fault.mockRestore(); }
+    expect(runTreeExitVeto(run)).toBeUndefined();
+  });
+
+  it("refuses depth/deadline truncation and nested symlinks", () => {
+    const run = temporaryDirectory();
+    expect(runTreeExitVeto(run, 33)).toMatch(/incomplete/);
+    expect(runTreeExitVeto(run, 0, () => true)).toMatch(/incomplete/);
+    const target = temporaryDirectory(); fs.symlinkSync(target, path.join(run, "nested"), "junction");
+    expect(runTreeExitVeto(run)).toMatch(/unsafe nested/);
+    expect(fs.existsSync(target)).toBe(true);
+  });
+});
 describe("safe run roots", () => {
   const sweep = (tempRoot: string, now = 100 * DAY) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
 

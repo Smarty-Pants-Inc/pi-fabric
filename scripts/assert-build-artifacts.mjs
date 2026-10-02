@@ -68,6 +68,7 @@ const lazy = [
   "worker/activation-window.js",
   "worker/reply-tool.js",
   "worker/principal-delivery.js",
+  "worker/session-id.js",
   "guards/actor-bash-hook.js",
   "guards/model-route-hook.js",
   "worker/options.js",

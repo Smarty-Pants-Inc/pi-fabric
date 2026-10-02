@@ -82,6 +82,18 @@ describe("Windows file-data namespace ACL policy", () => {
     expect(() => windowsDataRoot(root)).toThrow(/untrusted principal/);
   });
 
+  it.each([0x1, 0x80, 0x20000, 0x80000000, 0xa01200a9])("private scratch rejects untrusted read grants (%s)", mask => {
+    directories[2]!.dacl!.push(allow(everyone, mask));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/not private/);
+  });
+
+  it("private scratch still allows read/traverse-only ancestors, not writable ancestors", () => {
+    directories[0]!.dacl!.push(allow(everyone, 0xa01200a9));
+    expect(windowsDataRoot(root, { private: true })).toBe(root);
+    directories[0]!.dacl!.push(allow(everyone, 0x2));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/untrusted principal/);
+  });
+
   it("permits known untrusted read/traverse rights and standard denies", () => {
     for (const directory of directories) directory.dacl!.push(allow(everyone, 0xa01200a9), { ...allow(users), type: 1 });
     expect(windowsDataRoot(root)).toBe(root);

@@ -41,7 +41,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     return manager.run({ task, transport: "process" });
   };
 
-  it("gives concurrent real worker/Pi runs distinct private TMPDIRs and removes scratch while retaining logs", async () => {
+  it("gives concurrent real worker/Pi runs distinct private TMPDIRs and retains uncontained scratch with logs", async () => {
     process.env.FAKE_PI_BEHAVIOR = "run-tmpdir";
     const parentTmpdir = process.env.TMPDIR;
     const parentTmp = process.env.TMP;
@@ -62,7 +62,8 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       expect(path.dirname(report.scratch)).toBe(report.tmpdir); // real ordinary mktemp, without -p
       if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
       else expect(report.mode).toBe(0o700);
-      expect(fs.existsSync(report.tmpdir)).toBe(false);
+      expect(fs.existsSync(report.tmpdir)).toBe(true);
+      expect(fs.existsSync(path.join(runDirectory, "unresolved-scratch.json"))).toBe(true);
       expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8")).sessionId).toBe(result.sessionId);
       expect(fs.existsSync(path.join(runDirectory, "events.jsonl"))).toBe(true);
       return report;

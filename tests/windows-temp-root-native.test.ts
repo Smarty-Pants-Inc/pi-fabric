@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createScratch } from "../src/storage/scratch.js";
+import { createRunTmpDirectory } from "../src/storage/run-scratch.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
 
@@ -143,6 +145,47 @@ describe.skipIf(process.platform !== "win32")("native Windows temp-root ACL cont
     expect(fs.existsSync(scratch)).toBe(true);
     expect(sddl(directory)).toBe(before);
   }, 30_000);
+
+  it("exports private run scratch only under a natively proven private explicit run root", async () => {
+    const directory = privateDirectory("explicit-run");
+    const before = sddl(directory);
+    const worker = path.join(directory, "worker.mjs");
+    fs.writeFileSync(worker, `import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(path.join(directory, "environment.json"))}, JSON.stringify({tmpdir:process.env.TMPDIR,tmp:process.env.TMP,temp:process.env.TEMP}));`);
+    const handle = await new ProcessTransport().launch({ id: "private", name: "private", cwd: directory, workerPath: worker,
+      workerArguments: ["--status-file", path.join(directory, "status.json")] });
+    try {
+      await vi.waitFor(async () => expect(await handle.isAlive()).toBe(false), { timeout: 10000 });
+      const tmp = path.join(directory, "tmp");
+      expect(JSON.parse(fs.readFileSync(path.join(directory, "environment.json"), "utf8"))).toEqual({tmpdir:tmp,tmp:tmp,temp:tmp});
+      expect(createRunTmpDirectory(directory)).toBe(tmp);
+      expect(sddl(directory)).toBe(before);
+    } finally {
+      await handle.stop();
+      await vi.waitFor(async () => expect(await handle.isAlive()).toBe(false), { timeout: 10000 });
+    }
+  }, 60000);
+
+  it.each([0x1, 0x3])("rejects explicit run roots with another ordinary user's read/read-write grant (%s) before spawn", async mask => {
+    const directory = privateDirectory("foreign-grant");
+    const sid = native("([System.Security.Principal.WindowsIdentity]::GetCurrent().User.AccountDomainSid.Value) + '-424242'");
+    grant(directory, sid, mask);
+    const before = sddl(directory);
+    await expect(new ProcessTransport().launch({ id: "unsafe", name: "unsafe", cwd: directory,
+      workerPath: path.join(directory, "must-not-launch.mjs"), workerArguments: ["--status-file", path.join(directory, "status.json")] })).rejects.toThrow(/not private|untrusted principal/);
+    expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false);
+    expect(sddl(directory)).toBe(before);
+  }, 30000);
+
+  it("rejects an existing read-public scratch directory even inside a private explicit run root", () => {
+    const directory = privateDirectory("existing-scratch");
+    const tmp = path.join(directory, "tmp");
+    fs.mkdirSync(tmp);
+    grant(tmp, "S-1-1-0", 0x1);
+    const before = sddl(tmp);
+    expect(() => createRunTmpDirectory(directory)).toThrow(/not private/);
+    expect(sddl(tmp)).toBe(before);
+  }, 30000);
 
   it("rejects a foreign-owned root without changing ownership or ACLs", () => {
     const directory = privateDirectory();

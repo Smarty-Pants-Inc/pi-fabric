@@ -64,7 +64,7 @@ describe("runner-owned scratch", () => {
     expect(safeRunTmpTree(tmp, () => false)).toBe(false);
   });
 
-  it("joins a replacement launch before disposing scratch when stop races its returned handle", async () => {
+  it("joins a replacement launch and keeps scratch fenced when stop races its returned handle", async () => {
     const root = sandbox();
     const worker = path.join(root, "retry-worker.mjs");
     const attempts = path.join(root, "attempts");
@@ -110,7 +110,7 @@ if (!failed) setInterval(() => {}, 1000);
       expect(fs.existsSync(path.join(directory, "tmp", "scratch"))).toBe(true);
       release();
       await stop;
-      expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false);
+      expect(fs.existsSync(path.join(directory, "tmp"))).toBe(true);
       expect(calls).toBe(2);
     } finally {
       release();
@@ -119,7 +119,7 @@ if (!failed) setInterval(() => {}, 1000);
     }
   }, 20_000);
 
-  it("does not dispose scratch on terminal status until the process actually exits", async () => {
+  it("joins actual worker exit but retains scratch without a complete descendant receipt", async () => {
     const root = sandbox();
     const release = path.join(root, "release");
     const worker = path.join(root, "terminal-writer.mjs");
@@ -144,7 +144,8 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(release)}))
     expect(fs.existsSync(path.join(directory, "tmp", "scratch"))).toBe(true);
     fs.writeFileSync(release, "exit now");
     expect((await result).status).toBe("completed");
-    expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false);
+    expect(fs.existsSync(path.join(directory, "tmp"))).toBe(true);
     expect(fs.existsSync(path.join(directory, "status.json"))).toBe(true);
+    expect(fs.existsSync(path.join(directory, "unresolved-scratch.json"))).toBe(true);
   });
 });

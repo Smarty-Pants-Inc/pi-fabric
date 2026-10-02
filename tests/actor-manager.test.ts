@@ -2508,7 +2508,7 @@ describe("ActorManager", () => {
     expect(listener).toHaveBeenCalledTimes(beforeUnsubscribedUpdate);
   });
 
-  it("allocates and disposes separate private scratch for every process actor activation", async () => {
+  it("allocates separate private scratch and retains its custody fence for every process actor activation", async () => {
     const { actors, agents, root } = setup(false, undefined, undefined, undefined, {}, { retainRuns: true });
     const actor = await actors.create({ name: "scratch-reviewer", instructions: "REPORT_RUN_TMPDIR", responseMode: "text", transport: "process" });
     const reports: Array<{ tmpdir: string; scratch: string }> = [];
@@ -2519,12 +2519,14 @@ describe("ActorManager", () => {
       if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
       else expect(report.mode).toBe(0o700);
       expect(path.dirname(report.scratch)).toBe(report.tmpdir);
-      expect(fs.existsSync(report.tmpdir)).toBe(false);
+      expect(fs.existsSync(report.tmpdir)).toBe(true);
+      expect(fs.existsSync(path.join(path.dirname(report.tmpdir), "unresolved-scratch.json"))).toBe(true);
       reports.push(report);
       await waitFor(() => actors.status(actor.id).status === "idle");
     }
     expect(reports[0]!.tmpdir).not.toBe(reports[1]!.tmpdir);
-    expect(agents.list()).toEqual([]);
+    expect(agents.list()).toHaveLength(2);
+    for (const run of agents.list()) await expect(agents.cleanup(run.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
   });
 
   it("keeps a persistent actor identity and processes direct mailbox messages", async () => {
@@ -2540,7 +2542,8 @@ describe("ActorManager", () => {
     expect(reply.actorId).toBe(actor.id);
     await waitFor(() => actors.status(actor.id).status === "idle");
     expect(actors.status(actor.id)).toMatchObject({ status: "idle", messages: 2 });
-    expect(agents.list()).toEqual([]);
+    // The worker exited, but arbitrary tool descendants still have no scope receipt.
+    expect(agents.list()).toMatchObject([{ id: reply.runId, status: "completed" }]);
     expect(actors.messages(actor.id)).toMatchObject([
       { direction: "in", source: "direct" },
       { direction: "out", source: "direct", text: "fake worker complete" },
@@ -2782,9 +2785,10 @@ describe("ActorManager", () => {
       error: expect.stringContaining("Structured agent output was invalid"),
     });
 
-    // Removing the actor releases the retained run.
+    // Removing an actor is not an exit receipt for uncontained scratch writers.
     await actors.remove(actor.id);
-    expect(agents.list()).toEqual([]);
+    expect(agents.list()).toMatchObject([{ id: retained[0]!.id, status: "failed" }]);
+    await expect(agents.cleanup(retained[0]!.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
   });
 
   it("restores persistent ambient actors for the same Pi session", async () => {
@@ -3235,9 +3239,9 @@ describe("ActorManager", () => {
     expect(eventTypes).toContain("message_end");
     expect(log.run!.status?.status).toBe("completed");
     expect(log.retainedRuns).toHaveLength(1);
-    // Completed runs are released from the in-memory registry, but the log
-    // copy in the actor directory survives.
-    expect(agents.list()).toEqual([]);
+    // The copied logs and the original scratch both survive without a complete
+    // descendant exit receipt; the retained run remains inspectable.
+    expect(agents.list()).toMatchObject([{ status: "completed", actorId: actor.id }]);
   });
 
   it("retains failed-run logs too so readLog can inspect them", async () => {

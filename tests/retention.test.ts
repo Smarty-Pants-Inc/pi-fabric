@@ -106,7 +106,7 @@ describe("safe run roots", () => {
     expect(fs.existsSync(path.join(root, "done"))).toBe(false);
     for (const name of ["pending", "live", "unresolved"]) expect(fs.existsSync(path.join(root, name))).toBe(true);
   });
-  it.each(["closed", "orphan"])("collects arbitrary leftover private scratch in expired %s runs, but vetoes live/unsettled/unsafe trees", kind => {
+  it.each(["closed", "orphan"])("retains uncontained scratch in expired %s runs, even when worker/nested records say exited", kind => {
     const tempRoot = temporaryDirectory();
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + kind);
     for (const name of ["done", "live", "unsettled", "nested-live", "unknown", "nested-unknown", "unsafe"]) {
@@ -126,8 +126,7 @@ describe("safe run roots", () => {
     fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1,
       ...(kind === "closed" ? { closedAt: 1, childrenStopped: true } : { orphanedAt: 1 }) }));
     sweep(tempRoot);
-    expect(fs.existsSync(path.join(root, "done"))).toBe(false);
-    for (const name of ["live", "unsettled", "nested-live", "unknown", "nested-unknown", "unsafe"]) {
+    for (const name of ["done", "live", "unsettled", "nested-live", "unknown", "nested-unknown", "unsafe"]) {
       expect(fs.existsSync(path.join(root, name, "tmp", "compound-suffix", "anything.tmp"))).toBe(true);
     }
   });

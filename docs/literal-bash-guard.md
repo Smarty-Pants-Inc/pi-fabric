@@ -81,6 +81,7 @@ The per-session TMPDIR is supplied by the `smarty-role` launcher in `smarty-dev`
 Launch with a private per-session TMPDIR and use a TMPDIR-scoped scratch directory;
 submit its literal absolute descendant path for cleanup. Setting TMPDIR inside
 the Bash command cannot establish this grant, and shared temp roots remain refused.
+For the launcher side, see smarty-role's per-session TMPDIR in smarty-dev#3232.
 
 ## Proof
 
@@ -91,6 +92,10 @@ the Bash command cannot establish this grant, and shared temp roots remain refus
   fragments in scripts/substitutions still refuse with accurate opaque diagnostics.
   Org and Light 07:09-07:10Z cases cover a bounded read-only find list, rg pipeline
   and list, Unicode text bodies, and unchanged destructive find refusals.
+  Playful-org field repros from smarty-dev#3230 (blind supervisor on main
+  `ab8c2575`) pass: `gh api --jq` and `jq` slices, numeric arguments, whole-literal
+  grep/rg regex DATA, quoted-delimiter prose heredocs and ordinary Python heredocs.
+  Shell `-c` receivers such as `bash -c 'kill 123'` still refuse.
 - `tests/literal-bash-guard-hook.test.ts`: actual extension registration, cold
   import/idle/non-Bash no-load, awaited first refusal, one call per valid Bash event,
   guard-time host TMPDIR, refusal before timeout mutation and retained wait gate.
@@ -136,6 +141,12 @@ sandbox for dynamic command names, custom script files, arbitrary executors or
 other programming languages. Variable-assembled receivers such as `$a$b` remain
 an accepted limit: the guard never resolves variable bindings or predicts their
 expansions. Literal PIDs are not proof of process ownership.
+Protected receiver words outside the whole-literal inert DATA grant still refuse:
+a piped search (`grep -E 'kill|pkill' f | head -n 5`), an unlisted flag
+(`grep -A2 'pkill' f`), a `sed` program (`sed -n '/kill 123/p' f`; sed has `e`/`w`
+execution and write commands, so it gets no DATA grant) and a heredoc body naming
+a receiver (`cat > f.md <<'EOF'` with `kill`). The guard does not parse pipelines,
+sed programs or heredoc bodies, so these field false positives are accepted limits.
 Keep those isolation/ownership questions with #2313; do not revive old analyzer
 certificates or imply installation/Windows/overall-CI acceptance from lane tests.
 #2497 stays parked until the publishing owner explicitly resumes it.

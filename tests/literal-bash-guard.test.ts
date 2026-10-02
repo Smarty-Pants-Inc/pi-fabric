@@ -112,6 +112,34 @@ describe("literal-only signal and recursive-delete guard", () => {
     expect(OPAQUE_REASON).not.toBe(SIGNAL_REASON);
     expect(OPAQUE_REASON).toMatch(/protected signal\/delete token/);
   });
+  it.each([
+    "gh api repos/o/r/pulls --jq '.[] | .head.sha[0:8]'",
+    "jq -r '.items[0:8][] | .id' f.json",
+    "sleep 5; date -u +%s",
+    "head -n 20 f",
+    "grep -E '^(kill|pkill)-like text$' f",
+    "rg -n '^(kill|pkill)' src",
+    "grep -E '^(foo|bar)-like text$' f",
+    "cat > f.md <<'EOF'\n# Notes\n\nRun the job, then check status.\n\n```sh\nls -al /tmp\necho ok\n```\nEOF",
+    "python3 - <<'EOF'\nimport json, sys\nfor i in range(3):\n    print(json.dumps({'i': i}))\nEOF",
+  ])("allows playful-org field repro (smarty-dev#3230): %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBeUndefined();
+  });
+  it.each([
+    "bash -c 'kill 123'", 'bash -c "pkill worker"', "bash -lc 'kill 123'", "zsh -c 'kill 123'",
+    "/bin/bash -c 'kill 123'", "bash -c kill\\ 123", 'bash -c "$(printf x) kill 123"',
+  ])("refuses opaque shell -c receivers: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBe(SIGNAL_REASON);
+  });
+  it("refuses fragmented shell -c receivers with the opaque reason", () => {
+    expect(bashGuardRefusal("bash -c 'k\\ill 123'", tmpdir)).toBe(OPAQUE_REASON);
+  });
+  it.each([
+    "grep -E 'kill|pkill' f | head -n 5", "grep -A2 'pkill' f", "sed -n '/kill 123/p' f",
+    "cat > f.md <<'EOF'\nDon't kill the session.\nEOF",
+  ])("keeps protected words outside the whole-literal DATA grant refused (accepted limit): %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBe(SIGNAL_REASON);
+  });
   it("keeps variable-assembled receivers as an explicit mistake-guard limit", () => {
     expect(bashGuardRefusal("$a$b 123", tmpdir)).toBeUndefined();
   });

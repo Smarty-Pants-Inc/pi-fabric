@@ -422,7 +422,7 @@ export const resolveAvailablePiModel = (
     throw unavailablePiModelError(query);
   }
   const resolution = resolveFabricModel(query, options);
-  if (resolution.kind === "resolved" && isFuzzyMarker(resolution.via)) {
+  if (resolution.kind === "resolved" && !alias && isFuzzyMarker(resolution.via)) {
     if (options.closest === false) {
       throw closestMatchRefusedError(query, closestCandidates(lower, options.available));
     }

@@ -2778,7 +2778,7 @@ describe("AgentsProvider runner support", () => {
         return realWait(id, options);
       });
     });
-    const run = provider.invoke("run", { task: "HANG", transport: "process", timeoutMs }, mainContext);
+    const run = provider.invoke("run", { task: "HANG", transport: "process", timeoutMs, model: "gpt-sol" }, mainContext);
     try {
       await waiting;
       let settled = false;
@@ -2789,7 +2789,7 @@ describe("AgentsProvider runner support", () => {
       expect(settled).toBe(true);
       const result = await run as Record<string, unknown>;
       expect(waitOptions?.timeoutMs).toBe(60_000);
-      expect(result).toMatchObject({ status: "running", waitTimedOut: true });
+      expect(result).toMatchObject({ status: "running", waitTimedOut: true, model: "cliproxyapi/gpt-6-sol", via: "closest" });
       expect(result.note).toMatch(/continues.*completion message/);
       expect(mainAgent.flushHeldAtNextBoundary).toHaveBeenCalledOnce();
       controller.abort();
@@ -5283,6 +5283,33 @@ describe("AgentsProvider switchModel", () => {
     expect(activity).toHaveBeenCalledWith(expect.objectContaining({ type: "progress", message: expect.stringContaining('via: "closest"') }));
   });
 
+  it.each(["closest", "recent", "latest"])("allows exact marker-name alias %s in public spawn/create", async (name) => {
+    const { provider, agents } = setup([], [], undefined, {
+      modelsConfig: { aliases: { [name]: { targets: ["cliproxyapi/gpt-6.1-sol"] } } },
+    });
+    const child = await provider.invoke("spawn", { task: "t", model: name }, context) as AgentHandleInfo;
+    expect(child.model).toBe("cliproxyapi/gpt-6.1-sol");
+    await agents.wait(child.id);
+    await expect(provider.invoke("create", { name: "alias-actor", instructions: "i", model: name }, context))
+      .resolves.toMatchObject({ model: "cliproxyapi/gpt-6.1-sol" });
+  });
+
+  it("returns chosen model and via for run, setModel and import without activity", async () => {
+    const { provider, globalActors } = setup();
+    const { activity: _activity, ...invocation } = context;
+    const expected = { model: "cliproxyapi/gpt-6-sol", via: "closest" };
+    await expect(provider.invoke("run", { task: "t", model: "gpt-sol" }, invocation)).resolves.toMatchObject(expected);
+    const actor = await provider.invoke("create", { name: "selection", instructions: "i", model: "cliproxyapi/gpt-6.1-sol" }, invocation) as FabricActorInfo;
+    const template = globalActors.create({ name: "selection-template", instructions: "i", runner: "pi", model: "gpt-sol" });
+    await expect(provider.invoke("import", { id: template.id, as: "imported-selection" }, invocation)).resolves.toMatchObject(expected);
+    for (const scope of ["session", "project", "global"]) {
+      await expect(provider.invoke("setModel", { id: scope === "global" ? template.id : actor.id, scope, model: "gpt-sol" }, invocation))
+        .resolves.toMatchObject(expected);
+    }
+    await expect(provider.invoke("run", { task: "exact", model: "cliproxyapi/gpt-6.1-sol" }, invocation))
+      .resolves.not.toHaveProperty("via");
+  });
+
   it("launches near-miss models canonically while isolating unrelated batch failures", async () => {
     const { provider, agents } = setup();
     const spawn = vi.spyOn(agents, "spawn");
@@ -5496,6 +5523,20 @@ describe("own-root resident setters and authoritative status", () => {
     expect(state.setActor).toHaveBeenLastCalledWith({ operation: "setModel", id: state.actor.id, model: "provider/model-b", scope: "project" }, context.signal, { identity: state.identity, hostId: state.identity.id });
     expect(state.setActor.mock.calls.every(([, , caller]) => caller?.identity.id === state.mainAgent.id && caller.identity.kind === "main")).toBe(true);
     expect(state.actors.status(state.actor.id)).toMatchObject({ model: "provider/session", projectDefaults: { model: "provider/project" } });
+  });
+
+  it("returns model and via from resident model setters without activity", async () => {
+    const state = await remoteState();
+    state.setActor.mockResolvedValue({ ...state.effective, model: "cliproxyapi/gpt-6-sol" });
+    const { activity: _activity, ...invocation } = context;
+    for (const scope of ["session", "project"]) {
+      await expect(state.provider.invoke("setModel", { id: state.actor.id, scope, model: "gpt-sol" }, invocation))
+        .resolves.toMatchObject({ model: "cliproxyapi/gpt-6-sol", via: "closest" });
+      expect(state.setActor).toHaveBeenLastCalledWith(
+        { operation: "setModel", id: state.actor.id, scope, model: "cliproxyapi/gpt-6-sol" },
+        invocation.signal, { identity: state.identity, hostId: state.identity.id },
+      );
+    }
   });
 
   it("captures the turn principal for every Main-routed setter, never action args or inherited authority", async () => {

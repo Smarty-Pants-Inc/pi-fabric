@@ -215,6 +215,13 @@ describe("resolveAvailablePiModel", () => {
       expect(resolveAvailablePiModel("sol", strict)).toBe(sols[1]);
     });
 
+    it.each(["closest", "recent", "latest"])("keeps exact marker-name alias %s authoritative", (name) => {
+      const state = { aliases: normalizeModelAliases({ [name]: "cliproxyapi/gpt-6.1-sol" }), available: sols };
+      for (const closest of [false, true]) {
+        expect(resolveAvailablePiModel(`  ${name.toUpperCase()}  `, { ...state, exact: true, closest })).toBe(sols[1]);
+      }
+    });
+
     it("reports via closest wherever closest-match remains allowed", () => {
       const state = { aliases: {}, available: sols };
       expect(resolveAvailablePiModel("sol", state)).toEqual({ ...sols[0], via: "closest" });

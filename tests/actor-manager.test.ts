@@ -1591,6 +1591,39 @@ describe("ActorManager", () => {
     }
   });
 
+  it("F22 retries idle persistent actor stop publication after a pre-rename registry fsync failure", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "stop-receipt", instructions: "Never run after stop.", events: ["agent_settled"], responseMode: "text" });
+    const registry = path.join(s.root, "actors", "actors.json");
+    const savedStatus = () => JSON.parse(fs.readFileSync(registry, "utf8")).actors.find((row: { id: string }) => row.id === actor.id).status;
+    expect(savedStatus()).toBe("idle");
+    const descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    let failures = 0;
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = descriptors.get(fd) ?? "";
+      if (file.startsWith(registry + ".") && file.endsWith(".tmp") && failures++ === 0) throw new Error("injected registry pre-rename fsync failure");
+      sync(fd);
+    });
+    try {
+      await expect(s.actors.stop(actor.id)).rejects.toThrow("injected registry pre-rename fsync failure");
+      expect(savedStatus()).toBe("idle");
+      await expect(s.actors.stop(actor.id)).resolves.toMatchObject({ status: "stopped" });
+      expect(savedStatus()).toBe("stopped");
+      // No graceful close or unrelated save can repair the snapshot before replacement.
+      const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+        actorRoot: path.join(s.root, "actors"), persistent: true,
+      });
+      actorManagers.push(restored);
+      expect(restored.status(actor.id)).toMatchObject({ status: "stopped" });
+      expect(restored.dispatchHostEvent("agent_settled", {})).toBe(0);
+      expect(() => restored.tell(actor.id, "later")).toThrow("is stopped");
+      expect(() => restored.ask(actor.id, "later")).toThrow("is stopped");
+      expect(s.agents.runningCount()).toBe(0);
+    } finally { synced.mockRestore(); opened.mockRestore(); }
+  });
+
   it.each([false, true])("does not requeue a stopped in-flight actor (persistent owner: %s)", async (persistent) => {
     const { actors } = setup(persistent);
     const actor = await actors.create({ name: "stopped-busy", instructions: "Work.", events: ["agent_settled"], responseMode: "text" });

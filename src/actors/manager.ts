@@ -403,6 +403,8 @@ export class ActorManager {
   readonly #listeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
   readonly #pendingPresence = new Set<string>();
+  /** An explicit stop whose registry/presence publication has not been acknowledged. */
+  readonly #pendingStopPublication = new Set<string>();
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
   /** A timed-out write stays serialized; drains need not join that same stalled chain again. */
@@ -1686,12 +1688,21 @@ export class ActorManager {
     const actor = this.#requireOwnedActor(id);
     const running = this.#runningActor(actor.id)!;
     const stopped = actor.status === "stopped";
+    if (!stopped || running !== actor) this.#pendingStopPublication.add(actor.id);
     this.#stopRun(running);
     if (running !== actor) this.#stopRun(actor);
-    if (stopped && running === actor) return this.#publicInfo(actor);
+    if (stopped && running === actor) {
+      // Retry only an owed publication: already-confirmed stops stay effect-free.
+      if (this.#pendingStopPublication.has(actor.id)) {
+        await this.#publishPresence(actor);
+        this.#pendingStopPublication.delete(actor.id);
+      }
+      return this.#publicInfo(actor);
+    }
     this.#drop(actor, [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
     await this.#publishPresence(actor);
+    this.#pendingStopPublication.delete(actor.id);
     await this.#publishNotification({
         topic: "fabric.actor.lifecycle",
         kind: "stopped",

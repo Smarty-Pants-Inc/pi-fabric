@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
+import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
 
 /**
@@ -81,7 +81,7 @@ export function activeBudgetState(): BudgetLedgerState | undefined {
  * when no budget has been inherited and a positive budget is configured.
  */
 export function initBudgetLedger(budget: number): BudgetLedgerState {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-budget-"));
+  const directory = fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-budget-"));
   const file = path.join(directory, "cost.jsonl");
   try {
     fs.writeFileSync(file, "", { mode: 0o600 });

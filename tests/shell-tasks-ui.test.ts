@@ -10,7 +10,8 @@ import { registerFabricCommand } from "../src/commands/fabric.js";
 import type { CapturedToolCatalog } from "../src/capture/catalog.js";
 const theme = { fg: (_: string, s: string) => s, bg: (_: string, s: string) => s, bold: (s: string) => s } as unknown as Theme;
 const cleanup: Array<() => Promise<void> | void> = [];
-afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); vi.useRealTimers(); });
+// Filesystem removal may use nextTick internally; restore real timers before async teardown.
+afterEach(async () => { vi.useRealTimers(); for (const close of cleanup.splice(0).reverse()) await close(); });
 
 const fixture = () => {
   const jobs = new FabricShellJobStore(); cleanup.push(() => jobs.close());

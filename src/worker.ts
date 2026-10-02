@@ -14,6 +14,7 @@ import type {
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
 import { readProcessIdentity } from "./core/process-identity.js";
+import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
@@ -476,7 +477,7 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
-  const childEnvironment = { ...process.env };
+  const childEnvironment = options.actorName ? { ...process.env } : taskAgentEnvironment();
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
   if (options.actorId && options.bashTimeoutSeconds !== undefined &&
     Number.isInteger(options.bashTimeoutSeconds) && options.bashTimeoutSeconds >= 0) {
@@ -489,7 +490,6 @@ const main = async (): Promise<void> => {
     detached: process.platform !== "win32",
     env: {
       ...childEnvironment,
-      ...(options.actorName ? {} : { SMARTY_ROLE: "task-agent" }),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),

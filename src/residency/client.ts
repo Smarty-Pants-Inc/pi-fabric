@@ -84,7 +84,7 @@ const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 const atomicWrite = (filePath: string, value: unknown): void => {
-  writeJsonAtomic(filePath, value, { space: 2 });
+  writeJsonAtomic(filePath, value, { space: 2, durable: true });
 };
 
 const readJson = <T>(filePath: string): T | undefined => {

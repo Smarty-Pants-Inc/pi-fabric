@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 import net from "node:net";
 import path from "node:path";
 import { errorFromWire, LineReader, type WireResponse } from "./protocol.js";
@@ -86,13 +87,12 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
     }
     const nonce = saved?.nonce ?? randomBytes(32).toString("base64url");
     const save = (value: SavedEnrollment) => {
-      fs.mkdirSync(this.options.credentialDir, { recursive: true, mode: 0o700 });
-      const temp = `${file}.${process.pid}.tmp`;
-      fs.writeFileSync(temp, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-      fs.renameSync(temp, file);
+      writeJsonAtomic(file, value, { newline: true, durable: true });
     };
-    // The nonce is on disk before the service can commit anything for it.
-    if (!saved?.nonce) save({ id: this.options.identity.id, nonce });
+    // Existence is not a namespace receipt: a previous rename may have become
+    // visible before its directory barrier failed. Republish the SAME nonce on
+    // every register attempt, confirming it before the service can commit.
+    save({ id: this.options.identity.id, nonce });
     const issued = await this.#call("register", { id: this.options.identity.id, name: this.options.identity.name, nonce }, signal, false) as RecordsCredential;
     save({ id: issued.id, nonce, token: issued.token });
     return issued;

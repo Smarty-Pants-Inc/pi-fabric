@@ -13,6 +13,7 @@ import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import type { FabricActorDeliveryRequest, FabricActorInfo, FabricActorReadInfo, FabricActorRequest } from "../src/actors/types.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -179,7 +180,7 @@ describe("fleet model policy (#2490)", () => {
     };
     const beforeFiles = snapshot(path.join(root, "actors"));
     const beforePresence = mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 });
-    const beforePresenceKeys = mesh.listAll("actors/presence/").map(entry => entry.key);
+    const beforePresenceKeys = mesh.listAll("actors/test/").map(entry => entry.key);
     let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
     let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
     let finished!: () => void; const done = new Promise<void>(resolve => { finished = resolve; });
@@ -199,12 +200,14 @@ describe("fleet model policy (#2490)", () => {
       await entered;
       if (ending === "Escape") abort.abort(new Error("Escape"));
       if (ending === "revocation") registry.revokeProvider("agents");
-      expect((await running).success).toBe(false);
+      const cancelled = await running;
+      expect(cancelled.success).toBe(false);
+      expect(cancelled.residentOutcomes).toBeUndefined();
       release(); await done;
       expect(actors.list()).toEqual(beforeActors);
       expect(globalActors.list()).toEqual(beforeTemplates);
       expect(snapshot(path.join(root, "actors"))).toEqual(beforeFiles);
-      expect(mesh.listAll("actors/presence/").map(entry => entry.key)).toEqual(beforePresenceKeys);
+      expect(mesh.listAll("actors/test/").map(entry => entry.key)).toEqual(beforePresenceKeys);
       expect(mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 })).toEqual(beforePresence);
       await mesh.publish({ topic: "round3.work", from: state.identity, data: { task: "never activate cancelled actor" } });
       // Allow several real actor-monitor polls; a leaked subscription must not
@@ -217,6 +220,81 @@ describe("fleet model policy (#2490)", () => {
       await expect(provider.invoke(action, args, { ...context, extensionContext: { modelRegistry } as unknown as ExtensionContext })).resolves.toMatchObject({ model: "provider/late" });
     } finally { release(); await done; spy.mockRestore(); }
   });
+
+  it.each((["create", "import"] as const).flatMap(action =>
+    (["registry", "presence"] as const).flatMap(publication =>
+      (["Escape", "deadline", "revocation"] as const).map(ending => [action, publication, ending] as const))))(
+    "F6 #3115 public %s retains committed actor identity during %s publication (%s)", async (action, publication, ending) => {
+      const { provider, actors, globalActors, root, mesh, identity } = setup();
+      const request = { name: "committed-subscriber", instructions: "Review.", topics: ["round4.work"] };
+      const args = action === "import" ? { id: globalActors.create(request).id } : request;
+      const lock = publication === "registry" ? path.join(root, "actors", "actors.json.lock") : path.join(mesh.root, ".lock");
+      fs.mkdirSync(lock, { recursive: true });
+      fs.writeFileSync(path.join(lock, "owner"), `held-by-F6-test\n${process.pid}\n${Date.now()}\n`);
+      let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
+      let finished!: () => void; const done = new Promise<void>(resolve => { finished = resolve; });
+      const originalLock = ActorRegistryStore.prototype.withLock;
+      const lockSpy = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function<T>(this: ActorRegistryStore, operation: () => T): Promise<T> {
+        const pending = originalLock.call(this, operation) as Promise<T>;
+        if (publication === "registry") enter();
+        return pending;
+      });
+      const originalPut = mesh.put.bind(mesh);
+      const presenceSpy = vi.spyOn(mesh, "put").mockImplementation((...params) => {
+        const pending = originalPut(...params);
+        if (publication === "presence" && params[0].key.startsWith("actors/test/")) enter();
+        return pending;
+      });
+      const invoke = provider.invoke.bind(provider);
+      const invocationSpy = vi.spyOn(provider, "invoke").mockImplementation(async (...params) => {
+        try { return await invoke(...params); } finally { finished(); }
+      });
+      const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
+      config.executor.timeoutMs = ending === "deadline" ? 1_000 : 5_000;
+      const registry = new ActionRegistry(); registry.register(provider);
+      const service = new FabricExecutionService(registry, config); const abort = new AbortController();
+      const execute = (code: string, signal?: AbortSignal) => service.execute({ code, signal, parentToolCallId: "F6-public-guest",
+        context: { ...context.extensionContext, cwd: process.cwd(), hasUI: false } as ExtensionContext, onPartial() {} });
+      const running = execute(`return await agents.${action}(${JSON.stringify(args)});`, abort.signal);
+      try {
+        await Promise.race([entered, running.then(result => { throw new Error(`Guest ended before publication contention: ${result.error}`); })]);
+        const committed = actors.list(); expect(committed).toHaveLength(1);
+        const id = committed[0]!.id;
+        expect(actors.owns(id)).toBe(true);
+        expect(fs.existsSync(path.join(root, "actors", id))).toBe(true);
+        expect(actors.definition(id).topics).toEqual(["round4.work"]);
+        if (publication === "registry") expect(fs.existsSync(path.join(root, "actors", "actors.json"))).toBe(false);
+        else expect(JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")).actors).toEqual([expect.objectContaining({ id })]);
+        expect(mesh.listAll("actors/test/")).toEqual([]);
+        if (ending === "Escape") abort.abort(new Error("Escape"));
+        if (ending === "revocation") registry.revokeProvider("agents");
+        const result = await running;
+        expect(result.success).toBe(false); expect(result.value).toBeUndefined();
+        expect(result.residentOutcomes).toEqual([expect.objectContaining({ state: "committed", operation: "createActor", entityKind: "actor", id, ownerHostId: identity.id })]);
+        expect(result.residentOutcomes![0]!.requestId).toBeTruthy();
+        expect(result.error).toContain(id); expect(result.error).toContain("Do not retry or reassign");
+        // Cancellation only ended observation. Complete the real publication promise before cleanup.
+        fs.rmSync(lock, { recursive: true, force: true }); await done;
+        expect(actors.status(id)).toMatchObject({ id, status: "idle" });
+        expect(JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")).actors).toEqual([expect.objectContaining({ id })]);
+        expect(mesh.listAll("actors/test/").map(entry => entry.value)).toEqual([expect.objectContaining({ id })]);
+        invocationSpy.mockRestore(); lockSpy.mockRestore(); presenceSpy.mockRestore();
+        if (ending === "revocation") registry.register(provider);
+        // The returned receipt supplies the exact public cleanup key; an uncancelled control still returns a handle.
+        expect((await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`)).success).toBe(true);
+        expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+        const control = await execute(`return await agents.${action}(${JSON.stringify(args)});`);
+        expect(control.success).toBe(true); expect(control.residentOutcomes).toBeUndefined();
+        expect(control.value).toMatchObject({ name: request.name, status: "idle" });
+        const controlId = (control.value as FabricActorInfo).id;
+        expect((await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`)).success).toBe(true);
+        expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+      } finally {
+        fs.rmSync(lock, { recursive: true, force: true });
+        await running; await done;
+        invocationSpy.mockRestore(); lockSpy.mockRestore(); presenceSpy.mockRestore();
+      }
+    });
 
   it("round 3 F4 public cancellation under the binding lock cannot change a local overlay", async () => {
     const { provider, actors, root } = setup();

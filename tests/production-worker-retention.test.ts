@@ -9,7 +9,7 @@ import { decideModelRoute } from "../src/agents/model-route.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { fabricTurnProvenance } from "../src/fabric-provenance.js";
-import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, sweepTempRunRoots } from "../src/storage/retention.js";
+import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
 
 const workerPath = path.resolve("dist/worker.js");
 const roots: string[] = [];
@@ -32,7 +32,7 @@ afterEach(async () => {
 // Real built worker AND native Pi; the only substitute is a loopback model endpoint.
 // In particular native Pi loads the production principal-delivery hook and consumes
 // the ingress item before it can emit a successful result. No fake-worker fixtures.
-const productionRun = async (principal: boolean, retainRuns = true) => {
+const productionRun = async (principal: boolean, retainRuns = true, nestedRunRoot?: string) => {
   expect(fs.existsSync(workerPath), "build the production worker before running this suite").toBe(true);
   const piBinary = findExecutable("pi");
   expect(piBinary, "native Pi is required for the offline production proof").toBeTruthy();
@@ -60,7 +60,7 @@ const productionRun = async (principal: boolean, retainRuns = true) => {
   fs.writeFileSync(path.join(agent, "settings.json"), JSON.stringify({ enableInstallTelemetry: false, compaction: { enabled: false } }));
   vi.stubEnv("PI_CODING_AGENT_DIR", agent); vi.stubEnv("PI_OFFLINE", "1"); vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
   const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30000, retainRuns, sessionExport: false, nice: 19 }, {
-    workerPath, piBinary: piBinary!, fullCodeMode: false,
+    workerPath, piBinary: piBinary!, fullCodeMode: false, ...(nestedRunRoot ? { runRoot: nestedRunRoot } : {}),
   });
   managers.push(manager);
   const routeDecision = await decideModelRoute({ routeClass: "bounded-lookup", protected: true,
@@ -111,6 +111,25 @@ const makeUnsafe = (run: string, kind: UnsafeKind) => {
 const copyRun = (source: string, destination: string) => { fs.cpSync(source, destination, { recursive: true }); return destination; };
 
 describe("I-2 production-worker ingress retention", () => {
+  it("a completed native descendant persists its process identity and releases a retained failed parent's ownership debt", async () => {
+    const root = temporary();
+    const runs = path.join(root, "runs");
+    const parent = path.join(runs, "failed-parent");
+    fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(parent, "status.json"), JSON.stringify({
+      id: "failed-parent", actorId: "native-descendant-actor", status: "failed", transport: "process", sessionId: "2147483647",
+    }), { mode: 0o600 });
+    // The same explicit nested run-root API used by recursive workers, with a
+    // real compiled worker + native Pi (loopback model, not a fabricated child record).
+    const child = await productionRun(false, true, path.join(parent, "nested"));
+    const status = JSON.parse(fs.readFileSync(path.join(child.run, "status.json"), "utf8"));
+    expect(status).toMatchObject({ status: "completed", transport: "process", sessionId: child.result.sessionId });
+    if (process.platform === "linux") expect(status.processStartTime).toMatch(/^\d+$/);
+    expect(runTreeExitVeto(parent, 0, undefined, true)).toBeUndefined();
+    const recovered = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, { runRoot: runs });
+    managers.push(recovered);
+    expect(recovered.retentionReferences().has("native-descendant-actor")).toBe(false);
+  }, 45000);
   it.each([false, true])("collects default-root close with principal provenance=%s", async principal => {
     const { manager, runRoot } = await productionRun(principal, false);
     await manager.close();

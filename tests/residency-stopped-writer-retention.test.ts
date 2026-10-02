@@ -123,7 +123,9 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
 // relies on POSIX detached process groups. Windows durable residency is unsupported
 // (src/residency/host.ts, docs/residency-runtime.md), and there the nested child does
 // not survive the primary's exit, so this descendant-tracking claim is not made.
-it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a settled tracked activation retains reconciliation IDs while its real nested writer survives, then collects once (%s scope)", async scope => {
+it.skipIf(process.platform === "win32").each([
+  ["project", false], ["session", false], ["project", true], ["session", true],
+] as const)("a settled tracked activation retains reconciliation IDs while its real nested writer survives, then collects once (%s scope, restart=%s)", async (scope, restart) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nested-writer-retention-"));
   const rootId = "session:nested-writer-retention";
   const meshRoot = path.join(root, "mesh");
@@ -138,7 +140,7 @@ it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
   };
-  const host = new ResidentHost(config);
+  let host = new ResidentHost(config);
   let client: ResidencyClient | undefined;
   let control: FabricControlPlane | undefined;
   let scanTime: number | undefined;
@@ -185,6 +187,8 @@ it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a
     expect(processAlive(child.pid)).toBe(true);
     expect(host.agents.runDirectory(writer.id)).toBeDefined(); // Still tracked, disk-scan skip applies.
     expect(hasUnresolvedWorker(host.agents.runDirectory(writer.id)!)).toBe(false);
+    await expect(host.agents.cleanup(writer.id)).rejects.toThrow(/descendant worker may still be running/);
+    expect(processAlive(child.pid)).toBe(true);
 
     scanTime = ack.acknowledgedAt + RESIDENT_REQUEST_RETENTION_MS + 1;
     due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
@@ -208,6 +212,35 @@ it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a
     expect(outcome.message).toMatch(/do not replay or reassign/i);
     expect(Object.isFrozen(outcome.residentOutcome)).toBe(true);
     expect(create).toHaveBeenCalledTimes(1);
+
+    if (restart) {
+      const runDirectory = host.agents.runDirectory(writer.id)!;
+      expect(config.agents.retainRuns).toBe(false);
+      await control.close(); await client.close(); await host.close();
+      // Teardown must not erase the dead primary's owning-actor evidence while
+      // a descendant still owns the tree, even without an unresolved marker.
+      expect(processAlive(child.pid)).toBe(true);
+      expect(fs.existsSync(runDirectory)).toBe(true);
+      expect(fs.existsSync(child.statusFile)).toBe(true);
+      host = new ResidentHost(config);
+      await host.start(); // Acquires a new owner fence; scans previous owner's runs.
+      client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+      const before = scans;
+      scanTime = (scanTime ?? 0) + 60_001;
+      due.mockReturnValue(true);
+      await waitFor(() => scans > before);
+      due.mockReturnValue(false);
+      expect(host.agents.retentionReferences().has(actor.id)).toBe(true);
+      expect(fs.readFileSync(decisionPath, "utf8")).toBe(committed);
+      expect(JSON.parse(fs.readFileSync(ackPath, "utf8"))).toEqual(ack);
+      const late = new AbortController();
+      registerResidentCancellation(late.signal, config.residencyRoot, command);
+      late.abort();
+      expect(cancellationError(late.signal, new Error("late descendant settlement"))).toMatchObject({
+        code: "RESIDENT_REQUEST_EXPIRED", residentOutcome: { requestId, id: actor.id, ownerHostId: client.hostId, expired: true },
+      });
+      expect(host.actors.status(actor.id)).toMatchObject({ id: actor.id, status: "stopped" });
+    }
 
     fs.writeFileSync(release, "finish nested");
     await waitFor(() => !processAlive(child.pid));
@@ -267,10 +300,13 @@ it("retention ownership uses checked orphan exit evidence, not terminal status, 
     const nested = path.join(record("parent", "parent_actor", "2147483647"), "nested", "child");
     fs.mkdirSync(nested, { recursive: true });
     markUnresolvedWorker(nested, "nested worker exit unconfirmed");
+    const unknownChild = path.join(record("unknown_child", "unknown_child_actor", "2147483647"), "nested", "child");
+    fs.mkdirSync(unknownChild, { recursive: true });
+    fs.writeFileSync(path.join(unknownChild, "status.json"), JSON.stringify({ transport: "process", status: "completed" }), { mode: 0o600 });
     record("external", "external_actor", "pane", "tmux");
     record("missing_pid", "missing_pid_actor", "");
     refs = manager.retentionReferences();
-    for (const id of ["unresolved_actor", "parent_actor", "external_actor", "missing_pid_actor"]) expect(refs.has(id)).toBe(true);
+    for (const id of ["unresolved_actor", "parent_actor", "unknown_child_actor", "external_actor", "missing_pid_actor"]) expect(refs.has(id)).toBe(true);
     fs.mkdirSync(path.join(runs, "unknown"));
     expect(manager.retentionReferences().has("*")).toBe(true);
     fs.rmSync(path.join(runs, "unknown"), { recursive: true });

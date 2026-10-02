@@ -1370,7 +1370,7 @@ export class AgentManager {
           throw error;
         }
         try { routeDispatch?.outcome({ status: "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
-        if (worktree && !runTreeExitVeto(runDirectory)) await this.#worktrees.cleanup(id, true).catch(() => false);
+        if (worktree && !runTreeExitVeto(runDirectory, 0, undefined, true)) await this.#worktrees.cleanup(id, true).catch(() => false);
         throw error;
       }
     };
@@ -1757,7 +1757,7 @@ export class AgentManager {
     for (const managed of this.#runs.values()) {
       const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
       const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
-      if (!managed.settled || managed.lostContact || uncheckedExternalExit(managed.transport) ||
+      if (!managed.settled || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
           // Settlement and primary exit do not prove descendant exit. The
           // persistent tree veto checks every descendant's worker identity too.
           unconfirmedProcess || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) protect(managed.id, managed.actorId);
@@ -1785,7 +1785,7 @@ export class AgentManager {
         // establish exit; a terminal record with no PID is still uncertain.
         const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
           ? Number(record.sessionId) : undefined;
-        if (pid !== undefined && !processAlive(pid) && canRemoveTerminalRun(run, expired)) continue;
+        if (pid !== undefined && !processAlive(pid) && !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired)) continue;
         const actorId = record?.actorId;
         if (typeof actorId === "string" && /^[A-Za-z0-9_-]+$/.test(actorId)) protect(entry.name, actorId);
         else refs.add("*");
@@ -1894,7 +1894,7 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
-    const exitVeto = runTreeExitVeto(managed.runDirectory);
+    const exitVeto = runTreeExitVeto(managed.runDirectory, 0, undefined, true);
     if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
     if (!this.#canCollect(managed)) {
       throw new Error(`Cannot clean up agent ${id}: ${uncheckedExternalExit(managed.transport) ? "external transport has no checked worker exit receipt" : managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
@@ -2107,7 +2107,10 @@ export class AgentManager {
     const alive = await Promise.all(transports.map((transport) =>
       uncheckedExternalExit(transport) ? true :
         this.#transportAliveUntil(transport, observationDeadline).then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
-    const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
+    // Primary transport exit cannot release a surviving descendant's files or
+    // shared budget. Keep the persistent run tree (and its owning actor ID) for
+    // the next fenced owner whenever tree-wide exit evidence is incomplete.
+    const unresolved = all.some((managed) => managed.lostContact || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) ||
       [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasUnresolvedWorker(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {
@@ -2670,7 +2673,7 @@ export class AgentManager {
   }
 
   #canCollect(managed: ManagedAgent): boolean {
-    if (uncheckedExternalExit(managed.transport) || runTreeExitVeto(managed.runDirectory)) return false;
+    if (uncheckedExternalExit(managed.transport) || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) return false;
     // Settlement compacts UI caches. Retry only the original full result, never those caches.
     if (managed.settlementSaveFailure &&
         !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) return false;

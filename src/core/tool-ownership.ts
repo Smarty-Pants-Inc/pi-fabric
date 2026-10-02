@@ -91,11 +91,11 @@ export class FabricToolLifecycle {
     }
     if (event.toolName === FABRIC_TOOL_NAME && this.ownsFabricTool()) {
       if (nativeNested) {
-        const parentId = event.parentToolCallId as string;
-        const parent = this.#ownedCalls.get(parentId) ?? this.#nestedCalls.get(parentId);
-        if (!owner || parent !== owner || !this.#isLive(parent)) {
-          return { block: true, reason: "Native nested fabric_exec requires a live owned Fabric invocation" };
-        }
+        // Native ctx.executeTool promises are outside the outer runtime's task
+        // ledger. Revoking their Pi-hook grant cannot fence non-Pi provider
+        // effects after outer settlement, so refuse before creating a grant or
+        // starting a child runtime. A caller-supplied signal cannot opt out.
+        return { block: true, reason: "Native nested fabric_exec is disabled: native child execution is not bound to its owner's lifetime. Use Fabric-mediated calls in the current program instead." };
       }
       this.#ownedCalls.set(event.toolCallId, { active: true, ...(owner ? { parent: owner } : {}) });
       this.#resultCalls.add(event.toolCallId);
@@ -154,7 +154,7 @@ export class FabricToolLifecycle {
   toolResult(event: ToolResultEvent): { isError: true } | undefined {
     this.#nestedCalls.delete(event.toolCallId);
     if (event.toolName !== FABRIC_TOOL_NAME || !this.#resultCalls.delete(event.toolCallId)) return undefined;
-    // Native prefixed children were admitted too: insertion/cleanup is symmetric.
+    // Every admitted Fabric call has symmetric insertion/cleanup, including prefixed replay calls.
     this.#revoke(event.toolCallId);
     return !event.isError && finalFabricDetailsFailed(event.details)
       ? { isError: true }

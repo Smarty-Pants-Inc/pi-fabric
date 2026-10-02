@@ -169,6 +169,24 @@ describe("Exclusive native orchestrator prefix gate", () => {
   });
 });
 describe("Direct top-level tool approval gate", () => {
+  it.each(["off", "audit", "enforce"])("refuses native nested Fabric regardless of schema %s or call-id prefix", async mode => {
+    const authorize = vi.fn(async () => { if (mode === "enforce") throw new Error("schema denied"); });
+    const approve = vi.fn(async () => {});
+    const lifecycle = new FabricToolLifecycle(() => true, () => ({ authorize }), () => ({ approve }));
+    await lifecycle.toolCall({ type: "tool_call", toolCallId: "outer", toolName: "fabric_exec", input: {} });
+    await lifecycle.runOwned("outer", undefined, async () => {
+      const parentId = `${NESTED_TOOL_CALL_ID_PREFIX}captured`;
+      await lifecycle.toolCall({ type: "tool_call", toolCallId: parentId, toolName: "captured_fixture", input: {} });
+      for (const toolCallId of [`${parentId}/1`, "unprefixed-native-child"]) {
+        expect(await lifecycle.toolCall({ type: "tool_call", toolCallId, parentToolCallId: parentId, toolName: "fabric_exec", input: {} })).toMatchObject({ block: true, reason: expect.stringContaining("Native nested fabric_exec is disabled") });
+        await expect(lifecycle.runOwned(toolCallId, undefined, async () => "must not run")).rejects.toThrow("authorization has ended");
+        // A refused child is not tracked for success/failure-status repair.
+        expect(lifecycle.toolResult({ type: "tool_result", toolCallId, toolName: "fabric_exec", input: {}, content: [], details: { success: false }, isError: false })).toBeUndefined();
+      }
+    });
+    expect(authorize).not.toHaveBeenCalled();
+    expect(approve).not.toHaveBeenCalled();
+  });
   it.each(["codemode", "tool_search"])("blocks stale native %s calls at execution, independent of loadout visibility", async toolName => {
     let exclusive = true;
     const lifecycle = new FabricToolLifecycle(() => true, () => undefined, () => undefined, () => false, () => exclusive);
@@ -337,7 +355,7 @@ describe("Schema top-level tool gate", () => {
     expect(nested.decisions).toEqual([]);
   });
 
-  it.each(["child-first", "outer-first"])("revokes native prefixed child grants in %s result order", async order => {
+  it.each(["child-first", "outer-first"])("revokes Fabric-mediated prefixed child grants in %s result order", async order => {
     const { lifecycle } = gate("enforce");
     const childId = `${NESTED_TOOL_CALL_ID_PREFIX}captured/1`;
     const call = (id: string) => ({ type: "tool_call" as const, toolCallId: id, toolName: "fabric_exec", input: {} });
@@ -345,7 +363,7 @@ describe("Schema top-level tool gate", () => {
     await lifecycle.toolCall(call("outer"));
     await lifecycle.runOwned("outer", undefined, async () => {
       await lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured`, toolName: "captured_fixture", input: {} });
-      expect(await lifecycle.toolCall({ ...call(childId), parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured` })).toBeUndefined();
+      expect(await lifecycle.toolCall(call(childId))).toBeUndefined();
       const ids = order === "outer-first" ? ["outer", childId] : [childId, "outer"];
       lifecycle.toolResult(result(ids[0]!));
       if (order === "outer-first") {
@@ -356,7 +374,7 @@ describe("Schema top-level tool gate", () => {
     await expect(lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}later`, toolName: "write", input: {} })).rejects.toThrow("blocked schema.top_level_tool.write");
   });
 
-  it.each(["settle", "error", "abort", "result", "clear"])("revokes a near-end nested execution on outer %s, without an unrelated root resurrecting it", async end => {
+  it.each(["settle", "error", "abort", "result", "clear"])("revokes a near-end Fabric-mediated execution on outer %s, without an unrelated root resurrecting it", async end => {
     const { lifecycle } = gate("enforce");
     const controller = new AbortController();
     const childId = `${NESTED_TOOL_CALL_ID_PREFIX}captured/1`;
@@ -368,7 +386,7 @@ describe("Schema top-level tool gate", () => {
     await lifecycle.toolCall(call("outer"));
     const owned = lifecycle.runOwned("outer", controller.signal, async () => {
       await lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured`, toolName: "captured_fixture", input: {} });
-      expect(await lifecycle.toolCall({ ...call(childId), parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured` })).toBeUndefined();
+      expect(await lifecycle.toolCall(call(childId))).toBeUndefined();
       late = () => lifecycle.toolCall({ ...call(`${NESTED_TOOL_CALL_ID_PREFIX}captured/2`), parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured` });
       // Start just before the outer returns; the child does not settle first.
       nested = lifecycle.runOwned(childId, undefined, async () => {
@@ -436,14 +454,14 @@ describe("Schema top-level tool gate", () => {
     lifecycle.clear();
   });
 
-  it("keeps outer failure-status repair after bound execute settles and repairs tracked native prefixed results", async () => {
+  it("keeps outer failure-status repair after bound execute settles and repairs tracked Fabric-mediated prefixed results", async () => {
     const { lifecycle } = gate("enforce");
     const call = { type: "tool_call" as const, toolCallId: "outer", toolName: "fabric_exec", input: {} };
     const childId = `${NESTED_TOOL_CALL_ID_PREFIX}captured/1`;
     await lifecycle.toolCall(call);
     const execute = vi.fn(async () => {
       await lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured`, toolName: "captured_fixture", input: {} });
-      await lifecycle.toolCall({ ...call, toolCallId: childId, parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured` });
+      await lifecycle.toolCall({ ...call, toolCallId: childId });
       return { content: [], details: { success: false } };
     });
     const tool = lifecycle.bindExecution({ name: "fabric_exec", execute } as unknown as import("@earendil-works/pi-coding-agent").ToolDefinition<any, any, any>);

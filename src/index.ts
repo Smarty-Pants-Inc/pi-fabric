@@ -870,14 +870,15 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // smarty-dev#774: a kill by name pattern kills other owners' processes on a shared host. Every
   // session that loads Fabric (Mains, task agents, actors) runs this, and fabric_exec's pi.bash
   // emits the same tool_call.
+  let literalGuard: Promise<typeof import("./core/literal-bash-guard.js")> | undefined;
   pi.on("tool_call", async (event) => {
     if (event.toolName !== "bash") return undefined;
     const { command, timeout } = event.input as { command?: unknown; timeout?: unknown };
     if (typeof command !== "string") return undefined;
-    // Host-free parser loaded only for an actual shell call, before admission.
-    const { killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp } = await import("./core/pattern-kill.js");
-    if (killsByPattern(command)) return { block: true, reason: PATTERN_KILL_REASON };
-    if (wipesTmp(command)) return { block: true, reason: TMP_WIPE_REASON };
+    const { bashGuardRefusal } = await (literalGuard ??= import("./core/literal-bash-guard.js"));
+    // Guard-time host input, not a TMPDIR assignment or expansion in the command being guarded.
+    const guardReason = bashGuardRefusal(command, process.env.TMPDIR);
+    if (guardReason) return { block: true, reason: guardReason };
     const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);
     if (reason) return { block: true, reason };
     // smarty-dev#2184: judged on the caller's own timeout above, so the injected default never unblocks a wait.

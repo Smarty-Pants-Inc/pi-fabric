@@ -586,15 +586,29 @@ export class ResidentHost {
         // Preserve positive process evidence before close can delete the resident run tree.
         // Incomplete/unresolved evidence must never produce a clean-close receipt.
         let runs: RunProcessEvidence[] | undefined;
-        try { runs = readRunProcessEvidence(path.join(this.config.residencyRoot, "runs")); } catch { /* unknown */ }
+        let unsettled: unknown;
+        try { runs = readRunProcessEvidence(path.join(this.config.residencyRoot, "runs")); } catch (error) { unsettled = error; }
         try {
           await this.agents?.close();
+          // Close can settle tools after the initial capture. Refresh only from retained
+          // durable logs; never upgrade an earlier live-runner snapshot by PID absence.
+          if (runs?.some(run => run.toolSettlement?.state !== "settled") &&
+              fs.existsSync(path.join(this.config.residencyRoot, "runs"))) {
+            try { runs = readRunProcessEvidence(path.join(this.config.residencyRoot, "runs")); }
+            catch (error) { unsettled = error; }
+          }
           if (runs) {
             try {
               assertRunProcessesSettled(runs);
               writeJsonAtomic(path.join(this.config.residencyRoot, "workers-settled.json"),
                 { format: 1, rootId: this.config.rootId, runs }, { durable: true });
-            } catch { /* keep unknown settlement unaccepted by successors */ }
+              fs.rmSync(path.join(this.config.residencyRoot, "workers-unsettled.json"), { force: true });
+            } catch (error) { unsettled = error; }
+          }
+          if (unsettled) {
+            fs.rmSync(path.join(this.config.residencyRoot, "workers-settled.json"), { force: true });
+            writeJsonAtomic(path.join(this.config.residencyRoot, "workers-unsettled.json"),
+              { format: 1, rootId: this.config.rootId, reason: errorMessage(unsettled), ...(runs ? { runs } : {}) }, { durable: true });
           }
         } finally {
           await this.#backgroundDeliveries.close();

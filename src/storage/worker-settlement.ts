@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
+import { readRunToolSettlement, type RunToolSettlement } from "../worker/run-log.js";
 import { processStartIdentityState, validProcessIdentity, type ProcessIdentity } from "../core/process-identity.js";
 
-export interface RunProcessEvidence { id: string; actorId?: string; processes: ProcessIdentity[] }
+export interface RunProcessEvidence { id: string; actorId?: string; processes: ProcessIdentity[]; toolSettlement?: RunToolSettlement }
 export interface WorkerSettlementReceipt { format: 1; rootId: string; runs: RunProcessEvidence[] }
 
 const record = (file: string): Record<string, unknown> => {
@@ -56,6 +57,7 @@ const readRun = (dir: string, depth = 0): RunProcessEvidence[] => {
   const registered = new Set<string>();
   const processes: ProcessIdentity[] = [];
   const launched = new Map<string, boolean>();
+  const runnerAttempts = new Map<string, boolean>();
   for (const entry of journalEntries(file)) {
     if (!validProcessIdentity(entry.worker) || (entry.runner !== undefined && !validProcessIdentity(entry.runner))) {
       throw new Error(`Missing worker/runner process identity at ${file}`);
@@ -63,17 +65,35 @@ const readRun = (dir: string, depth = 0): RunProcessEvidence[] => {
     if (entry.attempt !== undefined && (typeof entry.attempt !== "string" || !entry.attempt)) {
       throw new Error(`Malformed worker launch attempt at ${file}`);
     }
+    if (entry.runnerAttempt !== undefined && (typeof entry.runnerAttempt !== "string" || !entry.runnerAttempt)) {
+      throw new Error(`Malformed runner launch attempt at ${file}`);
+    }
     const key = JSON.stringify([entry.attempt ?? null, entry.worker]);
+    if (typeof entry.runnerAttempt === "string") {
+      const spawn = JSON.stringify([key, entry.runnerAttempt]);
+      runnerAttempts.set(spawn, runnerAttempts.get(spawn) === true || entry.runner !== undefined);
+    }
     if (typeof entry.attempt === "string" && entry.runner !== undefined) registered.add(entry.attempt);
     launched.set(key, launched.get(key) === true || entry.runner !== undefined);
     processes.push(entry.worker);
     if (validProcessIdentity(entry.runner)) processes.push(entry.runner);
   }
-  if (!launched.size || [...launched.values()].some(value => !value)) throw new Error(`Missing runner launch evidence at ${file}`);
+  if (!launched.size || [...launched.values()].some(value => !value) || [...runnerAttempts.values()].some(value => !value)) {
+    throw new Error(`Missing runner launch evidence at ${file}`);
+  }
   for (const attempt of attempts) {
     if (!registered.has(attempt)) throw new Error(`Unregistered worker launch attempt ${attempt} at ${file}`);
   }
-  const runs = [{ id, ...(typeof status.actorId === "string" ? { actorId: status.actorId } : {}), processes }];
+  // A tool-free snapshot of a LIVE runner cannot prove cleanup after a later crash:
+  // it could admit another tool between this read and close's ancestor-exit check.
+  // Capture positive log proof only after every admitted ancestor is kernel-settled.
+  const ancestorsSettled = processes.every(identity => {
+    const state = processStartIdentityState(identity);
+    return state === "dead" || state === "mismatch";
+  });
+  const runs: RunProcessEvidence[] = [{ id, ...(typeof status.actorId === "string" ? { actorId: status.actorId } : {}), processes,
+    toolSettlement: ancestorsSettled ? readRunToolSettlement(path.join(dir, "events.jsonl"), status.toolCalls)
+      : { format: 1, state: "unknown", reason: "worker/runner exit was not proven before tool log inspection" } }];
   const nested = path.join(dir, "nested");
   if (fs.existsSync(nested)) runs.push(...readRunProcessEvidence(nested, depth + 1));
   return runs;
@@ -83,8 +103,9 @@ const readRun = (dir: string, depth = 0): RunProcessEvidence[] => {
 export const readRunProcessEvidence = (root: string, depth = 0): RunProcessEvidence[] =>
   directory(root).flatMap(id => readRun(path.join(root, id), depth));
 
-/** No signals: kernel absence or a changed kernel start time is the only stop proof.
- * Command-line changes (title rewrites/exec) do not settle a still-live process. */
+/** No signals: ancestor exit requires kernel absence or a changed kernel start time,
+ * AND durable tool execution balance. Neither terminal status nor ancestor absence
+ * discharges an in-flight/unknown tool. Command-line changes do not prove exit. */
 export const assertRunProcessesSettled = (runs: RunProcessEvidence[]): void => {
   if (!Array.isArray(runs)) throw new Error("Missing predecessor run settlement evidence");
   for (const run of runs) {
@@ -95,6 +116,10 @@ export const assertRunProcessesSettled = (runs: RunProcessEvidence[]): void => {
       if (!validProcessIdentity(identity)) throw new Error(`Missing worker process identity for ${run.id}`);
       const state = processStartIdentityState(identity);
       if (state !== "dead" && state !== "mismatch") throw new Error(`Predecessor run ${run.id} worker/runner ${identity.pid} is ${state}; settlement not proven`);
+    }
+    // Legacy receipts only prove ancestor exit; they cannot discharge native tool debt.
+    if (run.toolSettlement?.format !== 1 || run.toolSettlement.state !== "settled") {
+      throw new Error(`Predecessor run ${run.id} tool settlement not proven: ${run.toolSettlement?.reason ?? "missing durable tool execution proof"}`);
     }
   }
 };

@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as processIdentity from "../src/core/process-identity.js";
 import { readProcessIdentity, type ProcessIdentity } from "../src/core/process-identity.js";
 import { assertRunProcessesSettled, hasUnsettledRecordedProcesses, readRunProcessEvidence, recordWorkerLaunchAttempt } from "../src/storage/worker-settlement.js";
 import { canRemoveManagedRunRoot, runTreeExitVeto, markRunRootClosed, markUnresolvedWorker, pruneActorRunArchives, sweepTempRunRoots } from "../src/storage/retention.js";
@@ -24,6 +25,7 @@ const setup = () => {
 const journal = (dir: string, worker: ProcessIdentity | null, runner: ProcessIdentity | null) => {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ id: path.basename(dir), actorId: "actor", status: "completed", finishedAt: 1 }));
+  fs.writeFileSync(path.join(dir, "events.jsonl"), '{"type":"agent_start"}\n'); // known complete, no tool execution
   const launchFile = path.join(dir, "worker-launches.jsonl");
   const attempts = fs.existsSync(launchFile)
     ? fs.readFileSync(launchFile, "utf8").trim().split("\n").map(line => JSON.parse(line).attempt as string)
@@ -35,6 +37,62 @@ const journal = (dir: string, worker: ProcessIdentity | null, runner: ProcessIde
 };
 
 describe.skipIf(process.platform !== "linux")("worker settlement evidence preservation", () => {
+  it("a tool-free log snapshot taken while ancestors live cannot authorize removal after their later abrupt exit", () => {
+    const { root, dead } = setup(); const dir = path.join(root, "run"); journal(dir, dead, dead);
+    const state = vi.spyOn(processIdentity, "processStartIdentityState").mockReturnValue("alive");
+    let snapshot: ReturnType<typeof readRunProcessEvidence>;
+    try { snapshot = readRunProcessEvidence(root); } finally { state.mockRestore(); }
+    // Ancestors now prove dead, but their old snapshot precedes the last possible tool admission.
+    expect(() => assertRunProcessesSettled(snapshot)).toThrow("exit was not proven before tool log inspection");
+    expect(() => assertRunProcessesSettled(readRunProcessEvidence(root))).not.toThrow();
+  });
+  it("dead ancestors and a completed status never settle an in-flight tool; an exact end later discharges it", () => {
+    const { root, dead } = setup();
+    const dir = path.join(root, "run");
+    journal(dir, dead, dead);
+    const log = path.join(dir, "events.jsonl");
+    fs.appendFileSync(log, '{"type":"tool_execution_start","toolCallId":"bash-1","toolName":"bash"}\n');
+    expect(() => assertRunProcessesSettled(readRunProcessEvidence(root))).toThrow("tool settlement not proven: 1 in-flight");
+    expect(hasUnsettledRecordedProcesses(dir)).toBe(true);
+    expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 1, now: 1000 })).toEqual([]);
+    fs.appendFileSync(log, '{"type":"tool_execution_end","toolCallId":"bash-1","toolName":"bash"}\n');
+    const evidence = readRunProcessEvidence(root);
+    expect(() => assertRunProcessesSettled(evidence)).not.toThrow();
+    expect(hasUnsettledRecordedProcesses(dir)).toBe(false);
+    expect(() => assertRunProcessesSettled(evidence.map(({ toolSettlement: _legacy, ...run }) => run))).toThrow("missing durable tool execution proof");
+    expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 1, now: 1000 })).toEqual([dir]);
+    expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 1, now: 1000 })).toEqual([]);
+  });
+  it.each(["missing", "empty", "truncated", "malformed", "wrong end", "wrong tool", "unmatched end", "duplicate start", "dropped event", "count mismatch", "symlink"])("unknown %s tool log stays unaccepted and retained", kind => {
+    const { root, dead } = setup();
+    const dir = path.join(root, "run"); journal(dir, dead, dead);
+    const log = path.join(dir, "events.jsonl");
+    const start = '{"type":"tool_execution_start","toolCallId":"bash-1","toolName":"bash"}\n';
+    if (kind === "missing") fs.rmSync(log);
+    if (kind === "empty") fs.writeFileSync(log, "");
+    if (kind === "truncated") fs.writeFileSync(log, start + '{"type":"tool_execution_end"');
+    if (kind === "malformed") fs.writeFileSync(log, "broken\n");
+    if (kind === "wrong end") fs.writeFileSync(log, start + '{"type":"tool_execution_end","toolCallId":"bash-2","toolName":"bash"}\n');
+    if (kind === "wrong tool") fs.writeFileSync(log, start + '{"type":"tool_execution_end","toolCallId":"bash-1","toolName":"read"}\n');
+    if (kind === "unmatched end") fs.writeFileSync(log, '{"type":"tool_execution_end","toolCallId":"bash-1","toolName":"bash"}\n');
+    if (kind === "duplicate start") fs.writeFileSync(log, start + start);
+    if (kind === "dropped event") fs.writeFileSync(log, '{"type":"worker_warning","warning":"Dropped an oversized agent event line (tool_execution_start)"}\n');
+    if (kind === "count mismatch") fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ id: "run", status: "completed", toolCalls: 1 }));
+    if (kind === "symlink") { fs.renameSync(log, path.join(dir, "outside.jsonl")); fs.symlinkSync(path.join(dir, "outside.jsonl"), log); }
+    expect(() => assertRunProcessesSettled(readRunProcessEvidence(root))).toThrow("tool settlement not proven");
+    expect(hasUnsettledRecordedProcesses(dir)).toBe(true);
+    expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 1, now: 1000 })).toEqual([]);
+    expect(fs.existsSync(dir)).toBe(true);
+  });
+  it("a same-worker runner resume cannot reuse an earlier runner's completed journal after a spawn crash", () => {
+    const { root, dead } = setup();
+    const dir = path.join(root, "run"); journal(dir, dead, dead);
+    fs.appendFileSync(path.join(dir, "worker-processes.jsonl"), JSON.stringify({ worker: dead, runnerAttempt: "resume-2" }) + "\n");
+    expect(() => readRunProcessEvidence(root)).toThrow("Missing runner launch evidence");
+    expect(hasUnsettledRecordedProcesses(dir)).toBe(true);
+    fs.appendFileSync(path.join(dir, "worker-processes.jsonl"), JSON.stringify({ worker: dead, runnerAttempt: "resume-2", runner: dead }) + "\n");
+    expect(() => assertRunProcessesSettled(readRunProcessEvidence(root))).not.toThrow();
+  });
   it.each(["worker spawn", "runner spawn"])("a crash after %s but before registration cannot reuse earlier settled evidence", kind => {
     const { root, dead } = setup();
     const dir = path.join(root, "run");

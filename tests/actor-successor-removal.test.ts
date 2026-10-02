@@ -134,6 +134,7 @@ const runEvidence = (root: string, id: string, worker: Awaited<ReturnType<typeof
   const dir = path.join(root, id);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ id, status: "running", transport: "process" }));
+  fs.writeFileSync(path.join(dir, "events.jsonl"), '{"type":"agent_start"}\n'); // explicit tool-free fixture
   fs.writeFileSync(path.join(dir, "worker-processes.jsonl"), JSON.stringify({ worker }) + "\n" + JSON.stringify({ worker, runner }) + "\n");
   return dir;
 };

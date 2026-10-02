@@ -303,9 +303,10 @@ const main = async (): Promise<void> => {
   // leave any attempt detached. Register this attempt before publishing runnable status.
   const workerIdentity = readProcessIdentity();
   const processJournal = path.join(path.dirname(options.statusFile), "worker-processes.jsonl");
-  const recordProcesses = (runner?: unknown): void => {
+  const recordProcesses = (runner?: unknown, runnerAttempt?: string): void => {
     fs.appendFileSync(processJournal, JSON.stringify({
       ...(options.launchAttempt ? { attempt: options.launchAttempt } : {}), worker: workerIdentity ?? null,
+      ...(runnerAttempt ? { runnerAttempt } : {}),
       ...(runner === undefined ? {} : { runner }) }) + "\n", { encoding: "utf8", mode: 0o600 });
   };
   recordProcesses(); // incomplete runner evidence is already durable before spawnCli below
@@ -522,7 +523,8 @@ const main = async (): Promise<void> => {
   // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
   const taskEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/task-entry.ts" : "./worker/task-entry.js", import.meta.url));
   const spawnChild = (): ChildProcess => {
-    recordProcesses(); // each resume/spawn is incomplete until its runner is registered
+    const runnerAttempt = randomUUID();
+    recordProcesses(undefined, runnerAttempt); // each resume/spawn has its own incomplete obligation
     const spawned = spawnCli(piRetrySdk ? taskEntryPath : childBinary,
     piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments] : childArguments, {
     cwd: options.cwd,
@@ -577,7 +579,7 @@ const main = async (): Promise<void> => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
-    recordProcesses(spawned.pid ? readProcessIdentity(spawned.pid) ?? null : null);
+    recordProcesses(spawned.pid ? readProcessIdentity(spawned.pid) ?? null : null, runnerAttempt);
     return spawned;
   };
   let child = spawnChild();

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 
 const args = new Map();
@@ -14,7 +15,16 @@ const attempts = fs.existsSync(marker) ? Number(fs.readFileSync(marker, "utf8"))
 fs.writeFileSync(marker, String(attempts));
 const now = Date.now();
 const retryable = task !== "Reject startup";
-const failed = retryable ? attempts === 1 : true;
+const windowRefusal = task === "window before first turn" || task === "window after work";
+let capabilityMissing = false;
+if (task === "Recover pinned Pi startup") {
+  const binary = args.get("pi-binary");
+  const probe = JSON.parse(execFileSync(process.execPath, [binary], { encoding: "utf8" }));
+  const turnProvenance = probe.hostCapabilities.turnProvenance;
+  capabilityMissing = turnProvenance !== 1;
+  fs.appendFileSync(path.join(path.dirname(statusFile), "pi-launches.jsonl"), JSON.stringify({ binary, turnProvenance }) + "\n");
+}
+const failed = capabilityMissing || windowRefusal || (retryable ? attempts === 1 : true);
 fs.writeFileSync(
   statusFile,
   JSON.stringify({
@@ -28,11 +38,15 @@ fs.writeFileSync(
     startedAt: now,
     updatedAt: now,
     finishedAt: now,
-    turns: failed ? 0 : 1,
+    turns: task === "window after work" ? 1 : failed ? 0 : 1,
     toolCalls: 0,
     text: failed ? "" : "startup retry recovered",
     ...(failed
-      ? { error: retryable ? "No API key found for openai-codex" : "provider rejected the prompt" }
+      ? { error: capabilityMissing
+          ? "Child Pi exited before requested model admission completed; task was not sent: [pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1"
+          : windowRefusal
+            ? (task === "window after work" ? "Agent transport exited without a result · " : "") + "Context exceeds window: estimated 272511 input tokens, window 272000 · No API key found"
+            : retryable ? "No API key found for openai-codex" : "provider rejected the prompt" }
       : {}),
     exitCode: 0,
     usage: failed

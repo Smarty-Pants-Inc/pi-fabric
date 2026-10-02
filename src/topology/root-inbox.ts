@@ -39,6 +39,9 @@ const inboxHorizonMs = (): number => {
 const SAVE_INTERVAL_MS = 10 * 60_000;
 /** One batch holds at most this many events and this much text; a longer text is cut. */
 const MAX_BATCH_EVENTS = 20;
+/** Bound persisted dedup independently of session lifetime; leave 25% for mesh/headroom. */
+const MAX_DELIVERED_RECEIPTS = 1024;
+const RECEIPT_VALUE_FRACTION = 0.75;
 const MAX_BATCH_TEXT_BYTES = 32 * 1024;
 const MAX_EVENT_TEXT_BYTES = 8 * 1024;
 /**
@@ -68,6 +71,8 @@ interface RootInboxState {
   pending?: { through: number; ids: string[] };
   /** Hashed delivery/work identities, scoped by this recipient's state key. */
   delivered?: string[];
+  /** Receipt times parallel to delivered. Legacy string-only states migrate on first save. */
+  deliveredAt?: number[];
 }
 
 const workKey = (data: unknown): string | undefined => {
@@ -78,16 +83,22 @@ const workKey = (data: unknown): string | undefined => {
 const receipt = (fromId: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([fromId, kind, value])).digest("hex");
 
-/** A ref is a fallback identity only: a shared issue ref must not collapse distinct work keys. */
+/** A delivery identity outranks work-key/ref fallbacks, never the other way around. */
+const deliveryIdentity = (data: unknown): { kind: string; value: string } | undefined => {
+  if (!data || typeof data !== "object") return undefined;
+  const fields = data as Record<string, unknown>;
+  if (typeof fields.deliveryId === "string" && fields.deliveryId) return { kind: "delivery", value: fields.deliveryId };
+  if (typeof fields.messageId === "string" && fields.messageId) return { kind: "id", value: fields.messageId };
+  return undefined;
+};
 const workReceipts = (fromId: string, data: unknown): string[] => {
   if (!data || typeof data !== "object") return [];
+  const identity = deliveryIdentity(data);
+  if (identity) return [receipt(fromId, identity.kind, identity.value)];
   const fields = data as Record<string, unknown>;
   const key = workKey(data);
   const ref = typeof fields.ref === "string" && fields.ref.trim() ? fields.ref.trim() : undefined;
-  const ids = key ? [receipt(fromId, "key", key)] : ref ? [receipt(fromId, "ref", ref)] : [];
-  if (typeof fields.messageId === "string" && fields.messageId) ids.push(receipt(fromId, "id", fields.messageId));
-  if (typeof fields.deliveryId === "string" && fields.deliveryId) ids.push(receipt(fromId, "delivery", fields.deliveryId));
-  return ids;
+  return key ? [receipt(fromId, "key", key)] : ref ? [receipt(fromId, "ref", ref)] : [];
 };
 const eventReceipt = (id: string): string => receipt("", "event", id);
 const eventReceipts = (event: MeshEvent): string[] => [
@@ -101,6 +112,8 @@ export interface RootInboxSession {
   holdsSteer(fromId: string, key: string): boolean;
   /** Confirmed native/inbox receipts from the whole history, not the recent-entry window. */
   delivered?: ReadonlySet<string>;
+  /** Canonical session-entry times, so rescanning history cannot renew old receipts. */
+  deliveredAt?: ReadonlyMap<string, number>;
 }
 
 export class RootInbox {
@@ -108,7 +121,7 @@ export class RootInbox {
   #saved: string | undefined;
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
-  #delivered = new Set<string>();
+  #delivered = new Map<string, number>();
 
   constructor(
     readonly mesh: MeshStore,
@@ -129,7 +142,9 @@ export class RootInbox {
    */
   async next(session: RootInboxSession): Promise<RootInboxBatch> {
     const state = this.#load();
-    let receiptsChanged = this.#remember(session.delivered ?? []);
+    let receiptsChanged = this.#trimReceipts();
+    receiptsChanged = JSON.stringify(state) !== this.#saved || receiptsChanged;
+    receiptsChanged = this.#remember(session.delivered ?? [], session.deliveredAt) || receiptsChanged;
     let skippedStale = 0;
     if (state.pending) {
       const pending = this.#reread(state.after, state.pending);
@@ -254,19 +269,52 @@ export class RootInbox {
   // Positive delivery evidence only, qualified by sender and this recipient's state key.
   // Before Pi records a native message, its shadow remains recoverable (at least once).
   #steered(event: MeshEvent, session: RootInboxSession): boolean {
-    const key = workKey(event.data);
+    const key = deliveryIdentity(event.data) ? undefined : workKey(event.data);
     return eventReceipts(event).some((id) => this.#delivered.has(id) || session.delivered?.has(id)) ||
       (key !== undefined && session.holdsSteer(event.from.id, key));
   }
 
-  #remember(ids: Iterable<string>): boolean {
+  #remember(ids: Iterable<string>, times?: ReadonlyMap<string, number>): boolean {
     let changed = false;
-    for (const id of ids) if (!this.#delivered.has(id)) {
-      this.#delivered.add(id);
-      (this.#state!.delivered ??= []).push(id);
-      changed = true;
+    const cutoff = this.#now() - this.#horizon();
+    for (const id of ids) {
+      // Missing times (legacy/custom callers) retain the original observation time.
+      const at = times?.get(id) ?? this.#delivered.get(id) ?? this.#now();
+      if (at < cutoff) continue;
+      const previous = this.#delivered.get(id);
+      if (previous === undefined || at > previous) {
+        this.#delivered.set(id, at);
+        changed = true;
+      }
     }
     return changed;
+  }
+
+  /** Oldest first, by canonical receipt time, not the most recent history scan. */
+  #trimReceipts(): boolean {
+    const before = this.#delivered.size;
+    const cutoff = this.#now() - this.#horizon();
+    let entries = [...this.#delivered].filter(([, at]) => at >= cutoff)
+      .sort((a, b) => a[1] - b[1]).slice(-MAX_DELIVERED_RECEIPTS);
+    const state = this.#state!;
+    const assign = (offset: number): void => {
+      state.delivered = entries.slice(offset).map(([id]) => id);
+      state.deliveredAt = entries.slice(offset).map(([, at]) => at);
+    };
+    // Account for the actual cursor and pending IDs too. Byte-size (not count) protects
+    // configured small mesh values; count also caps memory at the default/larger limit.
+    const budget = Math.floor(this.mesh.maxEventBytes * RECEIPT_VALUE_FRACTION);
+    let low = 0, high = entries.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      assign(middle);
+      if (Buffer.byteLength(JSON.stringify(state), "utf8") > budget) low = middle + 1;
+      else high = middle;
+    }
+    assign(low);
+    entries = entries.slice(low);
+    this.#delivered = new Map(entries);
+    return before !== entries.length;
   }
 
   #horizon(): number { return this.options.horizonMs ?? inboxHorizonMs(); }
@@ -303,13 +351,18 @@ export class RootInbox {
         ? { pending: { through: pending.through, ids: pending.ids.filter((id): id is string => typeof id === "string") } }
         : {}),
     };
-    this.#delivered = new Set(this.#state.delivered);
-    this.#saved = saved ? JSON.stringify(this.#state) : undefined;
+    this.#delivered = new Map((this.#state.delivered ?? []).map((id, index) => {
+      const at = value?.deliveredAt?.[index];
+      return [id, typeof at === "number" && Number.isFinite(at) ? at : this.#now()];
+    }));
+    this.#saved = saved ? JSON.stringify(value) : undefined;
+    this.#trimReceipts();
     this.#savedAt = saved ? this.#now() : 0;
     return this.#state;
   }
 
   async #save(now: boolean): Promise<void> {
+    this.#trimReceipts();
     const text = JSON.stringify(this.#state);
     if (text === this.#saved) return;
     if (!now && this.#now() - this.#savedAt < SAVE_INTERVAL_MS) return;
@@ -330,19 +383,26 @@ export const rootInboxSession = (entries: readonly unknown[], lookback = 500): R
   let hasBatch = false;
   const steers = new Map<string, Set<string>>();
   const delivered = new Set<string>();
+  const deliveredAt = new Map<string, number>();
+  const remember = (id: string, at: number): void => {
+    delivered.add(id);
+    deliveredAt.set(id, Math.max(deliveredAt.get(id) ?? Number.NEGATIVE_INFINITY, at));
+  };
   for (let index = entries.length - 1; index >= 0; index--) {
     type Carried = { from?: { id?: unknown }; data?: unknown; id?: unknown; deliveryId?: unknown };
-    const entry = entries[index] as { type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
+    const entry = entries[index] as { timestamp?: string; type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
     if (entry?.type !== "custom_message") continue;
+    const parsedAt = Date.parse(entry.timestamp ?? "");
+    const at = Number.isFinite(parsedAt) ? parsedAt : Date.now();
     if (entry.customType === ROOT_INBOX_CUSTOM_TYPE && Array.isArray(entry.details?.ids)) {
       if (index >= Math.max(0, entries.length - lookback)) {
         hasBatch = true;
         for (const id of entry.details.ids) if (typeof id === "string") batchIds.add(id);
       }
       // Mixed-version inbox messages carried only globally unique mesh event ids.
-      for (const id of entry.details.ids) if (typeof id === "string") delivered.add(eventReceipt(id));
+      for (const id of entry.details.ids) if (typeof id === "string") remember(eventReceipt(id), at);
       if (Array.isArray(entry.details.receipts)) {
-        for (const id of entry.details.receipts) if (typeof id === "string") delivered.add(id);
+        for (const id of entry.details.receipts) if (typeof id === "string") remember(id, at);
       }
     }
     if (entry.customType !== AGENT_MESSAGE_CUSTOM_TYPE) continue;
@@ -352,9 +412,9 @@ export const rootInboxSession = (entries: readonly unknown[], lookback = 500): R
       const fromId = item?.from?.id;
       const key = workKey(item?.data);
       if (typeof fromId !== "string") continue;
-      for (const id of workReceipts(fromId, item.data)) delivered.add(id);
-      if (typeof item.id === "string") delivered.add(receipt(fromId, "id", item.id));
-      if (typeof item.deliveryId === "string") delivered.add(receipt(fromId, "delivery", item.deliveryId));
+      for (const id of workReceipts(fromId, item.data)) remember(id, at);
+      if (typeof item.id === "string") remember(receipt(fromId, "id", item.id), at);
+      if (typeof item.deliveryId === "string") remember(receipt(fromId, "delivery", item.deliveryId), at);
       if (key === undefined) continue;
       const keys = steers.get(fromId) ?? new Set<string>();
       keys.add(key);
@@ -362,7 +422,7 @@ export const rootInboxSession = (entries: readonly unknown[], lookback = 500): R
     }
   }
   return {
-    delivered,
+    delivered, deliveredAt,
     holdsBatch: (ids) => hasBatch && ids.every((id) => batchIds.has(id)),
     holdsSteer: (fromId, key) => steers.get(fromId)?.has(key) ?? false,
   };

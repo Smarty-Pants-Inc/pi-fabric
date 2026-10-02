@@ -11,16 +11,16 @@ const roots: string[] = [];
 const me: MeshIdentity = { id: "session:recipient", name: "recipient", kind: "main" };
 const peer: MeshIdentity = { id: "session:sender", name: "sender", kind: "main" };
 const HOUR = 60 * 60_000;
-const setup = () => {
+const setup = (maxEventBytes = 64 * 1024) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-inbox-dedup-"));
   roots.push(root);
-  const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 500);
+  const mesh = new MeshStore(path.join(root, "mesh"), maxEventBytes, 500);
   const entries: unknown[] = [];
   let now = Date.now();
   vi.spyOn(Date, "now").mockImplementation(() => now);
   const box = (options = {}, identity = me) => new RootInbox(mesh, identity, () => [identity.id], { now: () => now, steerGraceMs: 0, ...options });
   const pi = {
-    sendMessage: (message: unknown) => entries.push({ type: "custom_message", ...(message as object) }),
+    sendMessage: (message: unknown) => entries.push({ type: "custom_message", timestamp: new Date(now).toISOString(), ...(message as object) }),
   } as unknown as ExtensionAPI;
   const main = new MainAgentController(pi, me.id, true, root, "recipient");
   const followUp = (data?: unknown, delivery: "steer" | "followUp" = "followUp") => main.deliverAgent({ from: peer, message: "already handled", delivery, data });
@@ -132,6 +132,137 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
       expect(first.events).toHaveLength(1);
       expect((await h.box().next(h.session())).events.map(e => e.id)).toEqual(first.events.map(e => e.id));
     } finally { held.closeFollowUpDrain(); }
+  });
+});
+
+describe("receipt capacity and strong identities (review F1/F2)", () => {
+  it.each(["deliveryId", "messageId"])("keeps distinct %s values on a shared ref after a native receipt and reload", async (field) => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    h.followUp({ ref: "ticket:42", [field]: "A" });
+    await inbox.next(h.session());
+    h.entries.length = 0;
+    await h.publish({ ref: "ticket:42", [field]: "A" });
+    const b = await h.publish({ ref: "ticket:42", [field]: "B" }); h.advance(1);
+    const recovered = h.box();
+    const batch = await recovered.next(h.session());
+    expect(batch.events.map(event => event.id)).toEqual([b.id]);
+    h.entries.push({ type: "custom_message", ...rootInboxMessage(batch.events) });
+    await recovered.next(h.session());
+    await h.publish({ ref: "ticket:42", [field]: "B" }); h.advance(1);
+    expect((await h.box().next(h.session())).events).toEqual([]);
+  });
+
+  it.each(["deliveryId", "messageId"])("delivers two distinct %s values on one ref once each, suppressing true shadows in the batch", async (field) => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const a = await h.publish({ ref: "ticket:42", [field]: "A" });
+    const b = await h.publish({ ref: "ticket:42", [field]: "B" });
+    await h.publish({ ref: "ticket:42", [field]: "A" }); h.advance(1);
+    const batch = await inbox.next(h.session());
+    expect(batch.events.map(event => event.id)).toEqual([a.id, b.id]);
+    h.entries.push({ type: "custom_message", ...rootInboxMessage(batch.events) });
+    await inbox.next(h.session());
+    h.entries.length = 0;
+    await h.publish({ ref: "ticket:42", [field]: "A" });
+    await h.publish({ ref: "ticket:42", [field]: "B" }); h.advance(1);
+    expect((await h.box().next(h.session())).events).toEqual([]);
+  });
+
+  it.each([64 * 1024, 256 * 1024])("recovers at and above the %i-byte mesh limit with pending headroom", async (limit) => {
+    const h = setup(limit); const inbox = h.box(); inbox.start();
+    // Real native follow-ups contribute two 64-character receipt hashes each.
+    // First drain approximates the value limit; then cross it on the upgrade/history drain.
+    const threshold = Math.floor((limit - 26) / 134);
+    for (let index = 0; index < threshold; index++) {
+      h.followUp({ key: `capacity:${index}` }); h.advance(1);
+    }
+    expect(Buffer.byteLength(JSON.stringify({ after: 0, delivered: [...h.session().delivered!] }))).toBeLessThanOrEqual(limit);
+    await inbox.next(h.session());
+    for (let index = threshold; index < threshold + 40; index++) {
+      h.followUp({ key: `capacity:${index}` }); h.advance(1);
+    }
+    expect(Buffer.byteLength(JSON.stringify({ after: 0, delivered: [...h.session().delivered!] }))).toBeGreaterThan(limit);
+    // Even an evicted old receipt is matched from canonical session history, not re-injected.
+    await h.publish({ key: "capacity:0" });
+    const fresh = await h.publish({ key: "fresh unseen" }); h.advance(1);
+    const batch = await h.box().next(h.session());
+    expect(batch.events.map(event => event.id)).toEqual([fresh.id]);
+    const value = h.mesh.get(inbox.key)!.value as { delivered: string[]; pending?: unknown };
+    expect(value.pending).toBeDefined();
+    expect(value.delivered.length).toBeLessThanOrEqual(1024);
+    expect(Buffer.byteLength(JSON.stringify(value))).toBeLessThan(limit * 0.75);
+    const last = [...rootInboxSession([{ type: "custom_message", customType: "pi-fabric-agent-message",
+      details: { from: peer, data: { key: `capacity:${threshold + 39}` } } }]).delivered!][0];
+    const first = [...rootInboxSession([{ type: "custom_message", customType: "pi-fabric-agent-message",
+      details: { from: peer, data: { key: "capacity:0" } } }]).delivered!][0];
+    expect(value.delivered).toContain(last);
+    expect(value.delivered).not.toContain(first);
+    h.entries.length = 0;
+    // Reload cannot lose the pending work, and the newest native shadow is still suppressed.
+    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([fresh.id]);
+    h.entries.push({ type: "custom_message", ...rootInboxMessage(batch.events) });
+    await h.box().next(h.session());
+    h.entries.length = 0;
+    await h.publish({ key: `capacity:${threshold + 39}` });
+    const another = await h.publish({ key: "another unseen" }); h.advance(1);
+    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([another.id]);
+  });
+
+  it("migrates an at-limit legacy receipt value and retains pending recovery", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    for (let index = 0; index < 488; index++) { h.followUp({ key: `legacy:${index}` }); h.advance(1); }
+    const delivered = [...h.session().delivered!];
+    const fresh = [];
+    for (let index = 0; index < 20; index++) fresh.push(await h.publish({ key: `legacy fresh:${index}` }));
+    h.advance(1);
+    // Old runtime's string-only ledger fit before pending metadata was added.
+    const legacy = { after: 0, delivered };
+    expect(Buffer.byteLength(JSON.stringify(legacy))).toBeGreaterThan(64 * 1024 - 150);
+    await h.mesh.put({ key: inbox.key, identity: me, value: legacy });
+    h.entries.length = 0;
+    const recovered = h.box();
+    expect((await recovered.next(h.session())).events.map(event => event.id)).toEqual(fresh.map(event => event.id));
+    const saved = h.mesh.get(inbox.key)!.value as { delivered: string[]; deliveredAt: number[]; pending?: unknown };
+    expect(saved.deliveredAt).toHaveLength(saved.delivered.length);
+    expect(saved.pending).toBeDefined();
+    expect(Buffer.byteLength(JSON.stringify(saved))).toBeLessThan(64 * 1024 * 0.75);
+    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual(fresh.map(event => event.id));
+  });
+
+  it.each(["deliveryId", "messageId"])("does not let a shared key override distinct %s values", async (field) => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    h.followUp({ key: "shared-key", ref: "ticket:42", [field]: "A" });
+    await h.publish({ key: "shared-key", ref: "ticket:42", [field]: "A" });
+    const b = await h.publish({ key: "shared-key", ref: "ticket:42", [field]: "B" }); h.advance(1);
+    expect((await inbox.next(h.session())).events.map(event => event.id)).toEqual([b.id]);
+  });
+
+  it("delivery IDs outrank a shared message ID in one batch", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const a = await h.publish({ ref: "ticket:42", messageId: "same", deliveryId: "A" });
+    const b = await h.publish({ ref: "ticket:42", messageId: "same", deliveryId: "B" });
+    await h.publish({ ref: "ticket:42", messageId: "same", deliveryId: "A" }); h.advance(1);
+    expect((await inbox.next(h.session())).events.map(event => event.id)).toEqual([a.id, b.id]);
+  });
+
+  it("prunes expired receipts durably on an empty reload drain", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    h.followUp({ key: "old without shadow" });
+    await inbox.next(h.session());
+    h.advance(3 * HOUR);
+    expect((await h.box().next(h.session())).events).toEqual([]);
+    expect((h.mesh.get(inbox.key)!.value as { delivered: string[] }).delivered).toEqual([]);
+  });
+
+  it("prunes expired native receipts without refreshing their age on every history scan", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    h.followUp({ key: "old" });
+    await inbox.next(h.session());
+    expect((h.mesh.get(inbox.key)!.value as { delivered: string[] }).delivered.length).toBeGreaterThan(0);
+    const old = await h.publish({ key: "old" });
+    h.advance(3 * HOUR);
+    expect(await h.box().next(h.session())).toMatchObject({ events: [], skippedStale: 1 });
+    expect((h.mesh.get(inbox.key)!.value as { delivered: string[] }).delivered).toEqual([]);
+    expect(old).toBeDefined();
   });
 });
 

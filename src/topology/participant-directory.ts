@@ -164,7 +164,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "repository", "model", "thinking", "parentId"]) ||
+    !optionalStrings(value, ["sessionId", "rootRegistrationOwnerId", "cwd", "label", "role", "project", "repository", "model", "thinking", "parentId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -898,7 +898,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
   }
 
-  root(main: FabricMainAgentInfo, interactive = true): FabricParticipantRecord {
+  root(main: FabricMainAgentInfo, interactive = true, sessionName?: string, rootRegistrationOwnerId?: string): FabricParticipantRecord {
     const role = participantRole();
     const project = main.cwd ? participantProject(main.cwd) : undefined;
     const repository = project ? repositoryOf(project) : undefined;
@@ -909,7 +909,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: main.id,
       ownerHostId: this.options.hostId,
       ownerIdentityId: this.options.identity.id,
-      name: "main",
+      name: sessionName?.trim() || "main",
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",
@@ -920,6 +920,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ...(repository ? { repository } : {}),
       ...(role ? { role } : {}),
       ...(main.sessionId ? { sessionId: main.sessionId } : {}),
+      ...(rootRegistrationOwnerId ? { rootRegistrationOwnerId } : {}),
       ...(main.model ? { model: main.model } : {}),
       ...(main.thinking ? { thinking: main.thinking } : {}),
       startedAt: main.startedAt ?? this.#startedAt,
@@ -952,6 +953,24 @@ export class ParticipantDirectory implements FabricParticipantSource {
     await this.#refreshing?.catch(() => undefined);
     await this.refresh();
     this.#reloadPublished = this.#reloadUntil !== undefined;
+  }
+
+  /** A lazy reload replacement may retire without ever publishing a new directory. */
+  async retireReloadRoot(rootRegistrationOwnerId: string): Promise<void> {
+    if (!this.#reloadPublished || !this.options.enabled) return;
+    const ownReload = (entry: MeshStateEntry): boolean => {
+      const participant = participantFromEntry(entry);
+      return participant !== undefined && isLocal(participant, this.options.hostId) &&
+        participant.kind === "root" && participant.id === this.options.rootId &&
+        participant.rootRegistrationOwnerId === rootRegistrationOwnerId &&
+        participant.status === "reloading" && participant.reloadUntil === this.#reloadUntil;
+    };
+    // Conditional file/state removal cannot erase a replacement's newer publication. The
+    // fixed host lease may expire naturally; without its root it grants no root ownership.
+    await Promise.all(readParticipantFiles(this.mesh.root, { maxAgeMs: 0 }).filter(ownReload)
+      .map(entry => removeParticipantFileIf(this.mesh, entry.key, ownReload)));
+    const owned = this.mesh.listAll(PARTICIPANT_PREFIX).filter(ownReload);
+    await Promise.all(owned.map(entry => this.mesh.delete({ key: entry.key, ifVersion: entry.version })));
   }
 
   async close(): Promise<void> {

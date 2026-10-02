@@ -16,6 +16,8 @@ const MAIN_AGENT_ALIAS = "main";
 const promptPending = (ctx: ExtensionContext): boolean =>
   "isPromptPending" in ctx && typeof ctx.isPromptPending === "function" && ctx.isPromptPending() === true;
 
+export { retainRootRegistration, forgetRetainedRootRegistration, releaseRetainedRootRegistrations } from "./topology/root-registration-retention.js";
+
 /** Mirror Pi's operation cancellation test: its native deadline is a recoverable failure. */
 const isCompactionCancelled = (signal: AbortSignal | undefined): boolean =>
   signal?.aborted === true && !(signal.reason instanceof DOMException && signal.reason.name === "TimeoutError");

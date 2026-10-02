@@ -180,6 +180,8 @@ interface FabricParticipantInfo {
   capabilities: FabricParticipantCapability[];
   cwd?: string;
   sessionId?: string;
+  /** Generated root process/session owner token; do not inherit it into new sessions. */
+  rootRegistrationOwnerId?: string;
   model?: string;
   thinking?: string;
   startedAt: number;

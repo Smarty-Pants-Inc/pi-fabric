@@ -64,6 +64,17 @@ const createState = (loader: never): FabricState => new FabricState(
 );
 
 describe("FabricState lazy bootstrap", () => {
+  it("threads native reload ownership preservation to runtime shutdown", async () => {
+    const cwd = project({ mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    try {
+      await state.bootstrap(contextAt(cwd));
+      await state.ensure(contextAt(cwd));
+      await state.shutdown("reload");
+      expect(harness.instances[0]?.shutdown).toHaveBeenCalledWith("reload");
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
   it("rereads component configuration at first use without activating the runtime while idle", async () => {
     const cwd = project({ components: [] });
     const harness = runtimeHarness();

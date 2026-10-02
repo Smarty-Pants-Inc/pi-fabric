@@ -33,6 +33,7 @@ import type {
   FabricPeerInfo,
 } from "./topology/types.js";
 import { resolveFabricIdentity } from "./fabric-provenance.js";
+import { releaseRetainedRootRegistrations } from "./topology/root-registration-retention.js";
 import type {
   FabricAgentMessageDelivery,
   FabricAgentMessageResult,
@@ -72,6 +73,7 @@ export class FabricState {
   #kernelReloadRequired = false;
 
   #cwd: string | undefined;
+  #sessionId: string | undefined;
   #generation = 0;
   #everActivated = false;
   // Set by shutdown(), cleared by the next session_start's bootstrap(). A tool call that
@@ -186,6 +188,7 @@ export class FabricState {
     this.#shutDown = false;
     const generation = ++this.#generation;
     this.#cwd = context.cwd;
+    this.#sessionId = context.sessionManager.getSessionId();
     // A failed config load must not leak the previous session's configuration
     // into this one: clear before the read so bootstrapped stays false and
     // presentation falls back to the safe default until a load succeeds.
@@ -439,7 +442,7 @@ export class FabricState {
     if (this.#shutDown) throw new Error("Pi Fabric is shut down for this session (reload or session replacement); retry in the new session");
   }
 
-  async shutdown(reason?: string): Promise<void> {
+  async shutdown(reason?: string, sessionId = this.#sessionId): Promise<void> {
     this.#shutDown = true;
     const generation = ++this.#generation;
     const activation = this.#activation;
@@ -451,10 +454,14 @@ export class FabricState {
     try {
       await runtime?.shutdown(reason);
       await this.#managedHost?.close();
+      if (reason !== "reload" && sessionId) {
+        await releaseRetainedRootRegistrations(sessionId);
+      }
     } finally {
       if (generation === this.#generation) {
         this.#config = undefined;
         this.#cwd = undefined;
+        this.#sessionId = undefined;
         this.#externalProviders.clear();
         this.#externalComponents.clear();
         this.#everActivated = false;

@@ -1214,7 +1214,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     directToolApproval.clear();
     toolDisplay.clear();
     try {
-      await state.shutdown(reason);
+      await state.shutdown(reason, context?.sessionManager?.getSessionId?.());
     } finally {
       uninstallHaltOnEscape();
       uninstallShellHangKeys();

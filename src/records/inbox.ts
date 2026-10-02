@@ -11,6 +11,8 @@ import type { RecordEnvelope, RecordsOps } from "./store.js";
 export const RECORDS_INBOX_CUSTOM_TYPE = "pi-fabric-records";
 const MAX_BATCH = 20;
 const MAX_RECORD_TEXT_BYTES = 8 * 1024;
+/** Mirrors topology/root-inbox ROOT_ID_PREFIX without importing the mesh inbox into records. */
+const ROOT_ID_PREFIX = "session:";
 
 export interface RecordsInboxBatch { records: RecordEnvelope[]; through: number }
 export interface RecordsInboxSession { holdsBatch(ids: readonly string[]): boolean }
@@ -26,7 +28,11 @@ export class RecordsInbox {
   ) {}
 
   #names(): string[] {
-    return [...new Set([this.consumer, ...this.names()].map((name) => name.trim()).filter(Boolean))];
+    // As the mesh RootInbox does: an alias shaped like another root's canonical ID is never a
+    // recipient here, so a name/ID overlap cannot duplicate that root's mailbox.
+    const [own = "", ...aliases] = this.names().map((name) => name.trim());
+    const ids = new Set([this.consumer.trim(), own]);
+    return [...new Set([...ids, ...aliases.filter((name) => ids.has(name) || !name.startsWith(ROOT_ID_PREFIX))].filter(Boolean))];
   }
 
   async #save(after: number, pending: { through: number; ids: string[] } | null): Promise<void> {

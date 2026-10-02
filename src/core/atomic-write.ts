@@ -78,6 +78,192 @@ export const renameAtomic = (
   }
 };
 
+// A unique recovery marker fences admission before the canonical lock moves.
+// PID in its name covers crashes before any marker owner file could be written.
+const recoveryPrefix = (lock: string): string => `${path.basename(lock)}.reap-`;
+const definitelyDead = (pid: number): boolean => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return false; }
+  catch (error) { return errorCode(error) === "ESRCH"; }
+};
+const markerRecoverable = (entry: string, prefix: string, directory: string): boolean => {
+  const suffix = entry.slice(prefix.length);
+  if (suffix.startsWith("done-") || definitelyDead(Number(suffix.split("-")[0]))) return true;
+  try { return fs.readFileSync(path.join(directory, entry, "done"), "utf8") === "1\n"; }
+  catch { return false; }
+};
+
+// A crashed provisional canonical lock can obstruct restoration of a claim.
+// Recover the obstruction by the same exclusive claim, never canonical rm.
+const reapObstructingLock = (lock: string): boolean => {
+  try {
+    const instance = fs.statSync(lock);
+    let owner: string | undefined;
+    try { owner = fs.readFileSync(path.join(lock, "owner"), "utf8"); }
+    catch (error) { if (errorCode(error) !== "ENOENT") return false; }
+    const pid = Number(owner?.trim().split("\n")[1]);
+    const validPid = Number.isSafeInteger(pid) && pid > 0;
+    if (validPid) {
+      if (!definitelyDead(pid)) return false;
+    } else if (Date.now() - instance.mtimeMs <= 30_000) return false;
+    return reapStaleLock(lock, claimed => {
+      try {
+        const current = fs.statSync(claimed);
+        if (current.dev !== instance.dev || current.ino !== instance.ino) return false;
+        if (owner !== undefined) return fs.readFileSync(path.join(claimed, "owner"), "utf8") === owner &&
+          (validPid ? definitelyDead(pid) : current.mtimeMs === instance.mtimeMs && Date.now() - current.mtimeMs > 30_000);
+        try { fs.readFileSync(path.join(claimed, "owner"), "utf8"); return false; }
+        catch (error) { if (errorCode(error) !== "ENOENT") return false; }
+        return current.mtimeMs === instance.mtimeMs && Date.now() - current.mtimeMs > 30_000;
+      } catch { return false; }
+    });
+  } catch { return false; }
+};
+const finishRecovery = (lock: string, marker: string): void => {
+  // A finisher may die after unlinking the completion flag. First put every
+  // completed/dead PID marker under an intrinsically recoverable done name;
+  // on rename denial leave the flag untouched for the next finisher.
+  if (!path.basename(marker).startsWith(`${recoveryPrefix(lock)}done-`)) {
+    const done = `${lock}.reap-done-${process.pid}-${randomUUID()}`;
+    try { renameAtomic(marker, done, { renameRetries: 1 }); }
+    catch { return; }
+    marker = done;
+  }
+  const claim = path.join(marker, "lock");
+  try { renameAtomic(claim, lock, { renameRetries: 1 }); }
+  catch (error) {
+    if (errorCode(error) !== "ENOENT") {
+      if (!reapObstructingLock(lock)) return;
+      try { renameAtomic(claim, lock, { renameRetries: 1 }); }
+      catch (error) { if (errorCode(error) !== "ENOENT") return; }
+    }
+  }
+  try {
+    fs.rmSync(path.join(marker, "done"), { force: true });
+    fs.rmdirSync(marker);
+  } catch {
+    // A PID-named fallback must keep its completion receipt if empty-directory
+    // removal fails. Otherwise a transient denial strands a live marker forever.
+    try { fs.writeFileSync(path.join(marker, "done"), "1\n", { mode: 0o600 }); }
+    catch { /* Permanent I/O denial remains fail-closed; no ownership is lost. */ }
+  }
+};
+// Retain explicit ownership of finished-but-unpublished markers across reloads.
+// Only our completion path adds entries; no active reaper is eligible here.
+const PENDING_RECOVERIES = Symbol.for("pi-fabric.pending-lock-recoveries");
+const pendingRecoveries = (): Map<string, string> => {
+  const globals = globalThis as typeof globalThis & { [PENDING_RECOVERIES]?: Map<string, string> };
+  return globals[PENDING_RECOVERIES] ??= new Map();
+};
+const forgetRemovedRecovery = (marker: string): void => {
+  try { fs.lstatSync(marker); }
+  catch (error) { if (errorCode(error) === "ENOENT") pendingRecoveries().delete(marker); }
+};
+const sealRecovery = (lock: string, marker: string): void => {
+  pendingRecoveries().set(marker, lock);
+  const done = `${lock}.reap-done-${process.pid}-${randomUUID()}`;
+  // Completion is visible even if the subsequent rename fails. Nobody writes
+  // another claim after this flag; other finishers only restore/remove it.
+  try { fs.writeFileSync(path.join(marker, "done"), "1\n", { flag: "wx", mode: 0o600 }); }
+  catch (error) {
+    if (errorCode(error) === "ENOENT") { pendingRecoveries().delete(marker); return; }
+    if (errorCode(error) !== "EEXIST") {
+      // Completion publication failed independently of rename. Try the bounded
+      // rename handoff anyway; if both fail, the owning process retains retry
+      // ownership and its next admission scan finishes this exact marker.
+      try { renameAtomic(marker, done); }
+      catch { finishRecovery(lock, marker); forgetRemovedRecovery(marker); throw error; }
+      pendingRecoveries().delete(marker);
+      finishRecovery(lock, done);
+      return;
+    }
+  }
+  try {
+    // Reuse bounded transient-rename retry. One EACCES must not strand a live
+    // PID marker forever. We still own the unsealed marker if retries fail.
+    renameAtomic(marker, done);
+  } catch (error) {
+    finishRecovery(lock, marker);
+    forgetRemovedRecovery(marker);
+    throw error;
+  }
+  pendingRecoveries().delete(marker);
+  finishRecovery(lock, done);
+};
+
+/** Acquisition checks before publication AND after owner publication. */
+export const lockRecoveryBlocked = (lock: string): boolean => {
+  for (const [marker, ownedLock] of pendingRecoveries()) {
+    if (ownedLock !== lock) continue;
+    finishRecovery(lock, marker);
+    forgetRemovedRecovery(marker);
+  }
+  const directory = path.dirname(lock);
+  const prefix = recoveryPrefix(lock);
+  for (const entry of fs.readdirSync(directory)) {
+    if (entry.startsWith(prefix) && markerRecoverable(entry, prefix, directory)) finishRecovery(lock, path.join(directory, entry));
+  }
+  return fs.readdirSync(directory).some(entry => entry.startsWith(prefix));
+};
+
+// Shared file-lock primitive: canonical verification under the admission
+// marker, exclusive rename, claimed-instance revalidation, then retirement.
+// ponytail: reuse the existing atomic-I/O chunk, not another eager graph edge.
+export const reapStaleLock = (
+  lock: string,
+  verify: (claimed: string) => boolean,
+  retire: (claimed: string) => void = claimed => fs.rmSync(claimed, { recursive: true, force: true }),
+): boolean => {
+  const marker = `${lock}.reap-${process.pid}-${randomUUID()}`;
+  const claim = path.join(marker, "lock");
+  fs.mkdirSync(marker, { mode: 0o700 });
+  try {
+    if (fs.readdirSync(path.dirname(lock)).some(entry =>
+      entry.startsWith(recoveryPrefix(lock)) && entry !== path.basename(marker) &&
+      !markerRecoverable(entry, recoveryPrefix(lock), path.dirname(lock)))) return false;
+    if (!verify(lock)) return false;
+    try { renameAtomic(lock, claim, { renameRetries: 1 }); }
+    catch { return false; }
+    if (!verify(claim)) return false;
+    retire(claim);
+    return true;
+  } finally { sealRecovery(lock, marker); }
+};
+
+/** Withdraw only this token, even if recovery moved a provisional publication. */
+export const releaseLockToken = (lock: string, token: string): void => {
+  const marker = `${lock}.reap-${process.pid}-${randomUUID()}`;
+  fs.mkdirSync(marker, { mode: 0o700 });
+  try {
+    // The fence vetoes new reapers. A prior reaper plus a sealed restoration
+    // can move this token at most four times; five scans include a stable pass.
+    for (let pass = 0; pass < 5; pass++) {
+      const candidates = [lock, ...fs.readdirSync(path.dirname(lock))
+        .filter(entry => entry.startsWith(recoveryPrefix(lock)))
+        .map(entry => path.join(path.dirname(lock), entry, "lock"))];
+      for (const candidate of candidates) {
+        try {
+          if (!fs.readFileSync(path.join(candidate, "owner"), "utf8").startsWith(`${token}\n`)) continue;
+          if (candidate === lock) {
+            const removal = `${lock}.reap-${process.pid}-${randomUUID()}`;
+            const claimed = path.join(removal, "lock");
+            fs.mkdirSync(removal, { mode: 0o700 });
+            try {
+              renameAtomic(lock, claimed, { renameRetries: 1 });
+              if (fs.readFileSync(path.join(claimed, "owner"), "utf8").startsWith(`${token}\n`)) {
+                fs.rmSync(claimed, { recursive: true, force: true });
+              }
+            } finally { sealRecovery(lock, removal); }
+          } else {
+            // Unique claim paths are never replaced with another instance.
+            fs.rmSync(candidate, { recursive: true, force: true });
+          }
+        } catch { /* A prior claim may still be moving; the next pass follows it. */ }
+      }
+    }
+  } finally { sealRecovery(lock, marker); }
+};
+
 type Inode = Pick<fs.Stats, "dev" | "ino">;
 const sameInode = (left: Inode, right: Inode): boolean => left.dev === right.dev && left.ino === right.ino;
 
@@ -204,6 +390,7 @@ export const writeFileAtomic = (
     }
   }
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let committed = false;
   try {
     if (options?.durable) {
       const fd = fs.openSync(temporary, "w", options.mode ?? 0o600);
@@ -220,10 +407,12 @@ export const writeFileAtomic = (
       });
     }
     renameAtomic(temporary, filePath, options);
+    committed = true;
     if (options?.durable) syncDirectoryChain(directory);
   } finally {
-    // No-op right after a successful rename; removes the temp on failure.
-    fs.rmSync(temporary, { force: true });
+    // After a committed rename the temporary pathname is gone: housekeeping there could only
+    // fail (for example EACCES) and misreport a committed replacement as a failed write.
+    if (!committed) fs.rmSync(temporary, { force: true });
   }
 };
 
@@ -279,14 +468,16 @@ const writeFileAtomicAsync = async (
     mode: options?.dirMode ?? 0o700,
   });
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let committed = false;
   try {
     await fs.promises.writeFile(temporary, contents, {
       encoding: "utf8",
       mode: options?.mode ?? 0o600,
     });
     await renameAtomicAsync(temporary, filePath, options);
+    committed = true;
   } finally {
-    await fs.promises.rm(temporary, { force: true });
+    if (!committed) await fs.promises.rm(temporary, { force: true });
   }
 };
 

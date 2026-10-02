@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { build } from "esbuild";
 import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 const primaryEntryPoints = [
   "src/index.ts",
@@ -32,6 +33,7 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/core/literal-bash-guard.ts",
   "src/lifecycle/reload-target-profile.ts",
   "src/coordination/unverified-ids.ts",
   "src/core/provider-operations.ts",
@@ -71,6 +73,7 @@ const lazyEntryPoints = [
   "src/worker/activation-window.ts",
   "src/worker/reply-tool.ts",
   "src/worker/principal-delivery.ts",
+  "src/worker/session-id.ts",
   "src/worker/model-control.ts",
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",
@@ -81,6 +84,16 @@ const lazyEntryPoints = [
 
 const result = await build({
   entryPoints: [...primaryEntryPoints, ...lazyEntryPoints],
+  // Both facades only re-export host metadata. Resolve to their implementation
+  // so empty facade-only chunks do not consume startup graph slots.
+  plugins: [{
+    name: "host-metadata-facades",
+    setup(pluginBuild) {
+      pluginBuild.onResolve({ filter: /\/(?:model-policy|fabric-provenance)\.js$/ }, () => ({
+        path: resolve("src/host-compatibility.ts"),
+      }));
+    },
+  }],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",

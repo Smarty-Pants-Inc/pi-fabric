@@ -283,9 +283,10 @@ export class AgentMessageRouter {
           principal: options.principal,
           message,
           data,
-          ...(typeof options.triggerTurn === "boolean"
-            ? { triggerTurn: options.triggerTurn }
-            : {}),
+          // Carry the local Main default across runtime generations (#3015).
+          ...(kind === "followUp"
+            ? { triggerTurn: options.triggerTurn ?? true }
+            : typeof options.triggerTurn === "boolean" ? { triggerTurn: options.triggerTurn } : {}),
         },
         participant.ownerIdentityId,
         {
@@ -485,6 +486,8 @@ export class AgentMessageRouter {
       return {
         accepted: true,
         messageId: result.messageId,
+        ...(typeof result.triggered === "boolean" ? { triggered: result.triggered } : {}),
+        ...(typeof result.reason === "string" ? { reason: result.reason } : {}),
         ...(result.pendingFollowUps === undefined ? {} : { pendingFollowUps: result.pendingFollowUps }),
         ...(result.oldestAgeS === undefined ? {} : { oldestAgeS: result.oldestAgeS }),
         ...(result.stalled ? { stalled: true as const } : {}),

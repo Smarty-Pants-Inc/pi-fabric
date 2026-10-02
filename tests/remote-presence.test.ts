@@ -160,7 +160,8 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(received).toEqual([[kind, remote.id, "first-minute reply", local.id]]);
     expect(directory.peers()).toEqual([expect.objectContaining({ id: remote.id, host: "forge" })]);
     expect(request).toHaveBeenCalledExactlyOnceWith(remote.id, remote.id, kind,
-      { message: "first-minute reply", data: undefined }, remote.id, { routedRemoteHost: "forge" });
+      { message: "first-minute reply", data: undefined, principal: undefined,
+        ...(kind === "followUp" ? { triggerTurn: true } : {}) }, remote.id, { routedRemoteHost: "forge" });
   });
 
   // The far side of the bridge: the owner runs on its own mesh; a relay carries commands there and
@@ -225,7 +226,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(request).toHaveBeenNthCalledWith(1, remote.id, remote.id, "steer",
       { message: "steer me", data: undefined }, remote.id, { routedRemoteHost: "forge" });
     expect(request).toHaveBeenNthCalledWith(2, remote.id, remote.id, "followUp",
-      { message: "later", data: undefined }, remote.id, { routedRemoteHost: "forge" });
+      { message: "later", data: undefined, principal: undefined, triggerTurn: true }, remote.id, { routedRemoteHost: "forge" });
     expect(received).toEqual([
       ["steer", remote.id, "steer me", local.id],
       ["followUp", remote.id, "later", local.id],
@@ -302,14 +303,23 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
       (data: Record<string, unknown>) => ({ ...data, bridge: { from: "ryzen2", id: "x" } }),    // another link
     ]) {
       const { mesh, directory, mirror, local, remote } = await setup();
-      // Keep the lease live beyond the 6 s ACK window: this tests ACK authority,
-      // not the independent watchdog's correct 5 s fixture-lease lapse.
-      await mirror({ expiresAt: Date.now() + 30_000 });
+      // Keep the lease live beyond the 45 s bridge/ACK window. The fake clock drives
+      // the actual relay, command handler and sender observation without a real 45 s wait.
+      await mirror({ expiresAt: Date.now() + 120_000 });
+      vi.useFakeTimers();
       const { received } = await remoteOwner(mesh, local, remote, forged);
-      // Long enough for the relay to deliver on a loaded host: the owner must run before the wait ends.
-      const router = routerFor(directory, senderOn(mesh, local, 2_000, directory), local);
-      await expect(router.routeMessage(remote.id, "hi", undefined, "steer"))
-        .rejects.toThrow("Fabric mesh bridge to remote host forge is not responding");
+      const sender = senderOn(mesh, local, 2_000, directory);
+      const router = routerFor(directory, sender, local);
+      try {
+        const observation = router.routeMessage(remote.id, "hi", undefined, "steer");
+        void observation.catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(0); // publish the actual command before the clock jump
+        await vi.advanceTimersByTimeAsync(45_000);
+        await expect(observation).rejects.toThrow("Fabric mesh bridge to remote host forge is not responding");
+      } finally {
+        await sender.close();
+        vi.useRealTimers();
+      }
       expect(received.length).toBeGreaterThan(0);                                               // it ran; the forged answer was ignored
     }
   });

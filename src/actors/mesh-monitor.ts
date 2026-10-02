@@ -1,4 +1,5 @@
 import fs, { type FSWatcher } from "node:fs";
+import { MeshBackgroundRetry } from "../core/atomic-write.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricMeshConfig } from "../config.js";
@@ -16,6 +17,7 @@ const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_
 
 /** Owns observation resources and the format-1 cursor, never actor ownership or dispatch policy. */
 export class ActorMeshMonitor {
+  readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
   #timer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
   #offset: number;
@@ -94,6 +96,15 @@ export class ActorMeshMonitor {
     this.schedule();
   }
 
+  /** Checked release receipt; normal best-effort writes are NOT a handover barrier. */
+  checkpointForRelease(): void {
+    if (this.#polling) throw new Error("Actor mesh cursor still polling");
+    if (this.callbacks.cursorPath) {
+      writeJsonAtomic(this.callbacks.cursorPath, { format: 1, ...this.#safeCursor }, { durable: true, space: 2 });
+      this.#persistedCursor = JSON.stringify(this.#safeCursor);
+    }
+  }
+
   close(): void {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
@@ -109,7 +120,7 @@ export class ActorMeshMonitor {
     queueMicrotask(() => {
       this.#scheduled = false;
       if (this.#closed) return;
-      void this.#poll().catch(() => undefined);
+      void this.#backgroundPoll.run(() => this.#poll());
     });
   }
 

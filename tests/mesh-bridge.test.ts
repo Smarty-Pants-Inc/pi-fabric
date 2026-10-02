@@ -5,9 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
+  type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MainAgentController } from "../src/main-agent.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import {
   type BridgeSide,
@@ -18,6 +21,7 @@ import {
   StoreBridgeSide,
 } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { runBridge, transportCommand } from "../src/mesh-bridge.js";
 import { LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { RootInbox } from "../src/topology/root-inbox.js";
@@ -286,15 +290,16 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
       local: (store, peer) => new StoreBridgeSide(new MeshStore(store.root, 64 * 1024, 1), peer),
       agent: (store) => {
         const side = new StoreBridgeSide(new MeshStore(store.root, 64 * 1024, 1), "dev1");
-        const read = side.read.bind(side);
+        const tail = side.tail.bind(side);
         // RemoteBridgeSide uses the protocol frame budget; shrink the agent's budget for
         // this test so small real events exercise skips through the actual RPC path.
-        vi.spyOn(side, "read").mockImplementation((after) => read(after, 2_000));
+        vi.spyOn(side, "tail").mockImplementation((after, offset) => tail(after, offset, 2_000));
         return side;
       },
     });
     const lane = await addRoot(hub, "lane");
     const root = await addRoot(far, "remote");
+    await remote.hello();
     await bridge.start();
     await bridge.syncPresence();
     expect(readHostLeases(hub.root).get(root.hostId)!.expiresAt).toBe(startedAt + BRIDGE_LEASE_MS);
@@ -306,11 +311,11 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
       await store.publish({ topic: traffic === "filtered" ? "probe.unrelated" : "fleet.work.big", kind: "ask",
         from: sender.identity, to: direction === "toRemote" ? root.hostId : lane.hostId, text: "x".repeat(4_000) });
     }
-    const read = source.read.bind(source);
+    const tail: StoreBridgeSide["tail"] = source.tail.bind(source);
     let advancingPages = 0;
-    vi.spyOn(source, "read").mockImplementation(async (after: number) => {
+    vi.spyOn(source, "tail").mockImplementation(async (after: number, offset?: number) => {
       // Real scanner/transport filtering and oversized skips, not fabricated empty pages.
-      const page = await read(after, 2_000);
+      const page = await tail(after, offset, 2_000);
       expect(page.events).toEqual([]);
       if (page.through > after) {
         advancingPages++;
@@ -604,7 +609,180 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
   });
 });
 
+describe("cross-host Main delivery semantics (#3015)", () => {
+  it("starts a real idle Pi Main through the pipe bridge and returns triggered:true", async () => {
+    const { hub, far, bridge } = setup(undefined, { realPipe: true });
+    const source = await addRoot(hub, "real-source");
+    const target = await addRoot(far, "real-target");
+    const root = scratch();
+    const faux = fauxProvider();
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+    modelRuntime.registerNativeProvider(faux.provider);
+    let main!: MainAgentController;
+    let starts = 0;
+    const loader = new DefaultResourceLoader({ cwd: root, agentDir: path.join(root, "agent"), noExtensions: true,
+      noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [{ name: "remote-main", factory: pi => {
+        pi.on("session_start", (_event, ctx) => {
+          main = new MainAgentController(pi, target.identity.id, true, root, "real-target");
+          main.attachFollowUpDrain(ctx, 120_000, path.join(root, "followups.json"));
+        });
+        pi.on("agent_start", () => { starts++; });
+      } }] });
+    await loader.reload();
+    const { session } = await createAgentSession({ cwd: root, agentDir: path.join(root, "agent"), modelRuntime,
+      model: faux.getModel(), resourceLoader: loader, sessionManager: SessionManager.inMemory(root), tools: [],
+      settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }) });
+    const sourceDirectory = new ParticipantDirectory(hub, { enabled: true, hostId: source.hostId, rootId: source.identity.id, identity: source.identity });
+    const targetDirectory = new ParticipantDirectory(far, { enabled: true, hostId: target.hostId, rootId: target.identity.id, identity: target.identity });
+    const sender = new FabricControlPlane(hub, source.identity, { enabled: true, hostId: source.hostId, pollMs: 20,
+      readMirroredOwner: (...args) => sourceDirectory.mirroredControlOwner(...args) });
+    const receiver = new FabricControlPlane(far, target.identity, { enabled: true, hostId: target.hostId, pollMs: 20 });
+    try {
+      await session.bindExtensions({});
+      expect(starts).toBe(0);
+      faux.setResponses([fauxAssistantMessage("remote followUp received")]);
+      const sending = new AgentsProvider({ cwd: root } as any, { identity: source.identity } as any, {} as any,
+        { local: true, id: source.identity.id, matches: (id: string) => id === source.identity.id } as any,
+        sourceDirectory, sender, {} as any, () => false, undefined, false);
+      const receiving = new AgentMessageRouter({} as any, { identity: target.identity } as any, main, targetDirectory, receiver, binding => binding);
+      sender.start(() => ({ accepted: false }));
+      receiver.start((...args) => receiving.acceptControl(...args));
+      await bridge.start(); await bridge.syncPresence();
+      const receipt = sending.invoke("followUp", { id: target.identity.id, message: "wake real idle Main" }, { cwd: root } as any);
+      void receipt.catch(() => undefined);
+      await waitFor(() => on(hub, "fabric.control.command").length === 1);
+      await bridge.step();
+      await waitFor(() => starts === 1 && on(far, "fabric.control.ack").length === 1);
+      await bridge.step();
+      expect(await receipt).toMatchObject({ acknowledged: true, routed: "mesh", triggered: true });
+      await session.waitForIdle();
+      expect(session.getLastAssistantText()).toBe("remote followUp received");
+      expect(starts).toBe(1);
+    } finally {
+      await sender.close(); await receiver.close();
+      main?.closeFollowUpDrain(); await bridge.stop(); session.dispose();
+    }
+  });
+  it.each([
+    { delivery: "followUp" as const, idle: true, policy: undefined, triggered: true },
+    { delivery: "followUp" as const, idle: false, policy: undefined, triggered: false },
+    { delivery: "followUp" as const, idle: true, policy: false, triggered: false },
+    { delivery: "steer" as const, idle: true, policy: undefined, triggered: true },
+    { delivery: "steer" as const, idle: false, policy: undefined, triggered: false },
+  ])("$delivery idle=$idle policy=$policy preserves wake and receipt", async ({ delivery, idle, policy, triggered }) => {
+    const { hub, far, bridge } = setup(undefined, { realPipe: true });
+    const source = await addRoot(hub, "source");
+    const target = await addRoot(far, "target");
+    const handlers = new Map<string, Array<(event: any, ctx: ExtensionContext) => unknown>>();
+    const sendMessage = vi.fn();
+    const pi = { sendMessage, on: (name: string, fn: any) => {
+      handlers.set(name, [...(handlers.get(name) ?? []), fn]);
+    } } as unknown as ExtensionAPI;
+    const state = { idle };
+    const ctx = { isIdle: () => state.idle, sessionManager: { getEntries: () => [] } } as unknown as ExtensionContext;
+    const main = new MainAgentController(pi, target.identity.id, true, os.tmpdir(), "target");
+    main.attachFollowUpDrain(ctx, 120_000, path.join(scratch(), "followups.json"));
+    const participants = (store: MeshStore, identity: MeshIdentity) => new ParticipantDirectory(store, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity,
+    });
+    const sourceDirectory = participants(hub, source.identity);
+    const targetDirectory = participants(far, target.identity);
+    const sender = new FabricControlPlane(hub, source.identity, { enabled: true, hostId: source.hostId, pollMs: 20,
+      readMirroredOwner: (...args) => sourceDirectory.mirroredControlOwner(...args) });
+    const receiver = new FabricControlPlane(far, target.identity, { enabled: true, hostId: target.hostId, pollMs: 20 });
+    const provider = (identity: MeshIdentity, controller: any, store: MeshStore, control: FabricControlPlane) =>
+      new AgentsProvider({ cwd: os.tmpdir() } as any, { identity } as any, {} as any, controller,
+        store === hub ? sourceDirectory : targetDirectory, control, {} as any, () => false, undefined, false);
+    const sending = provider(source.identity, { local: true, id: source.identity.id, matches: (id: string) => id === source.identity.id }, hub, sender);
+    const receiving = provider(target.identity, main, far, receiver);
+    sender.start(() => ({ accepted: false }));
+    receiver.start((cmd, from, signal, verification) => receiving.acceptControl(cmd, from, signal, verification));
+    try {
+      await bridge.start();
+      await bridge.syncPresence();
+      const pending = policy === undefined
+        ? sending.invoke(delivery, { id: target.identity.id, message: "wake remote Main" }, { cwd: os.tmpdir() } as any)
+        : sending.routeMessage(target.identity.id, "passive", undefined, delivery, undefined, { triggerTurn: policy });
+      let routeError: unknown;
+      void pending.catch(error => { routeError = error; });
+      await waitFor(() => on(hub, "fabric.control.command").length === 1 || routeError !== undefined);
+      if (routeError) throw routeError;
+      const envelope = on(hub, "fabric.control.command")[0]!.data as Record<string, unknown>;
+      expect(envelope.triggerTurn).toBe(delivery === "followUp" ? policy ?? true : undefined);
+      await bridge.step();
+      await waitFor(() => on(far, "fabric.control.ack").length === 1);
+      await bridge.step();
+      expect(await pending).toMatchObject({ queued: true, acknowledged: true, routed: "mesh", triggered });
+      expect(on(far, "fabric.control.command")[0]!.verification).toBe("bridge");
+      if (delivery === "followUp" && !idle) {
+        expect(sendMessage).not.toHaveBeenCalled();
+        expect(main.queueDepth().pendingFollowUps).toBe(1);
+        main.flushHeldAtNextBoundary();
+        for (const fn of handlers.get("turn_end") ?? []) fn({ message: { role: "assistant", stopReason: "toolUse" } }, ctx);
+        expect(sendMessage).toHaveBeenCalledOnce();
+        expect(sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "steer", triggerTurn: true });
+        state.idle = true;
+        for (const fn of handlers.get("agent_settled") ?? []) fn({ outcome: "completed" }, ctx);
+        expect(sendMessage).toHaveBeenCalledOnce(); // no extra idle turn
+      } else {
+        expect(sendMessage).toHaveBeenCalledOnce();
+        expect(sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: delivery, triggerTurn: policy ?? true });
+      }
+    } finally {
+      await sender.close(); await receiver.close();
+      main.closeFollowUpDrain(); await bridge.stop();
+    }
+  });
+});
+
 describe("mesh bridge", () => {
+  it("accepts and ACKs a bridged control command after 10 s of injected transport latency", async () => {
+    const { hub, far, bridge, remote } = setup(undefined, { realPipe: true, presenceMs: 5_000 });
+    const lane = await addRoot(hub, "lane", 60_000);
+    const target = await addRoot(far, "remote", 60_000);
+    const directory = new ParticipantDirectory(hub, { enabled: true, hostId: lane.hostId, rootId: lane.identity.id, identity: lane.identity });
+    const sender = new FabricControlPlane(hub, lane.identity, { enabled: true, hostId: lane.hostId, pollMs: 20,
+      readMirroredOwner: (host, owner, id) => directory.mirroredControlOwner(host, owner, id) });
+    const receiver = new FabricControlPlane(far, target.identity, { enabled: true, hostId: target.hostId, pollMs: 20 });
+    const receive = vi.fn(() => ({ accepted: true, messageId: "delayed-delivery" }));
+    let observation: Promise<unknown> | undefined;
+    try {
+      await remote.hello();
+      await bridge.start();
+      await bridge.syncPresence();
+      sender.start(() => ({ accepted: false }));
+      receiver.start(receive);
+      const publish = remote.publish.bind(remote);
+      vi.spyOn(remote, "publish").mockImplementation(async (...args) => {
+        if (args[0].topic === "fabric.control.command" && args[0].kind !== "cancel") {
+          await new Promise(resolve => setTimeout(resolve, 10_000));
+        }
+        return publish(...args);
+      });
+      observation = sender.request(target.hostId, target.identity.id, "followUp", { message: "arrives late" }, target.identity.id,
+        { routedRemoteHost: "forge" });
+      void observation.catch(() => undefined);
+      await waitFor(() => on(hub, "fabric.control.command").length === 1);
+      const sent = on(hub, "fabric.control.command")[0]!.data as { requestedAt: number; deadlineAt: number };
+      const firstPass = await bridge.step();
+      await waitFor(() => on(far, "fabric.control.ack").length === 1);
+      const secondPass = await bridge.step();
+      await expect(observation).resolves.toMatchObject({ acknowledged: true, messageId: "delayed-delivery" });
+      expect(sent.deadlineAt - sent.requestedAt).toBe(30_000);
+      expect(firstPass.toRemote).toBe(1);
+      expect(firstPass.toLocal + secondPass.toLocal).toBe(1);
+      expect(receive).toHaveBeenCalledOnce();
+      expect(on(hub, "fabric.control.command")).toHaveLength(1); // first try, no replay/cancel
+    } finally {
+      await sender.close();
+      await receiver.close();
+      await observation?.catch(() => undefined);
+      await bridge.stop();
+      remote.close();
+    }
+  }, 20_000);
+
   it("carries admitted remote provenance through real bridge and control delivery to Pi", async () => {
     const { hub, far, bridge } = setup();
     const lane = await addRoot(hub, "lane");
@@ -768,12 +946,13 @@ describe("mesh bridge", () => {
       stopMs: 100,
       local: (store, peer) => {
         const side = new StoreBridgeSide(store, peer);
-        side.latestSequence = async () => { calls++; throw lockTimeout(); };
+        side.latestCursor = async () => { calls++; throw lockTimeout(); };
         return side;
       },
     });
     const running = bridge.run();
-    await waitFor(() => logs.some((line) => line.includes("retrying in 800 ms")));
+    await waitFor(() => calls >= 4); // 100, 200, 400 ms backoffs; now waiting 800 ms
+    expect(logs.filter(line => line.includes("retrying"))).toHaveLength(1);
     const before = calls;
     const started = Date.now();
     await bridge.stop();
@@ -787,7 +966,7 @@ describe("mesh bridge", () => {
       const { bridge, logs } = setup(undefined, {
         local: (store, peer) => {
           const side = new StoreBridgeSide(store, peer);
-          side.latestSequence = async () => { throw error; };
+          side.latestCursor = async () => { throw error; };
           return side;
         },
       });
@@ -933,6 +1112,72 @@ describe("mesh bridge", () => {
     expect(on(hub, "fabric.control.ack")).toHaveLength(0);
     expect(logs.join("\n")).toMatch(/claims a hub identity/);
     expect(logs.join("\n")).toMatch(/not a live participant of the remote/);
+  });
+
+  // PR #207: security F1 / Astra F1. A rename can precede the generation update.
+  it.each(["toRemote", "toLocal"] as const)("recovers archived control and work in %s from a persisted cursor before the generation bump", async (direction) => {
+    const cursorPath = path.join(scratch(), "cursor.json");
+    const { hub, far, remote, bridge } = setup(cursorPath, { presenceMs: 60_000 });
+    await remote.hello(); // exercise the byte-tail RPC for the remote source too
+    const lane = await addRoot(hub, "lane");
+    const forgeRoot = await addRoot(far, "forge-main");
+    const source = direction === "toRemote" ? hub : far;
+    const destination = direction === "toRemote" ? far : hub;
+    const sender = direction === "toRemote" ? lane : forgeRoot;
+    const recipient = direction === "toRemote" ? forgeRoot : lane;
+    const archive = scratch();
+    fs.writeFileSync(path.join(source.root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir: archive }));
+    await source.publish({ topic: "chatter", from: sender.identity, text: "handled" });
+    await bridge.start();
+    await bridge.step();
+    const saved = JSON.parse(fs.readFileSync(cursorPath, "utf8"));
+    expect(saved[direction].after).toBe(1);
+    expect(saved[direction].offset).toBeGreaterThan(0);
+
+    const data = { ...command(recipient.hostId, sender.hostId), operation: "ask", commandId: "pending-ask" };
+    const pending: MeshEvent[] = [];
+    pending.push(await source.publish({ topic: "fabric.control.command", kind: "ask", from: sender.identity, to: recipient.hostId, data }));
+    pending.push(await source.publish({ topic: "fabric.control.command", kind: "cancel", from: sender.identity, to: recipient.hostId,
+      data: { ...data, operation: "cancel", commandId: "cancel-ask", cancelCommandId: data.commandId } }));
+    pending.push(await source.publish({ topic: "fabric.control.ack", kind: "accepted", from: sender.identity, to: recipient.hostId,
+      data: { version: 1, commandId: "earlier-ask", targetId: sender.hostId, accepted: true } }));
+    pending.push(await source.publish({ topic: "fleet.work.review", from: sender.identity, to: recipient.hostId, text: "unread work" }));
+    for (let i = 0; i < 4; i++) await source.publish({ topic: "chatter", from: sender.identity, text: "x".repeat(500) });
+
+    // Perform exactly compaction's first write. The old nonzero byte offset now points
+    // into a retained, entirely filtered-out suffix, still tagged with generation zero.
+    const eventsPath = path.join(source.root, "events.jsonl");
+    const retained = fs.readFileSync(eventsPath, "utf8").split("\n")
+      .filter(line => line && (JSON.parse(line) as MeshEvent).sequence > pending.at(-1)!.sequence);
+    fs.writeFileSync(`${eventsPath}.tmp`, retained.join("\n") + "\n");
+    fs.renameSync(`${eventsPath}.tmp`, eventsPath);
+    expect(source.oldestSequence()).toBe(6);
+    const raw = source.tail(saved[direction].offset);
+    expect(raw.nextOffset).toBeGreaterThanOrEqual(saved[direction].offset);
+    expect(raw.events[0]!.sequence).toBeGreaterThan(2);
+    expect(raw.events.every(event => event.topic === "chatter")).toBe(true);
+    expect(fs.existsSync(path.join(source.root, "generation"))).toBe(false);
+
+    // A new bridge loads the disk checkpoint, not the previous instance's memory.
+    const resumed = new MeshBridge({ ...bridge.options, local: new StoreBridgeSide(new MeshStore(hub.root, 64 * 1024, 100), "forge") });
+    try {
+      await resumed.start();
+      expect(await resumed.step()).toEqual({ toRemote: direction === "toRemote" ? 4 : 0, toLocal: direction === "toLocal" ? 4 : 0, dropped: 0 });
+      const deliveredIds = () => destination.read({ after: 0, limit: 100 })
+        .map(event => (event.data as { bridge: { id: string } }).bridge.id);
+      expect(deliveredIds()).toEqual(pending.map(event => event.id));
+      expect(on(destination, "fabric.control.command").map(event => event.kind)).toEqual(["ask", "cancel"]);
+      expect(on(destination, "fabric.control.command")[1]!.data).toMatchObject({ cancelCommandId: "pending-ask" });
+      expect(JSON.parse(fs.readFileSync(cursorPath, "utf8"))[direction].after).toBe(9);
+
+      // Only now does the second compaction write land; it must neither lose nor repeat work.
+      fs.writeFileSync(path.join(source.root, "generation"), "1");
+      const next = await source.publish({ topic: "fleet.work.review", from: sender.identity, to: recipient.hostId, text: "after bump" });
+      expect(await resumed.step()).toMatchObject({ [direction]: 1, dropped: 0 });
+      expect(deliveredIds()).toEqual([...pending.map(event => event.id), next.id]);
+      expect(await resumed.step()).toEqual({ toRemote: 0, toLocal: 0, dropped: 0 });
+      expect(JSON.parse(fs.readFileSync(cursorPath, "utf8"))[direction].offset).toBe(source.latestOffset());
+    } finally { await resumed.stop(); }
   });
 
   it("resumes from its cursor file without forwarding an event twice", async () => {

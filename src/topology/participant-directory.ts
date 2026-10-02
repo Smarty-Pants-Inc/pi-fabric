@@ -405,6 +405,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #changeRefreshAt = 0;
   /** Whether the refresh in flight renews the lease (a heartbeat) or only publishes changes. */
   #refreshingFull = false;
+  /** Per-key waits must not stop the independent host heartbeat. */
+  #fileWork = 0;
   #refreshedAt = Date.now();
   #refreshStartedAt: number | undefined;
   #refreshError: unknown;
@@ -437,21 +439,25 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#closed = false;
     this.#refreshError = undefined;
     this.#refreshedAt = Date.now();
-    let initialError: unknown;
-    try {
-      await this.refresh();
-    } catch (error) {
-      initialError = error;
-    }
     if (this.options.enabled) {
-      // The heartbeat doubles as the recovery path: even when the initial
-      // publish fails (for example a contended mesh lock at startup), keep
-      // retrying so this host joins the mesh once the lock clears instead of
-      // staying invisible until the next restart.
-      this.#timer = setInterval(() => void this.#backgroundRefresh.run(() => this.refresh(), false), this.#heartbeatMs);
+      // Start before the initial publish: its per-key work can contend too. The
+      // timer also retries a failed initial publish so the host can join later.
+      this.#timer = setInterval(() => {
+        if (this.#closed) return;
+        // The retry runner coalesces shared publication, not independent liveness.
+        // Renew through per-key waits even when run() skips an in-flight refresh;
+        // shared-lock-only waits still lapse and confirmation still needs its lock.
+        try {
+          if (this.#refreshing && this.#fileWork > 0 && !this.#quiescing) this.#renewFileLease();
+        } catch (error) {
+          this.#backgroundRefresh.failure(error);
+          return;
+        }
+        void this.#backgroundRefresh.run(() => this.refresh(), false);
+      }, this.#heartbeatMs);
       this.#timer.unref();
     }
-    if (initialError) throw initialError;
+    await this.refresh();
   }
 
   // Publishes changed local records soon: at once after a quiet second, otherwise at the
@@ -482,6 +488,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async refresh(): Promise<void> {
     if (this.#closed) return;
     if (this.#refreshing) {
+      // A key waiter is still a live host. Do not turn this into a mesh-lock bypass:
+      // confirmation remains gated on the shared write; shared-lock-only waits still lapse.
+      if (this.#fileWork > 0 && this.options.enabled && !this.#quiescing) this.#renewFileLease();
       if (this.#refreshingFull) return this.#refreshing;
       // A change-only refresh may skip its write; renew the lease right after it.
       return this.#refreshing.catch(() => undefined).then(() => this.refresh());
@@ -1116,7 +1125,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const current = existingById.get(record.id);
       const currentFile = ownParticipant(filesByKey.get(key));
       if (filesOnly
-        ? currentFile && JSON.stringify(currentFile) === JSON.stringify(record)
+        ? !current && currentFile && JSON.stringify(currentFile) === JSON.stringify(record)
         : current && JSON.stringify(current.participant) === JSON.stringify(record)) continue;
       const stateEntry = stateByKey.get(key) ?? (filesOnly ? undefined : this.mesh.get(key));
       // Before the switch the shared state arbitrates ownership (its compare-and-swap), so it
@@ -1137,7 +1146,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ) continue;
       if (filesOnly) {
         // A file write does not take the mesh lock, so it does not count as a shared change.
-        if (!currentFile || withoutTime(currentFile) !== withoutTime(record)) fileWrites.push(record);
+        if (current || !currentFile || withoutTime(currentFile) !== withoutTime(record)) fileWrites.push(record);
         else if (activityOf(currentFile, record)) activityWrites.push(record);
         continue;
       }
@@ -1157,14 +1166,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
         },
       });
     }
+    // Renew before ANY per-key cleanup/write/copy, including migration and retry copies.
+    // Heartbeat calls keep renewing while #retryFile is waiting on a contended key.
+    if (!this.#quiescing || this.#reloadUntil !== undefined) this.#renewFileLease();
     for (const entry of fileEntries) {
       const participant = ownParticipant(entry);
       if (participant && !desired.has(participant.id)) {
-        await removeParticipantFileIf(this.mesh, entry.key, (current) => ownParticipant(current) !== undefined);
+        await this.#retryFile(() => removeParticipantFileIf(this.mesh, entry.key, (current) => ownParticipant(current) !== undefined));
       }
     }
     for (const { entry, participant } of existing) {
-      if (!filesOnly && desired.has(participant.id)) continue;
+      // Desired migrations delete their shared copy only after a durable, verified file
+      // publication below. A suppressed key failure must keep the last ownership record.
+      if (desired.has(participant.id)) continue;
       changed = true;
       ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
     }
@@ -1173,23 +1187,26 @@ export class ParticipantDirectory implements FabricParticipantSource {
         fileWrites.push(...activityWrites);
         this.#recordsWrittenAt = now;
       }
-      // This host's file lease goes first: a contender that sees a file of ours finds its owner
-      // live, even before our first shared host record (review/astra round 2 F1 on #142).
-      if (fileWrites.length > 0 && !this.#quiescing) this.#renewFileLease();
       // Written before the state removals below commit, so a reader always finds each record.
       for (const record of fileWrites) {
         // Under the key's lock, the file as it is now: absent, ours, or its owner gone by a fresh
         // (uncached) read of that owner's liveness. A live owner keeps it (review/astra F1 on #142).
         // The shared state's entry for the key counts too: a runtime that writes only the state may
         // hold it (review/astra round 4 on #142).
-        await this.#writeFile(record, (current) => {
+        const key = keyFor(PARTICIPANT_PREFIX, record.id);
+        const migrating = existingById.get(record.id)?.entry;
+        const published = await this.#retryFile(() => this.#writeFile(record, (current) => {
           const taken = (entry: MeshStateEntry | undefined): boolean => {
             if (!entry || ownParticipant(entry) !== undefined) return false;
             const holder = participantFromEntry(entry);
             return holder !== undefined && holder.remoteHost === undefined && this.#ownerLive(holder);
           };
-          return !taken(current) && !taken(this.mesh.get(keyFor(PARTICIPANT_PREFIX, record.id), { fresh: true }));
-        });
+          return !taken(current) && !taken(this.mesh.get(key, { fresh: true }));
+        }, migrating !== undefined));
+        if (migrating && published === true) {
+          changed = true;
+          ops.push({ kind: "delete", key, ifVersion: migrating.version, onConflict: "skip" });
+        }
       }
     }
     if (!filesOnly) {
@@ -1252,17 +1269,34 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return true;
   }
 
+  // One failed key does not abort other keys or the shared host heartbeat. No decision or
+  // cleanup is replayed outside its lock: the next refresh rereads and retries that key.
+  async #retryFile<T>(operation: () => Promise<T>): Promise<T | undefined> {
+    this.#fileWork += 1;
+    try {
+      if (!this.#quiescing || this.#reloadUntil !== undefined) this.#renewFileLease();
+      return await operation();
+    } catch { return undefined; /* retry on the next refresh */ }
+    finally {
+      this.#fileWork -= 1;
+      // Renew between keys too: already-resolved promises can monopolize microtasks,
+      // and the dual-write copies run AFTER the shared host commit. This file-only
+      // renewal does not advance confirmedAt or certify shared writability.
+      if (!this.#quiescing || this.#reloadUntil !== undefined) this.#renewFileLease();
+    }
+  }
+
   // The copy is the committed state entry itself, with its own version and commit time, and only
   // while the state still holds exactly that write and it is this host's: a copy delayed past a
   // newer owner's state write is dropped and never looks newer than it (review/astra round 4 and
   // security pass S1 on #142). A failed copy is made again by a later refresh.
   async #copyCommitted(key: string, version: number): Promise<void> {
-    await writeParticipantFileIf(this.mesh, key, () => {
+    await this.#retryFile(() => writeParticipantFileIf(this.mesh, key, () => {
       const committed = this.mesh.get(key, { fresh: true });
       const participant = committed && participantFromEntry(committed);
       return committed?.version === version && participant && isLocal(participant, this.options.hostId)
         ? committed : undefined;
-    }).catch(() => undefined);
+    }));
   }
 
   #renewFileLease(): number {
@@ -1296,6 +1330,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #writeFile(
     record: FabricParticipantRecord,
     allowed: (current: MeshStateEntry | undefined) => boolean,
+    durable = false,
   ): Promise<boolean> {
     const key = keyFor(PARTICIPANT_PREFIX, record.id);
     return writeParticipantFileIf(this.mesh, key, (current) => allowed(current) ? {
@@ -1304,7 +1339,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       version: (current?.version ?? 0) + 1,
       updatedAt: Date.now(),
       updatedBy: this.options.identity,
-    } : undefined);
+    } : undefined, { durable });
   }
 
   /**

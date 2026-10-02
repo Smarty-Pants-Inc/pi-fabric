@@ -65,6 +65,16 @@ describe("worker run-record process identity", () => {
 });
 
 describe("worker run-record usage", () => {
+  it("persists the publishing process identity for process workers only", () => {
+    const options = { id: "identity", name: "identity", runner: "pi" as const, transport: "process" as const,
+      cwd: "/tmp", taskFile: "/tmp/task", statusFile: "/tmp/status", logFile: "/tmp/log", lifecycleFile: "/tmp/lifecycle",
+      piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda", vedaBackend: "", vedaPersona: "",
+      timeoutMs: 1000, depth: 0, fullCodeMode: false, extensions: false, tools: [], grantedRisks: [] };
+    const record = createRunningRecord(options, "task", undefined, Date.now());
+    expect(record.sessionId).toBe(String(process.pid));
+    if (process.platform === "linux") expect(record.processStartTime).toMatch(/^\d+$/);
+    expect(createRunningRecord({ ...options, transport: "tmux" }, "task", undefined, Date.now()).sessionId).toBeUndefined();
+  });
   it("extractUsageDelta returns per-message usage without mutating the record", () => {
     const record = baseRecord();
     const delta = extractUsageDelta({

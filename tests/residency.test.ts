@@ -1661,7 +1661,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     }
   });
 
-  it.skipIf(process.platform !== "linux")("replaces owner and host lock whose live PID has a different start time", { timeout: 45_000 }, async () => {
+  it.skipIf(process.platform !== "linux" || !fs.existsSync(`/proc/${process.pid}/stat`))("replaces owner and host lock whose live PID has a different start time", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-reused-pid");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh,
       participants: state.participants, mainAgent: state.mainAgent, hostPath });

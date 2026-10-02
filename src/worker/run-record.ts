@@ -48,9 +48,7 @@ export const createRunningRecord = (
   transport: options.transport,
   // The publisher must save its own identity before any terminal publication;
   // the manager's enriched in-memory result is not a persistent exit receipt.
-  ...(options.transport === "process"
-    ? workerProcessIdentity()
-    : {}),
+  ...(options.transport === "process" ? workerProcessIdentity() : {}),
   cwd: options.cwd,
   ...(options.model ? { model: options.model, requestedModel: options.model } : {}),
   ...(thinking ? { thinking } : {}),

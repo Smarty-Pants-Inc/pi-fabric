@@ -105,7 +105,9 @@ export const runTreeExitVeto = (directory: string, depth = 0, expired: Deadline 
     const record = readJson<RunRecordSummary>(statusFile);
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (fs.existsSync(statusFile) && !record) return "worker exit is unconfirmed: unreadable run record";
-    if (record?.transport === "tmux" || record?.transport === "screen") {
+    // No durable Herdr exit proof is recorded. In particular, a lost pane may
+    // overwrite status.json after a failed unresolved-marker publication.
+    if (record?.transport === "herdr" || record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
     }
     const nested = path.join(directory, "nested");

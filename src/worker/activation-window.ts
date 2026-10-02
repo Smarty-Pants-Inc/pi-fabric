@@ -3,12 +3,20 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import * as nodeModule from "node:module";
 import { getCurrentSystemMessage, type Provider, type ProviderRequestOptions } from "@earendil-works/pi-ai";
-import { buildSessionContext, getPackageDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, convertToLlm, getPackageDir, sessionEntryToContextMessages, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 type AgentMessage = ReturnType<typeof buildSessionContext>["messages"][number];
 
 const isSystem = (message: AgentMessage): boolean => (message as { role?: string }).role === "system";
-const systemHead = (messages: readonly AgentMessage[]): string =>
-  JSON.stringify(getCurrentSystemMessage(messages as Parameters<typeof getCurrentSystemMessage>[0]) ?? null);
+const systemHead = (messages: readonly AgentMessage[], checkpoint = false): string => {
+  const head = getCurrentSystemMessage(messages as Parameters<typeof getCurrentSystemMessage>[0]);
+  // Pi timestamps a native compaction checkpoint when it appends the marker.
+  // Only that timestamp may differ; raw system records remain byte-witnessed.
+  if (head && checkpoint) {
+    const { timestamp: _timestamp, ...semanticHead } = head;
+    return JSON.stringify(semanticHead);
+  }
+  return JSON.stringify(head ?? null);
+};
 
 /** A native startup snapshot, never a guessed prompt marker or a journal edit. */
 export class ActivationWindow {
@@ -17,6 +25,13 @@ export class ActivationWindow {
   private readonly witness: readonly string[];
   private system: readonly string[];
   private current: string[] = [];
+  private compacted = false;
+  private pending: { summary: string; messages: string[] } | undefined;
+
+  authorizeCompaction(summary: string, messages: AgentMessage[]): void {
+    if (this.pending) throw new Error("Activation compaction is already pending");
+    this.pending = { summary, messages: messages.map(message => JSON.stringify(message)) };
+  }
 
   constructor(messages: readonly AgentMessage[]) {
     // Pi journals system-prompt changes as role "system" records. It strips them
@@ -40,19 +55,32 @@ export class ActivationWindow {
       throw new Error("Activation window lost its native system records");
     }
     this.system = encoded;
-    if (systemHead(running) !== systemHead(records)) {
+    if (systemHead(running, this.compacted) !== systemHead(records, this.compacted)) {
       throw new Error("Activation window lost its native system prompt");
     }
   }
 
   project(messages: AgentMessage[]): AgentMessage[] {
     const encoded = messages.map(message => JSON.stringify(message));
+    if (this.pending) {
+      const summary = messages[0] as { role?: string; summary?: string } | undefined;
+      if (summary?.role !== "compactionSummary" || summary.summary !== this.pending.summary ||
+          this.pending.messages.some((message, index) => encoded[index + 1] !== message)) {
+        throw new Error("Activation window lost its authorized compaction");
+      }
+      // Native checkpoint metadata (timestamp/tokensBefore) is host-owned. The
+      // summary and every retained message are checked before accepting it.
+      this.prior.length = 0;
+      this.current = encoded.slice(0, this.pending.messages.length + 1);
+      this.pending = undefined;
+      this.compacted = true;
+    }
     if (this.prior.some((message, index) => encoded[index] !== message)) {
       throw new Error("Activation window lost its native history boundary");
     }
     const result = messages.slice(this.prior.length);
     const current = encoded.slice(this.prior.length);
-    if (result[0]?.role !== "user" || this.current.some((message, index) => current[index] !== message)) {
+    if ((!this.compacted && result[0]?.role !== "user") || this.current.some((message, index) => current[index] !== message)) {
       throw new Error("Activation window lost current activation messages");
     }
     this.current = current;
@@ -139,6 +167,28 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
     // Reinstall per request so refresh/registration during a transform is covered.
     // No private host fields, alternate AI runtime, auth or provider composition.
     const guarded = new WeakSet<Provider>();
+    let lastPayload: { tokens: number; contextWindow: number } | undefined;
+    pi.on("turn_end", async event => {
+      try {
+        if (!window || !lastPayload || !event.toolResults.length) return;
+        // Measure the actual last dispatched payload plus this completed batch,
+        // not usage from before the tools or a carried journal's token count.
+        const completedBatch = convertToLlm([event.message, ...event.toolResults]);
+        const nextTokens = lastPayload.tokens + estimateTextTokens(JSON.stringify(completedBatch));
+        if (nextTokens < lastPayload.contextWindow * 0.8) return;
+        // Stable package-local first-use edge; idle activation registration stays cheap.
+        const { compactActivationTools } = await import("./activation-compaction.js");
+        // Compaction may only replace our witnessed append-only activation,
+        // not legitimize a prior boundary handler rewriting its messages.
+        window.project(event.context.contextMessages.filter(message => !isSystem(message)));
+        const plan = compactActivationTools(event);
+        if (!plan) return; // The latest batch alone may be too big: final admission refuses once.
+        window.authorizeCompaction(plan.summary, plan.messages);
+        return { entries: plan.entries };
+      } catch (error) {
+        return failClosed(error);
+      }
+    });
     pi.on("before_provider_headers", (_event, ctx) => {
       try {
         if (!window || !ctx.model) throw new Error("Activation window is not initialized");
@@ -150,7 +200,10 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
         providers.add(ctx.model.provider);
         const verify = (context: Parameters<Provider["streamSimple"]>[1]): void => {
           try {
-            window!.verifySystem(buildSessionContext(ctx.sessionManager.getBranch()).messages, context.messages);
+            // Compaction checkpoints replay a single system head; audit the raw
+            // append-only system records, not that compacted projection.
+            window!.verifySystem(ctx.sessionManager.getBranch().flatMap(entry =>
+              entry.type === "message" ? sessionEntryToContextMessages(entry) : []), context.messages);
           } catch (error) {
             failClosed(error);
           }
@@ -215,6 +268,7 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             if (tokens > model.contextWindow) {
               failClosed(`Context exceeds window: estimated ${tokens} input tokens, window ${model.contextWindow}`);
             }
+            lastPayload = { tokens, contextWindow: model.contextWindow };
             // Ordinary wire payloads dispatch the admitted JSON snapshot, not
             // stateful getters/toJSON that could change at the next serialization.
             if (!google) return admitted;
@@ -266,8 +320,8 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
         failClosed(error);
       }
     });
-    // Native summarization bypasses the context hook. Never summarize either
-    // historical messages or incomplete current tool exchanges under this policy.
+    // Unbound manual/automatic summarization bypasses the context hook. Only
+    // the witnessed native turn_end drafts above may compact this activation.
     pi.on("session_before_compact", () => failClosed("Compaction is unsupported during an activation window"));
     pi.on("session_before_tree", () => ({ cancel: true }));
     pi.on("session_before_switch", () => ({ cancel: true }));

@@ -21,6 +21,7 @@ import {
 import { MeshStore, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
+import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readJsonlPage } from "../log-tail.js";
@@ -180,7 +181,6 @@ type RemovalResult = { removed: boolean; cleaned?: boolean; pending?: string };
 const REMOVAL_RETRIES = 5;
 const REMOVAL_RETRY_MS = 1_000;
 
-const ACTOR_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9 _.-]{0,59}$/;
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const HOST_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set(FABRIC_ACTOR_HOST_EVENTS);
 const MAIN_REVISION_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set([
@@ -1684,10 +1684,14 @@ export class ActorManager {
     return this.#halted;
   }
 
-  /**
-   * Actors with a run in flight or a queue being drained in this runtime: a reload would stop
-   * them (smarty-dev#1830, #2160).
-   */
+  /** Include immutable executing objects even if a registry reload replaced their rows. */
+  inFlightActorIds(): string[] {
+    return [...new Set([...this.#actors.values(), ...this.#draining.values()])]
+      .filter(actor => actor.abortController !== undefined || actor.draining || actor.inFlightRun !== undefined || this.#inFlight.has(actor.id))
+      .map(actor => actor.id);
+  }
+
+  /** Actors whose runs or drains a reload would stop (smarty-dev#1830, #2160). */
   inFlightCount(): number {
     return [...new Set([...this.#actors.values(), ...this.#draining.values()])]
       .filter((actor) => actor.abortController !== undefined || actor.draining).length;

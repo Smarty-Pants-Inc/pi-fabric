@@ -91,14 +91,19 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
 /** A terminal record is not a descendant exit receipt. Share this persistent,
  * tree-wide veto across tracked, recovered and offline cleanup before removing
  * worktrees or files; absence of an unresolved marker never proves worker exit.
- * Recordless pre-launch rollback remains distinct from an admitted process run. */
-export const runTreeExitVeto = (directory: string, depth = 0, expired: Deadline = noDeadline): string | undefined => {
+ * Recordless pre-launch rollback remains distinct from an admitted process run.
+ * Ownership retention additionally requires checked process exit for every
+ * descendant, without coupling that proof to cleanup's artifact allowlist. */
+export const runTreeExitVeto = (
+  directory: string, depth = 0, expired: Deadline = noDeadline, requireDescendantExit = false,
+): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
   // initial absence is safe; errors or changes during inspection veto cleanup.
   try { fs.lstatSync(directory); }
   catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : "worker exit is unconfirmed: run-tree inspection failed";
+    return (error as NodeJS.ErrnoException).code === "ENOENT" && !requireDescendantExit
+      ? undefined : "worker exit is unconfirmed: run-tree inspection failed";
   }
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
@@ -110,6 +115,16 @@ export const runTreeExitVeto = (directory: string, depth = 0, expired: Deadline 
     if (fs.existsSync(statusFile) && !record) return "worker exit is unconfirmed: unreadable run record";
     if (record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
+    }
+    // Tracked ownership and collection compose conservatively: the descendant
+    // ownership check must pass as well as the terminal PID/birth proof below.
+    // A surviving tracked root has its own transport exit evidence; descendants
+    // have no surviving handles and must retain their persisted identities.
+    if (requireDescendantExit && depth > 0) {
+      const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
+        ? Number(record.sessionId) : undefined;
+      if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return "worker exit is unconfirmed: unknown descendant identity";
+      if (processAlive(pid)) return `its descendant worker may still be running (${directory})`;
     }
     if (record?.transport === "process") {
       if (!record.status || !TERMINAL_STATUSES.has(record.status)) {
@@ -143,7 +158,7 @@ export const runTreeExitVeto = (directory: string, depth = 0, expired: Deadline 
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
     if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
     for (const name of fs.readdirSync(nested)) {
-      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired);
+      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requireDescendantExit);
       if (reason) return reason;
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }

@@ -48,7 +48,8 @@ describe("background shell timing bridge", () => {
   });
 
   it("publishes terminal timing when a monitor deadline expires", async () => {
-    vi.useFakeTimers();
+    // ScratchScope release yields with setImmediate; only fake the timers under test.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const { jobs, emit } = harness();
     const job = jobs.begin("bash", "monitor", { monitor: { delivery: "ui", timeoutMs: 1000, intervalMs: 1000 } });
     job.spill();
@@ -72,7 +73,8 @@ describe("background shell timing bridge", () => {
   });
 
   it("observes automatic hang handoff and manual spill through the same lifecycle", async () => {
-    vi.useFakeTimers();
+    // ScratchScope release yields with setImmediate; only fake the timers under test.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const { jobs, emit } = harness();
     const job = jobs.begin("bash", "long command");
     let complete!: (value: number) => void;

@@ -8,7 +8,8 @@ const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: str
 const cleanup: Array<() => void | Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); vi.useRealTimers(); });
 const fixture = () => {
-  vi.useFakeTimers(); vi.setSystemTime(10000);
+  // ScratchScope release yields with setImmediate; only fake the timers under test.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] }); vi.setSystemTime(10000);
   const jobs = new FabricShellJobStore();
   cleanup.push(() => jobs.close());
   let rows = 40;
@@ -78,7 +79,8 @@ describe("shell task inspector layout", () => {
   });
 
   it("animates only live views, never reads logs per frame, and releases timers/subscriptions", async () => {
-    vi.useFakeTimers(); vi.setSystemTime(10000);
+    // ScratchScope release yields with setImmediate; only fake the timers under test.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] }); vi.setSystemTime(10000);
     const h = fixture(); const job = h.add("Quiet task");
     const read = vi.spyOn(job, "outputText");
     const view = h.open(); await Promise.resolve();

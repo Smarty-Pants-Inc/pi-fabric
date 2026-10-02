@@ -5,6 +5,7 @@ import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type 
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
+import { OutputArtifactStore } from "./output-budget.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
 import { resolvePiModel } from "./core/model-refresh.js";
@@ -233,6 +234,8 @@ export class FabricRuntimeState {
   readonly #builtinComponentNames = new Set<string>();
   readonly componentCatalog = new FabricComponentCatalog();
   readonly activity: FabricActivityStore;
+  #outputArtifacts = new OutputArtifactStore();
+  get outputArtifactWriter(): OutputArtifactStore["write"] { return this.#outputArtifacts.write; }
   #shellJobs = new FabricShellJobStore();
   get shellJobs(): FabricShellJobStore { return this.#shellJobs; }
   readonly prewalk: PrewalkController;
@@ -423,6 +426,7 @@ export class FabricRuntimeState {
     try {
       await this.#closeInternal();
       this.#shellJobs = new FabricShellJobStore();
+      this.#outputArtifacts = new OutputArtifactStore();
       // Closed-world managed hosts must not reach the ambient session manager.
       const sessionId = this.#managedHost ? undefined : context.sessionManager?.getSessionId?.();
       if (sessionId && this.pi.events) {
@@ -1519,6 +1523,7 @@ export class FabricRuntimeState {
     await this.#closeRecords();
     await this.#agents?.close();
     await this.shellJobs.close();
+    await this.#outputArtifacts.close();
     try {
       await this.#registry?.close();
     } finally {
@@ -1625,7 +1630,10 @@ export class FabricRuntimeState {
     this.#shellTiming = undefined;
     await this.shellJobs.close();
     await this.#deactivateRepairs();
-    if (!this.#registry) return;
+    if (!this.#registry) {
+      await this.#outputArtifacts.close();
+      return;
+    }
     await this.#participants?.quiesce().catch(() => undefined);
     this.#stopComponentWatch?.();
     this.#stopComponentWatch = undefined;
@@ -1640,6 +1648,8 @@ export class FabricRuntimeState {
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
     await this.#closeRecords();
     await this.#agents?.close();
+    // Reinitialization, like shutdown, must drain workers before releasing output artifacts.
+    await this.#outputArtifacts.close();
     const externalNames = new Set(this.#externalProviders.keys());
     try {
       await this.#registry.close(externalNames);

@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import os from "node:os";
+import { fabricDataRoot } from "./temp-root.js";
 import path from "node:path";
 
 export const SCRATCH_OWNER_FILE = ".fabric-scratch.json";
@@ -54,7 +54,7 @@ const readOwner = (directory: string): Owner | undefined => {
   } catch { return; }
 };
 
-export const createScratch = (kind: ScratchKind, tempRoot = os.tmpdir()): string => {
+export const createScratch = (kind: ScratchKind, tempRoot = fabricDataRoot()): string => {
   const directory = fs.mkdtempSync(path.join(tempRoot, prefixes[kind]));
   try {
     fs.chmodSync(directory, 0o700);
@@ -89,6 +89,8 @@ export interface ScratchSweepOptions {
   orphanGraceMs?: number;
   maxBytes?: number;
   maxItems?: number;
+  /** Session release: only these allocated, closed roots of this process, regardless of age. */
+  released?: ReadonlySet<string>;
 }
 export interface ScratchSweepResult {
   eligible: string[];
@@ -106,8 +108,11 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
   const result: ScratchSweepResult = { eligible: [], removed: [], orphaned: [] };
   const now = options.now ?? Date.now();
   const candidates: { directory: string; root: fs.Stats; files: Map<string, fs.Stats>; owner: Owner; childPid?: number; age: number; bytes: number; cache: boolean; expired: boolean }[] = [];
-  let entries: fs.Dirent[];
-  try { entries = await fs.promises.readdir(options.tempRoot, { withFileTypes: true }); }
+  let entries: Pick<fs.Dirent, "name" | "isDirectory">[];
+  try { entries = options.released
+    ? [...options.released].filter(directory => path.dirname(directory) === options.tempRoot)
+      .map(directory => ({ name: path.basename(directory), isDirectory: () => true }))
+    : await fs.promises.readdir(options.tempRoot, { withFileTypes: true }); }
   catch { return result; }
   let totalBytes = 0;
   let totalItems = 0;
@@ -121,6 +126,7 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
       if (!root?.isDirectory()) continue;
       const owner = readOwner(directory);
       if (!owner) continue;
+      if (options.released && (owner.pid !== process.pid || owner.closedAt === undefined)) continue;
       let bytes = 0;
       const files = new Map<string, fs.Stats>();
       let safe = true;
@@ -148,7 +154,7 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
         if (now - owner.orphanedAt < (options.orphanGraceMs ?? SCRATCH_ORPHAN_GRACE_MS)) continue;
       }
       const age = now - (owner.closedAt ?? owner.orphanedAt ?? owner.createdAt);
-      candidates.push({ directory, root, files, owner, ...(childPid === undefined ? {} : { childPid }), age, bytes, cache, expired: owner.closedAt === undefined || age >= (options.maxAgeMs ?? SCRATCH_MAX_AGE_MS) });
+      candidates.push({ directory, root, files, owner, ...(childPid === undefined ? {} : { childPid }), age, bytes, cache, expired: options.released?.has(directory) === true || owner.closedAt === undefined || age >= (options.maxAgeMs ?? SCRATCH_MAX_AGE_MS) });
     } catch { /* disappearing or inaccessible artifacts are not cleanup authority */ }
   }
   candidates.sort((a, b) => b.age - a.age);
@@ -176,9 +182,44 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
   return result;
 };
 
+/** Tracks exact allocations, not prefixes or process-wide roots: sessions cannot release each other. */
+export class ScratchScope {
+  readonly #directories = new Map<string, { dev: number; ino: number }>();
+  #closed = false;
+  #closePromise: Promise<void> | undefined;
+
+  create(kind: ScratchKind, tempRoot = fabricDataRoot()): string {
+    if (this.#closed) throw new Error("Fabric scratch scope is closed");
+    const directory = createScratch(kind, tempRoot);
+    const { dev, ino } = fs.lstatSync(directory);
+    this.#directories.set(directory, { dev, ino });
+    return directory;
+  }
+
+  forget(directory: string): void { this.#directories.delete(directory); }
+
+  close(): Promise<void> {
+    this.#closed = true;
+    return this.#closePromise ??= this.#release();
+  }
+
+  async #release(): Promise<void> {
+    const roots = new Set([...this.#directories.keys()].map(directory => path.dirname(directory)));
+    for (const tempRoot of roots) {
+      const released = new Set([...this.#directories].filter(([directory, identity]) => {
+        const stat = ownedStat(directory);
+        return path.dirname(directory) === tempRoot && stat?.dev === identity.dev && stat.ino === identity.ino;
+      }).map(([directory]) => directory));
+      // Walk only this scope, not the shared root. Concurrent sweeps recheck file identity.
+      await sweepScratch({ tempRoot, released });
+    }
+    this.#directories.clear();
+  }
+}
+
 const pending = new Map<string, Promise<unknown>>();
 const lastSweep = new Map<string, number>();
-export const scheduleScratchSweep = (tempRoot = os.tmpdir()): void => {
+export const scheduleScratchSweep = (tempRoot = fabricDataRoot()): void => {
   if (pending.has(tempRoot) || Date.now() - (lastSweep.get(tempRoot) ?? 0) < 60_000) return;
   lastSweep.set(tempRoot, Date.now());
   if (lastSweep.size > 8) lastSweep.delete(lastSweep.keys().next().value!);

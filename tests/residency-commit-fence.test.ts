@@ -321,9 +321,14 @@ describe("resident creation cache boundaries", () => {
     try {
       const first = await state.client.createActor(actorRequest("before-eviction", "oldest"));
       // Real client/host exchanges with fail-fast requests avoid 256 extra actors/workers.
-      const rejected = await Promise.all(Array.from({ length: 256 }, (_, i) =>
-        state.client.createActor(actorRequest("", `bounded-${i}`)).catch((error: Error) => error)));
-      for (const error of rejected) expect(error).toMatchObject({ message: expect.stringContaining("Invalid Fabric actor name") });
+      // The host picks up at most 32 requests per sweep, with durable namespace
+      // barriers for each. Exercise completed-cache eviction, not the admission
+      // deadline of a 256-request queue: await each pickup-sized batch.
+      for (let offset = 0; offset < 256; offset += 32) {
+        const rejected = await Promise.all(Array.from({ length: 32 }, (_, i) =>
+          state.client.createActor(actorRequest("", `bounded-${offset + i}`)).catch((error: Error) => error)));
+        for (const error of rejected) expect(error).toMatchObject({ message: expect.stringContaining("Invalid Fabric actor name") });
+      }
       const next = await state.client.createActor(actorRequest("after-eviction", "oldest"));
       expect(next.id).not.toBe(first.id);
       expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(2);

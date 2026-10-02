@@ -73,7 +73,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     const inboxMessages = () => session.messages.filter((message) =>
       message.role === "custom" && (message as { customType?: string }).customType === "pi-fabric-inbox");
     // A peer's shadow record from two minutes ago, whose steer never arrived.
-    const missedWork = (text: string, to: string | null = `session:${session.sessionManager.getSessionId()}`) => {
+    const missedWork = (text: string, to: string | null = `session:${session.sessionManager.getSessionId()}`, ageMs = 120_000) => {
       const id = randomUUID();
       const log = path.join(meshRoot, "events.jsonl");
       const lines = fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean) : [];
@@ -82,7 +82,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
         id, sequence, topic: "fleet.work.pi-fabric.1", kind: "handoff",
         from: { id: "session:peer", name: "main", kind: "main", sessionId: "peer" },
         ...(to ? { to } : {}),
-        text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key: text }, createdAt: Date.now() - 120_000,
+        text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key: text }, createdAt: Date.now() - ageMs,
       })}\n`);
       fs.writeFileSync(path.join(meshRoot, "sequence"), String(sequence));
       return id;
@@ -94,6 +94,43 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(inboxMessages()).toEqual([]);
     return { session, faux, inboxMessages, missedWork };
   };
+
+  it("summarises a 20-hour backlog once at turn start without injecting work or chaining turns (#3036)", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start();
+    for (let index = 0; index < 45; index++) missedWork(`stale shadow ${index}`, undefined, 20 * 60 * 60_000);
+    let inferences = 0;
+    faux.setResponses([() => { inferences++; return fauxAssistantMessage("next"); },
+      () => { inferences++; return fauxAssistantMessage("unwanted backlog wake"); }]);
+    await session.prompt("next");
+    expect(inboxMessages()).toEqual([]);
+    expect(inferences).toBe(1);
+    const summaries = () => session.messages.filter(message => message.role === "custom" &&
+      (message as { customType?: string }).customType === "pi-fabric-inbox-summary");
+    expect(summaries()).toHaveLength(1);
+    expect((summaries()[0] as { content: string }).content).toBe("Fabric inbox: skipped 45 addressed shadows older than 7200000 ms; no stale work injected.");
+    faux.setResponses([fauxAssistantMessage("again")]);
+    await session.prompt("again");
+    expect(summaries()).toHaveLength(1);
+    expect(inboxMessages()).toEqual([]);
+  }, 60_000);
+
+  it("summarises stale-only idle work without starting a model turn (#3036)", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    let inferences = 0;
+    faux.setResponses([() => { inferences++; return fauxAssistantMessage("must not wake"); }]);
+    for (let index = 0; index < 45; index++) missedWork(`idle stale shadow ${index}`, undefined, 20 * 60 * 60_000);
+    const summaries = () => session.sessionManager.getEntries().filter(entry => entry.type === "custom_message" &&
+      entry.customType === "pi-fabric-inbox-summary");
+    const deadline = Date.now() + 10_000;
+    while (summaries().length === 0 && inferences === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+    expect(inferences).toBe(0);
+    expect(summaries()).toHaveLength(1);
+    expect(inboxMessages()).toEqual([]);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(summaries()).toHaveLength(1);
+    expect(inferences).toBe(0);
+    expect(session.isStreaming).toBe(false);
+  }, 60_000);
 
   it("brings a missed work event to the next turn, and only once", async () => {
     const { session, faux, inboxMessages, missedWork } = await start();

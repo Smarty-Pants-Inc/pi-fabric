@@ -249,6 +249,7 @@ export const spawnDetached = async (
   workerArguments: string[],
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize">,
+  environment?: NodeJS.ProcessEnv,
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
@@ -260,6 +261,7 @@ export const spawnDetached = async (
   const tracksExecution = executionCustodian && process.platform !== "win32";
   const child = spawn(runtime, [workerPath, ...workerArguments], {
     cwd,
+    ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
     stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });

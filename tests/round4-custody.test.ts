@@ -150,7 +150,8 @@ describe("round 4 execution custody", () => {
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     const spawn = vi.spyOn(processUtils, "spawnDetached").mockResolvedValue({ pid: 123, stop: async () => {}, isAlive: async () => false });
     await new ProcessTransport().launch({ id: "windows", name: "windows", cwd: process.cwd(), workerPath: "worker.js", workerArguments: [] });
-    expect(spawn.mock.calls[0]?.[5]).toBe(false);
+    expect(spawn.mock.calls[0]?.[5]).toBe(7_000);
+    expect(spawn.mock.calls[0]?.[6]).toBe(false);
   });
 
   it.skipIf(process.platform !== "linux")("F7 protects a fresh inode's creator from a contender acquiring its flock first", async () => {

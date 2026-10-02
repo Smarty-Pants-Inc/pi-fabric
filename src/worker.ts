@@ -13,6 +13,7 @@ import type {
   AgentRunStatus,
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
+import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { processStartTime } from "./residency/process-identity.js";
 import { executionGroup } from "./worker/execution-group.js";
 
@@ -499,7 +500,7 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
-  const childEnvironment = { ...process.env };
+  const childEnvironment = options.actorName ? { ...process.env } : taskAgentEnvironment();
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
   if (options.actorId && options.bashTimeoutSeconds !== undefined &&
     Number.isInteger(options.bashTimeoutSeconds) && options.bashTimeoutSeconds >= 0) {
@@ -521,7 +522,6 @@ const main = async (): Promise<void> => {
     detached: process.platform !== "win32",
     env: {
       ...childEnvironment,
-      ...(options.actorName ? {} : { SMARTY_ROLE: "task-agent" }),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
@@ -626,6 +626,9 @@ const main = async (): Promise<void> => {
   let terminalError: string | undefined;
   let sawAgentError = false;
   let retryPending = false;
+  let piSettledSuccessfully = false;
+  let hasFinalText = false;
+  let hasFinalResult = false;
 
   const update = (): void => updateRunRecord(options.statusFile, record);
   let killTimer: NodeJS.Timeout | undefined;
@@ -667,9 +670,28 @@ const main = async (): Promise<void> => {
     recoveryWatchdog.clear();
     if (closeTimer || killTimer) return;
     // RPC EOF requests disposal, but a stuck extension can prevent process exit.
-    closeTimer = setTimeout(() => failStalledChild(
-      `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`,
-    ), KILL_GRACE_MS);
+    closeTimer = setTimeout(() => {
+      const error = `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`;
+      // fabric_reply writes after assistant message_end; inspect the durable
+      // reply now too. Post-drain reply/schema validation remains authoritative.
+      hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
+      if (piSettledSuccessfully && hasFinalResult && modelControl.ready && !terminalStatus &&
+          !terminalError && !sawAgentError && !lostResult) {
+        const warning = `${error}; preserving final result and terminating child`;
+        record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+        appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
+        process.stderr.write(`[pi-fabric] ${warning}\n`);
+        // Persist the result and warning BEFORE signalling the owned group.
+        // Keep the public record running until close drains the streams and
+        // reply/schema validation finishes; terminal records can be collected
+        // immediately by the manager. Forced exit must not erase this result.
+        update();
+        terminalStatus = "completed";
+        killChild();
+      } else {
+        failStalledChild(error);
+      }
+    }, KILL_GRACE_MS);
     closeTimer.unref();
   };
 
@@ -1170,6 +1192,9 @@ const main = async (): Promise<void> => {
         ...(record.fabricSessionId ? { fabricSessionId: record.fabricSessionId } : {}),
       });
       retryPending = false;
+      piSettledSuccessfully = false;
+      hasFinalText = false;
+      hasFinalResult = false;
       // Starting a retry is not proof of acceptance: preserve the error and timer
       // until the provider starts a new assistant response.
       return;
@@ -1252,6 +1277,7 @@ const main = async (): Promise<void> => {
       if (messageRecord.role !== "assistant") return;
       lostResult = undefined;
       const text = extractText(messageRecord);
+      hasFinalText = Boolean(text);
       if (text) {
         record.text = latestRunText(text);
         process.stdout.write(`\n${text}\n`);
@@ -1288,6 +1314,12 @@ const main = async (): Promise<void> => {
     if (event.type === "agent_settled") {
       emitLifecycle("pi.agent_settled");
       if (!retryPending) {
+        // Settlement ends automatic work, not necessarily successfully: native
+        // compaction failures/aborts need not emit an assistant error message.
+        // Older Pi frames omit outcome; retain their existing result checks.
+        piSettledSuccessfully = event.outcome !== "error" && event.outcome !== "aborted";
+        // Tool-only assistant events precede the tool's durable reply write.
+        hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
         // Pull controls that landed with the final stream events before deciding
         // whether this one-shot child can close. A queued compact keeps stdin
         // open until its correlated response and compaction_end are observed.

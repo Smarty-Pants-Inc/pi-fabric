@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
@@ -1086,6 +1087,81 @@ describe("ParticipantDirectory", () => {
       expect(writes).not.toHaveBeenCalled();
     });
 
+    it("preserves backoff and one warning across unchanged refreshes until real lock recovery", async () => {
+      vi.useFakeTimers();
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-outage-"));
+      roots.push(root);
+      const identity: MeshIdentity = { id: "session:busy", name: "main", kind: "main", sessionId: "busy" };
+      const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 100 });
+      const source = vi.fn(() => [rootRecord(identity.id, identity.id, "busy")]);
+      const directory = new ParticipantDirectory(mesh, {
+        enabled: true, hostId: identity.id, rootId: identity.id, identity,
+        heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false,
+      });
+      directory.registerSource(source);
+      directories.push(directory);
+      const intervals = vi.spyOn(globalThis, "setInterval");
+      const lockPath = path.join(mesh.root, ".lock");
+      try {
+        await directory.start();
+        // Drive the real heartbeat callback without incidental ticks during backoff.
+        const heartbeat = intervals.mock.calls[0]![0] as () => void;
+        const runs = vi.spyOn(MeshBackgroundRetry.prototype, "run");
+        const writes = vi.spyOn(mesh, "writeBatch");
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        const tick = async () => {
+          heartbeat();
+          const result = runs.mock.results.at(-1)!.value;
+          await vi.advanceTimersByTimeAsync(200); // acquisition times out after 100 ms
+          return await result;
+        };
+        const hold = () => {
+          fs.mkdirSync(lockPath, { mode: 0o700 });
+          fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+        };
+        hold();
+        const holder = fs.readFileSync(path.join(lockPath, "owner"), "utf8");
+        expect(await tick()).toBe("retry");
+        expect(warn).toHaveBeenCalledOnce();
+        expect(warn.mock.calls[0]![0]).toContain(`pid ${process.pid}`);
+        const retry = runs.mock.contexts.at(-1) as MeshBackgroundRetry;
+        const recovered = vi.spyOn(retry, "success");
+        await vi.advanceTimersByTimeAsync(retry.waitMs);
+
+        const readsBefore = source.mock.calls.length;
+        directory.scheduleRefresh();
+        await Promise.resolve(); // run the queued change-only refresh
+        expect(await runs.mock.results.at(-1)!.value).toBe("done");
+        expect(source.mock.calls.length).toBeGreaterThan(readsBefore);
+        expect(writes).toHaveBeenCalledOnce(); // unchanged snapshot took no mesh lock
+        expect(recovered).not.toHaveBeenCalled();
+        expect(directory.writeStalled()).toBeDefined();
+        expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(holder);
+
+        expect(await tick()).toBe("retry");
+        expect(warn).toHaveBeenCalledOnce(); // same live holder, same continuous outage
+        expect(retry.waitMs).toBeGreaterThan(0); // second timeout retained the doubled delay
+        heartbeat();
+        expect(await runs.mock.results.at(-1)!.value).toBe("skipped");
+        expect(writes).toHaveBeenCalledTimes(2);
+
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        await vi.advanceTimersByTimeAsync(retry.waitMs);
+        expect(await tick()).toBe("done"); // a real locked write confirms recovery
+        expect(directory.writeStalled()).toBeUndefined();
+        expect(recovered).toHaveBeenCalledOnce();
+        expect(retry.waitMs).toBe(0);
+        hold();
+        expect(await tick()).toBe("retry");
+        expect(warn).toHaveBeenCalledTimes(2); // a later outage gets its own warning
+      } finally {
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        await directory.close();
+        vi.restoreAllMocks();
+        vi.useRealTimers();
+      }
+    });
+
     it("publishes a burst of changes with at most two writes, ending on the latest", async () => {
       const { directory, mesh, writes, setStatus } = await changing();
       for (let index = 0; index < 10; index++) {
@@ -1270,7 +1346,7 @@ describe("ParticipantDirectory", () => {
     fs.mkdirSync(lockPath, { mode: 0o700 });
     fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
     await expect.poll(() => directory.writeStalled()?.message ?? "", { timeout: 5_000, interval: 50 })
-      .toMatch(/^Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock/);
+      .toMatch(/^Fabric mesh is write-stalled: FABRIC_MESH_LOCK_TIMEOUT: Timed out waiting for the Fabric mesh lock/);
     // Timers, the dashboard and ownership checks read these: they must never throw.
     expect(() => directory.sessions()).not.toThrow();
     expect(() => directory.peers()).not.toThrow();

@@ -151,6 +151,7 @@ const explicitExtensions = (): string[] => {
 // module but keeps the process and the session id; the next runtime reports what it replaced.
 const HANDOFF = Symbol.for("pi-fabric.self-reload");
 const ATTEMPTS = Symbol.for("pi-fabric.self-reload.attempts");
+const FABRIC_ATTEMPTS = Symbol.for("pi-fabric.self-reload.fabric-attempts");
 interface SelfReloadHandoff { old: string; target: string; owner?: string; resource?: string; reported?: boolean; releaseSlot?: () => void }
 const handoffs = (): Map<string, SelfReloadHandoff> =>
   ((globalThis as Record<symbol, unknown>)[HANDOFF] ??= new Map<string, SelfReloadHandoff>()) as Map<string, SelfReloadHandoff>;
@@ -250,6 +251,8 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     candidate.kind === "fabric" ? "fabric" : `resource:${candidate.resource!}`;
   // Keep exact-target attempts through native reloads, even if a different target was tried later.
   const attempts = ((globalThis as Record<symbol, unknown>)[ATTEMPTS] ??= new Map<string, Set<string>>()) as Map<string, Set<string>>;
+  // Keep the shared set's shape compatible with already-loaded runtimes; only Fabric entries reset.
+  const fabricAttempts = ((globalThis as Record<symbol, unknown>)[FABRIC_ATTEMPTS] ??= new Map<string, Set<string>>()) as Map<string, Set<string>>;
   const attempted = (id: string, candidate: ReloadCandidate): boolean => attemptedSelfReload(id, candidate.target);
   // Escape and failed/aborted runs hold reload until user input, never extension followups.
   let stopped = false;
@@ -526,7 +529,11 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
         if (candidate.kind === "resource") {
           pending.delete(pendingKey(candidate));
           handoffs().set(id, { old: candidate.loaded, target: candidate.target, owner: candidate.owner!, resource: candidate.resource! });
-        } else rememberSelfReload(id, candidate.loaded, candidate.target);
+        } else {
+          const fabricTried = fabricAttempts.get(id) ?? new Set<string>();
+          fabricTried.add(candidate.target); fabricAttempts.set(id, fabricTried);
+          rememberSelfReload(id, candidate.loaded, candidate.target);
+        }
         // Transfer ownership at session_start, but hold capacity through ensure/re-arm/publish.
         // Shutdown alone must not free it early; an unclaimed native failure releases below.
         handoff = handoffs().get(id)!;
@@ -562,10 +569,15 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       if (!unsubscribe) unsubscribe = pi.events?.on(RELOAD_TARGET_TOPIC, receive);
       const done = takeSelfReload(sessionId, reason);
       const loaded = loadedFabricRoot(deps.moduleUrl);
-      // smarty-dev#3324: attempts only stop a retry loop onto a target that failed to load. Once a
-      // Fabric reload has landed on its target, every earlier target is followable again; otherwise
-      // a --restore to a release this Main once reloaded onto would be ignored forever.
-      if (done && !done.resource && loaded === done.target) attempts.delete(sessionId);
+      // smarty-dev#3324: once a Fabric reload lands, earlier Fabric releases are followable again
+      // (including --restore). Resource targets retain their one-native-attempt-per-session guard,
+      // including failed reloads; an unrelated Fabric takeover must not reset them.
+      if (done && !done.resource && loaded === done.target) {
+        const tried = attempts.get(sessionId);
+        for (const target of fabricAttempts.get(sessionId) ?? []) tried?.delete(target);
+        if (tried?.size === 0) attempts.delete(sessionId);
+        fabricAttempts.delete(sessionId);
+      }
       if (!loaded || !contextNow) {
         watch = undefined;
         done?.releaseSlot?.();

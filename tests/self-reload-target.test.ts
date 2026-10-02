@@ -107,7 +107,7 @@ const setup = (options: { concurrency?: number; uiQuery?: boolean; hostQuery?: b
     const [command, ...args] = text.slice(1).split(" ");
     await commands.get(command!)!.handler(args.join(" "), context);
   };
-  return { pi, context, state, uiState, held, loaded, next, fabric, settingsPath, activate, request, bind, execute, emit, sent, replies, controller,
+  return { pi, deps, context, state, uiState, held, loaded, next, fabric, settingsPath, activate, request, bind, execute, emit, sent, replies, controller,
     replaceSessionWithoutStart: () => { sessionId = `replaced-${++serial}`; },
     switchSession: () => { sessionId = `switched-${++serial}`; controller.sessionStart("switch", context as never); } };
 };
@@ -372,6 +372,36 @@ describe("reload-target v1 adversarial admission", () => {
     await expect(s.execute()).rejects.toThrow("native failure");
     expect(await s.request(s.next)).toMatchObject({ accepted: false, reason: "already-attempted" });
     s.emit("agent_settled"); expect(s.sent).toHaveLength(1);
+  });
+  it("keeps a failed resource target suppressed across a successful Fabric reload and takeover", async () => {
+    vi.useFakeTimers();
+    const s = setup(); await s.bind(); s.activate(s.next); await s.request(s.next); s.emit("agent_settled");
+    s.context.reload.mockRejectedValueOnce(new Error("native resource failure"));
+    await expect(s.execute()).rejects.toThrow("native resource failure");
+    expect(await s.request(s.next)).toMatchObject({ accepted: false, reason: "already-attempted" });
+
+    // Restore the resource slot, then successfully move Fabric A -> B in the same session.
+    s.activate(s.loaded);
+    const fabricNext = entry("fabric-next", "pi-fabric");
+    const profile = (resource: string) => {
+      const previous = fs.statSync(s.settingsPath).mtimeMs;
+      fs.writeFileSync(s.settingsPath, JSON.stringify({ packages: [path.dirname(fabricNext)], extensions: [resource] }));
+      fs.utimesSync(s.settingsPath, new Date(previous + 1000), new Date(previous + 1000));
+    };
+    profile(s.loaded); s.emit("agent_settled");
+    expect(s.sent).toHaveLength(2);
+    expect(s.sent.at(-1)).toBe(`/${SELF_RELOAD_COMMAND} auto`);
+    await s.execute(); expect(s.context.reload).toHaveBeenCalledTimes(2);
+    s.emit("session_shutdown");
+
+    // A new controller claims the native handoff; the old request listener is gone.
+    const fresh = installSelfReload(s.pi as never, { ...s.deps, moduleUrl: pathToFileURL(fabricNext).href });
+    expect(fresh.sessionStart("reload", s.context as never)).toEqual({ old: "fabric", new: "fabric-next" });
+    await s.bind(); profile(s.next);
+    expect(await s.request(s.next)).toMatchObject({ accepted: false, reason: "already-attempted", target: s.next });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(s.sent).toHaveLength(2);
+    expect(s.context.reload).toHaveBeenCalledTimes(2);
   });
   it("profile exclusions and empty package manifests are never treated as selected resources", async () => {
     const s = setup(); s.activate(s.loaded, [`-${s.loaded}`]);

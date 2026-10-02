@@ -1072,6 +1072,9 @@ export class FabricRuntimeState {
     await builtins.memory(context, this.#config, sessionId);
     builtins.assertActive(this.#config);
     await this.#mountExecution(context, enforceSchema);
+    // Reload restores accepted activations before provider/directory startup finishes. Re-admit
+    // both actor scopes now, retaining a wake if an early drain is still finalizing (#3167).
+    this.#actors.resumeQueued();
     const inheritedRequirements = inheritedCapabilityRequirements();
     const inheritedDigest = process.env.PI_FABRIC_CAPABILITY_DIGEST;
     const hasInheritedCommit =

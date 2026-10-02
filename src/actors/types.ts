@@ -119,7 +119,7 @@ export function validateActorCoalesceKey(value: unknown): asserts value is strin
 
 export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
-export type FabricActorStatus = "idle" | "queued" | "running" | "stopped";
+export type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped";
 export type FabricActorBindingScope = "session" | "project";
 export type FabricActorStorageScope = "session" | "project";
 
@@ -309,7 +309,16 @@ export interface FabricActorInfo {
   createdAt: number;
   updatedAt: number;
   lastRunId?: string;
-  /** The run in flight now, and how long it has run (smarty-dev#2184 item 8). */
+  /** Accepted activation without a worker: bounded setup, or waiting for admission. */
+  preparing?: {
+    phase: string;
+    startedAt: number;
+    ageS: number;
+    attempts: number;
+    runId?: string;
+    queuePosition?: number;
+  };
+  /** The admitted run with a launched worker, and how long it has run. */
   inFlightRun?: { id: string; startedAt: number; ageS: number };
   /** A removal that returned at once and finishes when the in-flight run ends (smarty-dev#2184). */
   removal?: { requestedAt: number; runId?: string; runStartedAt?: number; state: string };

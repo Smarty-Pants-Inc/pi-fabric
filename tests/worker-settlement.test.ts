@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { readProcessIdentity, type ProcessIdentity } from "../src/core/process-identity.js";
 import { assertRunProcessesSettled, hasUnsettledRecordedProcesses, readRunProcessEvidence, recordWorkerLaunchAttempt } from "../src/storage/worker-settlement.js";
-import { canRemoveManagedRunRoot, markRunRootClosed, markUnresolvedWorker, pruneActorRunArchives, sweepTempRunRoots } from "../src/storage/retention.js";
+import { canRemoveManagedRunRoot, runTreeExitVeto, markRunRootClosed, markUnresolvedWorker, pruneActorRunArchives, sweepTempRunRoots } from "../src/storage/retention.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
@@ -64,9 +64,11 @@ describe.skipIf(process.platform !== "linux")("worker settlement evidence preser
     fs.appendFileSync(path.join(dir, "worker-processes.jsonl"), JSON.stringify({ worker: { ...dead, pid: 2147483646 }, runner: dead }) + "\n");
     expect(() => assertRunProcessesSettled(readRunProcessEvidence(root))).toThrow("settlement not proven");
     expect(hasUnsettledRecordedProcesses(dir)).toBe(true);
+    expect(runTreeExitVeto(dir)).toMatch(/settlement is unconfirmed/);
     journal(dir, dead, dead);
     expect(() => assertRunProcessesSettled(readRunProcessEvidence(root))).not.toThrow();
     expect(hasUnsettledRecordedProcesses(dir)).toBe(false);
+    expect(runTreeExitVeto(dir)).toBeUndefined();
   });
   it.each(["missing runner", "unknown kernel", "malformed journal", "unresolved", "missing nested journal"])("preserves %s evidence", kind => {
     const { root, dead } = setup();

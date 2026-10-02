@@ -123,7 +123,9 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
       // Host shutdown confirms resident worker exit. Public CPython cases must
       // separately confirm guest close: runtime settlement bounds its reap wait.
       // After those barriers, retry only transient OS cwd/directory retention.
-      fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+      // ponytail: Windows can hold a just-exited guest's cwd for >125 ms on hosted runners (EBUSY,
+      // pi-fabric#215 job 110720930928); use the suite-wide retry budget, as worker-activation-window does.
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     },
   };
 };
@@ -806,8 +808,9 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
       const text = visibleText(result);
       artifactPath = /saved to: ([^\n]+)\]/.exec(text)?.[1];
       const decisions = decisionsFor(state); expect(decisions).toHaveLength(3);
-      const mapped = collected.value.mapped;
+      // Assert success first: a failed execution has no value, and reading it first hid the error (pi-fabric#287).
       expect(collected.success, collected.error).toBe(true);
+      const mapped = collected.value.mapped;
       expect(collected.trace.outcome).toBe("succeeded");
       expect(result.isError).not.toBe(true);
       expect(mapped).toEqual([expect.objectContaining({ ok: true, handle: expect.objectContaining({ id: expect.any(String) }) }),

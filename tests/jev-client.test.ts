@@ -12,7 +12,9 @@ describe("Jev transport and credentials", () => {
     const credentials = new JevCredentials(["does-not-exist"], { TYPESAFE_API_KEY:"test-key" });
     expect(credentials.status()).toEqual({ configured:true,source:"environment",verified:false });
     expect(await credentials.resolve(signal())).toBe("test-key");
-    expect(new JevCredentials(["does-not-exist"], {}).status().source).toBe("command");
+    expect(new JevCredentials(["does-not-exist"], {}).status()).toEqual(process.platform === "win32"
+      ? { configured: false, source: "command-unsupported", verified: false }
+      : { configured: true, source: "command", verified: false });
     await expect(new JevCredentials([], {}).resolve(signal())).rejects.toThrow("unavailable");
   });
   it.skipIf(process.platform === "win32")("never exposes credential command stdout/stderr on failure", async () => {

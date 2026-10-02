@@ -273,8 +273,89 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
     expect(new ActorRegistryStore(h.owner.actorRoots.project).records().map(a => a.id)).toContain(h.project.id);
     expect(fs.existsSync(path.join(h.owner.actorRoots.project, h.project.id))).toBe(true);
   });
+  it.skipIf(process.platform !== "linux").each(["first-registry-removal", "shared-state-commit"])("F5 resumes after %s without losing dead-root ownership or durable controls", async fault => {
+    const h = await fixture(); await h.owner.close(); const lease = await expiredOwner(h);
+    const at = h.owner.actorRoots.project; const store = new ActorRegistryStore(at);
+    const durable = "d".repeat(32); const durableRow = { ...store.records()[0]!, id: durable, name: "keep-durable", residency: "durable" };
+    await store.withLock(() => store.write([...store.records(), durableRow]));
+    fs.mkdirSync(path.join(at, durable), { recursive: true });
+    const durableFile = path.join(at, durable, "session.jsonl"); fs.writeFileSync(durableFile, "durable transcript\n");
+    for (const actor of [h.project, h.session, { ...h.project, id: durable, name: "keep-durable", residency: "durable" as const }]) {
+      const value = actorParticipantRecord(actor, h.owner.identity.id, h.owner.identity.id, h.owner.identity.id, h.owner.identity.id);
+      const entry = await h.mesh.put({ key: `topology/participants/${hash(actor.id)}`, value, identity: h.owner.identity });
+      writeParticipantFile(h.mesh.root, entry);
+    }
+    const durableParticipantFile = path.join(h.mesh.root, "participants", `${hash(durable)}.json`);
+    const durableParticipantBytes = fs.readFileSync(durableParticipantFile, "utf8");
+    const durableKey = `actors/old-main/${durable}`;
+    await h.mesh.put({ key: durableKey, value: { id: durable, rootId: h.owner.identity.id, residency: "durable" }, identity: h.owner.identity });
+    const unrelated = await h.caller.actors.create({ name: "keep-unrelated", instructions: "Wait.", scope: "session" });
+    const controls = h.mesh.listAll("actors/", { fresh: true }).filter(e => e.key.endsWith(durable) || e.key.endsWith(unrelated.id));
+    const write = ActorRegistryStore.prototype.write; const writeBatch = h.mesh.writeBatch.bind(h.mesh); let injected = false;
+    if (fault === "first-registry-removal") vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementation(function (this: ActorRegistryStore, rows, options) {
+      const removed = this.records().some(row => row.id === h.project.id) && !rows.some(row => row.id === h.project.id);
+      write.call(this, rows, options);
+      if (!injected && removed) { injected = true; throw new Error("fixture failure after first registry removal"); }
+    });
+    else vi.spyOn(h.mesh, "writeBatch").mockImplementation(async options => {
+      if (options.ops.some(op => op.kind === "delete" && op.key.startsWith("actors/"))) { injected = true; fs.writeFileSync(lease, "{bad renewal"); }
+      return writeBatch(options);
+    });
+    const first = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(first.success).toBe(false); expect(injected).toBe(true);
+    expect(new ActorRegistryStore(at).records().some(row => row.id === h.project.id)).toBe(false);
+    const receiptPath = path.join(residentRoot(h.mesh.root, h.owner.identity.id), "prune.json");
+    const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    expect(receipt.rootId).toBe(h.owner.identity.id);
+    expect(receipt.actors.map((actor: any) => actor.id).sort()).toEqual([h.project.id, h.session.id].sort());
+    expect(receipt.removed.files).toContain(path.join(at, h.project.id));
+    vi.restoreAllMocks(); await expiredOwner(h);
+    const retry = await h.run('const plan = await agents.prune({ root: "session:old-main" }); return { plan, members: await agents.members({ includeStale: true }), actors: await agents.actors() };');
+    expect(retry.success, retry.error).toBe(true);
+    const value = retry.value as any;
+    expect(value.plan.removed.actors).toBe(fault === "first-registry-removal" ? 1 : 0);
+    for (const id of [h.project.id, h.session.id]) {
+      expect(h.mesh.listAll("actors/", { fresh: true }).some(e => e.key.endsWith(id))).toBe(false);
+      expect(fs.existsSync(path.join(h.mesh.root, "participants", `${hash(id)}.json`))).toBe(false);
+      expect([...value.members, ...value.actors].some((actor: any) => actor.id === id)).toBe(false);
+    }
+    expect(fs.existsSync(path.join(at, h.project.id))).toBe(false);
+    expect(fs.existsSync(path.join(h.owner.actorRoots.session, h.session.id))).toBe(false);
+    expect(store.records()).toEqual([durableRow]); expect(fs.readFileSync(durableFile, "utf8")).toBe("durable transcript\n");
+    expect(fs.existsSync(receiptPath)).toBe(false);
+    expect(fs.readFileSync(durableParticipantFile, "utf8")).toBe(durableParticipantBytes);
+    expect(h.mesh.listAll("actors/", { fresh: true }).filter(e => e.key.endsWith(durable) || e.key.endsWith(unrelated.id))).toEqual(controls);
+  });
+  it.skipIf(process.platform !== "linux")("S3 preserves a live root's same-name model/thinking bindings when storage and root IDs differ", async () => {
+    const h = await fixture(); await h.owner.close(); const at = h.owner.actorRoots.project;
+    const liveRoot = "session:live-main"; const liveId = "e".repeat(32); const durable = "d".repeat(32);
+    writeHostLease(h.mesh.root, { id: liveRoot, rootId: liveRoot, identityId: liveRoot, updatedAt: Date.now(), expiresAt: Date.now() + 60_000 });
+    const store = new ActorRegistryStore(at);
+    await store.withLock(() => store.write([...store.records(), { ...store.records()[0]!, id: liveId, name: h.project.name, rootId: liveRoot },
+      { ...store.records()[0]!, id: durable, name: "keep-live-durable", rootId: liveRoot, residency: "durable" }]));
+    const liveBinding = new ActorBindingStore("old-main", at, liveRoot);
+    await liveBinding.setModel(liveId, "provider/live-model"); await liveBinding.setThinking(liveId, "high");
+    await liveBinding.setThinking(durable, "low");
+    const before = fs.readFileSync(liveBinding.filePath!, "utf8");
+    const deadBinding = new ActorBindingStore("dead-storage-overlay", at, h.owner.identity.id);
+    await deadBinding.setModel(h.project.id, "provider/dead-model"); await deadBinding.setThinking(h.project.id, "low");
+    const legacyBinding = new ActorBindingStore("legacy-storage-overlay", at);
+    await legacyBinding.setThinking(h.project.id, "high"); const legacyBytes = fs.readFileSync(legacyBinding.filePath!, "utf8");
+    const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(result.success, result.error).toBe(true);
+    expect(fs.existsSync(liveBinding.filePath!)).toBe(true);
+    expect(fs.readFileSync(liveBinding.filePath!, "utf8")).toBe(before);
+    expect(liveBinding.get(liveId)).toMatchObject({ model: "provider/live-model", thinking: "high" });
+    expect(liveBinding.get(durable)).toMatchObject({ thinking: "low" });
+    expect(deadBinding.get(h.project.id)).toBeUndefined();
+    expect(fs.readFileSync(legacyBinding.filePath!, "utf8")).toBe(legacyBytes);
+    const repeat = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(repeat.success, repeat.error).toBe(true); expect(fs.readFileSync(liveBinding.filePath!, "utf8")).toBe(before);
+  });
   it.skipIf(process.platform !== "linux")("F1 rechecks unknown leases inside the shared-state commit", async () => {
     const h = await fixture(); await h.owner.close(); const file = await expiredOwner(h);
+    const inboxKey = `topology/inbox/${hash(h.owner.identity.id).slice(0, 32)}`;
+    await h.mesh.put({ key: inboxKey, value: { after: 0 }, identity: h.owner.identity });
     const entry = h.mesh.listAll("actors/", { fresh: true }).find(e => e.key.endsWith(h.project.id))!;
     const writeBatch = h.mesh.writeBatch.bind(h.mesh);
     vi.spyOn(h.mesh, "writeBatch").mockImplementation(async options => {
@@ -284,6 +365,57 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
     const result = await h.run('return await agents.prune({ root: "session:old-main" });');
     expect(result.success).toBe(false); expect(result.error).toMatch(/cannot prove.*lease/i);
     expect(h.mesh.get(entry.key, { fresh: true })).toEqual(entry);
+    vi.restoreAllMocks(); await expiredOwner(h);
+    const retry = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(retry.success, retry.error).toBe(true);
+    expect(h.mesh.get(entry.key, { fresh: true })).toBeUndefined();
+    expect(h.mesh.get(inboxKey, { fresh: true })).toBeUndefined();
+    expect(h.mesh.listAll("topology/participants/", { fresh: true }).some(e => (e.value as any).rootId === h.owner.identity.id)).toBe(false);
+    expect(fs.existsSync(path.join(residentRoot(h.mesh.root, h.owner.identity.id), "prune.json"))).toBe(false);
+  });
+  it.skipIf(process.platform !== "linux")("F5 establishes the durable receipt barrier before the first destructive operation", async () => {
+    const h = await fixture(); await h.owner.close(); const dir = residentRoot(h.mesh.root, h.owner.identity.id);
+    fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "host.lock"), "");
+    const before = snapshot(h.root); const fsync = fs.fsyncSync; let injected = false;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fs.readlinkSync(`/proc/self/fd/${fd}`).includes("/prune.json.")) {
+        injected = true; throw Object.assign(new Error("fixture prune receipt fsync EIO"), { code: "EIO" });
+      }
+      return fsync(fd);
+    });
+    const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(result.success).toBe(false); expect(injected).toBe(true); expect(result.error).toMatch(/fsync EIO/);
+    vi.restoreAllMocks(); expect(snapshot(h.root)).toEqual(before);
+  });
+  it.skipIf(process.platform !== "linux").each(["root", "registry", "residency", "malformed"])("F5 refuses %s prune receipt ambiguity without deleting anything", async fault => {
+    const h = await fixture(); await h.owner.close(); const dir = residentRoot(h.mesh.root, h.owner.identity.id);
+    fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "host.lock"), "");
+    const receipt = { format: 1, rootId: fault === "root" ? "session:foreign" : h.owner.identity.id, meshRoot: h.mesh.root,
+      actors: [{ at: fault === "registry" ? path.join(h.root, "foreign-registry") : h.owner.actorRoots.project,
+        id: h.project.id, residency: fault === "residency" ? "durable" : "session" }],
+      removed: { actors: [], files: [], stateKeys: [] } };
+    fs.writeFileSync(path.join(dir, "prune.json"), fault === "malformed" ? "{broken" : JSON.stringify(receipt));
+    const before = snapshot(h.root);
+    for (const dryRun of [true, false]) {
+      const result = await h.run(`return await agents.prune({ root: "session:old-main", dryRun: ${dryRun} });`);
+      expect(result.success).toBe(false);
+      expect(snapshot(h.root)).toEqual(before);
+    }
+  });
+  it.skipIf(process.platform !== "linux")("F5 never derives orphan cleanup authority from state when registry proof and receipt are absent", async () => {
+    const h = await fixture(); await h.owner.close();
+    for (const at of [h.owner.actorRoots.project, h.owner.actorRoots.session]) {
+      const store = new ActorRegistryStore(at); await store.withLock(() => store.write([]));
+    }
+    const participant = actorParticipantRecord(h.project, h.owner.identity.id, h.owner.identity.id, h.owner.identity.id, h.owner.identity.id);
+    const participantEntry = await h.mesh.put({ key: `topology/participants/${hash(h.project.id)}`, value: participant, identity: h.owner.identity });
+    writeParticipantFile(h.mesh.root, participantEntry);
+    const before = h.mesh.listAll("actors/", { fresh: true });
+    const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(result.success, result.error).toBe(true); expect((result.value as any).removed.actors).toBe(0);
+    expect(h.mesh.listAll("actors/", { fresh: true })).toEqual(before);
+    expect(fs.existsSync(path.join(h.owner.actorRoots.project, h.project.id))).toBe(true);
+    expect(fs.existsSync(path.join(h.mesh.root, "participants", `${hash(h.project.id)}.json`))).toBe(true);
   });
   it.skipIf(process.platform !== "linux")("F3 aborts a session-to-durable scope change under the registry lock", async () => {
     const h = await fixture(); await h.owner.close(); const original = ActorRegistryStore.prototype.withLock;
@@ -300,7 +432,7 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
   });
   it.skipIf(process.platform !== "linux")("prunes an exited non-project owner, files and discovery, preserving other roots and audit", async () => {
     const h = await fixture();
-    const oldBinding = new ActorBindingStore("old-main", h.owner.actorRoots.project);
+    const oldBinding = new ActorBindingStore("old-main", h.owner.actorRoots.project, h.owner.identity.id);
     await oldBinding.setThinking(h.project.id, "low");
     for (const [at, actor] of [[h.owner.actorRoots.project, h.project], [h.owner.actorRoots.session, h.session]] as const) {
       fs.mkdirSync(path.join(at, actor.id), { recursive: true });
@@ -326,7 +458,8 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
     expect([...value.members, ...value.listed].some((p: any) => [h.project.id, h.session.id].includes(p.id))).toBe(false);
     expect(fs.existsSync(path.join(h.owner.actorRoots.project, h.project.id))).toBe(false);
     expect(fs.existsSync(path.join(h.owner.actorRoots.session, h.session.id))).toBe(false);
-    expect(fs.existsSync(oldBinding.filePath!)).toBe(false);
+    expect(oldBinding.get(h.project.id)).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(oldBinding.filePath!, "utf8")).bindings).toEqual({});
     expect(h.mesh.get(inboxKey, { fresh: true })).toBeUndefined();
     expect(h.mesh.listAll("actors/", { fresh: true }).some(e => e.key.endsWith(h.project.id) || e.key.endsWith(h.session.id))).toBe(false);
     expect(h.mesh.read({ topic: "ops.owner", limit: 100 }).some(e => e.kind === "actor.prune")).toBe(true);

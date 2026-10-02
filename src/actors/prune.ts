@@ -8,6 +8,8 @@ import { processStartTime } from "../residency/process-identity.js";
 import { assertPruneOwnershipDead } from "../topology/prune-ownership.js";
 import { FileLockBusy, kernelFenceAvailable, lockFile } from "../residency/file-lock.js";
 import { ActorRegistryStore } from "./registry-store.js";
+import { ActorBindingStore } from "./binding-store.js";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 
 export interface ActorPruneRequest { root: string; dryRun?: boolean }
 export interface ActorPruneResult {
@@ -17,6 +19,13 @@ export interface ActorPruneResult {
   files: string[];
   stateKeys: string[];
   removed: { actors: number; files: number; stateKeys: number };
+}
+interface PruneReceipt {
+  format: 1;
+  rootId: string;
+  meshRoot: string;
+  actors: Array<{ at: string; id: string; residency: "session" }>;
+  removed: { actors: string[]; files: string[]; stateKeys: string[] };
 }
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const record = (value: unknown): Record<string, unknown> | undefined =>
@@ -91,10 +100,14 @@ export const pruneActorRoot = async (
   assertPruneOwnershipDead(options.mesh.root, root);
   options.assertDead();
   return residentFence(options.mesh, root, dryRun, async checkOwner => {
+    const selectedIds = new Set<string>();
     const assertDead = () => {
       checkOwner();
       assertPruneOwnershipDead(options.mesh.root, root);
       options.assertDead();
+      for (const id of selectedIds) if (options.canManageActor?.(id) !== undefined) {
+        throw new Error(`Cannot prune live lineage ${root}: actor owner is live`);
+      }
     };
     assertDead();
     const stores = [...new Set(options.roots)].map(at => ({ at, store: new ActorRegistryStore(at) }));
@@ -106,6 +119,21 @@ export const pruneActorRoot = async (
     };
     const selected = new Map<string, Set<string>>();
     const preserved = new Set<string>();
+    const receiptPath = path.join(residentRoot(options.mesh.root, root), "prune.json");
+    let receipt: PruneReceipt | undefined;
+    if (exists(receiptPath)) {
+      if (!fs.lstatSync(receiptPath).isFile()) throw new Error(`Cannot prove lineage ${root} dead: invalid prune receipt`);
+      const saved = record(read(receiptPath)); const removed = record(saved?.removed);
+      if (saved?.format !== 1 || saved.rootId !== root || saved.meshRoot !== options.mesh.root || !Array.isArray(saved.actors) ||
+          saved.actors.some(value => { const actor = record(value); return actor?.residency !== "session" ||
+            typeof actor.id !== "string" || !/^[a-f0-9]{32}$/.test(actor.id) || !stores.some(store => store.at === actor.at); }) ||
+          !removed || [removed.actors, removed.files, removed.stateKeys].some(value => !Array.isArray(value) || value.some(item => typeof item !== "string"))) {
+        throw new Error(`Cannot prove lineage ${root} dead: invalid prune receipt ownership`);
+      }
+      receipt = saved as unknown as PruneReceipt;
+      for (const actor of receipt.actors) selected.set(actor.at, new Set([...(selected.get(actor.at) ?? []), actor.id]));
+    }
+
     // Missing residency is the legacy session default; unknown/new scopes are never selected.
     const eligible = (row: Record<string, unknown>): boolean =>
       row.rootId === root && (row.residency === "session" || row.residency === undefined);
@@ -138,6 +166,9 @@ export const pruneActorRoot = async (
       if (exists(registry)) {
         const rows = readRecords(at, store);
         proveUnowned(rows);
+        if (rows.some(row => selected.get(at)?.has(row.id) && !eligible(row))) {
+          throw new Error(`Cannot prune lineage ${root}: receipt actor ownership changed`);
+        }
         for (const row of rows.filter(row => row.rootId === root && !eligible(row))) preserved.add(row.id);
         for (const row of rows.filter(eligible)) {
           if (!/^[a-f0-9]{32}$/.test(row.id)) throw new Error(`Cannot prune: invalid actor id ${row.id}`);
@@ -170,7 +201,9 @@ export const pruneActorRoot = async (
       for (const id of selected.get(at) ?? []) addFile(at, path.join(at, id));
     }
     const ownership = assertPruneOwnershipDead(options.mesh.root, root);
-    const selectedIds = new Set([...selected.values()].flatMap(ids => [...ids]));
+    for (const ids of selected.values()) for (const id of ids) selectedIds.add(id);
+    // Revoked rows are absent on retry; recheck the saved exact IDs even after registry removal.
+    assertDead();
     for (const entry of [...ownership.state, ...ownership.participants]) {
       const value = record(entry.value);
       if ((entry.key.startsWith("actors/") || value?.kind === "actor") && value?.rootId === root &&
@@ -179,10 +212,25 @@ export const pruneActorRoot = async (
         preserved.add(value.id);
       }
     }
-    // Shared root metadata may also be needed by excluded durable actors.
-    if (root.startsWith("session:") && preserved.size === 0) {
-      for (const { at } of stores) addFile(at, path.join(at, "bindings", `${hash(root.slice(8))}.json`));
+    // Bindings are overlays keyed by storage session, not by the ownership root suffix.
+    // Only explicit per-entry root evidence plus this registry's exact selected IDs authorizes cleanup.
+    const bindings: Array<{ at: string; store: ActorRegistryStore; binding: ActorBindingStore }> = [];
+    for (const { at, store } of stores) {
+      const ids = selected.get(at); const dir = path.join(at, "bindings");
+      if (!ids?.size || !exists(dir)) continue;
+      for (const file of fs.readdirSync(dir)) {
+        if (!/^[a-f0-9]{64}\.json$/.test(file)) continue;
+        const filePath = path.join(dir, file);
+        if (!fs.lstatSync(filePath).isFile()) throw new Error(`Cannot prove binding ownership: ${filePath}`);
+        const saved = record(read(filePath));
+        if (typeof saved?.sessionId !== "string" || file !== `${hash(saved.sessionId)}.json`) {
+          throw new Error(`Cannot prove binding session ownership: ${filePath}`);
+        }
+        const binding = new ActorBindingStore(saved.sessionId, at);
+        if (binding.pruneCandidates(root, ids).length) bindings.push({ at, store, binding });
+      }
     }
+
     const session = root.startsWith("session:") ? root.slice(8) : undefined;
     const inboxKey = `topology/inbox/${hash(root).slice(0, 32)}`;
     const belongs = (entry: MeshStateEntry): boolean => {
@@ -207,15 +255,22 @@ export const pruneActorRoot = async (
     const entries = ownership.state.filter(belongs);
     const participantFiles = ownership.participants.filter(belongs);
     const presentFiles = [...files].filter(exists).sort();
-    const result: ActorPruneResult = { root, dryRun, actors, files: presentFiles,
+    const bindingFiles = bindings.map(({ binding }) => binding.filePath!);
+    const result: ActorPruneResult = { root, dryRun, actors, files: [...presentFiles, ...bindingFiles].sort(),
       stateKeys: [...new Set([...entries, ...participantFiles].map(entry => entry.key))].sort(),
       removed: { actors: 0, files: 0, stateKeys: 0 } };
     if (dryRun) { assertDead(); return result; }
     assertDead();
-    if (!actors.length && !presentFiles.length && !result.stateKeys.length) return result;
+    if (!actors.length && !presentFiles.length && !bindingFiles.length && !result.stateKeys.length && !receipt) return result;
+    receipt = { format: 1, rootId: root, meshRoot: options.mesh.root,
+      actors: [...selected].flatMap(([at, ids]) => [...ids].map(id => ({ at, id, residency: "session" as const }))),
+      removed: receipt?.removed ?? { actors: [], files: [], stateKeys: [] } };
+    const checkpoint = () => writeJsonAtomic(receiptPath, receipt, { durable: true });
+    // The original exact ownership set survives every destructive phase, even a crash before a checkpoint.
+    checkpoint();
     // Keep the existing append-only owner audit, not a replacement or deletion of history.
     await options.mesh.publish({ topic: "ops.owner", kind: "actor.prune", from: options.identity,
-      data: { root, actors, files: presentFiles, stateKeys: result.stateKeys } });
+      data: { root, actors, files: result.files, stateKeys: result.stateKeys } });
     for (const { at, store } of stores) {
       if (!exists(at) || (!(selected.get(at)?.size) &&
           !presentFiles.some(file => filesByRoot.get(at)?.has(file)))) continue;
@@ -239,16 +294,32 @@ export const pruneActorRoot = async (
             }
           }
           fs.rmSync(file, { recursive: true, force: true }); result.removed.files++;
+          receipt!.removed.files.push(file); checkpoint();
         }
         const removed = rows.filter(row => ids.has(row.id) && eligible(row));
         if (removed.length) store.write(rows.filter(row => !ids.has(row.id)), { durable: true });
         result.removed.actors += removed.length;
+        receipt!.removed.actors.push(...removed.map(row => `${at}/${row.id}`)); checkpoint();
       });
+    }
+    for (const { at, store, binding } of bindings) {
+      await binding.prune(root, selected.get(at)!, commit => store.withLock(() => {
+        assertDead();
+        const rows = readRecords(at, store); proveUnowned(rows);
+        if (rows.some(row => selected.get(at)!.has(row.id) && !eligible(row))) {
+          throw new Error(`Cannot prune lineage ${root}: binding actor ownership changed`);
+        }
+        return commit();
+      }));
     }
     for (const entry of participantFiles) {
       assertDead();
       if (await removeParticipantFileIf(options.mesh, entry.key,
-        current => { assertDead(); return current.version === entry.version && belongs(current); })) result.removed.stateKeys++;
+        current => {
+          assertDead();
+          if (current.version !== entry.version || !belongs(current)) throw new Error(`Cannot prune lineage ${root}: participant ownership changed`);
+          return true;
+        })) { result.removed.stateKeys++; receipt.removed.stateKeys.push(entry.key); checkpoint(); }
     }
     if (entries.length) {
       assertDead();
@@ -257,7 +328,14 @@ export const pruneActorRoot = async (
         condition: () => { assertDead(); return true; },
       })) });
       result.removed.stateKeys += removed.filter(item => item.applied && !participantFiles.some(entry => entry.key === item.key)).length;
+      receipt.removed.stateKeys.push(...removed.filter(item => item.applied).map(item => item.key)); checkpoint();
     }
+    assertDead();
+    const remaining = assertPruneOwnershipDead(options.mesh.root, root);
+    if ([...remaining.state, ...remaining.participants].some(belongs)) {
+      throw new Error(`Cannot prune lineage ${root}: cleanup incomplete; retry with retained receipt`);
+    }
+    fs.rmSync(receiptPath, { force: true });
     return result;
   });
 };

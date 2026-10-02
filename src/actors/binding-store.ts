@@ -5,6 +5,8 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 
 export interface ActorSessionBindingRecord {
+  /** Explicit overlay owner; absent legacy ownership is never inferred during pruning. */
+  rootId?: string;
   model?: string;
   thinking?: FabricThinking;
   updatedAt: number;
@@ -41,6 +43,7 @@ export class ActorBindingStore {
   constructor(
     readonly sessionId: string,
     root: string | undefined,
+    readonly rootId?: string,
   ) {
     this.filePath = root ? path.join(root, "bindings", bindingFileName(sessionId)) : undefined;
     this.#sync(true);
@@ -79,13 +82,60 @@ export class ActorBindingStore {
     return this.#mutate((bindings) => bindings.delete(actorId));
   }
 
+  /** Strict maintenance read: file session identity and per-entry root ownership are separate. */
+  pruneCandidates(rootId: string, actorIds: ReadonlySet<string>): string[] {
+    const file = this.#readPruneFile();
+    return file ? Object.entries(file.bindings).filter(([id, binding]) =>
+      actorIds.has(id) && binding.rootId === rootId).map(([id]) => id) : [];
+  }
+
+  /** Hold the overlay lock across the registry ownership fence; never unlink a shared file. */
+  async prune(rootId: string, actorIds: ReadonlySet<string>,
+    fence: (commit: () => number) => Promise<number>): Promise<number> {
+    return this.#withLock(() => fence(() => {
+      const file = this.#readPruneFile();
+      if (!file) return 0;
+      let removed = 0;
+      for (const [id, binding] of Object.entries(file.bindings)) {
+        if (actorIds.has(id) && binding.rootId === rootId) { delete file.bindings[id]; removed++; }
+      }
+      if (removed) {
+        // Preserve unknown/legacy and unrelated entries byte-for-value, including their fields.
+        writeJsonAtomic(this.filePath!, file, { space: 2, newline: true, durable: true });
+        this.#sync(true);
+      }
+      return removed;
+    }));
+  }
+
+  #readPruneFile(): ActorSessionBindingFile | undefined {
+    if (!this.filePath) return undefined;
+    let parsed: unknown;
+    try {
+      if (!fs.lstatSync(this.filePath).isFile()) throw new Error("invalid binding file");
+      parsed = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return undefined;
+      throw new Error(`Cannot prove binding ownership: ${this.filePath}: ${String(error)}`);
+    }
+    if (!isObject(parsed) || parsed.format !== 1 || parsed.sessionId !== this.sessionId || !isObject(parsed.bindings) ||
+        Object.values(parsed.bindings).some(value => !isObject(value) ||
+          (value.rootId !== undefined && (typeof value.rootId !== "string" || !value.rootId)))) {
+      throw new Error(`Cannot prove binding ownership: ${this.filePath}`);
+    }
+    return parsed as unknown as ActorSessionBindingFile;
+  }
+
   async #update(
     actorId: string,
     mutate: (binding: ActorSessionBindingRecord) => void,
     beforeCommit?: (id: string) => void,
   ): Promise<ActorSessionBindingRecord | undefined> {
     return this.#mutate((bindings) => {
-      const binding = bindings.get(actorId) ?? { updatedAt: Date.now() };
+      const binding = bindings.get(actorId) ?? { updatedAt: Date.now(), ...(this.rootId ? { rootId: this.rootId } : {}) };
+      if (this.rootId && binding.rootId && binding.rootId !== this.rootId) {
+        throw new Error("Cannot change actor binding owned by another root");
+      }
       // Lock acquisition may await: abandonment must still win until mutation.
       beforeCommit?.(actorId);
       mutate(binding);
@@ -141,6 +191,7 @@ export class ActorBindingStore {
       const thinking = isFabricThinking(value.thinking) ? value.thinking : undefined;
       if (!model && !thinking) continue;
       bindings.set(actorId, {
+        ...(typeof value.rootId === "string" ? { rootId: value.rootId } : {}),
         ...(model ? { model } : {}),
         ...(thinking ? { thinking } : {}),
         updatedAt: value.updatedAt,
@@ -180,7 +231,7 @@ export class ActorBindingStore {
     }
   }
 
-  async #withLock<T>(operation: () => T): Promise<T> {
+  async #withLock<T>(operation: () => T | Promise<T>): Promise<T> {
     if (!this.filePath) return operation();
     const lockPath = `${this.filePath}.lock`;
     const ownerPath = path.join(lockPath, "owner");
@@ -227,7 +278,7 @@ export class ActorBindingStore {
       }
     }
     try {
-      return operation();
+      return await operation();
     } finally {
       try {
         const owner = fs.readFileSync(ownerPath, "utf8");

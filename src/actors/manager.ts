@@ -474,6 +474,7 @@ export class ActorManager {
     this.#bindings = new ActorBindingStore(
       sessionId,
       this.#persistent && meshConfig.enabled ? this.#actorRoot : undefined,
+      this.#rootId,
     );
     if (this.#persistent && meshConfig.enabled) this.#loadActors();
     this.#registryFingerprint = this.#registry.fingerprint();

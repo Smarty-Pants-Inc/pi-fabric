@@ -771,7 +771,7 @@ export class FabricRuntimeState {
     markStoppedDelivered = restoreStoppedRuns({
       entries: context.sessionManager?.getEntries?.() ?? [],
       notifyOnComplete: agentConfig.notifyOnComplete,
-      restore: (runs) => agents.restorePreviousRuns(runs),
+      restore: (runs, confirmed) => agents.restorePreviousRuns(runs, confirmed),
       enqueue: (run, delivered) => completionInbox.enqueue(run, delivered),
       appendEntry: (data) => this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, data),
     });

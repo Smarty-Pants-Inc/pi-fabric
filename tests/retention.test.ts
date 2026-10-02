@@ -189,11 +189,10 @@ describe("temporal retention", () => {
     expect(result).toEqual({ removedRoots: [], removedRuns: [] });
     expect(fs.existsSync(path.join(orphaned, "lost"))).toBe(true);
     expect(fs.existsSync(path.join(closed, "lost"))).toBe(true);
-    // Without the marker the same runs are swept.
+    // Marker absence is not an exit proof: its publication may have failed.
     for (const runRoot of [orphaned, closed]) fs.rmSync(path.join(runRoot, "lost", "unresolved-worker.json"));
-    const unmarked = sweep(tempRoot);
-    expect(unmarked.removedRoots).toContain(orphaned);         // the closed root goes too once empty
-    expect(unmarked.removedRuns).toEqual([path.join(closed, "lost")]);
+    expect(sweep(tempRoot)).toEqual({ removedRoots: [], removedRuns: [] });
+    for (const runRoot of [orphaned, closed]) expect(fs.existsSync(path.join(runRoot, "lost"))).toBe(true);
   });
 
   it("never removes a completed parent run whose nested child is marked unresolved", () => {

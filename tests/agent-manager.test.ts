@@ -14,6 +14,7 @@ import {
 } from "../src/agents/manager.js";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import * as retentionStorage from "../src/storage/retention.js";
+import * as atomic from "../src/core/atomic-write.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import {
   clearOwnedBudgetEnv,
@@ -247,6 +248,19 @@ describe("AgentManager fleet model admission (#2490)", () => {
 });
 
 describe("AgentManager", () => {
+  it("#2479 persists manager terminal status before settling a stopped run", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-durable-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "HANG", transport: "process" });
+    const write = vi.spyOn(atomic, "writeJsonAtomic");
+    await manager.stop(handle.id);
+    const calls = write.mock.calls.filter(([target, value]) => target.endsWith("status.json") && (value as AgentRunRecord).status === "stopped");
+    expect(calls.length).toBeGreaterThan(0);
+    for (const [, , options] of calls) expect(options?.durable).toBe(true);
+  });
+
   it.each(["pending", "empty", "outcome", "live", "link", "unknown"] as const)("R-1 active-manager expiry applies the terminal-tree gate (%s)", async (contents) => {
     let sweep: (() => void) | undefined;
     const interval = globalThis.setInterval;
@@ -311,7 +325,6 @@ describe("AgentManager", () => {
       detachedSweep.mockRestore();
     }
   }, 15_000);
-
   it("F1 tracked retention retries the full failed save before collection, without pinning session or actor runs", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-save-fault-"));
     roots.push(root);
@@ -1591,18 +1604,30 @@ describe("AgentManager", () => {
 
   // review/astra on #26: a failed relaunch is terminal. No fallback launch runs after it, so
   // the saved failure can never mask a later result.
-  it("makes a failed resume relaunch terminal, with no fallback launch", async () => {
+  it.each([false, true])("F20 makes a failed resume relaunch terminal, with no fallback launch (terminal fsync fault: %s)", async fault => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const launch = ProcessTransport.prototype.launch;
-    let launches = 0;
+    let launches = 0, publicationAttempts = 0;
     const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
       launches++;
       if (launches === 2) throw new Error("transient launch failure");
       return launch.call(this, request);
     });
+    const descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    const openSpy = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd;
+    });
+    const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = descriptors.get(fd) ?? "";
+      if (fault && launches === 2 && /status\.json\..*\.tmp$/.test(file) && publicationAttempts++ === 0) {
+        throw new Error("F20 injected pre-rename terminal fsync failure");
+      }
+      sync(fd);
+    });
     try {
-      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
         workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
         runRoot: root,
       });
@@ -1611,8 +1636,12 @@ describe("AgentManager", () => {
       expect(launches).toBe(2);
       expect(result.status).toBe("failed");
       expect(result.error).toContain("relaunch failed: transient launch failure");
+      if (fault) expect(publicationAttempts).toBeGreaterThanOrEqual(2);
+      // Admission was released; this is an explicitly requested new run, not a fallback.
+      expect((await manager.run({ task: "next admitted", transport: "process" })).status).toBe("completed");
+      expect(launches).toBe(3);
     } finally {
-      spy.mockRestore();
+      spy.mockRestore(); syncSpy.mockRestore(); openSpy.mockRestore();
     }
   }, 45_000);
 

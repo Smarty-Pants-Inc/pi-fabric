@@ -20,7 +20,7 @@ import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
 import { resolvePiModel, type PiModelRegistryView } from "../core/model-refresh.js";
@@ -154,8 +154,8 @@ const testResidentRequestDelay = async (stage: "before_commit" | "after_commit")
   if (Number.isInteger(ms) && ms > 0 && ms <= 10_000) await delay(ms);
 };
 
-const atomicWrite = (filePath: string, value: unknown): void => {
-  writeJsonAtomic(filePath, value, { space: 2 });
+const atomicWrite = (filePath: string, value: unknown, durable = true): void => {
+  writeJsonAtomic(filePath, value, { space: 2, durable });
 };
 
 const residentActorRoots = (config: ResidentHostConfig): { project: string; session: string } =>
@@ -249,6 +249,8 @@ export class ResidentHost {
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
+  /** Renamed by this host, but not yet safe to execute. Never replay already executing work. */
+  readonly #unconfirmedPickups = new Set<string>();
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
   readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
@@ -543,7 +545,7 @@ export class ResidentHost {
           handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
           ...(this.launch.attempt ? { attempt: this.launch.attempt } : {}) } : {}),
       };
-      atomicWrite(this.#ownerPath, owner);
+      atomicWrite(this.#ownerPath, owner, false); // Live-host identity; never an authority after reboot.
       fs.rmSync(this.#errorPath, { force: true });
       // Removals a previous host accepted: their runs ended with it.
       if (!this.#staged) {
@@ -801,6 +803,17 @@ export class ResidentHost {
     if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
+      // Retry only pickups this running host renamed but never executed. Startup
+      // recovery handles older processing entries conservatively as indeterminate.
+      for (const entry of [...this.#unconfirmedPickups].slice(0, 32)) {
+        const processing = path.join(this.#processingPath, entry);
+        try {
+          syncPathNamespace(processing);
+          syncPathNamespace(this.#requestsPath);
+        } catch { continue; }
+        this.#unconfirmedPickups.delete(entry);
+        await this.#processRequest(processing);
+      }
       let entries: string[];
       try {
         entries = fs.readdirSync(this.#requestsPath).filter((entry) => entry.endsWith(".json"));
@@ -813,9 +826,13 @@ export class ResidentHost {
         const processing = path.join(this.#processingPath, entry);
         try {
           fs.renameSync(source, processing);
+          this.#unconfirmedPickups.add(entry);
+          syncPathNamespace(processing);
+          syncPathNamespace(path.dirname(source));
         } catch {
           continue;
         }
+        this.#unconfirmedPickups.delete(entry);
         await this.#processRequest(processing);
       }
     } finally {
@@ -1265,7 +1282,7 @@ export class ResidentHost {
   #writeRemovals(): void {
     const removals = this.actors.pendingRemovals();
     if (removals.length === 0) fs.rmSync(this.#removalsPath, { force: true });
-    else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals });
+    else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals }, false); // Registry is authoritative.
   }
 
   #recoverInterruptedRequests(): void {
@@ -1420,7 +1437,7 @@ export const runResidentHostFromConfigPath = async (
         occurredAt: Date.now(),
         launcherPid: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? process.ppid : undefined,
         launcherBirth: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? processStartTime(process.ppid) : undefined,
-      });
+      }, false);
     } catch {
       // Startup diagnostics are best-effort.
     }

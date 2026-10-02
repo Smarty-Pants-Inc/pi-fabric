@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { COMMENT_CUT_REASON, cutsCommentList } from "../core/comment-cut.js";
@@ -38,8 +39,24 @@ export default function replyTool(pi: ExtensionAPI): void {
       if (replied) throw new Error("You already replied; only the first fabric_reply call is delivered.");
       replied = true;
       const temporary = `${replyFile}.${process.pid}.tmp`;
-      fs.writeFileSync(temporary, JSON.stringify(params), { mode: 0o600 });
+      const fd = fs.openSync(temporary, "w", 0o600);
+      try { fs.writeFileSync(fd, JSON.stringify(params)); fs.fsyncSync(fd); }
+      finally { fs.closeSync(fd); }
       fs.renameSync(temporary, replyFile);
+      // A terminal status may now refer to this reply. Persist its published name first.
+      if (process.platform !== "win32") {
+        const synced = new Set<string>();
+        for (const parent of [path.resolve(path.dirname(replyFile)), fs.realpathSync(path.dirname(replyFile))]) {
+          for (let directory = parent; ; directory = path.dirname(directory)) {
+            if (!synced.has(directory)) {
+              const fd = fs.openSync(directory, "r");
+              try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+              synced.add(directory);
+            }
+            if (directory === path.dirname(directory)) break;
+          }
+        }
+      }
       return { content: [{ type: "text", text: "Reply delivered." }], details: {}, terminate: true };
     },
   });

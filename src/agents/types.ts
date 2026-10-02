@@ -193,6 +193,8 @@ export interface AgentRunRecord {
 }
 
 export interface AgentRunResult extends AgentRunRecord {
+  /** Close/recovery handoff only: answer retained, but not yet safe to deliver. */
+  terminalPending?: { statusFile: string; publication: boolean };
   /** Failed admission only: model/auth timed out before any transport launch was attempted.
    * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
   launchPreparationTimeoutMs?: number;

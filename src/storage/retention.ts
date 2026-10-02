@@ -84,7 +84,7 @@ export const hasUnresolvedWorker = (runDirectory: string, depth = 0, expired: De
 };
 export const markUnresolvedWorker = (runDirectory: string, reason: string, details: Record<string, unknown> = {}): void => {
   fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
-  writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details });
+  writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details }, { durable: true });
 };
 /** A terminal external-pane record is not an exit receipt. Share this persistent,
  * tree-wide veto across tracked, recovered and offline cleanup before removing
@@ -110,7 +110,9 @@ export const runTreeExitVeto = (
     const record = readJson<RunRecordSummary>(statusFile);
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (fs.existsSync(statusFile) && !record) return "worker exit is unconfirmed: unreadable run record";
-    if (record?.transport === "tmux" || record?.transport === "screen") {
+    // No durable Herdr exit proof is recorded. In particular, a lost pane may
+    // overwrite status.json after a failed unresolved-marker publication.
+    if (record?.transport === "herdr" || record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
     }
     // A surviving tracked root has its own transport exit evidence. Descendants

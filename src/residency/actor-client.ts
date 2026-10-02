@@ -153,7 +153,7 @@ export class ResidentActorClient {
     fs.mkdirSync(this.#requestsPath, { recursive: true });
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
     try {
-      writeJsonAtomic(path.join(this.#requestsPath, `${command.requestId}.json`), command);
+      writeJsonAtomic(path.join(this.#requestsPath, `${command.requestId}.json`), command, { durable: true });
       const deadline = Date.now() + this.commandTimeoutMs;
       while (Date.now() < deadline) {
         if (signal?.aborted) throw new Error("Resident host actor request was aborted");

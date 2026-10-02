@@ -1,12 +1,24 @@
 import { randomUUID } from "node:crypto";
+import type { AgentFollowUpRunningWarning } from "./agents/types.js";
 import fs from "node:fs";
-import { readFileRetrying, syncPathNamespace, writeFileAtomic } from "./core/atomic-write.js";
+import path from "node:path";
+import { readFileRetrying, writeFileAtomic } from "./core/atomic-write.js";
+import { withConfirmedSessionFile } from "./core/session-receipts.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
 
 const MAIN_AGENT_ALIAS = "main";
+// Pi can report idle while a prompt's preflight still runs. Sending a followUp then puts it
+// in Pi's native queue, behind later followUps flushed as steers by this drain (#754).
+// Older hosts do not expose this optional capability.
+const promptPending = (ctx: ExtensionContext): boolean =>
+  "isPromptPending" in ctx && typeof ctx.isPromptPending === "function" && ctx.isPromptPending() === true;
+
+/** Mirror Pi's operation cancellation test: its native deadline is a recoverable failure. */
+const isCompactionCancelled = (signal: AbortSignal | undefined): boolean =>
+  signal?.aborted === true && !(signal.reason instanceof DOMException && signal.reason.name === "TimeoutError");
 export type FabricAgentMessageDelivery = "steer" | "followUp";
 /** How a direct agent message goes to Pi: a nextTurn one waits for the next user prompt. */
 export type FabricMainAgentDelivery = FabricAgentMessageDelivery | "nextTurn";
@@ -54,6 +66,8 @@ export interface FabricFollowUpQueueDepth {
 }
 
 export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDepth> {
+  /** Sender-only observation at task admission; delivery is unchanged. */
+  warning?: AgentFollowUpRunningWarning;
   /** Advisory identifier provenance notice; appended to delivered text when admission permits. */
   notice?: string;
   queued: true;
@@ -225,6 +239,13 @@ type SessionEntryLike = { id?: unknown; parentId?: unknown; type?: string; custo
 const CONSUMED_DELIVERIES_MAX = 2000;
 const deliveryKey = (deliveryId: string): string => `delivery:${deliveryId}`;
 
+// Owner authority must outlive a controller AND a reloaded module generation when storage
+// rejects its write. Keep only uncommitted stops, scoped to the absolute index path; a
+// confirmed durable write removes them. This is a live-reload handoff, not a disk receipt.
+const PENDING_HALTS = Symbol.for("pi-fabric.main.pending-halts.v1");
+const pendingHalts = (): Map<string, { warned: boolean }> =>
+  ((globalThis as Record<symbol, unknown>)[PENDING_HALTS] ??= new Map<string, { warned: boolean }>()) as Map<string, { warned: boolean }>;
+
 /** Add the followUp ids a persisted agent-message entry carries. */
 const addDelivered = (ids: Set<string>, entry: SessionEntryLike | undefined): void => {
   if (entry?.type !== "custom_message" || entry.customType !== "pi-fabric-agent-message") return;
@@ -288,7 +309,9 @@ export class MainAgentController implements FabricMainAgentTarget {
   #closed = false;
   #reloading = false;
   #wake: ReturnType<typeof setInterval> | undefined;
+  #preflightWake: ReturnType<typeof setInterval> | undefined;
   #operation: AbortSignal | undefined;
+  #offOperationAbort: (() => void) | undefined;
   // Keep the veto signal through both settlement notifications, including late owner aborts.
   #compactionDecline: AbortSignal | undefined;
 
@@ -372,6 +395,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#halted = true;
     this.#providerReleaseUntil = undefined;
     this.#consumedDirty = true;
+    const index = this.#consumedPath();
+    if (index && !pendingHalts().has(index)) pendingHalts().set(index, { warned: false });
     this.#stopWake();
     this.#trySave();
   }
@@ -401,6 +426,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(request.data === undefined ? {} : { data: serializableData(request.data) }),
       ...(deliveryId === undefined ? {} : { deliveryId }),
     };
+    // Retry required owner authority at the next delivery, even without a durable delivery id.
+    this.#retryPendingHalt();
     const triggerTurn = (request.triggerTurn ?? true) && !this.#halted;
     const providerHeld = triggerTurn && request.delivery !== "nextTurn" &&
       !this.#context?.signal?.aborted && (this.#providerBackoffActive() || this.#providerAttemptInFlight);
@@ -469,11 +496,13 @@ export class MainAgentController implements FabricMainAgentTarget {
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
       if (providerHeld) this.#scheduleProviderWake();
+      else if (this.#context && promptPending(this.#context)) this.#wakeAfterPreflight();
       else if (this.#context?.isIdle()) {
         const canTrigger = !this.#halted && !this.#providerBackoffActive() && !this.#context?.signal?.aborted;
         this.#release(true);
         triggered = canTrigger && this.#sent.includes(item);
       }
+
     } else if (deliveryId !== undefined) {
       // A sent message may wait in Pi's volatile queue (prompt preflight, a settle): it stays in
       // the journal until the session holds it, and a restart replays it (#confirm, #replay).
@@ -599,24 +628,40 @@ export class MainAgentController implements FabricMainAgentTarget {
     return this.#journal ? `${this.#journal}.delivered` : undefined;
   }
 
+  #saveIndex(): void {
+    const file = this.#consumedPath();
+    if (!file || !this.#consumedDirty || this.#haltIndexUnknown) return;
+    writeFileAtomic(file, JSON.stringify({ version: 1, ids: [...this.#consumed], ...(this.#halted ? { halted: true } : {}) }), { durable: true });
+    this.#consumedDirty = false;
+    pendingHalts().delete(file); // Only the completed durability barriers commit authority.
+  }
+
   /** Write the held and unconfirmed followUps (0600), or remove the journal when none are left. */
   #save(): void {
     if (!this.#journal) return;
-    if (this.#consumedDirty && !this.#haltIndexUnknown) {
-      // Before the journal: an item leaves the journal only once its id is recorded as consumed.
-      const file = this.#consumedPath()!;
-      writeFileAtomic(file, JSON.stringify({ version: 1, ids: [...this.#consumed], ...(this.#halted ? { halted: true } : {}) }), { durable: true });
-      this.#consumedDirty = false;
-    }
+    // Before the journal: an item leaves the journal only once its id is recorded as consumed.
+    this.#saveIndex();
     const items = [...this.#unverified, ...this.#sent, ...this.#held];
     if (!items.length) { fs.rmSync(this.#journal, { force: true }); return; }
     writeFileAtomic(this.#journal, JSON.stringify({ version: 1, items }), { durable: true });
   }
 
-  #trySave(): void {
-    try { this.#save(); } catch {
-      // The previous journal still lists every item; the next change writes it again.
+  #trySave(indexOnly = false): void {
+    try { indexOnly ? this.#saveIndex() : this.#save(); } catch (error) {
+      // Delivery bookkeeping can retry on its next change, but an owner stop is required
+      // authority. Its dirty handoff stays live until a save succeeds, with one notice.
+      const pending = pendingHalts().get(this.#consumedPath()!);
+      if (pending && !pending.warned) {
+        pending.warned = true;
+        const message = `Cannot persist Main halt index ${this.#consumedPath()}; keeping Main halted across reload and retrying at the next opportunity`;
+        console.warn(`[pi-fabric] ${message}`, error);
+        try { if (this.#context?.hasUI) this.#context.ui.notify(message, "warning"); } catch { /* diagnostics must not lift the stop */ }
+      }
     }
+  }
+
+  #retryPendingHalt(): void {
+    if (this.#consumedDirty && pendingHalts().has(this.#consumedPath()!)) this.#trySave(true);
   }
 
   /**
@@ -660,24 +705,9 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Read the complete lines appended to the session file since the last call, in 1 MiB chunks. */
   #indexSessionFile(file: string): void {
-    let fd: number;
-    try {
-      // ponytail: Windows' FlushFileBuffers (fsyncSync) needs a writable handle; this code never writes through it.
-      fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      this.#restartIndex(file);    // not written (or removed): no cached persisted receipt
-      return;
-    }
-    try {
-      const stat = fs.fstatSync(fd);
+    if (!withConfirmedSessionFile(file, (fd, stat) => {
       const size = stat.size;
       const identity = `${stat.dev}:${stat.ino}`;
-      fs.fsyncSync(fd);
-      // Bind every namespace hop (including hidden link targets) to the opened
-      // receipt inode, and recheck the walk after ALL required barriers. Any
-      // uncertain hop retains the journal/source and propagates duplicate retries.
-      syncPathNamespace(file, stat);
       if (this.#source !== file || this.#scanned === undefined || size < this.#scanned || this.#sessionFileIdentity !== identity) {
         this.#restartIndex(file);
       }
@@ -704,9 +734,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         // A partial last line is read again next time, once it is complete.
         this.#scanned = position - carry.reduce((sum, part) => sum + part.length, 0);
       }
-    } finally {
-      fs.closeSync(fd);
-    }
+    })) this.#restartIndex(file); // Not written (or removed): no cached persisted receipt.
   }
 
   /** The followUp ids in Pi's in-memory entry list, persisted or not. */
@@ -755,6 +783,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Drop the handed-over followUps the session now holds (the only way one leaves the journal). */
   #confirm(): void {
+    this.#retryPendingHalt();
     if (!this.#sent.length) return;
     const delivered = this.#refreshDelivered();
     const before = this.#sent.length;
@@ -767,6 +796,12 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** After a restart: every journalled followUp the session does not hold goes back in the queue. */
   #replay(): void {
     if (!this.#journal) return;
+    // A readable running index can be stale after a rejected stop write. The live handoff
+    // overrides it before any replay/control can trigger, and remains dirty for a retry.
+    if (pendingHalts().has(this.#consumedPath()!)) {
+      this.#halted = true;
+      this.#consumedDirty = true;
+    }
     try {
       const parsed = JSON.parse(readFileRetrying(this.#consumedPath()!)) as { version?: unknown; ids?: unknown; halted?: unknown } | null;
       if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.ids) ||
@@ -813,6 +848,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         }
       }
     } catch {
+      this.#retryPendingHalt();                          // owner state survives an empty journal
       return;                                            // no journal
     }
     // The owner rule (dev-lead on pi-fabric#102): skip every id the session holds; a handoff
@@ -856,7 +892,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#halted = false;
     this.#recoverProvider();
     this.#haltIndexUnknown = false;
-    this.#journal = journal;
+    this.#journal = journal === undefined ? undefined : path.resolve(journal);
     const on = (name: string, fn: (event: any, ctx: ExtensionContext) => unknown): void => {
       if (typeof this.pi.on !== "function") return;
       const off = (this.pi.on as (name: string, fn: (event: any, ctx: ExtensionContext) => unknown) => unknown)(name, fn);
@@ -882,7 +918,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       else if (reason !== undefined) { this.#recoverProvider(); this.#suspended = false; }
     });
     const settleGate = (event: { outcome?: string }, ctx: ExtensionContext): void => {
-      if (ctx.signal?.aborted || this.#compactionDecline?.aborted ||
+      if (ctx.signal?.aborted || isCompactionCancelled(this.#compactionDecline) ||
         (event.outcome === "aborted" && !this.#compactionDecline)) this.halt();
       else if (event.outcome === "error") this.#recordProviderFailure();
       else if (event.outcome === "completed") this.#recoverProvider();
@@ -893,17 +929,29 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Observe the operation in BOTH drain modes. Pi also reports an extension's benign
     // decline as aborted, but only the operation signal proves an owner cancellation.
     on("session_before_compact", (event: { reason?: string; signal?: AbortSignal }) => {
+      this.#stopOperation();
       this.#operation = event.signal;
       this.#compactionDecline = undefined;
+      // Native manual cancellation is owner intent even when Pi has already emitted
+      // session_compact and is awaiting later handlers (some hosts emit no late failure).
+      // Pi uses the same controller for its deadline, which is NOT owner intent.
+      if (event.reason === "manual" && event.signal) {
+        const signal = event.signal;
+        const cancelled = () => { if (isCompactionCancelled(signal)) this.halt(); };
+        signal.addEventListener("abort", cancelled, { once: true });
+        this.#offOperationAbort = () => signal.removeEventListener("abort", cancelled);
+        if (signal.aborted) cancelled();
+      }
     });
     on("session_compact_failed", (event: { reason?: string; aborted?: boolean; willRetry?: boolean; errorMessage?: string }, ctx) => {
       this.#context = ctx;
       // The aborted bit alone is ambiguous: an earlier handler may decline and stop
       // dispatch before we see the signal. Escape/halt is explicit; a seen signal
-      // proves cancellation. Never manufacture durable owner intent from a decline.
+      // proves cancellation unless the native deadline expired. Never manufacture
+      // durable owner intent from a decline or recoverable operation timeout.
       const decline = takeCompactionDecline(this.pi);
       const operation = decline && decline.reason === event.reason ? decline.signal : this.#operation;
-      const ownerCancelled = ctx.signal?.aborted || (event.aborted && operation?.aborted);
+      const ownerCancelled = ctx.signal?.aborted || (event.aborted && isCompactionCancelled(operation));
       // Exact Pi no-op outcomes, with or without the host's error envelope. A provider
       // error merely quoting these phrases is still a recoverable failure, not a no-op.
       const message = event.errorMessage?.replace(/^Compaction failed: /, "");
@@ -921,7 +969,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       // Later peer deliveries retain permission after a veto; errors await recovery,
       // but only a real owner stop survives reload.
       if (event.reason === "manual" && ctx.isIdle()) this.#release(false);
-      this.#operation = undefined;
+      this.#stopOperation();
     });
     on("session_compact", (event: { reason?: string }, ctx) => {
       this.#context = ctx;
@@ -930,11 +978,13 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#providerRetryAt = 0;
       this.#stopProviderWake();
       this.#compactionDecline = undefined;
+      // Retain the signal through EVERY completion handler, in both drain modes.
       if (event.reason === "manual") this.#wakeWhenIdle();
-      else this.#operation = undefined;
+      else this.#stopOperation();
     });
     on("agent_start", () => {
       this.#compactionDecline = undefined;
+      this.#stopOperation();
       this.#providerFailureRecorded = false;
       this.#stopProviderWake();
     });
@@ -992,7 +1042,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     // leaves them to that run's boundaries.
     // The operation's own abort signal says whether the user cancelled it: Pi can report that
     // cancel after Main is idle again, or not at all (review/astra on pi-fabric#102).
-    on("session_before_tree", (event: { signal?: AbortSignal }) => { this.#operation = event.signal; });
+    on("session_before_tree", (event: { signal?: AbortSignal }) => { this.#stopOperation(); this.#operation = event.signal; });
     // A branch summary on /tree navigation is the same: busy without a run. A cancelled one
     // emits nothing, so its followUps wait for the next run.
     on("session_tree", (_event, ctx) => {
@@ -1025,7 +1075,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#journal = undefined;
     this.#context = undefined;
     this.#providerReleaseUntil = undefined;
-    this.#operation = undefined;
+    this.#stopOperation();
     this.#compactionDecline = undefined;
     takeCompactionDecline(this.pi);
   }
@@ -1033,7 +1083,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   #drainActive(): boolean {
     return this.#context !== undefined &&
       ((this.#providerReleaseUntil !== undefined && this.#held.length > 0) ||
-        (!this.#closed && (this.#held.length > 0 || this.#context.isIdle() === false)));
+        (!this.#closed && (this.#held.length > 0 || this.#context.isIdle() === false || promptPending(this.#context))));
+
   }
 
   /**
@@ -1131,13 +1182,42 @@ export class MainAgentController implements FabricMainAgentTarget {
     const operation = this.#operation;
     // Retain cancellation evidence while later completion handlers still run.
     this.#wake = setInterval(() => {
-      if (!this.#context || !operation || operation.aborted) this.#stopWake();
-      else if (this.#context?.isIdle()) {
-        if (this.#operation === operation) this.#operation = undefined;
+      // Drain-off uses #closed to stop holding, not to end a manual operation. Close
+      // itself cancels this timer; only the real idle boundary retires its signal.
+      if (!this.#context || !operation || operation.aborted) {
+        if (this.#operation === operation) this.#stopOperation();
+        this.#stopWake();
+      } else if (this.#context?.isIdle()) {
+        if (this.#operation === operation) this.#stopOperation();
         this.#held.length ? this.#release(true) : this.#stopWake();
       }
     }, 25);
     this.#wake.unref?.();
+  }
+
+  #wakeAfterPreflight(): void {
+    // Handled input and failed validation clear isPromptPending without any run/settle
+    // event. Observe that completion only after admission is journalled. If a run starts,
+    // leave FIFO delivery to its boundaries; halt/reload/close cancel this waiter too.
+    if (this.#preflightWake) return;
+    this.#preflightWake = setInterval(() => {
+      const ctx = this.#context;
+      // A no-run preflight may also leave an async compaction handler finishing. Busy
+      // alone is not proof of agent_start; that event explicitly cancels this waiter.
+      if (ctx && (promptPending(ctx) || !ctx.isIdle())) return;
+      if (ctx) this.#release(true); // #send retains owner/provider vetoes.
+      else this.#stopWake();
+    }, 25);
+    this.#preflightWake.unref?.();
+  }
+
+  #stopOperation(): void {
+    // Retiring a compaction signal must not cancel a scheduled provider retry.
+    if (this.#wake) clearInterval(this.#wake);
+    this.#wake = undefined;
+    this.#offOperationAbort?.();
+    this.#offOperationAbort = undefined;
+    this.#operation = undefined;
   }
 
   #providerBackoffActive(): boolean {
@@ -1185,16 +1265,24 @@ export class MainAgentController implements FabricMainAgentTarget {
   #stopProviderWake(): void {
     if (this.#providerWake) clearTimeout(this.#providerWake);
     this.#providerWake = undefined;
+
   }
 
   #stopWake(): void {
     if (this.#wake) clearInterval(this.#wake);
+    if (this.#preflightWake) clearInterval(this.#preflightWake);
     this.#wake = undefined;
+    this.#preflightWake = undefined;
     this.#stopProviderWake();
+
   }
 
   #release(triggerTurn: boolean, closing = false): void {
     if (this.#reloading) return;
+    if (!closing && this.#context && promptPending(this.#context)) {
+      this.#wakeAfterPreflight();
+      return;
+    }
     if (!closing && this.#providerAttemptInFlight && !this.#halted && !this.#context?.signal?.aborted) return;
     // An error settle must not downgrade a held wake into passive Pi context forever.
     if (!closing && this.#providerFailed && !this.#halted && !this.#context?.signal?.aborted &&

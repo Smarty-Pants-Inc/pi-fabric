@@ -216,7 +216,8 @@ describe("native Pi runner session attribution", () => {
     });
     const frames = fs.readFileSync(path.join(runDirectory, "events.jsonl"), "utf8").trim().split("\n");
     const argv = JSON.parse(frames.find(line => line.includes("fake_session_argv"))!).argv as string[];
-    expect(argv).toContain("--no-session");
+    expect(argv).not.toContain("--no-session");
+    expect(argv[argv.indexOf("--session") + 1]).toBe(path.join(runDirectory, "session.jsonl"));
     expect(argv.some(arg => arg.endsWith(path.join("worker", "session-id.ts")))).toBe(true);
   }, 15_000);
 

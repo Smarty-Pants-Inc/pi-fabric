@@ -8,6 +8,7 @@ const lock = path.join(root, ".lock");
 const ownerPath = path.join(lock, "owner");
 const write = fs.writeFileSync.bind(fs);
 const rename = fs.renameSync.bind(fs);
+const rmdir = fs.rmdirSync.bind(fs);
 const timer = globalThis.setTimeout;
 const wait = (file) => {
   const deadline = Date.now() + 10_000;
@@ -36,6 +37,10 @@ if (role === "initializer") {
     write(path.join(root, "recoverer.ready"), JSON.stringify({ boundary }));
     wait(path.join(root, "recoverer.go"));
   };
+  fs.rmdirSync = (file, options) => {
+    if (armed && String(file) === lock) pause("last-comparison-before-detach");
+    return rmdir(file, options);
+  };
   fs.renameSync = (from, to) => {
     if (armed && String(from) === lock && String(to).startsWith(`${lock}.dead.`)) {
       // Baseline: every owner/inode comparison has finished. Pause the ACTUAL detach,
@@ -46,8 +51,8 @@ if (role === "initializer") {
   };
   globalThis.setTimeout = (...args) => {
     if (armed) {
-      // Fixed policy has no ownerless detach boundary: pause its first denied retry
-      // instead, after recovery returned false, so the same initializer-first order runs.
+      // An opened (empty/torn) owner file fails closed before removal. Pause that
+      // denied retry so both phases exercise the same initializer-first order.
       pause("refused-before-detach");
       const now = Date.now.bind(Date);
       Date.now = () => now() + 5_001;

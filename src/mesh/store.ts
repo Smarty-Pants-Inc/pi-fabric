@@ -77,7 +77,7 @@ export interface MeshStoreOptions {
   maxStateBytes?: number;
   maxStateTombstones?: number;
   lockTimeoutMs?: number;
-  /** @deprecated Retained for source compatibility; age alone never authorizes recovery. */
+  /** Grace for an empty ownerless directory; recorded live owners never expire. Default 30 s. */
   staleLockMs?: number;
   /**
    * Reads (get, list, listAll) reuse the last parsed state for up to this long, even when
@@ -91,6 +91,7 @@ export interface MeshStoreOptions {
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
 const LOCK_TIMEOUT_MS = 10_000;
+const STALE_LOCK_MS = 30_000;
 const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
@@ -518,6 +519,7 @@ export class MeshStore {
   readonly #maxStateBytes: number;
   readonly #maxStateTombstones: number;
   readonly #lockTimeoutMs: number;
+  readonly #staleLockMs: number;
   readonly #readCacheMs: number;
   /**
    * Line ends (sequence, offset) that recent read({ after }) scans passed, by rising sequence. A
@@ -571,6 +573,7 @@ export class MeshStore {
       Math.floor(options.maxStateTombstones ?? DEFAULT_MAX_STATE_TOMBSTONES),
     );
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
+    this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
     this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   }
@@ -1653,10 +1656,10 @@ export class MeshStore {
     }
   }
 
-  // Recover only a complete receipt whose recorded holder is proven dead (or whose
-  // native incarnation is proven different). Missing/torn/corrupt receipts fail closed,
-  // regardless of age: a paused v1 initializer can still publish and enter after our
-  // last comparison. Both protocols may encounter such a canonical v1 directory.
+  // Complete dead/different-incarnation receipts recover immediately. Empty ownerless
+  // directories recover only after the grace, using atomic rmdir (never recursive removal
+  // or rename): an owner published after our last comparison makes rmdir fail closed.
+  // Torn/corrupt receipts and nonempty unrecorded directories remain protected.
   async #clearStaleLock(ownerPath: string): Promise<boolean> {
     try {
       const stat = fs.lstatSync(this.#lockPath);
@@ -1666,7 +1669,23 @@ export class MeshStore {
         catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
       };
       const owner = readOwner();
-      const fields = owner?.split("\n") ?? [];
+      if (owner === undefined) {
+        if (Date.now() - stat.mtimeMs <= this.#staleLockMs) return false;
+        const current = fs.lstatSync(this.#lockPath);
+        if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino ||
+          current.mtimeMs !== stat.mtimeMs || readOwner() !== undefined) return false;
+        // Native emptiness is the final fence, including against an initializer that
+        // publishes and enters while this recoverer is paused at the removal syscall.
+        fs.rmdirSync(this.#lockPath);
+        // Retain a nonempty recovery receipt, without ever renaming a live canonical.
+        // Inode reuse may revisit the same receipt; that must not undo successful recovery.
+        const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:`).digest("hex")}`;
+        fs.mkdirSync(fence, { recursive: true, mode: 0o700 });
+        try { fs.writeFileSync(path.join(fence, ".recovery-fence"), "1\n", { flag: "wx", mode: 0o600 }); }
+        catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
+        return true;
+      }
+      const fields = owner.split("\n");
       const [token, pidText, createdText, startText] = fields;
       // An in-flight/torn fourth line is not evidence of PID reuse.
       const recordedStart = owner?.endsWith("\n") ? startText : undefined;
@@ -1686,7 +1705,7 @@ export class MeshStore {
         return current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino && readOwner() === owner;
       };
       if (!unchanged()) return false;
-      const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner ?? ""}`).digest("hex")}`;
+      const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
       // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner
       // cannot rename a successor over the same fence (native EEXIST/ENOTEMPTY). Deleting
       // it, or recursively deleting the canonical name after a re-read, reopens that race.

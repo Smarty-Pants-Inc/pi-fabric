@@ -551,14 +551,15 @@ replaced aborts with `FABRIC_MESH_LOCK_OWNERSHIP_LOST` rather than overwriting a
 Protocol 2 uses fully initialized private-directory publication. Both require the complete
 owner record to match and detach the owned directory before recursive release. Recovery
 requires a complete recorded owner and proof that its PID is absent (native `ESRCH`), or
-that its native incarnation differs. Missing, empty, torn and corrupt receipts fail closed
-regardless of directory age: a paused v1 initializer can still publish and enter after a
-recoverer's last comparison. The source-level `staleLockMs` option is retained for
-compatibility but no longer authorizes recovery. An unrecorded orphan therefore needs a
-trusted repair after all possible writers/cleaners are fenced out; ordinary contention
-returns `FABRIC_MESH_LOCK_TIMEOUT`, never age-based deletion. Immediate proven-dead-holder
-recovery, retained recovery fences and bounded jitter/backoff remain. These safeguards do
-not repair old B68 binaries still running on the root. There is no environment fallback,
+that its native incarnation differs. An empty directory with no owner record is stale
+strictly after the 30-second grace (source-level `staleLockMs`). Recovery uses atomic
+empty-directory removal, not rename or recursive deletion: an initializer that publishes
+an owner before removal prevents it, even if the recoverer paused after its last check.
+Fresh ownerless directories, empty/torn/corrupt owner files and nonempty unrecorded
+directories fail closed; recorded live owners never expire. Unrecoverable unrecorded
+orphans need trusted repair after all possible writers/cleaners are fenced out. Immediate
+proven-dead-holder recovery, retained recovery receipts and bounded jitter/backoff remain.
+These safeguards do not repair old B68 binaries still running on the root. There is no environment fallback,
 runtime marker, transition guard or hot reload for this selector.
 
 Keep `1` for compatibility with B68 writers. Protocol 2 activation is deferred to the

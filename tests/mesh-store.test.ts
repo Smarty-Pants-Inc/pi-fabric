@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -649,7 +650,7 @@ describe("MeshStore lock recovery", () => {
       expect(fs.existsSync(lock), recoverer.output().stdout).toBe(true);
       expect(fs.readFileSync(ownerPath, "utf8")).toBe(held.owner);
       expect([fs.lstatSync(lock).dev, fs.lstatSync(lock).ino]).toEqual([held.dev, held.ino]);
-      expect(JSON.parse(recoverer.output().stdout.trim())).toMatchObject({ ran: false, timeout: true, boundary: "refused-before-detach" });
+      expect(JSON.parse(recoverer.output().stdout.trim())).toMatchObject({ ran: false, timeout: true, boundary: phase === "write" ? "last-comparison-before-detach" : "refused-before-detach" });
       expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."))).toEqual([]);
     } finally {
       signal("initializer.go");
@@ -689,8 +690,8 @@ describe("MeshStore lock recovery", () => {
         fs.writeFileSync(path.join(lock, "legacy-leftover"), "orphan\n");
         const past = new Date(Date.now() - 30_001);
         fs.utimesSync(lock, past, past);
-        // No recorded owner proves that this paused initializer cannot resume.
-        // Production must now refuse the old age-only recovery in BOTH protocols.
+        // This unrecorded directory is nonempty (or has an opened/torn owner).
+        // Atomic empty-directory recovery must refuse it in BOTH protocols.
         await expect(store.exclusive(() => { throw new Error("must not recover an unrecorded initializer"); }))
           .rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
         expect(fs.existsSync(lock)).toBe(true);
@@ -1113,10 +1114,10 @@ describe("MeshStore lock recovery", () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  it.each([1, 2] as const)("fails closed on old ownerless/torn/corrupt receipts (protocol %s), even with a dead-looking partial PID", async (lockProtocol) => {
+  it.each([1, 2] as const)("fails closed on old torn/corrupt receipts (protocol %s), even with a dead-looking partial PID", async (lockProtocol) => {
     vi.useFakeTimers({ now: 1_000_000 });
     const store = createStore({ lockProtocol, lockTimeoutMs: 100, staleLockMs: 100 });
-    const receipts = [undefined, "", "not-a-valid-owner", "writing\n999999999", "writing\n999999999\n",
+    const receipts = ["", "not-a-valid-owner", "writing\n999999999", "writing\n999999999\n",
       "writing\n999999999\n100", "writing\n999999999\ninvalid-time\n", "writing\n999999999\n100\nextra\nextra\n"];
     for (const owner of receipts) {
       const lock = holdLock(store, owner);
@@ -1130,11 +1131,50 @@ describe("MeshStore lock recovery", () => {
       expect(operation).not.toHaveBeenCalled();
       const after = fs.lstatSync(lock);
       expect([after.dev, after.ino, after.mtimeMs]).toEqual([before.dev, before.ino, before.mtimeMs]);
-      expect(fs.readdirSync(lock)).toEqual(owner === undefined ? [] : ["owner"]);
-      if (owner !== undefined) expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+      expect(fs.readdirSync(lock)).toEqual(["owner"]);
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
       expect(fs.readdirSync(store.root).some(name => name.startsWith(".lock.dead."))).toBe(false);
       fs.rmSync(lock, { recursive: true });
     }
+  });
+
+  it.each([1, 2] as const)("recovers an empty ownerless lock strictly after its grace (protocol %s)", async (lockProtocol) => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockProtocol, lockTimeoutMs: 100, staleLockMs: 100 });
+    const lock = holdLock(store);
+    const created = new Date(Date.now());
+    fs.utimesSync(lock, created, created);
+    const operation = vi.fn();
+    const pending = store.exclusive(operation).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await pending).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.readdirSync(lock)).toEqual([]);
+    expect(fs.readdirSync(store.root).some(name => name.startsWith(".lock.dead."))).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await store.exclusive(operation);
+    expect(operation).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(lock)).toBe(false);
+    const fences = fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."));
+    expect(fences).toHaveLength(1);
+    expect(fs.readFileSync(path.join(store.root, fences[0]!, ".recovery-fence"), "utf8")).toBe("1\n");
+  });
+
+  it.each([1, 2] as const)("reuses a retained ownerless recovery receipt after inode reuse (protocol %s)", async (lockProtocol) => {
+    const store = createStore({ lockProtocol, lockTimeoutMs: 100 });
+    const lock = holdLock(store);
+    const past = new Date(Date.now() - 60_000);
+    fs.utimesSync(lock, past, past);
+    const stat = fs.lstatSync(lock);
+    const fence = `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:`).digest("hex")}`;
+    fs.mkdirSync(fence);
+    fs.writeFileSync(path.join(fence, ".recovery-fence"), "1\n");
+    const operation = vi.fn();
+    await store.exclusive(operation);
+    expect(operation).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."))).toHaveLength(1);
+    expect(fs.readFileSync(path.join(fence, ".recovery-fence"), "utf8")).toBe("1\n");
   });
 
   it("never sweeps a lock owned by a live process and times out instead", async () => {

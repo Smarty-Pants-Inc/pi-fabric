@@ -103,10 +103,11 @@ import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-no
 
 export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "./agents-progress.js";
 
+// Keep launch/default selection separate from authoritative effective or observed model.
 // Resolution provenance belongs in action results even when no activity sink is installed.
-const modelResolutionMetadata = (selection: { model?: unknown; via?: unknown }): { model?: string; via?: string } =>
+const modelResolutionMetadata = (selection: { model?: unknown; via?: unknown }): { selectedModel?: string; via?: string } =>
   typeof selection.model === "string" && typeof selection.via === "string"
-    ? { model: selection.model, via: selection.via } : {};
+    ? { selectedModel: selection.model, via: selection.via } : {};
 
 const REMOTE_ASK_ACK_GRACE_MS = 30_000;
 const MAX_ACTIVITY_CWD_CHARS = 240;
@@ -655,6 +656,7 @@ export class AgentsProvider implements FabricProvider {
       { ...args, model },
       context,
       "pi",
+      false,
     );
     delete handoffArgs.cwd;
     const request = runRequest({ ...handoffArgs, runner: "pi" }, context, this.manager);
@@ -687,6 +689,8 @@ export class AgentsProvider implements FabricProvider {
           model,
         },
         context,
+        "pi",
+        false,
       ),
       context,
       this.manager,

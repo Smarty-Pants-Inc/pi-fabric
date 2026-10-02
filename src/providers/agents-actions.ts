@@ -156,8 +156,8 @@ const handoffSchema = {
     kernel: runProperties.kernel,
     transport: runProperties.transport,
     model: {
-      ...runProperties.model,
-      description: "Explicit Pi provider/id target that will continue the inherited trajectory",
+      ...strictModelProperty,
+      description: "Explicit Pi exact provider/id, model id, or configured alias target that will continue the inherited trajectory. Closest-match selectors are refused with candidate keys.",
     },
     thinking: runProperties.thinking,
     tools: runProperties.tools,

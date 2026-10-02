@@ -193,6 +193,10 @@ export interface AgentRunRecord {
 }
 
 export interface AgentRunResult extends AgentRunRecord {
+  /** Resolution marker in agents.run results; does not replace the observed model. */
+  via?: string;
+  /** Canonical launch selection when via is present; may differ from the observed model. */
+  selectedModel?: string;
   /** Failed admission only: model/auth timed out before any transport launch was attempted.
    * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
   launchPreparationTimeoutMs?: number;

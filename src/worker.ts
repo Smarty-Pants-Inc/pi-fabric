@@ -421,6 +421,15 @@ const main = async (): Promise<void> => {
     if (!fs.existsSync(hookPath)) throw new Error("Actor bash timeout hook is missing");
     piArguments.push("-e", hookPath);
   }
+  if (options.runner === "pi" && options.routeHeader) {
+    const hookPath = fileURLToPath(new URL(
+      import.meta.url.endsWith(".ts") ? "./guards/model-route-hook.ts" : "./guards/model-route-hook.js",
+      import.meta.url,
+    ));
+    if (!fs.existsSync(hookPath)) throw new Error("Model route header hook is missing");
+    // Explicit -e is loaded even with --no-extensions: attribution is not optional.
+    piArguments.push("-e", hookPath);
+  }
   const piTools = replyTool ? [...options.tools, "fabric_reply"] : options.tools;
   if (piTools.length > 0) piArguments.push("--tools", piTools.join(","));
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
@@ -479,6 +488,9 @@ const main = async (): Promise<void> => {
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
   const childEnvironment = options.actorName ? { ...process.env } : taskAgentEnvironment();
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
+  // A nested explicit-model task must never inherit its parent's route attribution.
+  delete childEnvironment.PI_FABRIC_ROUTE_HEADER;
+  if (options.routeHeader) childEnvironment.PI_FABRIC_ROUTE_HEADER = options.routeHeader;
   if (options.actorId && options.bashTimeoutSeconds !== undefined &&
     Number.isInteger(options.bashTimeoutSeconds) && options.bashTimeoutSeconds >= 0) {
     childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S = String(options.bashTimeoutSeconds);
@@ -660,6 +672,10 @@ const main = async (): Promise<void> => {
       if (["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(effectiveThinking ?? "")) {
         record.thinking = effectiveThinking as NonNullable<AgentRunRecord["thinking"]>;
       }
+      if (options.routeHeader) {
+        if (record.model) record.admittedModel = record.model;
+        if (record.thinking) record.admittedThinking = record.thinking;
+      }
       update();
       // The launcher authorizes this harmless isolated startup test. Exercise
       // the real worker/Pi/model/extension path, but never prompt a business actor
@@ -687,7 +703,7 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
-  }, activationWindow, options.residentStartupProbe === true);
+  }, activationWindow, options.residentStartupProbe === true, Boolean(options.routeHeader));
 
   // Attributed token telemetry. Every usage-bearing child event emits one
   // tokens.usage lifecycle entry identified by this run/actor/runner/depth.

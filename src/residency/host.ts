@@ -436,6 +436,7 @@ export class ResidentHost {
             actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd)),
           ),
           message.source === "fabric-host" ? undefined : message.principal,
+          message.source === "fabric-host" ? "fabric-host" : "actor-output",
         ));
       },
       {
@@ -657,7 +658,8 @@ export class ResidentHost {
       const result = command.operation === "steer"
         ? this.agents.steer(command.targetId, message, command.data, provenance)
         : this.agents.followUp(command.targetId, message, command.data, provenance);
-      return { accepted: true, messageId: result.messageId };
+      return { accepted: true, messageId: result.messageId,
+        ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
         return { accepted: false, error: errorMessage(error) };
@@ -738,6 +740,7 @@ export class ResidentHost {
     agentCompletionId?: string,
     rootId = this.config.rootId,
     principal?: FabricPrincipal,
+    source?: ResidentDeliveryRecord["source"],
   ): Promise<void> {
     const id = randomUUID();
     const record: ResidentDeliveryRecord = {
@@ -745,6 +748,7 @@ export class ResidentHost {
       id,
       rootId,
       from,
+      ...(source ? { source } : {}),
       ...(principal ? { principal } : {}),
       delivery,
       triggerTurn,

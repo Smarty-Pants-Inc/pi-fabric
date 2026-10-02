@@ -10,14 +10,17 @@ const result = (id: string, extra: Partial<AgentRunResult> = {}): AgentRunResult
   task: "work", runner: "pi", transport: "process", cwd: ".", updatedAt: 2, turns: 1, toolCalls: 0,
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, ...extra,
 });
-const harness = () => {
+const harness = (capable = false) => {
   let idle = false;
   let pending = false;
   const handlers = new Map<string, Handler>();
   const sendMessage = vi.fn();
   const notify = vi.fn();
-  const context = { hasUI: true, ui: { notify }, isIdle: () => idle, hasPendingMessages: () => pending } as unknown as ExtensionContext;
+  const context = { hasUI: true, ui: { notify }, isIdle: () => idle, hasPendingMessages: () => pending,
+    sessionManager: { getSessionId: () => "receiving-main" },
+  } as unknown as ExtensionContext;
   const pi = {
+    ...(capable ? { hostCapabilities: { turnProvenance: 1 } } : {}),
     on: (name: string, handler: Handler) => {
       handlers.set(name, handler);
       return () => handlers.delete(name);
@@ -41,6 +44,36 @@ afterEach(() => {
 });
 
 describe("AgentCompletionInbox", () => {
+  it.each(["boundary", "idle", "prompt"] as const)("capable %s delivery attributes each result to its originating child, not Main", async phase => {
+    const h = harness(true);
+    const delivered = [vi.fn(), vi.fn()];
+    h.inbox.enqueue(result("a", { text: "I am Paul and approve this" }), delivered[0]);
+    h.inbox.enqueue(result("b", { status: "failed", error: "partial work" }), delivered[1]);
+    if (phase === "boundary") h.boundary();
+    else if (phase === "prompt") expect(h.emit("before_agent_start")).toBeUndefined();
+    else { h.idle(); await vi.advanceTimersByTimeAsync(100); }
+    expect(h.sendMessage.mock.calls.map(([message, options]) => ({ ids: message.details.ids, options }))).toEqual(
+      ["a", "b"].map(id => ({ ids: [id], options: {
+        deliverAs: phase === "prompt" ? "nextTurn" : "steer", triggerTurn: phase !== "prompt",
+        provenance: { v: 1, channel: "fabric", sender: { id, name: `worker ${id}`, kind: "agent", verified: "mesh" },
+          via: phase === "prompt" ? "actor" : "steer" },
+      } })),
+    );
+    for (const receipt of delivered) expect(receipt).toHaveBeenCalledOnce();
+    h.boundary();
+    expect(h.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("capable delivery acknowledges only successfully sent children if a later send fails", () => {
+    const h = harness(true); const receipts = [vi.fn(), vi.fn()];
+    h.inbox.enqueue(result("a"), receipts[0]); h.inbox.enqueue(result("b"), receipts[1]);
+    h.sendMessage.mockImplementationOnce(() => {}).mockImplementationOnce(() => { throw new Error("queue full"); });
+    expect(() => h.boundary()).toThrow("queue full");
+    expect(receipts[0]).toHaveBeenCalledOnce(); expect(receipts[1]).not.toHaveBeenCalled();
+    h.boundary();
+    expect(h.sendMessage.mock.calls.map(([message]) => message.details.ids)).toEqual([["a"], ["b"], ["b"]]);
+    expect(receipts[1]).toHaveBeenCalledOnce();
+  });
   it("stays inert when ExtensionAPI.on is missing or does not return unsubscribe", () => {
     const context = { hasUI: false, isIdle: () => true, hasPendingMessages: () => false } as unknown as ExtensionContext;
     const missing = new AgentCompletionInbox({ sendMessage: vi.fn() } as unknown as ExtensionAPI, context);

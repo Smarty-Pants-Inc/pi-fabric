@@ -126,7 +126,7 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
   "task.txt", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
-  "reply.json", "relaunches.jsonl", "worker-processes.jsonl", "worker-launches.jsonl",
+  "reply.json", "relaunches.jsonl", "worker-processes.jsonl", "worker-launches.jsonl", "route-session.jsonl",
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */

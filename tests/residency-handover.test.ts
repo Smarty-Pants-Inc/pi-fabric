@@ -38,7 +38,10 @@ function release(root: string, name: string): string {
   fs.writeFileSync(path.join(dir, "dist/worker.js"), `import fs from 'node:fs';
 const args=new Map();for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i].slice(2),process.argv[i+1]);
 if(args.get('resident-startup-probe')==='true'){
- const now=Date.now();fs.writeFileSync(args.get('status-file'),JSON.stringify({id:args.get('id'),name:args.get('name'),task:'probe',status:'completed',runner:'pi',transport:'process',cwd:args.get('cwd'),startedAt:now,updatedAt:now,finishedAt:now,text:'resident worker startup verified',turns:0,toolCalls:0,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:0}}));
+ // Startup success includes cleanup, so persist the probe's own checked identity.
+ const identity={sessionId:String(process.pid)};
+ if(process.platform==='linux'){const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8');identity.processStartTime=stat.slice(stat.lastIndexOf(')')+2).trim().split(/\\s+/)[19];}
+ const now=Date.now();fs.writeFileSync(args.get('status-file'),JSON.stringify({id:args.get('id'),name:args.get('name'),task:'probe',status:'completed',runner:'pi',transport:'process',...identity,cwd:args.get('cwd'),startedAt:now,updatedAt:now,finishedAt:now,text:'resident worker startup verified',turns:0,toolCalls:0,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:0}}));
 }else await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-worker.mjs")).href)});
 `);
   return dir;

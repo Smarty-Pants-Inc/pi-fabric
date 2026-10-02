@@ -158,9 +158,11 @@ describe("resident orphan retention", () => {
     const run = path.join(runs, id);
     const result = {
       id, name: "orphaned public task", task: "work", status: "completed", text: "original completion",
-      runner: "pi", transport: "process", cwd: config.cwd, startedAt: 1, updatedAt: 2, finishedAt: 2,
+      // Already-exited orphan: persist a usable PID whose absence is checked below.
+      runner: "pi", transport: "process", sessionId: "2147483647", cwd: config.cwd, startedAt: 1, updatedAt: 2, finishedAt: 2,
       turns: 1, toolCalls: 0, usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 },
     };
+    expect(() => process.kill(Number(result.sessionId), 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
     fs.mkdirSync(run, { recursive: true });
     fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(result));
     const metadataPath = path.join(config.residencyRoot, "agents", `${id}.json`);

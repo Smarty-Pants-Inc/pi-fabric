@@ -22,7 +22,7 @@ output, cwd changes, attributes, files, descriptors or producer provenance.
 | Everyday maintenance | Whole-literal nonrecursive `rm`/`rm -f` with explicit operands; or `find` with only the source's fixed non-executing predicates | No `rm -d`, recursive option, glob or expansion; no find exec/ok/delete/file-write action or unknown predicate. This narrow owner exception is not a general argv interpreter. |
 | Outside these grants | Pass only if there is no visible protected token and no unproved opaque execution/quoting | Visible signal/delete tokens refuse; all shred forms refuse. No unrelated-head or executor-denylist DATA credit. |
 
-Complex protected forms are refused as whole calls rather than interpreted.
+Complex protected forms are refused as whole calls; they are not interpreted.
 Protected names in opaque scripts/heredocs cannot earn an allowance. Command
 prefix assignments cannot set the host TMPDIR or confer a literal-command grant.
 Unproved `rm` argv can select recursive options and therefore refuses. This
@@ -33,7 +33,7 @@ search DATA. No option denylist: `inertOptions` accepts only the source's listed
 single switches, clusters of listed inert switches, and explicit value-taking
 selectors; a literal `--` ends options. `printf` accepts only a stdout format
 (non-option first word or a literal `--`), never a destination selector. Unknown
-flags reach the protected-token/opaque checks instead of receiving DATA credit.
+flags reach the protected-token/opaque checks and receive no DATA credit.
 Unsupported dollar quoting, live substitutions/backticks/process
 substitution, continuation or heredoc syntax cannot hide protected receivers.
 Opaque inner quotes/escapes confer no absence proof; when the protected class

@@ -181,10 +181,12 @@ export class AgentMessageRouter {
     return result;
   }
 
-  /** Only this root's non-owned durable actors can wait out a dead local holder.
-   * Unknown/live holders and unrelated routing errors retain the ordinary failure path. */
+  /** Only this root's non-owned durable actors can wait out a dead or ownerless local lock.
+   * Live/corrupt holders and unrelated routing errors retain the ordinary failure path. */
   async #withDurableRecovery<T>(id: string, operation: () => Promise<T>): Promise<T> {
-    let deadline = Date.now() + RESIDENT_MESH_STALE_WINDOW_MS + 10_000;
+    // Ownerless recovery needs the first integer millisecond strictly after the
+    // stale boundary, plus the full final mesh write-timeout budget.
+    let deadline = Date.now() + RESIDENT_MESH_STALE_WINDOW_MS + 1 + 10_000;
     for (;;) {
       try { return await operation(); }
       catch (error) {
@@ -194,16 +196,39 @@ export class AgentMessageRouter {
         if ((actor?.residency ?? participant?.residency) !== "durable" ||
             (actor && (this.actorManager.owns?.(actor.id) ?? participant?.local)) ||
             !(actor?.rootId === this.residency.options.config.rootId || participant?.ownerHostId === this.residency.hostId)) throw error;
-        let owner: string;
-        try { owner = fs.readFileSync(path.join(this.residency.options.config.meshRoot, ".lock", "owner"), "utf8"); }
-        catch { throw error; }
-        const [, pidText, createdText] = owner.trim().split("\n");
-        const pid = Number(pidText), createdAt = Number(createdText);
-        if (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid) ||
-            !Number.isFinite(createdAt) || createdAt < 0 || createdAt > Date.now()) throw error;
-        deadline = Math.min(deadline, createdAt + RESIDENT_MESH_STALE_WINDOW_MS + 10_000);
+        const lockPath = path.join(this.residency.options.config.meshRoot, ".lock");
+        const ownerPath = path.join(lockPath, "owner");
+        let owner: string | undefined;
+        let createdAt = Number.NaN;
+        let staleBoundaryMs = 0;
+        try { owner = fs.readFileSync(ownerPath, "utf8"); }
+        catch (readError) {
+          if (!(readError instanceof Error && "code" in readError && readError.code === "ENOENT")) throw error;
+          // SIGKILL can interrupt legacy mkdir/publication or release, leaving no PID.
+          // Wait for the same directory-mtime stale window MeshStore already enforces;
+          // only MeshStore may reclaim it, with its existing identity checks and fence.
+          try {
+            const stat = fs.lstatSync(lockPath);
+            if (!stat.isDirectory() || fs.existsSync(ownerPath)) throw error;
+            // Date.now/timers use integer milliseconds, but MeshStore protects
+            // the full-precision mtime while age <= the stale window. Flooring is
+            // safe for future-time validation only: retry at floor(mtime) + 1 so
+            // neither fractional timestamps nor an exact boundary retry early.
+            createdAt = Math.floor(stat.mtimeMs);
+            staleBoundaryMs = 1;
+          } catch { throw error; }
+        }
+        if (owner !== undefined) {
+          const [, pidText, createdText] = owner.trim().split("\n");
+          const pid = Number(pidText);
+          createdAt = Number(createdText);
+          if (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid)) throw error;
+        }
+        if (!Number.isFinite(createdAt) || createdAt < 0 || createdAt > Date.now()) throw error;
+        const retryAt = createdAt + RESIDENT_MESH_STALE_WINDOW_MS + staleBoundaryMs;
+        deadline = Math.min(deadline, retryAt + 10_000);
         const now = Date.now();
-        const waitMs = Math.max(100, createdAt + RESIDENT_MESH_STALE_WINDOW_MS - now);
+        const waitMs = Math.max(100, retryAt - now);
         // Leave a full mesh write-timeout budget for the final attempt. Never extend for a new holder.
         if (now + waitMs + 10_000 > deadline) throw error;
         await new Promise((resolve) => setTimeout(resolve, waitMs));
@@ -299,7 +324,8 @@ export class AgentMessageRouter {
         kind === "steer"
           ? this.manager.steer(id, message, data, provenance)
           : this.manager.followUp(id, message, data, provenance);
-      return { queued: true, messageId: result.messageId, routed: "local" };
+      return { queued: true, messageId: result.messageId, routed: "local",
+        ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
     }
@@ -492,7 +518,8 @@ export class AgentMessageRouter {
         command.operation === "steer"
           ? this.manager.steer(command.targetId, message, command.data, provenance)
           : this.manager.followUp(command.targetId, message, command.data, provenance);
-      return { accepted: true, messageId: result.messageId };
+      return { accepted: true, messageId: result.messageId,
+        ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
         return { accepted: false, error: error instanceof Error ? error.message : String(error) };

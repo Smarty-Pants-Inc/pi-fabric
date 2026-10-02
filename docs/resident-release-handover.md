@@ -1,6 +1,6 @@
 # Resident release negotiation (#2615)
 
-A live Main chooses the release it actually loaded; only its **existing detached
+A live Main chooses the release it loaded; only its **existing detached
 launcher** may own an irreversible handover. This is not a new daemon, fleet
 scanner or installer migration.
 
@@ -55,15 +55,15 @@ Use the existing explicit installer drain/exit-proof path to change releases.
    It cannot override the current unconditional recovery gate.
 5. Staged startup probes require the real worker's nonce-bound extension ACK and
    correlated Pi RPC response, without inference. Terminal publication uncertainty
-   retains the owned generation rather than cutting possibly admitted business
+   retains the owned generation and does not cut possibly admitted business
    work. `host.reloaded` publication uncertainty never ungates or replays business
    work. None of these primitives supplies containment or enables automatic B.
 
 ## External transport scope cut (security round 2 F1)
 
 The tmux/screen adapters still conflate a failed CLI/socket query with an absent
-session. They have no checked exit contract. Rather than treat `false` as a
-receipt, release quiescence rejects any tracked or unregistered tmux/screen
+session. They have no checked exit contract. Release quiescence does not treat
+`false` as a receipt: it rejects any tracked or unregistered tmux/screen
 transport **without issuing a liveness query**. Thus a failed or hung query cannot
 permit custody or defeat the reversible drain bound.
 

@@ -31,7 +31,8 @@ const entry = (name: string, packageName = "smarty-code") => {
   fs.writeFileSync(path.join(dir, "index.js"), "export default () => {};\n");
   return path.join(dir, "index.js");
 };
-const setup = (options: { uiQuery?: boolean; hostQuery?: boolean; configured?: boolean; packages?: boolean; turnProvenance?: boolean; beforeStart?: (loaded: string) => void } = {}) => {
+const setup = (options: { concurrency?: number; uiQuery?: boolean; hostQuery?: boolean; configured?: boolean; packages?: boolean; turnProvenance?: boolean; beforeStart?: (loaded: string) => void } = {}) => {
+
   const fabric = entry("fabric", "pi-fabric");
   const loaded = entry("code-old");
   const next = entry("code-new");
@@ -80,8 +81,11 @@ const setup = (options: { uiQuery?: boolean; hostQuery?: boolean; configured?: b
     moduleUrl: pathToFileURL(fabric).href, settingsPath,
     busy: () => state.busy, halted: () => state.halted,
     autoReloadConfigured: () => options.configured ?? true,
+    selfReloadConcurrency: () => options.concurrency ?? 0, // other validation tests isolate the legacy scheduler
+    reloadSlotsDirectory: path.join(root, "reload-slots"), reloadJitterMs: () => 0,
     heldNoticeMs: 10_000, publishHeld: (data: { reason: string; heldForMs: number; target: string }) => held.push(data),
     ...(options.uiQuery === false ? {} : { reloadTargetUiHold: options.hostQuery ? productionUiHold : () => state.dialog ? "ui-dialog-active" : undefined }),
+
   };
   const controller = installSelfReload(pi as never, deps);
   const emit = (name: string, event: unknown = {}) => { for (const handler of handlers.get(name) ?? []) handler(event, context); };
@@ -163,17 +167,30 @@ describe("merged Pi holdState adapter", () => {
 });
 
 describe("reload-target v1 public producer/consumer counterexamples", () => {
-  it.each([false, true])("preserves pinned resource commands and provenance compatibility (capable=%s)", async turnProvenance => {
+  it("slot denial keeps an advertised resource target pending until idle retry can admit it", async () => {
+    vi.useFakeTimers();
+    const s = setup({ concurrency: 1 }); await s.bind();
+    const { tryAcquireReloadSlot } = await import("../src/lifecycle/reload-slots.js");
+    const release = tryAcquireReloadSlot(1, path.join(root, "reload-slots"))!;
+    try {
+      s.activate(s.next); await s.request(s.next); s.emit("agent_settled", { outcome: "completed" });
+      const firstCommand = s.sent.at(-1)!; await s.execute();
+      expect(s.context.reload).not.toHaveBeenCalled();
+      expect(await s.request(s.next)).toMatchObject({ accepted: true, reason: "pending" });
+      release(); await vi.advanceTimersByTimeAsync(5_000);
+      expect(s.sent.at(-1)).not.toBe(firstCommand); // retry has a fresh pinned command token
+      await s.execute(); expect(s.context.reload).toHaveBeenCalledOnce();
+      expect(fs.readdirSync(path.join(root, "reload-slots"))).toEqual([]);
+    } finally { release(); }
+  });
+  it.each([false, true])("preserves pinned participant-free resource commands without a sender claim (capable=%s)", async turnProvenance => {
     const s = setup({ turnProvenance }); await s.bind();
     s.activate(s.next); await s.request(s.next);
     s.emit("agent_settled", { outcome: "completed" });
     s.emit("agent_settled", { outcome: "completed" });
     expect(s.pi.sendUserMessage).toHaveBeenCalledExactlyOnceWith(
       expect.stringMatching(/^\/fabric-release-reload auto resource-\d+$/),
-      { expandPromptTemplates: true, ...(turnProvenance ? { provenance: {
-        v: 1, channel: "fabric", sender: { id: `session:${s.context.sessionManager.getSessionId()}`,
-          name: "main", kind: "main", verified: "mesh" }, via: "followUp",
-      } } : {}) },
+      { expandPromptTemplates: true },
     );
     await s.execute();
     expect(s.context.reload).toHaveBeenCalledTimes(1);

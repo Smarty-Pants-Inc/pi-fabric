@@ -771,40 +771,25 @@ describe("MeshStore lock recovery", () => {
     expect(fs.readFileSync(path.join(store.root, fences[0]!, "owner"), "utf8")).toContain("recent-dead\n");
   });
 
-  it("a paused stale cleaner cannot remove or rename over a successor held by another cleaner", async () => {
+  it("a recovery marker prevents a second cleaner entering while the canonical directory moves", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
     const store = createStore({ lockTimeoutMs: 100 });
     const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100 });
     const lock = holdLock(store, `old-unique-token\n999999999\n${Date.now() - 60_000}\n`);
-    const ownerPath = path.join(lock, "owner");
     const rename = fs.renameSync.bind(fs);
-    const remove = fs.rmSync.bind(fs);
+    const competingOperation = vi.fn();
     let armed = true;
     let competitor: Promise<void> | undefined;
-    let refused: unknown;
-    const pause = (resume: () => void) => {
-      armed = false;
-      competitor = other.exclusive(() => {
-        const successor = fs.readFileSync(ownerPath, "utf8");
-        const inode = fs.statSync(lock).ino;
-        try { resume(); } catch (error) { refused = error; }
-        expect(fs.readFileSync(ownerPath, "utf8")).toBe(successor);
-        expect(fs.statSync(lock).ino).toBe(inode);
-        expect(successor).not.toContain("old-unique-token");
-      });
-      void competitor.catch(() => undefined);
-      if (refused) throw refused;
-    };
-    // Intercept both the fixed atomic rename and HEAD's unsafe canonical recursive rm.
-    // The second cleaner runs synchronously and resumes the paused action while holding
-    // its successor, making this an actual filesystem fence test, not a guessed delay.
     vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      if (armed && String(from) === lock && String(to).startsWith(`${lock}.dead.`)) return pause(() => rename(from, to));
-      return rename(from, to);
-    });
-    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
-      if (armed && String(file) === lock) return pause(() => remove(file, options));
-      return remove(file, options);
+      if (armed && String(from) === lock && String(to).startsWith(`${lock}.reap-`)) {
+        armed = false;
+        competitor = other.exclusive(competingOperation);
+        expect(competingOperation).not.toHaveBeenCalled();
+        rename(from, to);
+        expect(competingOperation).not.toHaveBeenCalled();
+        return;
+      }
+      rename(from, to);
     });
     const operation = vi.fn();
     const result = store.exclusive(operation);
@@ -814,8 +799,8 @@ describe("MeshStore lock recovery", () => {
     await competitor;
     await result;
     expect(operation).toHaveBeenCalledOnce();
-    expect(refused).toBeDefined();
-    expect(fs.readdirSync(store.root).filter((name) => name.startsWith(".lock.dead."))).toHaveLength(1);
+    expect(competingOperation).toHaveBeenCalledOnce();
+    expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."))).toHaveLength(1);
   });
 
   it.skipIf(process.platform !== "linux")("publishes Linux start time and distinguishes a reused PID from its live incarnation", async () => {

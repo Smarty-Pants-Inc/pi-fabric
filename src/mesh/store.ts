@@ -3,7 +3,7 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, writeFileAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic, MeshLockTimeoutError, lockRecoveryBlocked, reapStaleLock, releaseLockToken } from "../core/atomic-write.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
@@ -1579,12 +1579,17 @@ export class MeshStore {
       if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
       attempts += 1;
       lastAttemptAt = attemptAt;
+      let published = false;
       try {
+        if (lockRecoveryBlocked(this.#lockPath)) {
+          throw Object.assign(new Error("Fabric mesh lock recovery is in progress"), { code: "EEXIST" });
+        }
         if (this.#lockProtocol === 1) {
           // B68 wire: exclusive canonical mkdir, then a three-line owner at that name.
           fs.mkdirSync(this.#lockPath, { mode: 0o700 });
+          published = true;
           fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
-            encoding: "utf8", mode: 0o600,
+            encoding: "utf8", mode: 0o600, flag: "wx",
           });
         } else {
           // Never expose an ownerless canonical directory: a stalled initializer must not
@@ -1606,14 +1611,22 @@ export class MeshStore {
             // New-format competitors publish nonempty owners atomically. This does not fence
             // old-format writers that create an empty canonical after the absence check.
             fs.renameSync(staging, this.#lockPath);
+            published = true;
           } finally {
             fs.rmSync(staging, { recursive: true, force: true });
           }
         }
+        // Recovery may have begun after our initial check. The owner remains
+        // provisional until every recovery marker has been resolved.
+        if (lockRecoveryBlocked(this.#lockPath) || !fs.readFileSync(ownerPath, "utf8").startsWith(`${token}\n`)) {
+          releaseLockToken(this.#lockPath, token);
+          throw Object.assign(new Error("Fabric mesh lock publication raced recovery"), { code: "EEXIST" });
+        }
         break;
       } catch (error) {
+        if (published) releaseLockToken(this.#lockPath, token);
         const code = errorCode(error);
-        if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
+        if (code !== "EEXIST" && code !== "ENOENT" && (this.#lockProtocol === 1 ||
           (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
         if (this.#clearStaleLock(ownerPath)) continue;
         if (Date.now() >= deadline) {
@@ -1679,25 +1692,32 @@ export class MeshStore {
       } else if (!validOwner && Date.now() - stat.mtimeMs <= this.#staleLockMs) {
         return false;
       }
-      const unchanged = (): boolean => {
-        const current = fs.lstatSync(this.#lockPath);
-        return current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino && readOwner() === owner;
-      };
-      if (!unchanged()) return false;
-      if (owner === undefined) {
-        // An empty orphan must also leave a NONEMPTY fence. Never overwrite an owner;
-        // identity/owner rechecks reject a successor even if this marker raced its mkdir.
-        if (fs.statSync(this.#lockPath).mtimeMs !== stat.mtimeMs) return false;
-        try { fs.writeFileSync(path.join(this.#lockPath, ".recovery-fence"), "1\n", { flag: "wx", mode: 0o600 }); }
-        catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
-      }
-      if (!unchanged()) return false;
+      if (readOwner() !== owner) return false;
       const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner ?? ""}`).digest("hex")}`;
-      // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner
-      // cannot rename a successor over the same fence (native EEXIST/ENOTEMPTY). Deleting
-      // it, or recursively deleting the canonical name after a re-read, reopens that race.
-      fs.renameSync(this.#lockPath, fence);
-      return true;
+      return reapStaleLock(this.#lockPath, claimed => {
+        try {
+          const current = fs.lstatSync(claimed);
+          if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino) return false;
+          let currentOwner: string | undefined;
+          try { currentOwner = fs.readFileSync(path.join(claimed, "owner"), "utf8"); }
+          catch (error) { if (errorCode(error) !== "ENOENT") return false; }
+          if (currentOwner !== owner) return false;
+          if (validPid && processAlive(pid)) {
+            const actualStart = processStartTime(pid);
+            return validOwner && !!recordedStart && /^\d+$/.test(recordedStart) &&
+              !!actualStart && actualStart !== recordedStart;
+          }
+          return validOwner || (current.mtimeMs === stat.mtimeMs && Date.now() - current.mtimeMs > this.#staleLockMs);
+        } catch { return false; }
+      }, claimed => {
+        if (owner === undefined) {
+          try { fs.writeFileSync(path.join(claimed, ".recovery-fence"), "1\n", { flag: "wx", mode: 0o600 }); }
+          catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
+        }
+        // Keep main's nonempty permanent fence: paused older cleaners cannot
+        // overwrite it with a replacement. Only the revalidated claim moves.
+        fs.renameSync(claimed, fence);
+      });
     } catch {
       return false;
     }

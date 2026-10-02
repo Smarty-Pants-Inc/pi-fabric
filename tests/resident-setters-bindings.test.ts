@@ -57,12 +57,14 @@ const setup = (queueLimit = 2, realRuns = false) => {
     nextHold = new Promise<void>((resolve) => { resume = resolve; });
     releases.push(resume); return resume;
   };
-  vi.spyOn(agents, "run").mockImplementation(async (request) => {
+  vi.spyOn(agents, "run").mockImplementation(async (request, signal, onSpawned, ...callbacks) => {
     const pause = nextHold; nextHold = undefined;
     launches.push(structuredClone(request));
+    // Non-process fixtures explicitly announce their simulated launched worker.
+    if (!realRuns) onSpawned?.({ ...terminal(request, launches.length), status: "running" });
     if (launches.length === 1) await held;
     if (pause) await pause;
-    const result = realRuns ? await actualRun(request) : terminal(request, launches.length);
+    const result = realRuns ? await actualRun(request, signal, onSpawned, ...callbacks) : terminal(request, launches.length);
     results.push(result); return result;
   });
   const actorRoot = path.join(root, "actors");

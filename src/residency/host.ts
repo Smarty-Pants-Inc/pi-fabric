@@ -1106,7 +1106,7 @@ export class ResidentHost {
         const caller = command.caller;
         const returnAddress = assertResidentTaskCaller(caller,
           caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
-        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, returnAddress);
+        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, undefined, undefined, returnAddress);
         const runDirectory = this.agents.runDirectory(handle.id);
         if (!runDirectory) {
           // Durable metadata currently requires an admitted run directory. Never

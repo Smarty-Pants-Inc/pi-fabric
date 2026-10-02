@@ -93,6 +93,89 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("ActorManager fleet model policy (#2490)", () => {
+  it.each(["hook", "predecessor"] as const)("round 3 F4 rechecks the synchronous invocation fence after %s wait", async wait => {
+    const { actors, root, mesh } = setup(true);
+    const abort = new AbortController();
+    let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
+    let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+    let remove: ReturnType<typeof vi.spyOn> | undefined;
+    if (wait === "predecessor") {
+      const previous = await actors.create({ name: "fenced", instructions: "Previous." });
+      await actors.stop(previous.id);
+      const original = actors.remove.bind(actors);
+      remove = vi.spyOn(actors, "remove").mockImplementation(async (...args) => { const result = await original(...args); enter(); await held; return result; });
+    }
+    const check = () => abort.signal.throwIfAborted();
+    const pending = actors.create({ name: "fenced", instructions: "Never publish after cancellation.", topics: ["round3.work"] }, {
+      async beforeCommit() { check(); if (wait === "hook") { enter(); await held; } }, checkActive: check,
+    }).catch(error => error);
+    try {
+      await entered; abort.abort(new Error("cancelled admission")); release();
+      expect(await pending).toMatchObject({ message: "cancelled admission" });
+      expect(actors.list().filter(actor => actor.name === "fenced")).toEqual([]);
+      const actorRoot = path.join(root, "actors");
+      expect(fs.existsSync(actorRoot) ? fs.readdirSync(actorRoot, { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== "bindings") : []).toEqual([]);
+      expect(mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 }).filter(event => event.kind === "created")).toHaveLength(wait === "hook" ? 0 : 1);
+      remove?.mockRestore();
+      await expect(actors.create({ name: "fenced", instructions: "Allowed control." }, { checkActive() {} })).resolves.toMatchObject({ name: "fenced" });
+    } finally { release(); await pending; remove?.mockRestore(); }
+  });
+
+  it.each(["session", "project"] as const)("review round A2 refuses %s clear against the owning Pi fallback and preserves both layers", async (scope) => {
+    const denied = "cliproxyapi/gpt-6-astra";
+    const allowed = "cliproxyapi/gpt-6.1-sol";
+    const preparePiModel = vi.fn(async (model: string | undefined) => model ?? denied);
+    const { actors } = setup(false, undefined, undefined, { preparePiModel }, {}, { deniedModels: [denied] });
+    const actor = await actors.create({ name: "fallback", instructions: "Review.", ...(scope === "project" ? { model: allowed } : {}) });
+    if (scope === "session") await actors.setModel(actor.id, allowed, scope);
+    const definition = actors.definition(actor.id);
+    const binding = actors.status(actor.id).binding;
+    await expect(actors.setModel(actor.id, undefined, scope)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(preparePiModel).toHaveBeenCalledWith(undefined);
+    expect(actors.definition(actor.id)).toEqual(definition);
+    expect(actors.status(actor.id).binding).toEqual(binding);
+    expect(actors.status(actor.id).model).toBe(allowed);
+  });
+  it("review round A2 admits a project clear when an allowed session overlay remains", async () => {
+    const { actors } = setup(false, undefined, undefined, { preparePiModel: async () => "cliproxyapi/gpt-6-astra" }, {}, { deniedModels: ["cliproxyapi/gpt-6-astra"] });
+    const actor = await actors.create({ name: "overlay", instructions: "Review.", model: "cliproxyapi/gpt-6.1-sol" });
+    await actors.setModel(actor.id, "provider/session", "session");
+    await actors.setModel(actor.id, undefined, "project");
+    expect(actors.definition(actor.id).model).toBeUndefined();
+    expect(actors.status(actor.id).model).toBe("provider/session");
+  });
+  it("refuses denied aliases in a foreign actor's caller-local session setter", async () => {
+    let owns = true;
+    const { actors } = setup(false, () => owns, undefined, {
+      resolvePiModel: (model) => model === "bad-alias" ? "cliproxyapi/gpt-6-astra" : model,
+    }, {}, { deniedModels: ["cliproxyapi/gpt-6-astra"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" });
+    const actor = await actors.create({ name: "foreign", instructions: "Review.", model: "cliproxyapi/gpt-6.1-sol" });
+    owns = false;
+    await expect(actors.setModel(actor.id, "bad-alias")).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(actors.status(actor.id).model).toBe("cliproxyapi/gpt-6.1-sol");
+  });
+  const denied = "cliproxyapi/gpt-6-astra";
+  const policy = { deniedModels: [denied], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol", model: denied };
+  it("refuses an explicit or default denied actor before registry mutation", async () => {
+    const { actors } = setup(false, undefined, undefined, undefined, {}, policy);
+    for (const model of [denied, undefined]) {
+      await expect(actors.create({ name: "review", instructions: "review", ...(model ? { model } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    }
+    expect(actors.list()).toEqual([]);
+  });
+  it("validates canonical model resolutions and both setter scopes", async () => {
+    const { actors } = setup(false, undefined, undefined, { resolvePiModel: (model) => model === "bad-alias" ? denied : model }, {}, policy);
+    await expect(actors.create({ name: "bad", instructions: "review", model: "bad-alias" })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    const actor = await actors.create({ name: "good", instructions: "review", model: "cliproxyapi/gpt-6.1-sol" });
+    for (const scope of ["session", "project"] as const) {
+      await expect(actors.setModel(actor.id, "bad-alias", scope)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      await expect(actors.setModel(actor.id, " CLIPROXYAPI/GPT-6-ASTRA ", scope)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    }
+    expect(actors.definition(actor.id).model).toBe("cliproxyapi/gpt-6.1-sol");
+  });
+});
+
 describe("ActorManager closing ingress", () => {
   it("P2-1 rejects tell while closing rather than accepting memory-only work", async () => {
     const { actors } = setup(true);
@@ -1375,6 +1458,58 @@ describe("ActorManager across a session reload", () => {
 });
 
 describe("ActorManager", () => {
+  it.each([false, true])("keeps an in-flight actor running while its queue grows (persistent owner: %s)", async (persistent) => {
+    const { actors, agents } = setup(persistent);
+    const run = agents.run.bind(agents);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const running = vi.spyOn(agents, "run").mockImplementation(async (request, signal, onSpawned) => {
+      const result = await run(request, signal, onSpawned);
+      await gate;
+      return result;
+    });
+    const actor = await actors.create({ name: "busy", instructions: "Work.", responseMode: "text" });
+    try {
+      actors.tell(actor.id, "first");
+      await waitFor(() => actors.status(actor.id).inFlightRun !== undefined);
+      const inFlightRun = actors.status(actor.id).inFlightRun!;
+      expect(actors.status(actor.id)).toMatchObject({ status: "running", queued: 0 });
+
+      actors.tell(actor.id, "second");
+      actors.tell(actor.id, "third");
+      const queued = actors.status(actor.id);
+      expect(queued).toMatchObject({ status: "running", queued: 2 });
+      expect(queued.inFlightRun).toMatchObject({ id: inFlightRun.id, startedAt: inFlightRun.startedAt });
+      expect(running).toHaveBeenCalledTimes(1);
+
+      release();
+      await waitFor(() => actors.status(actor.id).status === "idle", 10_000);
+      expect(actors.status(actor.id)).toMatchObject({ status: "idle", queued: 0 });
+      expect(actors.status(actor.id).inFlightRun).toBeUndefined();
+      expect(running).toHaveBeenCalledTimes(3);
+      expect(actors.messages(actor.id).filter((message) => message.direction === "out" && !message.error)).toHaveLength(3);
+    } finally {
+      release();
+    }
+  });
+
+  it.each([false, true])("does not requeue a stopped in-flight actor (persistent owner: %s)", async (persistent) => {
+    const { actors } = setup(persistent);
+    const actor = await actors.create({ name: "stopped-busy", instructions: "Work.", events: ["agent_settled"], responseMode: "text" });
+    actors.tell(actor.id, "HANG first");
+    await waitFor(() => actors.status(actor.id).inFlightRun !== undefined);
+    actors.tell(actor.id, "waiting");
+    expect(actors.status(actor.id)).toMatchObject({ status: "running", queued: 1 });
+
+    await actors.stop(actor.id);
+    expect(actors.status(actor.id)).toMatchObject({ status: "stopped", queued: 0 });
+    expect(() => actors.tell(actor.id, "later")).toThrow("is stopped");
+    expect(() => actors.ask(actor.id, "later")).toThrow("is stopped");
+    expect(actors.dispatchHostEvent("agent_settled", {})).toBe(0);
+    await waitFor(() => actors.status(actor.id).inFlightRun === undefined, 10_000);
+    expect(actors.status(actor.id)).toMatchObject({ status: "stopped", queued: 0 });
+  });
+
   it("updates inference context on the same identity, preserves policy/history, and restores it", async () => {
     const s = setup(true);
     const actor = await s.actors.create({

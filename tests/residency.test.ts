@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -1131,6 +1131,52 @@ describe("durable completion receipts", () => {
     }
   });
 
+  it.each([['tmux', 'closed'], ['screen', 'closed'], ['tmux', 'unknown'], ['screen', 'unknown']] as const)("vetoes public durable cleanup of terminal live %s after host %s without an unresolved marker", async (kind, route) => {
+    const state = await rootHarness(`external-cleanup-${kind}-${route}`);
+    const source = path.join(state.root, 'source'); initRepository(source);
+    const seeded = await seedCompletion(state, 'failed');
+    const branch = `pi-fabric/external-${kind}-${seeded.id.slice(0, 8)}`;
+    const worktree = path.join(source, '.pi', 'fabric', 'worktrees', seeded.id);
+    fs.mkdirSync(path.dirname(worktree), { recursive: true });
+    git(source, 'worktree', 'add', '-q', '-b', branch, worktree, 'HEAD');
+    const record = { ...seeded.result, transport: kind, sessionId: 'external-pane', cwd: worktree };
+    fs.writeFileSync(path.join(seeded.runDirectory, 'status.json'), JSON.stringify(record));
+    const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, 'utf8'));
+    fs.writeFileSync(seeded.metadataPath, JSON.stringify({ ...metadata, handle: { ...record, worktree, branch }, worktreeGitRoot: source }));
+    const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
+    fs.mkdirSync(path.dirname(resultPath), { recursive: true }); fs.writeFileSync(resultPath, JSON.stringify(record));
+    // A real live cwd holder substitutes for the external pane, without requiring tmux/screen on CI.
+    const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: worktree, stdio: 'ignore' });
+    const exited = new Promise<void>((resolve, reject) => { worker.once('error', reject); worker.once('close', () => resolve()); });
+    const host = new ResidentHost(state.config);
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    const agents = new AgentManager(repo, { ...state.config.agents, budgetUsd: 0, nice: 19 }, { workerPath: fakeWorker, runRoot: path.join(state.root, "session-runs") });
+    const actors = new ActorManager(state.config.sessionId, state.identity, state.mesh, state.meshConfig, agents, () => {}, { actorRoot: path.join(state.root, "session-actors"), persistent: true });
+    const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants, { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(agents, actors, new GlobalActorRegistry(state.root, 64 * 1024), state.mainAgent, state.participants, undefined, lifecycle, () => false, client);
+    const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "public-external-cleanup", nestedToolCallId: "cleanup", extensionContext: {} as ExtensionContext, update() {} };
+    const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
+    const join = vi.spyOn(AgentManager.prototype, "join");
+    try {
+      await host.start();
+      if (route === 'closed') await host.close();
+      expect(fs.existsSync(path.join(seeded.runDirectory, 'unresolved-worker.json'))).toBe(false);
+      await expect(provider.invoke("cleanup", { id: seeded.id, deleteBranch: true }, context)).rejects.toThrow(/checked.*exit|exit.*unconfirmed/);
+      expect(join).toHaveBeenCalledTimes(route === "unknown" ? 1 : 0);
+      expect(worker.exitCode).toBeNull(); expect(worker.signalCode).toBeNull();
+      expect(cleanup).not.toHaveBeenCalled();
+      for (const file of [seeded.runDirectory, seeded.metadataPath, resultPath, worktree]) expect(fs.existsSync(file)).toBe(true);
+      expect(worktreeBranches(source)).toContain(branch);
+      expect(git(source, 'branch', '--list', branch)).toContain(branch);
+      const decisions = path.join(state.config.residencyRoot, 'decisions');
+      const committed = fs.existsSync(decisions) ? fs.readdirSync(decisions).map(name => JSON.parse(fs.readFileSync(path.join(decisions, name), 'utf8'))).filter(decision => decision.state === 'committed') : [];
+      expect(committed).toEqual([]);
+    } finally {
+      worker.kill("SIGTERM"); await exited; cleanup.mockRestore(); join.mockRestore();
+      await client.close(); await host.close(); await actors.close(); await agents.close(); await lifecycle.close(); await state.participants.close();
+    }
+  }, 15_000);
+
   it("refuses the fallback cleanup of a completed durable run whose nested child is marked", async () => {
     const state = await rootHarness("unresolved-nested-cleanup");
     const seeded = await seedCompletion(state, "completed");
@@ -1331,6 +1377,80 @@ describe("durable completion receipts", () => {
 });
 
 describe.skipIf(!hasResidentHost || process.platform === "win32")("durable participant residency", () => {
+  // Compiled launcher + real resident host/control transport; inference is deliberately fake.
+  // Main supplies the separate native Pi actor acceptance proof for #2726.
+  it("#2726 exposes a busy resident-owned actor and two queued tells through both provider reads", { timeout: 45_000 }, async () => {
+    const state = await rootHarness("resident-live-read");
+    const releasePath = path.join(state.root, "release-first-worker");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    const control = new FabricControlPlane(state.mesh, state.identity, { enabled: true, hostId: state.identity.id, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
+    control.start(() => ({ accepted: false }));
+    const agents = new AgentManager(repo, state.config.agents, { workerPath: fakeWorker, runRoot: path.join(state.root, "passive-runs") });
+    const passive = new ActorDirectory([state.config.sessionId, state.identity, state.mesh, state.meshConfig, agents, () => {},
+      { persistent: true, rootId: state.identity.id, canManageActor: () => false }],
+      { project: state.config.actorRoot, session: state.config.sessionActorRoot! }, "project");
+    const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants, { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(agents, passive, new GlobalActorRegistry(state.root, 64 * 1024), state.mainAgent, state.participants, control, lifecycle, undefined, client);
+    const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "test", nestedToolCallId: "live-read",
+      extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
+    try {
+      client.start();
+      const actor = await client.createActor({ name: "resident live review", instructions: "Reply.", residency: "durable", transport: "process", responseMode: "text", delivery: "mailbox", coalesce: false });
+      const participant = () => state.participants.get(actor.id, undefined, { fresh: true });
+      await control.request(client.hostId, actor.id, "followUp", { message: "settled baseline" }, client.hostId);
+      await waitFor(() => participant()?.status === "idle" && Boolean(passive.status(actor.id).lastRunId));
+      const baseline = passive.status(actor.id);
+      expect(passive.owns(actor.id)).toBe(false);
+      const definition = passive.definition(actor.id);
+      await control.request(client.hostId, actor.id, "followUp", { message: "LIVE_WITH_PROGRESS", data: { fakeWorkerReleasePath: releasePath } }, client.hostId);
+      await waitFor(() => participant()?.status === "running" && participant()?.actorRun !== undefined);
+      const running = participant()!;
+      expect(await provider.invoke("actorStatus", { id: actor.id }, context)).toMatchObject({
+        status: "running", queued: 0, inFlightRun: { id: running.actorRun!.id }, lastRunId: baseline.lastRunId,
+      });
+      expect(await provider.invoke("actors", {}, context)).toContainEqual(expect.objectContaining({
+        id: actor.id, status: "running", queued: 0, inFlightRun: expect.objectContaining({ id: running.actorRun!.id }),
+      }));
+      await control.request(client.hostId, actor.id, "followUp", { message: "queued review one" }, client.hostId);
+      await control.request(client.hostId, actor.id, "followUp", { message: "queued review two" }, client.hostId);
+      await waitFor(() => participant()?.actorQueued === 2);
+      const live = participant()!;
+      expect(live).toMatchObject({ status: "running", ownerHostId: client.hostId, actorQueued: 2,
+        actorRun: { id: running.actorRun!.id } });
+      expect(live.actorMessages).toBeGreaterThan(baseline.messages);
+      expect(passive.status(actor.id)).toMatchObject({ status: "idle", queued: 0, lastRunId: baseline.lastRunId });
+      const single = await provider.invoke("actorStatus", { id: actor.id }, context);
+      const listed = (await provider.invoke("actors", {}, context) as Array<{ id: string }>).find(row => row.id === actor.id);
+      for (const view of [single, listed]) {
+        expect(view).toMatchObject({ id: actor.id, name: actor.name, status: "running", queued: 2,
+          messages: live.actorMessages, lastRunId: baseline.lastRunId, inFlightRun: { id: live.actorRun!.id } });
+      }
+      expect(passive.definition(actor.id)).toEqual(definition);
+      // The real worker cannot finish FIRST until both provider reads above agree.
+      fs.writeFileSync(releasePath, "release\n");
+      await waitFor(() => participant()?.status === "idle" && participant()?.actorQueued === 0 && participant()?.actorRun === undefined);
+      const idleSingle = await provider.invoke("actorStatus", { id: actor.id }, context) as { inFlightRun?: unknown; lastRunId?: string };
+      const idleListed = (await provider.invoke("actors", {}, context) as Array<{ id: string; inFlightRun?: unknown }>).find(row => row.id === actor.id)!;
+      for (const view of [idleSingle, idleListed]) {
+        expect(view).toMatchObject({ status: "idle", queued: 0, messages: participant()!.actorMessages });
+        expect(view.inFlightRun).toBeUndefined();
+      }
+      expect(idleSingle.lastRunId).not.toBe(baseline.lastRunId);
+      expect(idleSingle.lastRunId).not.toBe(running.actorRun!.id);
+      const persisted = new ActorRegistryStore(state.config.actorRoot).records().find(record => record.id === actor.id)!;
+      expect((persisted.messages as FabricActorMessage[]).filter(message => message.direction === "out").map(message => message.text)).toEqual([
+        "fake worker complete", "live attempt 1 complete", "fake worker complete", "fake worker complete",
+      ]);
+      await client.removeActor(actor.id);
+    } finally {
+      // Also release after an assertion failure; host shutdown and root cleanup stay bounded.
+      fs.writeFileSync(releasePath, "release\n");
+      await control.close(); await client.close(); await passive.close(); await agents.close(); await lifecycle.close();
+      await state.participants.close(); await stopResident(state.config);
+      fs.rmSync(releasePath, { force: true });
+    }
+  });
+
   it.skipIf(process.platform !== "linux")("F1 preserves original completion when the compiled resident host's result save fails through graceful close and two restarts", { timeout: 60_000 }, async () => {
     // Real compiled launcher -> real Pi -> compiled resident host; only model inference is fake.
     // STREAM_PREVIEW supplies its own running/terminal records and full text, without fixture edits.
@@ -2061,7 +2181,9 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     const provider = new AgentsProvider(agents, passive, new GlobalActorRegistry(state.root, 64 * 1024),
       state.mainAgent, state.participants, control, lifecycle, undefined, client);
     const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "test", nestedToolCallId: "setter",
-      extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
+      // Main now admits the selector before routing to the resident owner.
+      // Give this root session its actual visible registry, not an empty context.
+      extensionContext: { modelRegistry: { getAvailable: () => state.config.piModels?.available ?? [] } } as unknown as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
     try {
       const actor = await client.createActor({ name: "effective durable", instructions: "Before", residency: "durable", model: "provider/visible", thinking: "low" });
       expect(passive.owns(actor.id)).toBe(false);

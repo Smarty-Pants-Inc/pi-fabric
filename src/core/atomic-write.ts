@@ -265,7 +265,7 @@ export const syncDirectoryChain = (directory: string): void => {
 
 export const writeFileAtomic = (
   filePath: string,
-  contents: string,
+  contents: string | Uint8Array,
   options?: AtomicWriteOptions,
 ): void => {
   const directory = path.dirname(filePath);

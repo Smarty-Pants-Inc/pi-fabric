@@ -90,7 +90,10 @@ describe.each(["sync", "async"] as const)("shared %s file-lock recovery", mode =
     const remove = fs.rmdirSync;
     let removalFailed = false;
     vi.spyOn(fs, "rmdirSync").mockImplementation((directory, ...args) => {
-      if (!removalFailed && String(directory).includes(".reap-")) {
+      // Fail the marker's own removal only. Before Node 24, recursive rmSync
+      // routes through fs.rmdirSync, so a broader match would instead fail the
+      // retirement of the claimed lock (<marker>/lock) and test a different path.
+      if (!removalFailed && path.basename(String(directory)).startsWith("current.lock.reap-")) {
         removalFailed = true;
         throw Object.assign(new Error("transient marker removal failure"), { code: "EACCES" });
       }

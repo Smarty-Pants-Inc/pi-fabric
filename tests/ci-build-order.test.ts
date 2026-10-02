@@ -30,8 +30,26 @@ describe("CI build prerequisites", () => {
     expect(install).toBeGreaterThan(update);
   });
 
+  it.each(["test.yml", "entropy.yml"])("excludes fork PR source and pull_request_target in %s", (name) => {
+    const definition = parse(fs.readFileSync(fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)), "utf8"));
+    expect(definition.on).not.toHaveProperty("pull_request_target");
+    for (const job of Object.values(definition.jobs) as Array<{ if?: string }>) {
+      expect(job.if).toBe("github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository");
+    }
+  });
+
   it("lets both platforms finish when one fails", () => {
     expect(workflow.jobs.check.strategy["fail-fast"]).toBe(false);
-    expect(workflow.jobs.check.strategy.matrix.os).toEqual(["ubuntu-latest", "windows-latest"]);
+  });
+
+  it("keeps required check names mapped to the exact owned runner labels", () => {
+    expect(workflow.jobs.check.name).toBe("${{ matrix.name }}");
+    expect(workflow.jobs.check["runs-on"]).toBe("${{ matrix.runner }}");
+    expect(workflow.jobs.check.strategy.matrix).toEqual({
+      include: [
+        { name: "check (ubuntu-latest)", runner: ["self-hosted", "smarty-linux-x64"] },
+        { name: "check (windows-latest)", runner: ["self-hosted", "Windows", "X64", "smarty-ci-windows-x64"] },
+      ],
+    });
   });
 });

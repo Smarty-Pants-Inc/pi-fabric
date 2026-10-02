@@ -20,7 +20,7 @@ jobs:
       matrix:
         include:
           - name: check (ubuntu-latest)
-            runner: smarty-linux-x64
+            runner: [self-hosted, smarty-linux-x64]
           - name: check (windows-latest)
             # Dev3's native i9 runner (group "Smarty Windows CI"), not a hosted image (Paul, smarty-dev#1246).
             # The check name stays `check (windows-latest)` because the merge rules require it.

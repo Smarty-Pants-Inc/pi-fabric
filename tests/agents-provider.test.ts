@@ -664,6 +664,50 @@ const setup = (
   };
 };
 
+describe("#2643 immediate bound spawner routing", () => {
+  it.each(["session", "durable"] as const)("routes a %s actor child's spawner followUp to the actor, not root Main", async (residency) => {
+    const h = setup();
+    const actor = await h.actors.create({ name: "review-parent", instructions: "Review.", residency, delivery: "mailbox", responseMode: "text" });
+    vi.stubEnv("PI_FABRIC_SPAWNER_ID", actor.id);
+    vi.stubEnv("PI_FABRIC_SPAWNER_KIND", "actor");
+    vi.stubEnv("PI_FABRIC_SPAWNER_RUN", "a".repeat(32));
+    try {
+      const child = new AgentsProvider(h.agents, h.actors, h.globalActors, h.mainAgent, h.participants, h.control, h.lifecycle);
+      expect(await child.describe("spawner", context)).toMatchObject({ name: "spawner", risk: "read" });
+      expect(await child.invoke("spawner", {}, context)).toEqual({ id: actor.id, kind: "actor", runId: "a".repeat(32) });
+      const registry = new ActionRegistry(); registry.register(child);
+      const service = new FabricExecutionService(registry, structuredClone(DEFAULT_FABRIC_CONFIG));
+      const guest = await service.execute({ code: "return await agents.spawner();", context: context.extensionContext,
+        signal: undefined, parentToolCallId: "bound-spawner-guest", onPartial() {} });
+      expect(guest.success, guest.error ?? JSON.stringify(guest.typeErrors)).toBe(true);
+      expect(guest.value).toEqual({ id: actor.id, kind: "actor", runId: "a".repeat(32) });
+      await expect(child.invoke("followUp", { id: "spawner", message: "private sub-result" }, context)).resolves.toMatchObject({ queued: true, routed: "local" });
+      expect(h.actors.messages(actor.id).filter((message) => message.direction === "in")).toEqual([
+        expect.objectContaining({ data: { message: "private sub-result" } }),
+      ]);
+      expect(h.mainDeliveries).toEqual([]);
+      // Main is still deliberately the root; this is not a lineage-id rewrite.
+      await child.invoke("followUp", { id: "main", message: "explicit root notice" }, context);
+      expect(h.mainDeliveries).toEqual([expect.objectContaining({ message: "explicit root notice" })]);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("uses Main only for a Main spawner and refuses an absent binding without root fallback", async () => {
+    vi.stubEnv("PI_FABRIC_SPAWNER_ID", "session:test");
+    vi.stubEnv("PI_FABRIC_SPAWNER_KIND", "main");
+    vi.stubEnv("PI_FABRIC_SPAWNER_RUN", "");
+    try {
+      const h = setup();
+      await h.provider.invoke("followUp", { id: "spawner", message: "root's own child" }, context);
+      expect(h.mainDeliveries).toEqual([expect.objectContaining({ message: "root's own child" })]);
+      vi.stubEnv("PI_FABRIC_SPAWNER_ID", undefined);
+      const unbound = new AgentsProvider(h.agents, h.actors, h.globalActors, h.mainAgent, h.participants, h.control, h.lifecycle);
+      await expect(unbound.invoke("followUp", { id: "spawner", message: "do not leak" }, context)).rejects.toThrow("no bound Fabric spawner");
+      expect(h.mainDeliveries).toHaveLength(1);
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
+
 describe('model: "auto" spawn routing (#2890)', () => {
   beforeEach(() => {
     const host = fs.mkdtempSync(path.join(os.tmpdir(), "route-provider-host-")); roots.push(host);
@@ -3722,6 +3766,42 @@ describe("#2726 resident actor live read views", () => {
     expect(state.get).toHaveBeenCalledWith(state.actor.id, undefined, { fresh: true });
     return (action === "actors" ? (result as FabricActorReadInfo[]).find(row => row.id === state.actor.id) : result) as FabricActorReadInfo;
   };
+
+  it.each([
+    ["actorStatus", "preparing"], ["actorStatus", "waiting"],
+    ["actors", "preparing"], ["actors", "waiting"],
+  ] as const)("#3307 %s preserves %s diagnostics without resident RPC and clears old receipts", async (action, status) => {
+    const state = await passiveState();
+    const resident = vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue(undefined);
+    try {
+      const preparing = {
+        phase: status === "waiting" ? "waiting" : "binding", startedAt: Date.now() - 5_000,
+        ageS: 0, attempts: 2,
+        ...(status === "waiting" ? { runId: "admission-receipt", queuePosition: 0 } : {}),
+      };
+      const { actorRun: _run, ...owner } = state.live;
+      const live = { ...owner, status, actorPreparing: preparing };
+      state.setLive(live);
+      const view = await read(state, action);
+      expect(view).toMatchObject({ status, queued: 2, messages: 7,
+        preparing: { ...preparing, ageS: expect.any(Number) } });
+      expect(view.preparing!.ageS).toBeGreaterThanOrEqual(5);
+      expect(view.inFlightRun).toBeUndefined();
+
+      // A passive snapshot must not retain diagnostics absent from the fresh owner.
+      const oldView = { ...state.actor, status, preparing };
+      const actorStatus = vi.spyOn(state.passive, "status").mockReturnValue(oldView);
+      const actors = vi.spyOn(state.passive, "list").mockReturnValue([oldView]);
+      try {
+        for (const current of [{ ...owner, status: "idle" }, { ...live, stale: true }, undefined]) {
+          state.setLive(current);
+          const cleared = await read(state, action);
+          expect(cleared.status).toBe(current && !current.stale ? "idle" : "unknown");
+          expect(cleared.preparing).toBeUndefined();
+        }
+      } finally { actorStatus.mockRestore(); actors.mockRestore(); }
+    } finally { resident.mockRestore(); }
+  });
 
   it.each(["actorStatus", "actors"] as const)("%s reads fresh running owner counts, then clears the settled run on idle", async action => {
     const state = await passiveState();

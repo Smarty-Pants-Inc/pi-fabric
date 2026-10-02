@@ -44,7 +44,9 @@ import { ProcessTransport } from "./transports/process-transport.js";
 import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
+import { resolveAgentSpawner } from "./spawner.js";
 import type {
+  AgentSpawner,
   FabricBudgetSummary,
   FabricSteeringMode,
   FabricAgentLog,
@@ -323,6 +325,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   routePin?: Readonly<NonNullable<AgentRunRequest["routeDecision"]>["pin"]>;
   actorId?: string;
   actorName?: string;
+  spawner?: AgentSpawner;
   capabilityRequirements?: string[];
   capabilityDigest?: string;
   runnerSessionId?: string;
@@ -582,6 +585,7 @@ const failedRecord = (
     ...(managed.latestRecord?.admittedThinking ? { admittedThinking: managed.latestRecord.admittedThinking } : {}),
     ...(managed.actorId ? { actorId: managed.actorId } : {}),
     ...(managed.actorName ? { actorName: managed.actorName } : {}),
+    ...(managed.spawner ? { spawner: managed.spawner } : {}),
     ...(managed.runnerSessionId ? { runnerSessionId: managed.runnerSessionId } : {}),
     ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
     ...(managed.transport.attachCommand ? { attachCommand: managed.transport.attachCommand } : {}),
@@ -637,6 +641,7 @@ export class AgentManager {
   readonly #kernel: () => FabricKernel;
   readonly #pythonRuntime: () => FabricPythonRuntime;
   readonly #mainAgentId: string | undefined;
+  readonly #spawner: AgentSpawner | undefined;
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
   readonly #projectRoot: string;
@@ -645,6 +650,7 @@ export class AgentManager {
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
+  readonly #onBeforeResultReturned: ((id: string) => void) | undefined;
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
   readonly #onSettled: ((result: AgentRunResult) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
@@ -701,6 +707,8 @@ export class AgentManager {
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult) => void;
       onResultConsumed?: (id: string) => void;
+      /** Fail-closed durable fence before a foreground value reaches its caller. */
+      onBeforeResultReturned?: (id: string) => void;
       onStoppedAtClose?: (results: AgentRunResult[]) => void;
       /** Every terminal result, foreground or background, before its run directory can be removed. */
       onSettled?: (result: AgentRunResult) => void;
@@ -729,6 +737,7 @@ export class AgentManager {
       options.vedaBinary ?? process.env.PI_FABRIC_VEDA_BINARY ?? config.veda.binary;
     this.#onBackgroundComplete = options.onBackgroundComplete;
     this.#onResultConsumed = options.onResultConsumed;
+    this.#onBeforeResultReturned = options.onBeforeResultReturned;
     this.#onStoppedAtClose = options.onStoppedAtClose;
     this.#onSettled = options.onSettled;
     this.#onLifecycle = options.onLifecycle;
@@ -748,6 +757,7 @@ export class AgentManager {
       options.projectRoot ?? process.env.PI_FABRIC_PROJECT_ROOT ?? cwd;
     this.#hostId = options.hostId ?? process.env.PI_FABRIC_HOST_ID;
     this.#identityId = options.identityId ?? process.env.PI_FABRIC_IDENTITY_ID;
+    this.#spawner = resolveAgentSpawner(this.#identityId, this.#mainAgentId);
     const inheritedBudget = activeBudgetState();
     this.#budget =
       inheritedBudget ??
@@ -1156,7 +1166,12 @@ export class AgentManager {
         const componentGuidance = recursive
           ? undefined
           : this.#resolveParticipantGuidance?.({ ...(model ? { model } : {}), runner })?.trim();
-        const systemPrompt = [request.systemPrompt?.trim(), componentGuidance]
+        const spawnerGuidance = runner === "pi" && extensions && this.#spawner && this.#spawner.kind !== "main"
+          ? `Your immediate Fabric spawner is ${this.#spawner.kind} ${this.#spawner.id}${this.#spawner.runId ? ` (run ${this.#spawner.runId})` : ""}. ` +
+            "Your final result is returned to that spawner automatically. For addressed updates use agents.followUp({id:'spawner',message:'...'}); " +
+            "agents.spawner() discovers this binding. The 'main' target is the lineage root, NOT an actor spawner."
+          : undefined;
+        const systemPrompt = [request.systemPrompt?.trim(), componentGuidance, spawnerGuidance]
           .filter((section): section is string => Boolean(section))
           .join("\n\n") || undefined;
         const sessionExportDir = resolveSessionExportDir(this.config);
@@ -1201,6 +1216,8 @@ export class AgentManager {
           "--full-code-mode",
           String(inheritedFullCodeMode),
           ...(this.#mainAgentId ? ["--main-agent-id", this.#mainAgentId] : []),
+          ...(this.#spawner ? ["--spawner-id", this.#spawner.id, "--spawner-kind", this.#spawner.kind,
+            ...(this.#spawner.runId ? ["--spawner-run", this.#spawner.runId] : [])] : []),
           ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
           "--extensions",
           String(extensions),
@@ -1323,6 +1340,7 @@ export class AgentManager {
           ...(routePin ? { routePin } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
           ...(request.actorName ? { actorName: request.actorName } : {}),
+          ...(this.#spawner ? { spawner: this.#spawner } : {}),
           ...(request.capabilityRequirements
             ? { capabilityRequirements: [...request.capabilityRequirements] }
             : {}),
@@ -1395,7 +1413,7 @@ export class AgentManager {
           return this.#queuedInfo(queued);
         }
         release();
-        try { routeDispatch?.outcome({ status: "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
+        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
         if (worktree && !runTreeExitVeto(runDirectory)) await this.#worktrees.cleanup(id, true).catch(() => false);
         throw error;
       }
@@ -1429,6 +1447,7 @@ export class AgentManager {
         ? { thinking: request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking } : {}),
       ...(request.actorId ? { actorId: request.actorId } : {}),
       ...(request.actorName ? { actorName: request.actorName } : {}),
+      ...(this.#spawner ? { spawner: this.#spawner } : {}),
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
@@ -1561,11 +1580,13 @@ export class AgentManager {
   async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal; deferConsumption?: (consume: () => void, abandon?: () => void) => void } = {}): Promise<AgentRunResult> {
     const previous = this.#previousRun(id);
     if (previous) {
+      this.prepareForeground(id);
       if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id));
       else this.#onResultConsumed?.(id);
       return previous;
     }
     const consumed = (): void => {
+      this.prepareForeground(id);
       if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id), () => this.detachSignal(id));
       else this.#onResultConsumed?.(id);
     };
@@ -1626,7 +1647,12 @@ export class AgentManager {
     });
   }
 
+  prepareForeground(id: string): void {
+    this.#onBeforeResultReturned?.(id);
+  }
+
   markForeground(id: string): void {
+    this.prepareForeground(id);
     if (!this.#previousRun(id)) {
       const queued = this.#queued.get(id);
       if (queued) queued.background = false;
@@ -2243,6 +2269,8 @@ export class AgentManager {
     });
     for (const managed of expired) {
       if (!this.#canCollect(managed)) continue;
+      // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
+      if (!canRemoveTerminalRun(managed.runDirectory)) continue;
       await removeTree(managed.runDirectory).catch(() => undefined);
       if (!fs.existsSync(managed.runDirectory)) this.#runs.delete(managed.id);
     }
@@ -3025,6 +3053,7 @@ export class AgentManager {
       ...(thinking ? { thinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),
+      ...(managed.spawner ? { spawner: managed.spawner } : {}),
       ...(managed.capabilityRequirements
         ? { capabilityRequirements: [...managed.capabilityRequirements] }
         : {}),
@@ -3091,6 +3120,7 @@ export class AgentManager {
       ...(thinking ? { thinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),
+      ...(managed.spawner ? { spawner: managed.spawner } : {}),
       ...(managed.capabilityRequirements
         ? { capabilityRequirements: [...managed.capabilityRequirements] }
         : {}),

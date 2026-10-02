@@ -59,7 +59,8 @@ import {
   ActionRegistry,
   type FabricCapabilityViewLease,
 } from "./core/action-registry.js";
-import { FabricSessionApprovals } from "./core/approval-controller.js";
+import { ApprovalController, FabricSessionApprovals } from "./core/approval-controller.js";
+import { runAbortable } from "./async-settlement.js";
 import { CompactController, type CompactLastCommit, type CompactPendingIntent } from "./core/compact-controller.js";
 import { FabricToolResultProxy } from "./core/tool-result-proxy.js";
 import { FabricExecutionService, type FabricExecutionResult } from "./execution-service.js";
@@ -134,6 +135,8 @@ import {
 import { participantProject, participantRole } from "./topology/project-identity.js";
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
+import { ActorChildCompletionStore } from "./actors/child-completions.js";
+import { resolveAgentSpawner } from "./agents/spawner.js";
 import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
@@ -695,7 +698,11 @@ export class FabricRuntimeState {
       }
       return { key: `${resolved.provider}/${resolved.id}`, model };
     };
-    const completionInbox = new AgentCompletionInbox(this.pi, context);
+    const actorSpawner = identity.kind === "actor" ? resolveAgentSpawner(identity.id, mainAgentId) : undefined;
+    const actorSessionFile = process.env.PI_FABRIC_ACTOR_SESSION_FILE?.trim() || context.sessionManager.getSessionFile?.();
+    const actorChildStore = actorSpawner && actorSessionFile ? new ActorChildCompletionStore(actorSessionFile) : undefined;
+    const completionInbox = new AgentCompletionInbox(this.pi, context,
+      actorChildStore ? (ids) => actorChildStore.consumeLiveBatch(ids) : undefined);
     this.#completionInbox = completionInbox;
     let markStoppedDelivered = (_id: string): void => {};
     recordMainRelease(sessionId, loadedFabricRoot(import.meta.url));
@@ -754,12 +761,35 @@ export class FabricRuntimeState {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publishBackground(event);
       },
-      onBackgroundComplete: (result) => completionInbox.enqueue(result),
+      // Spool until consumption or handoff, independently of notification policy.
+      onSettled: (result) => {
+        if (actorChildStore && actorSpawner) actorChildStore.enqueue(result, actorSpawner, agentConfig.notifyOnComplete);
+      },
+      onBackgroundComplete: (result) => {
+        completionInbox.enqueue(result,
+          actorChildStore ? () => actorChildStore.acknowledge(result.id) : undefined,
+          actorChildStore ? () => actorChildStore.prepareLive(result.id) : undefined);
+      },
+      onBeforeResultReturned: (id) => {
+        // ponytail: commit BEFORE returning to the actor program, not in the
+        // deferred post-delivery callback. Retry a transient receipt failure once;
+        // persistent failure rejects the observation, making returned-but-unrecorded impossible.
+        if (actorChildStore) {
+          try { actorChildStore.consume(id, { handoff: true }); } catch {
+            actorChildStore.consume(id, { handoff: true });
+          }
+        }
+      },
       onResultConsumed: (id) => {
         completionInbox.acknowledge(id);
+        try { actorChildStore?.discard(id); } catch { /* Cleanup must not turn a returned outcome into a wait failure. */ }
         markStoppedDelivered(id);
       },
       onStoppedAtClose: (results) => {
+        if (actorChildStore && actorSpawner) {
+          for (const result of results) actorChildStore.enqueue(result, actorSpawner, agentConfig.notifyOnComplete);
+          return;
+        }
         rememberStoppedAtClose(sessionId, results);
         this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, { stopped: results });
       },
@@ -938,14 +968,30 @@ export class FabricRuntimeState {
       false,
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
       () => this.pi.getThinkingLevel(),
-      (request, signal) => {
+      (request, signal, invocation) => {
         const owner = routeOwner;
         if (!owner || owner.signal.aborted) throw new Error("Jev routing unavailable");
-        // Optional shadow inference cannot borrow the agent action's approval.
-        // Only an explicit current host network allow authorizes this internal call;
-        // ask/auto/deny (including inherited grants) take the recorded pinned fallback.
-        if (this.#config?.approvals.network !== "allow") throw new Error("Jev shadow routing requires explicit network allow");
-        const pending = owner.client.evaluate(request, AbortSignal.any([signal, owner.signal])).catch(error => {
+        const routeSignal = AbortSignal.any([signal, owner.signal]);
+        const pending = (async () => {
+          // agents.spawn approval grants agent work, not Jev network access. Use
+          // the current ordinary jev.evaluate policy before touching credentials.
+          // Ungranted `auto`/`ask` is refused before the approval queue (SR-8/9):
+          // neither classifier work nor a host dialog can be owned by routeSignal.
+          // Record pinned fallback instead; no approval cleanup debt is created.
+          await runAbortable(routeSignal, async () => {
+            const action = await this.#registry!.describe("jev.evaluate", { ...invocation, signal: routeSignal });
+            routeSignal.throwIfAborted();
+            await this.#schema!.authorize(action.ref, invocation.parentToolCallId);
+            routeSignal.throwIfAborted();
+            const approval = new ApprovalController(
+              this.#config!.approvals, invocation.extensionContext, this.sessionApprovals,
+              this.execution.autoApprovalClassifier, undefined, this.execution.brokeredNetwork, true,
+            );
+            await approval.approve(action, request as unknown as Record<string, unknown>);
+          });
+          routeSignal.throwIfAborted();
+          return owner.client.evaluate(request, routeSignal);
+        })().catch(error => {
           if (owner.signal.aborted && !signal.aborted) throw new Error("Jev routing owner retired");
           throw error;
         });

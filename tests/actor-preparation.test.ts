@@ -51,6 +51,16 @@ const readQueue = (sessionFile: string) => {
 };
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks(); });
 
+describe("preparation documentation (#3307)", () => {
+  it("documents the separate preparation counter and three-requeue limit", () => {
+    const docs = fs.readFileSync("docs/agents.md", "utf8");
+    expect(docs).toContain("`preparationAttempts` incremented");
+    expect(docs).toContain("three preparation requeues");
+    expect(docs).toContain("terminal exhaustion");
+    expect(docs).not.toContain("with `attempts` incremented");
+  });
+});
+
 describe("round-three accepted-work regressions (#3167)", () => {
   it("persists one activation during each held retry cleanup and executes it once after owner recreation", async () => {
     let stalled = false;

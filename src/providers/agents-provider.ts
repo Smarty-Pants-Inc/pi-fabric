@@ -865,6 +865,7 @@ export class AgentsProvider implements FabricProvider {
           const result = this.manager.status(id);
           // Model-facing terminal status returns the result; UI polling must not acknowledge it.
           if (terminalAgentStatuses.has(result.status)) {
+            this.manager.prepareForeground(id);
             if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.detachSignal(id));
             else this.manager.markForeground(id);
           }
@@ -917,6 +918,9 @@ export class AgentsProvider implements FabricProvider {
         return this.participants.self();
       case "main":
         return this.mainAgent.info(context.extensionContext);
+      case "spawner":
+        if (!this.#router.spawner) throw new Error("This worker has no bound Fabric spawner; specify an explicit reply target");
+        return structuredClone(this.#router.spawner);
       case "sessions": {
         const stalled = this.participants.writeStalled?.();
         if (stalled) throw stalled;

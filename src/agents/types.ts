@@ -42,6 +42,13 @@ export interface AgentSessionSeed {
   outerToolResult: AgentToolResultMessage;
 }
 
+export interface AgentSpawner {
+  id: string;
+  kind: "main" | "agent" | "actor";
+  /** The activation that spawned the child; actor identity survives that run ending. */
+  runId?: string;
+}
+
 export interface AgentRunRequest {
   /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
   idempotencyKey?: string;
@@ -129,6 +136,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Immediate caller, distinct from the lineage Main. */
+  spawner?: AgentSpawner;
   /** Requested launch model; model below follows verified state/assistant attribution. */
   requestedModel?: string;
   /** Shadow-route children: model/effort verified at the pre-prompt admission boundary. */
@@ -158,6 +167,8 @@ export interface AgentRunRecord {
   finishedAt?: number;
   currentTool?: string;
   turns: number;
+  /** Actual model output/tool execution, not worker startup or an error-only turn. */
+  inferenceStarted?: boolean;
   toolCalls: number;
   text: string;
   /** How a structured reply arrived: its fabric_reply tool call (smarty-dev#967). */
@@ -200,6 +211,7 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  spawner?: AgentSpawner;
   /** Present on terminal status snapshots when the full log was retained. */
   compactionSkipped?: string;
   id: string;
@@ -252,6 +264,7 @@ export interface AgentWorkerOptions {
   depth: number;
   fullCodeMode: boolean;
   mainAgentId?: string;
+  spawner?: AgentSpawner;
   fabricSessionId?: string;
   extensions: boolean;
   tools: string[];

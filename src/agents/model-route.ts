@@ -17,10 +17,10 @@ export interface ModelRoutingConfig {
   shadowCandidates?: RouteCandidate[];
 }
 export type RouteReason = "shadow-choice" | "excluded-protected" | "excluded-unknown" | "excluded-class" |
-  "low-confidence" | "jev-error" | "jev-timeout" | "malformed" | "invalid-candidates" | "record-failed";
+  "judgment-agent" | "low-confidence" | "jev-error" | "jev-timeout" | "malformed" | "invalid-candidates" | "record-failed";
 export interface ModelRouteDecision extends RouteCandidate {
   decisionId: string;
-  mode: "shadow";
+  mode: "shadow" | "judgment";
   routeClass: string;
   parentSessionId: string;
   pin: RouteCandidate;
@@ -34,6 +34,7 @@ export interface ModelRouteDecision extends RouteCandidate {
 export type RouteEvaluate = (request: JevRequest, signal: AbortSignal) => Promise<JevResponse>;
 export const ROUTE_DEADLINE_MS = 2_500;
 export const ROUTE_THRESHOLD = 0.90;
+export const allocateDecisionId = (): string => randomUUID().replaceAll("-", "");
 
 /** One finite Choice. No prompt, task text, history, credentials or generated reason leaves Fabric. */
 export async function decideModelRoute(input: {
@@ -45,7 +46,7 @@ export async function decideModelRoute(input: {
   const candidates = [input.pin, ...input.candidates].filter((candidate, index, all) =>
     all.findIndex(other => other.model === candidate.model && other.effort === candidate.effort) === index);
   const decision: ModelRouteDecision = {
-    ...input.pin, decisionId: randomUUID().replaceAll("-", ""), mode: "shadow",
+    ...input.pin, decisionId: allocateDecisionId(), mode: "shadow",
     routeClass: input.routeClass, parentSessionId: input.parentSessionId, pin: { ...input.pin },
     candidates, shadowChoice: { ...input.pin }, confidence: null, probability: null,
     reasonCode: "jev-error", latencyMs: 0,
@@ -134,10 +135,10 @@ export function appendRouteRecord(file: string, record: object): void {
   }
 }
 
-export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string | undefined, runDirectory: string, childId: string): {
+export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string | undefined, runDirectory: string, childId: string, options: { ledger?: string; decisionRecorded?: boolean } = {}): {
   header: string; sessionFile?: string; bindSession: (cwd: string) => string; outcome: (result: Pick<AgentRunResult, "status"> & Partial<AgentRunResult>) => void;
 } {
-  const file = path.join(resolveAgentDir(), "fabric", "model-routing.jsonl");
+  const file = options.ledger ?? path.join(resolveAgentDir(), "fabric", "model-routing.jsonl");
   let sessionFile: string | undefined;
   // Record before admission; seed only once the run's final worktree is known.
   // A seed write failure must never fall back to a different working directory.
@@ -153,8 +154,10 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
     // Direct callers may already know the final cwd; manager binds after worktree creation.
     fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
     if (cwd !== undefined) bindSession(cwd);
-    appendRouteRecord(file, { type: "decision", ...decision, childSessionId: childId, childAgentId: childId, at: Date.now() });
-  } catch {
+    if (!options.decisionRecorded) appendRouteRecord(file, { type: "decision", ...decision, childSessionId: childId, childAgentId: childId, at: Date.now() });
+  } catch (error) {
+    // Judgment dispatch is fail-closed; only shadow routing may fall back.
+    if (decision.mode === "judgment") throw error;
     decision.reasonCode = "record-failed";
     Object.assign(decision, decision.pin);
     // Shadow failures never block pinned work. The header still carries the failed record's ID.

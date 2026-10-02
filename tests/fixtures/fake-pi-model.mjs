@@ -45,11 +45,11 @@ process.stdin.on("data", chunk => {
       reply(model);
       if (behavior === "reswitch") model = wrong;
     } else if (frame.type === "set_thinking_level") {
-      thinkingLevel = behavior === "effort-lower" ? "low" : behavior === "effort-off" ? "off" : behavior === "effort-missing" ? undefined : behavior === "effort-malformed" ? "invalid" : frame.level;
+      thinkingLevel = ["effort-lower", "effort-downgrade"].includes(behavior) ? "low" : behavior === "effort-off" ? "off" : behavior === "effort-missing" ? undefined : behavior === "effort-malformed" ? "invalid" : frame.level;
       reply();
     } else if (frame.type === "get_state") {
       reply(behavior === "malformed" ? {} : {
-        model, thinkingLevel, isStreaming: false, isCompacting: false,
+        model, ...(behavior === "effort-missing" ? {} : { thinkingLevel: behavior === "effort-malformed" ? "turbo" : thinkingLevel }), isStreaming: false, isCompacting: false,
         ...(activation ? {
           autoCompactionEnabled: activation === "still-enabled",
           ...(activation === "ignored-flag" ? {} : { autoCompactionDisabledForProcess: true }),
@@ -58,7 +58,7 @@ process.stdin.on("data", chunk => {
     } else if (frame.type === "prompt") {
       emit({ type: "agent_start" });
       const actual = behavior === "drift" ? wrong : model;
-      const message = { role: "assistant", provider: actual.provider, model: actual.id, content: [{ type: "text", text: "correct model ran" }], stopReason: "stop", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0 } };
+      const message = { role: "assistant", provider: actual.provider, model: actual.id, content: [{ type: "text", text: behavior === "refusal" ? "I refuse this judgment." : "correct model ran" }], stopReason: "stop", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0 } };
       emit({ type: "message_start", message });
       emit({ type: "message_end", message });
       // Late events must never erase the model mismatch failure.

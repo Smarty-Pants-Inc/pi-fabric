@@ -12,7 +12,9 @@ export type FabricSandboxTerminationReason =
 /** Immutable resident fence facts, never reconstructed from guest-controlled prose. */
 export interface FabricResidentOutcomeReceipt {
   readonly requestId: string;
-  readonly state: "committed" | "unknown";
+  readonly state: "committed" | "unknown" | "expired";
+  /** Expiry is replay classification, not proof that the mutation was rejected. */
+  readonly expired?: true;
   readonly operation: string;
   readonly entityKind: "agent" | "actor";
   readonly id?: string;

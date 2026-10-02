@@ -52,6 +52,20 @@ describe("unknown terminal causes", () => {
   it("does not infer after the pre-record consumed the total deadline", async () => { const request = input(); request.timeboxMs = 1; vi.spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(100); expect(await judge(request, deps)).toMatchObject({ verdict: "unknown", reasonCode: "timeout" }); expect(deps.evaluate).not.toHaveBeenCalled(); expect(deps.agent).not.toHaveBeenCalled(); expect(rows()[0].type).toBe("decision"); });
   it.each([3000, 6000])("rejects a late high-confidence Jev result even before timer delivery: %s ms", async delay => { const clock = vi.spyOn(performance, "now").mockReturnValue(0); deps.evaluate = vi.fn(async () => { clock.mockReturnValue(delay); return response(); }); expect(await judge(input(), deps)).toMatchObject({ verdict: "unknown", reasonCode: "timeout" }); expect(deps.agent).not.toHaveBeenCalled(); });
   it("rejects a late valid agent reply rather than accepting a stale judgment", async () => { const clock = vi.spyOn(performance, "now").mockReturnValue(0); deps.evaluate = vi.fn(async () => response(.5)); deps.agent = vi.fn(async () => { clock.mockReturnValue(6000); return workerResult(); }); expect(await judge(input(), deps)).toMatchObject({ verdict: "unknown", reasonCode: "timeout" }); });
+  it.each(["timeout", "cancelled"])("preserves an unresolved cleanup receipt over %s", async cause => {
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    const abort = new AbortController();
+    deps.evaluate = vi.fn(async () => response(.5));
+    deps.agent = vi.fn(async () => {
+      if (cause === "timeout") clock.mockReturnValue(6000);
+      else abort.abort();
+      return workerResult({ status: "failed", error: "agent_cleanup_unresolved: retained receipt root /probe" });
+    });
+    expect(await judge(input(), deps, abort.signal)).toMatchObject({ verdict: "unknown", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 15 } });
+    expect(rows().find(row => row.backend === "pi-process")).toMatchObject({ childAgentId: "child", status: "failed", usage: { input: 4, output: 5, cacheRead: 1 } });
+    expect(rows().at(-1)).toMatchObject({ type: "judgment-outcome", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 15 } });
+    expect(deps.agent).toHaveBeenCalledTimes(1);
+  });
   it("times out a noncooperative Jev in 2.5s", async () => { vi.useFakeTimers(); deps.evaluate = vi.fn(() => new Promise<JevResponse>(() => {})); const pending = judge(input(), deps); await vi.advanceTimersByTimeAsync(2500); expect(await pending).toMatchObject({ verdict: "unknown", reasonCode: "timeout" }); expect(deps.agent).not.toHaveBeenCalled(); });
   it("cancellation aborts Jev and does not dispatch", async () => { const abort = new AbortController(); deps.evaluate = vi.fn(() => new Promise<JevResponse>(() => {})); const pending = judge(input(), deps, abort.signal); abort.abort(); expect(await pending).toMatchObject({ verdict: "unknown", reasonCode: "cancelled" }); expect(deps.agent).not.toHaveBeenCalled(); });
   it.each([ ["timed_out", "", "timeout"], ["stopped", "", "cancelled"], ["failed", "Structured output invalid", "invalid_schema"], ["failed", "model refusal", "refusal"], ["failed", "max tokens reached", "token_budget"], ["failed", "worker died", "agent_failed"] ])("worker %s/%s returns %s", async (status, error, reasonCode) => { deps.evaluate = vi.fn(async () => response(.5)); deps.agent = vi.fn(async () => workerResult({ status: status as AgentRunResult["status"], error })); expect(await judge(input(), deps)).toMatchObject({ verdict: "unknown", reasonCode }); });

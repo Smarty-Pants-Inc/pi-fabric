@@ -682,30 +682,34 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const stoppedUndelivered = readStoppedRuns(context.sessionManager?.getEntries?.() ?? []).undelivered.length > 0;
     // A self-reload (smarty-dev#2160) re-arms the actors this Main hosts and reports on the mesh.
     const selfReloaded = selfReload.sessionStart(event?.reason ?? "", context);
-    if (selfReloaded && context.hasUI) {
-      const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
-      context.ui.notify(notice, "info");
-      // The TUI's own "Reloaded ..." status line replaces an info notice; the footer keeps it
-      // until the user's next input.
-      context.ui.setStatus(SELF_RELOAD_STATUS, notice);
-    }
-    const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
-    const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
-    if (residentProbe && (context.mode !== "rpc" || !process.env.PI_FABRIC_PARENT_RUN)) {
-      throw new Error("resident startup probe requires a bound RPC worker");
-    }
-    if (residentProbe || stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
-    if (residentProbe) {
-      // Pi redirects console/stdout during extension startup; the native RPC
-      // descriptor carries a positive ACK only after this generation activated.
-      writeSync(1, `${JSON.stringify({ type: "fabric_resident_extension_ready", protocol: 1,
-        runId: process.env.PI_FABRIC_PARENT_RUN, nonce: probeNonce, extension: FABRIC_EXTENSION_ENTRY_PATH })}\n`);
-    }
-    if (selfReloaded) {
-      await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
-        ...selfReloaded,
-        sessionId: context.sessionManager.getSessionId(),
-      });
+    const { releaseSlot, ...reloadReport } = selfReloaded ?? {};
+    try {
+      if (selfReloaded && context.hasUI) {
+        const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
+        context.ui.notify(notice, "info");
+        // Keep the notice after the TUI's own reload status line replaces it.
+        context.ui.setStatus(SELF_RELOAD_STATUS, notice);
+      }
+      const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
+      const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
+      if (residentProbe && (context.mode !== "rpc" || !process.env.PI_FABRIC_PARENT_RUN)) {
+        throw new Error("resident startup probe requires a bound RPC worker");
+      }
+      if (residentProbe || stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+      if (residentProbe) {
+        // Positive native ACK is published only after this generation activated.
+        writeSync(1, `${JSON.stringify({ type: "fabric_resident_extension_ready", protocol: 1,
+          runId: process.env.PI_FABRIC_PARENT_RUN, nonce: probeNonce, extension: FABRIC_EXTENSION_ENTRY_PATH })}\n`);
+      }
+      if (selfReloaded) {
+        await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
+          ...reloadReport,
+          sessionId: context.sessionManager.getSessionId(),
+        });
+      }
+    } finally {
+      // Hold the lease through activation, actor re-arm and reporting, even on failure.
+      releaseSlot?.();
     }
   });
 
@@ -1116,8 +1120,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       details: {},
     };
     if (!fabricProvenanceSupported(pi)) return { message, systemPrompt: `${systemPrompt}\n\n${guidance}` };
-    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
-    () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
     return { systemPrompt: `${systemPrompt}\n\n${guidance}` };
   });
 
@@ -1150,8 +1153,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       details: { names: fresh, origin: "skill" },
     };
     if (!fabricProvenanceSupported(pi)) return { message };
-    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
-    () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
   });
 
   // Work events a steer missed reach the Main with its next turn (smarty-dev#754).
@@ -1240,6 +1242,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       ? state.agents.runningCount() + state.actors.inFlightCount() + state.backgroundWorkCount()
       : 0,
     autoReloadConfigured: () => state.provisionalConfig().autoReload,
+    selfReloadConcurrency: () => state.provisionalConfig().selfReloadConcurrency,
     moduleUrl: import.meta.url,
     publishHeld: data => { void state.publishOpsEvent(RELOAD_HELD_TOPIC, "fabric.reload_held", data); },
     // Escape's stop-the-world halt of actors or Jev observers (mesh off too); the user's next

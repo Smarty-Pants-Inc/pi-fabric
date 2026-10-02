@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricState } from "../fabric-state.js";
 import { assertFabricModelAllowed } from "../core/model-policy.js";
-import { fabricHostIdentity, resolveFabricIdentity, sendFabricMessage } from "../fabric-provenance.js";
+import { resolveFabricIdentity, sendFabricMessage } from "../fabric-provenance.js";
 import {
   PREWALK_ARMED_MESSAGE_TYPE,
   hasPrewalkArmedPrompt,
@@ -51,7 +51,7 @@ export const armFabricPrewalkSession = async (
         display: false,
         details: { mode: prewalk.mode, model: input.model },
       },
-      { deliverAs: "nextTurn" }, fabricHostIdentity(sessionId), "actor", "mesh",
+      { deliverAs: "nextTurn" },
     );
   }
   context.ui.setStatus("fabric-prewalk", `armed (${prewalk.mode}) → ${input.model}`);

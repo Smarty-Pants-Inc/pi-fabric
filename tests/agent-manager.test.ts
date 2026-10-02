@@ -2048,6 +2048,13 @@ describe("AgentManager", () => {
     };
 
     try {
+      vi.stubEnv("SMARTY_ROLE", "worktree-agent@0123456789ab");
+      vi.stubEnv("PI_FABRIC_ACTOR_NAME", undefined);
+      vi.stubEnv("PI_FABRIC_ROLE", "worktree-agent");
+      expect(await report()).toEqual({ role: "task-agent@0123456789ab", actorName: null, fabricRole: null });
+      expect(await report("security-review")).toEqual({
+        role: "worktree-agent@0123456789ab", actorName: "security-review", fabricRole: "worktree-agent",
+      });
       vi.stubEnv("SMARTY_ROLE", "worktree-agent@abc123");
       vi.stubEnv("PI_FABRIC_ACTOR_NAME", undefined);
       vi.stubEnv("PI_FABRIC_ROLE", undefined);
@@ -2060,12 +2067,12 @@ describe("AgentManager", () => {
       expect(await report("security-review")).toEqual({
         role: null, actorName: "security-review", fabricRole: null,
       });
-      // A task must not impersonate its spawning actor (#2643). Explicit actor launches
-      // above keep their own identity; the separate project-role metadata stays inherited.
+      // A task must not impersonate its spawning actor (#2643) or retain its
+      // spawner-only role override (#2998). Explicit actors retain their own identity.
       vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
       vi.stubEnv("PI_FABRIC_ROLE", "project-agent");
       expect(await report()).toEqual({
-        role: "task-agent", actorName: null, fabricRole: "project-agent",
+        role: "task-agent", actorName: null, fabricRole: null,
       });
     } finally {
       vi.unstubAllEnvs();

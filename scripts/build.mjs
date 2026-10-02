@@ -35,6 +35,7 @@ const primaryEntryPoints = [
 const lazyEntryPoints = [
   "src/core/literal-bash-guard.ts",
   "src/lifecycle/reload-target-profile.ts",
+  "src/lifecycle/reload-slots.ts",
   "src/coordination/unverified-ids.ts",
   "src/core/provider-operations.ts",
   "src/agents/claude-cli.ts",

@@ -1,15 +1,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { windowsDataRoot } from "./windows-temp-root.js";
 
 /** File data only: socket/pipe paths must keep their short transport-specific roots. */
 export const fabricDataRoot = (): string => {
   const root = process.env.PI_FABRIC_TMPDIR;
   if (!root) return os.tmpdir();
+  if (process.platform === "win32") return windowsDataRoot(root);
   if (!path.isAbsolute(root)) throw new Error("PI_FABRIC_TMPDIR must be an absolute path");
-  // POSIX mode/uid checks cannot establish Windows ACL safety. Keep that override out
-  // of scope rather than accepting an unverified namespace; OS-temp fallback is unchanged.
-  if (process.platform === "win32") throw new Error("PI_FABRIC_TMPDIR is unsupported on Windows until namespace ACL validation is available");
   const fail = (directory: string, reason: string): never => {
     throw new Error(`PI_FABRIC_TMPDIR is unsafe: ${directory} ${reason}`);
   };

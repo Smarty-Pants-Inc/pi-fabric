@@ -150,6 +150,7 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 - [Records](docs/records.md): the org's append-only record in its own PostgreSQL, with idempotent appends, cursor reads, mesh nudges and archive admission.
 - [Memory & recall](docs/memory-recall.md): compact ranked hits, uniform follow calls, lossless expansion, and guest-local `memory.walk` computation.
 - [Interface & commands](docs/interface.md): dashboard, settings, keybindings, slash commands, and headless runs.
+- [Shadow task model routing](docs/model-routing.md): opt-in `model: "auto"`, required role pins, decision/outcome ledger, and provider attribution (never changes the launched model).
 - [Agents, actors & mesh](docs/agents.md): model handoff, `/fabric prewalk`, runners, transports, actors, councils, recursive queries, and durable coordination.
 - [Participants CLI](docs/participants-cli.md): `fabric-participants --json`, the mesh's live participants as JSON for readers outside Pi.
 - [Durable residency through Pi](docs/residency-runtime.md): background host lifecycle and the Pi-runtime launcher boundary.

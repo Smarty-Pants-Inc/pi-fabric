@@ -67,6 +67,46 @@ describe("read-only release report", () => {
       pid: 20, mainId: "session:session-one", loaded: "old", active: "active",
     })]);
   });
+  it.each(["non-Pi", "Pi"])("contains an invalid observed %s profile without losing a valid Main", kind => {
+    const f = fixture();
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(f.root, "observer-profile"));
+    f.process(10, 1, ["pi"]);
+    f.record(10, "session-one");
+    f.process(11, 1, kind === "Pi" ? ["pi"] : ["unrelated-service"],
+      { PI_CODING_AGENT_DIR: "file:///tmp/profile%" });
+
+    const report = collectHostReleases({ procRoot: f.procRoot });
+    expect(report.mains.find(main => main.pid === 10)).toMatchObject({
+      mainId: "session:session-one", loaded: "old", active: "active", evidence: "runtime-record",
+    });
+    expect(report.skippedProcesses).toBe(1);
+    if (kind === "Pi") {
+      expect(report.mains.find(main => main.pid === 11)).toMatchObject({
+        loaded: "unknown", active: "unknown", evidence: "unknown",
+      });
+      expect(report.mains).toHaveLength(2);
+    } else {
+      expect(report.mains).toHaveLength(1);
+    }
+  });
+
+  it("keeps invalid-profile workers visible without using the observer's selector", () => {
+    const f = fixture();
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.dirname(f.settingsPath));
+    f.process(10, 1, ["pi"]);
+    f.record(10, "session-one");
+    f.process(20, 10, ["node", path.join(f.root, "releases", "old", "dist", "worker.js"),
+      "--id", "run-20", "--main-agent-id", "session:session-one"],
+    { PI_CODING_AGENT_DIR: "file:///tmp/profile%" });
+
+    const report = collectHostReleases({ procRoot: f.procRoot });
+    expect(report.skippedProcesses).toBe(1);
+    expect(report.mains).toHaveLength(1);
+    expect(report.mains[0]).toMatchObject({ pid: 10, active: "active", workers: [
+      { pid: 20, loaded: "old", active: "unknown" },
+    ] });
+  });
+
   it("groups live Main and actor workers using loaded paths, not the active selector", () => {
     const f = fixture();
     f.process(10, 1, ["pi"]);

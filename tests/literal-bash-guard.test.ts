@@ -144,8 +144,40 @@ describe("literal-only signal and recursive-delete guard", () => {
   ])("refuses ANSI-C decoded separators/letters in opaque receivers: %s", command => {
     expect(bashGuardRefusal(command, tmpdir)).toBe(OPAQUE_REASON);
   });
+  // Astra round-2 F1: outer quotes must not hide nested ANSI-C decoding, and NUL ends the segment.
+  // These signal/delete witnesses are scanner DATA only, never commands to execute.
+  it.each([
+    "echo \"$(bash -c $'pkill\\tworker')\"",
+    "echo \"$(bash -c $'rm\\t-rf /outside')\"",
+    "echo \"`bash -c $'pkill\\tworker'`\"",
+    "echo \"`bash -c $'rm\\t-rf /outside'`\"",
+    "echo \"$'pkill\\tworker'\"", // Deliberate conservative over-decoding of literal double-quoted text.
+    ...["\\000", "\\x00", "\\u0000", "\\c@"].flatMap(nul => [
+      `env $'pkill${nul}suffix' -f worker`,
+      `env $'rm${nul}suffix' -rf /outside`,
+    ]),
+    "env $'pkill\\000suff\\'ix' -f worker",
+    "env $'echo\\000discard' $'pkill\\tworker'",
+    "echo \"$(bash -c $'kill\\t-0 999999999')\"",
+    "env $'kill\\000x' -0 999999999",
+  ])("refuses nested or NUL-terminated ANSI-C protected evidence: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBe(OPAQUE_REASON);
+  });
+  it.each([
+    "env $'echo\\000\\q'", "env $'echo\\000unterminated",
+  ])("keeps malformed ANSI-C opaque receivers fail-closed after NUL: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBe(OPAQUE_REASON);
+  });
+  it.each([
+    "bash -c $'echo\\000pkill\\tworker'", "env $'echo\\000rm\\t-rf /outside'",
+    "echo \"$(bash -c $'echo\\tok')\"", "echo \"`bash -c $'echo\\tok'`\"",
+  ])("drops NUL suffixes and still allows harmless nested ANSI-C text: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBeUndefined();
+  });
   it.each([
     "bash -c $'echo\\qx'", "bash -c $'echo unterminated", "sh -c $'\\xZZ'", "eval $'\\k'",
+    "echo \"$(bash -c $'echo\\qx')\"", "echo \"$(bash -c $'echo unterminated)\"",
+    "echo \"`bash -c $'echo\\qx'`\"", "echo \"`bash -c $'echo unterminated`\"",
   ])("refuses undecodable or unterminated ANSI-C quoting in an opaque receiver: %s", command => {
     expect(bashGuardRefusal(command, tmpdir)).toBe(OPAQUE_REASON);
   });

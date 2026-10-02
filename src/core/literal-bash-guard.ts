@@ -225,45 +225,41 @@ const OPAQUE_RECEIVERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "mksh", "b
   "watch", "source", ".", "parallel", "script"]);
 
 /**
- * Rewrites each ANSI-C quoted $'...' segment to the bytes Bash decodes, so `$'pkill\tworker'`
- * scans as `pkill<TAB>worker`. Lexical only: other quoting is copied verbatim. `ok` is false for
- * an escape this decoder does not model or an unterminated segment.
+ * Rewrites every $'...' occurrence, including inside outer quotes and substitutions, so
+ * `$'pkill\tworker'` scans as `pkill<TAB>worker`. Over-decoding literal text is conservative.
+ * NUL truncates the segment as in Bash; `ok` is false for unmodelled escapes or missing closure.
  */
 function decodeAnsiC(source: string): { text: string; ok: boolean } {
-  let out = "", ok = true, quote = "";
+  let out = "", ok = true;
   for (let i = 0; i < source.length; i++) {
     const c = source[i]!;
-    if (quote) {
-      out += c;
-      if (quote === '"' && c === "\\" && i + 1 < source.length) out += source[++i];
-      else if (c === quote) quote = "";
-      continue;
-    }
-    if (c === "\\") { out += c + (source[++i] ?? ""); continue; }
-    if (c === "'" || c === '"') { quote = c; out += c; continue; }
     if (c !== "$" || source[i + 1] !== "'") { out += c; continue; }
-    let closed = false;
+    let closed = false, truncated = false;
+    const append = (value: string): void => {
+      if (value === "\0") truncated = true;
+      if (!truncated) out += value;
+    };
     for (i += 2; i < source.length; i++) {
       const d = source[i]!;
       if (d === "'") { closed = true; break; }
-      if (d !== "\\") { out += d; continue; }
+      if (d !== "\\") { append(d); continue; }
       const e = source[++i];
       if (e === undefined) break;
-      if (Object.hasOwn(ANSI_SIMPLE, e)) { out += ANSI_SIMPLE[e]; continue; }
+      if (Object.hasOwn(ANSI_SIMPLE, e)) { append(ANSI_SIMPLE[e]!); continue; }
       const run = Object.hasOwn(ANSI_RUNS, e) ? ANSI_RUNS[e]!.exec(source.slice(i + 1)) : null;
       if (run) {
         const code = Number.parseInt(run[0], 16);
         if (code > 0x10ffff) { ok = false; continue; }
-        out += String.fromCodePoint(code); i += run[0].length; continue;
+        append(String.fromCodePoint(code)); i += run[0].length; continue;
       }
       const octal = /^[0-7]{1,3}/.exec(source.slice(i));
-      if (octal) { out += String.fromCharCode(Number.parseInt(octal[0], 8) & 0xff); i += octal[0].length - 1; continue; }
+      if (octal) { append(String.fromCharCode(Number.parseInt(octal[0], 8) & 0xff)); i += octal[0].length - 1; continue; }
       if (e === "c" && i + 1 < source.length) {
         const x = source[++i]!;
         if (x === "\\" && source[i + 1] === "\\") i++; // Bash spells control-backslash as \c\\.
-        out += String.fromCharCode(x.toUpperCase().charCodeAt(0) & 0x1f); continue;
+        append(String.fromCharCode(x.toUpperCase().charCodeAt(0) & 0x1f)); continue;
       }
-      ok = false; out += `\\${e}`; // Bash keeps unknown escapes literally; refusal decides below.
+      ok = false; append(`\\${e}`); // Bash keeps unknown escapes literally; refusal decides below.
     }
     if (!closed) ok = false;
   }
@@ -271,7 +267,9 @@ function decodeAnsiC(source: string): { text: string; ok: boolean } {
 }
 
 function opaqueReceiver(words: Word[]): boolean {
-  return words.some(word => OPAQUE_RECEIVERS.has(word.text.slice(word.text.lastIndexOf("/") + 1)));
+  // Outer double quotes can keep a substitution body in one word; look for lexical wrappers too.
+  return words.some(word => word.text.split(/[\s;|&()<>"'`=]+/).some(token =>
+    OPAQUE_RECEIVERS.has(token.slice(token.lastIndexOf("/") + 1))));
 }
 
 /**

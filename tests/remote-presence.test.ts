@@ -484,6 +484,18 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(directory.peers()).toEqual([expect.objectContaining({ id: remote.id, label: "PF-2@forge", name: "PF-2@forge", host: "forge" })]);
   });
 
+  it("shows a named mirrored root without losing its qualified label or id ownership", async () => {
+    const { directory, mirror, remote } = await setup();
+    await mirror({ record: { name: "lucky-ios-lead", label: "PF-2" } });
+    expect(directory.peers()).toEqual([expect.objectContaining({
+      id: remote.id, name: "lucky-ios-lead@forge", label: "PF-2@forge", host: "forge",
+    })]);
+    expect(directory.get(remote.id)).toMatchObject({
+      id: remote.id, name: "lucky-ios-lead", kind: "root", remoteHost: "forge",
+      rootId: remote.id, ownerHostId: remote.id, ownerIdentityId: remote.id, local: false,
+    });
+  });
+
   // Security review F2 on #132: one malformed mirror must not break discovery for the mesh.
   it("drops a mirror with malformed optional fields alone, logs it once, and peers still lists the healthy ones", async () => {
     const { mesh, directory, mirror, remote } = await setup();

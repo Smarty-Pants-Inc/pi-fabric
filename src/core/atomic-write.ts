@@ -120,6 +120,15 @@ const reapObstructingLock = (lock: string): boolean => {
   } catch { return false; }
 };
 const finishRecovery = (lock: string, marker: string): void => {
+  // A finisher may die after unlinking the completion flag. First put every
+  // completed/dead PID marker under an intrinsically recoverable done name;
+  // on rename denial leave the flag untouched for the next finisher.
+  if (!path.basename(marker).startsWith(`${recoveryPrefix(lock)}done-`)) {
+    const done = `${lock}.reap-done-${process.pid}-${randomUUID()}`;
+    try { renameAtomic(marker, done, { renameRetries: 1 }); }
+    catch { return; }
+    marker = done;
+  }
   const claim = path.join(marker, "lock");
   try { renameAtomic(claim, lock, { renameRetries: 1 }); }
   catch (error) {

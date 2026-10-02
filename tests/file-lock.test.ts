@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { withExclusiveFileLock, withExclusiveFileLockAsync } from "../src/core/file-lock.js";
+import { lockRecoveryBlocked } from "../src/core/atomic-write.js";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -16,6 +17,25 @@ const fixture = () => {
     directory, lockName: "current.lock", timeoutMessage: "test lock timeout", attempts: 3, delayMs: 1,
   } };
 };
+
+it("hands a completed live-PID marker to a recoverable name before removing its receipt", () => {
+  const { lock } = fixture();
+  const marker = `${lock}.reap-${process.pid}-finished`;
+  fs.mkdirSync(marker);
+  fs.writeFileSync(path.join(marker, "done"), "1\n");
+  const remove = fs.rmSync;
+  let receiptRemoved = false;
+  vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    if (String(target).endsWith(`${path.sep}done`)) {
+      receiptRemoved = true;
+      expect.soft(path.basename(path.dirname(String(target)))).toMatch(/^current\.lock\.reap-done-/);
+    }
+    remove(target, options);
+  });
+  expect(lockRecoveryBlocked(lock)).toBe(false);
+  expect(receiptRemoved).toBe(true);
+  expect(fs.existsSync(marker)).toBe(false);
+});
 
 describe.each(["sync", "async"] as const)("shared %s file-lock recovery", mode => {
   const run = (options: ReturnType<typeof fixture>["options"], operation: () => string) => mode === "sync"

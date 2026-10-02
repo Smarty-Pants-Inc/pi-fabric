@@ -45,6 +45,8 @@ export interface FabricMainAgentDeliveryRequest {
   from: MeshIdentity;
   /** Recorded admission only; absence (including old bridges) makes no sender claim. */
   verification?: "mesh" | "bridge";
+  /** Producer-owned resident classification, carried through durable admission; never request.data. */
+  source?: "actor-output" | "fabric-host" | undefined;
   /** Host-owned envelope metadata, never request.data. */
   principal?: FabricPrincipal | undefined;
   message: string;
@@ -170,9 +172,16 @@ export const followUpCoalesceKey = (data: unknown): string | undefined => {
   return typeof key === "string" && key.length > 0 && key.length <= 200 ? key : undefined;
 };
 
+/** Resident alarms historically used actor labels. Their durable receipt alone proves no authorship. */
+const mainSenderClaimAllowed = (sender: MeshIdentity, deliveryId: unknown, source: unknown): boolean =>
+  source !== "fabric-host" && !(sender.kind === "actor" && typeof deliveryId === "string" &&
+    deliveryId.startsWith("resident:") && source !== "actor-output");
+
 interface HeldAgentMessage {
   id: string;
   from: MeshIdentity;
+  /** Resident producer evidence, retained even on hosts without Pi provenance support. */
+  source?: FabricMainAgentDeliveryRequest["source"];
   /** Original verified admission, journalled before acknowledgement; never a Pi receipt stamp. */
   provenance?: FabricTurnProvenance | undefined;
   message: string;
@@ -418,9 +427,11 @@ export class MainAgentController implements FabricMainAgentTarget {
     const item: HeldAgentMessage = {
       id: randomUUID(),
       from: sender,
-      ...(request.verification === "mesh" || request.verification === "bridge" ? {
+      ...((request.verification === "mesh" || request.verification === "bridge") &&
+        mainSenderClaimAllowed(sender, deliveryId, request.source) ? {
         provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, request.verification, request.principal),
       } : {}),
+      ...(request.source === "actor-output" || request.source === "fabric-host" ? { source: request.source } : {}),
       message,
       sentAt: Date.now(),
       ...(request.data === undefined ? {} : { data: serializableData(request.data) }),
@@ -831,17 +842,19 @@ export class MainAgentController implements FabricMainAgentTarget {
           }
           // A policy this runtime cannot read is dropped: the item is then released as a held
           // followUp, as before policies were journalled.
-          const { deliverAs, triggerTurn, supersedes, provenance, ...rest } = item;
+          const { deliverAs, triggerTurn, supersedes, provenance, source, ...rest } = item;
           const via = provenance?.via;
           const verified = provenance?.sender?.verified;
           items.push({
             ...rest, from: sender,
             // Only a recorded admission method permits a claim. Old journals (native or
             // bridged) are UNKNOWN; payload fields and a missing bridge marker prove nothing.
-            ...(verified === "mesh" || verified === "bridge" ? {
+            ...((verified === "mesh" || verified === "bridge") &&
+              mainSenderClaimAllowed(sender, item.deliveryId, source) ? {
               provenance: fabricTurnProvenance(sender, via === "steer" || via === "followUp" || via === "actor" || via === "replay"
                 ? via : deliverAs === "steer" ? "steer" : "followUp", verified, provenance?.principal),
             } : {}),
+            ...(source === "actor-output" || source === "fabric-host" ? { source } : {}),
             ...(Array.isArray(supersedes) ? { supersedes: supersedes.filter((id) => typeof id === "string") } : {}),
             ...(DIRECT_DELIVERIES.has(deliverAs) && typeof triggerTurn === "boolean" ? { deliverAs, triggerTurn } : {}),
           });

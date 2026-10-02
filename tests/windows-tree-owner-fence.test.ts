@@ -24,6 +24,102 @@ afterEach(() => {
 // No real workers or descendants: taskkill and the captured worker are native-event mocks.
 // The unconfirmed native descendant intentionally has no Fabric status/identity file.
 describe("Windows tree-stop owner custody (#360 security R1)", () => {
+  it.each(["confirmed", "timeout", "stop-confirmed", "stop-failure"] as const)(
+    "joins normal terminal cleanup to captured close without releasing uncertain custody (%s)", async outcome => {
+      vi.useFakeTimers();
+      vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-normal-close-"));
+      const worker = Object.assign(new EventEmitter(), { pid: 2147483647, unref: vi.fn(), kill: vi.fn() });
+      const killer = Object.assign(new EventEmitter(), { pid: 2147483646, kill: vi.fn() });
+      let exited = false;
+      vi.mocked(spawn).mockReturnValueOnce(worker as unknown as ChildProcess).mockReturnValueOnce(killer as unknown as ChildProcess);
+      vi.spyOn(process, "kill").mockImplementation(() => {
+        if (exited) throw Object.assign(new Error("worker absent"), { code: "ESRCH" });
+        return true;
+      });
+      const manager = new AgentManager(process.cwd(), {
+        ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 60_000, maxConcurrent: 1, retainRuns: false, budgetUsd: 0,
+      }, { runRoot: root, workerPath: path.join(root, "mock-worker.mjs") });
+      let cleaning: Promise<void> | undefined;
+      let stopping: Promise<unknown> | undefined;
+      try {
+        Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+        const handle = await manager.spawn({ task: "successful terminal cleanup", transport: "process", actorId: "normal-close-owner" });
+        const run = manager.runDirectory(handle.id)!;
+        const record: AgentRunRecord = {
+          id: handle.id, name: handle.name, task: "successful terminal cleanup", status: "completed", runner: "pi",
+          transport: "process", sessionId: String(worker.pid), actorId: "normal-close-owner", cwd: process.cwd(),
+          startedAt: Date.now(), updatedAt: Date.now(), finishedAt: Date.now(), turns: 1, toolCalls: 0, text: "done",
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 },
+        };
+        fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(record));
+        const waiting = manager.wait(handle.id);
+        await vi.advanceTimersByTimeAsync(250);
+        expect(await waiting).toMatchObject({ status: "completed" });
+        let collected = false;
+        let cleanupError: unknown;
+        cleaning = manager.cleanup(handle.id).then(() => { collected = true; }, error => { cleanupError = error; });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(collected).toBe(false);
+        expect(cleanupError, "ordinary cleanup must join, not reject incidental native-close ordering").toBeUndefined();
+        expect(fs.existsSync(run)).toBe(true);
+        expect(manager.retentionReferences().has("normal-close-owner")).toBe(true);
+        await expect(manager.checkpointForRelease()).rejects.toThrow(/pending/);
+        const probe = await manager.spawn({ task: "native capacity stays owned", transport: "process" });
+        expect(probe.status).toBe("queued");
+        await manager.stop(probe.id);
+        const stoppingDuringJoin = outcome.startsWith("stop-");
+        if (stoppingDuringJoin) {
+          stopping = manager.stop(handle.id);
+          await vi.advanceTimersByTimeAsync(0);
+          expect(spawn).toHaveBeenCalledTimes(2);
+          // Explicit teardown still vetoes a second cleanup call immediately.
+          await expect(manager.cleanup(handle.id)).rejects.toThrow(/pending|teardown/);
+        }
+        exited = true;
+        worker.emit("exit", 0);
+        if (outcome !== "timeout") worker.emit("close", 0);
+        await vi.advanceTimersByTimeAsync(100);
+        if (stoppingDuringJoin) {
+          expect(collected).toBe(false);
+          expect(cleanupError).toBeUndefined();
+          expect(fs.existsSync(run)).toBe(true);
+          await expect(manager.checkpointForRelease()).rejects.toThrow(/pending/);
+          killer.emit("close", outcome === "stop-confirmed" ? 0 : 1);
+        }
+        // A failed tree helper deliberately stays unresolved; the transport's
+        // existing seven-second stop bound must expire without faking tree exit.
+        if (outcome === "timeout" || outcome === "stop-failure") await vi.advanceTimersByTimeAsync(7_000);
+        await vi.advanceTimersByTimeAsync(0);
+        await Promise.all([cleaning, stopping]);
+        const uncertain = outcome === "timeout" || outcome === "stop-failure";
+        expect(collected).toBe(!uncertain);
+        expect(fs.existsSync(run)).toBe(uncertain);
+        if (uncertain) {
+          expect(cleanupError).toBeInstanceOf(Error);
+          expect((cleanupError as Error).message).toMatch(/lost track/);
+          expect(hasUnresolvedWorker(run)).toBe(true);
+          expect(canRemoveTerminalRun(run)).toBe(false);
+          expect(manager.retentionReferences().has("normal-close-owner")).toBe(true);
+          // Even late native close cannot erase the persisted uncertainty fence.
+          worker.emit("close", 0);
+          await vi.advanceTimersByTimeAsync(0);
+          await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
+          await expect(manager.checkpointForRelease()).rejects.toThrow(/unresolved|unconfirmed/);
+          const blocked = await manager.spawn({ task: "uncertain capacity stays owned", transport: "process" });
+          expect(blocked.status).toBe("queued");
+          await manager.stop(blocked.id);
+        } else expect(cleanupError).toBeUndefined();
+      } finally {
+        exited = true; killer.emit("close", 0); worker.emit("exit", 0); worker.emit("close", 0);
+        const closing = manager.close();
+        await vi.advanceTimersByTimeAsync(30_000);
+        await Promise.allSettled([cleaning, stopping, closing]);
+        Object.defineProperty(process, "platform", platform);
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
   it.each((["confirmed", "worker-close-last", "failure", "timeout"] as const).flatMap(outcome =>
     [false, true].map(closeDuringStop => [outcome, closeDuringStop] as const),
   ))("fences teardown started after settlement (%s, close=%s)", async (outcome, closeDuringStop) => {
@@ -274,7 +370,8 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
           // Parallel monitoring must be able to report failure, but not transfer custody.
           await vi.advanceTimersByTimeAsync(10_000);
         }
-        Object.defineProperty(process, "platform", platform);
+        // Keep Windows active through the later admission/close probe too;
+        // restoring Linux here used to hide that launch's captured-close debt.
         const result = await manager.wait(handle.id);
         expect(result.status).toBe(outcome === "terminal-before-error" ? "completed" : outcome === "confirmed" || outcome === "resume-error" ? "stopped" : "failed");
         if (outcome === "confirmed") {
@@ -301,6 +398,10 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
           const nextRun = manager.runDirectory(next.id)!;
           fs.writeFileSync(path.join(nextRun, "status.json"), JSON.stringify({ ...record, id: next.id, status: "completed", finishedAt: Date.now() }));
           await vi.advanceTimersByTimeAsync(1_000);
+          // This launch owns a new captured-close promise even though the mock
+          // reuses the same EventEmitter. Native Windows must close it too.
+          worker.emit("exit", 0); worker.emit("close", 0);
+          await vi.advanceTimersByTimeAsync(0);
         } else expect(next.status).toBe("queued");
         await manager.close();
         expect(fs.existsSync(run)).toBe(outcome !== "confirmed");

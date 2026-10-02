@@ -1916,6 +1916,15 @@ export class AgentManager {
     }
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
+    if (managed.processStopPending) {
+      throw new Error(`Cannot clean up agent ${id}: process teardown is pending`);
+    }
+    // A normal Windows terminal result can precede captured native close.
+    // Join its existing bounded obligation instead of exposing that incidental
+    // ordering as a cleanup failure. Expiry records uncertainty, not exit proof.
+    if (managed.nativeReleasePending) await managed.nativeReleasePending;
+    // A stop may have acquired tree custody during the join. Recheck every
+    // pending/uncertain fence before authorizing worktree or run collection.
     if (managed.processStopPending || managed.nativeReleasePending) {
       throw new Error(`Cannot clean up agent ${id}: process teardown is pending`);
     }

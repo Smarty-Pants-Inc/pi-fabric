@@ -38,6 +38,14 @@ standalone jev-fabric without being rewritten.
 | stop by ID | `tasks.stop` | `sessions.stop` | `stop` |
 | discovery | `tasks.list`, `tasks.external`, `tasks.adopt` | `sessions.list` | `list` |
 
+`sessions.read`, `sessions.events`, and the receipt-returning `sessions.status`,
+`sessions.wait`, and `sessions.stop` require a child opened by this provider.
+Terminal receipts contain stdout/stderr tails, so a shared-store durable ID
+alone never grants receipt or output access. Owned cached terminal receipts
+remain available after their Jev owner ends. For durable batch jobs, use
+`tasks.*`: that reader preserves the launch-time middleware filter and withholds
+protected output when the required middleware is unavailable after adoption.
+
 Read records share one shape everywhere:
 `{id, stream, offset, bytes, omittedBytes, text | data, next, eof, state}`.
 Offsets count bytes since launch and never reset; pass `next` back as the

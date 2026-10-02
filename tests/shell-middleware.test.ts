@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import os from "node:os";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBashToolDefinition, type ExtensionContext, type ExtensionRunner, type RegisteredTool } from "@earendil-works/pi-coding-agent";
@@ -11,6 +12,7 @@ import { FABRIC_BASH_MIDDLEWARE, type FabricBashMiddlewareV1 } from "../src/prot
 import { CapturedToolsProvider } from "../src/providers/captured-tools-provider.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { DurableShellBridge } from "../src/jev-fabric/bridge.js";
+import { JevFabricServe } from "../src/jev-fabric/serve.js";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
 import { DurableTaskRegistry } from "../src/jev-fabric/registry.js";
 import { SessionsProvider } from "../src/providers/sessions-provider.js";
@@ -106,6 +108,71 @@ const harness = (options: { middleware?: unknown; optIn?: boolean; hangMs?: numb
 };
 
 describe("cooperative bash middleware", () => {
+  it.skipIf(process.platform === "win32").each(
+    ["status", "wait", "stop"].flatMap(verb => [false, true].flatMap(shellOverride => ["launch-session", "foreign-session"].map(reader => ({ verb, shellOverride, reader })))),
+  )("SEC-3 real pinned backend refuses foreign receipt tails ($verb, override=$shellOverride, $reader)", async ({ verb, shellOverride, reader }) => {
+    // No env override or fake fallback: these receipts must come from the
+    // actual optional dependency pinned in package.json and bun.lock.
+    const backend = createRequire(import.meta.url)("jev-fabric") as { version: string; binaryPath(): string | undefined };
+    expect(backend.version).toBe("0.5.0");
+    const binary = backend.binaryPath();
+    expect(binary).toBeTruthy();
+    const h = harness();
+    const home = path.join(h.cwd, "home");
+    const settings = () => ({ binary: binary!, home, timeoutMs: 60_000 });
+    const jobs = h.provider.shellJobs;
+    jobs.durable = new DurableShellBridge(jobs, { cwd: h.cwd, agentDir: path.join(h.cwd, "agent"), ownerId: "filtered-owner",
+      settings, middleware: () => readFabricBashMiddleware(h.catalog.get("bash")?.definition) });
+    const other = new FabricShellJobStore();
+    other.durable = new DurableShellBridge(other, { cwd: h.cwd, agentDir: path.join(h.cwd, "foreign-agent"), ownerId: "foreign-reader",
+      settings, middleware: () => undefined });
+    const localSessions = new SessionsProvider(jobs.durable, { cwd: h.cwd, shellOverride: () => shellOverride });
+    const foreignSessions = new SessionsProvider(other.durable, { cwd: h.cwd, shellOverride: () => shellOverride });
+    const tasks = new TasksProvider(jobs);
+    const foreignTasks = new TasksProvider(other);
+    const release = path.join(h.cwd, "release-receipt-job");
+    let taskId: string | undefined;
+    let raw: JevFabricServe | undefined;
+    try {
+      fs.writeFileSync(path.join(h.cwd, "stdout-canary"), `${SECRET}:stdout\n`);
+      fs.writeFileSync(path.join(h.cwd, "stderr-canary"), `${SECRET}:stderr\n`);
+      const result = await h.invoke({ command: `cat stdout-canary; cat stderr-canary >&2; while [ ! -f '${release}' ]; do sleep 0.05; done`, durable: true });
+      taskId = (result.details as any).taskId;
+      await vi.waitFor(() => expect(jobs.get(taskId!)?.durable?.jobId).toBeDefined());
+      const external = await foreignTasks.invoke("external", {}, h.context) as { jobs: Array<{ id: string }> };
+      expect(external.jobs).toHaveLength(1);
+      const jobId = external.jobs[0]!.id;
+      expect(jobId).toBe(jobs.get(taskId!)!.durable!.jobId);
+      fs.writeFileSync(release, "done");
+      const filtered = await tasks.invoke("wait", { id: taskId, timeoutMs: 10_000 }, h.context) as any;
+      expect(filtered.timedOut).toBe(false);
+      expect(filtered.output).toContain("[filtered]:stdout");
+      expect(filtered.output).toContain("[filtered]:stderr");
+      expect(JSON.stringify(filtered)).not.toContain(SECRET);
+      const adopted = await foreignTasks.invoke("adopt", { jobId }, h.context) as any;
+      const withheld = await foreignTasks.invoke("wait", { id: adopted.task.id, timeoutMs: 10_000 }, h.context) as any;
+      expect(withheld.timedOut).toBe(false);
+      expect(withheld.output).toContain("Output withheld");
+      expect(JSON.stringify(withheld)).not.toContain(SECRET);
+      raw = await JevFabricServe.open(binary!, { home, cwd: h.cwd, timeoutMs: 60_000 });
+      expect(raw.banner.version).toBe("0.5.0-native");
+      const receipt = await raw.request<Record<string, any>>(verb, { job: jobId, ...(verb === "wait" ? { timeoutMs: 5000 } : {}) });
+      // Establish that this verb genuinely returns both raw tails; a fixture
+      // omitting receipt output would let the old implementation pass.
+      expect(receipt.state).toBe("exited");
+      expect(receipt.stdout).toContain(`${SECRET}:stdout`);
+      expect(receipt.stderr).toContain(`${SECRET}:stderr`);
+      const sessions = reader === "launch-session" ? localSessions : foreignSessions;
+      if (shellOverride) await expect(sessions.invoke("open", { argv: ["true"] }, h.context)).rejects.toThrow("bypass its shell protection");
+      await expect(sessions.invoke(verb, { id: jobId }, h.context)).rejects.toThrow("only for children opened here");
+    } finally {
+      // Even the vulnerable head must leave no durable worker or serve alive.
+      fs.writeFileSync(release, "done");
+      if (taskId) await tasks.invoke("wait", { id: taskId, timeoutMs: 10_000 }, h.context);
+      await raw?.close();
+      await Promise.all([localSessions.close(), foreignSessions.close(), other.close()]);
+    }
+  });
   it.skipIf(process.platform === "win32")("SEC-3 refuses cross-session adoption while discovered backend policy persistence is delayed", async () => {
     const h = harness();
     const fake = new URL("./fixtures/fake-jev-fabric.mjs", import.meta.url).pathname;

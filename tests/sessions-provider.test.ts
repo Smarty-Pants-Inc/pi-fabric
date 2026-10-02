@@ -9,6 +9,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import type { ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import type { DurableShellBridge } from "../src/jev-fabric/bridge.js";
+import { JevFabricCli } from "../src/jev-fabric/client.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { SessionsProvider } from "../src/providers/sessions-provider.js";
 
@@ -45,7 +46,7 @@ const setup = (options: { shellOverride?: boolean; root?: string; hook?: (event:
   cleanups.push(() => provider.close());
   const call = (name: string, args: Record<string, unknown>, parentToolCallId = "fabric_exec_1") =>
     provider.invoke(name, args, { parentToolCallId, signal: new AbortController().signal } as unknown as FabricInvocationContext) as Promise<Record<string, any>>;
-  return { root, provider, call };
+  return { root, provider, call, binary: selected, bridge };
 };
 
 describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve", () => {
@@ -66,8 +67,11 @@ describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve
   });
 
   it("opens a durable interactive child that keeps running after the connection ends", async () => {
-    const { call, provider, root } = setup();
+    const { call, provider, root, binary, bridge } = setup();
     const opened = await call("open", { argv: ["cat"], durable: true, label: "durable echo", cwd: root });
+    const cli = new JevFabricCli(binary, bridge.home);
+    // Durable workers outlive connections, so explicitly reap this test's job even on an assertion failure.
+    cleanups.push(async () => { await cli.stop(opened.id); });
     expect(opened).toMatchObject({ lifetime: "durable" });
     expect(opened.id).not.toMatch(/^s-/);
     await call("write", { id: opened.id, text: "kept\n" });
@@ -76,7 +80,8 @@ describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve
     // Another connection (another Pi session, or the CLI) still reaches the durable child.
     const other = setup({ root });
     await other.call("closeInput", { id: opened.id });
-    expect(await other.call("wait", { id: opened.id, timeoutMs: 10000 })).toMatchObject({ state: "exited" });
+    await expect(other.call("wait", { id: opened.id, timeoutMs: 10000 })).rejects.toThrow("only for children opened here");
+    await vi.waitFor(async () => expect(await cli.status(opened.id)).toMatchObject({ state: "exited" }), { timeout: 10000 });
   });
 
   it("answers other requests while a long-poll read is pending", async () => {
@@ -270,6 +275,6 @@ describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve
     expect(() => process.kill(pid, 0)).not.toThrow();
     await provider.close();
     await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow(), { timeout: 5000 });
-    await expect(call("status", { id })).rejects.toThrow("closed");
+    await expect(call("status", { id })).rejects.toThrow("only for children opened here");
   });
 });

@@ -10,7 +10,7 @@ import type { JevFabricServe } from "../jev-fabric/serve.js";
 const DAY_MS = 24 * 3_600_000;
 const OWNER_RECEIPT_GRACE_MS = 250;
 const TERMINAL_RECEIPT_LIMIT = 128;
-const id = { type: "string", minLength: 1, maxLength: 128, description: "Session ID from sessions.open (`s-…` for session lifetime). Output reads require a child opened here; use tasks.* for durable batch output." };
+const id = { type: "string", minLength: 1, maxLength: 128, description: "Session ID from sessions.open (`s-…` for session lifetime). Output and receipts require a child opened here; use tasks.* for durable batch output." };
 const idOnly = { type: "object", properties: { id }, required: ["id"], additionalProperties: false };
 const waitMs = { type: "integer", minimum: 1, maximum: 300000, description: "Long-poll ceiling; ready evidence returns at once. Never stops the child." };
 
@@ -48,10 +48,10 @@ const descriptors: FabricActionDescriptor[] = [
     } },
     risk: "read", effect: { kind: "none", ordering: "commutative" },
   },
-  { name: "status", description: "Current state, or the final receipt.", inputSchema: idOnly, risk: "read", effect: { kind: "none", ordering: "commutative" } },
+  { name: "status", description: "Current state, or the final receipt, for a child opened here.", inputSchema: idOnly, risk: "read", effect: { kind: "none", ordering: "commutative" } },
   {
     name: "wait",
-    description: "Wait for the final receipt, or return the running state at the ceiling (default 30 s). Waiting never stops the child.",
+    description: "Wait for the final receipt of a child opened here, or return the running state at the ceiling (default 30 s). Waiting never stops the child.",
     inputSchema: { type: "object", properties: { id, timeoutMs: { type: "integer", minimum: 1, maximum: 300000 } }, required: ["id"], additionalProperties: false },
     risk: "read", effect: { kind: "none", ordering: "commutative" },
   },
@@ -61,7 +61,7 @@ const descriptors: FabricActionDescriptor[] = [
     inputSchema: { type: "object", properties: { id, after: { type: "integer", minimum: 0 }, waitMs }, required: ["id"], additionalProperties: false },
     risk: "read", effect: { kind: "none", ordering: "commutative" },
   },
-  { name: "stop", description: "Stop a child by ID (process group, then force), never by PID. Idempotent.", inputSchema: idOnly, risk: "execute", effect: { kind: "emission", ordering: "ordered" } },
+  { name: "stop", description: "Stop a child opened here by ID (process group, then force), never by PID. Idempotent.", inputSchema: idOnly, risk: "execute", effect: { kind: "emission", ordering: "ordered" } },
   { name: "list", description: "Interactive children opened by this Pi session, with lifetime and state.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, risk: "read", effect: { kind: "none", ordering: "commutative" } },
 ];
 
@@ -159,9 +159,13 @@ export class SessionsProvider implements FabricProvider {
       try { return await launch; } finally { this.#launches.delete(launch); }
     }
     const job = args.id as string;
-    if ((name === "status" || name === "wait" || name === "stop") && this.#terminalReceipts.has(job)) return this.#terminalReceipts.get(job);
-    // Batch output belongs exclusively to tasks.*, with its launch-time filter.
-    if ((name === "read" || name === "events") && !this.#opened.has(job)) {
+    const returnsReceipt = name === "status" || name === "wait" || name === "stop";
+    // Cached receipts belong to children opened here, even after owner teardown.
+    if (returnsReceipt && this.#terminalReceipts.has(job)) return this.#terminalReceipts.get(job);
+    // Terminal receipts contain stdout/stderr too. Batch output belongs
+    // exclusively to tasks.*, with its launch-time filter; never connect to
+    // the shared store to retrieve output for a foreign job through any verb.
+    if ((name === "read" || name === "events" || returnsReceipt) && !this.#opened.has(job)) {
       throw new Error("Session output is available only for children opened here; use tasks for durable batch jobs");
     }
     const serve = this.#jobConnections.get(job) ?? await this.#connect();

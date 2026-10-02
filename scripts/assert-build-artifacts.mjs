@@ -79,6 +79,8 @@ const lazy = [
   "guards/model-route-hook.js",
   "worker/options.js",
   "worker/recovery-watchdog.js",
+  "worker/retry-profile.js",
+  "worker/task-entry.js",
   "worker/run-log.js",
   "worker/run-record.js",
   "worker/session-export.js",

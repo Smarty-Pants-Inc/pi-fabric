@@ -663,6 +663,8 @@ export class AgentManager {
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
   readonly #previousConfirmed = new Map<string, (run: AgentRunResult) => void>();
+  /** Session answers whose original temporary target was collected. Never relaunch them. */
+  readonly #previousPublicationFiles = new Map<string, string>();
   readonly #previousRecoveries = new Set<Promise<void>>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
   readonly #preparePiModel:
@@ -1813,14 +1815,34 @@ export class AgentManager {
     if (!previous) return undefined;
     if (previous.terminalPending) {
       const { terminalPending, ...answer } = previous;
-      if (terminalPending.publication) writeRecord(terminalPending.statusFile, answer);
-      const record = confirmTerminalRecord(terminalPending.statusFile);
+      let statusFile = this.#previousPublicationFiles.get(id);
+      if (!statusFile) {
+        statusFile = terminalPending.statusFile;
+        try { fs.lstatSync(statusFile); }
+        catch (error) {
+          // Only absence of the original target authorizes a new publication.
+          // Confirmation/namespace errors and existing mismatches stay fail-closed.
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          statusFile = path.join(this.#runRoot, randomUUID(), "status.json");
+          this.#previousPublicationFiles.set(id, statusFile);
+        }
+      }
+      if (terminalPending.publication || this.#previousPublicationFiles.has(id)) {
+        if (!this.#previousPublicationFiles.has(id)) {
+          const existing = JSON.parse(fs.readFileSync(statusFile, "utf8")) as AgentRunRecord;
+          if (existing.id !== id) throw new Error(`Terminal record identity changed for ${id}`);
+        }
+        fs.mkdirSync(path.dirname(statusFile), { recursive: true });
+        writeRecord(statusFile, answer);
+      }
+      const record = confirmTerminalRecord(statusFile);
       if (record.id !== id) throw new Error(`Terminal record identity changed for ${id}`);
       // Save the confirmed session record before enabling delivery. An append failure
       // leaves the original obligation intact for this or the next runtime to retry.
       this.#previousConfirmed.get(id)?.(answer);
       this.#previousRuns.set(id, answer);
       this.#previousConfirmed.delete(id);
+      this.#previousPublicationFiles.delete(id);
       return structuredClone(answer);
     }
     return structuredClone(previous);

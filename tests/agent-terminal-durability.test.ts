@@ -51,7 +51,7 @@ const faults = (reject: (file: string, fd: number) => boolean) => {
 const status = (manager: AgentManager, id: string) => path.join(manager.runDirectory(id)!, "status.json");
 
 describe("Astra F15-F22 terminal publication obligations", () => {
-  it.skipIf(process.platform === "win32")("F18 replacement runtime restores and confirms the original answer through session entries", async () => {
+  it.skipIf(process.platform === "win32").each(["original", "collected", "collected-pre-rename", "collected-post-rename"] as const)("F18 replacement runtime restores the exact session answer after %s storage handoff", async mode => {
     const { temp, manager: unused, exit, launch } = fixture({ retainRuns: false });
     await unused.close();
     const entries: unknown[] = [];
@@ -70,12 +70,13 @@ describe("Astra F15-F22 terminal publication obligations", () => {
       const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: {
         extension: path.resolve("dist/index.js"), worker: path.resolve("tests/fixtures/fake-worker.mjs"), residentHost: path.join(temp, "unused.mjs"), skills: temp,
       } });
-      const config = normalizeFabricConfig({ fullCodeMode: false, agents: { enabled: true, budgetUsd: 0, retainRuns: false, notifyOnComplete: true, sessionExport: false }, mcp: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, mesh: { enabled: true, root: path.join(temp, "mesh") }, prewalk: { enabled: false, alwaysRearm: false } });
+      const config = normalizeFabricConfig({ fullCodeMode: false, retention: { orphanedTempRunMs: 60 * 60 * 1000, oneShotRunMs: 60 * 60 * 1000 }, agents: { enabled: true, budgetUsd: 0, retainRuns: false, notifyOnComplete: true, sessionExport: false }, mcp: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, mesh: { enabled: true, root: path.join(temp, "mesh") }, prewalk: { enabled: false, alwaysRearm: false } });
       return { runtime, sendMessage, init: () => runtime.initialize(context, config) };
     };
     vi.stubEnv("PI_FABRIC_PROJECT_ROOT", temp);
+    vi.stubEnv("PI_FABRIC_TMPDIR", temp);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(temp, "agent"));
-    for (const name of ["PI_FABRIC_MESH_ROOT", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_PARENT_RUN", "PI_FABRIC_SESSION_ID", "PI_FABRIC_MAIN_AGENT_ID"]) vi.stubEnv(name, undefined);
+    for (const name of ["PI_FABRIC_RUN_ROOT", "PI_FABRIC_MESH_ROOT", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_PARENT_RUN", "PI_FABRIC_SESSION_ID", "PI_FABRIC_MAIN_AGENT_ID"]) vi.stubEnv(name, undefined);
     let first: ReturnType<typeof createRuntime> | undefined = createRuntime();
     let second: ReturnType<typeof createRuntime> | undefined;
     let third: ReturnType<typeof createRuntime> | undefined;
@@ -84,7 +85,7 @@ describe("Astra F15-F22 terminal publication obligations", () => {
       await first.init();
       const handle = await first.runtime.agents.spawn({ task: "fixture", transport: "process", model: "dest/old" });
       const file = status(first.runtime.agents, handle.id), directory = path.dirname(file);
-      const answer = { ...JSON.parse(fs.readFileSync(file, "utf8")), status: "completed", finishedAt: Date.now(), text: "original completed answer after replacement", turns: 7 };
+      const answer = { ...JSON.parse(fs.readFileSync(file, "utf8")), status: "completed", sessionId: "2147483647", finishedAt: Date.now(), text: "original completed answer after replacement\n" + "full answer ".repeat(2000), value: { exact: [1, "retained", { result: true }] }, usage: { input: 123, output: 456, cacheRead: 789, cacheWrite: 12, cost: 0.345 }, turns: 7 };
       fs.writeFileSync(file, JSON.stringify(answer));
       exit();
       let unavailable = true, confirmations = 0;
@@ -93,22 +94,60 @@ describe("Astra F15-F22 terminal publication obligations", () => {
       first = undefined; // The old manager/runtime is no longer accessible to recovery.
       expect(confirmations).toBeGreaterThan(0);
       expect(fs.existsSync(file)).toBe(true);
+      expect(entries).toContainEqual(expect.objectContaining({ customType: STOPPED_AGENTS_ENTRY, data: expect.objectContaining({ stopped: expect.arrayContaining([expect.objectContaining({ ...answer, terminalPending: { statusFile: file, publication: false } })]) }) }));
+      let recoveryBarriers = 0;
+      if (mode !== "original") {
+        fault.mockRestore();
+        vi.mocked(fs.openSync).mockRestore();
+        const root = path.dirname(directory), now = Date.now(), grace = 60 * 60 * 1000;
+        // The old host is gone; let the real collector detect the orphan, then
+        // expire the shortest configured grace. Do not just unlink status.json.
+        fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1 }));
+        const sweep = (at: number) => sweepTempRunRoots({ tempRoot: temp, now: at, orphanedTempRunRetentionMs: grace, oneShotRunRetentionMs: grace });
+        expect(sweep(now)).toEqual({ removedRoots: [], removedRuns: [] });
+        expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8")).orphanedAt).toBe(now);
+        expect(sweep(now + grace - 1)).toEqual({ removedRoots: [], removedRuns: [] });
+        expect(fs.existsSync(file)).toBe(true);
+        expect(sweep(now + grace + 1).removedRoots).toContain(root);
+        expect(fs.existsSync(root)).toBe(false);
+        unavailable = mode !== "collected";
+        fault = faults((target, fd) => {
+          const recoveryPublication = mode === "collected-pre-rename"
+            ? path.basename(target).startsWith("status.json.") && target.endsWith(".tmp")
+            : mode === "collected-post-rename" && fs.fstatSync(fd).isDirectory() && fs.existsSync(path.join(target, "status.json"));
+          return !!recoveryPublication && (++recoveryBarriers, unavailable);
+        });
+      }
       second = createRuntime();
       await second.init();
-      await expect(second.runtime.agents.wait(handle.id, { timeoutMs: 350 })).rejects.toThrow(/publication barrier/);
-      expect(() => second!.runtime.agents.status(handle.id)).toThrow(/publication barrier/);
-      expect(entries).toContainEqual(expect.objectContaining({ customType: STOPPED_AGENTS_ENTRY, data: expect.objectContaining({ stopped: expect.arrayContaining([expect.objectContaining({ id: handle.id, text: answer.text })]) }) }));
-      expect(second.sendMessage).not.toHaveBeenCalled();
+      if (unavailable) {
+        await expect(second.runtime.agents.wait(handle.id, { timeoutMs: 350 })).rejects.toThrow(/publication barrier/);
+        expect(() => second!.runtime.agents.status(handle.id)).toThrow(/publication barrier/);
+        expect(second.sendMessage).not.toHaveBeenCalled();
+        expect(entries.some(entry => (entry as { data?: { delivered?: string[] } }).data?.delivered?.includes(handle.id))).toBe(false);
+        if (mode !== "original") {
+          expect(recoveryBarriers).toBeGreaterThan(0);
+          // Discard this failed recovery manager as well: the only retained
+          // obligation for the next attempt is still the original session entry.
+          await second.runtime.shutdown();
+          second = undefined;
+          unavailable = false;
+          second = createRuntime();
+          await second.init();
+        }
+      }
       unavailable = false;
       await vi.waitFor(() => expect(second!.sendMessage).toHaveBeenCalledOnce(), { timeout: 4000 });
-      expect(second.runtime.agents.status(handle.id)).toMatchObject({ status: "completed", text: answer.text, turns: 7 });
-      expect(await second.runtime.agents.wait(handle.id)).toMatchObject({ status: "completed", text: answer.text, turns: 7 });
+      expect(second.runtime.agents.status(handle.id)).toMatchObject(answer);
+      expect(await second.runtime.agents.wait(handle.id)).toMatchObject(answer);
+      expect(entries).toContainEqual(expect.objectContaining({ data: { stopped: [expect.not.objectContaining({ terminalPending: expect.anything() })] } }));
+      if (mode !== "original") expect(fs.existsSync(file)).toBe(false);
       expect(launch).toHaveBeenCalledOnce();
       await second.runtime.shutdown();
       second = undefined;
       third = createRuntime();
       await third.init();
-      expect(await third.runtime.agents.wait(handle.id)).toMatchObject({ status: "completed", text: answer.text, turns: 7 });
+      expect(await third.runtime.agents.wait(handle.id)).toMatchObject(answer);
       expect(third.sendMessage).not.toHaveBeenCalled();
       expect(launch).toHaveBeenCalledOnce();
     } finally {
@@ -175,6 +214,72 @@ describe("Astra F15-F22 terminal publication obligations", () => {
       expect(launch).toHaveBeenCalledOnce();
       expect(entries.at(-1)).toMatchObject({ data: { stopped: [expect.not.objectContaining({ terminalPending: expect.anything() })] } });
     } finally { fault.mockRestore(); }
+  });
+
+  it.each(["lstat-EIO", "open-EACCES", "open-ENOENT", "mismatched", "mismatched-publication"] as const)("F18 never republishes an existing target on %s", async mode => {
+    const { manager, launch, consumed, root } = fixture();
+    const original = path.join(root, "previous", "status.json");
+    fs.mkdirSync(path.dirname(original), { recursive: true });
+    const answer: AgentRunResult = { id: "previous", name: "previous", task: "already done", status: "completed", runner: "pi", transport: "process", cwd: root, startedAt: 1, updatedAt: 2, finishedAt: 2, turns: 3, toolCalls: 4, text: "retained answer", value: { exact: true }, usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } };
+    const bytes = JSON.stringify({ ...answer, id: mode.startsWith("mismatched") ? "someone-else" : answer.id });
+    fs.writeFileSync(original, bytes);
+    const confirmed = vi.fn();
+    let fault: { mockRestore: () => void } | undefined;
+    if (mode === "lstat-EIO") {
+      const stat = fs.lstatSync.bind(fs);
+      fault = vi.spyOn(fs, "lstatSync").mockImplementation((...args: Parameters<typeof fs.lstatSync>) => {
+        if (String(args[0]) === original) throw Object.assign(new Error("injected original I/O failure"), { code: "EIO" });
+        return stat(...args);
+      });
+    } else if (mode.startsWith("open-")) {
+      const open = fs.openSync.bind(fs);
+      fault = vi.spyOn(fs, "openSync").mockImplementation((file, flags, permissions) => {
+        if (String(file) === original) throw Object.assign(new Error("injected original I/O failure"), { code: mode.slice(5) });
+        return open(file, flags, permissions);
+      });
+    }
+    try {
+      manager.restorePreviousRuns([{ ...answer, terminalPending: { statusFile: original, publication: mode === "mismatched-publication" } }], confirmed);
+      const message = mode.startsWith("mismatched") ? /identity changed/ : /original I\/O failure/;
+      await expect(manager.wait(answer.id)).rejects.toThrow(message);
+      expect(() => manager.status(answer.id)).toThrow(message);
+      expect(confirmed).not.toHaveBeenCalled();
+      expect(consumed).not.toHaveBeenCalled();
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root)).toEqual(["previous"]);
+      expect(fs.readFileSync(original, "utf8")).toBe(bytes);
+      await manager.close();
+    } finally { fault?.mockRestore(); }
+  });
+
+  it.each([false, true])("F18 missing status republishes in successor storage but gates delivery on session saving (publication=%s)", async publication => {
+    const { manager, root, launch, consumed } = fixture();
+    const oldDirectory = path.join(root, "old-run");
+    fs.mkdirSync(oldDirectory, { recursive: true });
+    const original = path.join(oldDirectory, "status.json"); // Only the status path is absent.
+    const answer: AgentRunResult = { id: "previous", name: "previous", task: "already done", status: "completed", runner: "pi", transport: "process", cwd: root, startedAt: 1, updatedAt: 2, finishedAt: 2, turns: 3, toolCalls: 4, text: "retained answer", value: { exact: true }, usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } };
+    const entries: unknown[] = [{ type: "custom", customType: STOPPED_AGENTS_ENTRY, data: { stopped: [{ ...answer, terminalPending: { statusFile: original, publication } }] } }];
+    let sessionUnavailable = true;
+    const enqueue = vi.fn();
+    restoreStoppedRuns({ entries, notifyOnComplete: true,
+      restore: (runs, confirmed) => manager.restorePreviousRuns(runs, confirmed), enqueue,
+      appendEntry: data => { if (sessionUnavailable) throw new Error("recovery session save unavailable"); entries.push({ type: "custom", customType: STOPPED_AGENTS_ENTRY, data }); },
+    });
+    await expect(manager.wait(answer.id)).rejects.toThrow("recovery session save unavailable");
+    expect(() => manager.status(answer.id)).toThrow("recovery session save unavailable");
+    expect(consumed).not.toHaveBeenCalled();
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(entries).toHaveLength(1);
+    expect(fs.existsSync(original)).toBe(false);
+    const recoveredDirectory = fs.readdirSync(root).find(name => name !== "old-run")!;
+    expect(JSON.parse(fs.readFileSync(path.join(root, recoveredDirectory, "status.json"), "utf8"))).toEqual(answer);
+    sessionUnavailable = false;
+    expect(await manager.wait(answer.id)).toEqual(answer);
+    expect(consumed).toHaveBeenCalledOnce();
+    expect(enqueue).toHaveBeenCalledOnce();
+    expect(entries.at(-1)).toMatchObject({ data: { stopped: [answer] } });
+    expect(fs.readdirSync(root)).toHaveLength(2); // Retries reuse this runtime's publication target.
+    expect(launch).not.toHaveBeenCalled();
   });
 
   it("F18 refuses close retirement if a pending terminal handoff cannot be saved", async () => {

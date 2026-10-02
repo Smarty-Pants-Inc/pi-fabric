@@ -12,6 +12,22 @@ const defaults = {
   },
 };
 
+describe("parent run inheritance (#2490)", () => {
+  const parent = { ...defaults, model: "shallow", inheritedModel: { provider: "cliproxyapi", id: "gpt-6.1-sol" }, inheritedThinking: "max" as const };
+  it("inherits the actual Pi model and effort ahead of configured defaults", () => {
+    expect(normalizeAgentRunRequest({ task: "review" }, parent)).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", thinking: "max" });
+  });
+  it("lets an explicit model or effort override inheritance independently", () => {
+    expect(normalizeAgentRunRequest({ task: "review", thinking: "high" }, parent)).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", thinking: "high" });
+    expect(normalizeAgentRunRequest({ task: "review", model: "shallow" }, parent)).toMatchObject({ model: "shallow", thinking: "low" });
+  });
+  it("does not forward a Pi parent binding to another runner", () => {
+    const request = normalizeAgentRunRequest({ task: "review", runner: "claude" }, parent);
+    expect(request.model).toBeUndefined();
+    expect(request.thinking).toBeUndefined();
+  });
+});
+
 describe("alias thinking levels", () => {
   it("applies an alias default when the run names the alias", () => {
     const request = normalizeAgentRunRequest({ task: "t", model: "shallow" }, defaults);

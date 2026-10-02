@@ -99,6 +99,16 @@ export const parseWorkerOptions = (
   const nice = optional(args, "nice");
   const carryOverSource = optional(args, "carry-over");
   const runnerSessionId = optional(args, "runner-session-id");
+  const runnerSessionIdsSource = optional(args, "runner-session-ids");
+  let runnerSessionIds: string[] | undefined;
+  if (runnerSessionIdsSource) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(runnerSessionIdsSource); } catch { /* rejected below */ }
+    if (!Array.isArray(parsed) || parsed.some(id => typeof id !== "string" || !id.trim())) {
+      throw new Error("Invalid worker runner session IDs");
+    }
+    runnerSessionIds = [...new Set(parsed as string[])];
+  }
   const inheritedSessionPinsSource = optional(args, "inherited-session-pins");
   const inheritedSessionPins = inheritedSessionPinsSource
     ? JSON.parse(inheritedSessionPinsSource) as AgentWorkerOptions["inheritedSessionPins"]
@@ -147,7 +157,12 @@ export const parseWorkerOptions = (
   }
   // Old launchers had no flag and always used TypeScript, regardless of ambient env.
   const kernel = runner === "pi" && extensions ? selectedKernel ?? "typescript" : undefined;
+  const residentStartupProbe = optional(args, "resident-startup-probe") === "true";
+  if (residentStartupProbe && (runner !== "pi" || !extensions || actorId || sessionFile || schemaFile || replyTool)) {
+    throw new Error("Resident startup probe must be an isolated Pi worker");
+  }
   return {
+    ...(residentStartupProbe ? { residentStartupProbe: true } : {}),
     id: required(args, "id"),
     runner,
     ...(kernel ? { kernel, pythonRuntime } : {}),
@@ -193,6 +208,7 @@ export const parseWorkerOptions = (
     ...(ownerHostId ? { ownerHostId } : {}),
     ...(ownerIdentityId ? { ownerIdentityId } : {}),
     ...(runnerSessionId ? { runnerSessionId } : {}),
+    ...(runnerSessionIds ? { runnerSessionIds } : {}),
     ...(runRoot ? { runRoot } : {}),
     ...(steerFile ? { steerFile } : {}),
     ...(branch ? { branch } : {}),

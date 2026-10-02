@@ -87,6 +87,7 @@ export class ActorDirectory extends ActorManager {
         await options.beforeCommit?.(id);
         // Cross-scope predecessor removal is part of this create's mutation too.
         for (const actor of sameName.filter((actor) => actor.scope !== scope)) {
+          options.checkActive?.();
           await this.remove(actor.id, { wait: false });
         }
       },
@@ -152,5 +153,8 @@ export class ActorDirectory extends ActorManager {
     if (this.#secondary.cleanupObligation(args[0])) return this.#secondary.remove(...args);
     return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args);
   }
+  override pauseForRelease(): void { super.pauseForRelease(); this.#secondary.pauseForRelease(); }
+  override resumeAfterRelease(): void { super.resumeAfterRelease(); this.#secondary.resumeAfterRelease(); }
+  override async checkpointForRelease(): Promise<void> { await super.checkpointForRelease(); await this.#secondary.checkpointForRelease(); }
   override async close(): Promise<void> { await Promise.all([super.close(), this.#secondary.close()]); }
 }

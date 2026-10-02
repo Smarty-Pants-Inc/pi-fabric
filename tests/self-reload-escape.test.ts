@@ -80,6 +80,7 @@ describe("self-reload after an idle Escape with the mesh off (pi-fabric#160)", (
         getEntries: () => [], getLeafId: () => undefined, getCwd: () => root,
       }),
       ui: anyFn({
+        holdState: undefined, // Explicitly model the old host; the proxy otherwise supplies a function.
         onTerminalInput: (handler: (data: string) => unknown) => { terminalInputs.add(handler); return () => { terminalInputs.delete(handler); }; },
       }),
     }) as unknown as ExtensionContext;

@@ -40,6 +40,25 @@ Independent work can continue without polling. With `agents.notifyOnComplete` en
 
 Durable spawns use the same inbox. Undelivered envelopes survive disconnects; receipts survive reconnects. Escape or an errored Main turn parks pending results: Fabric does not start a turn to deliver them, and they join Main's next turn, whatever starts it (typed input, a peer message or another trigger). Explicit lifecycle subscriptions, actor messages, and trajectory handoffs retain their separate delivery policies. A terminal run can still report incomplete work; Main must inspect its result.
 
+### Native runner session attribution
+
+Pi runs record the live native Pi session ID in `runnerSessionId`, including
+`--no-session` task agents and durable actors owned by Main or a resident host.
+This is the ID sent upstream as the gateway's `session_id`; it is **not** the
+transport `sessionId` (for example, a process PID) or the Fabric run ID.
+`agents.status`, `agents.wait`, and run listings expose the latest native ID.
+If Pi replaces its session during a run, `runnerSessionIds` keeps the distinct
+observed IDs in first-seen order, while `runnerSessionId` follows the latest.
+
+Run records also retain `mainAgentId` and `fabricSessionId` for the parent Main,
+alongside the task name and, for actor activations, `actorId`/`actorName`.
+Actor run copies retain these fields in `runs/<run-id>/status.json`.
+The `pi.agent_start` and terminal `run.*` lifecycle payloads carry
+`runnerSessionId` and the parent `fabricSessionId` when available.
+Native identity comes from Pi's live session manager, not a pre-launch session
+header: Pi can replace a header-only session's seeded ID during startup.
+No new store or configuration is required.
+
 ### Stalled Pi error recovery
 
 After a failed or aborted assistant response (including `Error: Terminated`), Fabric allows Pi's own retries to recover. If no recovery output arrives for 60 seconds, the worker fails the run with the original error and terminates the child, escalating from SIGTERM to SIGKILL after another 5 seconds. Repeated retry announcements, errors, or lifecycle events do not extend this deadline. Nonempty text/thinking/tool-call deltas refresh it; a successful assistant response clears it. Healthy inference and tool execution are not subject to this recovery timer, and the overall run deadline still applies.
@@ -97,6 +116,21 @@ return results.map(result => result.status === "fulfilled"
   ? { ok: true, handle: result.value }
   : { ok: false, error: String(result.reason) });
 ```
+
+### Parent inheritance and fleet model policy
+
+Without an explicit `model`, Pi children and live actors inherit the spawning run's **actual admitted model and thinking**, ahead of `agents.model` / `agents.thinking`. This includes actor/task parents, not just Main. Explicit model/effort choices still win; a different runner does not inherit a Pi model. Global actor templates retain deferred inheritance until import.
+
+The trusted host's `<agentDir>/fabric.json` can set:
+
+```json
+{ "agents": {
+  "deniedModels": ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"],
+  "deniedModelReplacement": "cliproxyapi/gpt-6.1-sol"
+} }
+```
+
+These policy keys are ignored in project/workspace `.pi/fabric.json`, even in trusted projects. The default deny-list is empty. Fabric checks requested selectors and canonical selections case-insensitively, including aliases, inherited models and defaults, before spawn/create or model-setter mutation. A denial raises `FabricModelDeniedError` (`code: "FABRIC_MODEL_DENIED"`), names #2236 and the configured replacement, and never silently falls back to another model. Alternate runners also admit the backend selector produced by their argv normalizer (including `veda/`, `claude/` and `anthropic/` routing forms). Under active policy, Claude aliases must have an allowed native CLI catalog `resolvedModel` (checked as both a runtime ID and `anthropic/<id>`); Veda requires backend `pi` and an exact concrete `provider/model` resolved by the Pi registry. Unknown targets, Veda aliases/bare IDs/defaults and other Veda backends fail closed with the same typed refusal before queueing or durable submission. Allowed canonical targets, not unresolved selectors, are forwarded to workers. In-place Prewalk checks policy at manual/automatic arm and again before switching Main, and denied binding clears preserve the old binding when the actual owning-session fallback is denied. The fixed refusal code is preserved in public TypeScript guest catches; arbitrary host error properties are not transferred. Deploy the host policy to enforce the fleet list; rebuilding does not retroactively change existing workers or resident owners. See the [public-path CLI proof and installation-only owner gate](model-policy-acceptance.md).
 
 ### Requested models are authoritative
 
@@ -334,7 +368,7 @@ return agents.run({
 });
 ```
 
-Fabric forwards Veda model values unchanged to the selected backend. Use `agents.veda.model` to set a backend-specific default. An explicit `agents.run({ model })` value has priority. If you omit both values, Veda selects its own backend default. Personas do not depend on models. Add custom personas at `~/.config/veda/personas/<name>/AGENTS.md`. Set the global default with `agents.veda.persona`, or select a persona for one run with `agents.run({ persona })`. `agents.models({ runner: "veda" })` currently returns an empty advisory list. Fabric normalizes usage (`inputTokens`/`outputTokens`/`cachedTokens`), backend conversation ID, turns, and errors from the Veda `--json` envelope. The data appears in the standard Fabric result, dashboard, lifecycle events, and budget ledger.
+With no active host policy, Fabric forwards Veda model values unchanged to the selected backend. Use `agents.veda.model` to set a backend-specific default. An explicit `agents.run({ model })` value has priority. If you omit both values and the host deny-list is empty, Veda selects its own backend default. Under an active host deny policy, Fabric refuses unknown defaults, aliases and bare selectors before queueing or durable submission; select `agents.veda.backend: "pi"` and configure `agents.veda.model` or pass an exact allowed `provider/model` present in the Pi registry. Other Veda backends are refused because their actual target cannot be established. The admitted concrete selection is forwarded to Veda. Personas do not depend on models. Add custom personas at `~/.config/veda/personas/<name>/AGENTS.md`. Set the global default with `agents.veda.persona`, or select a persona for one run with `agents.run({ persona })`. `agents.models({ runner: "veda" })` currently returns an empty advisory list. Fabric normalizes usage (`inputTokens`/`outputTokens`/`cachedTokens`), backend conversation ID, turns, and errors from the Veda `--json` envelope. The data appears in the standard Fabric result, dashboard, lifecycle events, and budget ledger.
 
 For each run, Fabric passes `--tools <allowlist>`. It passes `--no-tools` for an empty allowlist. This setting has priority over tool frontmatter in the persona. The built-in read-only personas specify `tools: none`. The `worker` persona specifies `tools: all` with `sandbox: workspace-write`. Fabric does not pass `--sandbox`, so persona frontmatter defines the sandbox, and `worker` agents can change files. The `navigator-plan` persona also requires a `<program>` design block, and `worker` requires a `<worker_report>`. A failure in either protocol appears as a run error, so `navigator-chat` is the default for free-form tasks.
 
@@ -406,6 +440,10 @@ return { self: await agents.self(), lineage };
 ```
 
 For Main and one-shot agents, `steer` arrives after the tool calls in the current turn and before the next model call. `followUp` waits until the current run settles, or, for a busy Main, until the next tool boundary after it has waited `mesh.followUpFlushMs` (2 minutes by default). Each delivered message header carries `delivery` and `sent_at` (ISO UTC). A followUp to Main returns `pendingFollowUps` and `oldestAgeS`: how many of the caller's own followUps Fabric still holds for that Main, and the age of the oldest; switch to `steer` when they grow. When Main is idle and its oldest held followUp, from any sender, is older than `mesh.followUpStallSeconds` (10 minutes by default), the queue is stalled: the followUp (or `tell`) throws `Fabric followUp to <target> was accepted but is not being delivered: ...`, and the message stays held. A busy Main admits at most 50 held followUps or 256 KiB per sender, and 200 or 1 MiB in total; past that, the followUp is rejected with the reason. Held followUps are journalled under the mesh root until the session holds them, so a restart does not lose them. A followUp whose `data.coalesceKey` is a non-empty string (at most 200 characters) replaces a followUp from the same sender with the same key that Main still holds unread: the newest message and data take its place in the queue, the result reports `coalesced: true` and `replacedMessageId`, and the replaced one is never delivered, also after a restart. A replacement does not count twice against the quota. A followUp without a key, with another key, or from another sender is held as before, and one already handed to Main is never replaced. `agents.tell` to Main is a followUp and coalesces the same way. This is the Main parallel of an actor's mailbox `coalesceKey`; judging whether a notice is stale stays the sender's job. For actors, both operations add a message to the serial mailbox. `agents.status({ id })` accepts any participant ID. It returns complete details for a local run or actor and a bounded directory summary for a remote participant. `agents.setSteeringMode` and `setFollowUpMode` continue to control local one-shot runs.
+
+Main message receipts include `triggered: true | false` when the owner can report it. `true` means delivery requested a new turn from an idle Main at admission; it is not a completion receipt. A normal `followUp` (including `tell` to Main) carries the same wake permission across mesh bridges as local delivery. A busy Main reports `false` while holding the followUp for the next eligible boundary, without starting an extra run. Passive, halted, provider-backoff-held, reload-held, and duplicate admissions also report `false`.
+
+A provider/compaction failure holds triggering peer `followUp` and `steer` messages until 60 seconds after the failure; consecutive failures without a successful turn double this delay, capped at 30 minutes. Held receipts include `reason: "provider-backoff until <ISO timestamp>"`. Fabric retains the messages (with the existing durable journal and quotas) and schedules their release at the deadline, even with the ordinary busy followUp drain disabled. Only one byte/provenance-bounded triggering batch is handed to Pi for a retry whose outcome is still unknown: remaining batches and new peer wakes stay in Fabric, not Pi's native continuation queue. New held admissions during that attempt report `reason: "provider-retry in flight"`. One best-effort `fabric.main.wake` mesh event per released batch, with kind `provider-backoff-released`, reports its message IDs and deadline. A successful turn resets the delay. Successful manual compaction also releases held wakes once Pi becomes idle, even with `mesh.followUpFlushMs: 0`, without resetting the consecutive-failure count. Escape/owner halts still suppress wakes indefinitely and cancel the timer; passive and `nextTurn` context do not arm it. An older owner or non-Main target may omit the field: treat that as unknown, not as `false`. A replayed control acknowledgement retains the original admission report; it does not describe a new wake. Existing cancellation gates and `steer` delivery semantics are unchanged.
 
 Exact-id `followUp`, `steer`, and `tell` use the same participant directory and mesh root as `peers()`, including participant files, state-only records and bridge mirrors. A cached miss is retried with a fresh read. If discovery lists the target but control presence is not yet admissible, the call throws `FabricParticipantNotYetMirroredError` (`code: FABRIC_PARTICIPANT_NOT_YET_MIRRORED`, `retryable: true`, “not yet mirrored”); retry after the next bridge presence refresh. Discovery never bypasses owner/capability or bridge admission checks. Messages to print/JSON roots fail with `FabricParticipantNonInteractiveError`.
 

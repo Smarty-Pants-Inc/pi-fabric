@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { installSelfReload, SELF_RELOAD_COMMAND } from "../src/lifecycle/self-reload.js";
+import { installSelfReload, reloadTargetUiHold as productionUiHold, SELF_RELOAD_COMMAND } from "../src/lifecycle/self-reload.js";
 
 // A producer uses only the public bus contract, never the controller's private state.
 const REQUEST = "pi-fabric:reload-target:v1";
@@ -31,7 +31,8 @@ const entry = (name: string, packageName = "smarty-code") => {
   fs.writeFileSync(path.join(dir, "index.js"), "export default () => {};\n");
   return path.join(dir, "index.js");
 };
-const setup = (options: { concurrency?: number; uiQuery?: boolean; configured?: boolean; packages?: boolean; turnProvenance?: boolean; beforeStart?: (loaded: string) => void } = {}) => {
+const setup = (options: { concurrency?: number; uiQuery?: boolean; hostQuery?: boolean; configured?: boolean; packages?: boolean; turnProvenance?: boolean; beforeStart?: (loaded: string) => void } = {}) => {
+
   const fabric = entry("fabric", "pi-fabric");
   const loaded = entry("code-old");
   const next = entry("code-new");
@@ -62,24 +63,29 @@ const setup = (options: { concurrency?: number; uiQuery?: boolean; configured?: 
     sendUserMessage: vi.fn((text: string, _options?: unknown) => { sent.push(text); }),
   };
   pi.events.on(RESULT, data => replies.push(data));
+  const uiState = { hold: undefined as "dialog" | "custom" | "editor" | undefined, throws: false };
+  const held: Array<{ reason: string; heldForMs: number; target: string }> = [];
   const state = { busy: 0, halted: false, idle: true, pending: false, prompt: false, settling: false, dialog: false, editor: "", compacting: false };
   let sessionId = `reload-target-${++serial}`;
   const context = {
     mode: "tui", hasUI: true,
-    ui: { notify: vi.fn(), setStatus: vi.fn(), getEditorText: () => state.editor },
+    ui: { notify: vi.fn(), setStatus: vi.fn(), getEditorText: () => state.editor,
+      ...(options.hostQuery ? { holdState() { if (uiState.throws) throw new Error("host query failed"); return uiState.hold; } } : {}) },
     isIdle: () => state.idle && !state.compacting,
     hasPendingMessages: () => state.pending,
     isPromptPending: () => state.prompt, isSettling: () => state.settling,
     sessionManager: { getSessionId: () => sessionId }, reload: vi.fn(async () => {}),
   };
-  // This adapter models a host with a supported global UI hold query. The pinned host has none.
+  // Existing seam cases model a host query; hostQuery cases use the production Pi adapter.
   const deps = {
     moduleUrl: pathToFileURL(fabric).href, settingsPath,
     busy: () => state.busy, halted: () => state.halted,
     autoReloadConfigured: () => options.configured ?? true,
     selfReloadConcurrency: () => options.concurrency ?? 0, // other validation tests isolate the legacy scheduler
     reloadSlotsDirectory: path.join(root, "reload-slots"), reloadJitterMs: () => 0,
-    ...(options.uiQuery === false ? {} : { reloadTargetUiHold: () => state.dialog ? "ui-dialog-active" : undefined }),
+    heldNoticeMs: 10_000, publishHeld: (data: { reason: string; heldForMs: number; target: string }) => held.push(data),
+    ...(options.uiQuery === false ? {} : { reloadTargetUiHold: options.hostQuery ? productionUiHold : () => state.dialog ? "ui-dialog-active" : undefined }),
+
   };
   const controller = installSelfReload(pi as never, deps);
   const emit = (name: string, event: unknown = {}) => { for (const handler of handlers.get(name) ?? []) handler(event, context); };
@@ -101,10 +107,64 @@ const setup = (options: { concurrency?: number; uiQuery?: boolean; configured?: 
     const [command, ...args] = text.slice(1).split(" ");
     await commands.get(command!)!.handler(args.join(" "), context);
   };
-  return { pi, context, state, loaded, next, fabric, settingsPath, activate, request, bind, execute, emit, sent, replies, controller,
+  return { pi, context, state, uiState, held, loaded, next, fabric, settingsPath, activate, request, bind, execute, emit, sent, replies, controller,
     replaceSessionWithoutStart: () => { sessionId = `replaced-${++serial}`; },
     switchSession: () => { sessionId = `switched-${++serial}`; controller.sessionStart("switch", context as never); } };
 };
+
+describe("merged Pi holdState adapter", () => {
+  it("keeps absent holdState fail-closed but admits a supported clear host", async () => {
+    const s = setup({ hostQuery: true }); await s.bind(); s.activate(s.next);
+    const holdState = s.context.ui.holdState!; delete s.context.ui.holdState;
+    expect(await s.request(s.next)).toMatchObject({ accepted: false, reason: "unsupported-host:global-dialog/editor-hold-query" });
+    s.context.ui.holdState = holdState;
+    expect(await s.request(s.next)).toMatchObject({ accepted: true, reason: "pending" });
+    s.emit("agent_settled"); await s.execute(); expect(s.context.reload).toHaveBeenCalledTimes(1);
+  });
+  it.each(["dialog", "custom", "editor"] as const)("resource %s retains pending target, reports once, then reloads once after clear", async hold => {
+    vi.useFakeTimers(); const s = setup({ hostQuery: true }); await s.bind(); s.activate(s.next); s.uiState.hold = hold;
+    const result = await s.request(s.next);
+    expect(result).toMatchObject({ accepted: true, reason: "pending" });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(s.sent).toEqual([]); expect(s.context.reload).not.toHaveBeenCalled();
+    expect(s.replies.filter(reply => reply.requestId === result.requestId)).toEqual([result]);
+    expect(s.held).toEqual([{ reason: `ui-hold:${hold}`, target: s.next, heldForMs: expect.any(Number) }]);
+    expect(s.context.ui.notify).toHaveBeenCalledTimes(1);
+    s.uiState.hold = undefined; await vi.advanceTimersByTimeAsync(6_000);
+    expect(s.sent).toHaveLength(1);
+    s.uiState.hold = hold; await s.execute(); expect(s.context.reload).not.toHaveBeenCalled();
+    s.uiState.hold = undefined; await vi.advanceTimersByTimeAsync(6_000); await s.execute();
+    const count = s.sent.length; await vi.advanceTimersByTimeAsync(20_000);
+    expect(s.sent).toHaveLength(count); expect(s.context.reload).toHaveBeenCalledTimes(1);
+  });
+  it.each(["dialog", "custom", "editor"] as const)("Fabric %s holds scheduling and native execution, then reloads once", async hold => {
+    vi.useFakeTimers(); const s = setup({ hostQuery: true });
+    const next = path.dirname(entry("fabric-held-next", "pi-fabric"));
+    const previous = fs.statSync(s.settingsPath).mtimeMs;
+    fs.writeFileSync(s.settingsPath, JSON.stringify({ packages: [next], extensions: [s.loaded] }));
+    fs.utimesSync(s.settingsPath, new Date(previous + 1000), new Date(previous + 1000));
+    s.uiState.hold = hold; s.emit("agent_settled"); await vi.advanceTimersByTimeAsync(30_000);
+    expect(s.sent).toEqual([]); expect(s.held).toEqual([{ reason: `ui-hold:${hold}`, target: next, heldForMs: expect.any(Number) }]);
+    expect(s.context.ui.notify).toHaveBeenCalledTimes(1);
+    s.uiState.hold = undefined; await vi.advanceTimersByTimeAsync(6_000); expect(s.sent).toHaveLength(1);
+    s.uiState.hold = hold; await s.execute(); expect(s.context.reload).not.toHaveBeenCalled();
+    s.uiState.hold = undefined; s.uiState.throws = true; await vi.advanceTimersByTimeAsync(6_000);
+    expect(s.sent).toHaveLength(1); expect(s.context.reload).not.toHaveBeenCalled();
+    s.uiState.throws = false; await vi.advanceTimersByTimeAsync(6_000); await s.execute();
+    expect(s.context.reload).toHaveBeenCalledTimes(1); const count = s.sent.length;
+    await vi.advanceTimersByTimeAsync(20_000); expect(s.sent).toHaveLength(count);
+  });
+  it.each(["advertisement", "execution"])("query throw at %s refuses the resource without consuming a reload attempt", async phase => {
+    vi.useFakeTimers(); const s = setup({ hostQuery: true }); await s.bind(); s.activate(s.next);
+    if (phase === "execution") { expect(await s.request(s.next)).toMatchObject({ accepted: true }); s.emit("agent_settled"); }
+    s.uiState.throws = true;
+    if (phase === "advertisement") expect(await s.request(s.next)).toMatchObject({ accepted: false, reason: "unsupported-host:ui-hold-query-failed" });
+    else { await s.execute(); expect(s.replies.at(-1)).toMatchObject({ accepted: false, reason: "unsupported-host:ui-hold-query-failed" }); }
+    expect(s.context.reload).not.toHaveBeenCalled();
+    s.uiState.throws = false; expect(await s.request(s.next)).toMatchObject({ accepted: true });
+    s.emit("agent_settled"); await s.execute(); expect(s.context.reload).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("reload-target v1 public producer/consumer counterexamples", () => {
   it("slot denial keeps an advertised resource target pending until idle retry can admit it", async () => {

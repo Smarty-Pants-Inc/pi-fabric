@@ -39,8 +39,11 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   for (const fn of close.splice(0).reverse()) await fn();
+  // Windows can briefly hold a terminated worker's cwd/log handles (EBUSY). Retry
+  // asynchronously: synchronous rmSync retries block the event loop, so this
+  // process's own pending handle closes could not settle between attempts.
   for (const dir of roots.splice(0)) {
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });
 const config = { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, retainRuns: true, budgetUsd: 0 };

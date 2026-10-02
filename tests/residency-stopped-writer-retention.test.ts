@@ -119,7 +119,11 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
   }
 }, 20_000);
 
-it.each(["project", "session"] as const)("a settled tracked activation retains reconciliation IDs while its real nested writer survives, then collects once (%s scope)", async scope => {
+// POSIX-only: the fixture's nested writer must outlive its crashed primary, which
+// relies on POSIX detached process groups. Windows durable residency is unsupported
+// (src/residency/host.ts, docs/residency-runtime.md), and there the nested child does
+// not survive the primary's exit, so this descendant-tracking claim is not made.
+it.skipIf(process.platform === "win32").each(["project", "session"] as const)("a settled tracked activation retains reconciliation IDs while its real nested writer survives, then collects once (%s scope)", async scope => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nested-writer-retention-"));
   const rootId = "session:nested-writer-retention";
   const meshRoot = path.join(root, "mesh");

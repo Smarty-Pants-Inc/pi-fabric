@@ -58,16 +58,19 @@ const nativeCases = registered.filter(item => /retains LARGE old|blocks native m
 assert.equal(nativeCases.length, 4);
 for (const item of nativeCases) assert.equal(item.skip, !input.PI_FABRIC_ACTIVATION_TEST_PI_BINARY, "qualification registration: " + item.name);
 assert.equal(registered.find(item => item.name.startsWith("rejects an old native CLI")).skip, Boolean(input.PI_FABRIC_ACTIVATION_TEST_PI_BINARY));
-// Worker selection is inside setup, so evaluate ONLY its actual AST initializer.
+// Worker selection is inside native setup and the retry fixture, so evaluate
+// ONLY their actual AST initializers (never a test callback).
 const workers = [];
 const visit = node => {
   if (ts.isPropertyAssignment(node) && node.name.getText(activation) === "workerPath" && node.initializer.getText(activation).includes("PI_FABRIC_ACTIVATION_TEST_WORKER")) workers.push(node.initializer.getText(activation));
   ts.forEachChild(node, visit);
 };
 visit(activation);
-assert.equal(workers.length, 1);
-vm.runInContext(js("globalThis.worker = " + workers[0]), context);
-assert.equal(context.worker, path.resolve(input.PI_FABRIC_ACTIVATION_TEST_WORKER ?? "src/worker.ts"));
+assert.equal(workers.length, 2);
+for (const worker of workers) {
+  vm.runInContext(js("globalThis.worker = " + worker), context);
+  assert.equal(context.worker, path.resolve(input.PI_FABRIC_ACTIVATION_TEST_WORKER ?? "src/worker.ts"));
+}
 // Audit the other two test-only inputs without executing PostgreSQL or a shell.
 const initializer = (file, name) => {
   const tree = source(file);

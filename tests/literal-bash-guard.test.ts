@@ -31,6 +31,45 @@ describe("literal-only signal and recursive-delete guard", () => {
     "r\\m -rf /x", "r'm' -rf /tmp/session-literal-guard/a", 'cat >(r\\m -rf /x)',
     "python3 - <<'EOF2'\nr\\m -rf /x\nEOF2",
   ];
+  it.each([
+    "find /x -delete", "find /x -exec rm -rf {} +", "find / -name '*.lock' -delete",
+  ])("keeps destructive find actions refused: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBe(DELETE_REASON);
+  });
+  it.each([
+    "ls /some/dir ; find /some/dir -maxdepth 4 -name 'relaunch*.sh'",
+    "rg foo /x | rg bar ; ls /y",
+    "printf 'a → b — c\\n' | cat",
+    'echo "status → done — ok"',
+  ])("allows org and Light 07:09–07:10Z field repro: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBeUndefined();
+  });
+  it.each([
+    "ls /x ; find /x -delete", "ls /x ; find /x -exec rm -rf {} +",
+    "ls /x ; find /x -maxdepth 4 -execdir printf ok ;",
+    "ls /x ; find /x -maxdepth 4 -fprint /outside",
+    "ls /x ; find /x -maxdepth 4 -unknown",
+    "ls /x ; find /x -maxdepth 4 -name relaunch*.sh",
+    "ls /x ; find /x -name '*.ts' -print",
+    "ls /x ; find $D -maxdepth 4 -name '*.sh'",
+    "ls /x ; sh -c 'find /x -maxdepth 4 -name literal.sh'",
+    "ls /x ; find /x -maxdepth 4 -name '*.sh' ; rm -rf /outside",
+  ])("keeps read-only find list proof narrow: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBe(DELETE_REASON);
+  });
+  it.each([
+    "echo pkill ; find /x -maxdepth 4 -name '*.sh'",
+    "ls /x ; find /x -maxdepth 4 -name '*.sh' ; kill 123",
+  ])("never discounts signals alongside a read-only find: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBe(SIGNAL_REASON);
+  });
+  it.each([
+    "ls /x ; find /x -type f",
+    "ls /x ; find /x -maxdepth 4 -name 'relaunch*.sh' -print ; git status",
+    "printf '%s' 'a;b' ; find /x -maxdepth 4 -name 'relaunch*.sh'",
+  ])("allows only fixed literal find maintenance lists: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBeUndefined();
+  });
   it.each(signals)("refuses signal class: %s", command => expect(bashGuardRefusal(command, tmpdir)).toBe(SIGNAL_REASON));
   it.each(deletes)("refuses delete class: %s", command => expect(bashGuardRefusal(command, tmpdir)).toBe(DELETE_REASON));
   it.each([

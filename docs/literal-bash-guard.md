@@ -61,10 +61,26 @@ No execution-boundary denylist exists: `trap`, `complete`, `compgen`, unknown
 heads and future executors receive no generic DATA grant. No cwd, executable
 lookup, trap/completion state or deferred action is modelled.
 
+A plain semicolon-separated maintenance list can discount the `find` token when
+every segment is whole-literal and uses the fixed inert heads or non-executing
+find predicates. Quoted wildcard values for `-name`/`-iname`/`-path`/`-ipath`
+require a literal numeric `-maxdepth` in this list grant. For example,
+`ls /some/dir ; find /some/dir -maxdepth 4 -name 'relaunch*.sh'` passes.
+This does not grant the whole list: signal, rm, shred and xargs evidence still
+refuses. Find delete, exec/ok, file-write and unknown predicates receive no grant.
+The existing unbounded wildcard find refusal is retained. Pipes and text bodies
+with Unicode arrows or dashes pass when they contain no protected evidence.
+
 TMPDIR is read **at each guard call**, never from the submitted shell text. Missing,
 relative, expansion-bearing, traversing or shared-root TMPDIR values confer no
 recursive-delete allowance. A prefix-sharing sibling is not a descendant. Deleting
 the TMPDIR itself is refused; the literal operand must be below it.
+
+The per-session TMPDIR is supplied by the `smarty-role` launcher in `smarty-dev`
+(Light's #3232). Sessions launched without TMPDIR get no recursive rm grant.
+Launch with a private per-session TMPDIR and use a TMPDIR-scoped scratch directory;
+submit its literal absolute descendant path for cleanup. Setting TMPDIR inside
+the Bash command cannot establish this grant, and shared temp roots remain refused.
 
 ## Proof
 
@@ -73,6 +89,8 @@ the TMPDIR itself is refused; the literal operand must be below it.
   commands and literal DATA; field regressions for org-note appends, quoted Light
   variables, Python heredocs, printf/SSH pipes and assignment expansion. Protected
   fragments in scripts/substitutions still refuse with accurate opaque diagnostics.
+  Org and Light 07:09-07:10Z cases cover a bounded read-only find list, rg pipeline
+  and list, Unicode text bodies, and unchanged destructive find refusals.
 - `tests/literal-bash-guard-hook.test.ts`: actual extension registration, cold
   import/idle/non-Bash no-load, awaited first refusal, one call per valid Bash event,
   guard-time host TMPDIR, refusal before timeout mutation and retained wait gate.

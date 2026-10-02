@@ -5,7 +5,7 @@ export const DELETE_REASON = "Recursive delete refused: delete only inside your 
 export const OPAQUE_REASON = "Opaque command refused: a protected signal/delete token is visible after removing quotes or escapes; use a supported literal command.";
 
 type Word = { text: string; literal: boolean };
-type Split = { words: Word[]; simple: boolean };
+type Split = { words: Word[]; simple: boolean; list: string[] | undefined };
 const SIGNALS = new Set(["kill", "pkill", "killall", "killall5"]);
 // A head AND its flags need inert proof. Unknown options never confer DATA credit.
 const DATA_FLAGS: Record<string, readonly string[]> = {
@@ -31,7 +31,8 @@ function split(source: string): Split {
   const words: Word[] = [];
   const opaqueInput = source.includes("<<");
   let text = "", started = false, literal = true, simple = true;
-  let quote = "";
+  let quote = "", listStart = 0, listOnly = true;
+  const list: string[] = [];
   const end = (): void => {
     if (started) words.push({ text, literal });
     text = ""; started = false; literal = true;
@@ -55,8 +56,14 @@ function split(source: string): Split {
       continue;
     }
     if (c === " " || c === "\t") { end(); continue; }
-    // Do not guess command boundaries, heredoc syntax, redirects, or continuation semantics.
-    if ("\n\r;&|()<>".includes(c)) { end(); simple = false; continue; }
+    // Only plain semicolon lists are candidates for the fixed read-only find proof.
+    // Other shell grammar, heredocs, redirects and continuations get no list grant.
+    if ("\n\r;&|()<>".includes(c)) {
+      end(); simple = false;
+      if (c === ";") { list.push(source.slice(listStart, i)); listStart = i + 1; }
+      else listOnly = false;
+      continue;
+    }
     if (c === "#" && !started && !opaqueInput) {
       while (i + 1 < source.length && source[i + 1] !== "\n") i++;
       continue;
@@ -75,11 +82,12 @@ function split(source: string): Split {
   }
   if (quote) { simple = false; literal = false; }
   end();
-  return { words, simple };
+  list.push(source.slice(listStart));
+  return { words, simple, list: listOnly ? list : undefined };
 }
 
 /** One forward pass: each lexical token/basename is considered once, without path backtracking. */
-function protectedTokens(source: string): { signal: boolean; deletion: boolean } {
+function protectedTokens(source: string, readOnlyFind = false): { signal: boolean; deletion: boolean } {
   let signal = false, deletion = false, start = 0, slash = -1;
   for (let i = 0; i <= source.length; i++) {
     const c = source[i];
@@ -89,7 +97,7 @@ function protectedTokens(source: string): { signal: boolean; deletion: boolean }
       // The attached env -S spelling is lexical evidence, not an argv/receiver interpreter.
       const token = source.slice(Math.max(start, slash + 1), i).replace(/^-[A-Za-z]*S/, "");
       signal ||= SIGNALS.has(token);
-      deletion ||= DELETES.has(token);
+      deletion ||= DELETES.has(token) && !(readOnlyFind && token === "find");
     }
     start = i + 1; slash = -1;
   }
@@ -99,7 +107,7 @@ function protectedTokens(source: string): { signal: boolean; deletion: boolean }
 const FIND_VALUES = new Set(["-type", "-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-size", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-user", "-group", "-uid", "-gid", "-perm", "-links", "-inum", "-maxdepth", "-mindepth"]);
 const FIND_FLAGS = new Set(["-H", "-L", "-P", "-print", "-print0", "-empty", "-readable", "-writable", "-executable", "-true", "-false", "-depth", "-mount", "-xdev", "-prune", "-ls"]);
 
-function literalFileMaintenance(words: Word[]): boolean {
+function literalFileMaintenance(words: Word[], boundedPatterns = false): boolean {
   const args = words.slice(1).map(word => word.text);
   if (words[0]?.text === "rm") {
     let i = 0;
@@ -107,7 +115,11 @@ function literalFileMaintenance(words: Word[]): boolean {
     if (args[i] === "--") i++;
     return i < args.length && args.slice(i).every(arg => arg.length > 0 && !arg.startsWith("-") && !/[$`*?\[\]{}~\r\n]/.test(arg));
   }
-  if (words[0]?.text !== "find" || args.some(arg => /[$`*?\[\]{}~\r\n]/.test(arg))) return false;
+  if (words[0]?.text !== "find") return false;
+  const depth = args.indexOf("-maxdepth");
+  const patterns = boundedPatterns && depth >= 0 && /^[0-9]+$/.test(args[depth + 1] ?? "");
+  if (args.some((arg, i) => /[$`{}~\r\n]/.test(arg)
+    || (/[*?\[\]]/.test(arg) && !(patterns && ["-name", "-iname", "-path", "-ipath"].includes(args[i - 1] ?? ""))))) return false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     if (FIND_FLAGS.has(arg)) continue;
@@ -154,6 +166,21 @@ function literalData(words: Word[], simple: boolean): boolean {
   return head === "git" && words.length === 2 && ["log", "status", "diff"].includes(words[1]!.text);
 }
 
+/** A fixed literal maintenance list only discounts find, never other protected tokens. */
+function readOnlyFindList(list: string[] | undefined): boolean {
+  if (!list || list.length < 2) return false;
+  let hasFind = false;
+  for (const source of list) {
+    const { words, simple } = split(source);
+    if (!simple || words.length === 0 || words.some(word => !word.literal)) return false;
+    if (/^\s*find(?:\s|$)/.test(source)) {
+      if (!literalFileMaintenance(words, true)) return false;
+      hasFind = true;
+    } else if (!literalData(words, simple)) return false;
+  }
+  return hasFind;
+}
+
 function literalKill(words: Word[]): boolean {
   if (words[0]?.text !== "kill" || words.some(word => !word.literal)) return false;
   const args = words.slice(1).map(word => word.text);
@@ -195,14 +222,15 @@ function literalRm(words: Word[], tmpdir: string | undefined): boolean {
  * not a sandbox: aliases, custom script files, other languages and dynamic names are not proved.
  */
 export function bashGuardRefusal(command: string, tmpdir: string | undefined): string | undefined {
-  const { words, simple } = split(command);
+  const { words, simple, list } = split(command);
   if (literalData(words, simple)
     || (simple && /^\s*kill(?:\s|$)/.test(command) && literalKill(words))
     || (simple && /^\s*rm(?:\s|$)/.test(command) && literalRm(words, tmpdir))) return undefined;
-  const raw = protectedTokens(command);
+  const readOnlyFind = readOnlyFindList(list);
+  const raw = protectedTokens(command, readOnlyFind);
   let signal = raw.signal, deletion = raw.deletion;
   for (const word of words) {
-    const found = protectedTokens(word.text);
+    const found = protectedTokens(word.text, readOnlyFind);
     signal ||= found.signal; deletion ||= found.deletion;
   }
   if (signal) return SIGNAL_REASON;
@@ -212,7 +240,7 @@ export function bashGuardRefusal(command: string, tmpdir: string | undefined): s
   if (execution || unprovedQuoting) {
     // Scan the whole de-quoted text, including substitution bodies. This is lexical evidence,
     // not execution/expansion interpretation; remove continuations so pki\\\nll stays visible.
-    const dequoted = protectedTokens(command.replace(/\$(['"])/g, "$1").replace(/\\\r?\n|['"\\]/g, ""));
+    const dequoted = protectedTokens(command.replace(/\$(['"])/g, "$1").replace(/\\\r?\n|['"\\]/g, ""), readOnlyFind);
     if (dequoted.signal || dequoted.deletion) return OPAQUE_REASON;
   }
   // Ponytail: variable-assembled receivers ($a$b) remain an accepted limit of this mistake guard.

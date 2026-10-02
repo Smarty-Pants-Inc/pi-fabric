@@ -180,7 +180,7 @@ export class PiModelControl {
     if (this.requested && !this.ready) {
       this.fail("child emitted an assistant message before model admission");
     } else if (
-      this.#admission === "strict" &&
+      (this.requiredPin || this.#admission === "strict") &&
       this.#expected &&
       (!actual || key(actual) !== key(this.#expected))
     ) {

@@ -9,9 +9,10 @@ const setup = (
   thinking: string | undefined = "high",
   finishStartup = true,
   admission: "strict" | "permissive" = "strict",
+  requiredPin = false,
 ) => {
   const io = { send: vi.fn(), admitted: vi.fn(), observed: vi.fn(), fail: vi.fn() };
-  const control = new PiModelControl("run", selector, thinking, io, admission);
+  const control = new PiModelControl("run", selector, thinking, io, false, admission, false, requiredPin);
   const reply = (data?: unknown, success = true) => {
     const sent = io.send.mock.calls.at(-1)![0];
     control.observe({ type: "response", id: sent.id, command: sent.type, success, data, error: success ? undefined : "denied" });
@@ -167,6 +168,30 @@ describe("Pi model admission", () => {
     h.control.observeAssistant({ role: "assistant", provider: wrong.provider, model: wrong.id });
     expect(h.io.fail).not.toHaveBeenCalled();
     expect(h.io.observed).toHaveBeenLastCalledWith("runinfra/glm-5-3-flash");
+  });
+
+  it.each([wrong, undefined])("keeps a required pin exact after permissive admission %#", actual => {
+    const h = setup(requested, "high", true, "permissive", true);
+    admit(h);
+    expect(h.control.ready).toBe(true);
+    expect(h.io.admitted).toHaveBeenCalledExactlyOnceWith(requested, "high");
+    expect(h.io.fail).not.toHaveBeenCalled();
+    h.control.observeAssistant({ role: "assistant", provider: actual?.provider, model: actual?.id });
+    expect(h.io.fail).toHaveBeenCalledExactlyOnceWith(expect.stringContaining(
+      `assistant reports ${actual ? "runinfra/glm-5-3-flash" : "missing model attribution"}; terminating child`,
+    ));
+    // A later valid frame must not undo failure or admit the task again.
+    h.control.observeAssistant({ role: "assistant", provider: model.provider, model: model.id });
+    expect(h.io.fail).toHaveBeenCalledOnce();
+    expect(h.io.admitted).toHaveBeenCalledOnce();
+  });
+
+  it.each([wrong, undefined])("keeps ordinary permissive assistant attribution open %#", actual => {
+    const h = setup(requested, "high", true, "permissive");
+    admit(h);
+    h.control.observeAssistant({ role: "assistant", provider: actual?.provider, model: actual?.id });
+    expect(h.io.fail).not.toHaveBeenCalled();
+    expect(h.io.admitted).toHaveBeenCalledExactlyOnceWith(requested, "high");
   });
 
   it("still fails closed when permissive admission sees no model at all", () => {

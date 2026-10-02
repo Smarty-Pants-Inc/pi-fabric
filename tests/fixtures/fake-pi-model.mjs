@@ -11,6 +11,11 @@ let thinkingLevel = "low";
 let behavior = "success";
 const taskFile = process.env.FAKE_MODEL_SCENARIO;
 if (taskFile) behavior = fs.readFileSync(taskFile, "utf8");
+const pinDrift = /^required-pin:(different|missing):(message_start|message_update|message_end)$/.exec(behavior);
+if (pinDrift) process.on("SIGTERM", () => {
+  fs.writeFileSync(`${taskFile}.terminated`, JSON.stringify({ signal: "SIGTERM", pid: process.pid }));
+  process.exit(143);
+});
 const activation = behavior.startsWith("activation:") ? behavior.slice("activation:".length) : undefined;
 if (activation) {
   emit({ type: "fake_argv", argv: process.argv.slice(2) });
@@ -57,10 +62,14 @@ process.stdin.on("data", chunk => {
       });
     } else if (frame.type === "prompt") {
       emit({ type: "agent_start" });
-      const actual = behavior === "drift" ? wrong : model;
+      const actual = behavior === "drift" || pinDrift?.[1] === "different" ? wrong : model;
       const message = { role: "assistant", provider: actual.provider, model: actual.id, content: [{ type: "text", text: "correct model ran" }], stopReason: "stop", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0 } };
-      emit({ type: "message_start", message });
-      emit({ type: "message_end", message });
+      if (pinDrift?.[1] === "missing") { delete message.provider; delete message.model; }
+      if (pinDrift) emit({ type: pinDrift[2], message });
+      else emit({ type: "message_start", message });
+      // Start/update regressions must fail on the first bad frame, not rely on
+      // message_end to notice it. A later exact frame must not clear failure.
+      emit({ type: "message_end", message: pinDrift ? { ...message, provider: model.provider, model: model.id } : message });
       // Late events must never erase the model mismatch failure.
       emit({ type: "agent_start" });
       emit({ type: "agent_end" });
@@ -68,4 +77,5 @@ process.stdin.on("data", chunk => {
     }
   }
 });
-process.stdin.on("end", () => process.exit(0));
+// Give the required-pin worker SIGTERM time to arrive before ordinary EOF exit.
+process.stdin.on("end", () => pinDrift ? setTimeout(() => process.exit(0), 100) : process.exit(0));

@@ -7,9 +7,54 @@ import { registerFabricActorHostEventObservers } from "../src/actors/host-event-
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
+import { JevClient } from "../src/jev/client.js";
+import { AgentManager } from "../src/agents/manager.js";
 import type { JevRunInfo } from "../src/jev/types.js";
 
 describe("Main lifecycle to Jev observer integration", () => {
+  it.each(["credential", "inference"])("R2 revokes and joins routing on Jev retirement during %s and permits fresh generation", async phase => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-jev-route-owner-"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent")); vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
+    const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "high", sendMessage: vi.fn(), appendEntry: vi.fn(), on: vi.fn(() => () => {}) } as unknown as ExtensionAPI;
+    const available = [{ provider: "test", id: "sol" }];
+    let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
+    let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+    let captured!: AbortSignal; let fetchCalls = 0;
+    const evaluation = JevClient.prototype.evaluate;
+    vi.spyOn(JevClient.prototype, "evaluate").mockImplementation(function (this: JevClient, request, signal) { captured = signal; return evaluation.call(this, request, signal); });
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+      fetchCalls++; if (phase === "inference" && fetchCalls === 1) { captured = init!.signal as AbortSignal; enter(); await new Promise<void>((resolve, reject) => { captured.addEventListener("abort", () => reject(new Error("retired")), { once: true }); void gate.then(resolve); }); }
+      return new Response(JSON.stringify({ model: "jev-latest", answers: { route: { type: "choice", choice: "candidate-0", confidence: 1, probabilities: { "candidate-0": 1 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
+    }));
+    let authCalls = 0;
+    const context = { cwd, hasUI: false, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
+      modelRegistry: { getAvailable: () => available, find: () => available[0], getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "offline-test-only", headers: {} }), getProviderAuthStatus: () => ({ configured: true }), getApiKeyForProvider: async () => { if (phase === "credential" && ++authCalls === 1) { enter(); await gate; } return "offline-test-only"; } },
+      sessionManager: { getSessionId: () => "route-owner", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined }, ui: { setStatus: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    const config = normalizeFabricConfig({ fullCodeMode: true, mcp: { enabled: false }, mesh: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, prewalk: { enabled: false }, agents: { enabled: true }, approvals: { agent: "allow", execute: "allow", read: "allow", network: "allow" } });
+    const fixture = path.join(cwd, "unused.mjs"); fs.writeFileSync(fixture, "export default {};");
+    const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: { extension: fixture, worker: path.resolve("tests/fixtures/fake-worker.mjs"), residentHost: fixture, skills: cwd } });
+    const invocation = { cwd, signal: undefined, parentToolCallId: "route", nestedToolCallId: "route", extensionContext: context, update() {}, approve: async () => {}, audits: [], maxResultChars: 32768 };
+    const launch = vi.spyOn(AgentManager.prototype, "spawn");
+    const spawn = () => runtime.registry.invoke("agents.spawn", { task: "lookup", model: "auto", pinModel: "test/sol", pinThinking: "high", routeClass: "bounded-lookup", protected: false }, invocation);
+    let pending: Promise<unknown> | undefined;
+    try {
+      await runtime.initialize(context, config); pending = spawn(); await entered;
+      let retired = false;
+      const retirement = runtime.registry.invoke("components.reload", { id: "fabric.provider.jev" }, invocation).then(() => { retired = true; });
+      await vi.waitFor(() => expect(captured.aborted).toBe(true));
+      if (phase === "credential") {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        try { expect(retired, "retirement must join the actual uncancellable credential lookup").toBe(false); }
+        finally { release(); await retirement; }
+      } else await retirement;
+      expect(captured.aborted).toBe(true);
+      expect(await pending).toMatchObject({ routeDecision: { reasonCode: "jev-error", model: "test/sol" } });
+      release(); await new Promise(resolve => setTimeout(resolve, 5));
+      expect(fetchCalls).toBe(phase === "credential" ? 0 : 1);
+      expect(await spawn()).toMatchObject({ routeDecision: { reasonCode: "shadow-choice" } }); expect(launch).toHaveBeenCalledTimes(2);
+    } finally { release(); await pending?.catch(() => {}); await runtime.shutdown(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  }, 20000);
+
   it.each([false, true])("delivers real host hooks and cleans up with mesh=%s", async (mesh) => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-jev-observer-"));
     fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });

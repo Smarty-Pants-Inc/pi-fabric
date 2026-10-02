@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -214,7 +215,13 @@ describe("round-1 native root inbox read provenance", () => {
       const batch = await inbox.next(rootInboxSession(manager.getEntries()));
       expect(batch.events).toHaveLength(mixed ? 2 : 1);
       const message = rootInboxMessage(batch.events);
-      expect(message.details).toEqual({ ids: batch.events.map(event => event.id) });
+      expect(message.details).toEqual({
+        ids: batch.events.map(event => event.id),
+        receipts: batch.events.flatMap(event => [
+          ["", "event", event.id],
+          [event.from.id, "id", event.id],
+        ].map(fields => createHash("sha256").update(JSON.stringify(fields)).digest("hex"))),
+      });
       manager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
       expect((await inbox.next(rootInboxSession(manager.getEntries()))).events).toEqual([]);
       const result = await provider.invoke("publish", { topic: "team", text: mixed ? `${text}; head abc1234` : text }, invocation(manager));

@@ -184,7 +184,9 @@ export class AgentMessageRouter {
   /** Only this root's non-owned durable actors can wait out a dead or ownerless local lock.
    * Live/corrupt holders and unrelated routing errors retain the ordinary failure path. */
   async #withDurableRecovery<T>(id: string, operation: () => Promise<T>): Promise<T> {
-    let deadline = Date.now() + RESIDENT_MESH_STALE_WINDOW_MS + 10_000;
+    // Ownerless recovery needs the first integer millisecond strictly after the
+    // stale boundary, plus the full final mesh write-timeout budget.
+    let deadline = Date.now() + RESIDENT_MESH_STALE_WINDOW_MS + 1 + 10_000;
     for (;;) {
       try { return await operation(); }
       catch (error) {
@@ -198,6 +200,7 @@ export class AgentMessageRouter {
         const ownerPath = path.join(lockPath, "owner");
         let owner: string | undefined;
         let createdAt = Number.NaN;
+        let staleBoundaryMs = 0;
         try { owner = fs.readFileSync(ownerPath, "utf8"); }
         catch (readError) {
           if (!(readError instanceof Error && "code" in readError && readError.code === "ENOENT")) throw error;
@@ -207,10 +210,12 @@ export class AgentMessageRouter {
           try {
             const stat = fs.lstatSync(lockPath);
             if (!stat.isDirectory() || fs.existsSync(ownerPath)) throw error;
-            // Date.now/deadline use integer milliseconds. Sub-ms mtime must not
-            // falsely exhaust the final write budget; MeshStore still checks the
-            // full-precision stale age before it reclaims anything.
+            // Date.now/timers use integer milliseconds, but MeshStore protects
+            // the full-precision mtime while age <= the stale window. Flooring is
+            // safe for future-time validation only: retry at floor(mtime) + 1 so
+            // neither fractional timestamps nor an exact boundary retry early.
             createdAt = Math.floor(stat.mtimeMs);
+            staleBoundaryMs = 1;
           } catch { throw error; }
         }
         if (owner !== undefined) {
@@ -220,9 +225,10 @@ export class AgentMessageRouter {
           if (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid)) throw error;
         }
         if (!Number.isFinite(createdAt) || createdAt < 0 || createdAt > Date.now()) throw error;
-        deadline = Math.min(deadline, createdAt + RESIDENT_MESH_STALE_WINDOW_MS + 10_000);
+        const retryAt = createdAt + RESIDENT_MESH_STALE_WINDOW_MS + staleBoundaryMs;
+        deadline = Math.min(deadline, retryAt + 10_000);
         const now = Date.now();
-        const waitMs = Math.max(100, createdAt + RESIDENT_MESH_STALE_WINDOW_MS - now);
+        const waitMs = Math.max(100, retryAt - now);
         // Leave a full mesh write-timeout budget for the final attempt. Never extend for a new holder.
         if (now + waitMs + 10_000 > deadline) throw error;
         await new Promise((resolve) => setTimeout(resolve, waitMs));

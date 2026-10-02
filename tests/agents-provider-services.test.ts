@@ -138,6 +138,7 @@ describe("agents provider message routing service boundaries", () => {
   it.each([
     ["ensure", "dead"], ["route", "dead"], ["ensure", "ownerless"], ["route", "ownerless"],
     ["ensure", "ownerless-submillisecond"], ["route", "ownerless-submillisecond"],
+    ["ensure", "ownerless-submillisecond-past"], ["route", "ownerless-submillisecond-past"],
   ] as const)("F7 waits through the mesh stale window on %s failure (%s holder)", async (stage, holder) => {
     const ports = routing();
     ports.actors.status.mockReturnValue({ id: "actor", residency: "durable", rootId: "main" } as ReturnType<Ports[1]["status"]>);
@@ -150,18 +151,23 @@ describe("agents provider message routing service boundaries", () => {
     const router = new AgentMessageRouter(ports.agents, { ...ports.actors, owns: () => false },
       ports.main, ports.participants, ports.control, (binding) => binding, residency);
     const failure = Object.assign(new Error("dead mesh holder"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
-    vi.useFakeTimers();
+    // Whole-second epoch avoids floating-point loss in the seconds-based utimes API.
+    vi.useFakeTimers({ now: new Date("2026-01-01T00:00:00.000Z") });
     const started = Date.now();
     const lockPath = path.join(root, ".lock");
     fs.mkdirSync(lockPath);
     if (holder === "dead") fs.writeFileSync(path.join(lockPath, "owner"), `fixture\n2147483647\n${started}\n`);
     else {
-      const created = started + (holder === "ownerless-submillisecond" ? 0.5 : 0);
+      const created = started + (holder === "ownerless-submillisecond" ? 0.5 : holder === "ownerless-submillisecond-past" ? -0.5 : 0);
       fs.utimesSync(lockPath, started / 1000, created / 1000);
+      const mtime = fs.statSync(lockPath).mtimeMs;
       if (holder === "ownerless-submillisecond") {
-        expect(fs.statSync(lockPath).mtimeMs).toBeGreaterThan(started);
-        expect(fs.statSync(lockPath).mtimeMs).toBeLessThan(started + 1);
-      }
+        expect(mtime).toBeGreaterThan(started);
+        expect(mtime).toBeLessThan(started + 1);
+      } else if (holder === "ownerless-submillisecond-past") {
+        expect(mtime).toBeGreaterThan(started - 1);
+        expect(mtime).toBeLessThan(started);
+      } else expect(mtime).toBe(started);
     }
     if (stage === "ensure") ensureActor.mockRejectedValueOnce(failure);
     else ports.control.request.mockRejectedValueOnce(failure);
@@ -169,9 +175,14 @@ describe("agents provider message routing service boundaries", () => {
     try {
       const result = router.routeMessage("actor", "immediate", undefined, "followUp")
         .then((value) => ({ value }), (error: unknown) => ({ error }));
+      // MeshStore protects an ownerless directory while age <= 30_000, including
+      // the exact boundary. Use the real filesystem timestamp, not the requested utime.
+      const protectedUntil = holder === "dead" ? started + 29_999 : Math.floor(fs.statSync(lockPath).mtimeMs + 30_000);
       await vi.advanceTimersByTimeAsync(29_999);
       expect(stage === "ensure" ? ensureActor : ports.control.request).toHaveBeenCalledTimes(1);
-      await vi.advanceTimersByTimeAsync(2);
+      await vi.advanceTimersByTimeAsync(protectedUntil - started - 29_999);
+      expect(stage === "ensure" ? ensureActor : ports.control.request).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(holder === "dead" ? 2 : 1);
       expect(await result).toMatchObject({ value: { queued: true } });
       expect(Date.now() - started).toBeLessThanOrEqual(40_000);
       // The router waits/retries only; MeshStore alone owns reclamation and fencing.

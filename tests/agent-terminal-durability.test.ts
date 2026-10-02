@@ -50,29 +50,126 @@ const faults = (reject: (file: string, fd: number) => boolean) => {
 };
 const status = (manager: AgentManager, id: string) => path.join(manager.runDirectory(id)!, "status.json");
 
+const runtimeFixture = (temp: string, entries: unknown[]) => {
+  const sendMessage = vi.fn();
+  const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "off", sendMessage, on: vi.fn(),
+    appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
+  } as unknown as ExtensionAPI;
+  const context = {
+    cwd: temp, hasUI: true, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
+    model: { provider: "dest", id: "old", contextWindow: 48_000 },
+    modelRegistry: { getAvailable: () => [{ provider: "dest", id: "old", contextWindow: 48_000 }], find: () => ({ provider: "dest", id: "old", contextWindow: 48_000 }), getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fixture" }), refresh: async () => ({}) },
+    sessionManager: { getSessionId: () => "terminal-replacement", getSessionFile: () => undefined, getBranch: () => [], getEntries: () => entries, getLeafId: () => null },
+    ui: { setStatus: vi.fn(), notify: vi.fn() },
+  } as unknown as ExtensionContext;
+  const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: {
+    extension: path.resolve("dist/index.js"), worker: path.resolve("tests/fixtures/fake-worker.mjs"), residentHost: path.join(temp, "unused.mjs"), skills: temp,
+  } });
+  const config = normalizeFabricConfig({ fullCodeMode: false, retention: { orphanedTempRunMs: 60 * 60 * 1000, oneShotRunMs: 60 * 60 * 1000 }, agents: { enabled: true, budgetUsd: 0, retainRuns: false, notifyOnComplete: true, sessionExport: false }, mcp: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, mesh: { enabled: true, root: path.join(temp, "mesh") }, prewalk: { enabled: false, alwaysRearm: false } });
+  return { runtime, sendMessage, init: () => runtime.initialize(context, config) };
+};
+
 describe("Astra F15-F22 terminal publication obligations", () => {
+  it.skipIf(process.platform === "win32")("F18 two-run runtime replacement preserves A after its monitor settles during B's slow stop", async () => {
+    const { temp, manager: unused, exit, launch } = fixture({ retainRuns: false });
+    await unused.close();
+    const entries: unknown[] = [];
+    vi.stubEnv("PI_FABRIC_PROJECT_ROOT", temp);
+    vi.stubEnv("PI_FABRIC_TMPDIR", temp);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(temp, "agent"));
+    for (const name of ["PI_FABRIC_RUN_ROOT", "PI_FABRIC_MESH_ROOT", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_PARENT_RUN", "PI_FABRIC_SESSION_ID", "PI_FABRIC_MAIN_AGENT_ID"]) vi.stubEnv(name, undefined);
+    let first: ReturnType<typeof runtimeFixture> | undefined = runtimeFixture(temp, entries);
+    let second: ReturnType<typeof runtimeFixture> | undefined;
+    let third: ReturnType<typeof runtimeFixture> | undefined;
+    let releaseSlowStop: (() => void) | undefined;
+    let closing: Promise<void> | undefined;
+    let shutdown: Promise<void> | undefined;
+    let fault: ReturnType<typeof faults> | undefined;
+    try {
+      await first.init();
+      const handle = await first.runtime.agents.spawn({ task: "A", transport: "process", model: "dest/old" });
+      const originalLaunch = launch.getMockImplementation()!;
+      let slowAlive = true;
+      const exitDelay = new Promise<void>(resolve => { releaseSlowStop = resolve; });
+      const slowStop = vi.fn(async () => { await exitDelay; slowAlive = false; });
+      launch.mockImplementationOnce(async request => ({ ...await originalLaunch(request), isAlive: async () => slowAlive, stop: slowStop }));
+      const slow = await first.runtime.agents.spawn({ task: "B", transport: "process", model: "dest/old" });
+      const file = status(first.runtime.agents, handle.id), directory = path.dirname(file);
+      const answer = { ...JSON.parse(fs.readFileSync(file, "utf8")), status: "completed", sessionId: "2147483647", finishedAt: Date.now(), text: "A's exact completed answer\n" + "full answer ".repeat(2000), value: { exact: [1, "retained", { result: true }] }, usage: { input: 123, output: 456, cacheRead: 789, cacheWrite: 12, cost: 0.345 }, turns: 7 };
+      fs.writeFileSync(file, JSON.stringify(answer));
+      exit();
+      let confirmations = 0;
+      fault = faults((target, fd) => target === directory && fs.fstatSync(fd).isDirectory() && ++confirmations === 1);
+      const originalStop = first.runtime.agents.stop.bind(first.runtime.agents);
+      let rejected = false, settled = false, closed = false;
+      vi.spyOn(first.runtime.agents, "stop").mockImplementation(async id => {
+        try { return await originalStop(id); }
+        catch (error) { if (id === handle.id) rejected = true; throw error; }
+      });
+      // join observes real settlement without consuming A or saving a session answer.
+      const joined = first.runtime.agents.join(handle.id).then(() => { settled = true; });
+      // Enter close synchronously so its stop sees the one-shot failure before the monitor.
+      closing = first.runtime.agents.close().then(() => { closed = true; });
+      shutdown = first.runtime.shutdown();
+      await vi.waitFor(() => {
+        expect(rejected).toBe(true);
+        expect(slowStop).toHaveBeenCalledOnce();
+        expect(settled).toBe(true);
+      }, { timeout: 4000 });
+      await joined;
+      expect(confirmations).toBeGreaterThan(1);
+      expect(closed).toBe(false);
+      expect(first.sendMessage).not.toHaveBeenCalled();
+      expect(entries.some(entry => (entry as { data?: { delivered?: string[] } }).data?.delivered?.includes(handle.id))).toBe(false);
+      expect(fs.existsSync(file)).toBe(true);
+      await expect(first.runtime.agents.cleanup(handle.id)).rejects.toThrow(/not durably preserved/);
+      expect(fs.existsSync(file)).toBe(true);
+      releaseSlowStop!();
+      await closing;
+      await shutdown;
+      first = undefined; // Recovery must use the saved session, not the settled old manager.
+      expect(entries).toContainEqual(expect.objectContaining({ customType: STOPPED_AGENTS_ENTRY, data: expect.objectContaining({ stopped: expect.arrayContaining([expect.objectContaining({ ...answer, terminalPending: { statusFile: file, publication: false } })]) }) }));
+      fault.mockRestore();
+      vi.mocked(fs.openSync).mockRestore();
+      let recoveryUnavailable = true, recoveryBarriers = 0;
+      fault = faults(target => path.basename(target).startsWith("status.json.") && target.endsWith(".tmp") && (++recoveryBarriers, recoveryUnavailable));
+      second = runtimeFixture(temp, entries);
+      await second.init();
+      await expect(second.runtime.agents.wait(handle.id)).rejects.toThrow(/publication barrier/);
+      expect(recoveryBarriers).toBeGreaterThan(0);
+      expect(JSON.stringify(second.sendMessage.mock.calls)).not.toContain("A's exact completed answer");
+      expect(entries.some(entry => (entry as { data?: { delivered?: string[] } }).data?.delivered?.includes(handle.id))).toBe(false);
+      recoveryUnavailable = false;
+      // The completion inbox may batch A and B, or deliver B before A's storage recovers.
+      await vi.waitFor(() => expect(JSON.stringify(second!.sendMessage.mock.calls)).toContain("A's exact completed answer"), { timeout: 4000 });
+      expect(second.runtime.agents.status(handle.id)).toMatchObject(answer);
+      expect(await second.runtime.agents.wait(handle.id)).toMatchObject(answer);
+      expect(second.runtime.agents.status(slow.id)).toMatchObject({ status: "stopped" });
+      expect(launch).toHaveBeenCalledTimes(2);
+      await second.runtime.shutdown();
+      second = undefined;
+      third = runtimeFixture(temp, entries);
+      await third.init();
+      expect(await third.runtime.agents.wait(handle.id)).toMatchObject(answer);
+      expect(third.sendMessage).not.toHaveBeenCalled();
+      expect(launch).toHaveBeenCalledTimes(2);
+    } finally {
+      fault?.mockRestore();
+      releaseSlowStop?.();
+      await closing;
+      await shutdown;
+      await first?.runtime.shutdown();
+      await second?.runtime.shutdown();
+      await third?.runtime.shutdown();
+      vi.unstubAllEnvs();
+    }
+  }, 30_000);
+
   it.skipIf(process.platform === "win32").each(["original", "collected", "collected-pre-rename", "collected-post-rename"] as const)("F18 replacement runtime restores the exact session answer after %s storage handoff", async mode => {
     const { temp, manager: unused, exit, launch } = fixture({ retainRuns: false });
     await unused.close();
     const entries: unknown[] = [];
-    const createRuntime = () => {
-      const sendMessage = vi.fn();
-      const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "off", sendMessage, on: vi.fn(),
-        appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
-      } as unknown as ExtensionAPI;
-      const context = {
-        cwd: temp, hasUI: true, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
-        model: { provider: "dest", id: "old", contextWindow: 48_000 },
-        modelRegistry: { getAvailable: () => [{ provider: "dest", id: "old", contextWindow: 48_000 }], find: () => ({ provider: "dest", id: "old", contextWindow: 48_000 }), getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fixture" }), refresh: async () => ({}) },
-        sessionManager: { getSessionId: () => "terminal-replacement", getSessionFile: () => undefined, getBranch: () => [], getEntries: () => entries, getLeafId: () => null },
-        ui: { setStatus: vi.fn(), notify: vi.fn() },
-      } as unknown as ExtensionContext;
-      const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: {
-        extension: path.resolve("dist/index.js"), worker: path.resolve("tests/fixtures/fake-worker.mjs"), residentHost: path.join(temp, "unused.mjs"), skills: temp,
-      } });
-      const config = normalizeFabricConfig({ fullCodeMode: false, retention: { orphanedTempRunMs: 60 * 60 * 1000, oneShotRunMs: 60 * 60 * 1000 }, agents: { enabled: true, budgetUsd: 0, retainRuns: false, notifyOnComplete: true, sessionExport: false }, mcp: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, mesh: { enabled: true, root: path.join(temp, "mesh") }, prewalk: { enabled: false, alwaysRearm: false } });
-      return { runtime, sendMessage, init: () => runtime.initialize(context, config) };
-    };
+    const createRuntime = () => runtimeFixture(temp, entries);
     vi.stubEnv("PI_FABRIC_PROJECT_ROOT", temp);
     vi.stubEnv("PI_FABRIC_TMPDIR", temp);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(temp, "agent"));
@@ -294,6 +391,9 @@ describe("Astra F15-F22 terminal publication obligations", () => {
     } finally {
       fault.mockRestore();
       await manager.wait(handle.id, { timeoutMs: 3000 });
+      // Later monitor recovery cannot authorize collection after the session save failed.
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/not durably preserved/);
+      expect(fs.existsSync(file)).toBe(true);
       managers.splice(managers.indexOf(manager), 1); // Its intentionally rejected close is already joined.
     }
   });

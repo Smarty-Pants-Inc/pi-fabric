@@ -315,6 +315,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   terminalConfirmation?: AgentRunResult;
   /** Full terminal publication owed after effects have finished; retry storage only. */
   terminalPublication?: AgentRunResult;
+  /** Rejected close-time stop's full answer; only a saved session handoff releases collection. */
+  terminalCloseHandoff?: AgentRunResult;
   model?: string;
   thinking?: AgentRunRequest["thinking"];
   routeOutcome?: (result: AgentRunResult) => void;
@@ -2106,20 +2108,31 @@ export class AgentManager {
     const running = [...this.#runs.values()].filter((managed) => !managed.settled);
     const lastEventAt = new Map(running.map((managed) => [managed.id, lastEventTime(managed)]));
     const stopped = await Promise.allSettled([
-      ...running.map((managed) => this.stop(managed.id)),
+      ...running.map(async (managed) => {
+        try { return await this.stop(managed.id); } catch (error) {
+          // Capture at rejection, before another run's slow stop lets the monitor
+          // settle this answer and clear its mutable confirmation/publication debt.
+          const answer = managed.terminalPublication ?? managed.terminalConfirmation;
+          if (answer) managed.terminalCloseHandoff = structuredClone({
+            ...hostStoppedResult(answer, lastEventAt.get(managed.id)),
+            terminalPending: { statusFile: managed.statusFile, publication: !!managed.terminalPublication },
+          });
+          throw error;
+        }
+      }),
       ...queuedAtClose.map((queued) => this.stop(queued.info.id)),
     ]);
     // A reload or shutdown ends these runs; tell the spawner's session (smarty-dev#1602).
     const results = stopped.flatMap((outcome, index): AgentRunResult[] => {
       if (outcome.status === "fulfilled") return [hostStoppedResult(outcome.value, lastEventAt.get(outcome.value.id))];
-      const managed = running[index];
-      const answer = managed?.terminalPublication ?? managed?.terminalConfirmation;
-      if (!managed || !answer) return [];
-      return [{ ...hostStoppedResult(answer, lastEventAt.get(managed.id)),
-        terminalPending: { statusFile: managed.statusFile, publication: !!managed.terminalPublication } }];
+      const handoff = running[index]?.terminalCloseHandoff;
+      return handoff ? [handoff] : [];
     });
     if (results.length > 0) {
-      try { this.#onStoppedAtClose?.(results); } catch (error) {
+      try {
+        this.#onStoppedAtClose?.(results);
+        if (this.#onStoppedAtClose) for (const managed of running) delete managed.terminalCloseHandoff;
+      } catch (error) {
         // Do not let runtime teardown discard an obligation with no session handoff.
         if (results.some(result => result.terminalPending)) throw error;
       }
@@ -2136,7 +2149,7 @@ export class AgentManager {
     const alive = await Promise.all(transports.map((transport) =>
       uncheckedExternalExit(transport) ? true :
         this.#transportAliveUntil(transport, observationDeadline).then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
-    const unresolved = all.some((managed) => !managed.settled || managed.resolve || managed.terminalConfirmation || managed.terminalPublication ||
+    const unresolved = all.some((managed) => !managed.settled || managed.resolve || managed.terminalConfirmation || managed.terminalPublication || managed.terminalCloseHandoff ||
       managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
       [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasUnresolvedWorker(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
@@ -2735,7 +2748,7 @@ export class AgentManager {
   }
 
   #canCollect(managed: ManagedAgent): boolean {
-    if (!managed.settled || managed.resolve || managed.terminalConfirmation || managed.terminalPublication) return false;
+    if (!managed.settled || managed.resolve || managed.terminalConfirmation || managed.terminalPublication || managed.terminalCloseHandoff) return false;
     if (managed.lostContact) this.#markLost(managed, managed.lostContact);
     if (uncheckedExternalExit(managed.transport) || runTreeExitVeto(managed.runDirectory)) return false;
     // Settlement compacts UI caches. Retry only the original full result, never those caches.

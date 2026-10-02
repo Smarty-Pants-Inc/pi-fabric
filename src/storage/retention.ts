@@ -86,9 +86,10 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
   fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
   writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details });
 };
-/** A terminal external-pane record is not an exit receipt. Share this persistent,
+/** A terminal record is not a descendant exit receipt. Share this persistent,
  * tree-wide veto across tracked, recovered and offline cleanup before removing
- * worktrees or files; absence of an unresolved marker never proves pane exit. */
+ * worktrees or files; absence of an unresolved marker never proves worker exit.
+ * Recordless pre-launch rollback remains distinct from an admitted process run. */
 export const runTreeExitVeto = (directory: string, depth = 0, expired: Deadline = noDeadline): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
@@ -107,6 +108,18 @@ export const runTreeExitVeto = (directory: string, depth = 0, expired: Deadline 
     if (fs.existsSync(statusFile) && !record) return "worker exit is unconfirmed: unreadable run record";
     if (record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
+    }
+    if (record?.transport === "process") {
+      if (!record.status || !TERMINAL_STATUSES.has(record.status)) {
+        return `worker exit is unconfirmed: nonterminal process record (${directory})`;
+      }
+      // Reuse the retention liveness probe: invalid PIDs and every query error
+      // except ESRCH are uncertainty, not proof of exit. A saved identity must
+      // be usable even when the worker reported a terminal UI status.
+      if (record.sessionId !== undefined && (typeof record.sessionId !== "string" ||
+          !/^\d+$/.test(record.sessionId) || processAlive(Number(record.sessionId)))) {
+        return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
+      }
     }
     const nested = path.join(directory, "nested");
     try { fs.lstatSync(nested); }
@@ -132,11 +145,8 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   if (runTreeExitVeto(root, 0, expired)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
-  const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
-    ? Number(record.sessionId) : undefined;
-  if (pid !== undefined && processAlive(pid)) return false;
   if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
-    if (!childrenStopped && pid === undefined) return false;
+    if (!childrenStopped) return false;
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
   }
   try {
@@ -165,8 +175,6 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
  * and still veto live/unknown workers, nested survivors and unresolved markers. */
 export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline): boolean => {
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-  if (record?.transport === "process" && record.sessionId !== undefined &&
-      (typeof record.sessionId !== "string" || !/^\d+$/.test(record.sessionId) || Number(record.sessionId) <= 0)) return false;
   return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired);
 };
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {

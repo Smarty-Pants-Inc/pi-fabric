@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  canRemoveTerminalRun,
   FABRIC_RUN_ROOT_PREFIX,
   markRunRootActive,
   markRunRootClosed,
@@ -37,6 +38,57 @@ afterEach(() => {
 });
 
 describe("shared run-tree exit veto", () => {
+  it.each(["running", "queued", "unknown", undefined])("vetoes a nested nonterminal process record (%s) even with a dead saved PID", status => {
+    const run = temporaryDirectory();
+    writeStatus(run, { status: "completed", transport: "process" });
+    writeStatus(path.join(run, "nested", "child"), { status, transport: "process", sessionId: "2147483647" });
+    const probe = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
+    try {
+      expect(runTreeExitVeto(run)).toMatch(/nonterminal process/);
+      expect(canRemoveTerminalRun(run)).toBe(false);
+    } finally { probe.mockRestore(); }
+  });
+
+  it.each(["", "not-a-pid", "0", "-1", "1.5", "9007199254740992", 123, null])("vetoes a nested terminal process record with an unusable saved identity (%s)", sessionId => {
+    const run = temporaryDirectory();
+    writeStatus(run, { status: "completed", transport: "process" });
+    writeStatus(path.join(run, "nested", "child"), { status: "completed", transport: "process", sessionId });
+    expect(runTreeExitVeto(run)).toMatch(/saved process identity is live or unknown/);
+    expect(canRemoveTerminalRun(run)).toBe(false);
+  });
+
+  it.each(["EPERM", "EACCES", "unexpected"])("vetoes a nested terminal process record on an unknown liveness result (%s)", code => {
+    const run = temporaryDirectory();
+    writeStatus(run, { status: "completed", transport: "process" });
+    writeStatus(path.join(run, "nested", "child"), { status: "completed", transport: "process", sessionId: "2147483647" });
+    const probe = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("unknown"), { code }); });
+    try {
+      expect(runTreeExitVeto(run)).toMatch(/saved process identity is live or unknown/);
+      expect(canRemoveTerminalRun(run)).toBe(false);
+    } finally { probe.mockRestore(); }
+  });
+
+  it.each(["completed", "failed", "stopped", "timed_out"])("permits a nested %s process record only after a usable saved PID is confirmed absent", status => {
+    const run = temporaryDirectory();
+    writeStatus(run, { status: "completed", transport: "process" });
+    writeStatus(path.join(run, "nested", "child"), { status, transport: "process", sessionId: "2147483647" });
+    const probe = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
+    try {
+      expect(runTreeExitVeto(run)).toBeUndefined();
+      expect(canRemoveTerminalRun(run)).toBe(true);
+      expect(probe).toHaveBeenCalledWith(2147483647, 0);
+    } finally { probe.mockRestore(); }
+  });
+
+  it("does not turn recordless pre-launch rollback into an admitted-worker obligation", () => {
+    const run = temporaryDirectory();
+    fs.writeFileSync(path.join(run, "task.txt"), "not launched");
+    expect(runTreeExitVeto(run)).toBeUndefined();
+    expect(canRemoveTerminalRun(run)).toBe(false);
+    expect(runTreeExitVeto(path.join(run, "already-removed"))).toBeUndefined();
+  });
+
+
   it("refuses malformed records and failed nested inspection rather than inferring exit", () => {
     const run = temporaryDirectory();
     const status = path.join(run, "status.json"); fs.writeFileSync(status, "{broken");

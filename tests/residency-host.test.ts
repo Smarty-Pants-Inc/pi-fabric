@@ -337,7 +337,7 @@ describe("resident host ownership", () => {
     try {
       await host.start();
       const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
-      expect(owner).toMatchObject({ requestFence: 1, commands: expect.arrayContaining(["setModel", "setTools"]), pid: process.pid, hostId: host.hostId });
+      expect(owner).toMatchObject({ requestFence: 1, callerBoundSpawn: 1, commands: expect.arrayContaining(["spawnBound", "setModel", "setTools"]), pid: process.pid, hostId: host.hostId });
       expect(owner.processStartTime).toBe(processStartTime(process.pid));
       expect(residentProcessAlive(owner.pid, owner.processStartTime)).toBe(true);
       await host.close();

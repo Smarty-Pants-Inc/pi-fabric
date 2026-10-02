@@ -459,7 +459,7 @@ export class ResidencyClient {
     const response = await this.#command(
       {
         format: RESIDENT_HOST_FORMAT,
-        operation: "spawn",
+        operation: "spawnBound",
         requestId: randomUUID(),
         rootId: this.options.config.rootId,
         request: { ...resolvedRequest, ...(tools ? { tools } : {}), residency: "durable" },
@@ -471,8 +471,8 @@ export class ResidencyClient {
     if (!response.handle) throw new Error("Fabric resident host returned no agent handle");
     await this.#waitForParticipant(response.handle.id, "agent", signal).catch((error) => {
       throw new ResidentOutcomeUnknownError({
-        format: RESIDENT_HOST_FORMAT, operation: "spawn", requestId: response.requestId,
-        rootId: this.options.config.rootId, request, createdAt: Date.now(),
+        format: RESIDENT_HOST_FORMAT, operation: "spawnBound", requestId: response.requestId,
+        rootId: this.options.config.rootId, request, caller, createdAt: Date.now(),
       }, { requestId: response.requestId, state: "committed", id: response.handle!.id, ownerHostId: this.hostId }, error, signal);
     });
     return response.handle;
@@ -710,7 +710,7 @@ export class ResidencyClient {
             }
             throw new Error(response.error ?? "Fabric resident host rejected request");
           }
-          if ((command.operation === "spawn" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
+          if ((command.operation === "spawnBound" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
             throw new Error("Fabric resident host returned no created entity");
           }
           return response;

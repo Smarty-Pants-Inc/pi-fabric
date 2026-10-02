@@ -527,6 +527,7 @@ export class ResidentHost {
         readyAt: now,
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
+        callerBoundSpawn: 1,
         ...(this.launch ? { releaseRoot: this.launch.spec.releaseRoot, configDigest: this.launch.spec.digest,
           handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
           ...(this.launch.attempt ? { attempt: this.launch.attempt } : {}) } : {}),
@@ -1013,7 +1014,7 @@ export class ResidentHost {
       if (command.operation === "releaseChange") {
         this.#prepareRelease(command);
         response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, completedAt: Date.now() };
-      } else if (command.operation === "spawn") {
+      } else if (command.operation === "spawnBound") {
         if (
           command.request.residentStartupProbe ||
           command.request.sessionSeed ||

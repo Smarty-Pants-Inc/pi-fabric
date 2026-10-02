@@ -147,7 +147,7 @@ export class ResidentOutcomeUnknownError extends Error {
 
   constructor(command: ResidentCommand, decision: ResidentRequestDecision | undefined, cause: unknown, signal?: AbortSignal) {
     const id = decision?.id ?? ("id" in command ? command.id : undefined);
-    const kind = ["spawn", "foreground", "cleanup"].includes(command.operation) ? "agent" : "actor";
+    const kind = ["spawn", "spawnBound", "foreground", "cleanup"].includes(command.operation) ? "agent" : "actor";
     // Guest runtimes may preserve only message, so the classification and IDs live there too.
     super(`ResidentOutcomeUnknownError: Fabric residency ${command.operation} outcome unknown: requestId=${command.requestId}` +
       `, ${kind}Id=${id ?? "not yet known"}` +
@@ -322,6 +322,8 @@ export interface ResidentHostOwner {
   commands?: readonly string[];
   /** New clients must not dispatch mutations to an already-running pre-fence host. */
   requestFence?: 1;
+  /** Loaded executor validates and applies a trusted per-launch caller return address. */
+  callerBoundSpawn?: 1;
   /** Attestation from the loaded host, never desired config.json. */
   releaseRoot?: string;
   configDigest?: string;
@@ -364,12 +366,13 @@ export const assertResidentTaskCaller = (
 
 interface ResidentSpawnCommand {
   format: typeof RESIDENT_HOST_FORMAT;
-  operation: "spawn";
+  // A distinct wire operation prevents rollback hosts from ignoring caller.
+  operation: "spawnBound";
   requestId: string;
   rootId: string;
   request: AgentRunRequest;
   /** Host-captured runtime binding, separate from all task-supplied run settings. */
-  caller?: ResidentTaskCaller;
+  caller: ResidentTaskCaller;
   createdAt: number;
 }
 
@@ -482,7 +485,7 @@ export type ResidentCommand =
 // The only operations every format-1 host predating command negotiation understood.
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
-  ...LEGACY_RESIDENT_COMMANDS, "actors", "actorStatus", "setInstructions", "setModel",
+  "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "setInstructions", "setModel",
   "setThinking", "setTools", "setActivationFilter", "releaseChange",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
@@ -499,6 +502,16 @@ export class ResidentCommandUnsupportedError extends Error {
 
 /** Check the running owner's publication, never the caller's release/config. */
 export const assertResidentCommandSupported = (owner: ResidentHostOwner, operation: ResidentCommand["operation"]): void => {
+  // Negotiation and the new wire discriminant are independent fences: this
+  // check prevents dispatch to an old live owner; spawnBound prevents a queued
+  // request being run unbound if a rollback host later acquires the directory.
+  if (operation === "spawnBound" && (owner.callerBoundSpawn !== 1 ||
+      !Array.isArray(owner.commands) || !owner.commands.includes(operation))) {
+    throw new ResidentCommandUnsupportedError(
+      `The owning resident host ${owner.hostId} (pid ${owner.pid}${owner.releaseRoot ? `, release ${owner.releaseRoot}` : ""}) ` +
+      "lacks caller-bound spawn support. Reload Main and complete resident host handover to the current release before retrying. No request was dispatched.",
+    );
+  }
   const supported = owner.commands === undefined ? LEGACY_RESIDENT_COMMANDS : owner.commands;
   if (!isResidentCommandOperation(operation) || !Array.isArray(supported) ||
       !(supported as readonly string[]).includes(operation)) {

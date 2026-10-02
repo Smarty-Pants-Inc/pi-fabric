@@ -254,7 +254,7 @@ describe.skipIf(process.platform === "win32")("durable public spawn return addre
     for (const value of forged) {
       const requestId = randomUUID();
       fs.writeFileSync(path.join(f.config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({
-        format: RESIDENT_HOST_FORMAT, operation: "spawn", requestId, rootId: SPAWNER,
+        format: RESIDENT_HOST_FORMAT, operation: "spawnBound", requestId, rootId: SPAWNER,
         request: { task: "must not launch", residency: "durable", transport: "process" }, caller: value, createdAt: Date.now(),
       }));
       const responseFile = path.join(f.config.residencyRoot, "responses", `${requestId}.json`);

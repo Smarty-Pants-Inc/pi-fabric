@@ -48,7 +48,7 @@ describe("abandonResidentRequest", () => {
     }
   });
 
-  it.each(["spawn", "createActor", "removeActor", "foreground", "cleanup"] as const)("fences %s with the same immutable decision", (operation) => {
+  it.each(["spawnBound", "createActor", "removeActor", "foreground", "cleanup"] as const)("fences %s with the same immutable decision", (operation) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-fence-"));
     const command = { requestId: "r", operation } as ResidentCommand;
     try {
@@ -65,11 +65,11 @@ describe("abandonResidentRequest", () => {
     fs.mkdirSync(requests); fs.mkdirSync(responses);
     fs.writeFileSync(path.join(requests, "r.json"), "{}");
     fs.writeFileSync(path.join(responses, "r.json"), "{}");
-    const command = { requestId: "r", operation: "spawn" } as ResidentCommand;
+    const command = { requestId: "r", operation: "spawnBound" } as ResidentCommand;
     try {
       commitResidentRequest(root, command, "known", "owner");
       expect(abandonResidentRequest(requests, responses, "r")).toEqual({
-        requestId: "r", state: "committed", operation: "spawn", id: "known", ownerHostId: "owner",
+        requestId: "r", state: "committed", operation: "spawnBound", id: "known", ownerHostId: "owner",
       });
       expect(fs.existsSync(path.join(requests, "r.json"))).toBe(true);
       expect(fs.existsSync(path.join(responses, "r.json"))).toBe(true);

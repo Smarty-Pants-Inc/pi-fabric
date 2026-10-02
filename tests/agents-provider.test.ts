@@ -1547,6 +1547,12 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
+// A real process-transport worker must spawn, load the worker bundle and publish its first
+// status before a zero-progress run is observable; on hosted Windows runners that alone can
+// exceed the 2 s default (#235: pre-cancellation timeout). The predicate is unchanged; only
+// the ceiling on waiting for that event grows.
+const PROCESS_WORKER_EVENT_TIMEOUT_MS = 10_000;
+
 const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -2940,7 +2946,7 @@ return { first, second, tail: "continued" };`,
         await waitFor(() => {
           const worker = agents.list()[0];
           return Boolean(actors.status(actor.id).inFlightRun) && worker?.status === "running" && "turns" in worker;
-        });
+        }, PROCESS_WORKER_EVENT_TIMEOUT_MS);
         expect(agents.list()[0]).toMatchObject({ turns: 0, toolCalls: 0 });
         if (cancellation === "explicit stop") await provider.invoke("stop", { id: actor.id }, context);
         else controller.abort(cancellation === "non-Main abort"
@@ -2948,12 +2954,13 @@ return { first, second, tail: "continued" };`,
           : new Error(cancellation === "ordinary deadline" ? "Execution timed out" : "Escape"));
         expect(await outcome).toBeInstanceOf(Error);
         expect((await outcome as Error).message).toMatch(/Agent stopped|Operation aborted/);
-        await waitFor(() => agents.list().every(run => run.status === "stopped"));
+        await waitFor(() => agents.list().every(run => run.status === "stopped"), PROCESS_WORKER_EVENT_TIMEOUT_MS);
         expect(stop).toHaveBeenCalled();
         expect(actorDeliveries).toEqual([]);
         expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.text)).toEqual([]);
       } finally { vi.unstubAllEnvs(); }
     },
+    30_000,
   );
 
   it("keeps explicit stop effective after Main's ceiling detaches a local ASK", async () => {
@@ -3117,17 +3124,17 @@ return { first, second, tail: "continued" };`,
       extensionContext: { ...context.extensionContext, mode, sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
     }).catch(error => error);
     try {
-      await waitFor(() => agents.list().length === 1 && "turns" in agents.list()[0]!);
+      await waitFor(() => agents.list().length === 1 && "turns" in agents.list()[0]!, PROCESS_WORKER_EVENT_TIMEOUT_MS);
       const id = agents.list()[0]!.id;
       expect(agents.status(id)).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
       controller.abort(new Error("Escape"));
       if (mode === "print") expect(await observation).toMatchObject({ status: "stopped" });
       else expect(await observation).toBeInstanceOf(Error);
-      await waitFor(() => agents.status(id).status !== "running");
+      await waitFor(() => agents.status(id).status !== "running", PROCESS_WORKER_EVENT_TIMEOUT_MS);
       expect(agents.status(id).status).toBe("stopped");
       expect(stop).toHaveBeenCalled();
     } finally { controller.abort(); await observation; vi.unstubAllEnvs(); }
-  });
+  }, 30_000);
 
   it("preserves a queued local ASK and its late delivery at Main's ceiling", async () => {
     const { provider, actors, agents, actorDeliveries } = setup();

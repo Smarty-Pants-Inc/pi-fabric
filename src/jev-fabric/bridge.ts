@@ -215,8 +215,10 @@ export class DurableShellBridge {
       if (!wrapped || typeof wrapped.exec !== "function") throw new Error("Invalid Fabric bash middleware operations; refusing to bypass shell protection");
       exec = wrapped;
     } else exec = attach;
-    const withheld = filtered && !middleware;
-    if (withheld) job.append(Buffer.from("[Output withheld: this task was filtered by shell middleware that is not active now.]\n"));
+    // Only the launcher's existing live wrapper can preserve its output policy.
+    // Adoption/resume has no proven policy identity, even with middleware active.
+    const withheld = filtered;
+    if (withheld) job.append(Buffer.from("[Output withheld: launched under an output filter.]\n"));
     void exec.exec(record.command, record.cwd, {
       onData: data => { if (!withheld) job.append(data); },
       signal: job.abort.signal,

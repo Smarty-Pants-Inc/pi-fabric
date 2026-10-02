@@ -12,6 +12,7 @@ import { FABRIC_BASH_MIDDLEWARE, type FabricBashMiddlewareV1 } from "../src/prot
 import { CapturedToolsProvider } from "../src/providers/captured-tools-provider.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { DurableShellBridge } from "../src/jev-fabric/bridge.js";
+import { JevFabricCli } from "../src/jev-fabric/client.js";
 import { JevFabricServe } from "../src/jev-fabric/serve.js";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
 import { DurableTaskRegistry } from "../src/jev-fabric/registry.js";
@@ -107,7 +108,163 @@ const harness = (options: { middleware?: unknown; optIn?: boolean; hangMs?: numb
   return { provider, catalog, registry, runner, fallback, context, cwd, previews, invoke };
 };
 
+const reattachmentMiddleware = (policy: string): FabricBashMiddlewareV1 | undefined => {
+  if (policy === "none") return undefined;
+  return {
+    version: 1,
+    options: { spawnHook: options => ({ ...options, env: { ...options.env, SEC12_ENV_ONLY: "kept" } }) },
+    wrapOperations: inner => policy === "environment-only" ? inner : ({
+      exec: (command, cwd, options) => inner.exec(command, cwd, {
+        ...options,
+        // A real but different policy: it does not redact the launcher's canary.
+        onData: data => options.onData(Buffer.from(data.toString().replaceAll("another-policy-secret", "[other-filter]"))),
+      }),
+    }),
+  };
+};
+
+const checkTaskOutput = async (tasks: TasksProvider, id: string, context: ReturnType<typeof harness>["context"], expected: string[], protectedOutput = true) => {
+  const get = await tasks.invoke("get", { id }, context) as any;
+  const wait = await tasks.invoke("wait", { id, timeoutMs: 1 }, context) as any;
+  const read = await tasks.invoke("read", { id }, context) as any;
+  const encoded = await tasks.invoke("read", { id, encoding: "base64" }, context) as any;
+  const decoded = Buffer.from(encoded.data, "base64").toString();
+  const watch = await tasks.invoke("watch", { id, match: expected[0]!.split(":")[0], timeoutMs: 1 }, context) as any;
+  const log = fs.readFileSync(get.task.logPath, "utf8");
+  for (const output of [get.output, wait.output, read.text, decoded, watch.lines.join("\n"), log]) {
+    for (const text of expected) expect(output).toContain(text);
+    if (protectedOutput) expect(output).not.toContain(SECRET);
+  }
+  if (protectedOutput) {
+    expect(JSON.stringify({ get, wait, read, watch })).not.toContain(SECRET);
+    const canaryWatch = await tasks.invoke("watch", { id, match: SECRET, timeoutMs: 1 }, context) as any;
+    expect(canaryWatch.lines).toEqual([]);
+    expect(JSON.stringify(canaryWatch)).not.toContain(SECRET);
+  }
+  return get;
+};
+
+// Pin the native backend, not the protocol fixture or an environment override.
+const sec12Job = async (filtered = true) => {
+  const backend = createRequire(import.meta.url)("jev-fabric") as { version: string; binaryPath(): string | undefined };
+  expect(backend.version).toBe("0.5.0");
+  const binary = backend.binaryPath();
+  expect(binary).toBeTruthy();
+  const h = harness();
+  if (!filtered) h.catalog.clear();
+  const home = path.join(h.cwd, "home");
+  const agentDir = path.join(h.cwd, "agent");
+  const settings = () => ({ binary: binary!, home, timeoutMs: 60_000 });
+  const jobs = h.provider.shellJobs;
+  jobs.durable = new DurableShellBridge(jobs, { cwd: h.cwd, agentDir, ownerId: "middleware-test", settings,
+    middleware: () => readFabricBashMiddleware(h.catalog.get("bash")?.definition) });
+  const tasks = new TasksProvider(jobs);
+  const cli = new JevFabricCli(binary!, home);
+  const release = path.join(h.cwd, "release-sec12");
+  fs.writeFileSync(path.join(h.cwd, "stdout-canary"), `${SECRET}:stdout\n`);
+  fs.writeFileSync(path.join(h.cwd, "stderr-canary"), `${SECRET}:stderr\n`);
+  const result = await h.invoke({ command: `cat stdout-canary; cat stderr-canary >&2; while [ ! -f '${release}' ]; do sleep 0.05; done; exit 7`, durable: true, description: "SEC-12 canary job" });
+  const id = (result.details as any).taskId as string;
+  return { h, jobs, tasks, cli, release, settings, agentDir, id };
+};
+
 describe("cooperative bash middleware", () => {
+  it.skipIf(process.platform === "win32").each(
+    ["running", "terminal"].flatMap(state => ["none", "environment-only", "different-redaction"].map(policy => ({ state, policy }))),
+  )("SEC-12 real pinned backend withholds filtered adoption ($state, $policy)", async ({ state, policy }) => {
+    const { h, jobs, tasks, cli, release, settings, id } = await sec12Job();
+    const other = new FabricShellJobStore();
+    other.durable = new DurableShellBridge(other, { cwd: h.cwd, agentDir: path.join(h.cwd, "foreign-agent"), ownerId: "foreign-session", settings,
+      middleware: () => reattachmentMiddleware(policy) });
+    const foreignTasks = new TasksProvider(other);
+    try {
+      await vi.waitFor(async () => {
+        const page = await tasks.invoke("get", { id }, h.context) as any;
+        expect(page.output).toContain("[filtered]:stderr");
+      }, { timeout: 10_000 });
+      const jobId = jobs.get(id)!.durable!.jobId!;
+      // The launcher's own live wrapper remains authoritative, even on adopt.
+      expect(await tasks.invoke("adopt", { jobId }, h.context)).toMatchObject({ task: { id } });
+      await checkTaskOutput(tasks, id, h.context, ["[filtered]:stdout", "[filtered]:stderr"]);
+      if (state === "terminal") {
+        fs.writeFileSync(release, "done");
+        await tasks.invoke("wait", { id, timeoutMs: 10_000 }, h.context);
+      }
+      const adopted = await foreignTasks.invoke("adopt", { jobId }, h.context) as any;
+      await vi.waitFor(async () => {
+        const page = await foreignTasks.invoke("get", { id: adopted.task.id }, h.context) as any;
+        // On the vulnerable head, wait for actual canary evidence before failing.
+        expect(page.output).toMatch(/Output withheld|fabric-test-secret-not-a-credential:stderr/);
+      }, { timeout: 10_000 });
+      const live = await checkTaskOutput(foreignTasks, adopted.task.id, h.context, ["Output withheld: launched under an output filter"]);
+      expect(live.task).toMatchObject({ description: "SEC-12 canary job", durable: { jobId, adopted: true } });
+      fs.writeFileSync(release, "done");
+      const completed = await foreignTasks.invoke("wait", { id: adopted.task.id, timeoutMs: 10_000 }, h.context) as any;
+      expect(completed).toMatchObject({ timedOut: false, task: { status: "failed", exitCode: 7 } });
+      await checkTaskOutput(foreignTasks, adopted.task.id, h.context, ["Output withheld: launched under an output filter"]);
+      await tasks.invoke("wait", { id, timeoutMs: 10_000 }, h.context);
+      await checkTaskOutput(tasks, id, h.context, ["[filtered]:stdout", "[filtered]:stderr"]);
+      // Prove both raw streams exist in the native retained receipt.
+      expect(await cli.status(jobId)).toMatchObject({ state: "failed", exitCode: 7,
+        stdout: expect.stringContaining(`${SECRET}:stdout`), stderr: expect.stringContaining(`${SECRET}:stderr`) });
+    } finally {
+      fs.writeFileSync(release, "done");
+      await tasks.invoke("wait", { id, timeoutMs: 10_000 }, h.context);
+      await other.close();
+    }
+  });
+
+  it.skipIf(process.platform === "win32").each(["none", "environment-only", "different-redaction"])(
+    "SEC-12 real pinned backend withholds resume after launching filter is gone (%s)", async policy => {
+      const { h, jobs, tasks, cli, release, settings, agentDir, id } = await sec12Job();
+      const resumed = new FabricShellJobStore();
+      resumed.durable = new DurableShellBridge(resumed, { cwd: h.cwd, agentDir, ownerId: "middleware-test", settings,
+        middleware: () => reattachmentMiddleware(policy) });
+      const resumedTasks = new TasksProvider(resumed);
+      let jobId: string | undefined;
+      try {
+        await vi.waitFor(async () => {
+          expect((await tasks.invoke("get", { id }, h.context) as any).output).toContain("[filtered]:stderr");
+        }, { timeout: 10_000 });
+        jobId = jobs.get(id)!.durable!.jobId!;
+        await checkTaskOutput(tasks, id, h.context, ["[filtered]:stdout", "[filtered]:stderr"]);
+        await jobs.close();
+        h.catalog.clear();
+        expect(readFabricBashMiddleware(h.catalog.get("bash")?.definition)).toBeUndefined();
+        expect(await resumedTasks.invoke("list", {}, h.context)).toEqual([expect.objectContaining({ id, durable: expect.objectContaining({ jobId, adopted: true }) })]);
+        fs.writeFileSync(release, "done");
+        const completed = await resumedTasks.invoke("wait", { id, timeoutMs: 10_000 }, h.context) as any;
+        expect(completed).toMatchObject({ timedOut: false, task: { status: "failed", exitCode: 7 } });
+        await checkTaskOutput(resumedTasks, id, h.context, ["Output withheld: launched under an output filter"]);
+        expect(await cli.status(jobId)).toMatchObject({ stdout: expect.stringContaining(`${SECRET}:stdout`), stderr: expect.stringContaining(`${SECRET}:stderr`) });
+      } finally {
+        fs.writeFileSync(release, "done");
+        if (jobId) await vi.waitFor(async () => expect(await cli.status(jobId!)).toMatchObject({ state: "failed" }), { timeout: 10_000 });
+        else await tasks.invoke("wait", { id, timeoutMs: 10_000 }, h.context);
+        await resumed.close();
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")("SEC-12 real pinned backend still streams unfiltered adoption", async () => {
+    const { h, jobs, tasks, release, settings, id } = await sec12Job(false);
+    const other = new FabricShellJobStore();
+    other.durable = new DurableShellBridge(other, { cwd: h.cwd, agentDir: path.join(h.cwd, "foreign-agent"), ownerId: "foreign-session", settings, middleware: () => undefined });
+    const foreignTasks = new TasksProvider(other);
+    try {
+      await vi.waitFor(() => expect(jobs.get(id)?.durable?.jobId).toBeDefined(), { timeout: 10_000 });
+      const adopted = await foreignTasks.invoke("adopt", { jobId: jobs.get(id)!.durable!.jobId! }, h.context) as any;
+      await vi.waitFor(async () => expect((await foreignTasks.invoke("get", { id: adopted.task.id }, h.context) as any).output).toContain(`${SECRET}:stderr`), { timeout: 10_000 });
+      await checkTaskOutput(foreignTasks, adopted.task.id, h.context, [SECRET], false);
+      fs.writeFileSync(release, "done");
+      expect(await foreignTasks.invoke("wait", { id: adopted.task.id, timeoutMs: 10_000 }, h.context)).toMatchObject({ timedOut: false, task: { exitCode: 7 } });
+      await checkTaskOutput(foreignTasks, adopted.task.id, h.context, [`${SECRET}:stdout`, `${SECRET}:stderr`], false);
+    } finally {
+      fs.writeFileSync(release, "done");
+      await tasks.invoke("wait", { id, timeoutMs: 10_000 }, h.context);
+      await other.close();
+    }
+  });
   it.skipIf(process.platform === "win32").each(
     ["status", "wait", "stop"].flatMap(verb => [false, true].flatMap(shellOverride => ["launch-session", "foreign-session"].map(reader => ({ verb, shellOverride, reader })))),
   )("SEC-3 real pinned backend refuses foreign receipt tails ($verb, override=$shellOverride, $reader)", async ({ verb, shellOverride, reader }) => {

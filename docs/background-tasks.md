@@ -168,8 +168,14 @@ return await pi.bash({cmd: "bun run dev", durable: true, description: "Dev serve
   the start of the job's retained events. A job that finished while Pi was away
   delivers its completion then. Another session never reattaches it
   automatically, and monitors are not restored.
-- Reattached output passes through the currently active middleware. If a task
-  was filtered at launch and no middleware is active now, its output is withheld.
+- A task filtered at launch exposes output only through the launching session's
+  own live wrapper. On adoption or resume, protected output is always replaced
+  with `[Output withheld: launched under an output filter.]`, even if middleware
+  is active (including another redaction policy). `tasks.read/get/wait/watch` and
+  the retained task log expose this marker, not backend bytes; status, exit code
+  and metadata remain readable. Unfiltered tasks reattach as before.
+  Reattachment with a proven matching policy identity is a follow-up feature
+  (smarty-dev#2874, owner fabric-v2), not supported by this fail-closed boundary.
 
 ### Jobs from other harnesses
 

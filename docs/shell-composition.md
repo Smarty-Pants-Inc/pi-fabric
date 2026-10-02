@@ -43,8 +43,12 @@ standalone jev-fabric without being rewritten.
 Terminal receipts contain stdout/stderr tails, so a shared-store durable ID
 alone never grants receipt or output access. Owned cached terminal receipts
 remain available after their Jev owner ends. For durable batch jobs, use
-`tasks.*`: that reader preserves the launch-time middleware filter and withholds
-protected output when the required middleware is unavailable after adoption.
+`tasks.*`: only the launching session's own live wrapper preserves a filtered
+job's output access. Adoption and resume always withhold protected backend output,
+regardless of the current middleware; task readers and retained logs return an
+`Output withheld: launched under an output filter` marker instead. Status, exit
+code and metadata stay readable, and unfiltered adoption is unchanged. Proven
+matching policy-identity reattachment is follow-up smarty-dev#2874 (fabric-v2).
 
 Read records share one shape everywhere:
 `{id, stream, offset, bytes, omittedBytes, text | data, next, eof, state}`.

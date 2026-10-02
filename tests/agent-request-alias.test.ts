@@ -28,6 +28,14 @@ describe("parent run inheritance (#2490)", () => {
   });
 });
 
+describe("resident retry keys", () => {
+  it("preserves caller-supplied keys through run request normalization", () => {
+    expect(normalizeAgentRunRequest({ task: "t", residency: "durable", idempotencyKey: "retry-1" }, defaults))
+      .toMatchObject({ residency: "durable", idempotencyKey: "retry-1" });
+    expect(normalizeAgentRunRequest({ task: "t" }, defaults)).not.toHaveProperty("idempotencyKey");
+  });
+});
+
 describe("alias thinking levels", () => {
   it("applies an alias default when the run names the alias", () => {
     const request = normalizeAgentRunRequest({ task: "t", model: "shallow" }, defaults);

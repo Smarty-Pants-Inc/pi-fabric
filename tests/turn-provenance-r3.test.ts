@@ -263,7 +263,7 @@ describe("round-3 provenance at the capable Pi API boundary", () => {
     expect(h.fake.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("host-generated skill turn-start notice uses the passive provenance adapter", async () => {
+  it("participant-free skill turn-start notice stays passive and unclaimed", async () => {
     const h = await indexFixture(); h.fake.getActiveTools.mockReturnValue(["fabric_exec"]);
     const skills = [
       { name: "wrapper", description: "Wrap a research task", filePath: "/skills/wrapper/SKILL.md" },
@@ -275,11 +275,10 @@ describe("round-3 provenance at the capable Pi API boundary", () => {
     });
     expect(returned.filter(value => value && typeof value === "object" && "message" in value)).toEqual([]);
     expect(h.fake.sendMessage).toHaveBeenCalledOnce();
-    expect(h.fake.sendMessage.mock.calls[0]![1]).toMatchObject({ deliverAs: "nextTurn", triggerTurn: false,
-      provenance: { channel: "fabric", sender: { id: host.id, verified: "mesh" } } });
+    expect(h.fake.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "nextTurn", triggerTurn: false });
   });
 
-  it("host-generated proxy turn-start notice uses the passive provenance adapter", async () => {
+  it("participant-free proxy turn-start notice stays passive and unclaimed", async () => {
     const h = await indexFixture(); h.fake.getActiveTools.mockReturnValue(["fabric_exec"]);
     vi.spyOn(FabricState.prototype, "cwd", "get").mockReturnValue(process.cwd());
     vi.spyOn(CapturedToolCatalog.prototype, "list").mockReturnValue([{ name: "probe_tool", description: "Probe" } as any]);
@@ -288,8 +287,7 @@ describe("round-3 provenance at the capable Pi API boundary", () => {
     expect(returned.filter(value => value && typeof value === "object" && "message" in value)).toEqual([]);
     expect(h.fake.sendMessage).toHaveBeenCalledOnce();
     expect(h.fake.sendMessage.mock.calls[0]![0].customType).toBe("pi-fabric-proxy");
-    expect(h.fake.sendMessage.mock.calls[0]![1]).toMatchObject({ deliverAs: "nextTurn", triggerTurn: false,
-      provenance: { channel: "fabric", sender: { id: host.id, verified: "mesh" } } });
+    expect(h.fake.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "nextTurn", triggerTurn: false });
   });
 
   it("records turn-start insertion uses the unclaimed passive adapter", async () => {
@@ -301,26 +299,30 @@ describe("round-3 provenance at the capable Pi API boundary", () => {
     expect(h.fake.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "nextTurn", triggerTurn: false });
   });
 
-  it("completion turn-start insertion uses the provenance adapter without a wake", async () => {
+  it("completion turn-start insertion claims the child without a wake", async () => {
     const h = recording(); const inbox = new AgentCompletionInbox(h.pi, h.context); cleanups.push(() => inbox.close());
     inbox.enqueue({ id: "worker", name: "Worker", status: "completed", text: "done", startedAt: 1, finishedAt: 2 });
     expect(await h.emit("before_agent_start")).toEqual([undefined]);
     expect(h.fake.sendMessage).toHaveBeenCalledOnce();
-    expect(h.fake.sendMessage.mock.calls[0]![1]).toMatchObject({ deliverAs: "nextTurn", triggerTurn: false,
-      provenance: { channel: "fabric", sender: { id: host.id, verified: "mesh" } } });
+    expect(h.fake.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "nextTurn", triggerTurn: false,
+      provenance: { v: 1, channel: "fabric", sender: { id: "worker", name: "Worker", kind: "agent", verified: "mesh" }, via: "actor" } });
   });
 
-  it("shell turn-start insertion uses the provenance adapter without a wake", async () => {
+  it.each(["prompt", "boundary", "idle"] as const)("participant-free shell %s notice is unclaimed", async phase => {
     const h = recording(); const jobs = new FabricShellJobStore(); cleanups.push(() => jobs.close());
+    if (phase === "idle") h.context.isIdle = () => true;
     const inbox = new ShellEventInbox(h.pi, h.context, jobs); cleanups.push(() => inbox.close());
     const job = jobs.begin("bash", "build"); job.spill(); await job.finish(0);
-    expect(await h.emit("before_agent_start")).toEqual([undefined]);
+    if (phase === "prompt") expect(await h.emit("before_agent_start")).toEqual([undefined]);
+    else if (phase === "boundary") await h.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" } });
+    else await vi.waitFor(() => expect(h.fake.sendMessage).toHaveBeenCalledOnce());
     expect(h.fake.sendMessage).toHaveBeenCalledOnce();
-    expect(h.fake.sendMessage.mock.calls[0]![1]).toMatchObject({ deliverAs: "nextTurn", triggerTurn: false,
-      provenance: { channel: "fabric", sender: { id: host.id, verified: "mesh" } } });
+    expect(h.fake.sendMessage.mock.calls[0]![1]).toEqual({
+      deliverAs: phase === "prompt" ? "nextTurn" : "steer", triggerTurn: phase !== "prompt",
+    });
   });
 
-  it("prewalk typed task is unclaimed on capable Pi; only its generated notice claims Fabric", async () => {
+  it("prewalk typed task and participant-free armed notice are both unclaimed on capable Pi", async () => {
     const h = recording();
     const state = { ensure: vi.fn(async () => {}), config: { ...DEFAULT_FABRIC_CONFIG, fullCodeMode: true,
       prewalk: { ...DEFAULT_FABRIC_CONFIG.prewalk, mode: "in-place", model: "provider/executor", detectShellWrites: false } },
@@ -329,8 +331,7 @@ describe("round-3 provenance at the capable Pi API boundary", () => {
     const command = h.fake.registerCommand.mock.calls.find(call => call[0] === "fabric")![1];
     await command.handler("prewalk Implement the guard", h.context);
     expect(h.fake.sendUserMessage.mock.calls).toEqual([["Implement the guard"]]);
-    expect(h.fake.sendMessage.mock.calls[0]![1]).toMatchObject({ deliverAs: "nextTurn",
-      provenance: { channel: "fabric", sender: { id: host.id, verified: "mesh" } } });
+    expect(h.fake.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "nextTurn" });
   });
 
   it("Main and generic adapters make no claim without a recorded method, even with a bridge identity marker", () => {

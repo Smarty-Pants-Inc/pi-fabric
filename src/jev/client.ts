@@ -66,6 +66,8 @@ export type JevDispatch = (request: JevRequest & { model: string }, credential: 
 
 export class JevClient {
   readonly credentials: JevCredentials;
+  /** Actual operations, not the abort-raced waiters; host credential APIs may not cancel. */
+  readonly #pendingCredentials = new Set<Promise<string>>();
   constructor(
     readonly config: FabricJevConfig,
     private readonly fetcher: typeof fetch = fetch,
@@ -80,7 +82,12 @@ export class JevClient {
     const model = resolveJevUpstreamModel(this.route, requestedModel);
     if (!model) throw new Error(`Jev model "${requestedModel}" is not available on the ${this.route.label} route`);
     const timedSignal = AbortSignal.any([signal, AbortSignal.timeout(this.config.requestTimeoutMs)]);
-    const key = await runAbortable(timedSignal, () => this.credentials.resolve(timedSignal));
+    const key = await runAbortable(timedSignal, () => {
+      const pending = this.credentials.resolve(timedSignal);
+      this.#pendingCredentials.add(pending);
+      void pending.then(() => this.#pendingCredentials.delete(pending), () => this.#pendingCredentials.delete(pending));
+      return pending;
+    });
     if (dispatch) {
       let answer: unknown;
       try {
@@ -121,6 +128,9 @@ export class JevClient {
     } catch {
       throw new Error(timedSignal.aborted ? "Jev response cancelled or timed out" : `${this.route.label} returned an invalid or oversized typed response`);
     } finally { await reader.cancel().catch(() => undefined); }
+  }
+  async drainCredentials(): Promise<void> {
+    while (this.#pendingCredentials.size) await Promise.allSettled([...this.#pendingCredentials]);
   }
   close(): void { this.credentials.clear(); }
 }

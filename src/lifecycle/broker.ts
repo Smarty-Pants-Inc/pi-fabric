@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import {
@@ -28,6 +30,12 @@ const subscriptionKey = (id: string): string =>
   FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + id;
 
 export class LifecycleBroker {
+  readonly #backgroundPoll = new MeshBackgroundRetry("lifecycle cursor poll");
+  readonly #backgroundPublish = new MeshBackgroundQueue("participant lifecycle event");
+
+  publishBackground(request: FabricLifecyclePublishRequest): Promise<void> {
+    return this.#backgroundPublish.enqueue(() => this.publish(request));
+  }
   readonly #pollMs: number;
   readonly #maxReadEvents: number;
   #timer: NodeJS.Timeout | undefined;
@@ -170,6 +178,7 @@ export class LifecycleBroker {
   resume(): void { this.#paused = false; this.#schedulePoll(); }
   async checkpointForRelease(): Promise<void> {
     if (!this.#paused) throw new Error("Lifecycle release gate is not paused");
+    await this.#backgroundPublish.checkpointForRelease();
     await this.#publishTail;
     await this.#polling;
     for (const id of this.#delivered.keys()) await this.#confirmDelivered(id);
@@ -181,6 +190,7 @@ export class LifecycleBroker {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    await this.#backgroundPublish.close();
     await this.#publishTail;
     await this.#polling?.catch(() => undefined);
   }
@@ -195,7 +205,7 @@ export class LifecycleBroker {
     queueMicrotask(() => {
       this.#pollScheduled = false;
       if (this.#closed) return;
-      void this.#poll().catch(() => undefined);
+      void this.#backgroundPoll.run(() => this.#poll());
     });
   }
 
@@ -223,7 +233,7 @@ export class LifecycleBroker {
       listed.add(subscription.id);
       if (this.#delivered.has(subscription.id)) {
         // Retry only the cursor/delete receipt; use a fresh poll after success.
-        await this.#confirmDelivered(subscription.id).catch(() => undefined);
+        await this.#confirmDelivered(subscription.id).catch(rethrowMeshLockTimeout);
         continue;
       }
       // Only the target's host drains a subscription. Pass over other hosts' targets (from
@@ -278,7 +288,7 @@ export class LifecycleBroker {
           ...subscription,
           afterSequence: latestSequence,
           updatedAt: Date.now(),
-        }).then(() => this.#unsaved.delete(subscription.id), () => undefined);
+        }).then(() => this.#unsaved.delete(subscription.id), rethrowMeshLockTimeout);
         return;
       }
 
@@ -309,7 +319,7 @@ export class LifecycleBroker {
             updatedAt: Date.now(),
             lastError: error instanceof Error ? error.message : String(error),
           };
-          await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id), () => undefined);
+          await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id), rethrowMeshLockTimeout);
           return;
         }
         cursor = lifecycle.sequence;
@@ -319,7 +329,7 @@ export class LifecycleBroker {
         const delivered = { ...subscription, afterSequence: cursor, updatedAt: Date.now(), lastDeliveredAt, lastEventId };
         delete delivered.lastError;
         this.#delivered.set(subscription.id, { entry, subscription: delivered });
-        const confirmed = await this.#confirmDelivered(subscription.id).catch(() => undefined);
+        const confirmed = await this.#confirmDelivered(subscription.id).catch(rethrowMeshLockTimeout);
         if (subscription.once || !confirmed) return;
         entry = confirmed; subscription = delivered;
       }
@@ -340,7 +350,7 @@ export class LifecycleBroker {
         if (events.length < this.#maxReadEvents) return;
         continue;
       }
-      const next = await this.#replace(entry, updated).catch(() => undefined);
+      const next = await this.#replace(entry, updated).catch(rethrowMeshLockTimeout);
       if (!next) return;
       this.#unsaved.delete(subscription.id);
       entry = next;

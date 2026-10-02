@@ -65,6 +65,20 @@ describe("fleet model policy configuration (#2490)", () => {
 });
 
 describe("Fabric configuration", () => {
+  it("defaults automatic per-host reload concurrency to six and preserves explicit unlimited mode", () => {
+    expect(DEFAULT_FABRIC_CONFIG.selfReloadConcurrency).toBe(6);
+    expect(normalizeFabricConfig({}).selfReloadConcurrency).toBe(6);
+    for (const value of [0, 2, 6, 12]) {
+      expect(normalizeFabricConfig({ selfReloadConcurrency: value }).selfReloadConcurrency).toBe(value);
+    }
+    for (const value of [-1, 1.5, "2", null, NaN, Infinity]) {
+      expect(normalizeFabricConfig({ selfReloadConcurrency: value }).selfReloadConcurrency).toBe(6);
+    }
+    const cwd = temporaryDirectory();
+    const options = { cwd, agentDir: cwd, projectTrusted: true, scope: "project" as const };
+    saveFabricConfig(options, { selfReloadConcurrency: 2 });
+    expect(loadFabricConfig(options).selfReloadConcurrency).toBe(2);
+  });
   it("normalizes models.aliases into fallback chains", () => {
     expect(DEFAULT_FABRIC_CONFIG.models.aliases).toEqual({});
     expect(normalizeFabricConfig({}).models.aliases).toEqual({});

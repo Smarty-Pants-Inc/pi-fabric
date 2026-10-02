@@ -32,6 +32,7 @@ export class PiModelControl {
   private readonly thinking: string | undefined;
   private readonly activationWindow: boolean;
   private readonly startupFence: boolean;
+  private readonly requiredPin: boolean;
   private readonly io: {
     send(frame: Record<string, unknown>): void;
     admitted(model?: string, thinking?: string): void;
@@ -47,6 +48,7 @@ export class PiModelControl {
     activationWindowOrAdmission: boolean | "strict" | "permissive" = false,
     admission: "strict" | "permissive" = "strict",
     startupFence = false,
+    requiredPin = false,
   ) {
     // Keep this module executable through Node's native type stripping too;
     // source workers must not rely on transform-only parameter properties.
@@ -57,6 +59,7 @@ export class PiModelControl {
     this.activationWindow = activationWindowOrAdmission === true;
     this.#admission = typeof activationWindowOrAdmission === "string" ? activationWindowOrAdmission : admission;
     this.startupFence = startupFence;
+    this.requiredPin = requiredPin;
   }
 
   start(): void {
@@ -149,10 +152,14 @@ export class PiModelControl {
       if (actual) this.io.observed(key(actual));
       // A virtual provider key resolves to a concrete backend at stream time.
       // Permissive admission records that attribution; strict admission keeps
-      // the fail-closed check for genuinely unexpected model switches.
+      // the fail-closed check for genuinely unexpected model switches. A required
+      // route pin is always exact: permissive admission never relaxes it.
       const mismatch = !actual || key(actual) !== key(this.#expected!);
-      if (mismatch && !(this.#admission === "permissive" && actual)) {
-        this.fail(`requested ${key(this.#expected!)}, but child reports ${actual ? key(actual) : "no model"} after set_model; task was not sent`);
+      if (mismatch && (this.requiredPin || !(this.#admission === "permissive" && actual))) {
+        this.fail(`${this.requiredPin ? "MODEL_ROUTE_PIN_MISMATCH: " : ""}requested ${key(this.#expected!)}, but child reports ${actual ? key(actual) : "no model"} after set_model; task was not sent`);
+      } else if (this.requiredPin && (!this.thinking || state?.thinkingLevel !== this.thinking ||
+        !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(this.thinking))) {
+        this.fail(`MODEL_ROUTE_PIN_MISMATCH: required effort ${this.thinking ?? "missing"}, but child reports ${String(state?.thinkingLevel ?? "missing")}; task was not sent`);
       } else if (state?.isStreaming === true || state?.isCompacting === true) {
         this.fail("child started work before model admission; task was not sent");
       } else {

@@ -153,6 +153,8 @@ export class JevProvider implements FabricProvider {
 
   async close(): Promise<void> {
     await this.manager.close();
+    // Drain host credential operations started by this generation before closing (#214).
+    await this.client.drainCredentials();
     this.client.close();
     const connections = [...this.#runs.values()];
     this.#runs.clear();

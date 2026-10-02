@@ -1,5 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
-import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
+import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
@@ -188,7 +188,12 @@ const settledCompleted = (event: unknown, context: ExtensionContext): boolean =>
 };
 
 // Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
-const inboxHeldBy = (context: ExtensionContext) => rootInboxSession(context.sessionManager.getEntries());
+const inboxHeldBy = (context: ExtensionContext) => confirmedRootInboxSession(context.sessionManager);
+
+/** Expiry is observational: one line, never a triggered continuation. */
+const reportInboxExpiry = (pi: ExtensionAPI, inbox: RootInboxBatch | undefined): void => {
+  if (inbox?.skippedStale) sendFabricMessage(pi, rootInboxSummary(inbox), { deliverAs: "followUp", triggerTurn: false });
+};
 
 // An idle Main reads its inbox this often (smarty-dev#1595). With the 60 s steer grace, an event
 // published to an idle Main starts a turn about 60-75 s later. PI_FABRIC_INBOX_WAKE_MS overrides it.
@@ -650,6 +655,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     try {
       if (!idle()) return;
       const inbox = await state.nextRootInbox(inboxHeldBy(context), idle);
+      reportInboxExpiry(pi, inbox);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
         deliverRootInbox(pi, inbox.events);
@@ -708,30 +714,34 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const stoppedUndelivered = readStoppedRuns(context.sessionManager?.getEntries?.() ?? []).undelivered.length > 0;
     // A self-reload (smarty-dev#2160) re-arms the actors this Main hosts and reports on the mesh.
     const selfReloaded = selfReload.sessionStart(event?.reason ?? "", context);
-    if (selfReloaded && context.hasUI) {
-      const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
-      context.ui.notify(notice, "info");
-      // The TUI's own "Reloaded ..." status line replaces an info notice; the footer keeps it
-      // until the user's next input.
-      context.ui.setStatus(SELF_RELOAD_STATUS, notice);
-    }
-    const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
-    const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
-    if (residentProbe && (context.mode !== "rpc" || !process.env.PI_FABRIC_PARENT_RUN)) {
-      throw new Error("resident startup probe requires a bound RPC worker");
-    }
-    if (residentProbe || stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
-    if (residentProbe) {
-      // Pi redirects console/stdout during extension startup; the native RPC
-      // descriptor carries a positive ACK only after this generation activated.
-      writeSync(1, `${JSON.stringify({ type: "fabric_resident_extension_ready", protocol: 1,
-        runId: process.env.PI_FABRIC_PARENT_RUN, nonce: probeNonce, extension: FABRIC_EXTENSION_ENTRY_PATH })}\n`);
-    }
-    if (selfReloaded) {
-      await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
-        ...selfReloaded,
-        sessionId: context.sessionManager.getSessionId(),
-      });
+    const { releaseSlot, ...reloadReport } = selfReloaded ?? {};
+    try {
+      if (selfReloaded && context.hasUI) {
+        const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
+        context.ui.notify(notice, "info");
+        // Keep the notice after the TUI's own reload status line replaces it.
+        context.ui.setStatus(SELF_RELOAD_STATUS, notice);
+      }
+      const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
+      const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
+      if (residentProbe && (context.mode !== "rpc" || !process.env.PI_FABRIC_PARENT_RUN)) {
+        throw new Error("resident startup probe requires a bound RPC worker");
+      }
+      if (residentProbe || stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+      if (residentProbe) {
+        // Positive native ACK is published only after this generation activated.
+        writeSync(1, `${JSON.stringify({ type: "fabric_resident_extension_ready", protocol: 1,
+          runId: process.env.PI_FABRIC_PARENT_RUN, nonce: probeNonce, extension: FABRIC_EXTENSION_ENTRY_PATH })}\n`);
+      }
+      if (selfReloaded) {
+        await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
+          ...reloadReport,
+          sessionId: context.sessionManager.getSessionId(),
+        });
+      }
+    } finally {
+      // Hold the lease through activation, actor re-arm and reporting, even on failure.
+      releaseSlot?.();
     }
   });
 
@@ -827,6 +837,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // (smarty-dev#754). An aborted or failed run starts nothing: the batch waits for a turn.
     if (settledCompleted(event, context)) {
       const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
+      reportInboxExpiry(pi, inbox);
       if (inbox?.events.length) deliverRootInbox(pi, inbox.events);
       // Records addressed to this root past its processing cursor (smarty-dev#754 C4), same hook.
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
@@ -1144,8 +1155,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       details: {},
     };
     if (!fabricProvenanceSupported(pi)) return { message, systemPrompt: `${systemPrompt}\n\n${guidance}` };
-    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
-    () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
     return { systemPrompt: `${systemPrompt}\n\n${guidance}` };
   });
 
@@ -1178,8 +1188,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       details: { names: fresh, origin: "skill" },
     };
     if (!fabricProvenanceSupported(pi)) return { message };
-    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
-    () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
   });
 
   // Work events a steer missed reach the Main with its next turn (smarty-dev#754).
@@ -1188,6 +1197,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     inboxWake.armed = true;
     if (!state.initialized) return;
     const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
+    reportInboxExpiry(pi, inbox);
     if (!inbox?.events.length) return;
     // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result.
     if (!fabricProvenanceSupported(pi)) return { message: rootInboxMessage(inbox.events) };
@@ -1284,6 +1294,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       ? state.agents.runningCount() + state.actors.inFlightCount() + state.backgroundWorkCount()
       : 0,
     autoReloadConfigured: () => state.provisionalConfig().autoReload,
+    selfReloadConcurrency: () => state.provisionalConfig().selfReloadConcurrency,
     moduleUrl: import.meta.url,
     publishHeld: data => { void state.publishOpsEvent(RELOAD_HELD_TOPIC, "fabric.reload_held", data); },
     // Escape's stop-the-world halt of actors or Jev observers (mesh off too); the user's next

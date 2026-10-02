@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { fabricHostIdentity, sendFabricMessage } from "../fabric-provenance.js";
+import { sendFabricMessage } from "../fabric-provenance.js";
 import type { FabricPrewalkMode } from "../config.js";
 import { MAX_PREWALK_PLAN_PROMPTS } from "./controller.js";
 import type {
@@ -55,7 +55,7 @@ export const deliverPrewalkPlanCheckpoint = (
           ...(files.length > 0 ? { files } : {}),
         },
       },
-      { deliverAs: "steer", triggerTurn: true }, fabricHostIdentity(arm.sessionId), "steer", "mesh",
+      { deliverAs: "steer", triggerTurn: true },
     );
     return true;
   } catch {

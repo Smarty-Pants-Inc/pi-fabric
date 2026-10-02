@@ -84,6 +84,97 @@ describe("Main followUp drain (unit)", () => {
     expect(sent[0]!.message.details).toMatchObject({ id: result.messageId, delivery: "followUp", sentAt: "2026-09-27T20:00:00.000Z" });
   });
 
+  it("keeps a HANDOFF arriving during an idle prompt preflight ahead of its busy correction (#754)", () => {
+    const { main, sent, ctx, state, emit } = setup(120_000, true);
+    let preflight = true;
+    Object.assign(ctx, { isPromptPending: () => preflight });
+    const handoff = main.deliverAgent({ from: from("lane"), message: `HANDOFF proof ${"x".repeat(3000)}`, delivery: "followUp" });
+    expect(sent).toHaveLength(0); // Must not escape into Pi's separate native followUp queue.
+    expect(handoff.pendingFollowUps).toBe(1);
+    preflight = false;
+    state.idle = false;
+    const correction = main.deliverAgent({ from: from("lane"), message: "checksum correction", delivery: "followUp" });
+    vi.advanceTimersByTime(120_000);
+    emit("turn_end", toolTurn, ctx);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.message.details.items.map((item: { id: string }) => item.id))
+      .toEqual([handoff.messageId, correction.messageId]);
+    expect(sent[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
+    main.closeFollowUpDrain();
+  });
+
+  it.each([true, false])("releases acknowledged followUps in FIFO order when preflight ends without a run (idle=%s, #754)", (idle) => {
+    const { main, sent, ctx, state } = setup(120_000, idle);
+    let preflight = true;
+    Object.assign(ctx, { isPromptPending: () => preflight });
+    const handoff = main.deliverAgent({ from: from("lane"), message: "HANDOFF", delivery: "followUp" });
+    const correction = main.deliverAgent({ from: from("lane"), message: "correction", delivery: "followUp" });
+    vi.advanceTimersByTime(1_000);
+    expect(sent).toHaveLength(0);
+    preflight = false; // handled input or failed validation: Pi emits no run boundaries.
+    state.idle = true;
+    vi.advanceTimersByTime(25);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.message.details.items.map((item: { id: string }) => item.id))
+      .toEqual([handoff.messageId, correction.messageId]);
+    expect(sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(main.queueDepth().pendingFollowUps).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    main.closeFollowUpDrain();
+  });
+
+  it("waits for idle if no-run preflight completion leaves another async operation finishing (#754)", () => {
+    const { main, sent, ctx, state } = setup(120_000, true);
+    let preflight = true;
+    Object.assign(ctx, { isPromptPending: () => preflight });
+    main.deliverAgent({ from: from("lane"), message: "HANDOFF", delivery: "followUp" });
+    state.idle = false;
+    preflight = false;
+    vi.advanceTimersByTime(1_000);
+    expect(sent).toHaveLength(0);
+    state.idle = true;
+    vi.advanceTimersByTime(25);
+    expect(sent.map(entry => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: true }]);
+    expect(vi.getTimerCount()).toBe(0);
+    main.closeFollowUpDrain();
+  });
+
+  it.each(["halt", "signal", "reload"])("does not wake a no-run preflight after %s (#754)", (end) => {
+    const { main, sent, ctx, state } = setup(120_000, true);
+    let preflight = true;
+    Object.assign(ctx, { isPromptPending: () => preflight });
+    main.deliverAgent({ from: from("lane"), message: "HANDOFF", delivery: "followUp" });
+    if (end === "halt") main.halt();
+    if (end === "signal") state.aborted = true;
+    if (end === "reload") main.prepareReload();
+    preflight = false;
+    vi.advanceTimersByTime(1_000);
+    expect(sent.map(entry => entry.options.triggerTurn)).toEqual(end === "signal" ? [false] : []);
+    expect(main.queueDepth().pendingFollowUps).toBe(end === "signal" ? 0 : 1);
+    expect(vi.getTimerCount()).toBe(0);
+    main.closeFollowUpDrain();
+  });
+
+  it("holds provider retry release through prompt preflight without reordering followUps", () => {
+    const { main, sent, ctx, emit } = setup(120_000, true);
+    emit("turn_end", { message: { stopReason: "error" } }, ctx);
+    let preflight = true;
+    Object.assign(ctx, { isPromptPending: () => preflight });
+    const handoff = main.deliverAgent({ from: from("lane"), message: "HANDOFF", delivery: "followUp" });
+    const correction = main.deliverAgent({ from: from("lane"), message: "correction", delivery: "followUp" });
+    expect(handoff.triggered).toBe(false);
+    vi.advanceTimersByTime(60_000);
+    expect(sent).toHaveLength(0);
+    preflight = false;
+    vi.advanceTimersByTime(25);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.message.details.items.map((item: { id: string }) => item.id))
+      .toEqual([handoff.messageId, correction.messageId]);
+    expect(sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    main.closeFollowUpDrain();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each(["passive", "halted", "aborted", "provider-error", "nextTurn"])("reports no new turn for %s admission", (mode) => {
     const { main, state, sent, emit, ctx } = setup(120_000, true);
     if (mode === "provider-error") emit("turn_end", { message: { stopReason: "error" } }, ctx);
@@ -110,6 +201,7 @@ describe("Main followUp drain (unit)", () => {
     expect(main.deliverAgent({ from: from("a"), message: "wake", delivery: "followUp" }).triggered).toBe(true);
     expect(sent).toHaveLength(1);
     expect(main.queueDepth().pendingFollowUps).toBe(0);
+
   });
 
   it("stamps a steer with sent_at and sends it at once, even to a busy Main", () => {
@@ -549,6 +641,52 @@ describe("Main followUp drain (unit)", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  // smarty-dev#2793 R2: Pi's deadline aborts the manual controller without owner intent.
+  it.each([0, 120_000].flatMap(flushMs => ["timeout", "owner", "timeout-after-owner-stop"].map(reason => ({ flushMs, reason }))))(
+    "$reason distinguishes operation recovery from durable owner authority (flushMs=$flushMs)",
+    ({ flushMs, reason }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-deadline-"));
+      const journal = path.join(root, "journal.json");
+      fs.writeFileSync(`${journal}.delivered`, JSON.stringify({ version: 1, ids: [] }));
+      const { pi, sent, emit } = fakePi();
+      const state = { idle: false };
+      const ctx = context(state);
+      const main = new MainAgentController(pi, "session:root", true, root, "root");
+      const stopped = reason !== "timeout";
+      main.attachFollowUpDrain(ctx, flushMs, journal);
+      try {
+        const operation = new AbortController();
+        emit("session_before_compact", { reason: "manual", signal: operation.signal }, ctx);
+        if (reason === "timeout-after-owner-stop") main.halt();
+        operation.abort(reason === "owner" ? undefined : new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
+        state.idle = true;
+        emit("session_compact_failed", { reason: "manual", aborted: reason === "owner", willRetry: false,
+          errorMessage: reason === "owner" ? undefined : "Compaction failed: Compaction exceeded its 20-minute deadline" }, ctx);
+        const held = main.deliverAgent({ from: from("peer"), message: "peer before recovery", delivery: "followUp" });
+        if (stopped) expect(sent.at(-1)!.options.triggerTurn).toBe(false); // Owner gate delivers passive context.
+        else {
+          // Main now journals recoverable peer wakes until its provider-backoff deadline.
+          expect(sent).toHaveLength(0);
+          expect(held).toMatchObject({ triggered: false, reason: expect.stringContaining("provider-backoff until ") });
+          expect(main.queueDepth().pendingFollowUps).toBe(1);
+        }
+        expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+        emit("session_before_compact", { reason: "manual", signal: new AbortController().signal }, ctx);
+        emit("session_compact", { reason: "manual" }, ctx); // Recovery, NOT user input.
+        main.deliverAgent({ from: from("peer"), message: "peer after recovery", delivery: "steer" });
+        expect(sent.at(-1)!.options.triggerTurn).toBe(!stopped);
+        main.closeFollowUpDrain();
+        main.attachFollowUpDrain(ctx, flushMs, journal);
+        main.deliverAgent({ from: from("peer"), message: "fresh peer after reload", delivery: "followUp" });
+        expect(sent.at(-1)!.options.triggerTurn).toBe(!stopped);
+        expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+      } finally {
+        main.closeFollowUpDrain();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("drops the pending wake when a later compaction is cancelled, a run starts, or the drain closes", () => {
     for (const end of ["cancelled", "run", "closed"] as const) {
       const { main, sent, emit, ctx, state } = setup();
@@ -679,6 +817,70 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 5_000): Promise<voi
 // The real Pi agent loop: Main chains tool calls; the followUp must arrive at a tool boundary,
 // never inside a call, and behind a steer that was queued before it.
 describe("Main followUp drain in a real Pi session", () => {
+  it("delivers a full HANDOFF then correction in order across prompt preflight (#754)", async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-order-754-"));
+    roots.push(root);
+    const faux = fauxProvider();
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+    modelRuntime.registerNativeProvider(faux.provider);
+    let main: MainAgentController | undefined;
+    let releasePreflight: (() => void) | undefined;
+    let releaseTool: (() => void) | undefined;
+    let preflights = 0;
+    let preflightCapability = false;
+    const loader = new DefaultResourceLoader({
+      cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [{ name: "ordering-754", factory: (pi: ExtensionAPI) => {
+        pi.on("before_agent_start", async () => {
+          if (++preflights === 1) await new Promise<void>((resolve) => { releasePreflight = resolve; });
+        });
+        pi.registerTool({ name: "work", label: "work", description: "held tool boundary", parameters: Type.Object({}),
+          execute: async () => {
+            await new Promise<void>((resolve) => { releaseTool = resolve; });
+            return { content: [{ type: "text", text: "done" }], details: {} };
+          },
+        });
+        pi.on("session_start", (_event, ctx) => {
+          preflightCapability = "isPromptPending" in ctx && typeof ctx.isPromptPending === "function";
+          main = new MainAgentController(pi, "session:root", true, root, "root");
+          main.attachFollowUpDrain(ctx, 10);
+        });
+      } }],
+    });
+    await loader.reload();
+    const { session } = await createAgentSession({ cwd: root, agentDir: path.join(root, "agent"), modelRuntime,
+      model: faux.getModel(), resourceLoader: loader, sessionManager: SessionManager.inMemory(root), tools: ["work"] });
+    sessions.push(session);
+    await session.bindExtensions({});
+    // Upstream 0.87.0 lacks the preflight capability; the installed fleet SDK exposes it.
+    // The unit regression still runs on both, and the native regression runs on the real host.
+    if (!preflightCapability) t.skip();
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("work", {}), { stopReason: "toolUse" }),
+      fauxAssistantMessage("read messages"), fauxAssistantMessage("finished")]);
+    const run = session.prompt("existing supervisor turn");
+    try {
+      await waitFor(() => releasePreflight !== undefined);
+      const handoff = main!.deliverAgent({ from: from("lane"), message: `HANDOFF proof ${"x".repeat(3000)}`, delivery: "followUp" });
+      releasePreflight!();
+      await waitFor(() => releaseTool !== undefined);
+      const correction = main!.deliverAgent({ from: from("lane"), message: "checksum correction", delivery: "followUp" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      releaseTool!();
+      await run;
+      const items = session.messages.filter((message) => message.role === "custom" &&
+        (message as { customType?: string }).customType === "pi-fabric-agent-message")
+        .flatMap((message) => {
+          const details = (message as { details: { id: string; items?: Array<{ id: string }> } }).details;
+          return details.items ?? [details];
+        });
+      expect(items.map((item) => item.id)).toEqual([handoff.messageId, correction.messageId]);
+    } finally {
+      releasePreflight?.(); releaseTool?.();
+      await session.abort(); await run.catch(() => undefined);
+      main?.closeFollowUpDrain();
+    }
+  });
+
   it("delivers a due followUp at the next tool boundary, behind an earlier steer, while Main keeps working", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-drain-"));
     roots.push(root);
@@ -1132,6 +1334,118 @@ describe("Main benign compaction rejection and owner cancellation in a real Pi s
           expect(faux.state.callCount - initialCalls).toBe(runs);
         }
       } finally {
+        await session.abort();
+        await session.waitForIdle();
+        mains.at(-1)?.closeFollowUpDrain();
+      }
+    },
+  );
+});
+
+// smarty-dev#2793 S7: session_compact is not terminal while later handlers still run.
+describe("Main manual compaction completion authority in a real Pi session", () => {
+  const cases = [0, 60_000].flatMap(flushMs => (["followUp", "steer"] as const).flatMap(delivery =>
+    (["late-owner-abort", "late-deadline", "success", "declined"] as const).map(outcome => ({ flushMs, delivery, outcome }))));
+  it.each(cases)(
+    "$outcome retains native cancellation evidence through completion and reload (flushMs=$flushMs, delivery=$delivery)",
+    async ({ flushMs, delivery, outcome }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manual-completion-"));
+      roots.push(root);
+      const journal = path.join(root, "journal.json");
+      const faux = fauxProvider();
+      const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+      modelRuntime.registerNativeProvider(faux.provider);
+      const mains: MainAgentController[] = [];
+      const failures: Array<{ reason: string; aborted: boolean }> = [];
+      let releaseCompletion: (() => void) | undefined;
+      let operation: AbortSignal | undefined;
+      let starts = 0;
+      const loader = new DefaultResourceLoader({
+        cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [{ name: "manual-completion", factory: (pi: ExtensionAPI) => {
+          pi.on("agent_start", () => { starts++; });
+          pi.on("session_before_compact", event => {
+            operation = event.signal;
+            if (outcome === "declined") return { cancel: true };
+            return { compaction: { summary: "summary", firstKeptEntryId: event.preparation.firstKeptEntryId,
+              tokensBefore: event.preparation.tokensBefore } };
+          });
+          pi.on("session_compact_failed", event => { failures.push(event); });
+          pi.on("session_start", (_event, ctx) => {
+            const main = new MainAgentController(pi, "session:root", true, root, "root");
+            main.attachFollowUpDrain(ctx, flushMs, journal);
+            mains.push(main);
+            // Registered AFTER Main: its session_compact handler has already returned.
+            pi.on("session_compact", () => new Promise<void>(resolve => { releaseCompletion = resolve; }));
+          });
+          pi.on("session_shutdown", () => { mains.at(-1)?.closeFollowUpDrain(); });
+        } }],
+      });
+      await loader.reload();
+      const { session } = await createAgentSession({
+        cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+        sessionManager: SessionManager.inMemory(root), noTools: "all",
+        settingsManager: SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 1 } }),
+      });
+      sessions.push(session);
+      await session.bindExtensions({ shutdownHandler: () => undefined });
+      faux.setResponses(Array.from({ length: 6 }, (_, index) => fauxAssistantMessage(`answer ${index}`)));
+      let compacting: Promise<unknown> | undefined;
+      const stopped = outcome === "late-owner-abort";
+      try {
+        await session.prompt("first question");
+        await session.prompt("second question");
+        const initialStarts = starts;
+        const initialCalls = faux.state.callCount;
+        compacting = session.compact().then(() => "completed", () => "failed");
+        if (outcome === "declined") {
+          expect(await compacting).toBe("failed");
+          expect(failures).toMatchObject([{ reason: "manual", aborted: true }]);
+          expect(operation?.aborted).toBe(false); // Benign veto is not native cancellation.
+        } else {
+          await waitFor(() => releaseCompletion !== undefined);
+          expect(session.isIdle).toBe(false);
+          expect(starts).toBe(initialStarts);
+          if (stopped) session.abortCompaction(); // Native SDK cancellation, never main.halt().
+          if (outcome === "late-deadline") {
+            // Pi 0.87.0 has no deadline timer; exercise the same native controller/reason
+            // used by installed Pi 0.87.1 without waiting twenty minutes.
+            (session as unknown as { _compactionAbortController: AbortController })._compactionAbortController
+              .abort(new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
+          }
+          expect(operation?.aborted).toBe(stopped || outcome === "late-deadline");
+          releaseCompletion!();
+          await compacting; // Pi versions differ on whether late abort emits compact_failed.
+        }
+        for (const phase of ["before", "after"] as const) {
+          if (phase === "after") {
+            await session.reload();
+            expect(mains).toHaveLength(2);
+          }
+          const result = mains.at(-1)!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" },
+            message: `peer ${phase} reload`, delivery, deliveryId: `completion-${phase}` });
+          await session.waitForIdle();
+          const received = session.messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message");
+          expect(received).toHaveLength(phase === "before" ? 1 : 2);
+          expect(received.at(-1)).toMatchObject({ details: { id: result.messageId, triggerTurn: !stopped } });
+          const runs = stopped ? 0 : phase === "before" ? 1 : 2;
+          expect(starts - initialStarts).toBe(runs);
+          expect(faux.state.callCount - initialCalls).toBe(runs);
+          expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+        }
+        if (stopped) {
+          await session.prompt("explicit owner resume");
+          expect(starts - initialStarts).toBe(1);
+          mains.at(-1)!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" },
+            message: "peer after owner resume", delivery });
+          await session.waitForIdle();
+          expect(starts - initialStarts).toBe(2);
+          expect(faux.state.callCount - initialCalls).toBe(2);
+        }
+      } finally {
+        session.abortCompaction();
+        releaseCompletion?.();
+        await compacting;
         await session.abort();
         await session.waitForIdle();
         mains.at(-1)?.closeFollowUpDrain();

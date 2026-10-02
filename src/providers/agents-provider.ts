@@ -1,5 +1,6 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
+import type { RouteEvaluate } from "../agents/model-route.js";
 import { formatAge, residentHostId, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
@@ -76,7 +77,7 @@ import {
   resolveFabricModel,
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
-import { resolvePiModel } from "../core/model-refresh.js";
+import { resolvePiModel, resolvePiRoutePin, ModelRoutePinError } from "../core/model-refresh.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
 import { mainExecutionCeilingAbortReason, throwIfExecutionExpired, withoutMainExecutionCeiling } from "../async-settlement.js";
@@ -410,6 +411,7 @@ export class AgentsProvider implements FabricProvider {
     readonly modelsConfig: () => FabricModelsConfig = () => DEFAULT_FABRIC_CONFIG.models,
     /** Current host effort, including child processes where the Main target is remote. */
     readonly callerThinking: () => string | undefined = () => undefined,
+    readonly routeEvaluate: RouteEvaluate = async () => { throw new Error("Jev routing unavailable"); },
   ) {
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
@@ -507,6 +509,7 @@ export class AgentsProvider implements FabricProvider {
       return { ...args, model: prepared };
     }
     if (!model) return args;
+    if (model === "auto") throw new Error('model: "auto" is supported only by agents.spawn with required routing pins');
     const thinking = isFabricThinking(args.thinking) ? args.thinking
       : aliasThinking(this.modelsConfig().aliases, model);
     const resolved = await this.#resolvePiModel(model, context);
@@ -525,6 +528,52 @@ export class AgentsProvider implements FabricProvider {
     const resolved = await this.#resolvePiModelArgs({ model, thinking: request.thinking }, context, request.runner);
     // Templates and unbound live actors retain their dynamic defaults, after validation.
     return request.model ? { ...request, model: resolved.model as string, ...(isFabricThinking(resolved.thinking) ? { thinking: resolved.thinking } : {}) } : request;
+  }
+
+  async #prepareSpawnRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
+    if (args.model !== "auto") return this.#runRequest(args, context);
+    const runner = args.runner ?? this.manager.config.runner;
+    const transport = args.transport ?? this.manager.config.transport;
+    if (runner !== "pi" || transport !== "process" || (args.residency !== undefined && args.residency !== "session") ||
+      args.actorId !== undefined || args.actorName !== undefined) {
+      throw new Error('model: "auto" requires a session-owned process/Pi task, not an actor');
+    }
+    if (typeof args.routeClass !== "string" || !/^[a-z][a-z0-9-]{0,63}$/.test(args.routeClass)) {
+      throw new Error('model: "auto" requires a bounded routeClass identifier');
+    }
+    const config = this.manager.config.modelRouting;
+    const pinModel = Object.hasOwn(args, "pinModel") ? args.pinModel : config?.pinModel;
+    const pinThinking = Object.hasOwn(args, "pinThinking") ? args.pinThinking : config?.pinThinking;
+    if (typeof pinModel !== "string" || !pinModel.trim() || pinModel === "auto" || !isFabricThinking(pinThinking)) {
+      throw new ModelRoutePinError(String(pinModel ?? ""));
+    }
+    this.manager.assertModelAllowed(pinModel, "pi");
+    // Canonicalize only the pin: auto must never fall through to MRU/session/default medium.
+    const exactPin = await resolvePiRoutePin({ selector: pinModel, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases });
+    const resolved = { ...args, model: `${exactPin.provider}/${exactPin.id}`, thinking: pinThinking };
+    this.manager.assertModelAllowed(resolved.model, "pi");
+    const pin = { model: resolved.model as string, effort: pinThinking };
+    const candidates = config?.shadowCandidates ?? [];
+    const available = context.extensionContext.modelRegistry.getAvailable();
+    const pinnedModel = available.find(model => `${model.provider}/${model.id}` === pin.model);
+    // Known capabilities can refuse before any judgment/worker starts. Unknown metadata
+    // still requires exact effective-effort readback at the worker admission boundary.
+    if (pinnedModel && typeof pinnedModel.reasoning === "boolean") {
+      const { getSupportedThinkingLevels } = await import("@earendil-works/pi-ai");
+      if (!getSupportedThinkingLevels(pinnedModel).includes(pinThinking)) {
+        throw Object.assign(new Error(`MODEL_ROUTE_EFFORT_UNSUPPORTED: ${pin.model} cannot honor required effort ${pinThinking}; task was not sent`), {
+          name: "ModelRouteEffortPinError", code: "MODEL_ROUTE_EFFORT_UNSUPPORTED",
+        });
+      }
+    }
+    const candidatesValid = candidates.length <= 16 && candidates.every(candidate =>
+      isFabricThinking(candidate.effort) && available.some(model => `${model.provider}/${model.id}` === candidate.model));
+    const { decideModelRoute } = await import("../agents/model-route.js");
+    const routeDecision = await decideModelRoute({ routeClass: args.routeClass, protected: args.protected, pin,
+      candidates, candidatesValid, parentSessionId: context.extensionContext.sessionManager?.getSessionId() ?? this.participants.self().sessionId ?? "unknown" },
+      this.routeEvaluate, context.signal);
+    // PR1 invariant: the choice is recorded, but dispatch ALWAYS uses the role pin.
+    return { ...await this.#runRequest(resolved, context), routeDecision };
   }
 
   async #resolvePiRunBinding(
@@ -737,7 +786,7 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = await this.#runRequest(args, context);
+        const request = await this.#prepareSpawnRequest(args, context);
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...baseRequest } = request;
         const durableCwd = request.residency === "durable" && request.cwd !== undefined
@@ -761,7 +810,7 @@ export class AgentsProvider implements FabricProvider {
           name: handle.name,
         });
         context.update(agentStartedMessage(handle));
-        return handle;
+        return request.routeDecision ? { ...handle, routeDecision: request.routeDecision } : handle;
       }
       case "join":
       case "wait": {

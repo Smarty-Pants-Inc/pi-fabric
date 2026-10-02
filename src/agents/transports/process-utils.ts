@@ -228,11 +228,13 @@ export const spawnDetached = async (
   workerArguments: string[],
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize">,
+  environment?: NodeJS.ProcessEnv,
 ): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
   const child = spawn(runtime, [workerPath, ...workerArguments], {
     cwd,
+    ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
     stdio: "ignore",
   });

@@ -70,7 +70,7 @@ export const collectHostReleases = (options: { procRoot?: string; settingsPath?:
   const records = new Map<number, MainReleaseProcess>();
   for (const process of processes.values()) {
     const profileSettings = options.settingsPath ?? (process.env.PI_CODING_AGENT_DIR
-      ? path.join(process.env.PI_CODING_AGENT_DIR, "settings.json") : settings);
+      ? path.join(resolveAgentDir(process.env.PI_CODING_AGENT_DIR), "settings.json") : settings);
     try {
       const record = JSON.parse(fs.readFileSync(path.join(mainReleaseRecordDir(profileSettings), `${process.pid}.json`), "utf8")) as MainReleaseProcess;
       if (record.pid === process.pid && record.start === process.start && typeof record.loadedRoot === "string" && typeof record.sessionId === "string") {
@@ -81,7 +81,7 @@ export const collectHostReleases = (options: { procRoot?: string; settingsPath?:
   const mains = new Map<string, MainRelease>();
   const mainsByPid = new Map<number, MainRelease>();
   const profile = (process: ProcessInfo): string => options.settingsPath ?? (process.env.PI_CODING_AGENT_DIR
-    ? path.join(process.env.PI_CODING_AGENT_DIR, "settings.json") : settings);
+    ? path.join(resolveAgentDir(process.env.PI_CODING_AGENT_DIR), "settings.json") : settings);
   for (const process of processes.values()) {
     const record = records.get(process.pid);
     const pi = process.args.slice(0, 2).map(normalizedArg).some(arg => path.posix.basename(arg) === "pi" || /(?:pi-coding-agent|pi-runtime).*\/cli\.js$/.test(arg));

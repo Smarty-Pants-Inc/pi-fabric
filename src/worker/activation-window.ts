@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import * as nodeModule from "node:module";
-import { getCurrentSystemMessage, type Provider } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, type Provider, type ProviderRequestOptions } from "@earendil-works/pi-ai";
 import { buildSessionContext, convertToLlm, getPackageDir, sessionEntryToContextMessages, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 type AgentMessage = ReturnType<typeof buildSessionContext>["messages"][number];
 
@@ -126,7 +126,7 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
     }
     // Bun source workers use native package imports (no Jiti root alias) and
     // do not yet implement findPackageJSON; Node hosts take the bound path above.
-    const { estimateContextTokens } = await import(estimatorUrl) as typeof import("@earendil-works/pi-ai/utils/estimate");
+    const { estimateTextTokens } = await import(estimatorUrl) as typeof import("@earendil-works/pi-ai/utils/estimate");
     pi.on("session_start", (_event, ctx) => {
       try {
         const hook = fs.realpathSync(fileURLToPath(import.meta.url));
@@ -157,23 +157,25 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
         return failClosed(error);
       }
     });
-    // context_with_system is still a transform phase: later handlers can replace
-    // its output. Pi resolves the provider and assembles headers only AFTER all
-    // context transforms and its own convertToLlm/normalization. Decorate that
-    // resolved provider's public dispatch entry points, not a context snapshot.
+    // Both context_with_system and before_provider_request are transform phases.
+    // Pi resolves the provider and assembles headers after context normalization,
+    // but that provider builds its wire payload and awaits onPayload even later.
+    // Decorate the resolved provider to wrap (not replace) that awaited callback:
+    // admission must follow the COMPLETE native before_provider_request chain.
     // prepareRequest retains this exact provider across the awaited header hook;
     // a later provider registration cannot replace the dispatch being admitted.
     // Reinstall per request so refresh/registration during a transform is covered.
     // No private host fields, alternate AI runtime, auth or provider composition.
     const guarded = new WeakSet<Provider>();
-    let lastPayload: { messages: Parameters<Provider["streamSimple"]>[1]["messages"]; contextWindow: number } | undefined;
+    let lastPayload: { tokens: number; contextWindow: number } | undefined;
     pi.on("turn_end", async event => {
       try {
         if (!window || !lastPayload || !event.toolResults.length) return;
         // Measure the actual last dispatched payload plus this completed batch,
         // not usage from before the tools or a carried journal's token count.
-        const next = [...lastPayload.messages, ...convertToLlm([event.message, ...event.toolResults])];
-        if (estimateContextTokens(next).tokens < lastPayload.contextWindow * 0.8) return;
+        const completedBatch = convertToLlm([event.message, ...event.toolResults]);
+        const nextTokens = lastPayload.tokens + estimateTextTokens(JSON.stringify(completedBatch));
+        if (nextTokens < lastPayload.contextWindow * 0.8) return;
         // Stable package-local first-use edge; idle activation registration stays cheap.
         const { compactActivationTools } = await import("./activation-compaction.js");
         // Compaction may only replace our witnessed append-only activation,
@@ -196,22 +198,54 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
         // as the authoritative window below. getAll is the host's loaded snapshot.
         const providers = new Set(ctx.modelRegistry.getAll().map(model => model.provider));
         providers.add(ctx.model.provider);
-        const admit = (model: Parameters<Provider["streamSimple"]>[0], context: Parameters<Provider["streamSimple"]>[1]): void => {
+        const verify = (context: Parameters<Provider["streamSimple"]>[1]): void => {
           try {
-            // This is Pi's final converted, normalized request context, including
-            // the effective system/tools and current tool results. Do not estimate
-            // earlier: a raw over-window context may be reduced by a later hook.
-            const tokens = estimateContextTokens(context.messages).tokens;
-            lastPayload = { messages: context.messages.slice(), contextWindow: model.contextWindow };
-            if (tokens > model.contextWindow) {
-              failClosed(`Context exceeds window: estimated ${tokens} input tokens, window ${model.contextWindow}`);
-            }
             // Compaction checkpoints replay a single system head; audit the raw
             // append-only system records, not that compacted projection.
             window!.verifySystem(ctx.sessionManager.getBranch().flatMap(entry =>
               entry.type === "message" ? sessionEntryToContextMessages(entry) : []), context.messages);
           } catch (error) {
             failClosed(error);
+          }
+        };
+        const guardPayload = (
+          model: Parameters<Provider["streamSimple"]>[0], options: ProviderRequestOptions | undefined,
+        ): NonNullable<ProviderRequestOptions["onPayload"]> => async (payload, requestModel) => {
+          try {
+            const replacement = await options?.onPayload?.(payload, requestModel);
+            // Undefined retains the input, including any in-place mutations.
+            const final = replacement === undefined ? payload : replacement;
+            if (!final || typeof final !== "object" || Array.isArray(final)) {
+              throw new Error("Activation window requires a JSON provider request object");
+            }
+            // Estimate the entire exact wire object: system/messages, tool schemas,
+            // and API-specific context fields, with no stale assistant-usage shortcut.
+            // Counting JSON framing too is deliberately conservative. Non-JSON
+            // payloads fail closed rather than silently dropping unmeasured context.
+            const encoded = JSON.stringify(final, (_key, value: unknown) => {
+              if (typeof value === "function" || typeof value === "symbol" || typeof value === "bigint" ||
+                  (typeof value === "number" && !Number.isFinite(value)) ||
+                  (value && typeof value === "object" && !Array.isArray(value) &&
+                    ![Object.prototype, null].includes(Object.getPrototypeOf(value)))) {
+                throw new Error("Activation window cannot admit a non-JSON provider payload");
+              }
+              return value;
+            });
+            if (encoded === undefined) throw new Error("Activation window cannot serialize the provider payload");
+            const admitted: unknown = JSON.parse(encoded);
+            if (!admitted || typeof admitted !== "object" || Array.isArray(admitted)) {
+              throw new Error("Activation window requires a JSON provider request object");
+            }
+            const tokens = estimateTextTokens(encoded);
+            if (tokens > model.contextWindow) {
+              failClosed(`Context exceeds window: estimated ${tokens} input tokens, window ${model.contextWindow}`);
+            }
+            lastPayload = { tokens, contextWindow: model.contextWindow };
+            // Dispatch the admitted JSON snapshot, not handler-owned references or
+            // stateful getters/toJSON that could change at the next serialization.
+            return admitted;
+          } catch (error) {
+            return failClosed(error);
           }
         };
         for (const id of providers) {
@@ -223,12 +257,15 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
           const stream = provider.stream;
           const streamSimple = provider.streamSimple;
           provider.stream = (model, context, options) => {
-            admit(model, context);
-            return stream.call(provider, model, context, options);
+            verify(context);
+            // Preserve the API-specific conditional options type while copying it.
+            const guardedOptions = { ...options } as NonNullable<typeof options>;
+            guardedOptions.onPayload = guardPayload(model, options);
+            return stream.call(provider, model, context, guardedOptions);
           };
           provider.streamSimple = (model, context, options) => {
-            admit(model, context);
-            return streamSimple.call(provider, model, context, options);
+            verify(context);
+            return streamSimple.call(provider, model, context, { ...options, onPayload: guardPayload(model, options) });
           };
           guarded.add(provider);
         }

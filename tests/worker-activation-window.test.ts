@@ -154,6 +154,69 @@ describe("activation projection", () => {
     expect(fs.existsSync(requestCounter)).toBe(false);
   }, TEST_GUARD_MS);
 
+  it.each(["stream", "streamSimple"].flatMap(method =>
+    ["expand", "shrink", "unsupported", "binary", "serialized-primitive", "snapshot", "no-callback"].map(mode => [method, mode]),
+  ))("guards the final JSON boundary via %s (%s)", (method, mode) => {
+    const dir = root();
+    const requestFile = path.join(dir, "requests");
+    const callbackFile = path.join(dir, "callback");
+    const hook = fs.realpathSync(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER
+      ? path.join(path.dirname(path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER)), "worker/activation-window.js")
+      : path.resolve("src/worker/activation-window.ts"));
+    const child = path.join(dir, "dispatch.mjs");
+    fs.writeFileSync(child, `
+      import fs from 'node:fs';
+      import hook from ${JSON.stringify(pathToFileURL(hook).href)};
+      process.env.PI_FABRIC_ACTIVATION_WORKER_PID = String(process.ppid);
+      process.env.PI_FABRIC_ACTIVATION_NONCE = 'dispatch-nonce';
+      process.env.PI_FABRIC_PARENT_RUN = 'dispatch-test';
+      process.env.PI_FABRIC_ACTIVATION_HOOK = ${JSON.stringify(hook)};
+      const handlers = new Map();
+      await hook({on(name, fn) {handlers.set(name, fn)}});
+      const model = {provider:'test', contextWindow:8000};
+      const provider = {stream:dispatch, streamSimple:dispatch};
+      async function dispatch(model, context, options) {
+        if (this !== provider || options?.headers?.probe !== 'preserved') throw new Error('lost provider/options');
+        let payload = {messages:context.messages};
+        const replacement = await options?.onPayload?.(payload, model);
+        if (replacement !== undefined) payload = replacement;
+        fs.writeFileSync(${JSON.stringify(requestFile)}, JSON.stringify(payload));
+      }
+      const ctx = {mode:'rpc', model, sessionManager:{getBranch(){return []}},
+        modelRegistry:{getAll(){return [model]}, getProvider(){return provider}}};
+      await handlers.get('session_start')({}, ctx);
+      await handlers.get('before_provider_headers')({}, ctx);
+      const mode = ${JSON.stringify(mode)};
+      const options = {headers:{probe:'preserved'}};
+      if (mode !== 'no-callback') options.onPayload = async (payload, requestModel) => {
+        if (requestModel !== model) throw new Error('lost callback model');
+        fs.appendFileSync(${JSON.stringify(callbackFile)}, 'callback\\n');
+        if (mode === 'unsupported') {payload.cycle = payload; return payload}
+        if (mode === 'binary') return {...payload, context:new Uint8Array([1, 2, 3])};
+        if (mode === 'serialized-primitive') return {toJSON(){return 'not a request object'}};
+        if (mode === 'snapshot') {
+          let reads = 0;
+          return {get messages() {return ++reads === 1 ? [{role:'user', content:'SMALL'}]
+            : [{role:'user', content:'x'.repeat(40_000)}]}};
+        }
+        return {messages:[{role:'user', content:mode === 'expand' ? 'x'.repeat(40_000) : 'SMALL'}]};
+      };
+      await provider[${JSON.stringify(method)}](model,
+        {messages:[{role:'user', content:mode === 'shrink' ? 'x'.repeat(80_000) : 'SMALL'}]}, options);
+    `);
+    const result = spawnSync(process.execPath, [child], {encoding: "utf8", timeout: HANG_GUARD_MS});
+    const refuses = ["expand", "unsupported", "binary", "serialized-primitive"].includes(mode);
+    expect(result.status, result.stderr).toBe(refuses ? 78 : 0);
+    if (refuses) {
+      expect(fs.existsSync(requestFile)).toBe(false);
+      expect(result.stderr).toContain(mode === "expand" ? "Context exceeds window" : "Fabric activation window failed");
+    } else {
+      expect(JSON.parse(fs.readFileSync(requestFile, "utf8"))).toEqual({messages:[{role:"user", content:"SMALL"}]});
+    }
+    if (mode === "no-callback") expect(fs.existsSync(callbackFile)).toBe(false);
+    else expect(fs.readFileSync(callbackFile, "utf8")).toBe("callback\n");
+  }, TEST_GUARD_MS);
+
   it("does not terminate an owner that accidentally loads the hook without worker binding", async () => {
     const { default: hook } = await import("../src/worker/activation-window.js");
     vi.stubEnv("PI_FABRIC_ACTIVATION_WORKER_PID", "");
@@ -268,7 +331,9 @@ describe("native activation window (offline; opted-in success needs exact native
   const setup = async (toolRounds = 0, oversizedRound = 0, toolTask?: string) => {
     const dir = root();
     const requests: Array<Record<string, any>> = [];
+    let requestCount = 0;
     const server = http.createServer((request, response) => {
+      requestCount++; // Count HTTP arrival even if its body is interrupted.
       let body = "";
       request.on("data", chunk => { body += chunk; });
       request.on("end", () => {
@@ -321,7 +386,7 @@ describe("native activation window (offline; opted-in success needs exact native
       piBinary: nativeBinary!, runRoot: path.join(dir, "runs"),
     });
     managers.push(manager);
-    return { dir, manager, requests, settingsFile, settings };
+    return { dir, manager, requests, get requestCount() { return requestCount; }, settingsFile, settings };
   };
 
   it.skipIf(Boolean(selectedNativeBinary))("rejects an old native CLI that ignores the flag even when global compaction is already false", async () => {
@@ -484,6 +549,75 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(fs.readFileSync(path.join(s.dir, "transforms"), "utf8")).toBe("transform\n");
   }, TEST_GUARD_MS);
 
+  // Astra round 3: native before_provider_request runs AFTER dispatch has
+  // converted the transcript. Exercise its real awaited handler chain and count
+  // actual requests at the localhost server, not calls to streamSimple.
+  it.skipIf(!selectedNativeBinary).each([
+    "expand-replace", "expand-in-place", "expand-tools", "shrink", "expand-shrink", "shrink-expand",
+  ])("3238 admits only the final payload after before_provider_request %s", async mode => {
+    const s = await setup();
+    const extensionDir = path.join(s.dir, "agent", "extensions");
+    fs.mkdirSync(extensionDir);
+    const transforms = path.join(s.dir, "payload-transforms");
+    fs.writeFileSync(path.join(extensionDir, "late-payload.ts"), `
+      import fs from 'node:fs';
+      export default function(pi) {
+        const shrink = payload => ({...payload, messages: payload.messages.map(message =>
+          message.role === 'user' ? {...message, content:'SMALL_FINAL_PAYLOAD'} : message)});
+        const expand = payload => ({...payload, messages: [...payload.messages,
+          {role:'user', content:'LATE_PAYLOAD ' + 'x'.repeat(40_000)}]});
+        pi.on('before_provider_request', async event => {
+          await Promise.resolve();
+          fs.appendFileSync(${JSON.stringify(transforms)}, 'first\\n');
+          const mode = ${JSON.stringify(mode)};
+          if (mode === 'expand-in-place') {
+            event.payload.messages.push({role:'user', content:'LATE_PAYLOAD ' + 'x'.repeat(40_000)});
+            return; // Undefined means retain the mutated input.
+          }
+          if (mode === 'expand-tools') return {...event.payload, tools:[{type:'function',
+            function:{name:'oversized', description:'LATE_TOOL ' + 'x'.repeat(40_000),
+              parameters:{type:'object', properties:{}}}}]};
+          return mode.startsWith('expand') ? expand(event.payload) : shrink(event.payload);
+        });
+        pi.on('before_provider_request', async event => {
+          await Promise.resolve();
+          fs.appendFileSync(${JSON.stringify(transforms)}, 'last\\n');
+          if (${JSON.stringify(mode)} === 'expand-shrink') return shrink(event.payload);
+          if (${JSON.stringify(mode)} === 'shrink-expand') return expand(event.payload);
+        });
+      }
+    `);
+    const alarms: Array<{message: {text?: string}}> = [];
+    const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
+    const actors = new ActorManager("payload-window-test", {id: "owner", name: "owner", kind: "main", sessionId: "payload-window-test"}, mesh,
+      {...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20}, s.manager, request => { alarms.push(request); },
+      {actorRoot: path.join(s.dir, "actors"), persistent: true});
+    managers.push(actors);
+    const actor = await actors.create({name: "late-payload", instructions: "Act.", inferenceContext: "activation",
+      model: "window-test/offline", tools: [], extensions: true, transport: "process", delivery: "mailbox"});
+    const run = vi.spyOn(s.manager, "run");
+    const reduces = mode === "shrink" || mode === "expand-shrink";
+    const outcome = actors.ask(actor.id, reduces ? "LARGE_RAW_PAYLOAD " + "x".repeat(80_000) : "SMALL_RAW_PAYLOAD");
+    if (reduces) await expect(outcome).resolves.toMatchObject({text: "useful current result"});
+    else await expect(outcome).rejects.toThrow(/Context exceeds window/);
+    await actors.close(); // Join the drain: exactly one activation, no hidden retry.
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(await run.mock.results[0]!.value).toMatchObject({status: reduces ? "completed" : "failed"});
+    expect(s.requestCount).toBe(reduces ? 1 : 0);
+    expect(s.requests).toHaveLength(reduces ? 1 : 0);
+    expect(alarms).toHaveLength(reduces ? 0 : 1);
+    expect(mesh.read({topic: "ops.owner"}).filter(event => event.kind === "actor.alarm")).toHaveLength(reduces ? 0 : 1);
+    if (reduces) {
+      expect(JSON.stringify(s.requests)).toContain("SMALL_FINAL_PAYLOAD");
+      expect(JSON.stringify(s.requests)).not.toContain("LARGE_RAW_PAYLOAD");
+      expect(JSON.stringify(s.requests)).not.toContain("LATE_PAYLOAD");
+    } else {
+      expect(alarms[0]!.message.text).toContain("Context exceeds window");
+      expect(actors.messages(actor.id, 20).filter(message => message.error?.includes("Context exceeds window"))).toHaveLength(1);
+    }
+    expect(fs.readFileSync(transforms, "utf8")).toBe("first\nlast\n");
+  }, TEST_GUARD_MS);
+
   it.skipIf(!selectedNativeBinary)("blocks native manual compaction before any summary request and retains the full journal", async () => {
     const s = await setup();
     const journal = path.join(s.dir, "actor.jsonl");
@@ -577,6 +711,52 @@ describe("native activation window (offline; opted-in success needs exact native
       expect(call.tool_calls.some((call: any) => call.id === tool.tool_call_id)).toBe(true);
     }
     expect(JSON.stringify(s.requests.at(-1))).toContain("Compacted tool output");
+    expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
+  }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary)("3238 compacts before final admission through the complete awaited payload chain", async () => {
+    const s = await setup(5);
+    const extensionDir = path.join(s.dir, "agent", "extensions");
+    fs.mkdirSync(extensionDir);
+    const transforms = path.join(s.dir, "compaction-payload-transforms");
+    fs.writeFileSync(path.join(extensionDir, "compaction-payload.ts"), `
+      import fs from 'node:fs';
+      export default function(pi) {
+        pi.on('before_provider_request', async event => {
+          await Promise.resolve();
+          fs.appendFileSync(${JSON.stringify(transforms)}, 'first\\n');
+          return {...event.payload, transientExpansion:'x'.repeat(40_000)};
+        });
+        pi.on('before_provider_request', async event => {
+          await Promise.resolve();
+          fs.appendFileSync(${JSON.stringify(transforms)}, 'last\\n');
+          const {transientExpansion, ...final} = event.payload;
+          return {...final, finalPayloadPadding:'FINAL_ADMITTED ' + 'x'.repeat(2000)};
+        });
+      }
+    `);
+    const journal = path.join(s.dir, "actor.jsonl");
+    const result = await s.manager.run({task: "CURRENT_COMPOSED_ACTIVATION", model: "window-test/offline",
+      actorId: "same-actor", sessionFile: journal, inferenceContext: "activation", tools: ["read"],
+      extensions: true, transport: "process"});
+    expect(result, explain(result)).toMatchObject({status: "completed", text: "useful current result"});
+    expect(s.requestCount).toBe(6);
+    expect(s.requests).toHaveLength(6);
+    expect(fs.readFileSync(transforms, "utf8")).toBe("first\nlast\n".repeat(6));
+    for (const request of s.requests) {
+      expect(request.finalPayloadPadding).toMatch(/^FINAL_ADMITTED /);
+      expect(request).not.toHaveProperty("transientExpansion");
+      expect(Math.ceil(JSON.stringify(request).length / 4)).toBeLessThanOrEqual(8000);
+    }
+    const final = s.requests.at(-1)!;
+    expect(JSON.stringify(final)).toContain("Compacted tool output");
+    expect(JSON.stringify(final)).toContain("CURRENT_COMPOSED_ACTIVATION");
+    expect(final.messages.find((message: any) => message.role === "tool" && message.tool_call_id === "read-5").content)
+      .toBe(fs.readFileSync(path.join(s.dir, "task-5.txt"), "utf8"));
+    const audit = readJournal(journal);
+    expect(audit.entries.some(entry => entry.type === "custom" && entry.customType === "fabric-activation-context" &&
+      entry.data?.scope === "activation" && entry.data.entry.type === "compaction")).toBe(true);
+    expect(audit.entries.some(entry => entry.type === "compaction" || entry.type === "context_edit")).toBe(false);
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
   }, TEST_GUARD_MS);
 

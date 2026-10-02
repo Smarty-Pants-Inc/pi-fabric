@@ -44,7 +44,7 @@ const fixture = async (filesOnly = false) => {
   await observer.start();
   const entries: any[] = [];
   const sent: Array<{ content: string; details: any; options: any }> = [];
-  const main = (idle = true, flushMs = 60_000) => {
+  const main = (idle = true, flushMs = 60_000, Controller = MainAgentController) => {
     const handlers = new Map<string, Array<(event: any, ctx: ExtensionContext) => void>>();
     const pi = {
       on(name: string, handler: (event: any, ctx: ExtensionContext) => void) {
@@ -58,7 +58,7 @@ const fixture = async (filesOnly = false) => {
       getThinkingLevel: () => "off",
     } as unknown as ExtensionAPI;
     const context = { isIdle: () => idle, hasPendingMessages: () => false, sessionManager: { getEntries: () => entries } } as unknown as ExtensionContext;
-    const controller = new MainAgentController(pi, identity.id, true, root, sessionId);
+    const controller = new Controller(pi, identity.id, true, root, sessionId);
     controller.attachFollowUpDrain(context, flushMs, path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`));
     cleanup.push(() => controller.closeFollowUpDrain());
     return { controller, pi, context, setIdle: (value: boolean) => { idle = value; }, emit: (name: string, event: any = {}) => { for (const fn of handlers.get(name) ?? []) fn(event, context); } };
@@ -545,6 +545,70 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
       warning.mockRestore();
     }
   });
+
+  it.each([0, 60_000].flatMap(flushMs => [false, true].map(recoverAfterAttach => ({ flushMs, recoverAfterAttach })) ))(
+    "an unsaved halt survives the final reload save and a new module generation (flushMs=$flushMs, recoverAfterAttach=$recoverAfterAttach)",
+    async ({ flushMs, recoverAfterAttach }) => {
+      const f = await fixture();
+      const old = f.main(true, flushMs);
+      const journal = path.join(f.mesh().root, "main-followups", `${encodeURIComponent(sessionId)}.json`);
+      const index = `${journal}.delivered`;
+      fs.mkdirSync(path.dirname(index), { recursive: true });
+      fs.writeFileSync(index, JSON.stringify({ version: 1, ids: ["earlier-receipt"], halted: false }));
+      const rename = fs.renameSync;
+      let blocked = true;
+      let attempts = 0;
+      const fault = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+        if (String(target) === index && blocked) {
+          attempts++;
+          throw Object.assign(new Error("owner halt index locked"), { code: "EBUSY" });
+        }
+        return rename(source, target);
+      });
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const notify = vi.fn();
+      Object.assign(old.context, { hasUI: true, ui: { notify } });
+      try {
+        old.controller.halt();
+        expect(attempts).toBe(8); // Exhaust the real atomic rename retries, not a mocked save.
+        expect(JSON.parse(fs.readFileSync(index, "utf8")).halted).toBe(false);
+        old.controller.prepareReload();
+        old.controller.closeFollowUpDrain();
+        expect(attempts).toBe(16); // The final reload save also exhausted its retries.
+        expect(fs.existsSync(journal)).toBe(false); // No payload policy can hide the stale index.
+        blocked = recoverAfterAttach;
+        vi.resetModules();
+        const { MainAgentController: Replacement } = await import("../src/main-agent.js");
+        const fresh = f.main(true, flushMs, Replacement);
+        if (recoverAfterAttach) expect(attempts).toBe(24); // Replacement retries while still locked.
+        blocked = false;
+        const owner = f.router(fresh.controller, f.owner, f.plane(identity));
+        expect(await owner.acceptControl({ version: 1, commandId: "unsaved-halt-gap", targetId: identity.id,
+          replyTo: sender.id, operation: "steer", message: "triggering gap control", requestedAt: Date.now() }, sender))
+          .toMatchObject({ accepted: true });
+        expect(f.sent).toHaveLength(1);
+        expect(f.sent[0]!.options.triggerTurn).toBe(false);
+        expect(JSON.parse(fs.readFileSync(index, "utf8"))).toMatchObject({ halted: true, ids: ["earlier-receipt"] });
+        expect(warning).toHaveBeenCalledTimes(1);
+        expect(notify).toHaveBeenCalledTimes(1);
+        fresh.emit("input", { source: "extension" });
+        fresh.emit("session_compact", { reason: "manual" });
+        fresh.controller.deliverAgent({ from: sender, message: "still stopped", delivery: "followUp" });
+        expect(f.sent.at(-1)!.options.triggerTurn).toBe(false);
+        fresh.controller.closeFollowUpDrain();
+        const again = f.main(true, flushMs, Replacement);
+        again.controller.deliverAgent({ from: sender, message: "persisted stop", delivery: "steer" });
+        expect(f.sent.at(-1)!.options.triggerTurn).toBe(false);
+        again.emit("input", { source: "interactive" });
+        again.controller.deliverAgent({ from: sender, message: "owner resumed", delivery: "steer" });
+        expect(f.sent.at(-1)!.options.triggerTurn).toBe(true);
+        expect(JSON.parse(fs.readFileSync(index, "utf8")).halted).toBeUndefined();
+      } finally {
+        fault.mockRestore();
+        warning.mockRestore();
+      }
+    }, 15_000,
+  );
 
   it.each([0, 60_000])("a transient halt-index read failure retries and retains readable running permission (flushMs=%s)", async (flushMs) => {
     const f = await fixture();

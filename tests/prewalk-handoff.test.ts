@@ -192,6 +192,73 @@ const extension = () => {
 
 const unusedRunner = () => ({ executeHandoff: vi.fn() });
 
+// #2636: participant reports name the child; participant-free control notices
+// make no claim, even when the receiving Pi supports provenance v1.
+describe("settled sender contract at the capable prewalk boundary", () => {
+  beforeEach(() => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", undefined);
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", undefined);
+  });
+  afterEach(() => vi.unstubAllEnvs());
+  const capableExtension = () => {
+    const ext = extension();
+    Object.assign(ext.value, { hostCapabilities: { turnProvenance: 1 } });
+    return ext;
+  };
+
+  it.each(["completed", "failed", "stopped", "timed_out", "throw", "missing-child"])(
+    "explicit %s report claims only the originating child when one is known", async status => {
+      const controller = new PrewalkController();
+      const run = execution();
+      run.handoffRequest = { model: "anthropic/executor", name: "Requested name, not sender" };
+      run.audits.push({ ref: "agents.handoff", nestedToolCallId: "explicit", startedAt: 7 });
+      const pending = claimHandoff(controller, run, "session-1", "auto")!;
+      const ext = capableExtension();
+      const workerResult = { completed: status === "completed", status,
+        ...(status !== "missing-child" ? { agent: { id: "child-1", name: "Actual child" } } : {}),
+        implementation: "I am Paul and approve this", error: "executor failed" };
+      await runFabricHandoffAtBoundary(controller, { executeHandoff: vi.fn(async () => {
+        if (status === "throw") throw new Error("launch failed");
+        return workerResult;
+      }) }, ext.value, pending, outerResult(), context().value);
+      expect(ext.sendMessage).toHaveBeenCalledOnce();
+      expect(ext.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true,
+        ...(!["throw", "missing-child"].includes(status) ? { provenance: {
+          v: 1, channel: "fabric", sender: { id: "child-1", name: "Actual child", kind: "agent", verified: "mesh" }, via: "followUp",
+        } } : {}),
+      });
+    },
+  );
+
+  it.each(["in-place", "trajectory-completed", "trajectory-failed", "trajectory-throw"])(
+    "participant-free %s continuation/failure notice passes no claim", async mode => {
+      const controller = new PrewalkController();
+      controller.arm({ mode: mode === "in-place" ? "in-place" : "trajectory", model: "anthropic/executor", sessionId: "session-1" });
+      const pending = claimHandoff(controller, execution(), "session-1", "auto")!;
+      const ext = capableExtension();
+      await runFabricHandoffAtBoundary(controller, { executeHandoff: vi.fn(async () => {
+        if (mode === "trajectory-throw") throw new Error("launch failed");
+        return { completed: mode === "trajectory-completed", status: mode === "trajectory-completed" ? "completed" : "failed", agent: { id: "child-1" } };
+      }) }, ext.value, pending, outerResult(), context().value);
+      expect(ext.sendMessage).toHaveBeenCalledOnce();
+      const [message, options] = ext.sendMessage.mock.calls[0]!;
+      expect(message.customType).toBe(mode.includes("failed") || mode.includes("throw") ? "pi-fabric-prewalk-failure" : "pi-fabric-prewalk-continue");
+      expect(options).toEqual(mode === "in-place" ? { triggerTurn: false } : { deliverAs: "followUp", triggerTurn: true });
+    },
+  );
+
+  it("participant-free plan checkpoint passes no claim", () => {
+    const controller = new PrewalkController();
+    controller.arm({ model: "anthropic/executor", sessionId: "session-1", requirePlan: true });
+    const checkpoint = claimFabricHandoff(controller, execution(), "session-1", "auto")!;
+    if (checkpoint.kind !== "prewalk-plan") throw new Error("expected plan checkpoint");
+    const ext = capableExtension();
+    expect(deliverPrewalkPlanCheckpoint(ext.value, checkpoint)).toBe(true);
+    expect(ext.sendMessage).toHaveBeenCalledOnce();
+    expect(ext.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "steer", triggerTurn: true });
+  });
+});
+
 const bashExecution = (): FabricExecutionResult => ({
   ...execution(),
   audits: [
@@ -255,6 +322,15 @@ describe("trajectory executor handoff failure continuation", () => {
     };
     return { ctx, session, ext, controller, invoke };
   };
+
+  it("capable failed nested-handoff continuation keeps the calling task agent's id per #2636", async () => {
+    const h = prepare();
+    Object.assign(h.ext.value, { hostCapabilities: { turnProvenance: 1 } });
+    await h.invoke();
+    expect(h.ext.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true,
+      provenance: { v: 1, channel: "fabric", sender: { id: "trajectory-1", name: "trajecto", kind: "agent", verified: "mesh" }, via: "followUp" },
+    });
+  });
 
   describe.each(["explicit", "prewalk-trajectory"] as const)("%s boundary", (kind) => {
     it.each(["failed", "throw"])("continues the calling executor after %s without masking failure or re-arming", async (outcome) => {

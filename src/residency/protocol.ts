@@ -481,7 +481,9 @@ export interface ResidentCommandResponse {
   pending?: string;
   cleaned?: boolean;
   error?: string;
-  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED";
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "FABRIC_MODEL_DENIED";
+  /** Allowlisted policy-refusal payload, never arbitrary host Error properties. */
+  modelDenied?: { model: string; replacement?: string };
   completedAt: number;
 }
 

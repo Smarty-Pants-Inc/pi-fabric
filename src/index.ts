@@ -676,7 +676,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
     // bootstrap() cancels any live arm; the borrowed Main model survives so a
     // new session that inherited the in-place executor can snap back.
-    await restoreBorrowedInPlaceMain(state.prewalk, pi, context);
+    await restoreBorrowedInPlaceMain(state.prewalk, pi, context, () => state.config.agents);
     refreshCodePreviewSettings();
     applyFabricMode();
     // Results of task agents the last reload/shutdown stopped reach the spawner now (smarty-dev#1602).
@@ -771,6 +771,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
     const sessionId = context.sessionManager.getSessionId();
     const settledInPlace = await settleInPlacePrewalk(state.prewalk, pi, context, {
+      policy: () => state.config.agents,
       compactOnReturn: state.config.prewalk.compactOnReturn,
       compact: state.compact,
     });
@@ -1250,3 +1251,4 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 export * from "./audit/index.js";
 export * from "./entropy/index.js";
 export * from "./protocol.js";
+export { FabricModelDeniedError } from "./core/model-policy.js";

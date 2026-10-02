@@ -87,6 +87,7 @@ export class ActorDirectory extends ActorManager {
         await options.beforeCommit?.(id);
         // Cross-scope predecessor removal is part of this create's mutation too.
         for (const actor of sameName.filter((actor) => actor.scope !== scope)) {
+          options.checkActive?.();
           await this.remove(actor.id, { wait: false });
         }
       },

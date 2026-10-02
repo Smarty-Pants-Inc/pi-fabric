@@ -388,6 +388,8 @@ export class ActorManager {
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
+  // Visible restored images are not receipts until their queue barrier succeeds.
+  readonly #restoredDeliveries = new Map<string, Set<string>>();
   #closing = false;
   #releasePaused = false;
   readonly #closeGraceMs: number;
@@ -497,6 +499,7 @@ export class ActorManager {
         if (this.#releasePaused) return false;
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();
+        this.#scheduleRestoreParked(); // Retry restoration/prelaunch barriers on the existing poll.
         // Preserve deferred events while halted; fencing remains manager-owned.
         return !this.#halted;
       },
@@ -2240,6 +2243,7 @@ export class ActorManager {
     ) {
       return;
     }
+    if (this.#restoredDeliveries.has(actor.id) && !this.#persistQueue(actor.id)) return;
     actor.draining = true;
     this.#draining.set(actor.id, actor);
     const drain = this.#drain(actor);
@@ -2283,17 +2287,7 @@ export class ActorManager {
         delete actor.lastError;
         const abortController = new AbortController();
         actor.abortController = abortController;
-        await this.#publishPresence(actor);
-        const beforeRun = await this.#validity(actor, item);
-        if (!beforeRun.valid) {
-          this.#recordStale(actor, item, beforeRun.reason);
-          this.#finishInFlight(actor.id, item);
-          delete actor.abortController;
-          actor.status = actor.queue.length > 0 ? "queued" : "idle";
-          actor.updatedAt = Date.now();
-          await this.#publishPresence(actor);
-          continue;
-        }
+        let prelaunchConfirmed = false;
         let runId: string | undefined;
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
@@ -2302,6 +2296,15 @@ export class ActorManager {
         let capabilityLease: FabricCapabilityViewLease | undefined;
         let committedRefs: string[] | undefined;
         try {
+          // Presence is now durable registry I/O. It and validity must share the
+          // activation's caller settlement and in-flight/controller cleanup.
+          await this.#publishPresence(actor);
+          const beforeRun = await this.#validity(actor, item);
+          if (!beforeRun.valid) {
+            this.#recordStale(actor, item, beforeRun.reason);
+            continue;
+          }
+          prelaunchConfirmed = true;
           if (actor.requirements.length > 0 && this.#acquireCapabilityView) {
             capabilityLease = await this.#acquireCapabilityView(
               actor.requirements,
@@ -2476,6 +2479,13 @@ export class ActorManager {
             this.#scheduleRestoreParked();
             continue;
           }
+          if (!prelaunchConfirmed && !item.resolve && !item.reject) {
+            // Admission succeeded but no worker launched. Keep callerless work
+            // for a later poll instead of retiring it or spinning on the outage.
+            this.#inFlight.delete(actor.id); // Park one copy, not both in-flight and parked images.
+            this.#park(actor, [item], message);
+            break;
+          }
           actor.lastError = message;
           const failed: FabricActorMessage = {
             id: randomUUID(),
@@ -2512,7 +2522,11 @@ export class ActorManager {
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           this.#finishInFlight(actor.id, item);
-          if (this.#canManage(actor.id)) await this.#publishPresence(actor);
+          if (this.#canManage(actor.id)) {
+            const presence = this.#publishPresence(actor);
+            if (prelaunchConfirmed) await presence;
+            else await presence.catch(() => undefined); // Original error already settled/parked.
+          }
         }
       }
     } finally {
@@ -2898,6 +2912,9 @@ export class ActorManager {
       if (event.from.id === actor.id && !addressed) continue;
       if (!this.#canManageCached(actor.id)) continue;
       const delivery = `${actor.id}\0${event.id}`;
+      if (this.#restoredDeliveries.get(actor.id)?.has(delivery) && !this.#persistQueue(actor.id)) {
+        throw new ActorQueueDurabilityError(actor.id);
+      }
       if (this.#delivered.has(delivery)) continue;
       try {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
@@ -3479,6 +3496,10 @@ export class ActorManager {
       }
     } catch { return false; } // Retain the takeover obligation for a retry.
     this.#takenOver.delete(actorId);
+    if (durable) {
+      for (const delivery of this.#restoredDeliveries.get(actorId) ?? []) this.#delivered.add(delivery);
+      this.#restoredDeliveries.delete(actorId);
+    }
     return true;
   }
 
@@ -3591,12 +3612,20 @@ export class ActorManager {
       const eventId = value.source.startsWith("mesh:") && typeof value.payload === "object" && value.payload !== null
         ? (value.payload as { id?: unknown }).id : undefined;
       if (typeof eventId === "string") {
-        if (this.#delivered.has(`${actor.id}\0${eventId}`)) continue;
-        this.#delivered.add(`${actor.id}\0${eventId}`);
+        const delivery = `${actor.id}\0${eventId}`;
+        if (this.#delivered.has(delivery) || this.#restoredDeliveries.get(actor.id)?.has(delivery)) continue;
+        const pending = this.#restoredDeliveries.get(actor.id) ?? new Set<string>();
+        pending.add(delivery);
+        this.#restoredDeliveries.set(actor.id, pending);
       }
       restored.push(item);
     }
-    if (restored.length > 0) this.#parked.set(actor.id, [...restored, ...(this.#parked.get(actor.id) ?? [])]);
+    if (restored.length > 0) {
+      this.#parked.set(actor.id, [...restored, ...(this.#parked.get(actor.id) ?? [])]);
+      // Host/direct callerless restoration owes the same launch barrier even
+      // when there is no mesh delivery ID to acknowledge.
+      if (!this.#restoredDeliveries.has(actor.id)) this.#restoredDeliveries.set(actor.id, new Set());
+    }
     this.#persistQueue(actor.id);
   }
 
@@ -4081,6 +4110,7 @@ export class ActorManager {
       for (const [id, items] of [...this.#parked]) {
         const actor = this.#actors.get(id);
         if (!actor || actor.status === "stopped" || !this.#canManageCached(id)) continue;
+        if (this.#restoredDeliveries.has(id) && !this.#persistQueue(id)) continue;
         this.#parked.delete(id);
         actor.queue.unshift(...items);
         this.#mergeCoalesced(actor);                            // a returning item may duplicate a queued one

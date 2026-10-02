@@ -89,8 +89,10 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
     const save = (value: SavedEnrollment) => {
       writeJsonAtomic(file, value, { newline: true, durable: true });
     };
-    // The nonce is on disk before the service can commit anything for it.
-    if (!saved?.nonce) save({ id: this.options.identity.id, nonce });
+    // Existence is not a namespace receipt: a previous rename may have become
+    // visible before its directory barrier failed. Republish the SAME nonce on
+    // every register attempt, confirming it before the service can commit.
+    save({ id: this.options.identity.id, nonce });
     const issued = await this.#call("register", { id: this.options.identity.id, name: this.options.identity.name, nonce }, signal, false) as RecordsCredential;
     save({ id: issued.id, nonce, token: issued.token });
     return issued;

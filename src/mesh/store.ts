@@ -280,15 +280,27 @@ const readCanonicalState = (
 
 /** The allocation clock is also the monotone commit generation. Kept in the
  * bounded header, after readGeneration, without changing the revision ABI. */
-const stateCommitGeneration = (file: string): number => {
+const stateCommitGeneration = (file: string, maxBytes = DEFAULT_MAX_STATE_BYTES): number => {
   let fd: number | undefined;
   try {
     fd = fs.openSync(file, "r");
     const buffer = Buffer.alloc(128);
     const count = fs.readSync(fd, buffer, 0, buffer.length, 0);
     const match = /^\{"readGeneration":"[0-9a-f-]{36}","highWater":([0-9]+),/.exec(buffer.toString("utf8", 0, count));
-    const generation = Number(match?.[1]);
-    return Number.isSafeInteger(generation) && generation > 0 ? generation : 0;
+    if (match) {
+      const generation = Number(match[1]);
+      return Number.isSafeInteger(generation) && generation > 0 ? generation : 0;
+    }
+    // Pre-upgrade writers put highWater AFTER entries, possibly megabytes past
+    // the header. Parse only this cold compatibility path, from the same open
+    // inode we inspected (not a pathname that a successor can replace).
+    if (fs.fstatSync(fd).size > maxBytes) throw new Error("Fabric mesh snapshot exceeds compatibility read limit");
+    let parsed: unknown;
+    try { parsed = JSON.parse(fs.readFileSync(fd, "utf8")); }
+    catch (error) { if (error instanceof SyntaxError) return 0; throw error; }
+    if (!isMeshStateFile(parsed)) return 0;
+    const generation = parsed.highWater;
+    return typeof generation === "number" && Number.isSafeInteger(generation) && generation > 0 ? generation : 0;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
     throw error;
@@ -302,7 +314,7 @@ const readState = (
 ): MeshStateFile => {
   const checkpoint = path.join(path.dirname(filePath), "state.durable.json");
   let covered = 0;
-  try { covered = stateCommitGeneration(checkpoint); }
+  try { covered = stateCommitGeneration(checkpoint, maxBytes); }
   catch (error) {
     if (!recoverDamage) throw new Error(`Failed to read Fabric mesh state: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1663,7 +1675,7 @@ export class MeshStore {
     });
     if (generation !== 0) {
       this.#stateDurability ??= import("./state-durability.js").then(({ MeshStateDurability }) =>
-        new MeshStateDurability(this.#statePath, this.#stateDirectory, stateCommitGeneration,
+        new MeshStateDurability(this.#statePath, this.#stateDirectory, (file) => stateCommitGeneration(file, this.#maxStateBytes),
           (operation) => this.#withLock(operation, path.join(this.root, ".state-durability-lock")),
           (before, after) => this.#restampSignal(before, after)));
       await (await this.#stateDurability).commit(generation, durable);

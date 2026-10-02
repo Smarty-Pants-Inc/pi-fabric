@@ -223,7 +223,10 @@ export class DurableDirectory {
       // barrier, or even during the namespace barrier itself. Reconfirm changed
       // evidence before ack; bounded retries tolerate benign sibling churn.
       let confirmed = this.#prepared;
-      for (let attempt = 0; attempt < 4; attempt++) {
+      // Concurrent sibling writers can change ancestor ctimes during each
+      // sweep. Allow a bounded burst without relaxing any inode/ctime check or
+      // acknowledging before the last changed ancestor has been reconfirmed.
+      for (let attempt = 0; attempt < 16; attempt++) {
         const before = walkPathNamespace(directory);
         if (confirmed === undefined || JSON.stringify(before.entries) !== this.#identities) {
           throw new Error("Durability receipt namespace changed or unprepared");

@@ -191,6 +191,45 @@ describe("native Pi runner session attribution", () => {
     });
   }, 15_000);
 
+  it.each(["retained", "removed"] as const)("preserves freshly reported session IDs when force-stop leaves %s nonterminal status", async status => {
+    const { agents, events } = setup();
+    let statusFile = "";
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const { runnerSessionId: _id, runnerSessionIds: _ids, ...initial } = seededRecord(request.id);
+      fs.writeFileSync(statusFile, JSON.stringify(initial));
+      let alive = true;
+      return {
+        kind: "process", sessionId: "transport-not-native", isAlive: async () => alive,
+        stop: async () => {
+          alive = false;
+          // Windows can kill the worker without letting it publish a terminal record.
+          if (status === "removed") fs.rmSync(statusFile, { force: true });
+        },
+      };
+    });
+    const handle = await agents.spawn({ task: "work", transport: "process", extensions: false });
+    expect(handle.runnerSessionId).toBeUndefined();
+    // Report identity after the monitor's initial read, then stop before its next poll.
+    // Do not call status(): that would refresh the cache and hide the race.
+    fs.writeFileSync(statusFile, JSON.stringify({
+      ...seededRecord(handle.id), runnerSessionId: latest, runnerSessionIds: [first, latest],
+    }));
+    const before = Date.now();
+    const result = await agents.stop(handle.id);
+    expect(Date.now() - before).toBeLessThan(2000);
+    expect(result).toMatchObject({
+      status: "stopped", runnerSessionId: latest, runnerSessionIds: [first, latest],
+      mainAgentId: "session:" + parent, fabricSessionId: parent,
+    });
+    expect(await agents.wait(handle.id)).toMatchObject(result);
+    expect(readRecord(statusFile)).toMatchObject(result);
+    expect(events.find(event => event.event === "run.stopped")).toMatchObject({
+      data: { runnerSessionId: latest, fabricSessionId: parent },
+    });
+    expect(launch).toHaveBeenCalledTimes(1);
+  }, 15_000);
+
   it("records task identity live and the latest identity after compaction in status, listing, and terminal events", async () => {
     const { dir, agents, events } = setup();
     const handle = await agents.spawn({

@@ -1746,6 +1746,15 @@ export class AgentManager {
     await this.#waitForTransportExit(managed);
     await this.#noteUnconfirmedExit(managed);
     const terminal = readRecord(managed.statusFile);
+    // A force-killed worker (notably on Windows) may leave only running status.
+    // Its session telemetry can be newer than the monitor's last poll. Preserve
+    // that snapshot, or the pre-stop one if stopping removed the status file,
+    // before synthesizing a terminal result.
+    const observed = terminal ?? existing;
+    if (observed) {
+      managed.latestRecord = observed;
+      if (observed.runnerSessionId) managed.runnerSessionId = observed.runnerSessionId;
+    }
     const record =
       terminal && terminalStatuses.has(terminal.status)
         ? (this.#withTransportMetadata(terminal, managed) as AgentRunResult)

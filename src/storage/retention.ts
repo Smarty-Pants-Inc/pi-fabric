@@ -177,6 +177,13 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   if (runTreeExitVeto(root, 0, expired)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
+  // Automatic retention keeps its independent live-writer fence. A mismatched
+  // birth identity can clear explicit cleanup's exit veto, but never authorizes
+  // a sweep to remove a run with a live or unknown saved PID. Apply this at
+  // every level, including descendants, alongside the recursive exit proof.
+  const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
+    ? Number(record.sessionId) : undefined;
+  if (pid !== undefined && processAlive(pid)) return false;
   if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
     if (!childrenStopped) return false;
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;

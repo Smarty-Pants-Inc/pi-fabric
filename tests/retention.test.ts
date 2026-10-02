@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as processIdentity from "../src/residency/process-identity.js";
 import {
+  canRemoveManagedRunRoot,
   canRemoveTerminalRun,
   FABRIC_RUN_ROOT_PREFIX,
   markRunRootActive,
@@ -89,7 +90,9 @@ describe("shared run-tree exit veto", () => {
     const birth = vi.spyOn(processIdentity, "processStartTime").mockReturnValue(current);
     try {
       expect(!!runTreeExitVeto(run)).toBe(current !== "456");
-      expect(canRemoveTerminalRun(run)).toBe(current === "456");
+      // Birth mismatch can clear explicit cleanup's exit veto, but automatic
+      // retention must still preserve a run whose saved PID is live or unknown.
+      expect(canRemoveTerminalRun(run)).toBe(false);
     } finally { probe.mockRestore(); birth.mockRestore(); }
   });
 
@@ -156,7 +159,7 @@ describe("shared run-tree exit veto", () => {
     expect(runTreeExitVeto(run, 0, () => true, true)).toMatch(/incomplete/);
   });
 
-  it("retains tracked descendant ownership even when PID reuse passes the collection birth proof", () => {
+  it("retains tracked descendant ownership even when PID reuse passes the cleanup birth proof", () => {
     const run = temporaryDirectory();
     writeStatus(run, { status: "completed" });
     writeStatus(path.join(run, "nested", "child"), { status: "completed", transport: "process", sessionId: "2147483647", processStartTime: "123" });
@@ -196,6 +199,34 @@ describe("safe run roots", () => {
     expect(fs.existsSync(path.join(root, "done"))).toBe(false);
     for (const name of ["pending", "live", "unresolved"]) expect(fs.existsSync(path.join(root, name))).toBe(true);
   });
+  it.each([
+    ["closed", "root"], ["closed", "descendant"],
+    ["orphan", "root"], ["orphan", "descendant"],
+  ])("keeps a live %s-root %s writer even with a mismatched saved birth identity", (kind, location) => {
+    const tempRoot = temporaryDirectory();
+    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + kind);
+    const run = path.join(root, "run");
+    writeStatus(run, { status: "completed", finishedAt: 1 });
+    const writer = location === "root" ? run : path.join(run, "nested", "child");
+    writeStatus(writer, { status: "completed", finishedAt: 1, transport: "process", sessionId: String(process.pid), processStartTime: "123" });
+    fs.writeFileSync(path.join(run, "task.txt.provenance.json"), "{}");
+    fs.mkdirSync(path.join(run, "deliveries"));
+    markRunRootActive(root, 1);
+    if (kind === "closed") markRunRootClosed(root, 1, true);
+    else fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+    const birth = vi.spyOn(processIdentity, "processStartTime").mockReturnValue("456");
+    try {
+      // Explicit cleanup's PID-reuse proof does not replace retention's
+      // independent live-writer fence, for roots or nested descendants.
+      expect(runTreeExitVeto(run)).toBeUndefined();
+      expect(canRemoveTerminalRun(run)).toBe(false);
+      if (kind === "closed") expect(canRemoveManagedRunRoot(root)).toBe(false);
+      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY })).toEqual([]);
+      expect(sweep(tempRoot)).toEqual({ removedRuns: [], removedRoots: [] });
+      expect(fs.existsSync(writer)).toBe(true);
+    } finally { birth.mockRestore(); }
+  });
+
   it("preserves malformed/unmarked ownership and unknown root contents", () => {
     const tempRoot = temporaryDirectory();
     for (const [suffix, owner] of [["bad", {}], ["pid", { pid: "gone", startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }], ["time", { pid: 2147483647, startedAt: 1, heartbeatAt: "old", orphanedAt: 1 }]] as const) {

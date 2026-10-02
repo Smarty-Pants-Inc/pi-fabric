@@ -480,6 +480,7 @@ export class AgentsProvider implements FabricProvider {
   async #resolvePiModel(
     model: string,
     context: FabricInvocationContext,
+    closest = true,
   ): Promise<string> {
     // A model added to models.json after startup resolves after one shared refresh (smarty-dev#1830).
     const resolved = await resolvePiModel({
@@ -487,14 +488,21 @@ export class AgentsProvider implements FabricProvider {
       registry: context.extensionContext.modelRegistry,
       aliases: this.modelsConfig().aliases,
       policy: this.manager.config,
+      ...(closest ? {} : { closest: false }),
     });
-    return `${resolved.provider}/${resolved.id}`;
+    const key = `${resolved.provider}/${resolved.id}`;
+    // Never closest-match silently (smarty-dev#3326): say which model an inexact name became.
+    if (resolved.via) {
+      context.activity?.({ type: "progress", message: `Model ${JSON.stringify(model)} → ${key} (via: "${resolved.via}")` });
+    }
+    return key;
   }
 
   async #resolvePiModelArgs(
     args: Record<string, unknown>,
     context: FabricInvocationContext,
     runnerOverride?: FabricAgentRunner,
+    closest = true,
   ): Promise<Record<string, unknown>> {
     const runner = runnerOverride ??
       (args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
@@ -511,26 +519,31 @@ export class AgentsProvider implements FabricProvider {
     if (model === "auto") throw new Error('model: "auto" is supported only by agents.spawn with required routing pins');
     const thinking = isFabricThinking(args.thinking) ? args.thinking
       : aliasThinking(this.modelsConfig().aliases, model);
-    const resolved = await this.#resolvePiModel(model, context);
+    const resolved = await this.#resolvePiModel(model, context, closest);
     return { ...args, model: resolved, ...(thinking ? { thinking } : {}) };
   }
 
-  async #runRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
+  /** `closest: false` (agents.spawn) refuses an inexact requested model instead of closest-matching it. */
+  async #runRequest(args: Record<string, unknown>, context: FabricInvocationContext, closest = true): Promise<AgentRunRequest> {
     const request = runRequest(args, context, this.manager, { inheritedThinking: this.callerThinking() });
     const model = request.model ?? this.manager.defaultModel(request.runner);
-    return await this.#resolvePiModelArgs({ ...request, ...(model ? { model } : {}) }, context) as unknown as AgentRunRequest;
+    return await this.#resolvePiModelArgs(
+      { ...request, ...(model ? { model } : {}) }, context, undefined, closest || request.model === undefined,
+    ) as unknown as AgentRunRequest;
   }
 
-  async #admitActorRequest(request: FabricActorRequest, context: FabricInvocationContext): Promise<FabricActorRequest> {
+  async #admitActorRequest(request: FabricActorRequest, context: FabricInvocationContext, closest = true): Promise<FabricActorRequest> {
     const model = request.model ?? this.manager.defaultModel(request.runner);
     if (!model && (request.runner === "pi" || this.manager.config.deniedModels.length === 0)) return request;
-    const resolved = await this.#resolvePiModelArgs({ model, thinking: request.thinking }, context, request.runner);
+    const resolved = await this.#resolvePiModelArgs(
+      { model, thinking: request.thinking }, context, request.runner, closest || request.model === undefined,
+    );
     // Templates and unbound live actors retain their dynamic defaults, after validation.
     return request.model ? { ...request, model: resolved.model as string, ...(isFabricThinking(resolved.thinking) ? { thinking: resolved.thinking } : {}) } : request;
   }
 
   async #prepareSpawnRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
-    if (args.model !== "auto") return this.#runRequest(args, context);
+    if (args.model !== "auto") return this.#runRequest(args, context, false);
     const runner = args.runner ?? this.manager.config.runner;
     const transport = args.transport ?? this.manager.config.transport;
     if (runner !== "pi" || transport !== "process" || (args.residency !== undefined && args.residency !== "session") ||
@@ -572,7 +585,7 @@ export class AgentsProvider implements FabricProvider {
       candidates, candidatesValid, parentSessionId: context.extensionContext.sessionManager?.getSessionId() ?? this.participants.self().sessionId ?? "unknown" },
       (request, signal) => this.routeEvaluate(request, signal, context), context.signal);
     // PR1 invariant: the choice is recorded, but dispatch ALWAYS uses the role pin.
-    return { ...await this.#runRequest(resolved, context), routeDecision };
+    return { ...await this.#runRequest(resolved, context, false), routeDecision };
   }
 
   async #resolvePiRunBinding(
@@ -1116,7 +1129,7 @@ export class AgentsProvider implements FabricProvider {
       }
       case "create": {
         const request = await this.#admitActorRequest(
-          actorRequest(args, context, this.manager, args.scope !== "global", this.callerThinking()), context,
+          actorRequest(args, context, this.manager, args.scope !== "global", this.callerThinking()), context, false,
         );
         if (args.scope === "global") {
           checkCommit();

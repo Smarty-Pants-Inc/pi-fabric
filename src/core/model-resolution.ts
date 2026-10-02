@@ -31,6 +31,14 @@ export type FabricModelAliases = Record<string, FabricModelAlias>;
 /** Markers reported in `via` when an inexact selector is fuzzy-resolved. */
 export const FUZZY_RESOLUTION_MARKERS = ["closest", "recent", "latest"] as const;
 
+export type FabricFuzzyResolutionMarker = (typeof FUZZY_RESOLUTION_MARKERS)[number];
+
+/** A resolved Pi model; `via` is set only when an inexact selector was closest-matched. */
+export type FabricResolvedPiModel = FabricModelCandidate & { via?: FabricFuzzyResolutionMarker };
+
+const isFuzzyMarker = (via: string | undefined): via is FabricFuzzyResolutionMarker =>
+  via !== undefined && (FUZZY_RESOLUTION_MARKERS as readonly string[]).includes(via);
+
 const modelKey = (model: FabricModelCandidate): string => `${model.provider}/${model.id}`;
 
 const sameModel = (
@@ -316,6 +324,29 @@ export const resolveFabricModel = (
   return { kind: "not-found", query };
 };
 
+/** Models resembling an inexact selector, closest first, for a refusal message. */
+const closestCandidates = (
+  query: string,
+  pool: readonly FabricModelCandidate[],
+): FabricModelCandidate[] =>
+  pool
+    .map((model) => ({ model, score: closenessScore(query, model) }))
+    .filter(({ score }) => score > 0)
+    .sort((left, right) => right.score - left.score || modelKey(left.model).localeCompare(modelKey(right.model)))
+    .slice(0, 8)
+    .map(({ model }) => model);
+
+/** Refuse an inexact selector instead of silently closest-matching it (smarty-dev#3326). */
+const closestMatchRefusedError = (
+  query: string,
+  candidates: readonly FabricModelCandidate[],
+): Error =>
+  new Error(
+    `Model ${JSON.stringify(query)} is not an exact model id or configured alias; closest-match ` +
+      `resolution is refused here. Candidates: ${candidates.map(modelKey).join(", ")}. ` +
+      "Pass an exact provider/id or configure a models.aliases entry.",
+  );
+
 const unavailablePiModelError = (
   query: string,
   resolution?: Extract<FabricModelResolution, { kind: "ambiguous" | "not-found" }>,
@@ -335,7 +366,8 @@ const unavailablePiModelError = (
  * Resolve a Pi participant selector strictly within the execution owner's
  * visible registry. Provider-qualified selectors prefer exact IDs, then the
  * closest visible ID/name on that same provider. Aliases retain their ordered
- * exact-target policy; bare selectors retain normal Fabric fuzzy resolution.
+ * exact-target policy; bare selectors retain normal Fabric fuzzy resolution. A closest-match
+ * pick is reported as `via`; `closest: false` refuses it with the candidate list instead.
  */
 export const resolveAvailablePiModel = (
   selector: string,
@@ -349,8 +381,13 @@ export const resolveAvailablePiModel = (
      * caller can refresh a stale registry before a similar old model wins (smarty-dev#1830).
      */
     exact?: boolean;
+    /**
+     * `false` refuses an inexact selector that needs closest-match ranking, naming the
+     * candidates, so agents.spawn/create never silently run an older model (smarty-dev#3326).
+     */
+    closest?: boolean;
   },
-): FabricModelCandidate => {
+): FabricResolvedPiModel => {
   const query = selector.trim();
   const lower = query.toLowerCase();
   const alias = Object.keys(options.aliases).some(
@@ -365,12 +402,16 @@ export const resolveAvailablePiModel = (
     // Recover near-miss IDs without crossing provider/auth boundaries.
     const separator = query.indexOf("/");
     const provider = query.slice(0, separator).toLowerCase();
-    const closest = pickClosestCandidate(
-      query.slice(separator + 1).toLowerCase(),
-      options.available.filter((model) => model.provider.toLowerCase() === provider),
-      options.lastUsed,
-    )?.model;
-    if (closest) return closest;
+    const id = query.slice(separator + 1).toLowerCase();
+    const pool = options.available.filter((model) => model.provider.toLowerCase() === provider);
+    if (options.closest === false) {
+      const candidates = closestCandidates(id, pool);
+      throw candidates.length > 0
+        ? closestMatchRefusedError(query, candidates)
+        : unavailablePiModelError(query);
+    }
+    const closest = pickClosestCandidate(id, pool, options.lastUsed);
+    if (closest) return { ...closest.model, via: closest.via };
     throw unavailablePiModelError(query);
   }
 
@@ -381,6 +422,12 @@ export const resolveAvailablePiModel = (
     throw unavailablePiModelError(query);
   }
   const resolution = resolveFabricModel(query, options);
+  if (resolution.kind === "resolved" && isFuzzyMarker(resolution.via)) {
+    if (options.closest === false) {
+      throw closestMatchRefusedError(query, closestCandidates(lower, options.available));
+    }
+    return { ...resolution.model, via: resolution.via };
+  }
   if (resolution.kind === "resolved" || resolution.kind === "already-active") {
     return resolution.model;
   }

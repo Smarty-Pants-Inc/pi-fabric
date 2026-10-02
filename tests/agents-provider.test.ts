@@ -5255,6 +5255,34 @@ describe("AgentsProvider switchModel", () => {
     },
   );
 
+  it("refuses closest-match models for agents.spawn and agents.create but keeps exact ids and aliases (smarty-dev#3326)", async () => {
+    const { provider, agents, actors } = setup([], [], undefined, {
+      modelsConfig: { aliases: { sol: { targets: ["cliproxyapi/gpt-6.1-sol"] } } },
+    });
+    const spawn = vi.spyOn(agents, "spawn");
+    const invocation: FabricInvocationContext = {
+      ...context,
+      extensionContext: {
+        modelRegistry: { getAvailable: () => [
+          { provider: "cliproxyapi", id: "gpt-6-sol" },
+          { provider: "cliproxyapi", id: "gpt-6.1-sol" },
+        ] },
+      } as unknown as ExtensionContext,
+    };
+    const refused = /not an exact model id or configured alias.*Candidates: (?=.*cliproxyapi\/gpt-6-sol\b)(?=.*cliproxyapi\/gpt-6\.1-sol\b)/;
+    await expect(provider.invoke("spawn", { task: "t", model: "gpt-sol" }, invocation)).rejects.toThrow(refused);
+    await expect(provider.invoke("create", { name: "a", instructions: "i", model: "gpt-sol" }, invocation)).rejects.toThrow(refused);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(actors.list()).toEqual([]);
+    await expect(provider.invoke("spawn", { task: "t", model: "sol" }, invocation))
+      .resolves.toMatchObject({ model: "cliproxyapi/gpt-6.1-sol" });
+    await expect(provider.invoke("spawn", { task: "t", model: "cliproxyapi/gpt-6-sol" }, invocation))
+      .resolves.toMatchObject({ model: "cliproxyapi/gpt-6-sol" });
+    const activity = vi.fn();
+    await provider.invoke("run", { task: "t", model: "gpt-sol" }, { ...invocation, activity });
+    expect(activity).toHaveBeenCalledWith(expect.objectContaining({ type: "progress", message: expect.stringContaining('via: "closest"') }));
+  });
+
   it("launches near-miss models canonically while isolating unrelated batch failures", async () => {
     const { provider, agents } = setup();
     const spawn = vi.spyOn(agents, "spawn");
@@ -5273,10 +5301,10 @@ describe("AgentsProvider switchModel", () => {
       provider.invoke("spawn", { task: "Unrelated", model: "openai-codex/zzzz" }, invocation),
     ]);
     expect(results[0]).toMatchObject({ status: "fulfilled", value: { model: "openai-codex/gpt-6-astra" } });
-    expect(results[1]).toMatchObject({ status: "fulfilled", value: { model: "openai-codex/gpt-5.6-sol" } });
+    // agents.spawn refuses a closest-match model and names the candidate (smarty-dev#3326).
+    expect(results[1]).toMatchObject({ status: "rejected", reason: expect.objectContaining({ message: expect.stringContaining("openai-codex/gpt-5.6-sol") }) });
     expect(results[2]).toMatchObject({ status: "rejected", reason: expect.any(Error) });
-    expect(spawn).toHaveBeenCalledTimes(2);
-    expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ model: "openai-codex/gpt-5.6-sol" }), undefined);
+    expect(spawn).toHaveBeenCalledTimes(1);
     for (const result of results) {
       if (result.status !== "fulfilled") continue;
       const handle = result.value as { id: string; model: string };

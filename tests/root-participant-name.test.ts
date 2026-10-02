@@ -8,6 +8,7 @@ import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
 
 const identity: MeshIdentity = { id: "session:owner", kind: "main", name: "main", sessionId: "owner" };
 const info = { id: identity.id, name: "Main", kind: "main", status: "idle", runner: "pi", transport: "host",
@@ -67,8 +68,9 @@ describe("root participant session names", () => {
 
 const main = (cwd: string, sessionId: string, initialName?: string) => {
   let sessionName = initialName;
+  const sendMessage = vi.fn();
   const pi = { on: vi.fn(() => () => {}), events: { emit: vi.fn() },
-    getThinkingLevel: () => "off", getSessionName: () => sessionName, sendMessage: vi.fn(),
+    getThinkingLevel: () => "off", getSessionName: () => sessionName, sendMessage,
   } as unknown as ExtensionAPI;
   const context = { cwd, mode: "rpc", hasUI: false, isProjectTrusted: () => true,
     isIdle: () => true, hasPendingMessages: () => false,
@@ -85,7 +87,7 @@ const main = (cwd: string, sessionId: string, initialName?: string) => {
     cwd, signal: undefined, parentToolCallId: "root-name-probe", nestedToolCallId: ref,
     extensionContext: context, update() {}, approve: async () => {}, audits: [], maxResultChars: 10_000,
   });
-  return { runtime, context, invoke, rename: (name: string) => { sessionName = name; } };
+  return { runtime, context, invoke, sendMessage, rename: (name: string) => { sessionName = name; } };
 };
 
 it("lists the Pi-named Main through agents.peers/members and reaches its current name after a heartbeat rename", async () => {
@@ -137,3 +139,135 @@ it("lists the Pi-named Main through agents.peers/members and reaches its current
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }, 20_000);
+
+// Separate runtimes, directories and control planes; only the mesh path is shared.
+// Exercise both mixed-generation state publication and the fleet's file-only policy.
+const acrossRoots = async (filesOnly: boolean, run: (roots: {
+  owner: ReturnType<typeof main>; reviewer: ReturnType<typeof main>; duplicate: ReturnType<typeof main>;
+  ownerId: string; reviewerId: string; duplicateId: string;
+}) => Promise<void>) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cross-root-name-"));
+  for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
+  vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+  const meshRoot = path.join(root, "mesh");
+  const config = normalizeFabricConfig({ fullCodeMode: false,
+    mesh: { enabled: true, root: meshRoot, actorPollMs: 20 },
+    agents: { enabled: false }, residency: { enabled: false }, records: { enabled: false },
+    mcp: { enabled: false }, memory: { enabled: false }, jev: { enabled: false },
+    prewalk: { enabled: false, alwaysRearm: false },
+  });
+  const ownerSession = "aaaaaaaa-0000-4000-8000-000000000001";
+  const reviewerSession = "bbbbbbbb-0000-4000-8000-000000000002";
+  const duplicateSession = "cccccccc-0000-4000-8000-000000000003";
+  const owner = main(root, ownerSession, "lucky-ios-lead");
+  const reviewer = main(root, reviewerSession);
+  const duplicate = main(root, duplicateSession, "other-lead");
+  const ownerId = `session:${ownerSession}`;
+  const reviewerId = `session:${reviewerSession}`;
+  const duplicateId = `session:${duplicateSession}`;
+  try {
+    if (filesOnly) await new MeshStore(meshRoot, 64 * 1024, 1000).put({
+      key: LIVENESS_POLICY_KEY, value: { version: 1, participants: "files", hostLeases: "files" },
+      identity: { id: ownerId, kind: "main", name: "main", sessionId: ownerSession },
+    });
+    await owner.runtime.initialize(owner.context, config);
+    await reviewer.runtime.initialize(reviewer.context, config);
+    await duplicate.runtime.initialize(duplicate.context, config);
+    // Prove the file-only leg really has no state/legacy participant fallback.
+    if (filesOnly) {
+      expect(reviewer.runtime.mesh.listAll("topology/participants/", { fresh: true })).toEqual([]);
+      expect(reviewer.runtime.mesh.listAll("sessions/", { fresh: true })).toEqual([]);
+    } else {
+      expect(reviewer.runtime.mesh.listAll("topology/participants/", { fresh: true })).toHaveLength(3);
+    }
+    await run({ owner, reviewer, duplicate, ownerId, reviewerId, duplicateId });
+  } finally {
+    await duplicate.runtime.shutdown(); await reviewer.runtime.shutdown(); await owner.runtime.shutdown();
+    vi.unstubAllEnvs();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+};
+
+const received = (target: ReturnType<typeof main>, senderId: string, text: string, delivery: string) => {
+  expect(target.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+    customType: "pi-fabric-agent-message", content: expect.stringContaining(text),
+    details: expect.objectContaining({ from: expect.objectContaining({ id: senderId }), delivery }),
+  }), expect.objectContaining({ deliverAs: delivery, triggerTurn: true }));
+};
+
+describe.each([false, true])("cross-root participant name routing (filesOnly=%s)", (filesOnly) => {
+  it("delivers followUp/steer/tell by published name and forgets the old name after a heartbeat rename", async () => {
+    await acrossRoots(filesOnly, async ({ owner, reviewer, ownerId, reviewerId }) => {
+      for (const [action, targetKey, delivery] of [["followUp", "id", "followUp"],
+        ["steer", "to", "steer"], ["tell", "to", "followUp"]] as const) {
+        const text = `cross-root ${action}`;
+        await expect(reviewer.invoke(`agents.${action}`, { [targetKey]: "lucky-ios-lead", message: text }))
+          .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+        received(owner, reviewerId, text, delivery);
+      }
+      expect(owner.sendMessage).toHaveBeenCalledTimes(3);
+      expect(reviewer.sendMessage).not.toHaveBeenCalled();
+      owner.rename("renamed-lead");
+      await vi.waitFor(async () => expect(await reviewer.invoke("agents.members", { kinds: ["root"] }))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ id: ownerId, name: "renamed-lead" })])),
+      { timeout: 8000, interval: 100 });
+      for (const action of ["followUp", "steer"] as const) {
+        await expect(reviewer.invoke(`agents.${action}`, { id: "lucky-ios-lead", message: "must not arrive" }))
+          .rejects.toThrow("Unknown Fabric participant: lucky-ios-lead");
+        expect(owner.sendMessage).toHaveBeenCalledTimes(action === "followUp" ? 3 : 4);
+        await expect(reviewer.invoke(`agents.${action}`, { to: "renamed-lead", message: `renamed ${action}` }))
+          .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+        received(owner, reviewerId, `renamed ${action}`, action);
+      }
+      expect(reviewer.sendMessage).not.toHaveBeenCalled();
+    });
+  }, 30_000);
+
+  it("refuses duplicate live root names with both ids, without publishing or delivering to either", async () => {
+    await acrossRoots(filesOnly, async ({ owner, reviewer, duplicate, ownerId, duplicateId, reviewerId }) => {
+      duplicate.rename("lucky-ios-lead");
+      await vi.waitFor(async () => expect(await reviewer.invoke("agents.members", { kinds: ["root"] }))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ id: duplicateId, name: "lucky-ios-lead" })])),
+      { timeout: 8000, interval: 100 });
+      const commandsBefore = reviewer.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 });
+      for (const action of ["followUp", "steer", "tell"] as const) {
+        const failure = await reviewer.invoke(`agents.${action}`, { to: "lucky-ios-lead", message: "never guess" })
+          .catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toContain("Ambiguous Fabric participant: lucky-ios-lead");
+        expect((failure as Error).message).toContain(ownerId);
+        expect((failure as Error).message).toContain(duplicateId);
+      }
+      // A root with the same name must not silently choose itself either.
+      await expect(owner.invoke("agents.followUp", { id: "lucky-ios-lead", message: "not even self" }))
+        .rejects.toThrow("Ambiguous Fabric participant: lucky-ios-lead");
+      expect(reviewer.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual(commandsBefore);
+      expect(owner.sendMessage).not.toHaveBeenCalled();
+      expect(duplicate.sendMessage).not.toHaveBeenCalled();
+      expect(reviewer.sendMessage).not.toHaveBeenCalled();
+      await expect(reviewer.invoke("agents.followUp", { id: ownerId, message: "exact id still works" }))
+        .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+      received(owner, reviewerId, "exact id still works", "followUp");
+      await duplicate.runtime.shutdown();
+      await expect(reviewer.invoke("agents.followUp", { id: "lucky-ios-lead", message: "only live root" }))
+        .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+      received(owner, reviewerId, "only live root", "followUp");
+      expect(duplicate.sendMessage).not.toHaveBeenCalled();
+    });
+  }, 30_000);
+
+  it("keeps an unnamed root reachable by exact id, bare session UUID and its local main alias", async () => {
+    await acrossRoots(filesOnly, async ({ owner, reviewer, ownerId, reviewerId }) => {
+      expect(await reviewer.invoke("agents.self")).toMatchObject({ id: reviewerId, name: "main" });
+      for (const id of [reviewerId, reviewerId.slice("session:".length)]) {
+        await expect(owner.invoke("agents.followUp", { id, message: `unnamed ${id}` }))
+          .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+        received(reviewer, ownerId, `unnamed ${id}`, "followUp");
+      }
+      await expect(reviewer.invoke("agents.followUp", { id: "main", message: "local unnamed main" }))
+        .resolves.toMatchObject({ routed: "main", queued: true });
+      received(reviewer, reviewerId, "local unnamed main", "followUp");
+      expect(owner.sendMessage).not.toHaveBeenCalled();
+    });
+  }, 30_000);
+});

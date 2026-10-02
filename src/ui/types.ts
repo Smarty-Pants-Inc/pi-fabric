@@ -93,6 +93,8 @@ export interface FabricDashboardSnapshot {
 
 export const activeStatuses = new Set([
   "queued",
+  "preparing",
+  "waiting",
   "pending",
   "ready",
   "claimed",

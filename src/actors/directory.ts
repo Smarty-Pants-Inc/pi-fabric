@@ -85,6 +85,7 @@ export class ActorDirectory extends ActorManager {
   }
 
   override retryCapabilityWaiters(): void { super.retryCapabilityWaiters(); this.#secondary.retryCapabilityWaiters(); }
+  override resumeQueued(): void { super.resumeQueued(); this.#secondary.resumeQueued(); }
   override async create(request: FabricActorRequest, options: Parameters<ActorManager["create"]>[1] = {}): Promise<FabricActorInfo> {
     const scope = request.scope ?? this.#defaultScope;
     if (scope !== "project" && scope !== "session") {

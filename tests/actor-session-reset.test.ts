@@ -300,7 +300,9 @@ describe("actor session reset (smarty-dev#1439)", () => {
     const before = actors.definition(actor.id);
     const messagesBefore = actors.messages(actor.id, 50).length;
 
-    const info = await actors.resetSession(actor.id);
+    // agents.resetSession({ id: "keeper" }) forwards the name unchanged to
+    // this owning-host path; it must not need a UUID or a global-template reset.
+    const info = await actors.resetSession("keeper");
     expect(info).toMatchObject({ id: actor.id, status: "idle" });
     expect(sessionHeader(actor.sessionFile!)).toMatchObject({ type: "session", version: 3 });
     expect(backups(actor.sessionFile!)).toHaveLength(1);
@@ -443,7 +445,7 @@ describe("actor session reset (smarty-dev#1439)", () => {
     const actor = await actors.create({ name: "leased", instructions: "Observe." });
     await actors.ask(actor.id, "one");
     owns = false;
-    await expect(actors.resetSession(actor.id)).rejects.toThrow("owned by another host");
+    await expect(actors.resetSession("leased")).rejects.toThrow("owned by another host");
     expect(fs.existsSync(actor.sessionFile!)).toBe(true);
     expect(backups(actor.sessionFile!)).toEqual([]);
   });

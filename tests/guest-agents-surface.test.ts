@@ -23,6 +23,19 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("types retry keys on public durable create/spawn (fullCodeMode=%s)", fullCodeMode => {
+    const result = typeCheckFabricCode(
+      `await agents.create({ name: "actor", instructions: "work", residency: "durable", idempotencyKey: "actor-retry" });
+       return await agents.spawn({ task: "work", residency: "durable", idempotencyKey: "spawn-retry" });`,
+      guestTypeDeclarations(fullCodeMode), true,
+    );
+    expect(result.errors).toEqual([]);
+    for (const name of ["create", "spawn"]) {
+      const schema = AGENTS_ACTION_DESCRIPTORS.find(descriptor => descriptor.name === name)!.inputSchema as { properties: Record<string, unknown> };
+      expect(schema.properties.idempotencyKey).toMatchObject({ type: "string", minLength: 1, maxLength: 256 });
+    }
+  });
+
   it("followUp advisory types the bounded warning on public message receipts", () => {
     const result = typeCheckFabricCode(
       `const receipt = await agents.followUp({ id: "task", message: "later" });

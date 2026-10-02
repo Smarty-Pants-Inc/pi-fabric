@@ -83,6 +83,7 @@ import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
+import { rootParticipantName } from "./topology/participant-name.js";
 import type {
   FabricParticipantInfo,
   FabricParticipantListOptions,
@@ -711,7 +712,7 @@ export class FabricRuntimeState {
       hostId,
       identityId: identity.id,
       ...(ownsPersistentActorRegistry ? { completionRecipient: {
-        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: "main", role: participantRole(),
+        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.()), role: participantRole(),
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
       } } : {}),
       retention: this.#config.retention,
@@ -880,7 +881,7 @@ export class FabricRuntimeState {
             sessionId,
             cwd: context.cwd,
             projectRoot,
-            mainName: "main",
+            mainName: rootParticipantName(this.pi.getSessionName?.()),
             mainStartedAt: mainAgent.info(context).startedAt ?? Date.now(),
             ...(participantRole() ? { role: participantRole()! } : {}),
             project: participantProject(context.cwd),

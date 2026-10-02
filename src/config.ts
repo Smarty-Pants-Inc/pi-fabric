@@ -1035,7 +1035,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
         ? { modelRouting: (() => {
             const routing = agents.modelRouting as Record<string, unknown>;
+            if (routing.live !== undefined && routing.live !== false) throw new Error("Live model routing requires measured parity and Paul's floor approval (#2236); unavailable in shadow mode");
             return {
+              live: false as const,
               ...(typeof routing.pinModel === "string" ? { pinModel: routing.pinModel } : {}),
               ...(isFabricThinking(routing.pinThinking) ? { pinThinking: routing.pinThinking } : {}),
               shadowCandidates: Array.isArray(routing.shadowCandidates)

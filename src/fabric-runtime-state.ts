@@ -16,6 +16,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
 import { ActorDirectory } from "./actors/directory.js";
+import type { ActorModelRouteInput } from "./actors/manager.js";
 import { resolvePiBinary } from "./agents/pi-binary.js";
 import { isPiShellRef } from "./core/pi-tools.js";
 import { DEFAULT_SHELL_HANG_MS, FabricShellJobStore } from "./core/shell-jobs.js";
@@ -796,6 +797,18 @@ export class FabricRuntimeState {
       extensionContext: context,
       update() {},
     });
+    const prepareActorModelRoute = async (input: ActorModelRouteInput, signal: AbortSignal) => {
+      const { prepareModelRoute } = await import("./agents/model-route-prepare.js");
+      return prepareModelRoute({ ...input, signal, config: this.#config!.agents.modelRouting,
+        registry: context.modelRegistry, aliases: this.#config!.models.aliases,
+        assertModelAllowed: model => this.#agents!.assertModelAllowed(model, "pi"),
+        evaluate: (request, routeSignal) => {
+          if (!this.#agentsProvider) throw new Error("Jev routing unavailable");
+          return this.#agentsProvider.routeEvaluate(request, routeSignal, { cwd: context.cwd,
+            signal: routeSignal, parentToolCallId: "fabric-actor-route", nestedToolCallId: "fabric-actor-route",
+            extensionContext: context, update() {} });
+        } });
+    };
     this.#actors = new ActorDirectory([
       fabricSessionId,
       identity,
@@ -816,7 +829,8 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
+            resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, requiredPin)).key,
+            prepareModelRoute: prepareActorModelRoute,
             acquireCapabilityView: acquireActorCapabilityView,
             // A /reload or restart of this session resumes its actors' mesh stream where the
             // last runtime stopped, so events published in between still reach them
@@ -835,7 +849,8 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
+            resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, requiredPin)).key,
+            prepareModelRoute: prepareActorModelRoute,
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);
@@ -882,6 +897,8 @@ export class FabricRuntimeState {
             mesh: structuredClone(this.#config.mesh),
             retention: structuredClone(this.#config.retention),
             actors: structuredClone(this.#config.actors),
+            shadowRouting: { jev: structuredClone(this.#config.jev),
+              networkAllowed: this.#config.approvals.network === "allow", schemaEnforced: enforceSchema },
             workerPath: this.#paths?.worker ?? fileURLToPath(new URL("./worker.js", import.meta.url)),
             fabricExtensionPath: this.#paths?.extension ?? fileURLToPath(new URL("./index.js", import.meta.url)),
             piBinary: resolvePiBinary(),

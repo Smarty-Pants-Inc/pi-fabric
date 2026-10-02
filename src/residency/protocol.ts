@@ -346,6 +346,8 @@ export interface ResidentHostConfig {
   retention: FabricRetentionConfig;
   /** Absent in a config an older release wrote: the defaults apply. */
   actors?: FabricActorsConfig;
+  /** Host-only shadow gates; old snapshots refuse optional inference. */
+  shadowRouting?: import("../agents/model-route-owner.js").ShadowRoutePolicy;
   workerPath: string;
   fabricExtensionPath: string;
   piBinary: string;

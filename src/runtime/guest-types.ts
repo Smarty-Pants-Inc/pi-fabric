@@ -684,6 +684,10 @@ interface FabricActorRequestBase {
   coalesceKey?: string;
   /** Skip-only rules checked before a queued mesh or host event runs the model. */
   activationFilter?: FabricActorActivationFilter;
+  /** Per-activation shadow routing; requires explicit model/thinking. */
+  routeClass?: "status-groom";
+  /** Required clear trusted state; review/security/audit/needs-security-pass must be true. */
+  protected?: boolean;
   runner?: FabricAgentRunner;
   model?: string;
   thinking?: FabricThinking;
@@ -749,6 +753,8 @@ interface FabricActorInfo {
   activationFilterError?: string;
   model?: string;
   thinking?: FabricThinking;
+  routeClass?: "status-groom";
+  protected?: boolean;
   binding?: FabricActorRunBinding & { scope: "session"; sessionId: string; updatedAt?: number };
   projectDefaults?: FabricActorRunBinding & { scope: "project" };
   tools?: string[];

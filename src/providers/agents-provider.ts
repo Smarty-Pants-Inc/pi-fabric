@@ -303,7 +303,7 @@ const actorRequest = (
   const kernel = inheritModel ? manager.resolveKernel(kernelRequest) : requestedKernel;
   if (!inheritModel && kernel !== undefined && kernel !== "inherit") manager.resolveKernel(kernelRequest);
   const inheritedModel =
-    inheritModel && runner === "pi" && !(typeof args.model === "string" && args.model.trim()) && context.extensionContext.model
+    inheritModel && args.routeClass === undefined && runner === "pi" && !(typeof args.model === "string" && args.model.trim()) && context.extensionContext.model
       ? `${context.extensionContext.model.provider}/${context.extensionContext.model.id}`
       : undefined;
   return {
@@ -327,6 +327,8 @@ const actorRequest = (
     ...(typeof args.coalesce === "boolean" ? { coalesce: args.coalesce } : {}),
     ...(typeof args.coalesceKey === "string" ? { coalesceKey: args.coalesceKey } : {}),
     ...(activationFilter ? { activationFilter } : {}),
+    ...(args.routeClass !== undefined ? { routeClass: args.routeClass as "status-groom" } : {}),
+    ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
     ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}),
     ...(args.residency === "session" || args.residency === "durable"
       ? { residency: args.residency }
@@ -415,7 +417,7 @@ export class AgentsProvider implements FabricProvider {
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
-      (binding, runner, context) => this.#resolvePiRunBinding(binding, runner, context),
+      (binding, runner, context, requiredPin) => this.#resolvePiRunBinding(binding, runner, context, requiredPin),
       residency,
     );
     this.#lifecycleScheduler = new LifecycleDeliveryScheduler(
@@ -522,6 +524,12 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #admitActorRequest(request: FabricActorRequest, context: FabricInvocationContext): Promise<FabricActorRequest> {
+    if (request.routeClass !== undefined) {
+      if (!request.model || !isFabricThinking(request.thinking)) throw new ModelRoutePinError(request.model ?? "");
+      const exact = await resolvePiRoutePin({ selector: request.model, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases });
+      this.manager.assertModelAllowed(`${exact.provider}/${exact.id}`, "pi");
+      return { ...request, model: `${exact.provider}/${exact.id}` };
+    }
     const model = request.model ?? this.manager.defaultModel(request.runner);
     if (!model && (request.runner === "pi" || this.manager.config.deniedModels.length === 0)) return request;
     const resolved = await this.#resolvePiModelArgs({ model, thinking: request.thinking }, context, request.runner);
@@ -543,44 +551,28 @@ export class AgentsProvider implements FabricProvider {
     const config = this.manager.config.modelRouting;
     const pinModel = Object.hasOwn(args, "pinModel") ? args.pinModel : config?.pinModel;
     const pinThinking = Object.hasOwn(args, "pinThinking") ? args.pinThinking : config?.pinThinking;
-    if (typeof pinModel !== "string" || !pinModel.trim() || pinModel === "auto" || !isFabricThinking(pinThinking)) {
-      throw new ModelRoutePinError(String(pinModel ?? ""));
-    }
-    this.manager.assertModelAllowed(pinModel, "pi");
-    // Canonicalize only the pin: auto must never fall through to MRU/session/default medium.
-    const exactPin = await resolvePiRoutePin({ selector: pinModel, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases });
-    const resolved = { ...args, model: `${exactPin.provider}/${exactPin.id}`, thinking: pinThinking };
-    this.manager.assertModelAllowed(resolved.model, "pi");
-    const pin = { model: resolved.model as string, effort: pinThinking };
-    const candidates = config?.shadowCandidates ?? [];
-    const available = context.extensionContext.modelRegistry.getAvailable();
-    const pinnedModel = available.find(model => `${model.provider}/${model.id}` === pin.model);
-    // Known capabilities can refuse before any judgment/worker starts. Unknown metadata
-    // still requires exact effective-effort readback at the worker admission boundary.
-    if (pinnedModel && typeof pinnedModel.reasoning === "boolean") {
-      const { getSupportedThinkingLevels } = await import("@earendil-works/pi-ai");
-      if (!getSupportedThinkingLevels(pinnedModel).includes(pinThinking)) {
-        throw Object.assign(new Error(`MODEL_ROUTE_EFFORT_UNSUPPORTED: ${pin.model} cannot honor required effort ${pinThinking}; task was not sent`), {
-          name: "ModelRouteEffortPinError", code: "MODEL_ROUTE_EFFORT_UNSUPPORTED",
-        });
-      }
-    }
-    const candidatesValid = candidates.length <= 16 && candidates.every(candidate =>
-      isFabricThinking(candidate.effort) && available.some(model => `${model.provider}/${model.id}` === candidate.model));
-    const { decideModelRoute } = await import("../agents/model-route.js");
-    const routeDecision = await decideModelRoute({ routeClass: args.routeClass, protected: args.protected, pin,
-      candidates, candidatesValid, parentSessionId: context.extensionContext.sessionManager?.getSessionId() ?? this.participants.self().sessionId ?? "unknown" },
-      (request, signal) => this.routeEvaluate(request, signal, context), context.signal);
-    // PR1 invariant: the choice is recorded, but dispatch ALWAYS uses the role pin.
-    return { ...await this.#runRequest(resolved, context), routeDecision };
+    const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
+    const routeDecision = await prepareModelRoute({ routeClass: args.routeClass, protected: args.protected,
+      pinModel, pinThinking, config, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases,
+      parentSessionId: context.extensionContext.sessionManager?.getSessionId() ?? this.participants.self().sessionId ?? "unknown",
+      assertModelAllowed: model => this.manager.assertModelAllowed(model, "pi"),
+      evaluate: (request, signal) => this.routeEvaluate(request, signal, context), signal: context.signal });
+    // Shadow invariant: the choice is recorded, but dispatch ALWAYS uses the role pin.
+    return { ...await this.#runRequest({ ...args, model: routeDecision.pin.model, thinking: routeDecision.pin.effort }, context), routeDecision };
   }
 
   async #resolvePiRunBinding(
     binding: FabricActorRunBinding,
     runner: FabricAgentRunner,
     context: FabricInvocationContext,
+    requiredPin = false,
   ): Promise<FabricActorRunBinding> {
     if (runner !== "pi" || !binding.model) return binding;
+    if (requiredPin) {
+      const exact = await resolvePiRoutePin({ selector: binding.model, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases });
+      this.manager.assertModelAllowed(`${exact.provider}/${exact.id}`, "pi");
+      return { ...binding, model: `${exact.provider}/${exact.id}` };
+    }
     return { ...binding, model: await this.#resolvePiModel(binding.model, context) };
   }
 
@@ -1135,7 +1127,7 @@ export class AgentsProvider implements FabricProvider {
         const ownsActor = actor ? this.actorManager.owns(actor.id) : false;
         const requestedOverrides = actorRunBinding(args);
         const overrides = ownsActor
-          ? await this.#resolvePiRunBinding(requestedOverrides, actor!.runner, context)
+          ? await this.#resolvePiRunBinding(requestedOverrides, actor!.runner, context, actor!.routeClass !== undefined)
           : requestedOverrides;
         context.activity?.({
           type: "entity",
@@ -1299,23 +1291,26 @@ export class AgentsProvider implements FabricProvider {
         if (args.scope === "global") {
           const template = this.globalActors.resolve(id);
           if (!template) throw new Error(`Unknown global actor: ${id}`);
-          const resolved = model && template.runner === "pi" ? await this.#resolvePiModel(model, context) : model;
+          const resolved = model && template.runner === "pi"
+            ? (await this.#resolvePiRunBinding({ model }, "pi", context, template.routeClass !== undefined)).model! : model;
           checkCommit();
           return this.globalActors.update(template.id, { model: resolved });
         }
         const target = this.#resolveActorTarget(id);
         const runner = target.actor?.runner ?? target.participant!.runner;
         const resident = this.#residentActorOwner(id);
-        const residentModel = resident && model
-          ? (await this.#resolvePiModelArgs({ model }, context, runner)).model as string : model;
+        const routeModel = model && target.actor?.routeClass !== undefined
+          ? (await this.#resolvePiRunBinding({ model }, runner, context, true)).model : undefined;
+        const residentModel = routeModel ?? (resident && model
+          ? (await this.#resolvePiModelArgs({ model }, context, runner)).model as string : model);
         if (resident) return this.#setResidentActor(resident, {
           operation: "setModel", id: resident.id, ...(residentModel ? { model: residentModel } : {}),
           scope: args.scope === "project" ? "project" : "session",
         }, context);
         const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;
-        const resolvedModel = model && (ownsActor || this.manager.config.deniedModels.length > 0)
+        const resolvedModel = routeModel ?? (model && (ownsActor || this.manager.config.deniedModels.length > 0)
           ? (await this.#resolvePiModelArgs({ model }, context, runner)).model as string
-          : model || undefined;
+          : model || undefined);
         return this.actorManager.setModel(
           id,
           resolvedModel,

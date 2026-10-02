@@ -230,6 +230,8 @@ export class GlobalActorRegistry {
       ...(patch.kernel !== undefined ? { kernel: patch.kernel } : existing.kernel ? { kernel: existing.kernel } : {}),
       ...(patch.model !== undefined ? { model: patch.model } : existing.model ? { model: existing.model } : {}),
       ...(patch.thinking !== undefined ? { thinking: patch.thinking } : existing.thinking ? { thinking: existing.thinking } : {}),
+      ...(patch.routeClass !== undefined ? { routeClass: patch.routeClass } : existing.routeClass ? { routeClass: existing.routeClass } : {}),
+      ...(typeof (patch.protected ?? existing.protected) === "boolean" ? { protected: patch.protected ?? existing.protected } : {}),
       ...(patch.tools !== undefined ? { tools: patch.tools } : existing.tools ? { tools: existing.tools } : {}),
       ...(patch.transport !== undefined ? { transport: patch.transport } : existing.transport ? { transport: existing.transport } : {}),
       ...(patch.timeoutMs !== undefined ? { timeoutMs: patch.timeoutMs } : existing.timeoutMs ? { timeoutMs: existing.timeoutMs } : {}),
@@ -318,6 +320,8 @@ export class GlobalActorRegistry {
       runner: def.runner,
       ...(def.model ? { model: def.model } : {}),
       ...(def.thinking ? { thinking: def.thinking } : {}),
+      ...(def.routeClass ? { routeClass: def.routeClass } : {}),
+      ...(typeof def.protected === "boolean" ? { protected: def.protected } : {}),
       ...(def.tools ? { tools: [...def.tools] } : {}),
       ...(def.transport ? { transport: def.transport } : {}),
       ...(def.timeoutMs ? { timeoutMs: def.timeoutMs } : {}),
@@ -372,6 +376,9 @@ export class GlobalActorRegistry {
     const model = typeof def.model === "string" && def.model.trim() ? def.model.trim() : undefined;
     const thinking =
       def.thinking !== undefined && isFabricThinking(def.thinking) ? def.thinking : undefined;
+    if (def.routeClass !== undefined && (def.routeClass !== "status-groom" || runner !== "pi" || !model || !thinking)) {
+      throw new Error("Actor shadow routing requires status-groom, Pi and explicit model/thinking pins");
+    }
     const tools = Array.isArray(def.tools)
       ? [...new Set(def.tools.filter((tool): tool is string => typeof tool === "string"))]
       : undefined;
@@ -405,6 +412,8 @@ export class GlobalActorRegistry {
       ...(def.kernel ? { kernel: def.kernel } : {}),
       ...(model ? { model } : {}),
       ...(thinking ? { thinking } : {}),
+      ...(def.routeClass ? { routeClass: def.routeClass } : {}),
+      ...(typeof def.protected === "boolean" ? { protected: def.protected } : {}),
       ...(tools ? { tools } : {}),
       ...(transport ? { transport } : {}),
       ...(timeoutMs ? { timeoutMs } : {}),
@@ -549,6 +558,8 @@ export class GlobalActorRegistry {
         updatedAt: typeof record.updatedAt === "number" ? record.updatedAt : record.createdAt,
         ...(typeof record.model === "string" && record.model ? { model: record.model } : {}),
         ...(thinking ? { thinking } : {}),
+        ...(record.routeClass !== undefined ? { routeClass: record.routeClass } : {}),
+        ...(typeof record.protected === "boolean" ? { protected: record.protected } : {}),
         ...(tools ? { tools } : {}),
         ...(transport ? { transport } : {}),
         ...(timeoutMs ? { timeoutMs } : {}),

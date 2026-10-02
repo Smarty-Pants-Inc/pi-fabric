@@ -967,10 +967,12 @@ export class AgentManager {
     }
     assertAgentTask(request);
     if (request.model === "auto") throw new Error('Unresolved model: "auto" must go through agents.spawn routing');
+    const routedActor = request.routeDecision?.mode === "shadow" && Boolean(request.actorId) &&
+      request.routeDecision.actorId === request.actorId && Boolean(request.routeDecision.activationId) && Boolean(request.sessionFile);
     if (request.routeDecision && ((request.runner ?? this.config.runner) !== "pi" ||
       (request.transport ?? this.config.transport) !== "process" || (request.residency ?? "session") !== "session" ||
-      request.actorId || request.actorName || request.sessionSeed || request.sessionFile)) {
-      throw new Error("Shadow routing is only supported for new process/Pi task sessions");
+      request.sessionSeed || (!routedActor && (request.actorId || request.actorName || request.sessionFile)))) {
+      throw new Error("Shadow routing requires a new process/Pi task session or a host-prepared actor activation");
     }
     const kernel = this.resolveKernel({
       ...request,
@@ -1129,7 +1131,7 @@ export class AgentManager {
               request.handoffCompact,
               request.handoffCompact ? await this.#resolveHandoffCompactionBudget?.(model, agentCwd) : undefined,
             )
-          : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
+          : routedActor ? request.sessionFile : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
         const adapter = await this.#resolveTransport(request.transport ?? this.config.transport);
         const timeoutMs = effectiveAgentTimeoutMs(
           this.config.timeoutMs,

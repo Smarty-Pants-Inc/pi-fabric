@@ -464,7 +464,7 @@ describe("durable route dispatch", () => {
   it("preserves explicit routing configuration and never creates a default role pin", () => {
     expect(normalizeFabricConfig({}).agents.modelRouting).toBeUndefined();
     expect(normalizeFabricConfig({ agents: { modelRouting: { pinModel: pin.model, pinThinking: pin.effort, shadowCandidates: [cheap] } } }).agents.modelRouting)
-      .toEqual({ pinModel: pin.model, pinThinking: pin.effort, shadowCandidates: [cheap] });
+      .toEqual({ live: false, pinModel: pin.model, pinThinking: pin.effort, shadowCandidates: [cheap] });
     expect(() => normalizeFabricConfig({ agents: { modelRouting: { shadowCandidates: [{ model: "bad", effort: "bogus" }] } } })).toThrow("Invalid agents.modelRouting");
   });
 });

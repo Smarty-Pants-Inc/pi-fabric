@@ -230,6 +230,10 @@ export interface FabricActorRequest {
   pythonRuntime?: FabricPythonRuntime;
   model?: string;
   thinking?: FabricThinking;
+  /** Opt-in per-activation shadow Choice; requires explicit model/effort pins. */
+  routeClass?: "status-groom";
+  /** Trusted review/security/audit/needs-security-pass snapshot, never prompt-inferred. */
+  protected?: boolean;
   tools?: string[];
   transport?: FabricAgentTransport;
   timeoutMs?: number;
@@ -293,6 +297,8 @@ export interface FabricActorInfo {
   model?: string;
   /** Effective value for this caller after session bindings overlay project defaults. */
   thinking?: FabricThinking;
+  routeClass?: "status-groom";
+  protected?: boolean;
   binding?: FabricActorBindingView;
   projectDefaults?: FabricActorProjectDefaults;
   tools?: string[];

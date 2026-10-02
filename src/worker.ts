@@ -368,7 +368,9 @@ const main = async (): Promise<void> => {
     const { prepareRetryProfile, resolveRetrySdk } = await import(profileModule) as typeof import("./worker/retry-profile.js");
     if (prepareRetryProfile(options.cwd, path.join(path.dirname(options.statusFile), "pi-agent"), process.env, recoveryScale)) {
       piRetrySdk = resolveRetrySdk(options.piBinary);
-      if (!piRetrySdk) appendLog(`${JSON.stringify({ type: "worker_warning", warning: "Selected Pi launcher has no discoverable native SDK; preserving its retry settings and canonical auth path (Fabric same-session recovery remains enabled)" })}\n`);
+      // Opaque/custom launchers are a supported fallback, not a degraded run.
+      // Keep profile-selection telemetry separate from result/cleanup warnings.
+      if (!piRetrySdk) appendLog(`${JSON.stringify({ type: "fabric_retry_profile", mode: "launcher", reason: "sdk_unavailable", message: "Selected Pi launcher has no discoverable native SDK; preserving its retry settings and canonical auth path (Fabric same-session recovery remains enabled)" })}\n`);
     }
   }
   const piArguments = ["--mode", "rpc"];

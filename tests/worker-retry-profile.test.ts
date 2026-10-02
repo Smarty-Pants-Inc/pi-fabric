@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { AgentManager } from "../src/agents/manager.js";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { pathToFileURL } from "node:url";
 import { applyTaskRetryDefaults, prepareRetryProfile, PI_TASK_RETRY_SETTINGS, taskRetrySettings, resolveRetrySdk } from "../src/worker/retry-profile.js";
 import { retryableProviderError } from "../src/worker/provider-error.js";
@@ -121,6 +123,30 @@ describe("native task retry profile", () => {
       fs.writeFileSync(path.join(process.env.FABRIC_OVERLOAD_TEST_EVIDENCE_DIR, "auth-lock.json"), JSON.stringify({ binary, overlappingLocks, contents }, null, 2));
     }
     expect({ overlappingLocks, contents }).toEqual({ overlappingLocks: false, contents: { main: true, task: true } });
+  });
+  it("records opaque launcher fallback without adding a run warning", async () => {
+    const s = setup(); const before = fs.readFileSync(s.settings, "utf8");
+    vi.stubEnv("PI_CODING_AGENT_DIR", s.original);
+    const manager = new AgentManager(s.cwd, DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve(process.env.FABRIC_OVERLOAD_TEST_WORKER ?? "src/worker.ts"),
+      piBinary: path.resolve("tests/fixtures/fake-pi-rpc.mjs"), runRoot: path.join(s.cwd, "runs"),
+    });
+    try {
+      const result = await manager.run({ task: "Use the selected custom launcher", cwd: s.cwd, transport: "process", extensions: false });
+      expect(result.status).toBe("completed");
+      expect(result.warnings ?? []).toEqual([]);
+      const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(events.filter(event => event.type === "fabric_retry_profile")).toEqual([{
+        type: "fabric_retry_profile", mode: "launcher", reason: "sdk_unavailable",
+        message: "Selected Pi launcher has no discoverable native SDK; preserving its retry settings and canonical auth path (Fabric same-session recovery remains enabled)",
+      }]);
+      expect(events.filter(event => event.type === "worker_warning")).toEqual([]);
+      expect(fs.readFileSync(s.settings, "utf8")).toBe(before);
+      expect(fs.existsSync(s.target)).toBe(false);
+    } finally {
+      await manager.close();
+      vi.unstubAllEnvs();
+    }
   });
   it("never substitutes Fabric's peer SDK for an opaque or missing launcher", () => {
     const s = setup();

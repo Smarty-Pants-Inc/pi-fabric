@@ -1048,8 +1048,16 @@ export class FabricControlPlane {
 
   #boundedAcceptance(acceptance: FabricControlAcceptance): FabricControlAcceptance {
     try {
-      if (controlAcceptanceBytes(acceptance) <= this.mesh.maxEventBytes - 2_048) {
+      const budget = this.mesh.maxEventBytes - 2_048;
+      if (controlAcceptanceBytes(acceptance) <= budget) {
         return acceptance;
+      }
+      if (acceptance.accepted && acceptance.warning) {
+        // Admission has already committed the delivery. An optional advisory must
+        // not turn its successful receipt into a refusal (and invite a duplicate
+        // retry). Keep all delivery fields, omitting only the warning if it fits.
+        const { warning: _warning, ...delivery } = acceptance;
+        if (controlAcceptanceBytes(delivery) <= budget) return delivery;
       }
     } catch {
       // Return a bounded rejection below.

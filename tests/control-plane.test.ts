@@ -52,6 +52,34 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
+  it.each([false, true])("only sheds an optional warning, not delivery fields or an oversized core (oversized=%s)", async oversized => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-advisory-budget-")); roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const make = (id: string) => {
+      const value = new FabricControlPlane(new MeshStore(meshRoot, 2300, 1000), identity(id), {
+        enabled: true, hostId: id, pollMs: 20, acknowledgementTimeoutMs: 1000,
+      });
+      planes.push(value); return value;
+    };
+    const owner = make("host:owner"), sender = make("host:sender");
+    const delivery = { accepted: true, messageId: "accepted", triggered: false, reason: "held",
+      pendingFollowUps: 1, oldestAgeS: 2, coalesced: true as const, replacedMessageId: "previous",
+      ...(oversized ? { result: "x".repeat(300) } : {}),
+    };
+    owner.start(() => ({ ...delivery, warning: {
+      code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: "agent:target", kind: "agent", status: "running",
+      message: "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.",
+    } }));
+    sender.start(() => ({ accepted: false }));
+    const outcome = sender.request("host:owner", "agent:target", "followUp", { message: "later" });
+    if (oversized) await expect(outcome).rejects.toThrow("Fabric control result exceeds 2300 mesh event bytes");
+    else await expect(outcome).resolves.toEqual({ queued: true, messageId: delivery.messageId, routed: "mesh", acknowledged: true,
+      triggered: false, reason: "held", pendingFollowUps: 1, oldestAgeS: 2, coalesced: true, replacedMessageId: "previous" });
+    const ack = sender.mesh.read({ topic: "fabric.control.ack", limit: 10 })[0]!.data;
+    expect(ack).toMatchObject(oversized ? { accepted: false, error: "Fabric control result exceeds 2300 mesh event bytes" } : delivery);
+    expect(ack).not.toHaveProperty("warning");
+  });
+
   it("followUp advisory A6 validates incoming ACKs without changing success or retrying", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-followup-ack-")); roots.push(root);
     const sender = plane(path.join(root, "mesh"), "host:sender");

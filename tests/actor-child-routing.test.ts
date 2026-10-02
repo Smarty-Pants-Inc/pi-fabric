@@ -636,7 +636,7 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     let blocked = false;
     const put = h.mesh.put.bind(h.mesh);
     vi.spyOn(h.mesh, "put").mockImplementation(async (...args) => {
-      if (!blocked && (args[0].value as { status?: string }).status === "running" && store.received(child.id)) {
+      if (!blocked && (args[0].value as { status?: string }).status === "preparing" && store.received(child.id)) {
         blocked = true;
         await gate; // Supersede the handoff before its freshness check, not after inference.
       }

@@ -53,6 +53,8 @@ interface FabricAction {
   effect?: FabricActionEffect;
 }
 interface FabricAgentRequest {
+  /** Deduplicate durable spawns on the same host; reuse for retries within 10 minutes (last 256 results). */
+  idempotencyKey?: string;
   /** Omitted/inherit uses caller executor.kernel; concrete choices require Pi with extensions. */
   kernel?: FabricKernel | "inherit";
   task: string;
@@ -670,6 +672,8 @@ interface FabricActorActivationSkipRule {
 type FabricActorActivationFilter = Array<"hold" | "never-message-events" | FabricActorActivationSkipRule>;
 type FabricActorValidWhile = (facts: Readonly<FabricActorValidityFacts>) => FabricActorValidityDecision;
 interface FabricActorRequestBase {
+  /** Deduplicate durable creates on the same host; reuse for retries within 10 minutes (last 256 results). */
+  idempotencyKey?: string;
   /** Fixed at creation; ask/tell cannot change language. Global templates resolve inheritance on import. */
   kernel?: FabricKernel | "inherit";
   scope?: "session" | "project" | "global";

@@ -10,6 +10,7 @@ import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import {
   effectiveAgentTimeoutMs,
   AgentManager,
+  AgentLaunchPreparationTimeoutError,
 } from "../src/agents/manager.js";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import * as retentionStorage from "../src/storage/retention.js";
@@ -539,6 +540,57 @@ describe("AgentManager", () => {
     } finally { release(); launch.mockRestore(); }
   });
 
+  it("expires actor launch preparation with a typed error and permits a fresh same-model admission before the old promise resolves", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-")); roots.push(root);
+    let resume!: () => void;
+    const gate = new Promise<void>((resolve) => { resume = resolve; });
+    let calls = 0;
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: async (model) => { if (++calls === 1) await gate; return model; },
+    });
+    managers.push(manager);
+    const launched = vi.fn();
+    try {
+      await expect(manager.spawn({ task: "never launch", model: "test/shared" }, undefined, () => true,
+        undefined, undefined, launched, { timeoutMs: 40 })).rejects.toMatchObject({
+        name: "AgentLaunchPreparationTimeoutError", code: "FABRIC_AGENT_LAUNCH_PREPARATION_TIMEOUT", timeoutMs: 40,
+      });
+      expect(new AgentLaunchPreparationTimeoutError(40)).toBeInstanceOf(Error);
+      expect(manager.runningCount()).toBe(0);
+      expect(fs.readdirSync(root)).toEqual([]);
+      const handle = await manager.spawn({ task: "fresh same model", model: "test/shared" }, undefined, () => true,
+        undefined, undefined, launched, { timeoutMs: 40 });
+      expect(handle.status).toBe("running");
+      expect(calls).toBe(2);
+      await manager.wait(handle.id);
+      resume(); await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(launched).toHaveBeenCalledTimes(1);
+      expect(manager.list().map((run) => run.id)).toEqual([handle.id]);
+    } finally { resume(); }
+  });
+
+  it("ends the actor setup deadline before transport creation and never times out an already launched worker", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-")); roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel: async (model) => model,
+    });
+    managers.push(manager);
+    const launch = ProcessTransport.prototype.launch;
+    const delayed = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return launch.call(this, request);
+    });
+    try {
+      const handle = await manager.spawn({ task: "HANG" }, undefined, () => true, undefined, undefined, undefined, { timeoutMs: 30 });
+      expect(handle.status).toBe("running");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(manager.status(handle.id).status).toBe("running");
+      await manager.stop(handle.id);
+      expect(manager.runningCount()).toBe(0);
+    } finally { delayed.mockRestore(); }
+  });
+
   it("cancels an admitted queued run during model preparation without launching its worker", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -1057,6 +1109,51 @@ describe("AgentManager", () => {
       fs.readFileSync(path.join(manager.runDirectory(result.id)!, "startup-attempts"), "utf8"),
     ).toBe("2");
   });
+
+  it.skipIf(process.platform === "win32")("3238 pins the first Pi artifact across a startup retry when its launcher symlink moves", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launch-pin-"));
+    roots.push(root);
+    const launcher = path.join(root, "pi.mjs");
+    const qualified = path.join(root, "qualified.mjs");
+    const oldPi = path.join(root, "old.mjs");
+    fs.writeFileSync(qualified, `
+      import fs from 'node:fs';
+      if (fs.readlinkSync(${JSON.stringify(launcher)}) === ${JSON.stringify(qualified)}) {
+        fs.unlinkSync(${JSON.stringify(launcher)});
+        fs.symlinkSync(${JSON.stringify(oldPi)}, ${JSON.stringify(launcher)});
+      }
+      console.log(JSON.stringify({hostCapabilities:{turnProvenance:1}}));
+    `);
+    fs.writeFileSync(oldPi, "console.log(JSON.stringify({hostCapabilities:{}}));\n");
+    fs.symlinkSync(qualified, launcher);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), piBinary: launcher, runRoot: root,
+    });
+    managers.push(manager);
+    const result = await manager.run({task: "Recover pinned Pi startup", transport: "process"});
+    expect(result, JSON.stringify(result)).toMatchObject({status: "completed", text: "startup retry recovered"});
+    const attempts = fs.readFileSync(path.join(manager.runDirectory(result.id)!, "pi-launches.jsonl"), "utf8")
+      .trim().split("\n").map(line => JSON.parse(line));
+    expect(attempts).toEqual([
+      {binary: qualified, turnProvenance: 1}, {binary: qualified, turnProvenance: 1},
+    ]);
+    expect(fs.readlinkSync(launcher)).toBe(oldPi);
+  }, 30_000);
+
+  it.each(["window before first turn", "window after work"])("3238 never relaunches a window refusal despite retryable transport/auth diagnostics: %s", async task => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-window-terminal-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const result = await manager.run({task, actorId: "window-actor", transport: "process"});
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("Context exceeds window:");
+    const directory = manager.runDirectory(result.id)!;
+    expect(fs.readFileSync(path.join(directory, "startup-attempts"), "utf8")).toBe("1");
+    expect(fs.existsSync(path.join(directory, "relaunches.jsonl"))).toBe(false);
+  }, 30_000);
 
   it("does not retry deterministic failures before the first turn", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));

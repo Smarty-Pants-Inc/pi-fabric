@@ -55,6 +55,7 @@ describe("resident producer classification (smarty-dev#2775 F3 mixed releases)",
     let oldWriter: ReturnType<typeof vi.spyOn> | undefined;
     let client: ResidencyClient | undefined;
     let beforeUpgrade: ResidencyClient | undefined;
+    let replayMain: MainAgentController | undefined;
     try {
       await host.start();
       // Wire-format adapter for a surviving older producer: retain the real host callback,
@@ -145,11 +146,43 @@ describe("resident producer classification (smarty-dev#2775 F3 mixed releases)",
       client!.start();
       await new Promise((resolve) => setTimeout(resolve, 80));
       expect(sendMessage).toHaveBeenCalledTimes(2);
+
+      // The resident envelopes are gone: Main's journal is now the only payload copy.
+      // Replay must use its retained producer evidence, not consult the upgraded client.
+      await client!.close();
+      main.closeFollowUpDrain();
+      const replaySend = vi.fn();
+      let settle: ((event: any, context: ExtensionContext) => void) | undefined;
+      const replayPi = { hostCapabilities: { turnProvenance: 1 }, sendMessage: replaySend,
+        on: (name: string, handler: (event: any, context: ExtensionContext) => void) => {
+          if (name === "agent_before_settle") settle = handler;
+          return () => {};
+        },
+      } as unknown as ExtensionAPI;
+      replayMain = new MainAgentController(replayPi, config.rootId, true, config.cwd, config.sessionId);
+      replayMain.attachFollowUpDrain(context, 0, journal);
+      settle!({ context: { pendingMessages: [] } }, context);
+      expect(replaySend).toHaveBeenCalledTimes(2);
+      const replayed = JSON.parse(fs.readFileSync(journal, "utf8")).items;
+      for (const [record, claimed] of [[actorRecord, !legacy], [alarmRecord, false]] as const) {
+        const id = `resident:${config.rootId}:${record.id}`;
+        const call = replaySend.mock.calls.find(([message]) => message.details.deliveryId === id)!;
+        expect(call[0].content).toContain(actor.name);
+        const saved = replayed.find((item: { deliveryId: string }) => item.deliveryId === id);
+        expect(saved.source).toBe(record.source);
+        if (claimed) {
+          expect(call[1]).toMatchObject({ provenance: { sender: { id: actor.id, kind: "actor", verified: "mesh" }, via: "replay" } });
+        } else {
+          expect(call[1]).toEqual({ deliverAs: record.delivery, triggerTurn: record.triggerTurn });
+          expect(saved).not.toHaveProperty("provenance");
+        }
+      }
     } finally {
       oldWriter?.mockRestore();
       await beforeUpgrade?.close();
       await client?.close();
       main.closeFollowUpDrain();
+      replayMain?.closeFollowUpDrain();
       await host.close();
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }

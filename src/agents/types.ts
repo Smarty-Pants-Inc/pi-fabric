@@ -50,6 +50,8 @@ export interface AgentSpawner {
 }
 
 export interface AgentRunRequest {
+  /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
+  idempotencyKey?: string;
   /** Host-created shadow decision; never accepted from external argument normalization. */
   routeDecision?: ModelRouteDecision;
   /** Host-only resident startup probe: model/extension admission, no prompt or tools. */
@@ -200,6 +202,9 @@ export interface AgentRunRecord {
 }
 
 export interface AgentRunResult extends AgentRunRecord {
+  /** Failed admission only: model/auth timed out before any transport launch was attempted.
+   * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
+  launchPreparationTimeoutMs?: number;
   status: "completed" | "failed" | "stopped" | "timed_out";
 }
 

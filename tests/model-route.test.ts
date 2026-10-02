@@ -123,6 +123,59 @@ describe("durable route dispatch", () => {
     expect(preparePiModel).toHaveBeenNthCalledWith(3, undefined);
     expect(preparePiModel).toHaveBeenCalledTimes(3);
   });
+  it("bounds routed preparation before launch and admits a fresh strict pin after timeout", async () => {
+    const dir = root();
+    const decision = await decideModelRoute(input, async () => response());
+    let resume!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    let calls = 0;
+    const preparePiModel = vi.fn(async (model: string | undefined, _requiredPin?: boolean) => {
+      if (++calls === 1) await gate;
+      return model;
+    });
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"), preparePiModel,
+    }); managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const onPreparing = vi.fn();
+    try {
+      await expect(manager.spawn({ task: "blocked pin", routeDecision: decision }, undefined, undefined,
+        undefined, undefined, undefined, { timeoutMs: 40, onPreparing })).rejects.toMatchObject({
+        name: "AgentLaunchPreparationTimeoutError", code: "FABRIC_AGENT_LAUNCH_PREPARATION_TIMEOUT", launchOutcome: "unlaunched",
+      });
+      expect(launch).not.toHaveBeenCalled();
+      expect(manager.runningCount()).toBe(0);
+      expect(onPreparing).toHaveBeenCalledTimes(1);
+      const handle = await manager.spawn({ task: "fresh pin", routeDecision: decision }, undefined, undefined,
+        undefined, undefined, undefined, { timeoutMs: 40 });
+      expect((await manager.wait(handle.id)).status).toBe("completed");
+      resume(); await new Promise(resolve => setTimeout(resolve, 80));
+      expect(preparePiModel).toHaveBeenNthCalledWith(1, pin.model, true);
+      expect(preparePiModel).toHaveBeenNthCalledWith(2, pin.model, true);
+      expect(launch).toHaveBeenCalledTimes(1);
+      const outcomes = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n").map(line => JSON.parse(line))
+        .filter(row => row.status);
+      expect(outcomes.map(row => row.status)).toEqual(["failed", "completed"]);
+    } finally { resume(); }
+  });
+  it("applies each strict preparation waiter's deadline to a shared pending promise", async () => {
+    const dir = root();
+    let resume!: () => void;
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    const preparePiModel = vi.fn(async (model: string | undefined, _requiredPin?: boolean) => { await gate; return model; });
+    const manager = new AgentManager(dir, DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"), preparePiModel,
+    }); managers.push(manager);
+    const owner = new AbortController();
+    const first = manager.prepareModelForAdmission(pin.model, "pi", undefined, true, owner.signal);
+    try {
+      await expect(manager.prepareModelForAdmission(pin.model, "pi", undefined, true, undefined, 40))
+        .rejects.toMatchObject({ name: "AgentLaunchPreparationTimeoutError", timeoutMs: 40 });
+      expect(preparePiModel).toHaveBeenCalledTimes(1);
+      resume();
+      await expect(first).resolves.toBe(pin.model);
+    } finally { resume(); await first; }
+  });
   it.each(["startup", "resume"])("R3 refuses a replacement model during %s recovery", async phase => {
     const dir = root();
     const decision = await decideModelRoute(input, async () => response());

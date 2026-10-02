@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+// Read-only per-host Main/worker release census; see docs/stale-main.md.
+import { main } from "../dist/releases-cli.js";
+try { process.exitCode = main(process.argv.slice(2)); }
+catch (error) {
+  process.stderr.write(`fabric-releases: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+}

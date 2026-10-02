@@ -56,7 +56,8 @@ import {
   ActionRegistry,
   type FabricCapabilityViewLease,
 } from "./core/action-registry.js";
-import { FabricSessionApprovals } from "./core/approval-controller.js";
+import { ApprovalController, FabricSessionApprovals } from "./core/approval-controller.js";
+import { runAbortable } from "./async-settlement.js";
 import { CompactController, type CompactLastCommit, type CompactPendingIntent } from "./core/compact-controller.js";
 import { FabricToolResultProxy } from "./core/tool-result-proxy.js";
 import { FabricExecutionService, type FabricExecutionResult } from "./execution-service.js";
@@ -922,10 +923,27 @@ export class FabricRuntimeState {
       false,
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
       () => this.pi.getThinkingLevel(),
-      (request, signal) => {
+      (request, signal, invocation) => {
         const owner = routeOwner;
         if (!owner || owner.signal.aborted) throw new Error("Jev routing unavailable");
-        const pending = owner.client.evaluate(request, AbortSignal.any([signal, owner.signal])).catch(error => {
+        const routeSignal = AbortSignal.any([signal, owner.signal]);
+        const pending = (async () => {
+          // agents.spawn approval grants agent work, not Jev network access. Use
+          // the current ordinary jev.evaluate policy before touching credentials.
+          await runAbortable(routeSignal, async () => {
+            const action = await this.#registry!.describe("jev.evaluate", { ...invocation, signal: routeSignal });
+            routeSignal.throwIfAborted();
+            await this.#schema!.authorize(action.ref, invocation.parentToolCallId);
+            routeSignal.throwIfAborted();
+            const approval = new ApprovalController(
+              this.#config!.approvals, invocation.extensionContext, this.sessionApprovals,
+              this.execution.autoApprovalClassifier, undefined, this.execution.brokeredNetwork,
+            );
+            await approval.approve(action, request as unknown as Record<string, unknown>);
+          });
+          routeSignal.throwIfAborted();
+          return owner.client.evaluate(request, routeSignal);
+        })().catch(error => {
           if (owner.signal.aborted && !signal.aborted) throw new Error("Jev routing owner retired");
           throw error;
         });

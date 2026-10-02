@@ -123,7 +123,7 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 // Every file the worker and manager write into a run directory. A missing name made the run
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
-  "task.txt", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
+  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
   "reply.json", "relaunches.jsonl", "route-session.jsonl",
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
@@ -149,6 +149,15 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
+        continue;
+      }
+      if (stat.isDirectory() && name === "deliveries") {
+        // Only the worker's UUID-addressed private delivery envelopes are ours.
+        // Empty directories are normal; unknown content, links and non-files veto.
+        for (const child of fs.readdirSync(file)) {
+          if (expired() || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/.test(child) ||
+              !ownedStat(path.join(file, child))?.isFile()) return false;
+        }
         continue;
       }
       if (stat.isDirectory() && name === "nested") {

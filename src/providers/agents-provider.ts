@@ -2,6 +2,7 @@ import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity
 import { createHash, randomUUID } from "node:crypto";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
 import type { RouteEvaluate } from "../agents/model-route.js";
+import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
@@ -412,7 +413,7 @@ export class AgentsProvider implements FabricProvider {
     readonly modelsConfig: () => FabricModelsConfig = () => DEFAULT_FABRIC_CONFIG.models,
     /** Current host effort, including child processes where the Main target is remote. */
     readonly callerThinking: () => string | undefined = () => undefined,
-    readonly routeEvaluate: RouteEvaluate = async () => { throw new Error("Jev routing unavailable"); },
+    readonly routeEvaluate: (request: JevRequest, signal: AbortSignal, context: FabricInvocationContext) => Promise<JevResponse> = async () => { throw new Error("Jev routing unavailable"); },
   ) {
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
@@ -572,7 +573,7 @@ export class AgentsProvider implements FabricProvider {
     const { decideModelRoute } = await import("../agents/model-route.js");
     const routeDecision = await decideModelRoute({ routeClass: args.routeClass, protected: args.protected, pin,
       candidates, candidatesValid, parentSessionId: context.extensionContext.sessionManager?.getSessionId() ?? this.participants.self().sessionId ?? "unknown" },
-      this.routeEvaluate, context.signal);
+      (request, signal) => this.routeEvaluate(request, signal, context), context.signal);
     // PR1 invariant: the choice is recorded, but dispatch ALWAYS uses the role pin.
     return { ...await this.#runRequest(resolved, context), routeDecision };
   }

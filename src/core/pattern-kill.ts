@@ -24,7 +24,7 @@
 // `pattern` is `text` with each quoted or escaped glob character (* ? [ ]) masked (GLOB_MASK), a
 // double-quoted `$` as QUOTED and a single-quoted or escaped `$` as LITERAL, so the /tmp rule sees which
 // globs and expansions are live (smarty-dev#1998, round 1 on PR #148).
-type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean; pattern: string };
+type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean; pattern: string; ansiEscaped?: boolean };
 type Expansion = { subs: string[]; names: string[]; text?: string; dynamic?: boolean };
 
 let placeholders = 0;
@@ -188,9 +188,14 @@ function tokenize(source: string): Token[] {
       w.text += text.slice(index + 1, end < 0 ? text.length : end);
       index = end < 0 ? text.length : end + 1;
     } else if (c === "$" && text[index + 1] === "'") {
-      const end = text.indexOf("'", index + 2);
-      w.text += text.slice(index + 2, end < 0 ? text.length : end);
-      index = end < 0 ? text.length : end + 1;
+      const start = index + 2;
+      let end = start;
+      while (end < text.length && text[end] !== "'") {
+        if (text[end] === "\\") { w.ansiEscaped = true; end += 2; }
+        else end += 1;
+      }
+      w.text += text.slice(start, end);
+      index = end < text.length ? end + 1 : end;
     } else if (c === "\"") {
       index = readDouble(text, index + 1, w);
     } else if ((c === "$" && text[index + 1] === "(") || c === "`") {
@@ -273,7 +278,7 @@ function tmpGlob(pattern: string, cwd: string | undefined): boolean {
 
 // `blocked`: a kill by pattern. `lookup`: runs a name lookup (LOOKUPS) anywhere.
 // `wipe`: a delete over a /tmp glob (smarty-dev#1998). `tmpList`: a stage or substitution may list other agents' dirs.
-type Verdict = { blocked: boolean; lookup: boolean; wipe: boolean; tmpList: boolean; sourceKnown?: boolean };
+type Verdict = { blocked: boolean; lookup: boolean; wipe: boolean; tmpList: boolean; sourceKnown?: boolean; uncertain?: boolean };
 type Feed = { lookup: boolean; tmp: boolean };
 type Command = { words: Word[]; redirects: Redirect[]; heredocs: Array<{ body: string; quoted: boolean }>; closed?: number };
 type InputScope = { target: Word; start?: Word };
@@ -346,6 +351,10 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
   for (;;) {
     while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text)) words = words.slice(1);
     const prefix = words[0]?.text.split("/").pop() ?? "";
+    if (prefix === "coproc") {
+      words = words.slice(words[2]?.text === "{" ? 2 : 1);
+      continue;
+    }
     const options = PREFIXES[prefix];
     if (!options) return { words, fedByXargs, argFile };
     // `command -v pkill` names the command; it does not run it.
@@ -390,6 +399,43 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
   }
 }
 
+/** Native argv that the receiver executes or expands again, not ordinary field text. */
+function executionWords(name: string, args: Word[]): Word[] {
+  if (name === "trap") {
+    if (["-p", "-l"].includes(args[0]?.text ?? "")) return [];
+    const action = args[args[0]?.text === "--" ? 1 : 0];
+    return action && action.text !== "-" ? [action] : [];
+  }
+  if (name === "printf") {
+    const flag = args[0];
+    if (!flag?.text.startsWith("-v")) return [];
+    const destination = flag.text.length > 2 ? { ...flag, text: flag.text.slice(2) } : args[1];
+    return destination && destination.text.includes("[") ? [destination] : [];
+  }
+  if (!["rg", "complete", "compgen"].includes(name)) return [];
+  const actions: Word[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg.text === "--") break;
+    if (name === "rg") {
+      const match = /^--(?:pre|hostname-bin)(?:=(.*))?$/s.exec(arg.text);
+      if (!match) continue;
+      const action = match[1] === undefined ? args[++i] : { ...arg, text: match[1] };
+      if (action) actions.push(action);
+    } else if (name === "complete" || name === "compgen") {
+      if (!arg.text.startsWith("-")) continue;
+      for (let at = 1; at < arg.text.length; at++) {
+        const option = arg.text[at]!;
+        if (!"oACEFGPSWX".includes(option)) continue;
+        const action = at + 1 < arg.text.length ? { ...arg, text: arg.text.slice(at + 1) } : args[++i];
+        if (action && "CFW".includes(option)) actions.push(action);
+        break;
+      }
+    }
+  }
+  return actions;
+}
+
 /** Bash read/mapfile option values are not destinations; omitted destinations use shell defaults. */
 function readDestinations(name: string, args: Word[]): string[] {
   const read = name === "read";
@@ -424,7 +470,9 @@ function readDestinations(name: string, args: Word[]): string[] {
  */
 function scan(script: string, depth: number, names: ReadonlySet<string> = new Set(), tmpIn: ReadonlySet<string> = new Set(),
   context: Context = { root: script, owned: new Set(), values: new Map(), unknown: new Set() }, stdin?: Feed): Verdict {
-  if (depth > 6) return { blocked: false, lookup: false, wipe: false, tmpList: false };
+  // ponytail (#325 S3): do not certify nonempty execution text that the depth bound leaves
+  // unexamined. Even a printing-only tail is refused; empty tails have nothing left to execute.
+  if (depth > 6) return { blocked: false, lookup: false, wipe: false, tmpList: false, uncertain: script.trim().length > 0 };
   // Security F4/F5: collect with the state at each command, then replay from the same entry state.
   // F6: retain fallback for unresolved feeds, but late redirects belong only to their own scope.
   const tokens = tokenize(script);
@@ -437,6 +485,7 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
     blocked: first.blocked || second.blocked, lookup: first.lookup || second.lookup,
     wipe: first.wipe || second.wipe, tmpList: first.tmpList || second.tmpList,
     sourceKnown: first.sourceKnown === true && second.sourceKnown === true,
+    uncertain: first.uncertain === true || second.uncertain === true,
   };
 }
 
@@ -465,6 +514,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     verdict.blocked ||= inner.blocked;
     verdict.lookup ||= inner.lookup;
     verdict.wipe ||= inner.wipe;
+    verdict.uncertain ||= inner.uncertain === true;
     return inner;
   };
   const fromLookup = (text: string): boolean => [...text.matchAll(VARIABLE)].some((match) => tainted.has(match[1]!));
@@ -545,13 +595,15 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         captured = true;
         tainted.add(expansion.names[k]!);
       });
-      const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean; heredoc?: boolean }> = [];
+      const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean; heredoc?: boolean; uncertain?: boolean }> = [];
       const envScripts: Array<{ text: string; source: Word }> = [];
       const { words, fedByXargs, argFile } = unwrap(stage.words, envScripts);
       // review/astra F6 on #105: an `env -S` script, with the placeholders of its word.
-      for (const { text } of envScripts) scripts.push({ text });
+      for (const { text, source } of envScripts) scripts.push({ text, uncertain: source.ansiEscaped === true });
       const name = words[0]?.text.split("/").pop() ?? "";
       const args = words.slice(1);
+      // #325 S1: native actions/selectors are execution boundaries, not quoted DATA.
+      for (const action of executionWords(name, args)) scripts.push({ text: action.text, uncertain: action.ansiEscaped === true });
       let lookup = LOOKUPS.has(name);
       if (KILL_BY_NAME.has(name)) verdict.blocked = true;
       // Assignments and loop variables that take lookup output.
@@ -675,16 +727,20 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           positional.forEach((arg, k) => { if (tmpOperand(arg.pattern)) tmpExtra.push(String(k), "@", "*"); });
           if (xargsFeed) extra.push(..."123456789@*".split(""), "{}");
           if (xargsTmp) tmpExtra.push(..."123456789@*".split(""), "{}");
-          scripts.push({ text: payload.text, extra, tmpExtra });
+          scripts.push({ text: payload.text, extra, tmpExtra, uncertain: payload.ansiEscaped === true });
         }
       }
-      if (name === "eval") scripts.push({ text: args.map((arg) => arg.text).join(" ") });
+      if (name === "eval") scripts.push({ text: args.map((arg) => arg.text).join(" "), uncertain: args.some((arg) => arg.ansiEscaped) });
       if (name === "ssh") {
         let i = 0;
         while (args[i]?.text.startsWith("-")) i += SSH_VALUE_OPTIONS.has(args[i]!.text) ? 2 : 1;
-        scripts.push({ text: args.slice(i + 1).map((arg) => arg.text).join(" "), remote: true });
+        const payload = args.slice(i + 1);
+        scripts.push({ text: payload.map((arg) => arg.text).join(" "), remote: true, uncertain: payload.some((arg) => arg.ansiEscaped) });
       }
       for (const inner of scripts) {
+        // ponytail (#325 S2): ANSI-C escapes are not decoded here. Refuse them only at
+        // execution boundaries, rather than pretending the raw body is the script Bash runs.
+        verdict.uncertain ||= inner.uncertain === true;
         const result = nested(inner.text, inner.extra, inner.tmpExtra, !inner.remote,
           inner.heredoc ? undefined : receiverStdin);
         lookup = result.lookup || lookup;
@@ -755,12 +811,14 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
 
 /** True when the shell command kills processes by name pattern (smarty-dev#774). */
 export function killsByPattern(command: string): boolean {
-  return scan(command, 0).blocked;
+  const verdict = scan(command, 0);
+  return verdict.blocked || verdict.uncertain === true;
 }
 
 /** True when the shell command deletes by a glob over /tmp or /var/tmp, or deletes /tmp itself (smarty-dev#1998). */
 export function wipesTmp(command: string): boolean {
-  return scan(command, 0).wipe;
+  const verdict = scan(command, 0);
+  return verdict.wipe || verdict.uncertain === true;
 }
 
 export const TMP_WIPE_REASON =

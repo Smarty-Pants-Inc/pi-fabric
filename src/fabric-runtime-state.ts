@@ -711,10 +711,10 @@ export class FabricRuntimeState {
       projectRoot,
       hostId,
       identityId: identity.id,
-      ...(ownsPersistentActorRegistry ? { completionRecipient: {
+      ...(ownsPersistentActorRegistry ? { completionRecipient: () => ({
         rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.()), role: participantRole(),
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
-      } } : {}),
+      }) } : {}),
       retention: this.#config.retention,
       ...(this.#paths
         ? {
@@ -912,6 +912,7 @@ export class FabricRuntimeState {
           onBackgroundComplete: (result, delivered) => completionInbox.enqueue(result, delivered),
           onResultConsumed: (id) => completionInbox.acknowledge(id),
           piModelState,
+          mainName: () => rootParticipantName(this.pi.getSessionName?.()),
           ...(this.#paths ? { hostPath: this.#paths.residentHost } : {}),
         })
       : undefined;

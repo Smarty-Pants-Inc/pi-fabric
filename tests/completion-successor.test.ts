@@ -235,6 +235,48 @@ describe("round 5 Windows completion file confirmation", () => {
   });
 });
 
+describe("round 5 spawn-time completion authority", () => {
+  it("snapshots queued spawns and stopped settlements before later host renames", async () => {
+    const h = harness();
+    const owner = h.client("A", 100);
+    let name = "main";
+    const manager = new AgentManager(h.root, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, nice: 19, sessionExport: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(h.root, "runs"),
+      meshRoot: h.meshRoot, completionRecipient: () => ({ ...h.recipient, name }),
+      onSettled: result => owner.client.enqueueCompletion(result),
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    name = "probe-lane";
+    const queued = await manager.spawn({ task: "private queued work", transport: "process" });
+    expect(queued.status).toBe("queued");
+    name = "renamed-again";
+    await manager.stop(first.id);
+    await manager.wait(queued.id, { timeoutMs: 5_000, deferConsumption() {} });
+    const envelopes = pendingCompletions(h.meshRoot, h.root);
+    expect(envelopes.find(value => value.result.id === first.id)?.recipient.name).toBe("main");
+    expect(envelopes.find(value => value.result.id === queued.id)?.recipient.name).toBe("probe-lane");
+    const manifest = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(queued.id)!, "completion-recipient.json"), "utf8"));
+    expect(manifest.recipient.name).toBe("probe-lane");
+  });
+
+  it("refuses missing, corrupt or foreign run manifests instead of relabeling a body to the current name", () => {
+    const h = harness();
+    const journal = new CompletionJournal(h.meshRoot, () => ({ ...h.recipient, name: "renamed-again" }), h.participants, h.mesh, vi.fn());
+    const run = path.join(h.root, "run"); fs.mkdirSync(run);
+    const result = { ...h.result, logFile: path.join(run, "events.jsonl") };
+    const file = path.join(run, "completion-recipient.json");
+    expect(() => journal.save(result)).toThrow("Missing admitted completion recipient");
+    fs.writeFileSync(file, "broken");
+    expect(() => journal.save(result)).toThrow();
+    fs.writeFileSync(file, JSON.stringify({ meshRoot: path.join(h.root, "foreign"), recipient: h.recipient }));
+    expect(() => journal.save(result)).toThrow("Invalid admitted completion recipient");
+    expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(0);
+    fs.writeFileSync(file, JSON.stringify({ meshRoot: h.meshRoot, recipient: { ...h.recipient, name: "probe-lane" } }));
+    journal.save(result);
+    expect(pendingCompletions(h.meshRoot, h.root)[0]?.recipient.name).toBe("probe-lane");
+  });
+});
 describe("round 4 completion fences", () => {
   it.each([true, false])("Astra 3: quiet resident settlement survives a live supervisor; successor notices=%s", async notifyOnComplete => {
     const h = harness();

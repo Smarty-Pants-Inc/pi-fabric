@@ -130,6 +130,25 @@ export const saveCompletion = (meshRoot: string, recipient: CompletionRecipient,
   }
   fs.rmSync(candidatePath(meshRoot, result.id), { force: true });
 };
+/** Logical settlement must use the immutable host-owned launch address, not today's /name. */
+export const completionRecipientFromRun = (meshRoot: string, runDirectory: string): CompletionRecipient | undefined => {
+  const file = path.join(runDirectory, "completion-recipient.json");
+  let manifest: { meshRoot?: string; recipient?: CompletionRecipient };
+  try { manifest = JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; // legacy run
+    throw error;
+  }
+  const recipient = manifest?.recipient;
+  if (typeof manifest?.meshRoot !== "string" || canonical(manifest.meshRoot) !== canonical(meshRoot) ||
+    !recipient || typeof recipient.rootId !== "string" || typeof recipient.sessionId !== "string" ||
+    typeof recipient.cwd !== "string" || typeof recipient.projectRoot !== "string" ||
+    typeof recipient.name !== "string" || typeof recipient.startedAt !== "number" ||
+    !Number.isFinite(recipient.startedAt) || (recipient.role !== undefined && typeof recipient.role !== "string")) {
+    throw new Error(`Invalid admitted completion recipient at ${file}`);
+  }
+  return recipient;
+};
 /** Called only after the preceding worker's exit is confirmed, before its retry launches. */
 export const discardWorkerCompletion = (meshRoot: string, id: string): void => {
   fs.rmSync(candidatePath(meshRoot, id), { force: true });
@@ -214,11 +233,23 @@ export const pendingCompletionResult = (envelope: CompletionEnvelope): AgentRunR
 
 export class CompletionJournal {
   readonly #enqueued = new Set<string>();
-  constructor(readonly meshRoot: string, readonly recipient: CompletionRecipient,
+  constructor(readonly meshRoot: string, readonly recipientSource: CompletionRecipient | (() => CompletionRecipient),
     readonly participants: FabricParticipantSource, readonly mesh: MeshStore,
     readonly enqueue: (result: AgentRunResult, delivered: () => void) => void) {}
 
-  save(result: AgentRunResult): void { saveCompletion(this.meshRoot, this.recipient, result); }
+  get recipient(): CompletionRecipient {
+    return typeof this.recipientSource === "function" ? this.recipientSource() : this.recipientSource;
+  }
+  save(result: AgentRunResult): void {
+    if (result.actorId) return;
+    const admitted = result.logFile ? completionRecipientFromRun(this.meshRoot, path.dirname(result.logFile)) : undefined;
+    // A live-name source cannot safely reconstruct a missing admission address.
+    // Legacy fixed-address journals retain their original immutable fallback.
+    if (result.logFile && !admitted && typeof this.recipientSource === "function") {
+      throw new Error(`Missing admitted completion recipient for ${result.id}`);
+    }
+    saveCompletion(this.meshRoot, admitted ?? this.recipient, result);
+  }
   forget(id: string): void {
     const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id);
     if (envelope && !this.#canRead(envelope)) return;

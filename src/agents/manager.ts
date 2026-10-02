@@ -638,7 +638,7 @@ export class AgentManager {
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
   readonly #projectRoot: string;
-  readonly #completionRecipient: CompletionRecipient | undefined;
+  readonly #completionRecipient: CompletionRecipient | (() => CompletionRecipient) | undefined;
   readonly #hostId: string | undefined;
   readonly #identityId: string | undefined;
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
@@ -696,7 +696,7 @@ export class AgentManager {
       meshRoot?: string;
       projectRoot?: string;
       /** Root-owned return address; never inferred from a child request or inherited by nested agents. */
-      completionRecipient?: CompletionRecipient;
+      completionRecipient?: CompletionRecipient | (() => CompletionRecipient);
       hostId?: string;
       identityId?: string;
       retention?: FabricRetentionConfig;
@@ -972,6 +972,11 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
+    // Snapshot host-owned identity before any await/queue: later /name changes
+    // affect new spawns, never an already-admitted run or its retries.
+    const completionRecipient = this.#completionRecipient
+      ? { ...(typeof this.#completionRecipient === "function" ? this.#completionRecipient() : this.#completionRecipient) }
+      : undefined;
     if (request.model === "auto") throw new Error('Unresolved model: "auto" must go through agents.spawn routing');
     if (request.routeDecision && ((request.runner ?? this.config.runner) !== "pi" ||
       (request.transport ?? this.config.transport) !== "process" || (request.residency ?? "session") !== "session" ||
@@ -1086,9 +1091,9 @@ export class AgentManager {
         this.#retentionTimer.unref();
         this.#scheduleRetentionSweep();
       }
-      if (this.#completionRecipient && this.#meshRoot && !request.actorId) {
+      if (completionRecipient && this.#meshRoot && !request.actorId) {
         writeJsonAtomic(path.join(runDirectory, "completion-recipient.json"),
-          { meshRoot: this.#meshRoot, recipient: this.#completionRecipient,
+          { meshRoot: this.#meshRoot, recipient: completionRecipient,
             supervisor: { pid: process.pid, processStartedAt: processStartTime(process.pid) } }, { durable: true });
       }
       const taskFile = path.join(runDirectory, "task.txt");
@@ -2688,7 +2693,7 @@ export class AgentManager {
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
     try {
       managed.routeOutcome?.(result);
-      this.#onSettled?.(result);
+      this.#onSettled?.(this.#withTransportMetadata(result, managed) as AgentRunResult);
       delete managed.settlementSaveFailure;
       return true;
     } catch (error) {

@@ -64,7 +64,7 @@ import {
   type ResidentHostConfig,
   type ResidentHostOwner,
 } from "./protocol.js";
-import { saveCompletion } from "../agents/completion-journal.js";
+import { completionRecipientFromRun, saveCompletion } from "../agents/completion-journal.js";
 import { deliveryRoot, projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { canRemoveTerminalRun } from "../storage/retention.js";
@@ -375,9 +375,9 @@ export class ResidentHost {
       fabricSessionId: config.sessionId,
       meshRoot: config.meshRoot,
       projectRoot: config.projectRoot,
-      completionRecipient: { rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd,
-        projectRoot: config.projectRoot, name: config.mainName ?? "main", role: config.role,
-        startedAt: config.mainStartedAt ?? this.participants.lastKnown?.(config.rootId)?.participant.startedAt ?? 0 },
+      completionRecipient: () => ({ rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd,
+        projectRoot: config.projectRoot, name: currentConfig().mainName ?? config.mainName ?? "main", role: config.role,
+        startedAt: config.mainStartedAt ?? this.participants.lastKnown?.(config.rootId)?.participant.startedAt ?? 0 }),
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: config.retention,
@@ -402,10 +402,9 @@ export class ResidentHost {
           if (!this.agents.runDirectory(result.id)) return;
           // Retain/retry full sources on faults; logical settlement is recoverable
           // even when inbox notifications are disabled.
-          const original = this.participants.lastKnown?.(config.rootId)?.participant;
-          saveCompletion(config.meshRoot, { rootId: config.rootId, sessionId: config.sessionId,
-            cwd: config.cwd, projectRoot: config.projectRoot, name: config.mainName ?? original?.name ?? "main",
-            role: config.role, startedAt: config.mainStartedAt ?? original?.startedAt ?? 0 }, result);
+          const recipient = completionRecipientFromRun(config.meshRoot, this.agents.runDirectory(result.id)!);
+          if (!recipient) throw new Error(`Missing admitted completion recipient for ${result.id}`);
+          saveCompletion(config.meshRoot, recipient, result);
         } catch (error) { this.#publicationFailed = true; throw error; }
       },
       onBackgroundComplete: (result) => {

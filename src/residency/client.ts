@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { CompletionJournal, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
+import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 
@@ -140,6 +140,8 @@ export interface ResidencyClientOptions {
   participants: FabricParticipantSource;
   mainAgent: FabricMainAgentTarget;
   piModelState?: () => ResidentPiModelState;
+  /** Current normalized host-owned Main name; never supplied by a task request. */
+  mainName?: () => string;
   onBackgroundComplete?: (result: AgentRunResult, delivered: () => void) => void;
   onResultConsumed?: (id: string) => void;
   hostPath?: string;
@@ -186,7 +188,8 @@ export class ResidencyClient {
     this.#agentsPath = path.join(options.config.residencyRoot, "agents");
     this.#deliveryPrefix = residentDeliveryPrefix(options.config.rootId);
     this.#hostPath = options.hostPath ?? fileURLToPath(new URL("./launcher.js", import.meta.url));
-    this.#completions = new CompletionJournal(options.config.meshRoot, this.#recipient(options.config),
+    this.#completions = new CompletionJournal(options.config.meshRoot,
+      options.mainName ? () => this.#recipient(options.config) : this.#recipient(options.config),
       options.participants, options.mesh, (result, delivered) => {
         const acknowledge = () => { delivered(); this.acknowledgeCompletion(result.id); };
         if (options.onBackgroundComplete) options.onBackgroundComplete(result, acknowledge);
@@ -384,6 +387,7 @@ export class ResidencyClient {
   }
 
   #refreshPiModels(): void {
+    if (this.options.mainName) this.options.config.mainName = this.options.mainName();
     const state = this.options.piModelState?.();
     if (state) this.options.config.piModels = structuredClone(state);
   }
@@ -964,7 +968,7 @@ export class ResidencyClient {
   #recipient(config: ResidentHostConfig): CompletionRecipient {
     const original = this.options.participants.lastKnown?.(config.rootId)?.participant;
     return { rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd, projectRoot: config.projectRoot,
-      name: config.mainName ?? original?.name ?? "main", role: config.role,
+      name: (config === this.options.config ? this.options.mainName?.() : undefined) ?? config.mainName ?? original?.name ?? "main", role: config.role,
       startedAt: config.mainStartedAt ?? original?.startedAt ??
         (/^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-/.test(config.sessionId)
           ? Number.parseInt(config.sessionId.replaceAll("-", "").slice(0, 12), 16) : 0) };
@@ -995,7 +999,8 @@ export class ResidencyClient {
     const result = readJson<AgentRunResult>(residentResultPath(root, id)) ??
       readJson<AgentRunResult>(path.join(root, "runs", id, "status.json"));
     if (!result || result.id !== id || !terminal(result.status)) return;
-    saveCompletion(this.options.config.meshRoot, this.#recipient(config), result);
+    const admitted = completionRecipientFromRun(this.options.config.meshRoot, path.join(root, "runs", id));
+    saveCompletion(this.options.config.meshRoot, admitted ?? this.#recipient(config), result);
   }
 
   async #drainDeliveries(): Promise<void> {

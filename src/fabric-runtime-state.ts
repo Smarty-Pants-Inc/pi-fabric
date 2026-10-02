@@ -761,9 +761,9 @@ export class FabricRuntimeState {
         if (lifecycle) void lifecycle.publishBackground(event);
       },
       // Foreground handoffs are retained too, until their finalized result publication consumes them.
-      onSettled: (result) => this.#residency?.enqueueCompletion(result),
-      onBackgroundComplete: (result) => {
-        if (this.#residency) this.#residency.enqueueCompletion(result);
+      onSettled: (result, admittedRecipient) => this.#residency?.enqueueCompletion(result, admittedRecipient),
+      onBackgroundComplete: (result, admittedRecipient) => {
+        if (this.#residency) this.#residency.enqueueCompletion(result, admittedRecipient);
         else completionInbox.enqueue(result);
       },
       onResultConsumed: (id) => {

@@ -58,6 +58,104 @@ afterEach(() => {
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 describe("named lane completion succession through FabricRuntimeState", () => {
+  it.each([
+    { admittedName: "old-lane", outcome: "stopped", missing: false },
+    { admittedName: undefined, outcome: "stopped", missing: false },
+    { admittedName: "old-lane", outcome: "failed", missing: false },
+    { admittedName: "old-lane", outcome: "stopped", missing: true },
+  ] as const)("round 6: prelaunch $outcome keeps admission name=$admittedName; missing=$missing fails closed", async ({ admittedName, outcome, missing }) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-queued-successor-"))); roots.push(root);
+    for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", path.join(root, "runs"));
+    const meshRoot = path.join(root, "mesh");
+    const config = normalizeFabricConfig({ fullCodeMode: false,
+      mesh: { enabled: true, root: meshRoot, actorPollMs: 20 },
+      agents: { enabled: true, maxConcurrent: 1, nice: 19, sessionExport: false, retainRuns: true },
+      records: { enabled: false }, mcp: { enabled: false }, memory: { enabled: false }, jev: { enabled: false },
+      prewalk: { enabled: false, alwaysRearm: false },
+    });
+    const a = main(root, "aaaaaaaa-0000-4000-8000-00000000000a");
+    a.context.isIdle = () => false;
+    const started: Array<ReturnType<typeof main>> = [a];
+    let queuedId: string | undefined;
+    // Fault injection at the production publication boundary: discard only the
+    // queued result's host-owned binding, without altering its private body.
+    const enqueue = ResidencyClient.prototype.enqueueCompletion;
+    if (missing) vi.spyOn(ResidencyClient.prototype, "enqueueCompletion").mockImplementation(function (this: ResidencyClient, result) {
+      if (result.id === queuedId) return enqueue.call(this, result);
+      return enqueue.apply(this, arguments as unknown as Parameters<typeof enqueue>);
+    });
+    try {
+      await a.runtime.initialize(a.context, config);
+      a.rename(admittedName);
+      const blocker = await a.runtime.agents.spawn({ task: "HANG", name: "permit-holder", transport: "process", nice: 19, model: "fake/fake-model" });
+      const privateTask = "ROUND6_PRIVATE_QUEUED_TASK";
+      const queued = await a.runtime.agents.spawn({ task: privateTask, name: "queued-private", transport: "process", nice: 19, model: "fake/fake-model" });
+      queuedId = queued.id;
+      expect(queued.status).toBe("queued");
+      expect(a.runtime.agents.runDirectory(queued.id)).toBeUndefined();
+      a.rename("probe-lane");
+      if (outcome === "failed") {
+        const prepare = vi.spyOn(a.runtime.agents, "prepareModelForAdmission").mockRejectedValueOnce(new Error("ROUND6_PREMANIFEST_FAILURE"));
+        await a.runtime.agents.stop(blocker.id);
+        await vi.waitFor(() => expect(a.runtime.agents.status(queued.id).status).toBe("failed"), { timeout: 8000, interval: 20 });
+        prepare.mockRestore();
+      } else {
+        const result = await a.runtime.agents.stop(queued.id);
+        expect(result).toMatchObject({ task: privateTask, status: "stopped" });
+      }
+      expect(a.runtime.agents.runDirectory(queued.id)).toBeUndefined();
+      expect(fs.existsSync(path.join(root, "runs", queued.id))).toBe(false);
+      expect(a.runtime.agents.status(queued.id)).toMatchObject({ task: privateTask, status: outcome });
+      const envelopes = pendingCompletions(meshRoot, root).filter(value => value.result.id === queued.id);
+      if (missing) expect(envelopes).toEqual([]);
+      else expect(envelopes).toMatchObject([{ recipient: { rootId: a.id, name: rootParticipantName(admittedName) }, result: { task: privateTask, status: outcome } }]);
+      expect(completionConsumed(meshRoot, queued.id)).toBe(false);
+      await a.runtime.shutdown(); started.shift();
+      await pause(20);
+
+      // For an unnamed admission, the unnamed lane IS the authorized successor.
+      // For a named admission, an unrelated unnamed Main is a bystander too.
+      const bystanderNames = admittedName ? [undefined, "other-lane", "probe-lane"] : ["other-lane", "probe-lane"];
+      for (const [index, name] of bystanderNames.entries()) {
+        const bystander = main(root, `bystander-${index}`, name); started.push(bystander);
+        await bystander.runtime.initialize(bystander.context, config);
+      }
+      const bystanders = [...started];
+      await pause(400);
+      for (const bystander of bystanders) {
+        bystander.turn();
+        expect(bystander.texts().join("\n")).not.toContain(queued.id);
+        expect(await bystander.status(queued.id)).not.toContain(privateTask);
+        // An observer wait must not forge a consumption receipt either.
+        const waited = await bystander.runtime.registry.invoke("agents.wait", { id: queued.id, timeoutMs: 100 }, {
+          cwd: root, signal: AbortSignal.timeout(1000), parentToolCallId: "round6-wait", nestedToolCallId: "agents.wait",
+          extensionContext: bystander.context, update() {}, approve: async () => {}, audits: [], maxResultChars: 100_000,
+        }).then(value => JSON.stringify(value), (error: unknown) => String(error));
+        expect(waited).not.toContain(privateTask);
+        expect(completionConsumed(meshRoot, queued.id)).toBe(false);
+      }
+      const successor = main(root, "dddddddd-0000-4000-8000-00000000000d", admittedName); started.push(successor);
+      await successor.runtime.initialize(successor.context, config);
+      if (missing) {
+        await pause(400); successor.turn();
+        expect(successor.texts().join("\n")).not.toContain(queued.id);
+        expect(await successor.status(queued.id)).not.toContain(privateTask);
+        expect(completionConsumed(meshRoot, queued.id)).toBe(false);
+        expect(pendingCompletions(meshRoot, root).some(value => value.result.id === queued.id)).toBe(false);
+      } else {
+        await vi.waitFor(() => { successor.turn(); expect(successor.texts().join("\n")).toContain(queued.id); }, { timeout: 8000, interval: 50 });
+        expect(await successor.status(queued.id)).toContain(privateTask);
+        await vi.waitFor(() => expect(completionConsumed(meshRoot, queued.id)).toBe(true), { timeout: 8000, interval: 50 });
+        successor.turn(); await pause(100);
+        expect(successor.texts().filter(text => text.includes(queued.id))).toHaveLength(1);
+        for (const bystander of bystanders) expect(await bystander.status(queued.id)).not.toContain(privateTask);
+      }
+    } finally {
+      for (const value of started.reverse()) await value.runtime.shutdown();
+    }
+  }, 40_000);
   it("binds ordinary and production ResidentHost results to a host rename before spawn, never the startup unnamed lane", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-renamed-successor-"))); roots.push(root);
     for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);

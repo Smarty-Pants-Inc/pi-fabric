@@ -493,7 +493,9 @@ export class ResidencyClient {
   }
 
   /** Persist session-scoped background outcomes before their retractable inbox admission. */
-  enqueueCompletion(result: AgentRunResult): void { this.#completions.save(result); }
+  enqueueCompletion(result: AgentRunResult, admittedRecipient?: CompletionRecipient): void {
+    this.#completions.save(result, admittedRecipient);
+  }
 
   hasAgent(id: string): boolean {
     return AGENT_ID_PATTERN.test(id) && (fs.existsSync(this.#metadataPath(id)) || this.#completions.result(id) !== undefined);

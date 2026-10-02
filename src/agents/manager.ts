@@ -344,6 +344,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
 }
 
 interface QueuedAgent {
+  /** Host-owned admission address, including terminal outcomes with no launch manifest. */
+  completionRecipient?: CompletionRecipient;
   routeSaveFailure?: string;
   routeOutcome?: (result: AgentRunResult) => void;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
@@ -642,10 +644,10 @@ export class AgentManager {
   readonly #hostId: string | undefined;
   readonly #identityId: string | undefined;
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
-  readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
+  readonly #onBackgroundComplete: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
-  readonly #onSettled: ((result: AgentRunResult) => void) | undefined;
+  readonly #onSettled: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
@@ -700,11 +702,11 @@ export class AgentManager {
       hostId?: string;
       identityId?: string;
       retention?: FabricRetentionConfig;
-      onBackgroundComplete?: (result: AgentRunResult) => void;
+      onBackgroundComplete?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onResultConsumed?: (id: string) => void;
       onStoppedAtClose?: (results: AgentRunResult[]) => void;
       /** Every terminal result, foreground or background, before its run directory can be removed. */
-      onSettled?: (result: AgentRunResult) => void;
+      onSettled?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
       preparePiModel?: (model: string | undefined, requiredPin?: boolean) => Promise<string | void>;
       resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
@@ -1421,7 +1423,7 @@ export class AgentManager {
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
-    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome);
+    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient);
   }
 
   #enqueue(
@@ -1430,6 +1432,7 @@ export class AgentManager {
     start: (release: () => void, signal: AbortSignal) => Promise<AgentHandleInfo>,
     ownerSignal?: AbortSignal,
     routeOutcome?: (result: AgentRunResult) => void,
+    completionRecipient?: CompletionRecipient,
   ): AgentHandleInfo {
     const abort = new AbortController();
     // Guest receipts belong to the session, not a program deadline. Host-owned
@@ -1437,7 +1440,8 @@ export class AgentManager {
     const signal = AbortSignal.any([abort.signal, this.#closeAbort.signal, ...(ownerSignal ? [ownerSignal] : [])]);
     let resolve!: (result: AgentRunResult) => void;
     const result = new Promise<AgentRunResult>((done) => { resolve = done; });
-    const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false, ...(routeOutcome ? { routeOutcome } : {}) };
+    const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false,
+      ...(routeOutcome ? { routeOutcome } : {}), ...(completionRecipient ? { completionRecipient } : {}) };
     this.#queued.set(info.id, queued);
     const admission = this.#semaphore.acquire("native", signal);
     const pending = (async () => {
@@ -1481,7 +1485,7 @@ export class AgentManager {
     queued.resolve(record);
     this.#emitLifecycle(queued.info, `run.${status}`, now, { status });
     this.#invalidateUiList();
-    try { this.#onSettled?.(record); } catch { /* must not break settlement */ }
+    try { this.#onSettled?.(record, queued.completionRecipient); } catch { /* retain queued terminal result on publication failure */ }
     this.#notifyQueuedComplete(queued);
   }
 
@@ -1508,7 +1512,7 @@ export class AgentManager {
   #notifyQueuedComplete(queued: QueuedAgent): void {
     if (queued.terminal && queued.background && !queued.completionNotified && !this.#closing && this.config.notifyOnComplete) {
       queued.completionNotified = true;
-      try { this.#onBackgroundComplete?.(queued.terminal); } catch { /* must not break settlement */ }
+      try { this.#onBackgroundComplete?.(queued.terminal, queued.completionRecipient); } catch { /* must not break settlement */ }
     }
   }
 

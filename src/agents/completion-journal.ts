@@ -240,12 +240,15 @@ export class CompletionJournal {
   get recipient(): CompletionRecipient {
     return typeof this.recipientSource === "function" ? this.recipientSource() : this.recipientSource;
   }
-  save(result: AgentRunResult): void {
+  /** admittedRecipient is host-only queue metadata, never a field supplied by a worker/guest. */
+  save(result: AgentRunResult, admittedRecipient?: CompletionRecipient): void {
     if (result.actorId) return;
-    const admitted = result.logFile ? completionRecipientFromRun(this.meshRoot, path.dirname(result.logFile)) : undefined;
-    // A live-name source cannot safely reconstruct a missing admission address.
+    const admitted = result.logFile
+      ? completionRecipientFromRun(this.meshRoot, path.dirname(result.logFile)) : admittedRecipient;
+    // A live-name source cannot safely reconstruct a missing admission address,
+    // even when a queued task terminated before its launch manifest existed.
     // Legacy fixed-address journals retain their original immutable fallback.
-    if (result.logFile && !admitted && typeof this.recipientSource === "function") {
+    if (!admitted && typeof this.recipientSource === "function") {
       throw new Error(`Missing admitted completion recipient for ${result.id}`);
     }
     saveCompletion(this.meshRoot, admitted ?? this.recipient, result);

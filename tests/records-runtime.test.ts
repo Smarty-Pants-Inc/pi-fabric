@@ -41,6 +41,8 @@ describe.skipIf(!postgresBin)("records in a Fabric runtime", () => {
     fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));
     vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
+    // Runtime and nudge reader must share this fixture's mesh, not the suite's fleet-isolation root.
+    vi.stubEnv("PI_FABRIC_MESH_ROOT", path.join(cwd, ".pi", "fabric", "mesh"));
     const sent: unknown[] = [];
     const pi = {
       events: { emit: vi.fn() },

@@ -1,5 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
-import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
+import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
@@ -198,7 +198,12 @@ const settledCompleted = (event: unknown, context: ExtensionContext): boolean =>
 };
 
 // Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
-const inboxHeldBy = (context: ExtensionContext) => rootInboxSession(context.sessionManager.getEntries());
+const inboxHeldBy = (context: ExtensionContext) => confirmedRootInboxSession(context.sessionManager);
+
+/** Expiry is observational: one line, never a triggered continuation. */
+const reportInboxExpiry = (pi: ExtensionAPI, inbox: RootInboxBatch | undefined): void => {
+  if (inbox?.skippedStale) sendFabricMessage(pi, rootInboxSummary(inbox), { deliverAs: "followUp", triggerTurn: false });
+};
 
 // An idle Main reads its inbox this often (smarty-dev#1595). With the 60 s steer grace, an event
 // published to an idle Main starts a turn about 60-75 s later. PI_FABRIC_INBOX_WAKE_MS overrides it.
@@ -624,6 +629,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     try {
       if (!idle()) return;
       const inbox = await state.nextRootInbox(inboxHeldBy(context), idle);
+      reportInboxExpiry(pi, inbox);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
         deliverRootInbox(pi, inbox.events);
@@ -805,6 +811,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // (smarty-dev#754). An aborted or failed run starts nothing: the batch waits for a turn.
     if (settledCompleted(event, context)) {
       const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
+      reportInboxExpiry(pi, inbox);
       if (inbox?.events.length) deliverRootInbox(pi, inbox.events);
       // Records addressed to this root past its processing cursor (smarty-dev#754 C4), same hook.
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
@@ -1162,6 +1169,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     inboxWake.armed = true;
     if (!state.initialized) return;
     const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
+    reportInboxExpiry(pi, inbox);
     if (!inbox?.events.length) return;
     // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result.
     if (!fabricProvenanceSupported(pi)) return { message: rootInboxMessage(inbox.events) };

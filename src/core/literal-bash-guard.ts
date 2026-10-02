@@ -2,6 +2,7 @@ import { posix } from "node:path";
 
 export const SIGNAL_REASON = "Signal refused: use the PID you recorded (literal integer PIDs only).";
 export const DELETE_REASON = "Recursive delete refused: delete only inside your own TMPDIR using literal absolute paths.";
+export const OPAQUE_REASON = "Opaque command refused: a protected signal/delete token is visible after removing quotes or escapes; use a supported literal command.";
 
 type Word = { text: string; literal: boolean };
 type Split = { words: Word[]; simple: boolean };
@@ -188,26 +189,33 @@ function literalRm(words: Word[], tmpdir: string | undefined): boolean {
 
 /**
  * Scope cut from PR166: only one literal kill or recursive rm command can receive an allowance.
- * Outside the fixed inert-head grant, visible protected tokens and opaque execution refuse.
+ * Outside the fixed inert-head grant, visible protected tokens refuse, including fragmented
+ * spellings in opaque execution/quoting.
  * No safety bytes, executor semantics or parent effects are inferred. This is a mistake guard,
  * not a sandbox: aliases, custom script files, other languages and dynamic names are not proved.
  */
 export function bashGuardRefusal(command: string, tmpdir: string | undefined): string | undefined {
   const { words, simple } = split(command);
-  if (literalData(words, simple) || (simple && literalKill(words)) || (simple && literalRm(words, tmpdir))) return undefined;
+  if (literalData(words, simple)
+    || (simple && /^\s*kill(?:\s|$)/.test(command) && literalKill(words))
+    || (simple && /^\s*rm(?:\s|$)/.test(command) && literalRm(words, tmpdir))) return undefined;
   const raw = protectedTokens(command);
   let signal = raw.signal, deletion = raw.deletion;
   for (const word of words) {
     const found = protectedTokens(word.text);
     signal ||= found.signal; deletion ||= found.deletion;
   }
-  // No executor denylist: live substitutions/process substitutions/backticks and unsupported
-  // script quoting cannot prove absence of a fragmented protected receiver. Do not decode them.
-  const execution = /\$\(|`|[<>]\(|\$['"]|\\\r?\n|<</.test(command);
-  const unprovedQuoting = words.some(word => /['"\\]/.test(word.text));
   if (signal) return SIGNAL_REASON;
   if (deletion) return DELETE_REASON;
-  if (execution || unprovedQuoting) return SIGNAL_REASON;
-  // No visible protected token or opaque execution. This is not an unrelated-command DATA grant.
+  const execution = /\$\(|`|[<>]\(|\$['"]|\\\r?\n|<</.test(command);
+  const unprovedQuoting = words.some(word => /['"\\]/.test(word.text));
+  if (execution || unprovedQuoting) {
+    // Scan the whole de-quoted text, including substitution bodies. This is lexical evidence,
+    // not execution/expansion interpretation; remove continuations so pki\\\nll stays visible.
+    const dequoted = protectedTokens(command.replace(/\$(['"])/g, "$1").replace(/\\\r?\n|['"\\]/g, ""));
+    if (dequoted.signal || dequoted.deletion) return OPAQUE_REASON;
+  }
+  // Ponytail: variable-assembled receivers ($a$b) remain an accepted limit of this mistake guard.
+  // Opaque syntax alone is not a protected command or an unrelated-command DATA grant.
   return undefined;
 }

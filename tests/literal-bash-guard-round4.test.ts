@@ -1,18 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { bashGuardRefusal, DELETE_REASON, SIGNAL_REASON } from "../src/core/literal-bash-guard.js";
+import { bashGuardRefusal, DELETE_REASON, OPAQUE_REASON, SIGNAL_REASON } from "../src/core/literal-bash-guard.js";
 const root = "/tmp/session-literal-guard";
 // Derived witnesses for the review's described classes; all commands are scanner-only DATA.
 const pairs = [
-  { id: "S7 escaped signal substitution", reason: SIGNAL_REASON,
+  { id: "S7 escaped signal substitution", reason: OPAQUE_REASON,
     refused: ['echo "$(p\\kill worker)"', 'printf "%s" "$(p\\kill worker)"'],
     simple: ["kill -00 4242", "echo '$(p\\kill worker)'"] },
-  { id: "S7 quote-concatenated signal substitution", reason: SIGNAL_REASON,
+  { id: "S7 quote-concatenated signal substitution", reason: OPAQUE_REASON,
     refused: ['echo "$(p\'ki\'ll worker)"', 'printf "%s" "$(p\'ki\'ll worker)"'],
     simple: ["kill 4242", "printf '%s' 'pkill worker'"] },
-  { id: "S7 escaped deletion substitution", reason: SIGNAL_REASON,
+  { id: "S7 escaped deletion substitution", reason: OPAQUE_REASON,
     refused: ['echo "$(r\\m -rf /outside)"', 'printf "%s" "$(r\\m -rf /outside)"'],
     simple: ["rm -rf /tmp/session-literal-guard/a", "echo '$(r\\m -rf /outside)'"] },
-  { id: "S7 quote-concatenated deletion substitution", reason: SIGNAL_REASON,
+  { id: "S7 quote-concatenated deletion substitution", reason: OPAQUE_REASON,
     refused: ['echo "$(r\'m\' -rf /outside)"', 'printf "%s" "$(r\'m\' -rf /outside)"', "printf '%s' \"$(r'm' -rf /outside)\""],
     simple: ["rm -r /tmp/session-literal-guard/a", "printf '%s' 'rm -rf /outside'"] },
   { id: "S8 compgen command signal action", reason: SIGNAL_REASON,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bashGuardRefusal, DELETE_REASON, SIGNAL_REASON } from "../src/core/literal-bash-guard.js";
+import { bashGuardRefusal, DELETE_REASON, OPAQUE_REASON, SIGNAL_REASON } from "../src/core/literal-bash-guard.js";
 
 const tmpdir = "/tmp/session-literal-guard";
 describe("literal-only signal and recursive-delete guard", () => {
@@ -12,6 +12,8 @@ describe("literal-only signal and recursive-delete guard", () => {
     "sh -c 'kill 4242'", "ssh host 'pkill worker'", "env -S 'kill 4242'",
     "pki\\\nll worker", '"ki"ll $P', "\\kill $P", "kill 4242 > /outside",
     "kill 4242 && printf ok", "kill\r 4242", "kill '4242", "kill $'42'",
+    "k'i'll 123", '"pk"ill worker', 'echo "$(kill 123)"', 'echo `kill 123`',
+    'echo `k\'i\'ll 123`', 'cat <(p\\kill worker)',
   ];
   const deletes = [
     "rm -rf /", "rm -r /tmp", "rm -R /var/tmp", "rm --recursive /outside",
@@ -26,6 +28,8 @@ describe("literal-only signal and recursive-delete guard", () => {
     "rm $OPTS /outside", 'rm "$OPTS" /outside', "rm -r -- /tmp/session-literal-guard/$D",
     "rm -ri /tmp/session-literal-guard/a", "TMPDIR=/outside rm -rf /outside/a",
     'env --split-string="rm -rf /outside"', "env -iS'rm -rf /outside'", 'env -S "rm $OPTS /outside"',
+    "r\\m -rf /x", "r'm' -rf /tmp/session-literal-guard/a", 'cat >(r\\m -rf /x)',
+    "python3 - <<'EOF2'\nr\\m -rf /x\nEOF2",
   ];
   it.each(signals)("refuses signal class: %s", command => expect(bashGuardRefusal(command, tmpdir)).toBe(SIGNAL_REASON));
   it.each(deletes)("refuses delete class: %s", command => expect(bashGuardRefusal(command, tmpdir)).toBe(DELETE_REASON));
@@ -45,6 +49,32 @@ describe("literal-only signal and recursive-delete guard", () => {
   ])("passes unrelated commands and inert literal DATA: %s", command => {
     // Same historical ID/command; owner-directed round-4 cut refuses all shred forms.
     expect(bashGuardRefusal(command, tmpdir)).toBe(command === "shred /tmp/a" ? DELETE_REASON : undefined);
+  });
+  it.each([
+    `N=/path/ORG-NOTES.md; echo "$(date -u +%H:%MZ) text containing 'restored', 'restarted', 'Sessions'" >> "$N"; echo ok`,
+    'S=a; T=b; echo "$S $T"',
+    "python3 - <<'EOF2'\nprint('restored Sessions')\nEOF2",
+    "printf '%s\\n' x | ssh host 'cat'",
+    "A=1; echo $A",
+    'echo `date -u +%H:%MZ`', "cat <(printf x)", "cat >(cat)",
+    "printf %s $'restored\\n'", 'echo $"Sessions"', "echo \\\nrestored",
+    "ssh host 'printf %s\\n x'", "echo restoration; echo restarted; echo Sessions",
+  ])("allows ordinary opaque syntax without a protected token: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBeUndefined();
+  });
+  it.each([
+    'echo "$(p\\kill worker)"', 'echo "$(k\'i\'ll 123)"', 'echo "`k\'i\'ll 123`"',
+    'cat <(\'p"ki"ll worker\')', 'cat >(\'r"m" -rf /x\')',
+    'echo "$(r\'m\' -rf /x)"', "sh -c 'p\"ki\"ll worker'", "sh -c 'r\\m -rf /x'",
+    "sh -c $'p\"ki\"ll worker'", 'sh -c $"r\'m\' -rf /x"',
+    "python3 - <<'EOF2'\n'r\"m\"' -rf /x\nEOF2",
+  ])("refuses opaque protected spelling with an accurate reason: %s", command => {
+    expect(bashGuardRefusal(command, tmpdir)).toBe(OPAQUE_REASON);
+    expect(OPAQUE_REASON).not.toBe(SIGNAL_REASON);
+    expect(OPAQUE_REASON).toMatch(/protected signal\/delete token/);
+  });
+  it("keeps variable-assembled receivers as an explicit mistake-guard limit", () => {
+    expect(bashGuardRefusal("$a$b 123", tmpdir)).toBeUndefined();
   });
   it.each([undefined, "", "/", "/tmp", "/var/tmp", "relative", "/tmp/session/../other", "$TMPDIR"])(
     "never grants recursive deletion from an absent/shared/unproved TMPDIR: %s", root => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bashGuardRefusal, DELETE_REASON, SIGNAL_REASON } from "../src/core/literal-bash-guard.js";
+import { bashGuardRefusal, DELETE_REASON, OPAQUE_REASON, SIGNAL_REASON } from "../src/core/literal-bash-guard.js";
 
 const tmpdir = "/tmp/session-literal-guard";
 // All commands are scanner DATA; this suite never dispatches a shell or a protected operation.
@@ -21,10 +21,10 @@ const pairs: { id: string; refused: string[]; reason?: string; simple: string[] 
     refused: ["sh -c $'rm -rf /outside'", "bash -c $'rm -rf /outside'", "eval $'rm -rf /outside'"],
     simple: ["rm -r /tmp/session-literal-guard/a", "echo 'rm -rf /outside'"] },
   // Derived class witnesses: the security review describes these spellings without a code block.
-  { id: "security S3 derived: inner quote concatenation / escaped signal spelling", reason: SIGNAL_REASON,
+  { id: "security S3 derived: inner quote concatenation / escaped signal spelling", reason: OPAQUE_REASON,
     refused: ["sh -c 'p\"ki\"ll worker'", "bash -c 'p\\kill worker'", "eval 'p\"ki\"ll worker'"],
     simple: ["kill -- 4242", "echo 'p\"ki\"ll worker'"] },
-  { id: "security S3 derived: fragmented deletion spelling", // Unknown class receives a stable refusal, never an inferred executable.
+  { id: "security S3 derived: fragmented deletion spelling", reason: OPAQUE_REASON, // Lexical de-quoting, never an inferred executable.
     refused: ["sh -c 'r\"m\" -rf /outside'", "bash -c 'r\\m -rf /outside'", "eval 'r\"m\" -rf /outside'"],
     simple: ["rm -rf '/tmp/session-literal-guard/with space'", "printf '%s' 'r\"m\" -rf /outside'"] },
   { id: "security S3: unsupported locale / continuation / heredoc script quoting", reason: SIGNAL_REASON,

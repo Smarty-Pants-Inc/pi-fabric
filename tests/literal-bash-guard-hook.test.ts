@@ -73,6 +73,22 @@ it("awaits the literal guard only at first bash use and reads host TMPDIR at eac
     expect(await nativeGuard(deletion, context)).toEqual({ block: true, reason: "Recursive delete refused: delete only inside your own TMPDIR using literal absolute paths." });
     expect(loaded).toHaveBeenCalledOnce();
     expect(calls).toHaveBeenCalledTimes(4);
+    for (const command of [
+      `N=/path/ORG-NOTES.md; echo "$(date -u +%H:%MZ) 'restored' 'restarted' 'Sessions'" >> "$N"; echo ok`,
+      'S=a; T=b; echo "$S $T"', "python3 - <<'EOF2'\nprint('Sessions')\nEOF2",
+      "printf '%s\\n' x | ssh host 'cat'", "A=1; echo $A",
+    ]) {
+      const ordinary = { toolName: "bash", input: { command, timeout: 123 } };
+      expect(await nativeGuard(ordinary, context), command).toBeUndefined();
+      expect(ordinary.input.timeout).toBe(123);
+    }
+    const opaque = { toolName: "bash", input: { command: 'echo "$(r\\m -rf /x)"', timeout: 123 } };
+    const opaqueResult = await nativeGuard(opaque, context);
+    expect(opaqueResult).toMatchObject({ block: true, reason: expect.stringMatching(/^Opaque command refused:/) });
+    expect(opaqueResult).not.toHaveProperty("reason", "Signal refused: use the PID you recorded (literal integer PIDs only).");
+    expect(opaque.input.timeout).toBe(123);
+    expect(calls).toHaveBeenCalledTimes(10);
+    expect(loaded).toHaveBeenCalledOnce();
     expect(await nativeGuard({ toolName: "bash", input: { command: "sleep 600", timeout: 600 } }, context)).toHaveProperty("block", true);
   } finally {
     await lifecycle("session_shutdown");

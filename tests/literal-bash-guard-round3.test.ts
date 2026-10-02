@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bashGuardRefusal, DELETE_REASON, SIGNAL_REASON } from "../src/core/literal-bash-guard.js";
+import { bashGuardRefusal, DELETE_REASON, OPAQUE_REASON, SIGNAL_REASON } from "../src/core/literal-bash-guard.js";
 
 const tmpdir = "/tmp/session-literal-guard";
 // The reviewer supplied class descriptions, not verbatim command blocks. These are explicitly
@@ -34,7 +34,11 @@ const pairs = [
 describe("PR231 round 3 relative-path and deferred execution cuts", () => {
   for (const pair of pairs) {
     it(`${pair.id}: refusal`, () => {
-      for (const command of pair.refused) expect(bashGuardRefusal(command, tmpdir), command).toBe(pair.reason);
+      for (const command of pair.refused) {
+        // Refusal decisions and historical command bytes stay fixed; opaque evidence has its own reason.
+        const reason = command === "trap 'p\"ki\"ll worker' EXIT" ? OPAQUE_REASON : pair.reason;
+        expect(bashGuardRefusal(command, tmpdir), command).toBe(reason);
+      }
     });
     it(`${pair.id}: SIMPLE / inert DATA allowance`, () => {
       for (const command of pair.simple) expect(bashGuardRefusal(command, tmpdir), command).toBeUndefined();

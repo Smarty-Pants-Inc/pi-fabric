@@ -42,7 +42,7 @@ and heredoc syntax are allowed when no protected token is visible. Quotes and
 backslash characters are removed for a second lexical scan, including substitution
 bodies; line continuations are removed as a unit and dollar-quote introducers are
 stripped to expose their bodies. Fragmented protected spellings still refuse.
-This scan does not evaluate shell code, decode ANSI-C escapes or infer execution.
+This scan does not evaluate shell code or infer execution.
 
 Ordinary commands such as `A=1; echo $A`, `S=a; T=b; echo "$S $T"`,
 `printf '%s\n' x | ssh host 'cat'`, Python heredocs, and note appends containing

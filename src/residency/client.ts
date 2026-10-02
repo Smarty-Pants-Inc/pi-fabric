@@ -943,6 +943,7 @@ export class ResidencyClient {
     // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
     this.options.mainAgent.deliverAgent({
       from: value.from,
+      source: value.source,
       // The authenticated resident writer alone does not prove actor authorship: older
       // hosts also write alarms under the actor label. Require positive classification;
       // unclassified/unknown actor records retain routing/display and durable receipts only.

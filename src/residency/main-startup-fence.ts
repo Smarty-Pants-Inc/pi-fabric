@@ -3,12 +3,15 @@ import path from "node:path";
 import { lockFile } from "./file-lock.js";
 import { residentRoot } from "./protocol.js";
 
-/** Short native ownership fence, separate from the resident host's lifetime host.lock.
- * Prune holds BOTH fences through its destructive commits. Never unlink either inode. */
+/** Native Main lifetime ownership fence, separate from the resident host's host.lock.
+ * The startup path acquires it before publication/load, and retains it until shutdown.
+ * Prune holds BOTH fences through its commits. Never unlink either inode. */
 export const nativeMainStartupLock = (meshRoot: string, rootId: string): string =>
   path.join(residentRoot(meshRoot, rootId), "main-start.lock");
 
-/** Publish the first live lease and load the registry while holding prune's native fence.
+/** Acquire under the existing startup boundary; the caller must keep the returned
+ * release until ownership writers drain at shutdown/reinitialization (or load fails).
+ * Process death drops the flock even if every heartbeat has expired.
  * Non-Linux cannot destructively prune. On Linux a missing/broken helper fails closed:
  * another Pi process may have a different PATH, so its capability probe is not ours. */
 export const acquireNativeMainStartupFence = async (meshRoot: string, rootId: string): Promise<() => void> => {

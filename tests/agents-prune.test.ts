@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
@@ -241,6 +242,44 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
     expect(resume.runtime.actors.listOwned().map(a => a.id)).toEqual(expect.arrayContaining([h.project.id, h.session.id]));
   });
 
+  it.skipIf(process.platform !== "linux").each(["shutdown", "reload", "reinitialize"])(
+    "S4 native ownership fence survives %s writer draining and preserves its inode", async mode => {
+      const h = await fixture(); await h.owner.close();
+      const resume = nativeResume(h); await resume.start();
+      const file = path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-start.lock");
+      const inode = fs.statSync(file);
+      await expect(lockFile(file, 0, true, false)).rejects.toBeInstanceOf(residentLocks.FileLockBusy);
+      const entered = deferred(), release = deferred();
+      const actors = resume.runtime.actors, close = actors.close.bind(actors);
+      vi.spyOn(actors, "close").mockImplementation(async () => {
+        entered.resolve(); await release.promise; await close();
+      });
+      const draining = mode === "reinitialize" ? resume.start() : resume.runtime.shutdown(mode === "reload" ? "reload" : undefined);
+      try {
+        await entered.promise;
+        await expect(lockFile(file, 0, true, false)).rejects.toBeInstanceOf(residentLocks.FileLockBusy);
+      } finally { release.resolve(); await draining; }
+      if (mode === "reinitialize") {
+        await expect(lockFile(file, 0, true, false)).rejects.toBeInstanceOf(residentLocks.FileLockBusy);
+        expect(resume.runtime.actors.listOwned().map(actor => actor.id)).toEqual(expect.arrayContaining([h.project.id, h.session.id]));
+        await resume.runtime.shutdown();
+      }
+      const fd = await lockFile(file, 0, true, false);
+      try { expect(fs.fstatSync(fd).ino).toBe(inode.ino); expect(fs.fstatSync(fd).dev).toBe(inode.dev); }
+      finally { fs.closeSync(fd); }
+    });
+
+  it.skipIf(process.platform !== "linux")("S4 failed native writer drain retains ownership until successful shutdown", async () => {
+    const h = await fixture(); await h.owner.close();
+    const resume = nativeResume(h); await resume.start();
+    const file = path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-start.lock");
+    const fault = vi.spyOn(resume.runtime.actors, "close").mockRejectedValueOnce(new Error("fixture actor drain EIO"));
+    await expect(resume.runtime.shutdown()).rejects.toThrow("fixture actor drain EIO");
+    await expect(lockFile(file, 0, true, false)).rejects.toBeInstanceOf(residentLocks.FileLockBusy);
+    fault.mockRestore(); await resume.runtime.shutdown();
+    const fd = await lockFile(file, 0, true, false); fs.closeSync(fd);
+  });
+
   const expiredOwner = async (h: Awaited<ReturnType<typeof fixture>>) => {
     const lease = { id: h.owner.identity.id, rootId: h.owner.identity.id, identityId: h.owner.identity.id,
       updatedAt: 1, expiresAt: 2 };
@@ -249,6 +288,86 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
     writeHostLease(h.mesh.root, lease);
     return path.join(h.mesh.root, "host-leases", `${hash(lease.id).slice(0, 32)}.json`);
   };
+  it.skipIf(process.platform !== "linux").each([true, false, "exited"] as const)(
+    "S4 initialized native Main with expired leases: dryRun=%s honors process lifetime", async mode => {
+      const h = await fixture(); await h.owner.close();
+      const store = new ActorRegistryStore(h.owner.actorRoots.project);
+      const durable = { ...store.records().find(row => row.id === h.project.id)!, id: "d".repeat(32), name: "durable-control", residency: "durable" };
+      const unrelated = { ...durable, id: "e".repeat(32), name: "unrelated-control", residency: "session", rootId: h.caller.identity.id };
+      await store.withLock(() => store.write([...store.records(), durable, unrelated]));
+      for (const [at, id] of [[h.owner.actorRoots.project, h.project.id], [h.owner.actorRoots.session, h.session.id],
+        [h.owner.actorRoots.project, durable.id], [h.owner.actorRoots.project, unrelated.id]]) {
+        fs.mkdirSync(path.join(at!, id!), { recursive: true });
+        for (const file of ["session.jsonl", "mailbox.json", "queue.json"]) fs.writeFileSync(path.join(at!, id!, file), `${file}-${id}\n`);
+      }
+      const child = spawn("bun", [path.resolve("tests/fixtures/native-main-prune.ts"), h.root, h.mesh.root],
+        { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", chunk => { stdout += chunk; });
+      child.stderr.on("data", chunk => { stderr += chunk; });
+      const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+        child.once("error", reject); child.once("close", (code, signal) => resolve({ code, signal }));
+      });
+      // Observe spawn errors without abandoning the finally/checked-exit path.
+      void exited.catch(() => undefined);
+      const until = async (predicate: () => boolean) => {
+        const deadline = Date.now() + 10_000;
+        while (!predicate()) {
+          if (child.exitCode !== null || child.signalCode !== null || Date.now() > deadline) {
+            throw new Error(`Native Main fixture failed: ${stdout}\n${stderr}`);
+          }
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+      };
+      try {
+        await until(() => stdout.includes('"ready":true'));
+        const ready = JSON.parse(stdout.trim().split("\n").find(line => line.includes('"ready":true'))!);
+        expect(ready.initialized).toBe(true); expect(ready.pid).toBe(child.pid);
+        expect(ready.actors).toEqual(expect.arrayContaining([h.project.id, h.session.id]));
+        expect(child.kill("SIGSTOP")).toBe(true);
+        await until(() => /^State:\s+T/m.test(fs.readFileSync(`/proc/${child.pid}/status`, "utf8")));
+        // Age the legacy session compatibility stamp too; real timers/deadlines
+        // still advance, while the stopped native process cannot renew anything.
+        const now = Date.now.bind(Date);
+        vi.spyOn(Date, "now").mockImplementation(() => now() + 60_000);
+        await expiredOwner(h);
+        await h.caller.participants.refresh();
+        expect(h.caller.participants.writeStalled()).toBeUndefined();
+        expect(h.caller.participants.get(h.owner.identity.id, Date.now(), { fresh: true })).toBeUndefined();
+        expect(h.caller.participants.get(h.project.id, Date.now(), { fresh: true })).toBeUndefined();
+        expect(readHostLeases(h.mesh.root).get(h.owner.identity.id)?.expiresAt).toBe(2);
+        const actorBytes = snapshot(path.join(h.mesh.root, "actors"));
+        if (mode === "exited") {
+          expect(child.kill("SIGKILL")).toBe(true);
+          expect(await exited).toEqual({ code: null, signal: "SIGKILL" });
+          expect(() => process.kill(ready.pid, 0)).toThrow();
+          const plan = await h.run('return await agents.prune({ root: "session:old-main", dryRun: true });');
+          expect(plan.success, plan.error).toBe(true); expect((plan.value as any).actors).toHaveLength(2);
+          expect(snapshot(path.join(h.mesh.root, "actors"))).toEqual(actorBytes);
+          const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+          expect(result.success, result.error).toBe(true); expect((result.value as any).removed.actors).toBe(2);
+          expect(fs.existsSync(path.join(h.owner.actorRoots.project, h.project.id))).toBe(false);
+          expect(fs.existsSync(path.join(h.owner.actorRoots.session, h.session.id))).toBe(false);
+          expect(store.records().map(row => row.id)).toEqual(expect.arrayContaining([durable.id, unrelated.id]));
+          for (const id of [durable.id, unrelated.id]) for (const file of ["session.jsonl", "mailbox.json", "queue.json"]) {
+            expect(fs.readFileSync(path.join(h.owner.actorRoots.project, id, file), "utf8")).toBe(`${file}-${id}\n`);
+          }
+        } else {
+          const before = snapshot(h.root);
+          const result = await h.run(`return await agents.prune({ root: "session:old-main", dryRun: ${mode} });`);
+          expect(result.success, result.error).toBe(false);
+          expect(result.error).toMatch(/live lineage.*native Main/i);
+          expect(snapshot(h.root)).toEqual(before);
+          expect(snapshot(path.join(h.mesh.root, "actors"))).toEqual(actorBytes);
+          expect(() => process.kill(ready.pid, 0)).not.toThrow();
+          expect(child.exitCode).toBeNull(); expect(child.signalCode).toBeNull();
+        }
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        await exited;
+      }
+    }, 25_000);
+
   it.each(["invalid", "invalid-fields", "unreadable", "directory", "cached-renewal"])("F1 refuses unknown %s lease evidence byte-for-byte", async fault => {
     const h = await fixture(); await h.owner.close();
     const file = await expiredOwner(h);

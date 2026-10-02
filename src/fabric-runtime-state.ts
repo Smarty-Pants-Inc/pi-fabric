@@ -216,6 +216,8 @@ export class FabricRuntimeState {
   #identity: MeshIdentity | undefined;
   #mainAgent: MainAgentController | undefined;
   #participants: ParticipantDirectory | undefined;
+  // Acquired before first publication/actor load; kept until all ownership writers stop.
+  #releaseNativeMainOwnership: (() => void) | undefined;
   #control: FabricControlPlane | undefined;
   #lifecycle: LifecycleBroker | undefined;
   #residency: ResidencyClient | undefined;
@@ -799,6 +801,7 @@ export class FabricRuntimeState {
     });
     // Publish Main ownership before any manager loads/schedules persisted actors. A
     // resumed root either wins this fence, or loads only prune's committed registry.
+    // Keep it for the runtime's lifetime: lease expiry is never proof of process death.
     const releaseMainStartup = ownsPersistentActorRegistry
       ? await acquireNativeMainStartupFence(meshRoot, mainAgentId)
       : undefined;
@@ -854,7 +857,12 @@ export class FabricRuntimeState {
               acquireCapabilityView: acquireActorCapabilityView,
             },
       ], actorRoots, this.#config.mesh.actorScope);
-    } finally { releaseMainStartup?.(); }
+      this.#releaseNativeMainOwnership = releaseMainStartup;
+    } catch (error) {
+      // No actor directory was installed: a failed first publication/load owns no work.
+      releaseMainStartup?.();
+      throw error;
+    }
     // A removal this Main accepted behind a run that its restart ended (a same-name create) is
     // finished here, as a resident host does at start; ownership limits it to this Main's actors.
     if (ownsPersistentActorRegistry) void this.#actors.finishPendingRemovals().catch(() => undefined);
@@ -1562,6 +1570,10 @@ export class FabricRuntimeState {
     } finally {
       await this.#participants?.close();
     }
+    // Closing participants is not enough: every actor/control writer above must drain
+    // before prune may obtain this persistent inode. A failed drain keeps us fenced.
+    this.#releaseNativeMainOwnership?.();
+    this.#releaseNativeMainOwnership = undefined;
     this.#registry = undefined;
     this.#config = undefined;
     this.#execution = undefined;
@@ -1684,6 +1696,8 @@ export class FabricRuntimeState {
     } finally {
       await this.#participants?.close();
     }
+    this.#releaseNativeMainOwnership?.();
+    this.#releaseNativeMainOwnership = undefined;
     this.#registry = undefined;
     this.#execution = undefined;
     this.#agents = undefined;

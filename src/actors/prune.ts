@@ -51,7 +51,7 @@ const residentFence = async <T>(mesh: MeshStore, root: string, dryRun: boolean,
     if (mainFd !== undefined) {
       const held = fs.fstatSync(mainFd);
       const current = fs.lstatSync(mainLocked);
-      if (!current.isFile() || current.dev !== held.dev || current.ino !== held.ino) unknown("native Main startup fence changed");
+      if (!current.isFile() || current.dev !== held.dev || current.ino !== held.ino) unknown("native Main ownership fence changed");
     }
     if (fd !== undefined) {
       const held = fs.fstatSync(fd);
@@ -87,22 +87,27 @@ const residentFence = async <T>(mesh: MeshStore, root: string, dryRun: boolean,
   };
   checkOwner();
   if (!dryRun && !kernelFenceAvailable()) unknown("resident startup fence unavailable; destructive prune requires Linux flock/setpriv");
-  if (!dryRun || (exists(locked) && process.platform === "linux")) {
-    if (!kernelFenceAvailable()) unknown("resident kernel fence unavailable");
-    if (!dryRun) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    try { fd = await lockFile(locked, 0, true, !dryRun); }
-    catch (error) { if (error instanceof FileLockBusy) refuse(); throw error; }
-  }
   try {
-    // Resident hosts keep host.lock for their lifetime. Native Main startup uses
-    // this second, short fence so it can resume beside its live resident host.
+    // Native Main keeps main-start.lock for its lifetime, independently of host.lock.
+    // Probe an existing resident inode without creating anything first. Do not create
+    // a missing resident inode until Main is fenced: either live owner refuses cleanly.
+    if (exists(locked) && process.platform === "linux") {
+      if (!kernelFenceAvailable()) unknown("resident kernel fence unavailable");
+      try { fd = await lockFile(locked, 0, true, false); }
+      catch (error) { if (error instanceof FileLockBusy) refuse(); throw error; }
+    }
+    if (!dryRun) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     if (!dryRun || (exists(mainLocked) && process.platform === "linux")) {
       if (!kernelFenceAvailable()) unknown("native Main kernel fence unavailable");
       try { mainFd = await lockFile(mainLocked, 0, true, !dryRun); }
       catch (error) {
-        if (error instanceof FileLockBusy) throw new Error(`Cannot prune live lineage ${root}: native Main startup is live`);
+        if (error instanceof FileLockBusy) throw new Error(`Cannot prune live lineage ${root}: native Main startup/ownership is live`);
         throw error;
       }
+    }
+    if (!dryRun && fd === undefined) {
+      try { fd = await lockFile(locked, 0, true); }
+      catch (error) { if (error instanceof FileLockBusy) refuse(); throw error; }
     }
     checkOwner(); return await operation(checkOwner);
   } finally {

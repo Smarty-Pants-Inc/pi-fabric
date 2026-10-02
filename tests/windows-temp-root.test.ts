@@ -137,6 +137,7 @@ describe("Windows file-data namespace ACL policy", () => {
   });
 
   it("uses the absolute OS executable and transports names as data, with bounded execution", () => {
+    vi.stubEnv("PSModulePath", "C:\\Program Files\\PowerShell\\7\\Modules");
     const unusual = "R:\\private\\quote'$;日本語";
     directories[2]!.path = unusual;
     expect(windowsDataRoot(unusual)).toBe(unusual);
@@ -144,10 +145,11 @@ describe("Windows file-data namespace ACL policy", () => {
     expect(exe).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
     expect(args).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", expect.any(String)]);
     const source = Buffer.from((args as string[])[4]!, "base64").toString("utf16le");
+    expect(source.startsWith("$ErrorActionPreference = 'Stop'\nImport-Module Microsoft.PowerShell.Security -ErrorAction Stop\n")).toBe(true);
     expect(source).toContain("RawSecurityDescriptor");
     expect(source).toContain("Get-Acl -LiteralPath");
     expect(source).not.toContain(unusual);
-    expect(options).toMatchObject({ timeout: 15000, windowsHide: true, encoding: "utf8", env: { PI_FABRIC_ACL_CHAIN: JSON.stringify([paths[0], paths[1], unusual]) } });
+    expect(options).toMatchObject({ timeout: 15000, windowsHide: true, encoding: "utf8", env: { PSModulePath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules", PI_FABRIC_ACL_CHAIN: JSON.stringify([paths[0], paths[1], unusual]) } });
   });
 
   it.each(["\\\\??\\\\C:\\\\hidden", "\\\\Device\\\\LanmanRedirector\\\\share", "\\\\Device\\\\CdRom0", "unknown", ""])("rejects unproven, mapped or substituted device %j", device => {
@@ -155,7 +157,7 @@ describe("Windows file-data namespace ACL policy", () => {
     expect(() => windowsDataRoot(root)).toThrow(/not a proven direct local volume/);
   });
 
-  it.each(["ENOENT", "ETIMEDOUT", "EACCES"])("fails closed on native command error %s, without creating anything", code => {
+  it.each(["ENOENT", "ETIMEDOUT", "EACCES", "CouldNotAutoloadMatchingModule"])("fails closed on native command error %s, without creating anything", code => {
     vi.mocked(childProcess.execFileSync).mockImplementation(() => { throw Object.assign(new Error(code), { code }); });
     const mkdir = vi.spyOn(fs, "mkdirSync");
     expect(() => windowsDataRoot(root)).toThrow(/could not prove native Windows ACL/);

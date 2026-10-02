@@ -1,5 +1,6 @@
 import childProcess from "node:child_process";
 import path from "node:path";
+import { windowsSecurityPowerShell } from "./windows-powershell.js";
 
 // Use SIDs, not localized names or the caller's group membership. These principals
 // can already administer the machine. Services and ordinary user groups are not trusted.
@@ -20,7 +21,6 @@ const uint32 = (value: unknown): value is number => typeof value === "number" &&
 // as PowerShell source. Raw descriptors preserve null DACLs and unsupported ACEs
 // that GetAccessRules() or localized icacls text could hide. No profiles or writes.
 const INSPECT_ACLS = String.raw`
-$ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 try {
   $paths = ConvertFrom-Json -InputObject $env:PI_FABRIC_ACL_CHAIN
@@ -88,12 +88,9 @@ export const windowsDataRoot = (root: string): string => {
   }
   let snapshot: unknown;
   try {
-    const systemRoot = process.env.SystemRoot;
-    if (!systemRoot || !path.win32.isAbsolute(systemRoot)) throw new Error("Windows system directory is unavailable");
-    const output = childProcess.execFileSync(path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), [
-      "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(INSPECT_ACLS, "utf16le").toString("base64"),
-    ], {
-      env: { ...process.env, PI_FABRIC_ACL_CHAIN: JSON.stringify(chain) },
+    const command = windowsSecurityPowerShell(INSPECT_ACLS, { ...process.env, PI_FABRIC_ACL_CHAIN: JSON.stringify(chain) });
+    const output = childProcess.execFileSync(command.file, command.args, {
+      env: command.env,
       encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 1024 * 1024,
       stdio: ["ignore", "pipe", "pipe"],
     });

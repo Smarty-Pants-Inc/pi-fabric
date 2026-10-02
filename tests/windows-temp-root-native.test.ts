@@ -5,21 +5,22 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createScratch } from "../src/storage/scratch.js";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
+import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
 
 // A normal Windows drive root may allow Users to create directories. Do not weaken
 // ancestor checks or rewrite the runner's C:/D: ACLs to get a positive control.
 // windows-latest runs elevated: use an isolated, disposable 64 MiB NTFS VHD instead.
 // Setup failure on Windows is a failure, never a silent skip of native ACL evidence.
-const native = (source: string, values: Record<string, string | number> = {}): string => childProcess.execFileSync(
-  path.join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
-  ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(`
-$ErrorActionPreference = 'Stop'
+const native = (source: string, values: Record<string, string | number> = {}): string => {
+  const command = windowsSecurityPowerShell(`
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $p = ConvertFrom-Json -InputObject $env:FABRIC_ACL_TEST_VALUES
 ${source}
-`, "utf16le").toString("base64")],
-  { env: { ...process.env, FABRIC_ACL_TEST_VALUES: JSON.stringify(values) }, encoding: "utf8", windowsHide: true, timeout: 20_000, stdio: ["ignore", "pipe", "pipe"] },
-).trim();
+`, { ...process.env, FABRIC_ACL_TEST_VALUES: JSON.stringify(values) });
+  return childProcess.execFileSync(command.file, command.args,
+    { env: command.env, encoding: "utf8", windowsHide: true, timeout: 20_000, stdio: ["ignore", "pipe", "pipe"] },
+  ).trim();
+};
 
 const PRIVATE_ACL = String.raw`
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -82,7 +83,9 @@ const diskpart = (commands: string[]) => {
 const detach = () => {
   if (!backing) return;
   const vhd = path.join(backing, "acl-fixture.vhd");
-  if (fs.existsSync(vhd)) diskpart([`select vdisk file="${vhd}"`, "detach vdisk"]);
+  // Setup may already have detached the fixture. Ignore that diskpart error,
+  // but still fail below if the volume remains mounted after the command.
+  if (fs.existsSync(vhd)) diskpart([`select vdisk file="${vhd}"`, "detach vdisk noerr"]);
   if (volume && fs.existsSync(volume)) throw new Error(`Native ACL test VHD did not detach: ${volume}`);
 };
 const privateDirectory = (name = "private") => {

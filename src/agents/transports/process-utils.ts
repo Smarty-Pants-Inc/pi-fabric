@@ -260,7 +260,7 @@ export const spawnDetached = async (
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
-): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined }> => {
+): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
   const child = spawn(runtime, [workerPath, ...workerArguments], {
@@ -281,17 +281,28 @@ export const spawnDetached = async (
   const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
   let stopping: Promise<void> | undefined;
   let lost: string | undefined;
+  const unconfirmed = (reason: string): void => {
+    if (lost !== undefined) return;
+    lost = reason;
+    try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
+  };
   child.unref();
   return {
     pid,
     lostContact: () => lost,
+    async waitForClose() {
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([closed, new Promise<void>(resolve => {
+          deadline = setTimeout(() => {
+            unconfirmed("Owned process worker did not confirm native close within 7000ms");
+            resolve();
+          }, 7_000);
+        })]);
+      } finally { clearTimeout(deadline); }
+    },
     stop() {
       return stopping ??= (async () => {
-        const unconfirmed = (reason: string): void => {
-          if (lost !== undefined) return;
-          lost = reason;
-          try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
-        };
         let deadline: ReturnType<typeof setTimeout> | undefined;
         try {
           await Promise.race([

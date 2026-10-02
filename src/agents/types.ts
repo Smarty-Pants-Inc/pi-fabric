@@ -348,6 +348,8 @@ export interface AgentTransportHandle {
   lostContact?(): string | undefined;
   /** Optional checked session observation; absence alone is NOT a worker exit receipt. */
   observe?(options?: AgentTransportObservationOptions): Promise<AgentTransportObservation>;
+  /** Bounded join of the captured process worker's native close (not PID absence). */
+  waitForClose?(): Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;
 }

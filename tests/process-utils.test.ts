@@ -42,7 +42,7 @@ async function cleanupOwnedRoot(root: string, children: OwnedChild[]) {
 
 async function withOwnedWorker(
   source: string,
-  run: (handle: Awaited<ReturnType<typeof spawnDetached>>, root: string, child: ChildProcess) => Promise<void>,
+  run: (handle: Pick<Awaited<ReturnType<typeof spawnDetached>>, "pid" | "stop" | "isAlive" | "lostContact">, root: string, child: ChildProcess) => Promise<void>,
   workerArguments?: string[],
 ) {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
@@ -133,6 +133,38 @@ fs.writeFileSync("env.json", JSON.stringify({role:process.env.SMARTY_ROLE,overri
 });
 
 describe("spawnDetached", () => {
+  it.each(["confirmed", "timeout"] as const)("bounds the independent captured-close join (%s)", async outcome => {
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn() });
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess);
+    const unconfirmed = vi.fn();
+    const handle = await spawnDetached("worker.mjs", [], process.cwd(), { onUnconfirmedExit: unconfirmed });
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    child.emit("exit", 0);
+    let joined = false;
+    const joining = handle.waitForClose().then(() => { joined = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(6_999);
+      expect(joined, "native exit is not captured close").toBe(false);
+      expect(kill).not.toHaveBeenCalled();
+      if (outcome === "confirmed") child.emit("close", 0);
+      else await vi.advanceTimersByTimeAsync(1);
+      await joining;
+      expect(joined).toBe(true);
+      expect(unconfirmed).toHaveBeenCalledTimes(outcome === "timeout" ? 1 : 0);
+      expect(handle.lostContact() !== undefined).toBe(outcome === "timeout");
+      child.emit("close", 0);
+      await handle.waitForClose();
+      expect(handle.lostContact() !== undefined, "late close cannot erase persistent uncertainty").toBe(outcome === "timeout");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      child.emit("close", 0);
+      await joining;
+      vi.useRealTimers();
+    }
+  });
+
+
   it("joins native close even after exit, without signalling a reused PID", async () => {
     const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn() });
     vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess);

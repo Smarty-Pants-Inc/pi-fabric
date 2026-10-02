@@ -74,6 +74,48 @@ const writeSession = (agentDir: string, cwd: string, name: string, mtime: Date):
   return file;
 };
 
+// Negative control: preserves evidence but does all scanning before yielding.
+const blockingSessionScan: typeof sessionWindowEvidenceAsync = async (files) =>
+  sessionWindowEvidence(files);
+
+const timerProgressDuringScan = async (
+  scan: typeof sessionWindowEvidenceAsync,
+  files: readonly string[],
+) => {
+  let completed = false;
+  let timerAdvancedDuringScan = false;
+  let bytesReadDuringTimer = 0;
+  const createReadStream = fs.createReadStream;
+  const inputs: fs.ReadStream[] = [];
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const stream = vi.spyOn(fs, "createReadStream").mockImplementation((file, options) => {
+    const input = createReadStream(file, {
+      ...(typeof options === "string" ? { encoding: options } : options),
+      highWaterMark: 1024,
+    });
+    inputs.push(input);
+    // Gate the real stream after a chunk, not before the scan starts. The next
+    // chunk cannot arrive until the timer records whether the scan is pending.
+    input.once("data", () => {
+      input.pause();
+      timers.push(setTimeout(() => {
+        timerAdvancedDuringScan = !completed;
+        bytesReadDuringTimer = input.bytesRead;
+        input.resume();
+      }, 0));
+    });
+    return input;
+  });
+  try {
+    const evidence = await scan(files).finally(() => { completed = true; });
+    return { evidence, timerAdvancedDuringScan, bytesReadDuringTimer };
+  } finally {
+    stream.mockRestore();
+    for (const timer of timers) clearTimeout(timer);
+    for (const input of inputs) input.destroy();
+  }
+};
+
 describe("projectSessionFiles", () => {
   it("lists the newest project sessions first", () => {
     const agentDir = makeTempDir();
@@ -147,7 +189,7 @@ describe("async session pipeline", () => {
     expect((await read()).traceWindows[0]!.traces).not.toBe(truncated.traceWindows[0]!.traces);
   });
 
-  it("matches synchronous selection, evidence, and measurement without blocking timers", async () => {
+  it("matches synchronous selection, evidence, and measurement", async () => {
     const agentDir = makeTempDir();
     const older = writeSession(agentDir, "/repo", "old.jsonl", new Date(2020, 0, 1));
     const newer = writeSession(agentDir, "/repo", "new.jsonl", new Date(2021, 0, 1));
@@ -157,15 +199,30 @@ describe("async session pipeline", () => {
     const files = machineSessionFiles(agentDir, "/repo");
     expect(await machineSessionFilesAsync(agentDir, "/repo")).toEqual(files);
     const expectedEvidence = sessionWindowEvidence(files);
-    let eventLoopAdvanced = false;
-    const timer = setTimeout(() => {
-      eventLoopAdvanced = true;
-    }, 0);
     const evidence = await sessionWindowEvidenceAsync(files);
-    clearTimeout(timer);
-    expect(eventLoopAdvanced).toBe(true);
     expect(evidence).toEqual(expectedEvidence);
     expect(await measureSessionCorpusAsync({ files })).toEqual(measureSessionCorpus({ files }));
+  });
+
+  it("advances a timer while a session scan is still running", async () => {
+    const agentDir = makeTempDir();
+    const file = writeSession(agentDir, "/repo", "responsive.jsonl", new Date(2021, 0, 1));
+    // Multiple stream chunks ensure the timer runs before the corpus is exhausted.
+    fs.writeFileSync(file, `${sessionLine()}\n`.repeat(128));
+    const result = await timerProgressDuringScan(sessionWindowEvidenceAsync, [file]);
+    expect(result.evidence.traces).toHaveLength(128);
+    expect(result.timerAdvancedDuringScan).toBe(true);
+    expect(result.bytesReadDuringTimer).toBeGreaterThan(0);
+    expect(result.bytesReadDuringTimer).toBeLessThan(fs.statSync(file).size);
+  });
+
+  it("detects a blocking scan in the timer-progress check", async () => {
+    const agentDir = makeTempDir();
+    const file = writeSession(agentDir, "/repo", "blocking.jsonl", new Date(2021, 0, 1));
+    fs.writeFileSync(file, `${sessionLine()}\n`.repeat(128));
+    const result = await timerProgressDuringScan(blockingSessionScan, [file]);
+    expect(result.evidence.traces).toHaveLength(128);
+    expect(result.timerAdvancedDuringScan).toBe(false);
   });
 
   it("stops a large session read when its signal aborts (smarty-dev#2010)", async () => {

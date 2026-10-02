@@ -122,6 +122,34 @@ describe("FabricControlPlane", () => {
     await vi.waitFor(() => expect(aborted).toHaveBeenCalledOnce(), { timeout: 2_000 });
     expect(sender.mesh.read({ topic: "fabric.control.command", limit: 20 }).filter(event => event.kind === "cancel")).toHaveLength(0);
   });
+  it("keeps the production local deadline at 5 s and does not run a command arriving just after it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-local-deadline-"));
+    roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender", {}, { acknowledgementTimeoutMs: 5_000 });
+    const receiver = plane(path.join(root, "mesh"), "host:receiver", {}, { acknowledgementTimeoutMs: 5_000 });
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const receive = vi.fn(() => ({ accepted: true }));
+    const outcome = sender.request("host:receiver", "agent:target", "stop").catch((error: Error) => error);
+    try {
+      sender.start(() => ({ accepted: false }));
+      await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(1));
+      const command = sender.mesh.read({ topic: "fabric.control.command" })[0]!.data as FabricControlCommand;
+      expect(command.deadlineAt).toBe(command.requestedAt + 5_000);
+      now = command.requestedAt + 5_001;
+      receiver.start(receive);
+      expect(await outcome).toMatchObject({ message: "Fabric control command expired; not delivered, safe to resend." });
+      expect(receive).not.toHaveBeenCalled();
+      expect(sender.mesh.read({ topic: "fabric.control.ack" })[0]!.data)
+        .toMatchObject({ accepted: false, error: "Fabric control command expired", notRun: true });
+      expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(1);
+    } finally {
+      await sender.close(); await receiver.close();
+      await outcome;
+      clock.mockRestore();
+    }
+  });
+
   describe("pending mirrored owners", () => {
     const setup = async (timeoutMs = 1_000) => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-mirror-"));
@@ -503,6 +531,35 @@ describe("FabricControlPlane", () => {
     const settle = <T>(promise: Promise<T>) => promise.then(
       (value) => ({ value, error: undefined }), (error: Error) => ({ value: undefined, error }),
     );
+
+    it.each(["steer", "followUp", "stop"] as const)("reports a proven expired mirrored %s as not delivered and safe to resend", async (operation) => {
+      const f = await setup();
+      try {
+        f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 120_000 });
+        const outcome = settle(f.sender.request("host:owner", "agent:target", operation, {}, "identity:owner"));
+        // Messages retain their existing single notRun retry; stop never retries.
+        const attempts = operation === "stop" ? 1 : 2;
+        for (let attempt = 0; attempt < attempts; attempt++) {
+          await vi.advanceTimersByTimeAsync(0);
+          const command = f.commands().filter((event) => event.kind !== "cancel")[attempt]!.data as FabricControlCommand;
+          expect(command.deadlineAt).toBe(command.requestedAt + 30_000);
+          await vi.advanceTimersByTimeAsync(30_001);
+          await f.sender.mesh.publish({
+            topic: "fabric.control.ack", kind: "rejected", from: identity("identity:owner"), to: "host:sender",
+            data: { version: 1, commandId: command.commandId, targetId: "agent:target", accepted: false,
+              error: "Fabric control command expired", notRun: true, bridge: { from: "forge" } },
+          });
+          await vi.advanceTimersByTimeAsync(20);
+        }
+        const { error } = await outcome;
+        expect(error?.message).toBe("Fabric control command expired; not delivered, safe to resend.");
+        expect(error?.message).not.toContain("outcome is unknown");
+        expect(error).toHaveProperty("notRun", true);
+        expect(f.commands().map((event) => event.kind)).toEqual(Array(attempts).fill(operation));
+        await f.sender.close();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally { await f.dispose(); }
+    });
 
     it.each([[1, 30_000], [60_000, 60_000]])("uses configured bridge window %i, floored to %i ms", async (configured, expected) => {
       const f = await setup(false, true, true, configured);
@@ -2050,7 +2107,7 @@ describe("FabricControlPlane", () => {
 
     it("does not retry a command that is not a message", async () => {
       const { error, receive, commands } = await run("stop");
-      expect(error?.message).toBe("Fabric control command expired");
+      expect(error?.message).toBe("Fabric control command expired; not delivered, safe to resend.");
       expect(commands).toHaveLength(1);
       expect(receive).not.toHaveBeenCalled();
     }, 15_000);

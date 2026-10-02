@@ -170,6 +170,8 @@ export interface AgentRunRecord {
   budget?: FabricBudgetSummary;
   /** Transport identity (e.g. process PID), not the native Pi session. */
   sessionId?: string;
+  /** Linux process birth identity, persisted by the worker to detect PID reuse. */
+  processStartTime?: string;
   /** Latest native runner session; joins Pi gateway session_id to this run. */
   runnerSessionId?: string;
   /** Distinct native Pi sessions observed during this run, in first-seen order. */

@@ -555,7 +555,7 @@ describe("durable completion receipts", () => {
     fs.mkdirSync(agentsPath, { recursive: true });
     const result = {
       id, name: "durable worker", status, text: "authoritative full result", task: "work",
-      runner: "pi", transport: "process", cwd: state.root, startedAt: 1, updatedAt: 2, finishedAt: 2,
+      runner: "pi", transport: "process", sessionId: "2147483647", cwd: state.root, startedAt: 1, updatedAt: 2, finishedAt: 2,
       turns: 1, toolCalls: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     };
     fs.writeFileSync(path.join(runDirectory, "status.json"), JSON.stringify(result));
@@ -1209,6 +1209,11 @@ describe("durable completion receipts", () => {
         await host.start();
         if (route === "closed") await host.close();
         child = await retainedProcessWorker(path.join(seeded.runDirectory, "nested", "process-child"), worktree, childState);
+        if (childState === "missing-identity") {
+          const published = JSON.parse(fs.readFileSync(child.statusFile, "utf8"));
+          expect(published).toMatchObject({ status: "completed", transport: "process" });
+          expect(published).not.toHaveProperty("sessionId");
+        }
         expect(hasUnresolvedWorker(seeded.runDirectory)).toBe(false);
         await expect(invoke()).rejects.toThrow(/exit.*unconfirmed/);
         expect(join).toHaveBeenCalledTimes(route === "unknown" ? 1 : 0);
@@ -2623,6 +2628,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       status: "completed",
       runner: "pi",
       transport: "process",
+      sessionId: "2147483647", // Confirmed-absent parent: exercise the worktree fence, not the exit veto.
       cwd: worktree,
       startedAt: 1,
       updatedAt: 1,

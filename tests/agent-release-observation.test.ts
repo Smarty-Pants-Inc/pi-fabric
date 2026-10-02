@@ -74,6 +74,11 @@ describe("checked agent release observations", () => {
         await manager.wait(info.id);
         const run = manager.runDirectory(info.id)!;
         child = await retainedProcessWorker(path.join(run, "nested", "process-child"), info.worktree!, state);
+        if (state === "missing-identity") {
+          const published = JSON.parse(fs.readFileSync(child.statusFile, "utf8"));
+          expect(published).toMatchObject({ status: "completed", transport: "process" });
+          expect(published).not.toHaveProperty("sessionId");
+        }
         expect(hasUnresolvedWorker(run)).toBe(false);
         if (action === "cleanup") await expect(manager.cleanup(info.id, true)).rejects.toThrow(/exit.*unconfirmed/);
         else await manager.close();

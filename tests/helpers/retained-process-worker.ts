@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-export type RetainedProcessState = "running" | "terminal-live" | "unknown-identity";
-export const retainedProcessStates: RetainedProcessState[] = ["running", "terminal-live", "unknown-identity"];
+export type RetainedProcessState = "running" | "terminal-live" | "unknown-identity" | "missing-identity";
+export const retainedProcessStates: RetainedProcessState[] = ["running", "terminal-live", "unknown-identity", "missing-identity"];
 
 /** A detached worker with its own persistent nested record, but no managing handle/marker. */
 export const retainedProcessWorker = async (runDirectory: string, cwd: string, state: RetainedProcessState) => {
@@ -17,7 +17,7 @@ export const retainedProcessWorker = async (runDirectory: string, cwd: string, s
     fs.readFileSync(taskFile, "utf8");
     fs.writeFileSync(statusFile, JSON.stringify({
       status: state === "running" ? "running" : "completed", transport: "process",
-      sessionId: state === "unknown-identity" ? "not-a-pid" : String(process.pid),
+      ...(state === "missing-identity" ? {} : { sessionId: state === "unknown-identity" ? "not-a-pid" : String(process.pid) }),
       cwd: process.cwd(), startedAt: 1, updatedAt: 2,
     }));
     setInterval(() => fs.readFileSync(taskFile, "utf8"), 1000);

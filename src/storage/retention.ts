@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
+import { processStartTime } from "../residency/process-identity.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -21,6 +22,7 @@ interface RunRecordSummary {
   updatedAt?: number;
   transport?: string;
   sessionId?: string;
+  processStartTime?: string;
 }
 export interface RetentionSweepResult {
   removedRoots: string[];
@@ -113,11 +115,26 @@ export const runTreeExitVeto = (directory: string, depth = 0, expired: Deadline 
       if (!record.status || !TERMINAL_STATUSES.has(record.status)) {
         return `worker exit is unconfirmed: nonterminal process record (${directory})`;
       }
-      // Reuse the retention liveness probe: invalid PIDs and every query error
-      // except ESRCH are uncertainty, not proof of exit. A saved identity must
-      // be usable even when the worker reported a terminal UI status.
-      if (record.sessionId !== undefined && (typeof record.sessionId !== "string" ||
-          !/^\d+$/.test(record.sessionId) || processAlive(Number(record.sessionId)))) {
+      // A missing/invalid PID is unknown, not a never-launched record. ESRCH
+      // proves absence; a live PID is safe only if its checked start identity
+      // differs from the worker's saved identity (PID reuse). Query errors and
+      // unreadable birth identity never authorize removal.
+      const pid = typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
+        ? Number(record.sessionId) : NaN;
+      const validPid = Number.isSafeInteger(pid) && pid > 0;
+      let alive = false;
+      if (validPid) {
+        try { process.kill(pid, 0); alive = true; }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+            return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
+          }
+        }
+      }
+      const savedStart = typeof record.processStartTime === "string" && /^\d+$/.test(record.processStartTime)
+        ? record.processStartTime : undefined;
+      const currentStart = alive && savedStart ? processStartTime(pid) : undefined;
+      if (!validPid || (alive && (currentStart === undefined || currentStart === savedStart))) {
         return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
       }
     }
@@ -170,9 +187,8 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
     return true;
   } catch { return false; }
 };
-/** Explicit resident roots have no managed-temp owner. No birth identity is recorded for
- * their process workers (only status.json's transport/sessionId), so require terminal status,
- * and still veto live/unknown workers, nested survivors and unresolved markers. */
+/** Explicit resident roots have no managed-temp owner. Require terminal status
+ * plus checked process absence, and veto nested survivors and unresolved markers. */
 export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline): boolean => {
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
   return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired);

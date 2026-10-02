@@ -102,9 +102,10 @@ records to 64 KiB and the ledger to 64 MiB. Writes use append and `fsync`. This 
 Main/child native session IDs, class, role pin, candidates, shadow choice,
 confidence, probability, fixed reason, latency and time. A seeded native child
 session binds the recorded child ID to Pi, not just to the process transport.
-For worktree tasks, its header is atomically rebound to the final worktree cwd
-before launch; a failed rebind settles preparation failure instead of launching
-against the parent checkout. Retries and resumes retain that session and child ID.
+For worktree tasks, its header is seeded only after the final worktree cwd is
+known and before launch; a failed bind settles preparation failure instead of
+launching against the parent checkout. Retries and resumes retain that session
+and child ID.
 Once the terminal join is durable and workers have exited, `route-session.jsonl`
 is an owned run artifact collected by normal close/expiry retention. Pending
 outcomes, unresolved workers, links and unknown content still veto collection.

@@ -9,6 +9,8 @@ import {
 } from "./model-resolution.js";
 import { loadModelUsage } from "./model-usage.js";
 
+import { assertFabricModelAllowed, type FabricModelPolicy } from "./model-policy.js";
+
 const PI_MODEL_REFRESH_INTERVAL_MS = 10_000;
 
 interface RefreshableModelRegistry {
@@ -110,8 +112,10 @@ export const resolvePiModel = (options: {
   aliases: FabricModelAliases;
   defaultModel?: string | undefined;
   snapshot?: readonly FabricModelCandidate[] | undefined;
+  policy?: FabricModelPolicy;
 }): Promise<FabricModelCandidate> => {
   const query = options.selector?.trim() || options.defaultModel?.trim() || "";
+  assertFabricModelAllowed(query, options.policy);
   return resolveWithModelRefresh(options.registry, (exact) => {
     const live = registryCandidates(options.registry);
     const available = !options.snapshot
@@ -121,11 +125,13 @@ export const resolvePiModel = (options: {
         : [...options.snapshot, ...live.filter((model) => !options.snapshot!.some((known) =>
             known.provider.toLowerCase() === model.provider.toLowerCase() &&
             known.id.toLowerCase() === model.id.toLowerCase()))];
-    return resolveAvailablePiModel(query, {
+    const resolved = resolveAvailablePiModel(query, {
       aliases: options.aliases,
       available,
       lastUsed: loadModelUsage(),
       exact,
     });
+    assertFabricModelAllowed(`${resolved.provider}/${resolved.id}`, options.policy);
+    return resolved;
   });
 };

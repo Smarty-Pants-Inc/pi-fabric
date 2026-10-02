@@ -107,6 +107,68 @@ describe("shadow model routing", () => {
 });
 
 describe("durable route dispatch", () => {
+  it("preserves participant preparation arguments and explicitly marks required route pins", async () => {
+    const dir = root();
+    const preparePiModel = vi.fn(async (model: string | undefined, _requiredPin?: boolean) => model);
+    const manager = new AgentManager(dir, DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: path.join(dir, "runs"),
+      preparePiModel,
+    }); managers.push(manager);
+    await expect(manager.prepareModelForAdmission(pin.model, "pi")).resolves.toBe(pin.model);
+    expect(preparePiModel).toHaveBeenNthCalledWith(1, pin.model);
+    await expect(manager.prepareModelForAdmission(pin.model, "pi", undefined, true)).resolves.toBe(pin.model);
+    expect(preparePiModel).toHaveBeenNthCalledWith(2, pin.model, true);
+    await expect(manager.prepareModelForAdmission(undefined, "pi")).resolves.toBeUndefined();
+    expect(preparePiModel).toHaveBeenNthCalledWith(3, undefined);
+    expect(preparePiModel).toHaveBeenCalledTimes(3);
+  });
+  it.each(["startup", "resume"])("R3 refuses a replacement model during %s recovery", async phase => {
+    const dir = root();
+    const decision = await decideModelRoute(input, async () => response());
+    let preparations = 0;
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true }, {
+      workerPath: path.resolve(phase === "startup" ? "tests/fixtures/fake-worker-startup-retry.mjs" : "tests/fixtures/fake-worker.mjs"),
+      runRoot: path.join(dir, "runs"),
+      // Model disappears; ordinary fuzzy preparation would select the similar authenticated model.
+      preparePiModel: async () => ++preparations === 1 ? pin.model : "test/sol-next",
+    }); managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const result = await manager.run({ task: phase === "startup" ? "Recover startup" : "RESUME_AFTER_CRASH", routeDecision: decision, transport: "process" });
+    expect(preparations).toBe(2);
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("MODEL_ROUTE_PIN_MISMATCH");
+    const rows = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null });
+  }, 30000);
+  it("R3 binds native identity and cwd to the final worktree before launch", async () => {
+    const dir = root(); const final = root();
+    vi.spyOn(WorktreeManager.prototype, "create").mockResolvedValue({ gitRoot: dir, path: final, cwd: final, branch: "probe" });
+    vi.spyOn(WorktreeManager.prototype, "cleanup").mockResolvedValue(true);
+    const launch = ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const argv = request.workerArguments;
+      const file = argv[argv.indexOf("--session-file") + 1]!;
+      const session = SessionManager.open(file);
+      expect(session.getCwd()).toBe(final);
+      expect(session.getSessionId()).toBe(argv[argv.indexOf("--id") + 1]);
+      return launch.call(this, request);
+    });
+    const manager = new AgentManager(dir, DEFAULT_FABRIC_CONFIG.agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs") }); managers.push(manager);
+    await manager.run({ task: "lookup", worktree: true, routeDecision: await decideModelRoute(input, async () => response()) });
+  });
+  it("R3 close collects a successful routed session in the default managed root", async () => {
+    const dir = root();
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs") }); managers.push(manager);
+    const result = await manager.run({ task: "lookup", routeDecision: await decideModelRoute(input, async () => response()) });
+    const runRoot = path.dirname(manager.runDirectory(result.id)!);
+    roots.push(runRoot);
+    expect(fs.existsSync(path.join(runRoot, result.id, "route-session.jsonl"))).toBe(true);
+    await manager.close();
+    expect(fs.existsSync(runRoot)).toBe(false);
+  });
   it.skipIf(process.platform === "win32").each(["parent", "leaf"])("R2 ignores workspace ledger %s links", async kind => {
     const dir = root(); const outside = root(); const target = path.join(outside, "target"); fs.writeFileSync(target, "unchanged");
     if (kind === "parent") { fs.mkdirSync(path.join(dir, ".pi")); fs.symlinkSync(outside, path.join(dir, ".pi/fabric"), "dir"); }
@@ -232,7 +294,7 @@ describe("durable route dispatch", () => {
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     const result = await manager.run({ task: recovery === "startup-retry" ? "Recover startup" : "RESUME_AFTER_STOP", routeDecision: decision, transport: "process" });
     expect(result.status).not.toBe("completed");
-    expect(result.error).toMatch(/pin.*changed/i);
+    expect(result.error).toContain("MODEL_ROUTE_PIN_MISMATCH");
     expect(launch).toHaveBeenCalledTimes(1);
     expect(preparations).toBe(2);
     const rows = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n").map(line => JSON.parse(line));

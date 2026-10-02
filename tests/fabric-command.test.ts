@@ -241,6 +241,9 @@ describe("/fabric command", () => {
           { provider: "openai", id: "executor" },
           { provider: "anthropic", id: "other" },
         ],
+        find: (provider: string, id: string) =>
+          [{ provider: "openai", id: "executor" }, { provider: "anthropic", id: "other" }]
+            .find(model => model.provider === provider && model.id === id),
       },
       sessionManager: { getSessionId: () => "session-1", getBranch: () => [] },
       ui: { select, setStatus: vi.fn(), notify: vi.fn() },

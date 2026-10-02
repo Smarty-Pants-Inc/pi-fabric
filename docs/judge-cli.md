@@ -84,7 +84,8 @@ endpoint/authentication override.
 4. Worker: `tools:[]`, `extensions:false`, `recursive:false`, full-code off,
    empty private cwd, no ambient skills/prompts/context/themes/project resources,
    no auto-compaction; fixed system prompt replaces ambient system instructions.
-   Only the reviewed reply and route hooks load. The evidence packet is JSON
+   Only the reviewed host delivery, native-session-ID, reply and route hooks load;
+   delivery/session observation adds no model tool authority. The evidence packet is JSON
    wrapped/labelled UNTRUSTED DATA. The result must be one schema-validated
    `fabric_reply`; free text is not a verdict. Central citation/finite-action
    validation runs again before acceptance.

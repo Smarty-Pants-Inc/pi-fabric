@@ -135,22 +135,28 @@ export function appendRouteRecord(file: string, record: object): void {
   }
 }
 
-export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string, runDirectory: string, childId: string, options: { ledger?: string; decisionRecorded?: boolean } = {}): {
-  header: string; sessionFile?: string; bindCwd: (cwd: string) => void; outcome: (result: Pick<AgentRunResult, "status"> & Partial<AgentRunResult>) => void;
+export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string | undefined, runDirectory: string, childId: string, options: { ledger?: string; decisionRecorded?: boolean } = {}): {
+  header: string; sessionFile?: string; bindSession: (cwd: string) => string; outcome: (result: Pick<AgentRunResult, "status"> & Partial<AgentRunResult>) => void;
 } {
   const file = options.ledger ?? path.join(resolveAgentDir(), "fabric", "model-routing.jsonl");
   let sessionFile: string | undefined;
-  const sessionHeader = { type: "session", version: CURRENT_SESSION_VERSION,
-    id: childId, timestamp: new Date().toISOString(), cwd };
-  try {
-    // Seed a real native Pi session so the decision's child ID is not a guessed transport ID.
+  // Record before admission; seed only once the run's final worktree is known.
+  // A seed write failure must never fall back to a different working directory.
+  const bindSession = (finalCwd: string): string => {
     fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
-    const childSessionFile = path.join(runDirectory, "route-session.jsonl");
-    fs.writeFileSync(childSessionFile, `${JSON.stringify(sessionHeader)}\n`, { mode: 0o600 });
-    sessionFile = childSessionFile;
+    const file = path.join(runDirectory, "route-session.jsonl");
+    fs.writeFileSync(file, `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION,
+      id: childId, timestamp: new Date().toISOString(), cwd: finalCwd })}\n`, { mode: 0o600 });
+    sessionFile = file;
+    return file;
+  };
+  try {
+    // Direct callers may already know the final cwd; manager binds after worktree creation.
+    fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
+    if (cwd !== undefined) bindSession(cwd);
     if (!options.decisionRecorded) appendRouteRecord(file, { type: "decision", ...decision, childSessionId: childId, childAgentId: childId, at: Date.now() });
   } catch (error) {
-    // Judgment dispatch is fail-closed; the shadow path retains its historical fallback.
+    // Judgment dispatch is fail-closed; only shadow routing may fall back.
     if (decision.mode === "judgment") throw error;
     decision.reasonCode = "record-failed";
     Object.assign(decision, decision.pin);
@@ -160,14 +166,7 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string, 
   let pendingRecord: object | undefined;
   const pendingFile = path.join(runDirectory, "pending-route-outcome.json");
   return {
-    header: routeHeader(decision), ...(sessionFile ? { sessionFile } : {}),
-    bindCwd(finalCwd) {
-      if (!sessionFile || finalCwd === sessionHeader.cwd) return;
-      // Pi opens --session using its header cwd, not the transport's launch cwd.
-      // Only the pristine seed is rebound; retries/resumes keep this same native ID.
-      // A failed rebind must refuse launch rather than fall back to the parent seed.
-      writeJsonAtomic(sessionFile, { ...sessionHeader, cwd: finalCwd }, { durable: true, newline: true });
-    },
+    header: routeHeader(decision), ...(sessionFile ? { sessionFile } : {}), bindSession,
     outcome(result) {
       if (appended) return;
       pendingRecord ??= { type: "outcome", decisionId: decision.decisionId, childSessionId: childId,

@@ -3,7 +3,6 @@ import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
-import { killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp } from "./core/pattern-kill.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
@@ -110,11 +109,12 @@ import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import path from "node:path";
+import { writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
 import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
 import { readStoppedRuns, takeReloadStoppedNotice } from "./agents/stopped-runs.js";
-import { installSelfReload, RELOAD_HELD_TOPIC, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
+import { installSelfReload, reloadTargetUiHold, RELOAD_HELD_TOPIC, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -674,26 +674,41 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
     // bootstrap() cancels any live arm; the borrowed Main model survives so a
     // new session that inherited the in-place executor can snap back.
-    await restoreBorrowedInPlaceMain(state.prewalk, pi, context);
+    await restoreBorrowedInPlaceMain(state.prewalk, pi, context, () => state.config.agents);
     refreshCodePreviewSettings();
     applyFabricMode();
     // Results of task agents the last reload/shutdown stopped reach the spawner now (smarty-dev#1602).
     const stoppedUndelivered = readStoppedRuns(context.sessionManager?.getEntries?.() ?? []).undelivered.length > 0;
     // A self-reload (smarty-dev#2160) re-arms the actors this Main hosts and reports on the mesh.
     const selfReloaded = selfReload.sessionStart(event?.reason ?? "", context);
-    if (selfReloaded && context.hasUI) {
-      const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
-      context.ui.notify(notice, "info");
-      // The TUI's own "Reloaded ..." status line replaces an info notice; the footer keeps it
-      // until the user's next input.
-      context.ui.setStatus(SELF_RELOAD_STATUS, notice);
-    }
-    if (stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
-    if (selfReloaded) {
-      await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
-        ...selfReloaded,
-        sessionId: context.sessionManager.getSessionId(),
-      });
+    const { releaseSlot, ...reloadReport } = selfReloaded ?? {};
+    try {
+      if (selfReloaded && context.hasUI) {
+        const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
+        context.ui.notify(notice, "info");
+        // Keep the notice after the TUI's own reload status line replaces it.
+        context.ui.setStatus(SELF_RELOAD_STATUS, notice);
+      }
+      const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
+      const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
+      if (residentProbe && (context.mode !== "rpc" || !process.env.PI_FABRIC_PARENT_RUN)) {
+        throw new Error("resident startup probe requires a bound RPC worker");
+      }
+      if (residentProbe || stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+      if (residentProbe) {
+        // Positive native ACK is published only after this generation activated.
+        writeSync(1, `${JSON.stringify({ type: "fabric_resident_extension_ready", protocol: 1,
+          runId: process.env.PI_FABRIC_PARENT_RUN, nonce: probeNonce, extension: FABRIC_EXTENSION_ENTRY_PATH })}\n`);
+      }
+      if (selfReloaded) {
+        await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
+          ...reloadReport,
+          sessionId: context.sessionManager.getSessionId(),
+        });
+      }
+    } finally {
+      // Hold the lease through activation, actor re-arm and reporting, even on failure.
+      releaseSlot?.();
     }
   });
 
@@ -758,6 +773,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
     const sessionId = context.sessionManager.getSessionId();
     const settledInPlace = await settleInPlacePrewalk(state.prewalk, pi, context, {
+      policy: () => state.config.agents,
       compactOnReturn: state.config.prewalk.compactOnReturn,
       compact: state.compact,
     });
@@ -831,14 +847,16 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // smarty-dev#774: a kill by name pattern kills other owners' processes on a shared host. Every
   // session that loads Fabric (Mains, task agents, actors) runs this, and fabric_exec's pi.bash
   // emits the same tool_call.
+  let literalGuard: Promise<typeof import("./core/literal-bash-guard.js")> | undefined;
   pi.on("tool_call", async (event) => {
     if (event.toolName !== "bash") return undefined;
     const { command, timeout } = event.input as { command?: unknown; timeout?: unknown };
     if (typeof command !== "string") return undefined;
-    if (killsByPattern(command)) return { block: true, reason: PATTERN_KILL_REASON };
-    if (wipesTmp(command)) return { block: true, reason: TMP_WIPE_REASON };
-    // Load the optional shell parser on actual bash use, not idle registration.
+    const { bashGuardRefusal } = await (literalGuard ??= import("./core/literal-bash-guard.js"));
     const { foregroundWaitRefusal } = await import("./guards/foreground-wait.js");
+    // Guard-time host input, not a TMPDIR assignment or expansion in the command being guarded.
+    const guardReason = bashGuardRefusal(command, process.env.TMPDIR);
+    if (guardReason) return { block: true, reason: guardReason };
     const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);
     if (reason) return { block: true, reason };
     // smarty-dev#2184: judged on the caller's own timeout above, so the injected default never unblocks a wait.
@@ -892,6 +910,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     pendingHandoffs.delete(event.message.toolCallId);
 
     const outerToolResult = event.message as AgentToolResultMessage;
+    const outputArtifactWriter = state.outputArtifactWriter;
     const handoff = await state.runHandoffAtBoundary(
       pending,
       outerToolResult,
@@ -925,7 +944,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       fullOutput,
       modelOutputBudget(state.config.executor.maxOutputChars, boundarySucceeded),
       fullOutput,
-      undefined,
+      outputArtifactWriter,
       residentPriority ? { text: residentPriority, sections } : undefined,
     );
     const details =
@@ -1101,8 +1120,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       details: {},
     };
     if (!fabricProvenanceSupported(pi)) return { message, systemPrompt: `${systemPrompt}\n\n${guidance}` };
-    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
-    () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
     return { systemPrompt: `${systemPrompt}\n\n${guidance}` };
   });
 
@@ -1135,8 +1153,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       details: { names: fresh, origin: "skill" },
     };
     if (!fabricProvenanceSupported(pi)) return { message };
-    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
-    () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
   });
 
   // Work events a steer missed reach the Main with its next turn (smarty-dev#754).
@@ -1225,18 +1242,19 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       ? state.agents.runningCount() + state.actors.inFlightCount() + state.backgroundWorkCount()
       : 0,
     autoReloadConfigured: () => state.provisionalConfig().autoReload,
+    selfReloadConcurrency: () => state.provisionalConfig().selfReloadConcurrency,
     moduleUrl: import.meta.url,
     publishHeld: data => { void state.publishOpsEvent(RELOAD_HELD_TOPIC, "fabric.reload_held", data); },
     // Escape's stop-the-world halt of actors or Jev observers (mesh off too); the user's next
     // input lifts it (review/astra on pi-fabric#158, #160).
     halted: () => escapeLatched || state.escapeHalted,
-    // The pinned public Pi UI API cannot query global native/extension dialogs, custom UI or
-    // the external editor. A resource-originated reload MUST fail closed until the host supplies
-    // a supported query covering all of these holds. Fabric's legacy package watch is unchanged.
-    reloadTargetUiHold: () => "unsupported-host:global-dialog/editor-hold-query",
+    // Pi's host-wide hold query covers native/extension dialogs, custom UI and editors.
+    // Old hosts remain fail-closed for resources and retain legacy Fabric-only behavior.
+    reloadTargetUiHold,
   });
 }
 
 export * from "./audit/index.js";
 export * from "./entropy/index.js";
 export * from "./protocol.js";
+export { FabricModelDeniedError } from "./core/model-policy.js";

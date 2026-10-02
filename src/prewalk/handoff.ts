@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { fabricHostIdentity, sendFabricMessage } from "../fabric-provenance.js";
+import { FabricModelDeniedError } from "../core/model-policy.js";
+import { sendFabricMessage } from "../fabric-provenance.js";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -26,7 +27,7 @@ import {
   type ThinkingTransferInput,
 } from "../agents/thinking-transfer.js";
 import { PREWALK_CONTINUE_MESSAGE_TYPE } from "./messages.js";
-import { setModelSafely } from "./model-switch.js";
+import { assertPrewalkModelAllowed, setModelSafely, type PrewalkModelPolicy } from "./model-switch.js";
 import type {
   FabricPrewalkPlanCheckpoint,
   FabricPrewalkClaim,
@@ -83,7 +84,6 @@ const PREWALK_FAILURE_MESSAGE_TYPE = "pi-fabric-prewalk-failure";
 // fail or mask the handoff outcome itself.
 const queuePrewalkFollowUp = (
   extension: ExtensionAPI,
-  context: ExtensionContext,
   customType: string,
   content: string,
   details: Record<string, unknown>,
@@ -91,7 +91,7 @@ const queuePrewalkFollowUp = (
   try {
     sendFabricMessage(extension,
       { customType, content, display: false, details },
-      { deliverAs: "followUp", triggerTurn: true }, () => fabricHostIdentity(context.sessionManager.getSessionId()), "followUp", "mesh",
+      { deliverAs: "followUp", triggerTurn: true },
     );
   } catch {
     // Swallow: a missed follow-up turn must not fail the handoff.
@@ -256,10 +256,13 @@ const runInPlacePrewalk = async (
   extension: ExtensionAPI,
   pending: PendingFabricHandoff,
   context: ExtensionContext,
+  policy?: PrewalkModelPolicy,
 ): Promise<Record<string, unknown>> => {
   const modelKey = String(pending.args.model ?? "");
+  assertPrewalkModelAllowed(modelKey, policy);
   context.ui.setStatus("fabric-prewalk", `switching Main → ${modelKey}`);
   const model = modelForKey(modelKey, context);
+  assertPrewalkModelAllowed(`${model.provider}/${model.id}`, policy);
   // Snapshot the pre-switch reasoning channel and branch. In-place handoff
   // cannot rewrite Pi's ground-truth log, so foreign thinking stays
   // unreplayable for the new model; bridge continuity with the bounded digest.
@@ -347,9 +350,15 @@ const runInPlacePrewalk = async (
       },
       timestamp: Date.now(),
     };
-    sendFabricMessage(extension, continuationMessage, { triggerTurn: false }, () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
+    sendFabricMessage(extension, continuationMessage, { triggerTurn: false });
   } catch (error) {
-    const restored = await setModelSafely(extension, returnModel);
+    let restored: boolean;
+    try {
+      restored = await setModelSafely(extension, returnModel, policy, returnModelKey);
+    } catch (refusal) {
+      controller.cancel();
+      throw refusal;
+    }
     if (!restored) {
       // Main is stuck on the executor: disarm so the next mutation cannot hand
       // off again, but keep the borrow so a later session start or /fabric
@@ -388,6 +397,7 @@ export const runFabricHandoffAtBoundary = async (
   outerToolResult: AgentToolResultMessage,
   context: ExtensionContext,
   activity?: (update: FabricInvocationActivityUpdate) => void,
+  policy?: PrewalkModelPolicy,
 ): Promise<Record<string, unknown>> => {
   const model = String(pending.args.model ?? "");
   const inPlace = pending.kind === "prewalk-in-place";
@@ -397,7 +407,7 @@ export const runFabricHandoffAtBoundary = async (
   );
   try {
     if (inPlace) {
-      const result = await runInPlacePrewalk(controller, extension, pending, context);
+      const result = await runInPlacePrewalk(controller, extension, pending, context, policy);
       pending.audit.success = true;
       pending.audit.result = result;
       pending.audit.endedAt = Date.now();
@@ -441,14 +451,14 @@ export const runFabricHandoffAtBoundary = async (
       // failed, stopped, or timed-out executor never ends the turn in silence.
       if (completed) {
         queuePrewalkFollowUp(
-          extension, context,
+          extension,
           PREWALK_CONTINUE_MESSAGE_TYPE,
           PREWALK_TRAJECTORY_VERIFY_PROMPT,
           { mode: "trajectory", model, trigger: pending.triggerRef },
         );
       } else {
         queuePrewalkFollowUp(
-          extension, context,
+          extension,
           PREWALK_FAILURE_MESSAGE_TYPE,
           PREWALK_TRAJECTORY_INCOMPLETE_PROMPT,
           {
@@ -462,7 +472,7 @@ export const runFabricHandoffAtBoundary = async (
       }
     }
     if (!continuing && pending.kind === "explicit") {
-      queueHandoffCompletion(extension, pending.args, result, () => fabricHostIdentity(context.sessionManager.getSessionId()));
+      queueHandoffCompletion(extension, pending.args, result);
     }
     context.ui.setStatus(
       "fabric-prewalk",
@@ -481,7 +491,9 @@ export const runFabricHandoffAtBoundary = async (
     pending.audit.success = false;
     pending.audit.error = message;
     pending.audit.endedAt = Date.now();
-    const failure = { handedOff: false, continued: false, completed: false, status: "failed", error: message };
+    const failure = { handedOff: false, continued: false, completed: false, status: "failed", error: message,
+      ...(error instanceof FabricModelDeniedError ? { errorCode: error.code } : {}),
+    };
     const continuing = !inPlace && queueHandoffFailureContinuation(extension, context, { ...failure, error });
     if (continuing) controller.cancel();
     if (!continuing && pending.kind.startsWith("prewalk-") && !inPlace) {
@@ -490,14 +502,14 @@ export const runFabricHandoffAtBoundary = async (
       // would only add a duplicate turn. Trajectory failures still end the
       // turn silently, so they queue the report-and-propose reply.
       queuePrewalkFollowUp(
-        extension, context,
+        extension,
         PREWALK_FAILURE_MESSAGE_TYPE,
         PREWALK_FAILURE_PROMPT,
         { mode: inPlace ? "in-place" : "trajectory", trigger: pending.triggerRef, error: message },
       );
     }
     if (!continuing && pending.kind === "explicit") {
-      queueHandoffCompletion(extension, pending.args, failure, () => fabricHostIdentity(context.sessionManager.getSessionId()));
+      queueHandoffCompletion(extension, pending.args, failure);
     }
     context.ui.setStatus("fabric-prewalk", continuing ? "handoff failed; executor continuing directly"
       : inPlace ? "in-place continuation failed" : "trajectory handoff failed");

@@ -7,6 +7,7 @@ import {
   markRunRootActive,
   markRunRootClosed,
   hasUnresolvedWorker,
+  runTreeExitVeto,
   markUnresolvedWorker,
   pruneActorRunArchives,
   RUN_ROOT_SWEEP_MARKER,
@@ -35,9 +36,51 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("shared run-tree exit veto", () => {
+  it("refuses malformed records and failed nested inspection rather than inferring exit", () => {
+    const run = temporaryDirectory();
+    const status = path.join(run, "status.json"); fs.writeFileSync(status, "{broken");
+    expect(runTreeExitVeto(run)).toMatch(/exit is unconfirmed/);
+    fs.writeFileSync(status, JSON.stringify({ status: "completed", transport: "process" }));
+    const nested = path.join(run, "nested"); fs.mkdirSync(nested);
+    const readdir = fs.readdirSync;
+    const fault = vi.spyOn(fs, "readdirSync").mockImplementation((...args: Parameters<typeof readdir>) => {
+      if (String(args[0]) === nested) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      return readdir(...args);
+    });
+    try { expect(runTreeExitVeto(run)).toMatch(/inspection failed/); }
+    finally { fault.mockRestore(); }
+    expect(runTreeExitVeto(run)).toBeUndefined();
+  });
+
+  it("refuses depth/deadline truncation and nested symlinks", () => {
+    const run = temporaryDirectory();
+    expect(runTreeExitVeto(run, 33)).toMatch(/incomplete/);
+    expect(runTreeExitVeto(run, 0, () => true)).toMatch(/incomplete/);
+    const target = temporaryDirectory(); fs.symlinkSync(target, path.join(run, "nested"), "junction");
+    expect(runTreeExitVeto(run)).toMatch(/unsafe nested/);
+    expect(fs.existsSync(target)).toBe(true);
+  });
+});
 describe("safe run roots", () => {
   const sweep = (tempRoot: string, now = 100 * DAY) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
 
+  it.each(["closed", "orphan"])("R3 collects owned route sessions in expired %s roots without weakening fences", kind => {
+    const tempRoot = temporaryDirectory();
+    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + kind);
+    for (const name of ["done", "pending", "live", "unresolved"]) {
+      const directory = path.join(root, name);
+      writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", ...(name === "live" ? { sessionId: String(process.pid) } : {}) });
+      fs.writeFileSync(path.join(directory, "route-session.jsonl"), '{"type":"session"}\n');
+      if (name === "pending") fs.writeFileSync(path.join(directory, "pending-route-outcome.json"), "{}");
+      if (name === "unresolved") markUnresolvedWorker(directory, "not joined");
+    }
+    fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, ...(kind === "closed" ? { closedAt: 1, childrenStopped: true } : { orphanedAt: 1 }) }));
+    const result = sweep(tempRoot);
+    if (kind === "closed") expect(result.removedRuns).toContain(path.join(root, "done"));
+    expect(fs.existsSync(path.join(root, "done"))).toBe(false);
+    for (const name of ["pending", "live", "unresolved"]) expect(fs.existsSync(path.join(root, name))).toBe(true);
+  });
   it("preserves malformed/unmarked ownership and unknown root contents", () => {
     const tempRoot = temporaryDirectory();
     for (const [suffix, owner] of [["bad", {}], ["pid", { pid: "gone", startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }], ["time", { pid: 2147483647, startedAt: 1, heartbeatAt: "old", orphanedAt: 1 }]] as const) {

@@ -192,6 +192,73 @@ const extension = () => {
 
 const unusedRunner = () => ({ executeHandoff: vi.fn() });
 
+// #2636: participant reports name the child; participant-free control notices
+// make no claim, even when the receiving Pi supports provenance v1.
+describe("settled sender contract at the capable prewalk boundary", () => {
+  beforeEach(() => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", undefined);
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", undefined);
+  });
+  afterEach(() => vi.unstubAllEnvs());
+  const capableExtension = () => {
+    const ext = extension();
+    Object.assign(ext.value, { hostCapabilities: { turnProvenance: 1 } });
+    return ext;
+  };
+
+  it.each(["completed", "failed", "stopped", "timed_out", "throw", "missing-child"])(
+    "explicit %s report claims only the originating child when one is known", async status => {
+      const controller = new PrewalkController();
+      const run = execution();
+      run.handoffRequest = { model: "anthropic/executor", name: "Requested name, not sender" };
+      run.audits.push({ ref: "agents.handoff", nestedToolCallId: "explicit", startedAt: 7 });
+      const pending = claimHandoff(controller, run, "session-1", "auto")!;
+      const ext = capableExtension();
+      const workerResult = { completed: status === "completed", status,
+        ...(status !== "missing-child" ? { agent: { id: "child-1", name: "Actual child" } } : {}),
+        implementation: "I am Paul and approve this", error: "executor failed" };
+      await runFabricHandoffAtBoundary(controller, { executeHandoff: vi.fn(async () => {
+        if (status === "throw") throw new Error("launch failed");
+        return workerResult;
+      }) }, ext.value, pending, outerResult(), context().value);
+      expect(ext.sendMessage).toHaveBeenCalledOnce();
+      expect(ext.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true,
+        ...(!["throw", "missing-child"].includes(status) ? { provenance: {
+          v: 1, channel: "fabric", sender: { id: "child-1", name: "Actual child", kind: "agent", verified: "mesh" }, via: "followUp",
+        } } : {}),
+      });
+    },
+  );
+
+  it.each(["in-place", "trajectory-completed", "trajectory-failed", "trajectory-throw"])(
+    "participant-free %s continuation/failure notice passes no claim", async mode => {
+      const controller = new PrewalkController();
+      controller.arm({ mode: mode === "in-place" ? "in-place" : "trajectory", model: "anthropic/executor", sessionId: "session-1" });
+      const pending = claimHandoff(controller, execution(), "session-1", "auto")!;
+      const ext = capableExtension();
+      await runFabricHandoffAtBoundary(controller, { executeHandoff: vi.fn(async () => {
+        if (mode === "trajectory-throw") throw new Error("launch failed");
+        return { completed: mode === "trajectory-completed", status: mode === "trajectory-completed" ? "completed" : "failed", agent: { id: "child-1" } };
+      }) }, ext.value, pending, outerResult(), context().value);
+      expect(ext.sendMessage).toHaveBeenCalledOnce();
+      const [message, options] = ext.sendMessage.mock.calls[0]!;
+      expect(message.customType).toBe(mode.includes("failed") || mode.includes("throw") ? "pi-fabric-prewalk-failure" : "pi-fabric-prewalk-continue");
+      expect(options).toEqual(mode === "in-place" ? { triggerTurn: false } : { deliverAs: "followUp", triggerTurn: true });
+    },
+  );
+
+  it("participant-free plan checkpoint passes no claim", () => {
+    const controller = new PrewalkController();
+    controller.arm({ model: "anthropic/executor", sessionId: "session-1", requirePlan: true });
+    const checkpoint = claimFabricHandoff(controller, execution(), "session-1", "auto")!;
+    if (checkpoint.kind !== "prewalk-plan") throw new Error("expected plan checkpoint");
+    const ext = capableExtension();
+    expect(deliverPrewalkPlanCheckpoint(ext.value, checkpoint)).toBe(true);
+    expect(ext.sendMessage).toHaveBeenCalledOnce();
+    expect(ext.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "steer", triggerTurn: true });
+  });
+});
+
 const bashExecution = (): FabricExecutionResult => ({
   ...execution(),
   audits: [
@@ -255,6 +322,15 @@ describe("trajectory executor handoff failure continuation", () => {
     };
     return { ctx, session, ext, controller, invoke };
   };
+
+  it("capable failed nested-handoff continuation keeps the calling task agent's id per #2636", async () => {
+    const h = prepare();
+    Object.assign(h.ext.value, { hostCapabilities: { turnProvenance: 1 } });
+    await h.invoke();
+    expect(h.ext.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true,
+      provenance: { v: 1, channel: "fabric", sender: { id: "trajectory-1", name: "trajecto", kind: "agent", verified: "mesh" }, via: "followUp" },
+    });
+  });
 
   describe.each(["explicit", "prewalk-trajectory"] as const)("%s boundary", (kind) => {
     it.each(["failed", "throw"])("continues the calling executor after %s without masking failure or re-arming", async (outcome) => {
@@ -546,6 +622,85 @@ describe("persisted in-place Prewalk recovery", () => {
 });
 
 describe("outer-boundary Prewalk", () => {
+  it.each(["settle", "cancel", "recovery", "canonical", "post-compact"] as const)("round 3 F2 refuses denied return on %s and retains recovery", async (path) => {
+    const controller = new PrewalkController();
+    const ctx = context();
+    const ext = extension();
+    let policy = { deniedModels: path === "post-compact" ? [] as string[] : ["anthropic/frontier"] };
+    if (path === "recovery") {
+      const session = ctx.value.sessionManager as SessionManager;
+      session.appendModelChange("anthropic", "executor");
+      session.appendCustomMessageEntry("pi-fabric-prewalk-continue", "Continue", false, {
+        mode: "in-place", model: "anthropic/executor", returnModel: "anthropic/frontier", continuationId: "recovery",
+      });
+    } else {
+      controller.arm({ model: "anthropic/executor", sessionId: "session-1", alwaysRearm: true });
+      const pending = claimHandoff(controller, execution(), "session-1", "json")!;
+      await runFabricHandoffAtBoundary(controller, unusedRunner(), ext.value, pending, outerResult(), ctx.value);
+      const continuation = ext.sendMessage.mock.calls[0]![0] as { details: { continuationId: string } };
+      controller.acceptContinuation("session-1", continuation.details.continuationId);
+      if (path === "cancel") controller.cancel();
+    }
+    ctx.value.model = ctx.target as typeof ctx.value.model;
+    ext.setModel.mockClear();
+    if (path === "canonical") {
+      policy.deniedModels = ["canonical/denied"];
+      const find = ctx.value.modelRegistry.find.bind(ctx.value.modelRegistry);
+      ctx.value.modelRegistry.find = ((provider: string, id: string) => provider === "anthropic" && id === "frontier"
+        ? { provider: "canonical", id: "denied" } : find(provider, id)) as typeof find;
+    }
+    const returning = path === "cancel" || path === "recovery"
+      ? restoreBorrowedInPlaceMain(controller, ext.value, ctx.value, policy)
+      : settleInPlacePrewalk(controller, ext.value, ctx.value, { policy: () => policy, ...(path === "post-compact" ? { compact: {
+          request() {}, async maybeCommit() { policy = { deniedModels: ["anthropic/frontier"] }; },
+        } } : {}) });
+    await expect(returning).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+    expect(ext.setModel).not.toHaveBeenCalled();
+    expect(ctx.value.model).toBe(ctx.target);
+    expect(controller.borrowedReturn()).toEqual({ returnModel: "anthropic/frontier", executorModel: "anthropic/executor" });
+    expect(controller.status().state).toBe("idle");
+    expect(ctx.value.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("#2236"), "error");
+    // Retry the retained obligation only when policy permits the same captured target.
+    policy.deniedModels = [];
+    expect(await restoreBorrowedInPlaceMain(controller, ext.value, ctx.value, policy)).toBe(true);
+    expect(ext.setModel).toHaveBeenCalledOnce();
+  });
+
+  it.each(["captured", "changed-during-switch"] as const)("round 3 F2 refuses denied continuation-failure rollback with typed classification (%s)", async timing => {
+    const controller = new PrewalkController();
+    controller.arm({ model: "anthropic/executor", sessionId: "session-1", alwaysRearm: true });
+    const pending = claimHandoff(controller, execution(), "session-1", "json")!;
+    const ctx = context(); const ext = extension();
+    let policy = { deniedModels: timing === "captured" ? ["anthropic/frontier"] : [] as string[] };
+    ext.setModel.mockImplementation(async model => {
+      ctx.value.model = model;
+      policy = { deniedModels: ["anthropic/frontier"] };
+      return true;
+    });
+    ext.sendMessage.mockImplementationOnce(() => { throw new Error("queue unavailable"); });
+    const result = await runFabricHandoffAtBoundary(controller, unusedRunner(), ext.value, pending, outerResult(), ctx.value, undefined, () => policy);
+    expect(result).toMatchObject({ status: "failed", continued: false, errorCode: "FABRIC_MODEL_DENIED", error: expect.stringContaining("#2236") });
+    expect(ext.setModel.mock.calls).toEqual([[ctx.target]]);
+    expect(ctx.value.model).toBe(ctx.target);
+    expect(controller.status().state).toBe("idle");
+    expect(controller.borrowedReturn()?.returnModel).toBe("anthropic/frontier");
+  });
+
+  it.each(["raw", "canonical"] as const)("review round A1 refuses %s in-place executor without switching Main or continuing", async (selection) => {
+    const controller = new PrewalkController();
+    const selector = selection === "raw" ? "cliproxyapi/gpt-6-astra" : "provider/alias";
+    controller.arm({ model: selector, sessionId: "session-1", task: "Implement the guard" });
+    const pending = claimHandoff(controller, execution(), "session-1", "json")!;
+    const ctx = context();
+    ctx.value.modelRegistry = { find: () => ({ provider: "cliproxyapi", id: "gpt-6-astra" }) } as unknown as ExtensionContext["modelRegistry"];
+    const ext = extension();
+    const result = await runFabricHandoffAtBoundary(controller, unusedRunner(), ext.value, pending, outerResult(), ctx.value, undefined, { deniedModels: ["cliproxyapi/gpt-6-astra"] });
+    expect(result).toMatchObject({ status: "failed", continued: false, error: expect.stringContaining("#2236") });
+    expect(ext.setModel).not.toHaveBeenCalled();
+    expect(ctx.value.model).toBe(ctx.sourceModel);
+    expect(ext.sendMessage).not.toHaveBeenCalled();
+    expect(controller.borrowedReturn()).toBeUndefined();
+  });
   it("switches Main in place and queues a hidden follow-up by default", async () => {
     const controller = new PrewalkController();
     controller.arm({

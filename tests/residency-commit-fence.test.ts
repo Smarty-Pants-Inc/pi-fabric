@@ -9,6 +9,7 @@ import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
+import { MeshProvider } from "../src/providers/mesh-provider.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { CPythonRuntime } from "../src/runtime/cpython-runtime.js";
@@ -462,7 +463,7 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   });
 });
 
-const mainProvider = (state: Awaited<ReturnType<typeof harness>>, caller: "main" | "nested" = "main") => {
+const mainProvider = (state: Awaited<ReturnType<typeof harness>>, caller: "main" | "nested" = "main", acknowledgementTimeoutMs = 3_000) => {
   const manager = new AgentManager(state.root, state.config.agents, { runRoot: path.join(state.root, "local-runs") });
   const identity = { id: state.config.rootId, name: "main", kind: "main" as const };
   const actors = new ActorDirectory(["caller", identity, state.client.options.mesh, state.config.mesh, manager, () => {}, {
@@ -477,7 +478,7 @@ const mainProvider = (state: Awaited<ReturnType<typeof harness>>, caller: "main"
     },
   }], { project: state.config.actorRoot, session: state.config.sessionActorRoot! }, "project");
   const control = new FabricControlPlane(state.client.options.mesh, identity, {
-    enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 3_000,
+    enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs,
   });
   control.start(() => ({ accepted: false }));
   const lifecycle = new LifecycleBroker(state.client.options.mesh, identity, state.participants,
@@ -1065,6 +1066,83 @@ describe("round 4 public cleanup-obligation retry cancellation", { timeout: 25_0
   }
 });
 
+describe("durable systemPrompt public contract (#2985)", { timeout: 25_000 }, () => {
+  it.each(["typed", "described"] as const)("%s spawn carries its public prompt to the durable worker", async (surface) => {
+    const state = await harness(false, undefined, 10_000);
+    const main = mainProvider(state);
+    try {
+      const run = publicExecution(state, main, "quickjs", 5_000);
+      const described = await run('return await tools.describe({ref:"agents.spawn"});');
+      expect(described.success, described.error).toBe(true);
+      expect(described.value).toMatchObject({ inputSchema: { properties: { systemPrompt: { type: "string" } } } });
+      const systemPrompt = "Audit only; report evidence without changing source.";
+      const args = { ...requestArgs(state, "spawn"), systemPrompt };
+      const code = surface === "typed" ? `return await agents.spawn(${JSON.stringify(args)});`
+        : `return await tools.call({ref:"agents.spawn",args:${JSON.stringify(args)}});`;
+      const result = await run(code);
+      expect(result.success, result.error).toBe(true);
+      expect(result.residentOutcomes).toBeUndefined();
+      const handle = result.value as { id: string; residency: string };
+      expect(handle.residency).toBe("durable");
+      const completed = await state.client.waitAgent(handle.id);
+      // The real host launches the fixture worker through ProcessTransport.
+      // Its status echoes the actual --system-prompt argument it received.
+      expect(completed).toMatchObject({ status: "completed", systemPrompt });
+      expect(decisionsFor(state)).toEqual([expect.objectContaining({ state: "committed", operation: "spawn", id: handle.id })]);
+    } finally { await main.close(); await state.close(); }
+  });
+});
+
+describe("invocation-local spawn receipts (#2947)", { timeout: 25_000 }, () => {
+  for (const engine of ["quickjs", "node"] as const) for (const interactiveMain of [false, true]) {
+    it(`${engine} completed followUp does not downgrade earlier spawns or poison later calls (Main=${interactiveMain})`, async () => {
+      const state = await harness(false, undefined, 10_000);
+      const main = mainProvider(state);
+      const controller = new AbortController();
+      main.registry.register(new MeshProvider(state.client.options.mesh, main.actors.identity, state.participants));
+      try {
+        const run = publicExecution(state, main, engine, 5_000, interactiveMain);
+        // Pi can reuse the outer cancellation signal across tool calls. It is
+        // observation authority, not an invocation's mutation receipt ledger.
+        const invoke = (code: string) => run(code, controller.signal);
+        const ids: string[] = [];
+        for (let index = 0; index < 2; index++) {
+          const spawned = await invoke(`return ${publicCall(engine, "spawn", requestArgs(state, "spawn"))};`);
+          expect(spawned.success, spawned.error).toBe(true);
+          expect(spawned.residentOutcomes).toBeUndefined();
+          ids.push((spawned.value as { id: string }).id);
+        }
+        await state.client.waitAgent(ids[0]!);
+        await waitFor(() => !state.participants.get(ids[0]!, undefined, { fresh: true })?.capabilities.includes("followUp"));
+        const rejected = await invoke(`return await agents.followUp({id:"${ids[0]}",message:"too late"});`);
+        expect(rejected.success).toBe(false);
+        expect(rejected.error).toContain("does not support followUp");
+        expect(rejected.error).not.toContain("ResidentOutcomeUnknownError");
+        expect(rejected.residentOutcomes).toBeUndefined();
+        const status = await invoke(`return await agents.status({id:"${ids[0]}"});`);
+        expect(status).toMatchObject({ success: true, value: { id: ids[0], status: "completed" } });
+        expect(status.residentOutcomes).toBeUndefined();
+        const fresh = await invoke(`return ${publicCall(engine, "spawn", requestArgs(state, "spawn"))};`);
+        expect(fresh.success, fresh.error).toBe(true);
+        expect(fresh.residentOutcomes).toBeUndefined();
+        expect(ids).not.toContain((fresh.value as { id: string }).id);
+        const effects = await invoke(`return await Promise.allSettled([
+          agents.followUp({id:${JSON.stringify(state.config.rootId)},message:"acknowledge"}),
+          mesh.publish({topic:"work/receipt-regression",text:"published once"})
+        ]);`);
+        expect(effects.success, effects.error).toBe(true);
+        expect(effects.residentOutcomes).toBeUndefined();
+        expect(effects.value).toEqual([
+          expect.objectContaining({ status: "fulfilled", value: expect.objectContaining({ messageId: "unused" }) }),
+          expect.objectContaining({ status: "fulfilled", value: expect.objectContaining({ sequence: expect.any(Number) }) }),
+        ]);
+        expect(decisionsFor(state).filter(decision => decision.operation === "spawn")).toHaveLength(3);
+        expect(controller.signal.aborted).toBe(false);
+      } finally { controller.abort(); await main.close(); await state.close(); }
+    });
+  }
+});
+
 describe("round 2 public execution receipt contract", { timeout: 25_000 }, () => {
   for (const engine of engines) {
     it(`${engine} public Main ceiling retains committed resident receipts through normalized provider signals`, async () => {
@@ -1634,5 +1712,185 @@ describe("round 1 public cancellation contract", () => {
       state.release.resolve(); await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
       expect(cleanup).not.toHaveBeenCalled(); expect(state.client.hasAgent(handle.id)).toBe(true);
     } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
+  });
+});
+
+// Match the actual native-control timeout, not only the residency constructor's
+// shorter "outcome unknown" spelling (smarty-dev#3172 audit item 7).
+const outcomeContamination = /ResidentOutcomeUnknownError|residentOutcomes|outcome(?:[- ]| is )unknown|Do not retry/i;
+
+describe("outcome-unknown cross-process receipt isolation (#3172)", { timeout: 40_000 }, () => {
+  it("recognizes the real uncertainty strings, including the outcome is unknown", () => {
+    for (const text of [
+      "Timed out waiting for the remote Fabric owner to acknowledge session:peer; the outcome is unknown and it may still be delivered",
+      "ResidentOutcomeUnknownError", "residentOutcomes", "outcome-unknown", "outcome unknown", "Do not retry or reassign",
+    ]) expect(text).toMatch(outcomeContamination);
+    expect("call 2 completed successfully").not.toMatch(outcomeContamination);
+  });
+
+  it("one native Pi prompt isolates spawn/publish/status/wait before and after the owner resumes; only a separate query reveals the late ACK", async () => {
+    // Same native Main harness as #243, but the failure is a REAL remote-owner
+    // acknowledgement timeout. A successful durable spawn in call 1 arms the
+    // cancellation effect which the pre-#243 shared Pi signal leaked forward.
+    // No injected receipt, synthetic ResidentOutcomeUnknownError or response file.
+    const { MeshProvider: ReceiptMeshProvider } = await import("../src/providers/mesh-provider.js");
+    const state = await harness(false, undefined, 10_000);
+    const main = mainProvider(state, "main", 500);
+    const mesh = state.client.options.mesh;
+    main.registry.register(new ReceiptMeshProvider(mesh, main.actors.identity, state.participants));
+    const ownerId = `session:unknown:${path.basename(state.root)}`;
+    const ownerRoot = path.join(state.root, "remote-owner");
+    fs.mkdirSync(ownerRoot);
+    const ownerConfig = path.join(ownerRoot, "config.json");
+    fs.writeFileSync(ownerConfig, JSON.stringify({ meshRoot: mesh.root, ownerId, root: ownerRoot }));
+    const owner = childProcess.spawn("bun", [path.resolve("tests/fixtures/outcome-unknown-owner.ts"), ownerConfig], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let ownerStderr = "";
+    owner.stderr!.on("data", data => { ownerStderr += String(data); });
+    const ownerExited = new Promise<void>((resolve, reject) => {
+      owner.once("error", reject); owner.once("close", () => resolve());
+    });
+    // Observe spawn errors immediately, but still await/rethrow at teardown.
+    void ownerExited.catch(() => undefined);
+    const config = normalizeFabricConfig({ fullCodeMode: true,
+      executor: { resultFormat: "json", timeoutMs: 8_000, maxOutputChars: 50_000, memoryLimitBytes: 256 * 1024 * 1024 },
+      entropy: { compile: false }, prewalk: { compactOnReturn: false },
+    });
+    const execution = new FabricExecutionService(main.registry, config);
+    const signals: Array<AbortSignal | undefined> = [];
+    const outcomes: Array<Awaited<ReturnType<FabricExecutionService["execute"]>>> = [];
+    const execute = execution.execute.bind(execution);
+    vi.spyOn(execution, "execute").mockImplementation(async options => {
+      signals.push(options.signal);
+      const result = await execute(options); outcomes.push(result); return result;
+    });
+    // Only native-session bootstrap is substituted, as in the #243 harness.
+    // The registered fabric_exec, runtime, registry, provider, residency commit,
+    // worker processes, mesh store and cross-process control exchange are real.
+    vi.spyOn(FabricState.prototype, "bootstrapped", "get").mockReturnValue(true);
+    vi.spyOn(FabricState.prototype, "config", "get").mockReturnValue(config);
+    vi.spyOn(FabricState.prototype, "execution", "get").mockReturnValue(execution);
+    vi.spyOn(FabricState.prototype, "bootstrap").mockResolvedValue(undefined);
+    vi.spyOn(FabricState.prototype, "ensure").mockResolvedValue(undefined);
+    vi.spyOn(FabricState.prototype, "claimHandoff").mockResolvedValue(undefined);
+    const faux = fauxProvider({ provider: "test", models: [{ id: "visible" }], tokensPerSecond: 10_000 });
+    const runtime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(state.root, "unused-auth.json") });
+    runtime.registerNativeProvider(faux.provider);
+    const manager = SessionManager.create(state.root, path.join(state.root, "sessions"));
+    let session: AgentSession | undefined;
+    let commandId = "";
+    const nextModelResults: string[] = [];
+    const textOf = (message: { content: Array<{ type: string; text?: string }> }) =>
+      message.content.filter(block => block.type === "text").map(block => block.text).join("\n");
+    const loader = new DefaultResourceLoader({ cwd: state.root, agentDir: path.join(state.root, "agent"),
+      noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [{ name: path.resolve("src/index.ts"), factory: async api => {
+        await piFabric(api);
+        api.on("context", event => {
+          const results = event.messages.filter(message => message.role === "toolResult" && message.toolName === "fabric_exec");
+          const last = results.at(-1);
+          if (last?.role === "toolResult") nextModelResults.push(textOf(last));
+        });
+      } }],
+    });
+    try {
+      await waitFor(() => fs.existsSync(path.join(ownerRoot, "ready")) || owner.exitCode !== null);
+      expect(owner.exitCode, ownerStderr).toBeNull();
+      await waitFor(() => state.participants.get(ownerId, undefined, { fresh: true })?.stale === false);
+      await loader.reload();
+      loader.getExtensions().extensions[0]!.sourceInfo.path = path.resolve("src/index.ts");
+      ({ session } = await createAgentSession({ cwd: state.root, agentDir: path.join(state.root, "agent"), modelRuntime: runtime,
+        model: faux.getModel(), resourceLoader: loader, sessionManager: manager, tools: ["fabric_exec"] }));
+      await session.bindExtensions({});
+      const args = requestArgs(state, "spawn");
+      const call = (code: string) => fauxAssistantMessage(fauxToolCall("fabric_exec", { code }), { stopReason: "toolUse" });
+      // Receipt filenames are UUIDs, not chronological order. Select call 2's
+      // real returned handle, never readdir()[last] (which can be call 1).
+      const latestAgent = () => (outcomes[1]!.value as { id: string }).id;
+      const status = () => call(`return await agents.status({id:${JSON.stringify(latestAgent())}});`);
+      const wait = () => call(`return await agents.wait({id:${JSON.stringify(latestAgent())}});`);
+      const publish = (label: string) => call(`return await mesh.publish({topic:"work/3172",text:${JSON.stringify(label)}});`);
+      faux.setResponses([
+        call(`await agents.spawn(${JSON.stringify({ ...args, name: "call-1-writer", transport: "process" })});
+          return await agents.followUp({id:${JSON.stringify(ownerId)},message:"call-1-only"});`),
+        call(`return await agents.spawn(${JSON.stringify({ ...args, name: "call-2-writer", transport: "process" })});`),
+        () => publish("call-3-only"), status, wait,
+        async () => {
+          const admitted = JSON.parse(fs.readFileSync(path.join(ownerRoot, "admitted.json"), "utf8"));
+          commandId = admitted.command.commandId;
+          expect(admitted).toMatchObject({ pid: owner.pid, deliveries: 1 });
+          expect(admitted.command).toMatchObject({ operation: "followUp", targetId: ownerId, message: "call-1-only" });
+          // No ACK existed when calls 1..5 ran. Resume the *same* live owner,
+          // never replace it or resend the original message.
+          expect(mesh.read({ topic: "fabric.control.ack" }).some(event => (event.data as { commandId?: string })?.commandId === commandId)).toBe(false);
+          fs.writeFileSync(path.join(ownerRoot, "resume"), "resume original delivery");
+          await waitFor(() => mesh.read({ topic: "fabric.control.ack" }).some(event => (event.data as { commandId?: string })?.commandId === commandId));
+          return publish("call-6-after-resume-only");
+        },
+        status, wait,
+        () => call(`return {status:await agents.status({id:${JSON.stringify(ownerId)}}),
+          resolution:(await mesh.read({topic:"fabric.control.ack"})).filter(event => (event.data as {commandId?:string})?.commandId === ${JSON.stringify(commandId)})};`),
+        () => publish("call-10-after-query-only"),
+        fauxAssistantMessage("finished without replaying call 1"),
+      ]);
+      await session.prompt("Run the outcome-unknown regression and reconcile only through a separate query.");
+      const results = session.messages.flatMap(message => message.role === "toolResult" && message.toolName === "fabric_exec" ? [message] : []);
+      const texts = results.map(textOf);
+      const decisions = decisionsFor(state).filter(decision => decision.operation === "spawn");
+      const persisted = SessionManager.open(manager.getSessionFile()!).getBranch()
+        .flatMap(entry => entry.type === "message" && entry.message.role === "toolResult" ? [entry.message] : []);
+      const ownAgentId = latestAgent();
+      const priorAgentId = decisions.find(decision => decision.id !== ownAgentId)!.id as string;
+      const cleanIndices = [1, 2, 3, 4, 5, 6, 7, 9];
+      const matrix = texts.map((text, index) => ({ call: index + 1, isError: results[index]!.isError,
+        contamination: outcomeContamination.test(text), text }));
+      if (process.env.FABRIC_3172_EVIDENCE) fs.writeFileSync(process.env.FABRIC_3172_EVIDENCE,
+        JSON.stringify({ matrix, results, outcomes, decisions, commandId, ownerPid: owner.pid, ownerStderr,
+          sameNativePromptSignal: signals.length === 10 && signals.every(signal => signal === signals[0]),
+          nextModelResults, persisted, sessionMessages: session.messages }, null, 2));
+      // Collect the entire prompt first, so a baseline failure proves both the
+      // triggering timeout AND all later calls, including late reconciliation.
+      expect(results).toHaveLength(10);
+      expect(signals[0]).toBeInstanceOf(AbortSignal);
+      expect(signals.every(signal => signal === signals[0])).toBe(true);
+      expect(decisions).toHaveLength(2);
+      expect(decisions.every(decision => decision.state === "committed")).toBe(true);
+      expect(mesh.read({ topic: "fabric.control.command" }).filter(event =>
+        (event.data as { operation?: string; targetId?: string })?.operation === "followUp" &&
+        (event.data as { targetId?: string }).targetId === ownerId)).toHaveLength(1);
+      expect(texts[0]).toContain("the outcome is unknown");
+      expect(texts[0]).toMatch(outcomeContamination);
+      expect(results[0]!.isError).toBe(true);
+      expect(persisted).toEqual(results);
+      expect(nextModelResults).toEqual(texts);
+      const contaminated = cleanIndices.filter(index => outcomeContamination.test(texts[index]!));
+      expect(contaminated.map(index => `call ${index + 1}`), "Later calls must not inherit call 1 uncertainty").toEqual([]);
+      for (const index of cleanIndices) {
+        expect(results[index]!.isError, `call ${index + 1}: ${texts[index]}`).toBe(false);
+        expect(outcomes[index]!.residentOutcomes).toBeUndefined();
+        for (const foreign of [ownerId, commandId, "call-1-only", priorAgentId, ...decisions.map(decision => decision.requestId)]) {
+          expect(texts[index], `call ${index + 1} leaked ${foreign}`).not.toContain(foreign);
+        }
+      }
+      expect(JSON.parse(texts[1]!)).toMatchObject({ id: ownAgentId, name: "call-2-writer" });
+      for (const [index, text] of [[2, "call-3-only"], [5, "call-6-after-resume-only"], [9, "call-10-after-query-only"]] as const) {
+        expect(JSON.parse(texts[index]!)).toMatchObject({ topic: "work/3172", text, sequence: expect.any(Number) });
+        for (const foreign of ["call-3-only", "call-6-after-resume-only", "call-10-after-query-only"].filter(label => label !== text)) {
+          expect(texts[index]).not.toContain(foreign);
+        }
+      }
+      for (const index of [3, 4, 6, 7]) expect(JSON.parse(texts[index]!)).toMatchObject({ id: ownAgentId });
+      expect(results[8]!.isError).toBe(false);
+      expect(outcomes[8]!.residentOutcomes).toBeUndefined();
+      expect(JSON.parse(texts[8]!)).toMatchObject({ status: { id: ownerId, turns: 1, pendingMessages: true },
+        resolution: [{ data: { commandId, accepted: true, messageId: commandId } }] });
+      expect(outcomeContamination.test(texts[8]!)).toBe(false);
+    } finally {
+      fs.writeFileSync(path.join(ownerRoot, "resume"), "cleanup original delivery");
+      if (owner.exitCode === null && owner.signalCode === null) owner.kill("SIGTERM");
+      await ownerExited;
+      await session?.abort(); session?.dispose(); await main.close(); await state.close();
+    }
   });
 });

@@ -275,9 +275,10 @@ export class AgentMessageRouter {
           principal: options.principal,
           message,
           data,
-          ...(typeof options.triggerTurn === "boolean"
-            ? { triggerTurn: options.triggerTurn }
-            : {}),
+          // Carry the local Main default across runtime generations (#3015).
+          ...(kind === "followUp"
+            ? { triggerTurn: options.triggerTurn ?? true }
+            : typeof options.triggerTurn === "boolean" ? { triggerTurn: options.triggerTurn } : {}),
         },
         participant.ownerIdentityId,
         {
@@ -298,7 +299,8 @@ export class AgentMessageRouter {
         kind === "steer"
           ? this.manager.steer(id, message, data, provenance)
           : this.manager.followUp(id, message, data, provenance);
-      return { queued: true, messageId: result.messageId, routed: "local" };
+      return { queued: true, messageId: result.messageId, routed: "local",
+        ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
     }
@@ -477,6 +479,8 @@ export class AgentMessageRouter {
       return {
         accepted: true,
         messageId: result.messageId,
+        ...(typeof result.triggered === "boolean" ? { triggered: result.triggered } : {}),
+        ...(typeof result.reason === "string" ? { reason: result.reason } : {}),
         ...(result.pendingFollowUps === undefined ? {} : { pendingFollowUps: result.pendingFollowUps }),
         ...(result.oldestAgeS === undefined ? {} : { oldestAgeS: result.oldestAgeS }),
         ...(result.stalled ? { stalled: true as const } : {}),
@@ -489,7 +493,8 @@ export class AgentMessageRouter {
         command.operation === "steer"
           ? this.manager.steer(command.targetId, message, command.data, provenance)
           : this.manager.followUp(command.targetId, message, command.data, provenance);
-      return { accepted: true, messageId: result.messageId };
+      return { accepted: true, messageId: result.messageId,
+        ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
         return { accepted: false, error: error instanceof Error ? error.message : String(error) };

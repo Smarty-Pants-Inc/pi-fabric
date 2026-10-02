@@ -47,6 +47,8 @@ export interface AgentRunRequest {
   routeDecision?: ModelRouteDecision;
   /** Host-only judgment join; never normalized from public agent arguments. */
   routeRecord?: { ledger: string; decisionRecorded: boolean };
+  /** Host-only resident startup probe: model/extension admission, no prompt or tools. */
+  residentStartupProbe?: boolean;
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
   provenance?: FabricTurnProvenance | undefined;
   task: string;
@@ -168,8 +170,15 @@ export interface AgentRunRecord {
   exitCode?: number | null;
   usage: AgentUsage;
   budget?: FabricBudgetSummary;
+  /** Transport identity (e.g. process PID), not the native Pi session. */
   sessionId?: string;
+  /** Latest native runner session; joins Pi gateway session_id to this run. */
   runnerSessionId?: string;
+  /** Distinct native Pi sessions observed during this run, in first-seen order. */
+  runnerSessionIds?: string[];
+  /** Parent Main participant and its Pi/Fabric session, not the child session. */
+  mainAgentId?: string;
+  fabricSessionId?: string;
   attachCommand?: string;
   branch?: string;
   worktree?: string;
@@ -214,6 +223,7 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  residentStartupProbe?: boolean;
   id: string;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
@@ -272,6 +282,8 @@ export interface AgentWorkerOptions {
   branch?: string;
   worktree?: string;
   inheritedSessionPins?: InheritedSessionPin[];
+  /** Observed native Pi session history carried across a same-run worker relaunch. Not a resume target. */
+  runnerSessionIds?: string[];
   carryOver?: AgentRunCarryOver;
 }
 
@@ -358,7 +370,19 @@ export interface AgentSteerEntry {
   ts: number;
 }
 
+export const FOLLOW_UP_RUNNING_TASK_MESSAGE = "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.";
+
+/** Sender-only, receiver-time advisory; it does not change followUp delivery. */
+export interface AgentFollowUpRunningWarning {
+  code: "FABRIC_FOLLOW_UP_RUNNING_TASK";
+  targetId: string;
+  kind: "agent";
+  status: "running";
+  message: string;
+}
+
 export interface AgentSteerResult {
+  warning?: AgentFollowUpRunningWarning;
   queued: true;
   messageId: string;
 }

@@ -3,6 +3,30 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import path from "node:path";
 
+/** Trusted host policy for every Fabric participant model selection. */
+export interface FabricModelPolicy {
+  deniedModels?: readonly string[];
+  deniedModelReplacement?: string;
+}
+
+/** Refusal, not a retryable availability miss or an automatic model-family switch. */
+export class FabricModelDeniedError extends Error {
+  readonly code = "FABRIC_MODEL_DENIED";
+  constructor(readonly model: string, readonly replacement?: string) {
+    super(`Fabric model ${JSON.stringify(model)} is denied by fleet policy #2236. ` +
+      (replacement ? `Use ${replacement} instead.` : "Ask the host administrator for an allowed replacement."));
+    this.name = "FabricModelDeniedError";
+  }
+}
+
+/** Check both raw intent and the canonical resolved key, case-insensitively. */
+export const assertFabricModelAllowed = (model: string | undefined, policy?: FabricModelPolicy): void => {
+  const key = model?.trim().toLowerCase();
+  if (key && policy?.deniedModels?.some((denied) => denied.trim().toLowerCase() === key)) {
+    throw new FabricModelDeniedError(key, policy.deniedModelReplacement?.trim() || undefined);
+  }
+};
+
 export const MINIMUM_PI_HOST_VERSION = "0.80.6";
 
 const PI_HOST_PACKAGE_NAMES = new Set([
@@ -300,7 +324,7 @@ export const sendFabricUserMessage = (
   else pi.sendUserMessage(content, deliveryOptions);
 };
 
-/** Fabric's own runtime identity for host-generated messages, with no human principal. */
+/** Runtime participant identity, with no human principal. Participant-free notices make no claim. */
 export const fabricHostIdentity = (
   sessionId: string,
   environment: NodeJS.ProcessEnv = process.env,

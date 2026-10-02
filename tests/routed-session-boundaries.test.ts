@@ -29,15 +29,15 @@ const repository = (root: string) => {
 };
 
 describe("R3 routed session boundaries", () => {
-  it("I-1 refuses a failed final-cwd rebind before launch and settles the same decision", async () => {
+  it("I-1 refuses a failed final-cwd session bind before launch and settles the same decision", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-rebind-failure-")); const repo = repository(root);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
     const manager = new AgentManager(repo, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, nice: 19 }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs") });
-    const launch = vi.spyOn(ProcessTransport.prototype, "launch"); const rename = fs.renameSync;
-    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { if (String(to).endsWith("route-session.jsonl")) throw new Error("rebind disk failure"); return rename(from, to); });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch"); const write = fs.writeFileSync;
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file: any, data: any, options: any) => { if (String(file).endsWith("route-session.jsonl")) throw new Error("session bind disk failure"); return write(file, data, options); });
     try {
       const route = await decision();
-      await expect(manager.spawn({ task: "must not launch", worktree: true, routeDecision: route, transport: "process" })).rejects.toThrow("rebind disk failure");
+      await expect(manager.spawn({ task: "must not launch", worktree: true, routeDecision: route, transport: "process" })).rejects.toThrow("session bind disk failure");
       expect(launch).not.toHaveBeenCalled();
       const rows = fs.readFileSync(path.join(root, "agent/fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
       expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ type: "outcome", decisionId: route.decisionId, childSessionId: rows[0].childSessionId, status: "failed", admittedModel: null });

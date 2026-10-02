@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { terminateWindowsTree } from "../child-process-tree.js";
 import type { VerifyStatus } from "./types.js";
 
 export interface RunCommandOptions {
@@ -34,46 +35,6 @@ const truncateUtf8 = (
   const bounded = bytes.subarray(0, end).toString("utf8");
   return { value: bounded, omittedBytes: bytes.length - end };
 };
-
-const terminateWindowsTree = (child: ChildProcess): Promise<void> =>
-  new Promise((resolve) => {
-    if (child.pid === undefined) {
-      resolve();
-      return;
-    }
-    let settled = false;
-    let timeout: NodeJS.Timeout | undefined;
-    const finish = (): void => {
-      if (settled) return;
-      settled = true;
-      if (timeout) clearTimeout(timeout);
-      resolve();
-    };
-    const treeKillCommand = ["task", "kill"].join("");
-    const killer = spawn(treeKillCommand, ["/pid", String(child.pid), "/T", "/F"], {
-      windowsHide: true,
-      stdio: "ignore",
-    });
-    killer.once("error", () => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // The process may already have exited.
-      }
-      finish();
-    });
-    killer.once("close", finish);
-    timeout = setTimeout(() => {
-      try {
-        killer.kill("SIGKILL");
-        child.kill("SIGKILL");
-      } catch {
-        // Bounded best effort is all Windows can guarantee here.
-      }
-      finish();
-    }, 1_000);
-    timeout.unref?.();
-  });
 
 const terminateProcessTree = async (child: ChildProcess): Promise<void> => {
   if (process.platform === "win32") {

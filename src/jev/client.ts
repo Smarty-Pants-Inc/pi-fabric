@@ -1,4 +1,5 @@
-import { execFile } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { terminateWindowsTree } from "../child-process-tree.js";
 import { runAbortable } from "../async-settlement.js";
 import type { FabricJevConfig } from "./config.js";
 import type { JevRequest, JevResponse } from "./types.js";
@@ -11,6 +12,8 @@ export interface JevCredentialSource {
 }
 export class JevCredentials {
   #cached: string | undefined;
+  /** Command close obligations outlive caller-facing cancellation/results. */
+  readonly #pendingCommands = new Set<Promise<void>>();
   constructor(
     readonly command: readonly string[],
     private readonly env: NodeJS.ProcessEnv = process.env,
@@ -44,16 +47,76 @@ export class JevCredentials {
     const [file, ...args] = this.command;
     if (!file) throw new Error(`Jev credentials unavailable: set ${this.envKeys.join(" or ")} or configure jev.credentialCommand`);
     const secret = await new Promise<string>((resolve, reject) => {
-      execFile(file, args, { encoding: "utf8", timeout: 5_000, maxBuffer: 16_384, signal, windowsHide: true }, (error, stdout) => {
-        // Never propagate subprocess errors: they can contain stdout/stderr secrets.
-        if (error) reject(new Error("Jev credential resolver failed"));
-        else resolve(stdout.trim());
+      let child: ChildProcess;
+      try {
+        // execFile does NOT support detached. spawn an argv command (no shell)
+        // in its own POSIX group so stopping descendants cannot hit the host.
+        child = spawn(file, args, {
+          detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch {
+        reject(new Error("Jev credential resolver failed"));
+        return;
+      }
+      let closed = false;
+      let stopping = false;
+      let treeStop: Promise<void> | undefined;
+      let joined!: () => void;
+      const obligation = new Promise<void>(resolve => { joined = resolve; });
+      this.#pendingCommands.add(obligation);
+      void obligation.then(() => this.#pendingCommands.delete(obligation));
+      const stdout: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      const kill = (signal: NodeJS.Signals): void => {
+        if (child.pid === undefined) return;
+        try { process.kill(-child.pid, signal); }
+        catch { try { child.kill(signal); } catch { /* Already exited. */ } }
+      };
+      const stop = (): void => {
+        if (closed || stopping) return;
+        stopping = true;
+        // Never propagate subprocess errors/output, including on cancellation.
+        reject(new Error("Jev credential resolver failed"));
+        if (process.platform === "win32") treeStop = terminateWindowsTree(child);
+        else {
+          kill("SIGTERM");
+          treeStop = new Promise<void>(resolve => {
+            setTimeout(() => { kill("SIGKILL"); resolve(); }, 500);
+          });
+        }
+      };
+      const deadline = setTimeout(stop, 5_000);
+      child.stdout!.on("data", (chunk: Buffer) => {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > 16_384) stop();
+        else if (!stopping) stdout.push(chunk);
       });
+      child.stderr!.on("data", (chunk: Buffer) => {
+        stderrBytes += chunk.length;
+        if (stderrBytes > 16_384) stop();
+      });
+      child.once("error", () => reject(new Error("Jev credential resolver failed")));
+      child.once("close", (code) => {
+        closed = true;
+        clearTimeout(deadline);
+        signal.removeEventListener("abort", stop);
+        if (code !== 0 || stopping) reject(new Error("Jev credential resolver failed"));
+        else resolve(Buffer.concat(stdout).toString("utf8").trim());
+        // close confirms exit AND stream teardown. Also join tree termination:
+        // a TERM-exited parent must not abandon a stubborn descendant/helper.
+        void Promise.resolve(treeStop).then(joined);
+      });
+      signal.addEventListener("abort", stop, { once: true });
+      if (signal.aborted) stop();
     });
     signal.throwIfAborted();
     if (!secret || /[\r\n]/.test(secret)) throw new Error("Jev credential resolver returned an invalid credential");
     this.#cached = secret;
     return secret;
+  }
+  async drainCommands(): Promise<void> {
+    while (this.#pendingCommands.size) await Promise.allSettled([...this.#pendingCommands]);
   }
   clear(): void { this.#cached = undefined; }
 }
@@ -115,6 +178,7 @@ export class JevClient {
   }
   async drainCredentials(): Promise<void> {
     while (this.#pendingCredentials.size) await Promise.allSettled([...this.#pendingCredentials]);
+    await this.credentials.drainCommands();
   }
   close(): void { this.credentials.clear(); }
 }

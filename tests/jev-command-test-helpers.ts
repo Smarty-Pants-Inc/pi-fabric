@@ -11,24 +11,27 @@ export function alive(pid: number): boolean {
 }
 
 /** Real owned children, with readiness recorded only AFTER installing SIGTERM handling. */
-export function commandFixture(tree = false, parentIgnoresTerm = true, inheritStreams = true) {
+export function commandFixture(tree = false, parentIgnoresTerm = true, inheritStreams = true, parentExitCode?: number) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "jev-command-lifetime-"));
   const pidFile = path.join(root, "pid");
   const descendantFile = path.join(root, "descendant");
   const terminated = path.join(root, "term");
   const fresh = path.join(root, "fresh");
+  const exitFile = path.join(root, "exit");
   const code = `
     const fs = require('node:fs');
     if (fs.existsSync(${JSON.stringify(fresh)})) { console.log('offline-fresh-key'); process.exit(0); }
     process.on('SIGTERM', () => { fs.writeFileSync(${JSON.stringify(terminated)}, 'received'); ${parentIgnoresTerm ? '' : 'process.exit(0);'} });
-    ${tree ? `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`const fs = require('node:fs'); process.on('SIGTERM', () => {}); fs.writeFileSync(${JSON.stringify(descendantFile)}, String(process.pid)); setInterval(() => {}, 1000);`)}], { stdio: '${inheritStreams ? 'inherit' : 'ignore'}' });` : ""}
+    ${tree ? `const descendant = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`const fs = require('node:fs'); process.on('SIGTERM', () => {}); fs.writeFileSync(${JSON.stringify(descendantFile)}, String(process.pid)); setInterval(() => {}, 1000);`)}], { stdio: '${inheritStreams ? 'inherit' : 'ignore'}' }); descendant.unref();` : ""}
     fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
     console.log('FAKE_SECRET_MUST_NOT_BE_USED'); console.error('FAKE_SECRET_MUST_NOT_LEAK');
-    setInterval(() => {}, 1000);
+    setInterval(() => {
+      ${parentExitCode === undefined ? "" : `if (fs.existsSync(${JSON.stringify(exitFile)})) process.exit(${parentExitCode});`}
+    }, 10);
   `;
   const pids = () => [descendantFile, pidFile].filter(file => fs.existsSync(file)).map(file => Number(fs.readFileSync(file, "utf8")));
   return {
-    root, pidFile, terminated, fresh,
+    root, pidFile, terminated, fresh, exitFile,
     command: [process.execPath, "-e", code],
     async ready() {
       await vi.waitFor(() => {

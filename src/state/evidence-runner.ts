@@ -56,7 +56,8 @@ const terminateProcessTree = async (child: ChildProcess): Promise<void> => {
 // Shell evidence is trusted input. Output is streamed into a byte-bounded
 // prefix while a hash and byte count cover the complete stdout/stderr stream.
 // POSIX shells lead detached process groups so timeout/abort can kill the
-// group. Windows uses bounded taskkill tree cleanup and then a direct fallback.
+// group. Windows joins successful taskkill tree cleanup; a failed helper
+// retains an alarmed uncertain-tree fence rather than trusting a parent-only kill.
 export const runCommand = (
   command: string,
   options: RunCommandOptions,

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { terminateWindowsTree } from "../child-process-tree.js";
+import { terminatePosixGroup, terminateWindowsTree } from "../child-process-tree.js";
 import { runAbortable } from "../async-settlement.js";
 import type { FabricJevConfig } from "./config.js";
 import type { JevRequest, JevResponse } from "./types.js";
@@ -58,9 +58,13 @@ export class JevCredentials {
         reject(new Error("Jev credential resolver failed"));
         return;
       }
-      let closed = false;
       let stopping = false;
+      // Capture ownership before an early parent exit. A close event says
+      // nothing about pipe-independent descendants in this detached group.
+      const pgid = child.pid;
       let treeStop: Promise<void> | undefined;
+      const stopTree = (): Promise<void> => treeStop ??= process.platform === "win32"
+        ? terminateWindowsTree(child) : terminatePosixGroup(pgid);
       let joined!: () => void;
       const obligation = new Promise<void>(resolve => { joined = resolve; });
       this.#pendingCommands.add(obligation);
@@ -68,23 +72,12 @@ export class JevCredentials {
       const stdout: Buffer[] = [];
       let stdoutBytes = 0;
       let stderrBytes = 0;
-      const kill = (signal: NodeJS.Signals): void => {
-        if (child.pid === undefined) return;
-        try { process.kill(-child.pid, signal); }
-        catch { try { child.kill(signal); } catch { /* Already exited. */ } }
-      };
       const stop = (): void => {
-        if (closed || stopping) return;
+        if (stopping) return;
         stopping = true;
         // Never propagate subprocess errors/output, including on cancellation.
         reject(new Error("Jev credential resolver failed"));
-        if (process.platform === "win32") treeStop = terminateWindowsTree(child);
-        else {
-          kill("SIGTERM");
-          treeStop = new Promise<void>(resolve => {
-            setTimeout(() => { kill("SIGKILL"); resolve(); }, 500);
-          });
-        }
+        void stopTree();
       };
       const deadline = setTimeout(stop, 5_000);
       child.stdout!.on("data", (chunk: Buffer) => {
@@ -96,16 +89,18 @@ export class JevCredentials {
         stderrBytes += chunk.length;
         if (stderrBytes > 16_384) stop();
       });
-      child.once("error", () => reject(new Error("Jev credential resolver failed")));
+      child.once("error", stop);
       child.once("close", (code) => {
-        closed = true;
         clearTimeout(deadline);
         signal.removeEventListener("abort", stop);
+        // Always stop and join the owned tree, including spontaneous successful
+        // or failed parent exit before cancellation/deadline initiated cleanup.
+        const tree = stopTree();
         if (code !== 0 || stopping) reject(new Error("Jev credential resolver failed"));
         else resolve(Buffer.concat(stdout).toString("utf8").trim());
-        // close confirms exit AND stream teardown. Also join tree termination:
-        // a TERM-exited parent must not abandon a stubborn descendant/helper.
-        void Promise.resolve(treeStop).then(joined);
+        // Both parent close (exit + streams) AND whole-tree confirmation are
+        // required. An uncertain Windows tree deliberately never discharges it.
+        void tree.then(joined);
       });
       signal.addEventListener("abort", stop, { once: true });
       if (signal.aborted) stop();

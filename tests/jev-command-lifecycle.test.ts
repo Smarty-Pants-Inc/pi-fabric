@@ -75,6 +75,38 @@ describe("SR-7 real credential-command lifetime", () => {
     } finally { controller.abort(); await fixture.cleanup(); await pending; await drained; await client.drainCredentials(); }
   });
 
+  it.skipIf(process.platform === "win32").each([0, 7])("parent exit %i does not join a pipe-independent descendant still in the owned group", async exitCode => {
+    // No inherited pipes: parent close is real and prompt, while its unref'ed
+    // descendant remains independently alive in the captured POSIX group.
+    const fixture = commandFixture(true, true, false, exitCode);
+    const credentials = new JevCredentials(fixture.command, {});
+    const client = new JevClient(DEFAULT_JEV_CONFIG, undefined, credentials);
+    const controller = new AbortController();
+    const pending = credentials.resolve(controller.signal).then(value => value, error => String(error));
+    let drained: Promise<void> | undefined;
+    try {
+      const parent = await fixture.ready();
+      const descendant = fixture.pids()[0]!;
+      fs.writeFileSync(fixture.exitFile, "spontaneous parent exit");
+      expect(await pending).toBe(exitCode === 0 ? "FAKE_SECRET_MUST_NOT_BE_USED" : "Error: Jev credential resolver failed");
+      expect(alive(parent)).toBe(false);
+      expect(alive(descendant)).toBe(true);
+      // The group, unlike the parent/streams, still exists at this point.
+      expect(() => process.kill(-parent, 0)).not.toThrow();
+      let joined = false;
+      drained = client.drainCredentials().then(() => { joined = true; });
+      await delay(50);
+      expect(alive(descendant)).toBe(true);
+      expect(joined, "parent close alone must not discharge the owned-group obligation").toBe(false);
+      await drained;
+      expect(alive(descendant)).toBe(false);
+      expect(() => process.kill(-parent, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+      expect(joined).toBe(true);
+    } finally {
+      controller.abort(); await fixture.cleanup(); await pending; await drained; await client.drainCredentials();
+    }
+  });
+
   it.each(["stdout", "stderr"] as const)("bounds and sanitizes excessive %s", async stream => {
     const credentials = new JevCredentials([process.execPath, "-e", `process.${stream}.write('FAKE_SECRET'.repeat(2000)); setInterval(() => {}, 1000)`], {});
     const client = new JevClient(DEFAULT_JEV_CONFIG, undefined, credentials);

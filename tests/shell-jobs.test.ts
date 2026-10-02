@@ -90,7 +90,7 @@ describe("bounded shell lifecycle", () => {
     }
   });
 
-  it("bounds disk logs and retires spilled PID files while retaining readable logs", async () => {
+  it("bounds disk logs and preserves uncached live PID files while retaining readable logs", async () => {
     const job = store().begin("bash", "loud");
     fs.writeFileSync(job.pidPath, String(process.pid));
     job.append(Buffer.alloc(SHELL_TAIL_BYTES * 2, 97));
@@ -99,7 +99,7 @@ describe("bounded shell lifecycle", () => {
     job.spill();
     job.append(Buffer.alloc(SHELL_LOG_BYTES * 2, 98));
     await job.finish(0);
-    expect(fs.existsSync(job.pidPath)).toBe(false);
+    expect(fs.existsSync(job.pidPath)).toBe(true);
     expect(fs.statSync(log).size).toBeLessThanOrEqual(SHELL_LOG_BYTES);
     const text = fs.readFileSync(log, "utf8");
     expect(text).toContain("Not a full-output archive");

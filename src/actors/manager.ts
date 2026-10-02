@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
-import os from "node:os";
+import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
 import type { FabricCapabilityRequirement } from "../components/types.js";
 import type { FabricCapabilityViewLease } from "../core/action-registry.js";
@@ -442,7 +442,7 @@ export class ActorManager {
     } = {},
   ) {
     this.#actorRoot =
-      options.actorRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actors-"));
+      options.actorRoot ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-actors-"));
     this.#actorScope = options.actorScope ?? meshConfig.actorScope;
     this.#persistent = options.persistent ?? false;
     this.#releasePaused = options.releasePaused ?? false;

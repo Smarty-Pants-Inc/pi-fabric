@@ -120,6 +120,17 @@ describe("no hosted runners guard", () => {
     expect(result.stderr).toBe("");
   });
 
+  // Parity with the canonical factory detective rule, smarty-dev setup/factory/actions_minutes.py HOSTED
+  // (smarty-dev#1246): the same runs-on labels count as hosted in both checks.
+  it.each([
+    ["ubuntu-24.04", 1], ["macos-15-large", 1], ["windows-2025", 1], ["ubuntu-latest", 1],
+    ["smarty-linux-x64", 0], ["self.ubuntu-like", 0], ["corp-ubuntu-pool", 0],
+  ] as const)("classifies runs-on %s like the canonical detective check", (label, status) => {
+    const result = runGuard({ "test.yml": workflow(`    runs-on: ${label}`) });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(status);
+  });
+
   it("accepts reusable workflow jobs that do not select a runner", () => {
     const result = runGuard({ "test.yml": "jobs:\n  reuse:\n    uses: ./.github/workflows/test.yml\n" });
     expect(result.status).toBe(0);

@@ -759,6 +759,7 @@ const main = async (): Promise<void> => {
       cost: number;
     },
     attribution?: { model?: string | undefined; provider?: string | undefined },
+    journalMessage?: unknown,
   ): void => {
     const snapshot = record.usage;
     if (
@@ -798,6 +799,11 @@ const main = async (): Promise<void> => {
       },
       attribution?.model ?? record.model ?? options.model,
       attribution?.provider,
+      undefined,
+      // smarty-dev#3327: the Pi journal records this turn too; mark the copy.
+      piSessionFile && journalMessage
+        ? sessionExportHelpers.journalTurnId(activationSession?.file ?? piSessionFile, journalMessage)
+        : undefined,
     );
     lastEmittedUsage.input = snapshot.input;
     lastEmittedUsage.output = snapshot.output;
@@ -1296,7 +1302,7 @@ const main = async (): Promise<void> => {
       emitTokenUsage(usageDelta, {
         model: stringField(messageRecord.model),
         provider: stringField(messageRecord.provider),
-      });
+      }, messageRecord);
       modelControl.observeAssistant(messageRecord);
       enforceTokenLimit();
       if ((messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") && !terminalStatus) {

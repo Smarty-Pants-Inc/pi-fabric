@@ -1369,7 +1369,7 @@ export class AgentManager {
           } catch { /* best effort: the worktree is kept either way */ }
           throw error;
         }
-        try { routeDispatch?.outcome({ status: "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
+        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
         if (worktree && !runTreeExitVeto(runDirectory, 0, undefined, true)) await this.#worktrees.cleanup(id, true).catch(() => false);
         throw error;
       }
@@ -1859,6 +1859,15 @@ export class AgentManager {
     await this.#waitForTransportExit(managed);
     await this.#noteUnconfirmedExit(managed);
     const terminal = readRecord(managed.statusFile);
+    // A force-killed worker (notably on Windows) may leave only running status.
+    // Its session telemetry can be newer than the monitor's last poll. Preserve
+    // that snapshot, or the pre-stop one if stopping removed the status file,
+    // before synthesizing a terminal result.
+    const observed = terminal ?? existing;
+    if (observed) {
+      managed.latestRecord = observed;
+      if (observed.runnerSessionId) managed.runnerSessionId = observed.runnerSessionId;
+    }
     const record =
       terminal && terminalStatuses.has(terminal.status)
         ? (this.#withTransportMetadata(terminal, managed) as AgentRunResult)
@@ -2193,6 +2202,8 @@ export class AgentManager {
     });
     for (const managed of expired) {
       if (!this.#canCollect(managed)) continue;
+      // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
+      if (!canRemoveTerminalRun(managed.runDirectory)) continue;
       await removeTree(managed.runDirectory).catch(() => undefined);
       if (!fs.existsSync(managed.runDirectory)) this.#runs.delete(managed.id);
     }

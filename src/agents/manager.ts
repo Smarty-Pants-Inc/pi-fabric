@@ -1626,7 +1626,9 @@ export class AgentManager {
       const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
       const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
       if (!managed.settled || managed.lostContact || uncheckedExternalExit(managed.transport) ||
-          unconfirmedProcess || runTreeExitVeto(managed.runDirectory)) protect(managed.id, managed.actorId);
+          // Settlement and primary exit do not prove descendant exit. The
+          // persistent tree veto checks every descendant's worker identity too.
+          unconfirmedProcess || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) protect(managed.id, managed.actorId);
     }
     // A restarted host does not own handles for the previous host's actor workers.
     // Reuse offline retention's exit/ownership predicate; a truncated or unknown

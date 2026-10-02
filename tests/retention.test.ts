@@ -53,6 +53,31 @@ describe("shared run-tree exit veto", () => {
     expect(runTreeExitVeto(run)).toBeUndefined();
   });
 
+  it("ownership retention requires checked exit identities for every descendant, including terminal live writers", () => {
+    const run = temporaryDirectory();
+    const child = path.join(run, "nested", "child");
+    const grandchild = path.join(child, "nested", "grandchild");
+    const veto = () => runTreeExitVeto(run, 0, undefined, true);
+    writeStatus(child, { status: "completed", transport: "process", sessionId: String(process.pid) });
+    expect(veto()).toMatch(/descendant worker may still be running/);
+    for (const sessionId of [undefined, "", "0", "-1", "not-a-pid", "9007199254740993"]) {
+      writeStatus(child, { status: "completed", transport: "process", sessionId });
+      expect(veto()).toMatch(/unknown descendant identity/);
+    }
+    writeStatus(child, { status: "running", transport: "process", sessionId: "2147483647" });
+    // Real process exit proves a crashed worker gone even with a stale running record.
+    expect(veto()).toBeUndefined();
+    writeStatus(grandchild, { status: "completed", transport: "process", sessionId: String(process.pid) });
+    expect(veto()).toMatch(/descendant worker may still be running/);
+    writeStatus(grandchild, { status: "completed", transport: "process", sessionId: "2147483647" });
+    expect(veto()).toBeUndefined();
+    fs.rmSync(path.join(grandchild, "status.json"));
+    expect(veto()).toMatch(/unknown descendant identity/);
+    expect(runTreeExitVeto(path.join(run, "gone"), 1, undefined, true)).toMatch(/inspection failed/);
+    expect(runTreeExitVeto(path.join(run, "gone"), 0, undefined, true)).toMatch(/inspection failed/);
+    expect(runTreeExitVeto(run, 0, () => true, true)).toMatch(/incomplete/);
+  });
+
   it("refuses depth/deadline truncation and nested symlinks", () => {
     const run = temporaryDirectory();
     expect(runTreeExitVeto(run, 33)).toMatch(/incomplete/);

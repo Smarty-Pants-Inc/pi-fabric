@@ -18,6 +18,19 @@ describe("shipped turn-provenance contract (PR #229)", () => {
     expect(senderPolicy).toMatch(/Legacy hosts retain their existing batching/u);
   });
 
+  it("#3127: extends recovery and the real-entry notice gate to pre-upgrade Main journals", () => {
+    const recovery = reference.split("## First receipt and recovery")[1]!.split("## Originating principal")[0]!;
+    expect(recovery).toContain('source: "actor-output"');
+    expect(recovery).toMatch(/Pre-upgrade resident actor entries[^.]*replay unclaimed/u);
+    expect(recovery).toMatch(/already received Pi history is not rewritten/u);
+    expect(gate).toContain("https://github.com/Smarty-Pants-Inc/smarty-dev/issues/3127");
+    expect(gate).toMatch(/journal-upgrade case[^\n]*no `source` classification/u);
+    expect(gate).toMatch(/delete its acknowledged envelope/u);
+    expect(gate).toMatch(/before Pi receives it[^.]*first persisted replay receipt[^.]*no Fabric claim/u);
+    expect(gate).toMatch(/positively classified[^.]*actor sender[^.]*replay/u);
+    expect(gate).toMatch(/before-upgrade journal[^.]*raw Pi entries/u);
+  });
+
   it("F2: adopts a real-entry, owned, time-bounded gate with complete rollback conditions", () => {
     expect(gate).toMatch(/Owner: fabric-v2[^.]*check and rollback/u);
     expect(gate).toMatch(/capable Pi[^.]*Fabric release containing[^.]*installed[^.]*global[^.]*trust/u);

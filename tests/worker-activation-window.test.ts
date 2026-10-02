@@ -9,10 +9,12 @@ import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
 import { SessionManager, buildSessionContext, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ActivationWindow } from "../src/worker/activation-window.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { ActorManager } from "../src/actors/manager.js";
+import { MeshStore } from "../src/mesh/store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
 const roots: string[] = [];
-const managers: AgentManager[] = [];
+const managers: Array<{ close(): Promise<void> }> = [];
 const servers: http.Server[] = [];
 const root = () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-window-"));
@@ -123,7 +125,7 @@ describe("activation projection", () => {
       // to masquerade as the protocol readiness ACK.
       process.stdout.write = process.stderr.write.bind(process.stderr);
       const handlers = new Map();
-      try { hook({on(name, fn) { if (${JSON.stringify(mode)} === 'registration') throw new Error('registration failed'); handlers.set(name, fn); }}); }
+      try { await hook({on(name, fn) { if (${JSON.stringify(mode)} === 'registration') throw new Error('registration failed'); handlers.set(name, fn); }}); }
       catch {} // The real loader also catches registration errors.
       try {
         const mode = ${JSON.stringify(mode)};
@@ -151,11 +153,127 @@ describe("activation projection", () => {
     expect(fs.existsSync(requestCounter)).toBe(false);
   }, TEST_GUARD_MS);
 
+  it.each(["stream", "streamSimple"].flatMap(method =>
+    ["expand", "shrink", "unsupported", "binary", "serialized-primitive", "snapshot", "no-callback"].map(mode => [method, mode]),
+  ))("guards the final JSON boundary via %s (%s)", (method, mode) => {
+    const dir = root();
+    const requestFile = path.join(dir, "requests");
+    const callbackFile = path.join(dir, "callback");
+    const hook = fs.realpathSync(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER
+      ? path.join(path.dirname(path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER)), "worker/activation-window.js")
+      : path.resolve("src/worker/activation-window.ts"));
+    const child = path.join(dir, "dispatch.mjs");
+    fs.writeFileSync(child, `
+      import fs from 'node:fs';
+      import hook from ${JSON.stringify(pathToFileURL(hook).href)};
+      process.env.PI_FABRIC_ACTIVATION_WORKER_PID = String(process.ppid);
+      process.env.PI_FABRIC_ACTIVATION_NONCE = 'dispatch-nonce';
+      process.env.PI_FABRIC_PARENT_RUN = 'dispatch-test';
+      process.env.PI_FABRIC_ACTIVATION_HOOK = ${JSON.stringify(hook)};
+      const handlers = new Map();
+      await hook({on(name, fn) {handlers.set(name, fn)}});
+      const model = {provider:'test', contextWindow:8000};
+      const provider = {stream:dispatch, streamSimple:dispatch};
+      async function dispatch(model, context, options) {
+        if (this !== provider || options?.headers?.probe !== 'preserved') throw new Error('lost provider/options');
+        let payload = {messages:context.messages};
+        const replacement = await options?.onPayload?.(payload, model);
+        if (replacement !== undefined) payload = replacement;
+        fs.writeFileSync(${JSON.stringify(requestFile)}, JSON.stringify(payload));
+      }
+      const ctx = {mode:'rpc', model, sessionManager:{getBranch(){return []}},
+        modelRegistry:{getAll(){return [model]}, getProvider(){return provider}}};
+      await handlers.get('session_start')({}, ctx);
+      await handlers.get('before_provider_headers')({}, ctx);
+      const mode = ${JSON.stringify(mode)};
+      const options = {headers:{probe:'preserved'}};
+      if (mode !== 'no-callback') options.onPayload = async (payload, requestModel) => {
+        if (requestModel !== model) throw new Error('lost callback model');
+        fs.appendFileSync(${JSON.stringify(callbackFile)}, 'callback\\n');
+        if (mode === 'unsupported') {payload.cycle = payload; return payload}
+        if (mode === 'binary') return {...payload, context:new Uint8Array([1, 2, 3])};
+        if (mode === 'serialized-primitive') return {toJSON(){return 'not a request object'}};
+        if (mode === 'snapshot') {
+          let reads = 0;
+          return {get messages() {return ++reads === 1 ? [{role:'user', content:'SMALL'}]
+            : [{role:'user', content:'x'.repeat(40_000)}]}};
+        }
+        return {messages:[{role:'user', content:mode === 'expand' ? 'x'.repeat(40_000) : 'SMALL'}]};
+      };
+      await provider[${JSON.stringify(method)}](model,
+        {messages:[{role:'user', content:mode === 'shrink' ? 'x'.repeat(80_000) : 'SMALL'}]}, options);
+    `);
+    const result = spawnSync(process.execPath, [child], {encoding: "utf8", timeout: HANG_GUARD_MS});
+    const refuses = ["expand", "unsupported", "binary", "serialized-primitive"].includes(mode);
+    expect(result.status, result.stderr).toBe(refuses ? 78 : 0);
+    if (refuses) {
+      expect(fs.existsSync(requestFile)).toBe(false);
+      expect(result.stderr).toContain(mode === "expand" ? "Context exceeds window" : "Fabric activation window failed");
+    } else {
+      expect(JSON.parse(fs.readFileSync(requestFile, "utf8"))).toEqual({messages:[{role:"user", content:"SMALL"}]});
+    }
+    if (mode === "no-callback") expect(fs.existsSync(callbackFile)).toBe(false);
+    else expect(fs.readFileSync(callbackFile, "utf8")).toBe("callback\n");
+  }, TEST_GUARD_MS);
+
   it("does not terminate an owner that accidentally loads the hook without worker binding", async () => {
     const { default: hook } = await import("../src/worker/activation-window.js");
     vi.stubEnv("PI_FABRIC_ACTIVATION_WORKER_PID", "");
-    expect(() => hook({ on: vi.fn() } as unknown as ExtensionAPI)).toThrow(/not in a disposable worker/);
+    await expect(hook({ on: vi.fn() } as unknown as ExtensionAPI)).rejects.toThrow(/not in a disposable worker/);
   });
+});
+
+describe("actor context refusal (offline transport fixture)", () => {
+  it("3238 stops full-history native retries on the first window failure and alarms once", async () => {
+    const dir = root();
+    const counter = path.join(dir, "attempts");
+    const binary = path.join(dir, "retrying-pi.mjs");
+    fs.writeFileSync(binary, `
+      import fs from 'node:fs';
+      const emit = event => process.stdout.write(JSON.stringify(event) + '\\n');
+      let input = '';
+      process.stdin.on('data', chunk => {
+        input += chunk;
+        while (input.includes('\\n')) {
+          const end = input.indexOf('\\n');
+          const frame = JSON.parse(input.slice(0, end)); input = input.slice(end + 1);
+          if (frame.type !== 'prompt') continue;
+          fs.appendFileSync(${JSON.stringify(counter)}, 'attempt\\n');
+          const message = {role:'assistant', provider:'test', model:'test', content:[], stopReason:'error',
+            errorMessage:'Context exceeds window: estimated 272511 input tokens, window 272000',
+            usage:{input:0, output:0, cacheRead:0, cacheWrite:0, totalTokens:0}};
+          emit({type:'agent_start'});
+          emit({type:'message_end', message});
+          emit({type:'agent_end', willRetry:true});
+          setTimeout(() => {
+            fs.appendFileSync(${JSON.stringify(counter)}, 'retry\\n');
+            emit({type:'auto_retry_start', errorMessage:message.errorMessage});
+            emit({type:'message_end', message:{...message, content:[{type:'text', text:'retried incorrectly'}], stopReason:'stop'}});
+            emit({type:'auto_retry_end', success:true});
+            emit({type:'agent_end'}); emit({type:'agent_settled', outcome:'completed'});
+          }, 500);
+        }
+      });
+      process.stdin.on('end', () => process.exit(0));
+    `);
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: HANG_GUARD_MS }, {
+      workerPath: path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER ?? "src/worker.ts"),
+      piBinary: binary, runRoot: path.join(dir, "runs"),
+    });
+    const mesh = new MeshStore(path.join(dir, "mesh"), 64 * 1024, 100);
+    const alarms: string[] = [];
+    const actors = new ActorManager("retry-test", { id: "owner", name: "owner", kind: "main", sessionId: "retry-test" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, manager, ({ message }) => { alarms.push(message.text ?? ""); },
+      { actorRoot: path.join(dir, "actors"), persistent: true });
+    managers.push(actors, manager);
+    const actor = await actors.create({ name: "retrying", instructions: "Act.", inferenceContext: "full-history", extensions: false, tools: [], transport: "process" });
+    await expect(actors.ask(actor.id, "event")).rejects.toThrow(/Context exceeds window/);
+    await actors.close();
+    expect(fs.readFileSync(counter, "utf8")).toBe("attempt\n");
+    expect(alarms).toHaveLength(1);
+    expect(alarms[0]).toContain("Context exceeds window");
+    expect(mesh.read({ topic: "ops.owner" }).filter(event => event.kind === "actor.alarm")).toHaveLength(1);
+  }, TEST_GUARD_MS);
 });
 
 describe("activation worker admission (offline transport fixture)", () => {
@@ -209,15 +327,22 @@ describe("native activation window (offline; opted-in success needs exact native
     const log = result.logFile && fs.existsSync(result.logFile) ? fs.readFileSync(result.logFile, "utf8") : "";
     return `${JSON.stringify(result)}\n${log.slice(-12_000)}`;
   };
-  const setup = async () => {
+  const setup = async (api: "openai-completions" | "google-generative-ai" = "openai-completions") => {
     const dir = root();
     const requests: Array<Record<string, any>> = [];
+    let requestCount = 0;
     const server = http.createServer((request, response) => {
+      requestCount++; // Count HTTP arrival even if its body is interrupted.
       let body = "";
       request.on("data", chunk => { body += chunk; });
       request.on("end", () => {
         const payload = JSON.parse(body);
         requests.push(payload);
+        if (api === "google-generative-ai") {
+          response.writeHead(200, { "Content-Type": "text/event-stream" });
+          response.end(`data: ${JSON.stringify({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: "useful current result" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 3, totalTokenCount: 13 } })}\n\n`);
+          return;
+        }
         const useTool = payload.tools?.length && !payload.messages.some((m: {role: string}) => m.role === "tool");
         response.writeHead(200, { "Content-Type": "text/event-stream" });
         const chunk = (delta: unknown, finish_reason: string | null = null) => response.write(`data: ${JSON.stringify({
@@ -241,7 +366,7 @@ describe("native activation window (offline; opted-in success needs exact native
     fs.mkdirSync(agentDir);
     // Fake local credentials only. No model or fleet credential is read.
     fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({ providers: {
-      "window-test": { baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "offline-only", api: "openai-completions", models: [{
+      "window-test": { baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "offline-only", api, models: [{
         id: "offline", name: "offline", reasoning: false, input: ["text"], contextWindow: 8000, maxTokens: 1024,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       }] },
@@ -252,13 +377,146 @@ describe("native activation window (offline; opted-in success needs exact native
     fs.writeFileSync(path.join(dir, "task.txt"), "current tool result");
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     vi.stubEnv("PI_OFFLINE", "1");
+    const fabricExtensionPath = path.join(dir, "noop.ts");
+    fs.writeFileSync(fabricExtensionPath, "export default function () {}\n");
     const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: HANG_GUARD_MS }, {
+      fabricExtensionPath,
       workerPath: path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER ?? "src/worker.ts"),
       piBinary: nativeBinary!, runRoot: path.join(dir, "runs"),
     });
     managers.push(manager);
-    return { dir, manager, requests, settingsFile, settings };
+    return { dir, manager, requests, get requestCount() { return requestCount; }, settingsFile, settings };
   };
+
+  it.skipIf(!selectedNativeBinary).each(["google-generative-ai", "google-vertex"].flatMap(api =>
+    ["stream", "streamSimple"].flatMap(method =>
+      ["success", "abort", "snapshot", "expand", "shrink", "non-json", "invalid-control"].map(mode => [api, method, mode])),
+  ))("preserves native Google SDK payload and signal identity: %s %s %s", (api, method, mode) => {
+    const dir = root();
+    const resultFile = path.join(dir, "google-result.json");
+    const sdkCallFile = path.join(dir, "google-sdk-called");
+    const hook = fs.realpathSync(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER
+      ? path.join(path.dirname(path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER)), "worker/activation-window.js")
+      : path.resolve("src/worker/activation-window.ts"));
+    const adapter = path.resolve(path.dirname(nativeBinary), "../../pi-ai/dist/api", `${api}.js`);
+    const child = path.join(dir, "google-dispatch.mjs");
+    fs.writeFileSync(child, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import http from 'node:http';
+      import path from 'node:path';
+      import {findPackageJSON} from 'node:module';
+      import {pathToFileURL} from 'node:url';
+      import hook from ${JSON.stringify(pathToFileURL(hook).href)};
+      import * as native from ${JSON.stringify(pathToFileURL(adapter).href)};
+      const sdkPackage = findPackageJSON('@google/genai', ${JSON.stringify(pathToFileURL(adapter).href)});
+      const {Models} = await import(pathToFileURL(path.join(path.dirname(sdkPackage), 'dist/node/index.mjs')).href);
+      const controller = new AbortController();
+      // If cancellation state is accidentally serialized, this non-JSON graph
+      // fails admission. Its own serializer must never run, either.
+      controller.signal.context = {cycle:controller.signal, big:1n};
+      controller.signal.toJSON = () => {throw new Error('serialized SDK cancellation control')};
+      let observed, sdkCalls = 0, requests = 0, wire, disconnected = false, guardFired = false;
+      // The SDK installs this public method as an instance arrow function. Wrap
+      // that assignment to inspect the EXACT adapter input before SDK transforms.
+      Object.defineProperty(Models.prototype, 'generateContentStream', {configurable:true, set(fn) {
+        Object.defineProperty(this, 'generateContentStream', {value:async params => {
+          assert.equal(params, observed, 'replaced native SDK parameter object');
+          assert.equal(params.config.abortSignal, controller.signal, 'lost native AbortSignal identity');
+          sdkCalls++;
+          fs.writeFileSync(${JSON.stringify(sdkCallFile)}, 'called');
+          return fn(params);
+        }, configurable:true, writable:true});
+      }});
+      let closed;
+      const connectionClosed = new Promise(resolve => {closed = resolve});
+      const server = http.createServer((request, response) => {
+        requests++;
+        let body = '';
+        request.on('data', chunk => {body += chunk});
+        request.on('end', () => {
+          wire = JSON.parse(body);
+          response.once('close', () => {disconnected = true; closed()});
+          if (${JSON.stringify(mode)} === 'abort') {controller.abort(); return}
+          response.writeHead(200, {'Content-Type':'text/event-stream'});
+          response.end('data: ' + JSON.stringify({candidates:[{index:0, content:{role:'model', parts:[{text:'GOOGLE_OK'}]}, finishReason:'STOP'}],
+            usageMetadata:{promptTokenCount:10, candidatesTokenCount:3, totalTokenCount:13}}) + '\\n\\n');
+        });
+      });
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+      const timeout = setTimeout(() => {guardFired = true; controller.abort(); server.closeAllConnections()}, 15_000);
+      try {
+        process.env.PI_FABRIC_ACTIVATION_WORKER_PID = String(process.ppid);
+        process.env.PI_FABRIC_ACTIVATION_NONCE = 'google-nonce';
+        process.env.PI_FABRIC_PARENT_RUN = 'google-test';
+        process.env.PI_FABRIC_ACTIVATION_HOOK = ${JSON.stringify(hook)};
+        const handlers = new Map();
+        await hook({on(name, fn) {handlers.set(name, fn)}});
+        const model = {id:'offline', provider:'google-test', api:${JSON.stringify(api)}, baseUrl:'http://127.0.0.1:' + server.address().port + '/v1',
+          contextWindow:8000, maxTokens:1024, reasoning:false, input:['text'], cost:{input:0, output:0, cacheRead:0, cacheWrite:0}};
+        const provider = {stream:native.stream, streamSimple:native.streamSimple};
+        const ctx = {mode:'rpc', model, sessionManager:{getBranch(){return []}},
+          modelRegistry:{getAll(){return [model]}, getProvider(){return provider}}};
+        await handlers.get('session_start')({}, ctx);
+        await handlers.get('before_provider_headers')({}, ctx);
+        const result = await provider[${JSON.stringify(method)}](model, {messages:[{role:'user', content:${JSON.stringify(mode === "shrink" ? "x".repeat(80_000) : "SMALL_GOOGLE_INPUT")}, timestamp:1}]},
+          {apiKey:'offline-only', signal:controller.signal, maxRetries:0, onPayload:async payload => {
+            observed = payload;
+            assert.equal(payload.config.abortSignal, controller.signal);
+            if (${JSON.stringify(mode)} === 'expand') payload.contents.push({role:'user', parts:[{text:'x'.repeat(40_000)}]});
+            if (${JSON.stringify(mode)} === 'shrink') payload.contents = [{role:'user', parts:[{text:'SMALL_GOOGLE_INPUT'}]}];
+            // An identically named value anywhere else is context, not a control.
+            if (${JSON.stringify(mode)} === 'non-json') payload.config.extra = {abortSignal:controller.signal};
+            if (${JSON.stringify(mode)} === 'invalid-control') payload.config.abortSignal = {aborted:false};
+            if (${JSON.stringify(mode)} === 'snapshot') {
+              let reads = 0;
+              Object.defineProperty(payload, 'contents', {enumerable:true, configurable:true, get() {
+                return [{role:'user', parts:[{text:++reads === 1 ? 'SMALL_GOOGLE_INPUT' : 'x'.repeat(40_000)}]}];
+              }});
+            }
+          }}).result();
+        assert.equal(result.stopReason, ${JSON.stringify(mode === "abort" ? "aborted" : "stop")}, result.errorMessage);
+        assert.equal(sdkCalls, 1);
+        assert.equal(requests, 1);
+        assert.equal(JSON.stringify(wire).includes('abortSignal'), false);
+        assert.equal(JSON.stringify(wire).includes('SMALL_GOOGLE_INPUT'), true);
+        if (${JSON.stringify(mode)} === 'abort') await connectionClosed;
+        else assert.equal(result.content[0].text, 'GOOGLE_OK');
+        assert.equal(guardFired, false, 'request/disconnect ended only because the hang guard fired');
+        fs.writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({sdkCalls, requests, samePayload:true, sameSignal:true,
+          stopReason:result.stopReason, disconnected, wireKeys:Object.keys(wire)}));
+      } finally {
+        clearTimeout(timeout);
+        server.closeAllConnections();
+        await new Promise(resolve => server.close(resolve));
+      }
+    `);
+    const result = spawnSync(process.execPath, [child], {encoding: "utf8", timeout: HANG_GUARD_MS});
+    expect(result.error).toBeUndefined();
+    const refuses = ["expand", "non-json", "invalid-control"].includes(mode);
+    expect(result.status, result.stderr).toBe(refuses ? 78 : 0);
+    if (refuses) {
+      expect(fs.existsSync(sdkCallFile)).toBe(false);
+      expect(fs.existsSync(resultFile)).toBe(false);
+      expect(result.stderr).toContain(mode === "expand" ? "Context exceeds window" : "Fabric activation window failed");
+      return;
+    }
+    expect(JSON.parse(fs.readFileSync(resultFile, "utf8"))).toMatchObject({sdkCalls: 1, requests: 1, samePayload: true, sameSignal: true,
+      stopReason: mode === "abort" ? "aborted" : "stop", ...(mode === "abort" ? {disconnected: true} : {})});
+  }, TEST_GUARD_MS);
+
+  // Astra round 4: the native Google callback receives SDK parameters with a
+  // real config.abortSignal, while the wire body contains only model data.
+  it.skipIf(!selectedNativeBinary)("3238 admits a native Google activation with its normal cancellation control", async () => {
+    const s = await setup("google-generative-ai");
+    const result = await s.manager.run({ task: "CURRENT_GOOGLE_ACTIVATION", model: "window-test/offline", actorId: "google-actor",
+      sessionFile: path.join(s.dir, "actor.jsonl"), inferenceContext: "activation", tools: [], extensions: false, transport: "process" });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    expect(s.requestCount).toBe(1);
+    expect(s.requests).toHaveLength(1);
+    expect(JSON.stringify(s.requests)).toContain("CURRENT_GOOGLE_ACTIVATION");
+    expect(JSON.stringify(s.requests)).not.toContain("abortSignal");
+  }, TEST_GUARD_MS);
 
   it.skipIf(Boolean(selectedNativeBinary))("rejects an old native CLI that ignores the flag even when global compaction is already false", async () => {
     const s = await setup();
@@ -301,6 +559,192 @@ describe("native activation window (offline; opted-in success needs exact native
     const after = expectJournalAppended(journal, before);
     expect(after.bytes.toString("utf8")).toContain("CURRENT_ACTIVATION");
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
+  }, TEST_GUARD_MS);
+
+  // smarty-dev#3238: context projection is too late for a before_agent_start
+  // window guard, which still sees the native carried session.
+  it.skipIf(!selectedNativeBinary)("3238 oversized tool history cannot block activation preflight", async () => {
+    const s = await setup();
+    const extensionDir = path.join(s.dir, "agent", "extensions");
+    fs.mkdirSync(extensionDir);
+    fs.writeFileSync(path.join(extensionDir, "window-preflight.ts"), `
+      import { buildSessionContext, convertToLlm, getPackageDir } from '@earendil-works/pi-coding-agent';
+      import fs from 'node:fs';
+      import path from 'node:path';
+      import { pathToFileURL } from 'node:url';
+      import * as nodeModule from 'node:module';
+      export default async function(pi) {
+        let estimatorUrl = '@earendil-works/pi-ai/utils/estimate';
+        if (typeof nodeModule.findPackageJSON === 'function') {
+          const aiPackage = nodeModule.findPackageJSON('@earendil-works/pi-ai', pathToFileURL(path.join(getPackageDir(), 'package.json')));
+          estimatorUrl = pathToFileURL(path.join(path.dirname(aiPackage), 'dist', 'utils', 'estimate.js')).href;
+        }
+        const { estimateContextTokens } = await import(estimatorUrl);
+        pi.on('before_agent_start', (event, ctx) => {
+          const carried = convertToLlm(buildSessionContext(ctx.sessionManager.getBranch()).messages);
+          const tokens = estimateContextTokens([...carried, {role:'user', content:event.prompt, timestamp:Date.now()}]).tokens;
+          fs.appendFileSync(${JSON.stringify(path.join(s.dir, "preflight-tokens"))}, String(tokens) + '\\n');
+          if (tokens > ctx.model.contextWindow) {
+            fs.writeSync(2, 'Context exceeds window: estimated ' + tokens + ' input tokens, window ' + ctx.model.contextWindow + '\\n');
+            process.exit(78);
+          }
+        });
+      }
+    `);
+    const journal = path.join(s.dir, "actor.jsonl");
+    const session = SessionManager.open(journal);
+    session.appendMessage(user("OLD_PRIVATE_ACTIVATION"));
+    session.appendMessage({ ...assistant(""), content: [{ type: "toolCall", id: "old-read", name: "read", arguments: { path: "huge" } }] });
+    session.appendMessage({ role: "toolResult", toolCallId: "old-read", toolName: "read", content: [{ type: "text", text: "HUGE_PRIVATE_TOOL_RESULT " + "x".repeat(1_100_000) }], isError: false, timestamp: 3 });
+    const before = readJournal(journal);
+    const result = await s.manager.run({ task: "CURRENT_ACTIVATION", systemPrompt: "CURRENT_INSTRUCTIONS", model: "window-test/offline", actorId: "same-actor", sessionFile: journal, inferenceContext: "activation", tools: [], extensions: true, transport: "process" });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    expect(s.requests).toHaveLength(1);
+    expect(JSON.stringify(s.requests)).not.toContain("HUGE_PRIVATE_TOOL_RESULT");
+    expect(JSON.stringify(s.requests)).not.toContain("OLD_PRIVATE_ACTIVATION");
+    expect(JSON.stringify(s.requests)).toContain("CURRENT_ACTIVATION");
+    expect(JSON.stringify(s.requests)).toContain("CURRENT_INSTRUCTIONS");
+    expect(Number(fs.readFileSync(path.join(s.dir, "preflight-tokens"), "utf8").trim())).toBeLessThan(8000);
+    expectJournalAppended(journal, before);
+    const reloaded = buildSessionContext(SessionManager.open(journal).getBranch()).messages;
+    expect(JSON.stringify(reloaded)).toContain("HUGE_PRIVATE_TOOL_RESULT");
+    expect(JSON.stringify(reloaded)).toContain("CURRENT_ACTIVATION");
+  }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary)("3238 an unfittable single activation alarms once without retries", async () => {
+    const s = await setup();
+    const alarms: Array<{ delivery: string; triggerTurn: boolean; message: { text?: string } }> = [];
+    const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
+    const actors = new ActorManager("window-test", { id: "owner", name: "owner", kind: "main", sessionId: "window-test" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, s.manager, request => { alarms.push(request); },
+      { actorRoot: path.join(s.dir, "actors"), persistent: true });
+    managers.push(actors);
+    const actor = await actors.create({ name: "oversized", instructions: "Act on this event.", residency: "durable", inferenceContext: "activation", model: "window-test/offline", tools: [], extensions: false, transport: "process", delivery: "mailbox" });
+    const run = vi.spyOn(s.manager, "run");
+    await expect(actors.ask(actor.id, "x".repeat(80_000))).rejects.toThrow(/Context exceeds window/);
+    await actors.close(); // settles the drain; no timing sleep can hide a retry
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(s.requests).toHaveLength(0);
+    expect(alarms).toHaveLength(1);
+    expect(alarms[0]).toMatchObject({ delivery: "followUp", triggerTurn: true });
+    expect(alarms[0]!.message.text).toContain("Context exceeds window");
+    expect(mesh.read({ topic: "ops.owner" }).filter(event => event.kind === "actor.alarm")).toEqual([
+      expect.objectContaining({ data: expect.objectContaining({ actorId: actor.id, reason: "context_window" }) }),
+    ]);
+    expect(actors.messages(actor.id, 20).filter(message => message.error?.includes("Context exceeds window"))).toHaveLength(1);
+  }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary).each(["expand", "shrink"])("3238 admits only the final context after a later context_with_system %s", async mode => {
+    const s = await setup();
+    const extensionDir = path.join(s.dir, "agent", "extensions");
+    fs.mkdirSync(extensionDir);
+    fs.writeFileSync(path.join(extensionDir, "late-transform.ts"), `
+      import fs from 'node:fs';
+      export default function(pi) {
+        pi.on('context_with_system', event => {
+          fs.appendFileSync(${JSON.stringify(path.join(s.dir, "transforms"))}, 'transform\\n');
+          return {messages: ${mode === "expand"
+            ? "[...event.messages, {role:'user', content:'LATE_CONTEXT ' + 'x'.repeat(40_000), timestamp:Date.now()}]"
+            : "event.messages.map(message => message.role === 'user' ? {...message, content:'SMALL_TRANSFORMED_CONTEXT'} : message)"}};
+        });
+      }
+    `);
+    const alarms: Array<{message: {text?: string}}> = [];
+    const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
+    const actors = new ActorManager("late-window-test", {id: "owner", name: "owner", kind: "main", sessionId: "late-window-test"}, mesh,
+      {...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20}, s.manager, request => { alarms.push(request); },
+      {actorRoot: path.join(s.dir, "actors"), persistent: true});
+    managers.push(actors);
+    const actor = await actors.create({name: "late-transform", instructions: "Act.", inferenceContext: "activation",
+      model: "window-test/offline", tools: [], extensions: true, transport: "process", delivery: "mailbox"});
+    const run = vi.spyOn(s.manager, "run");
+    const outcome = actors.ask(actor.id, mode === "expand" ? "SMALL_RAW_CONTEXT" : "LARGE_RAW_CONTEXT " + "x".repeat(80_000));
+    if (mode === "expand") {
+      await expect(outcome).rejects.toThrow(/Context exceeds window/);
+      await actors.close();
+      expect(s.requests).toHaveLength(0);
+      expect(alarms).toHaveLength(1);
+      expect(alarms[0]!.message.text).toContain("Context exceeds window");
+      expect(mesh.read({topic: "ops.owner"}).filter(event => event.kind === "actor.alarm")).toHaveLength(1);
+    } else {
+      await expect(outcome).resolves.toMatchObject({text: "useful current result"});
+      await actors.close();
+      expect(s.requests).toHaveLength(1);
+      expect(JSON.stringify(s.requests)).toContain("SMALL_TRANSFORMED_CONTEXT");
+      expect(JSON.stringify(s.requests)).not.toContain("LARGE_RAW_CONTEXT");
+      expect(alarms).toHaveLength(0);
+    }
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(fs.readFileSync(path.join(s.dir, "transforms"), "utf8")).toBe("transform\n");
+  }, TEST_GUARD_MS);
+
+  // Astra round 3: native before_provider_request runs AFTER dispatch has
+  // converted the transcript. Exercise its real awaited handler chain and count
+  // actual requests at the localhost server, not calls to streamSimple.
+  it.skipIf(!selectedNativeBinary).each([
+    "expand-replace", "expand-in-place", "expand-tools", "shrink", "expand-shrink", "shrink-expand",
+  ])("3238 admits only the final payload after before_provider_request %s", async mode => {
+    const s = await setup();
+    const extensionDir = path.join(s.dir, "agent", "extensions");
+    fs.mkdirSync(extensionDir);
+    const transforms = path.join(s.dir, "payload-transforms");
+    fs.writeFileSync(path.join(extensionDir, "late-payload.ts"), `
+      import fs from 'node:fs';
+      export default function(pi) {
+        const shrink = payload => ({...payload, messages: payload.messages.map(message =>
+          message.role === 'user' ? {...message, content:'SMALL_FINAL_PAYLOAD'} : message)});
+        const expand = payload => ({...payload, messages: [...payload.messages,
+          {role:'user', content:'LATE_PAYLOAD ' + 'x'.repeat(40_000)}]});
+        pi.on('before_provider_request', async event => {
+          await Promise.resolve();
+          fs.appendFileSync(${JSON.stringify(transforms)}, 'first\\n');
+          const mode = ${JSON.stringify(mode)};
+          if (mode === 'expand-in-place') {
+            event.payload.messages.push({role:'user', content:'LATE_PAYLOAD ' + 'x'.repeat(40_000)});
+            return; // Undefined means retain the mutated input.
+          }
+          if (mode === 'expand-tools') return {...event.payload, tools:[{type:'function',
+            function:{name:'oversized', description:'LATE_TOOL ' + 'x'.repeat(40_000),
+              parameters:{type:'object', properties:{}}}}]};
+          return mode.startsWith('expand') ? expand(event.payload) : shrink(event.payload);
+        });
+        pi.on('before_provider_request', async event => {
+          await Promise.resolve();
+          fs.appendFileSync(${JSON.stringify(transforms)}, 'last\\n');
+          if (${JSON.stringify(mode)} === 'expand-shrink') return shrink(event.payload);
+          if (${JSON.stringify(mode)} === 'shrink-expand') return expand(event.payload);
+        });
+      }
+    `);
+    const alarms: Array<{message: {text?: string}}> = [];
+    const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
+    const actors = new ActorManager("payload-window-test", {id: "owner", name: "owner", kind: "main", sessionId: "payload-window-test"}, mesh,
+      {...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20}, s.manager, request => { alarms.push(request); },
+      {actorRoot: path.join(s.dir, "actors"), persistent: true});
+    managers.push(actors);
+    const actor = await actors.create({name: "late-payload", instructions: "Act.", inferenceContext: "activation",
+      model: "window-test/offline", tools: [], extensions: true, transport: "process", delivery: "mailbox"});
+    const run = vi.spyOn(s.manager, "run");
+    const reduces = mode === "shrink" || mode === "expand-shrink";
+    const outcome = actors.ask(actor.id, reduces ? "LARGE_RAW_PAYLOAD " + "x".repeat(80_000) : "SMALL_RAW_PAYLOAD");
+    if (reduces) await expect(outcome).resolves.toMatchObject({text: "useful current result"});
+    else await expect(outcome).rejects.toThrow(/Context exceeds window/);
+    await actors.close(); // Join the drain: exactly one activation, no hidden retry.
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(await run.mock.results[0]!.value).toMatchObject({status: reduces ? "completed" : "failed"});
+    expect(s.requestCount).toBe(reduces ? 1 : 0);
+    expect(s.requests).toHaveLength(reduces ? 1 : 0);
+    expect(alarms).toHaveLength(reduces ? 0 : 1);
+    expect(mesh.read({topic: "ops.owner"}).filter(event => event.kind === "actor.alarm")).toHaveLength(reduces ? 0 : 1);
+    if (reduces) {
+      expect(JSON.stringify(s.requests)).toContain("SMALL_FINAL_PAYLOAD");
+      expect(JSON.stringify(s.requests)).not.toContain("LARGE_RAW_PAYLOAD");
+      expect(JSON.stringify(s.requests)).not.toContain("LATE_PAYLOAD");
+    } else {
+      expect(alarms[0]!.message.text).toContain("Context exceeds window");
+      expect(actors.messages(actor.id, 20).filter(message => message.error?.includes("Context exceeds window"))).toHaveLength(1);
+    }
+    expect(fs.readFileSync(transforms, "utf8")).toBe("first\nlast\n");
   }, TEST_GUARD_MS);
 
   it.skipIf(!selectedNativeBinary)("blocks native manual compaction before any summary request and retains the full journal", async () => {
@@ -346,7 +790,7 @@ describe("native activation window (offline; opted-in success needs exact native
       child.once("error", reject);
       child.once("close", resolve);
     }).finally(() => clearTimeout(timeout));
-    expect(state).toMatchObject({ autoCompactionDisabledForProcess: true, autoCompactionEnabled: false });
+    expect(state, stderr).toMatchObject({ autoCompactionDisabledForProcess: true, autoCompactionEnabled: false });
     expect(exit, stderr).toBe(78);
     expect(stderr).toContain("Compaction is unsupported");
     expect(s.requests).toHaveLength(0);

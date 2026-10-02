@@ -242,6 +242,8 @@ export class ResidentHost {
   #pollingRequests = false;
   /** Renamed by this host, but not yet safe to execute. Never replay already executing work. */
   readonly #unconfirmedPickups = new Set<string>();
+  // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
+  readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
   readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
@@ -523,11 +525,13 @@ export class ResidentHost {
         hostId: this.hostId,
         pid: process.pid,
         processStartTime: processStartTime(process.pid),
+        fabricExtensionPath: this.config.fabricExtensionPath,
         token: this.#token,
         startedAt: now,
         readyAt: now,
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
+        creationIdempotency: 1,
         ...(this.launch ? { releaseRoot: this.launch.spec.releaseRoot, configDigest: this.launch.spec.digest,
           handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
           ...(this.launch.attempt ? { attempt: this.launch.attempt } : {}) } : {}),
@@ -1024,6 +1028,71 @@ export class ResidentHost {
       if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
         throw new Error(`Fabric residency request ${requestId} was abandoned before commit`);
       }
+      response = await this.#executeOnce(command);
+    } catch (error) {
+      response = { format: RESIDENT_HOST_FORMAT, requestId, ok: false, error: errorMessage(error),
+        ...(error instanceof ResidentCommandUnsupportedError ? { errorCode: error.code } : {}), completedAt: Date.now() };
+    }
+    if (response.ok) await testResidentRequestDelay("after_commit");
+    const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
+    writeJsonAtomic(responsePath, response, { durable: true });
+    // An abandoned caller already left; clean late responses as well as processing files.
+    if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+      fs.rmSync(responsePath, { force: true });
+    }
+    fs.rmSync(filePath, { force: true });
+    this.participants.scheduleRefresh();
+  }
+
+  #pruneCreations(): void {
+    const cutoff = Date.now() - 10 * 60_000;
+    for (const [key, entry] of this.#creations) {
+      if (entry.completedAt !== undefined && entry.completedAt <= cutoff) this.#creations.delete(key);
+    }
+    const completed = [...this.#creations].filter(([, entry]) => entry.completedAt !== undefined);
+    for (const [key] of completed.slice(0, Math.max(0, completed.length - 256))) this.#creations.delete(key);
+    // Never evict an in-flight creation: retries must join the same promise.
+  }
+
+  async #executeOnce(command: ResidentCommand): Promise<ResidentCommandResponse> {
+    if ((command.operation !== "spawn" && command.operation !== "createActor") || command.idempotencyKey === undefined) {
+      return this.#executeRequest(command);
+    }
+    if (typeof command.idempotencyKey !== "string" || !command.idempotencyKey.length || command.idempotencyKey.length > 256) {
+      throw new Error("Resident idempotencyKey must be a string of 1 to 256 characters");
+    }
+    this.#pruneCreations();
+    // Operation-scoped; this host already validates its one root before dispatch.
+    const key = JSON.stringify([command.operation, command.idempotencyKey]);
+    let entry = this.#creations.get(key);
+    if (!entry) {
+      entry = { result: Promise.resolve().then(() => this.#executeRequest(command)) };
+      this.#creations.set(key, entry);
+      const tracked = entry;
+      void tracked.result.then(() => { tracked.completedAt = Date.now(); this.#pruneCreations(); });
+    }
+    const response = await entry.result;
+    if (response.requestId !== command.requestId) {
+      // Cache hits still participate in the caller's existing cancellation fence,
+      // including failures after commit. Replays of a retry receipt are safe too.
+      const original = readResidentRequestDecision(this.config.residencyRoot, response.requestId);
+      if (response.ok || original?.state === "committed") {
+        const id = response.handle?.id ?? response.actor?.id ?? original?.id;
+        if (!id) throw new Error("Resident creation result has no entity ID");
+        const decision = readResidentRequestDecision(this.config.residencyRoot, command.requestId);
+        if (decision?.state !== "committed" || decision.id !== id ||
+          decision.operation !== command.operation || decision.ownerHostId !== this.hostId) {
+          commitResidentRequest(this.config.residencyRoot, command, id, this.hostId);
+        }
+      }
+    }
+    return { ...response, requestId: command.requestId };
+  }
+
+  async #executeRequest(command: ResidentCommand): Promise<ResidentCommandResponse> {
+    const requestId = command.requestId;
+    let response: ResidentCommandResponse;
+    try {
       await testResidentRequestDelay("before_commit");
       const commit = (id: string): void => commitResidentRequest(this.config.residencyRoot, command, id, this.hostId);
       if (command.operation === "releaseChange") {
@@ -1176,15 +1245,7 @@ export class ResidentHost {
         completedAt: Date.now(),
       };
     }
-    if (response.ok) await testResidentRequestDelay("after_commit");
-    const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
-    writeJsonAtomic(responsePath, response, { durable: true });
-    // An abandoned caller already left; clean late responses as well as processing files.
-    if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
-      fs.rmSync(responsePath, { force: true });
-    }
-    fs.rmSync(filePath, { force: true });
-    this.participants.scheduleRefresh();
+    return response;
   }
 
   /** Pending removals for clients' error messages (smarty-dev#2184 item 8). */

@@ -36,6 +36,27 @@ const fixture = () => {
 };
 
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+describe("resident loaded-path census metadata", () => {
+  it("publishes the startup generation rather than a later desired configuration", async () => {
+    const { root, config, host } = fixture();
+    const loaded = config.fabricExtensionPath;
+    try {
+      await host.start();
+      const ownerPath = path.join(config.residencyRoot, "owner.json");
+      const owner = fs.readFileSync(ownerPath, "utf8");
+      expect(JSON.parse(owner)).toMatchObject({ pid: process.pid, fabricExtensionPath: loaded });
+      fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify({
+        ...config, fabricExtensionPath: path.join(root, "replacement", "dist", "index.js"),
+      }));
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      expect(host.config.fabricExtensionPath).toBe(loaded);
+    } finally {
+      await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("resident tracked result preservation", () => {
   it.each(["processing", "requests"] as const)("#2479 R3 F4 retries the failed %s pickup barrier in the same live host before mutation or ack", async (failedDirectory) => {
     const { root, config, host } = fixture();
@@ -380,7 +401,7 @@ describe("resident host ownership", () => {
     try {
       await host.start();
       const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
-      expect(owner).toMatchObject({ requestFence: 1, commands: expect.arrayContaining(["setModel", "setTools"]), pid: process.pid, hostId: host.hostId });
+      expect(owner).toMatchObject({ requestFence: 1, creationIdempotency: 1, commands: expect.arrayContaining(["setModel", "setTools"]), pid: process.pid, hostId: host.hostId });
       expect(owner.processStartTime).toBe(processStartTime(process.pid));
       expect(residentProcessAlive(owner.pid, owner.processStartTime)).toBe(true);
       await host.close();

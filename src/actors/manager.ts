@@ -2554,7 +2554,9 @@ export class ActorManager {
                 actorId: actor.id, activationId: item.id }, abortController.signal);
             })
             : undefined;
-          const launchBinding = routeDecision ? { model: routeDecision.pin.model, thinking: routeDecision.pin.effort }
+          const launchBinding = routeDecision ? {
+            model: routeDecision.mode === "live" ? routeDecision.model : routeDecision.pin.model,
+            thinking: routeDecision.mode === "live" ? routeDecision.effort : routeDecision.pin.effort }
             : await this.#prepare(actor, "binding", () => this.#resolvedRunBinding(actor, binding));
           // Admission is held, but no child writer has launched yet. Repair/create
           // the native session before handing its path to the process.

@@ -323,6 +323,7 @@ interface FabricRemoteControlResult {
   acknowledged: true;
 }
 interface FabricAgentResult extends FabricAgentHandle {
+  routeQuality?: "pass" | "fail";
   /** Caller-supplied model justification, retained on the run record. */
   modelReason?: string;
   /** Resolution marker (alias name or closest); does not replace the observed model. */
@@ -941,7 +942,9 @@ interface FabricMessageDelivery {
   replacedMessageId?: string;
 }
 interface FabricAgentsApi {
-  run(args: FabricAgentRequest): Promise<FabricAgentResult>;
+  run(args: FabricAgentRequest & { pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentResult>;
+  /** Explicit review/test/retry quality assertion for a locally owned routed run. */
+  routeOutcome(args: FabricAgentTargetArgs & { routeQuality: "pass" | "fail" }): Promise<{ id: string; routeQuality: "pass" | "fail" }>;
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;

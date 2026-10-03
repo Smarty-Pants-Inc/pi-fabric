@@ -852,6 +852,31 @@ describe('model: "auto" spawn routing (#2890)', () => {
     expect(rows).toHaveLength(2); expect(rows[1].decisionId).toBe(rows[0].decisionId);
     expect(evaluate).toHaveBeenCalledTimes(1);
   });
+  it.each(["task:merge-additive", "task:ci-test-fixture", "task:exact-checks"])("routes explicit opt-in %s on spawn and run, never from task text", async routeClass => {
+    const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
+      agentsConfig: { modelRouting: { liveClasses: [routeClass], shadowCandidates: [{ model: "provider/model-b", effort: "high" }] } } });
+    for (const action of ["spawn", "run"]) {
+      const handle = await provider.invoke(action, { ...request, task: "ECHO_MODEL", routeClass }, context) as AgentHandleInfo;
+      expect(await agents.wait(handle.id)).toMatchObject({ model: "provider/model-b", thinking: "high", routeClass, routeClassSource: "explicit" });
+    }
+    expect(evaluate).toHaveBeenCalledTimes(2);
+    const plain = await provider.invoke("spawn", { task: routeClass, name: routeClass, transport: "process", protected: false }, context) as AgentHandleInfo;
+    expect(await agents.wait(plain.id)).toMatchObject({ routeClass: "task:pi:process", routeClassSource: "derived" });
+    expect(evaluate).toHaveBeenCalledTimes(2);
+  });
+  it("reports a quality failure via the registered routeOutcome API and demotes only the class", async () => {
+    const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
+      agentsConfig: { modelRouting: { liveClasses: [request.routeClass], shadowCandidates: [{ model: "provider/model-b", effort: "high" }] } } });
+    const registry = new ActionRegistry(); registry.register(provider);
+    const handle = await provider.invoke("spawn", request, context) as AgentHandleInfo;
+    await agents.wait(handle.id);
+    expect(await registry.invoke("agents.routeOutcome", { id: handle.id, routeQuality: "fail" }, { ...context, approve: async () => {}, audits: [], maxResultChars: 100000 })).toMatchObject({ id: handle.id, routeQuality: "fail" });
+    const second = await provider.invoke("spawn", request, context) as AgentHandleInfo & { routeDecision: { reasonCode: string } };
+    expect(second).toMatchObject({ model: request.pinModel, routeDecision: { reasonCode: "class-reverted" } });
+    await agents.wait(second.id);
+  });
   it.each([true, undefined])("excludes protected/unknown before Jev at the public API: %s", async protectedFlag => {
     const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
     const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });

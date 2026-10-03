@@ -23,6 +23,21 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("types explicit task-auto pins and quality reports (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const run = await agents.run({ task: "exact checks", model: "auto", routeClass: "task:exact-checks", protected: false, pinModel: "test/sol", pinThinking: "max" });
+      const quality = await agents.routeOutcome({ id: run.id, routeQuality: "fail" });
+      const checked: "pass" | "fail" = quality.routeQuality; return checked;`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+  });
+  it("routes quality assertions through the real guest bridge", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const result = await new QuickJsRuntime().execute(`return await agents.routeOutcome({ id: "run-1", routeQuality: "fail" });`, async (ref, args) => {
+      calls.push({ ref, args }); return { id: "run-1", routeQuality: "fail" };
+    }, { timeoutMs: 5000, memoryLimitBytes: 32 * 1024 * 1024 });
+    expect(result.terminationReason).toBe("completed");
+    expect(calls).toEqual([{ ref: "agents.routeOutcome", args: { id: "run-1", routeQuality: "fail" } }]);
+  });
+
   it.each([false, true])("types Main before/after readback without regressing literal actor targets (fullCodeMode=%s)", fullCodeMode => {
     const code = `const main = await agents.setThinking({ id: "session:root", thinking: "high" });
       const actor = await agents.setModel({ id: "actor", model: "probe/b" });

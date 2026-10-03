@@ -149,6 +149,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Explicit quality assertion from the caller/actor; never inferred from task text. */
+  routeQuality?: "pass" | "fail";
   /** Always populated for new runs; optional for legacy records. */
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];

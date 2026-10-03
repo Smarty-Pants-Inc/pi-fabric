@@ -330,6 +330,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   modelReason?: string;
   thinking?: AgentRunRequest["thinking"];
   routeOutcome?: (result: AgentRunResult) => void;
+  routeQualityReport?: (quality: "pass" | "fail") => void;
   /** Original authority for every attempt, never a prepared/observed replacement label. */
   routePin?: Readonly<NonNullable<AgentRunRequest["routeDecision"]>["pin"]>;
   actorId?: string;
@@ -1028,7 +1029,7 @@ export class AgentManager {
       ? { ...(typeof this.#completionRecipient === "function" ? this.#completionRecipient() : this.#completionRecipient) }
       : undefined;
     if (request.model === "auto") throw new Error('Unresolved model: "auto" must go through agents.spawn routing');
-    const routedActor = request.routeDecision?.mode === "shadow" && Boolean(request.actorId) &&
+    const routedActor = (request.routeDecision?.mode === "shadow" || request.routeDecision?.mode === "live") && Boolean(request.actorId) &&
       request.routeDecision.actorId === request.actorId && Boolean(request.routeDecision.activationId) && Boolean(request.sessionFile);
     if (request.routeDecision && ((request.runner ?? this.config.runner) !== "pi" ||
       (request.transport ?? this.config.transport) !== "process" || (request.residency ?? "session") !== "session" ||
@@ -1081,7 +1082,9 @@ export class AgentManager {
     const tools = this.#childTools(request, runner, requiresFabricKernel);
     if (runner === "claude") mapClaudeTools(tools);
     if (runner === "veda") mapVedaTools(tools);
-    const routePin = request.routeDecision ? Object.freeze({ ...request.routeDecision.pin }) : undefined;
+    // Freeze the admitted finite selection for every retry/resume.
+    let routePin = request.routeDecision ? Object.freeze({ ...(request.routeDecision.mode === "live"
+      ? { model: request.routeDecision.model, effort: request.routeDecision.effort } : request.routeDecision.pin) }) : undefined;
     let model = routePin?.model ?? (request.model?.trim() || this.defaultModel(runner));
     this.assertModelAllowed(model, runner);
     // Alternate backend targets must be known before even accepting a queue receipt.
@@ -1115,6 +1118,10 @@ export class AgentManager {
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
       routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id, request.routeRecord);
+      // Failed decision storage demotes before admission: no unlogged candidate.
+      routePin = Object.freeze({ ...(request.routeDecision.mode === "live"
+        ? { model: request.routeDecision.model, effort: request.routeDecision.effort } : request.routeDecision.pin) });
+      model = routePin.model;
     }
     const startPrepared = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try {
@@ -1407,7 +1414,7 @@ export class AgentManager {
           ...(model ? { model } : {}),
           ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
           ...(thinking ? { thinking } : {}),
-          ...(routeDispatch ? { routeOutcome: routeDispatch.outcome } : {}),
+          ...(routeDispatch ? { routeOutcome: routeDispatch.outcome, routeQualityReport: routeDispatch.reportQuality } : {}),
           ...(routePin ? { routePin } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
           ...(request.actorName ? { actorName: request.actorName } : {}),
@@ -1498,8 +1505,8 @@ export class AgentManager {
       ...(kernel ? { kernel } : {}),
       ...(model ? { model } : {}),
       ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
-      ...(request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking
-        ? { thinking: request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking } : {}),
+      ...(routePin?.effort ?? request.thinking ?? this.config.thinking
+        ? { thinking: routePin?.effort ?? request.thinking ?? this.config.thinking } : {}),
       ...(request.actorId ? { actorId: request.actorId } : {}),
       ...(request.actorName ? { actorName: request.actorName } : {}),
       ...(this.#spawner ? { spawner: this.#spawner } : {}),
@@ -1612,6 +1619,14 @@ export class AgentManager {
     const queued = this.#queued.get(handle.id);
     if (queued && !queued.terminal && !queued.preparing) onQueued?.(this.#queuedInfo(queued));
     return this.wait(handle.id);
+  }
+
+  /** Caller/actor quality assertion, joined to a locally owned routed run only. */
+  reportRouteQuality(id: string, quality: "pass" | "fail"): void {
+    if (quality !== "pass" && quality !== "fail") throw new Error("Invalid routeQuality");
+    const run = this.#requireRun(id);
+    if (!run.routeQualityReport) throw new Error("Run has no model route decision");
+    run.routeQualityReport(quality);
   }
 
   /** Side-effect-free settlement join for preparation before a durable mutation fence. */

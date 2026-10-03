@@ -58,6 +58,39 @@ describe("resident loaded-path census metadata", () => {
 });
 
 describe("resident tracked result preservation", () => {
+  it.each(process.platform === "win32" ? ["file", "retirement"] as const : ["file", "namespace", "retirement"] as const)("S5 retries completed response %s storage without repeating the mutation", async fault => {
+    const { root, config, host } = fixture();
+    const requestId = "response-retry", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    const files = new Map<number, string>(), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), rm = fs.rmSync.bind(fs);
+    let unavailable = true, failures = 0;
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); files.set(fd, String(file)); return fd; });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = files.get(fd) ?? "";
+      const target = fault === "file" ? file.startsWith(response + ".") && file.endsWith(".tmp") : fault === "namespace" && file === path.dirname(response);
+      if (unavailable && target) { failures++; throw new Error("response barrier unavailable"); }
+      sync(fd);
+    });
+    const removed = vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (unavailable && fault === "retirement" && String(file) === processing) { failures++; throw new Error("response retirement unavailable"); }
+      rm(file, options);
+    });
+    let create: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await host.start(); create = vi.spyOn(host.actors, "create");
+      fs.writeFileSync(path.join(config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({ format: 1, requestId, operation: "createActor", rootId: config.rootId, createdAt: Date.now(), request: { name: "response retry", instructions: "Work", residency: "durable" } }));
+      for (let n = 0; failures === 0 && n < 400; n++) await delay(10);
+      expect(failures).toBeGreaterThan(0); expect(create).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(processing)).toBe(true);
+      const created = host.actors.listOwned()[0]!.id;
+      await delay(250); expect(create).toHaveBeenCalledTimes(1);
+      unavailable = false;
+      for (let n = 0; (!fs.existsSync(response) || fs.existsSync(processing)) && n < 500; n++) await delay(10);
+      expect(fs.existsSync(response)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(response, "utf8"))).toMatchObject({ ok: true, requestId, actor: { id: created } });
+      expect(fs.existsSync(processing)).toBe(false); expect(create).toHaveBeenCalledTimes(1);
+    } finally { unavailable = false; removed.mockRestore(); synced.mockRestore(); opened.mockRestore(); create?.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 15_000);
+
   it.each(["processing", "requests"] as const)("#2479 R3 F4 retries the failed %s pickup barrier in the same live host before mutation or ack", async (failedDirectory) => {
     const { root, config, host } = fixture();
     config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");

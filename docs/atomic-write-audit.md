@@ -31,13 +31,13 @@ The earlier Schema, mesh-checkpoint and bridge slices remain deferred separately
 | `actors/registry-store.ts` | Durable definitions and lineage claims before queue takeover; durable rollback restores authoritative definitions |
 | `actors/global-registry.ts` | Durable user template library |
 | `actors/binding-store.ts` | Durable session model/thinking overrides |
-| `actors/manager.ts` | Durable new/coalesced callerless admission before acceptance; restored queue confirmation before launch/cursor progress; predecessor unlink barriers; complete source session inode and inode-bound archive namespace before replacement/pruning; prelaunch failure settlement/parking; live adoption claim/copy retries; explicit actor stop-publication retry |
+| `actors/manager.ts` | Durable new/coalesced callerless admission before acceptance; restored queue confirmation before launch/cursor progress; predecessor unlink barriers; complete source session inode and inode-bound archive namespace before replacement/pruning; prelaunch failure settlement/parking; live adoption claim/copy retries; explicit and directive actor stop-publication retry; durable ordinary-completion backlog replacement and storage-only retry gate |
 | `actors/mesh-monitor.ts` | Durable accepted replay checkpoint with existing batching |
 | `config.ts` | Published config namespace includes new ancestors and symlink parents; POSIX barrier errors fail closed |
-| `records/client.ts` | Durable same-nonce republishing before every register attempt; durable issued credential before open returns |
-| `residency/client.ts` | Durable metadata, completion-consumption state and resident request/receipt replacements |
+| `records/client.ts` | Durable same-nonce republishing before every register attempt; durable issued credential before open returns; reconfirm known-token enrollment on every successful open |
+| `residency/client.ts` | Durable metadata, completion-consumption state and resident request/receipt replacements; reconfirm visible consumption before acknowledgement or notification retirement |
 | `residency/actor-client.ts` | Durable command before host execution |
-| `residency/host.ts` | Confirm both pickup namespaces before execution; retry only this host's never-executed pickups; durable response before processing retirement; owner/error/removal hints stay non-durable |
+| `residency/host.ts` | Confirm both pickup namespaces before execution; retry only this host's never-executed pickups; durable response before processing retirement; live completed-response publication/retirement retry without mutation replay; owner/error/removal hints stay non-durable |
 | `residency/protocol.ts` | File barrier before immutable decision link; namespace barrier before winner acknowledgement; EEXIST confirms actual winning inode and bound namespace |
 | `storage/retention.ts` | Durable unresolved-worker veto plus shared fail-closed Herdr collection veto even when marker publication failed; sweep/heartbeat hints stay fast |
 
@@ -73,7 +73,14 @@ are required by ordinary registry durability, not task-terminal recovery.
 
 Schema, mesh, bridge, shared atomic helper, build/provider registrations and
 verified kernels remain actual-main. No new configuration keys are introduced.
-The earlier P2 follow-ups remain tracked in smarty-dev#3342.
+The earlier P2 follow-ups remain tracked in smarty-dev#3342. PR A round 1 also
+repairs Astra F2/security S1 ordinary-completion queue durability, S2/F25 known-token
+confirmation, S3/F23 directive-stop publication, S4 completion-consumption
+confirmation and S5 live storage-only resident response retry. These are queue,
+enrollment and resident request/consumption receipts, not task-terminal machinery.
+`atomic-review-r1.test.ts`, the completion/consumption process fixtures and the
+resident-host/client regressions cover failed barriers, healthy retries and normal
+process replacement without new ingress. They do not certify physical power loss.
 
 ## Limits and before-merge holds
 

@@ -83,7 +83,12 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
         if (error.code === "RECORD_UNAUTHENTICATED") return false;
         throw error;
       });
-      if (known) return { id: saved.id, token: saved.token };
+      if (known) {
+        // Authentication proves server validity, not the receipt of a previous
+        // local rename. Republish the same enrollment before accepting it.
+        writeJsonAtomic(file, saved, { newline: true, durable: true });
+        return { id: saved.id, token: saved.token };
+      }
     }
     const nonce = saved?.nonce ?? randomBytes(32).toString("base64url");
     const save = (value: SavedEnrollment) => {

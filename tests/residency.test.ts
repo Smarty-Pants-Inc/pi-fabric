@@ -1,6 +1,7 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import fs from "node:fs";
+import * as atomic from "../src/core/atomic-write.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -574,6 +575,46 @@ describe("durable completion receipts", () => {
     });
     return { id, result, runDirectory, metadataPath, key };
   };
+
+  it.skipIf(process.platform === "win32").each([
+    { restart: false, retry: true }, { restart: true, retry: true },
+    { restart: false, retry: false }, { restart: true, retry: false },
+  ])("S4 reconfirms visible consumption before retry or source retirement (restart: $restart, retry: $retry)", async ({ restart, retry }) => {
+    const state = await rootHarness(`consumption-confirm-${restart}`), seeded = await seedCompletion(state);
+    const consumed = vi.fn(), completed = vi.fn();
+    const options = { config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, onBackgroundComplete: completed, onResultConsumed: consumed };
+    let client = new ResidencyClient(options);
+    const files = new Map<number, string>(), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let unavailable = true, failures = 0;
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); files.set(fd, String(file)); return fd; });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (unavailable && files.get(fd) === path.dirname(seeded.metadataPath)) { failures++; throw new Error("consumption namespace unavailable"); }
+      sync(fd);
+    });
+    try {
+      if (restart) {
+        const configFile = path.join(state.root, "consumption-producer.json");
+        fs.writeFileSync(configFile, JSON.stringify(state.config));
+        const child = spawn("bun", [path.resolve("tests/fixtures/atomic-consumption-crash.ts"), configFile, seeded.id], { stdio: ["ignore", "pipe", "pipe"] });
+        let output = "", errors = "";
+        child.stdout.on("data", chunk => { output += chunk.toString(); }); child.stderr.on("data", chunk => { errors += chunk.toString(); });
+        const code = await new Promise<number | null>(resolve => child.once("exit", resolve));
+        expect(code, errors).toBe(0); expect(output).toContain("consumption namespace unavailable");
+      } else await expect(client.waitAgent(seeded.id)).rejects.toThrow("consumption namespace unavailable");
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeGreaterThan(0);
+      expect(consumed).not.toHaveBeenCalled();
+      if (restart) { await client.close(); client = new ResidencyClient(options); }
+      if (retry) expect(() => client.acknowledgeCompletion(seeded.id)).toThrow("consumption namespace unavailable");
+      client.start(); await delay(180);
+      expect(state.mesh.get(seeded.key, { fresh: true })).toBeDefined();
+      expect(failures).toBeGreaterThan(restart ? 0 : 1);
+      expect(consumed).not.toHaveBeenCalled();
+      unavailable = false;
+      await expect(client.waitAgent(seeded.id)).resolves.toMatchObject({ text: seeded.result.text });
+      expect(consumed).toHaveBeenCalledOnce();
+      await waitFor(() => state.mesh.get(seeded.key, { fresh: true }) === undefined);
+    } finally { unavailable = false; await client.close(); synced.mockRestore(); opened.mockRestore(); await state.participants.close(); }
+  });
 
   it.each(["wait", "join", "status"])("keeps a durable completion unread when terminal %s publication is rejected", async action => {
     const state = await rootHarness(`rejected-durable-${action}`);

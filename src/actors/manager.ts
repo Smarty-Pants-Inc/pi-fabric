@@ -410,8 +410,10 @@ export class ActorManager {
   readonly #listeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
   readonly #pendingPresence = new Set<string>();
-  /** An explicit stop whose registry/presence publication has not been acknowledged. */
+  /** A stop (explicit or directive) whose registry/presence publication is still owed. */
   readonly #pendingStopPublication = new Set<string>();
+  /** A failed queue replacement must be confirmed before accepted backlog can drain. */
+  readonly #pendingQueuePublication = new Set<string>();
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
   /** A timed-out write stays serialized; drains need not join that same stalled chain again. */
@@ -2421,6 +2423,7 @@ export class ActorManager {
 
   async #publishDrainPresence(actor: ManagedActor): Promise<void> {
     if (!this.#canManage(actor.id)) return;
+    const stopped = actor.status === "stopped";
     this.#emitChange();
     await this.#prepare(actor, "registry", () => this.#saveActors());
     // Do not break presence serialization or retry a late write out of order. Once a join
@@ -2432,6 +2435,7 @@ export class ActorManager {
     this.#stalledPresence.delete(actor.id);
     try {
       await this.#prepare(actor, "presence", () => this.#writePresence(actor.id));
+      if (stopped && actor.status === "stopped") this.#pendingStopPublication.delete(actor.id);
     } catch (error) {
       if (error instanceof ActorPreparationTimeoutError) this.#stalledPresence.add(actor.id);
       throw error;
@@ -2461,6 +2465,10 @@ export class ActorManager {
         !this.#closing &&
         this.#canManage(actor.id)
       ) {
+        if (this.#pendingQueuePublication.has(actor.id) && !this.#persistQueue(actor.id)) {
+          retryDrain = true;
+          break;
+        }
         const reset = this.#resetAtBoundary(actor);
         if (reset) await reset;
         if (actor.queue.length === 0 || (actor.status as string) === "stopped" || this.#closing) break;
@@ -2685,6 +2693,7 @@ export class ActorManager {
           }
           item.resolve?.(structuredClone(message));
           if (message.action === "stop") {
+            this.#pendingStopPublication.add(actor.id);
             actor.status = "stopped";
             this.#takeQueued(actor).forEach((queued) =>
               queued.reject?.(
@@ -3807,6 +3816,7 @@ export class ActorManager {
         }, { durable });
       }
     } catch (error) {
+      if (durable && items.length > 0) this.#pendingQueuePublication.add(actorId);
       if (release) throw error;
       return false;                                         // ingress must not acknowledge this work
     }
@@ -3818,6 +3828,7 @@ export class ActorManager {
     } catch { return false; } // Retain the takeover obligation for a retry.
     this.#takenOver.delete(actorId);
     if (durable) {
+      this.#pendingQueuePublication.delete(actorId);
       for (const delivery of this.#restoredDeliveries.get(actorId) ?? []) this.#delivered.add(delivery);
       this.#restoredDeliveries.delete(actorId);
     }
@@ -3843,7 +3854,7 @@ export class ActorManager {
     if (kept.length) this.#deferredHandoffs.set(actorId, kept);
     else this.#deferredHandoffs.delete(actorId);
     // Commit removal before deleting archives; failed persistence leaves them recoverable.
-    if (this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0) && actor) {
+    if (this.#persistQueue(actorId) && actor) {
       for (const id of consumedIds) {
         try { this.#childCompletionStore(actor).releaseResult(id); } catch { /* The retention sweep retries cleanup. */ }
       }

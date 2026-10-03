@@ -527,9 +527,9 @@ export class ResidencyClient {
   acknowledgeCompletion(id: string): void {
     const metadata = this.#metadata(id);
     if (!metadata) return;
-    if (!metadata.completionConsumedAt) {
-      atomicWrite(this.#metadataPath(id), { ...metadata, completionConsumedAt: Date.now() });
-    }
+    // Visible bytes can be left by a rejected post-rename barrier, including
+    // across process replacement. Every acknowledgement repays that receipt.
+    atomicWrite(this.#metadataPath(id), { ...metadata, completionConsumedAt: metadata.completionConsumedAt ?? Date.now() });
     this.options.onResultConsumed?.(id);
   }
 
@@ -939,6 +939,8 @@ export class ResidencyClient {
     if (value.from.kind === "agent" && typeof completionId === "string" && completionId === value.from.id) {
       const metadata = this.#metadata(completionId);
       if (!metadata || metadata.completionConsumedAt || !this.options.config.agents.notifyOnComplete) {
+        // A visible consumption timestamp alone must not retire the source.
+        if (metadata?.completionConsumedAt) atomicWrite(this.#metadataPath(completionId), metadata);
         await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
         return;
       }

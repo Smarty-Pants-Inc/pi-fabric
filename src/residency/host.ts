@@ -251,6 +251,8 @@ export class ResidentHost {
   #pollingRequests = false;
   /** Renamed by this host, but not yet safe to execute. Never replay already executing work. */
   readonly #unconfirmedPickups = new Set<string>();
+  /** Executed requests owe storage only; never route these through mutation pickup again. */
+  readonly #pendingResponses = new Map<string, ResidentCommandResponse>();
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
   readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
@@ -800,9 +802,11 @@ export class ResidentHost {
 
   async #pollRequests(): Promise<void> {
     if (this.#pollingRequests || this.#closed) return;
-    if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
+    if (this.#staged) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
+      for (const [file, response] of [...this.#pendingResponses].slice(0, 32)) this.#publishResponse(file, response);
+      if (this.#handover) return;
       // Retry only pickups this running host renamed but never executed. Startup
       // recovery handles older processing entries conservatively as indeterminate.
       for (const entry of [...this.#unconfirmedPickups].slice(0, 32)) {
@@ -839,6 +843,7 @@ export class ResidentHost {
       this.#pollingRequests = false;
       this.#maintainRequests();
       this.#checkIdle();
+      if (this.#handover) await this.#advanceRelease();
     }
   }
 
@@ -1064,6 +1069,12 @@ export class ResidentHost {
           ? { errorCode: error.code } : {}), completedAt: Date.now() };
     }
     if (response.ok) await testResidentRequestDelay("after_commit");
+    this.#pendingResponses.set(filePath, response);
+    this.#publishResponse(filePath, response);
+  }
+
+  #publishResponse(filePath: string, response: ResidentCommandResponse): void {
+    const requestId = response.requestId;
     const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
     writeJsonAtomic(responsePath, response, { durable: true });
     // An abandoned caller already left; clean late responses as well as processing files.
@@ -1071,6 +1082,7 @@ export class ResidentHost {
       fs.rmSync(responsePath, { force: true });
     }
     fs.rmSync(filePath, { force: true });
+    this.#pendingResponses.delete(filePath);
     this.participants.scheduleRefresh();
   }
 

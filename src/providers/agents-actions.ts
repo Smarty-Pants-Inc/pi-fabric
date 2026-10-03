@@ -208,6 +208,17 @@ const activationFilterSchema = {
     ],
   },
 };
+const actorInstructionsProperties = {
+  instructions: { type: "string" },
+  instructionsFile: { type: "string", minLength: 1, description: "Instructions file on the owning host under agents.instructionsRoot (default ~/.local/share/smarty-dev/factory/current/). Regular UTF-8 file, max 512 KB; no '..' or symlink escape." },
+  sha256: { type: "string", pattern: "^[a-f0-9]{64}$", description: "Exact lowercase SHA256 of the instructionsFile bytes. Required with instructionsFile; mutually exclusive with inline instructions." },
+};
+const actorInstructionsSourceSchema = {
+  oneOf: [
+    { required: ["instructions"], not: { anyOf: [{ required: ["instructionsFile"] }, { required: ["sha256"] }] } },
+    { required: ["instructionsFile", "sha256"], not: { required: ["instructions"] } },
+  ],
+};
 export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "run",
@@ -404,12 +415,12 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "create",
     description:
-      'Create a persistent actor with independently selected session or project storage. Use scope "global" to save a reusable project-independent template instead of a live actor.',
+      'Create a persistent actor with inline instructions or instructionsFile + sha256 verified by its owning host (max 512 KB, factory root only). Use scope "global" for a reusable template.',
     inputSchema: {
       type: "object",
       properties: {
         name: { type: "string" },
-        instructions: { type: "string" },
+        ...actorInstructionsProperties,
         events: {
           type: "array",
           items: {
@@ -472,7 +483,8 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
           description: "session isolates the actor to the root Pi session; project shares it across sessions; global creates a non-live template.",
         },
       },
-      required: ["name", "instructions"],
+      required: ["name"],
+      allOf: [actorInstructionsSourceSchema],
       oneOf: [
         {
           properties: {
@@ -804,16 +816,17 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "setInstructions",
     description:
-      'Replace an actor\'s default instruction (its persona / system-prompt body). Default scope "project" edits a live project actor; scope "global" edits a project-independent template. Takes effect on the actor\'s next queued message. A new body more than 80% shorter than the current one is refused unless replace is true.',
+      'Replace an actor\'s default instruction (its persona / system-prompt body). Default scope "project" edits a live project actor; scope "global" edits a project-independent template. Takes effect on the actor\'s next queued message. Pass inline instructions or instructionsFile + sha256 (owning-host factory root, max 512 KB). A new body more than 80% shorter than the current one is refused unless replace is true.',
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
-        instructions: { type: "string" },
+        ...actorInstructionsProperties,
         scope: { type: "string", enum: ["project", "global"] },
         replace: { type: "boolean" },
       },
-      required: ["id", "instructions"],
+      required: ["id"],
+      allOf: [actorInstructionsSourceSchema],
       additionalProperties: false,
     },
     risk: "agent",
@@ -884,3 +897,9 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "read",
   },
 ];
+
+// Explicit spelling for callers; keep create as the backwards-compatible API.
+AGENTS_ACTION_DESCRIPTORS.push({
+  ...AGENTS_ACTION_DESCRIPTORS.find(action => action.name === "create")!,
+  name: "createActor",
+});

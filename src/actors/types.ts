@@ -195,6 +195,8 @@ export interface FabricActorValidityFacts {
   };
 }
 
+/** Public creation input; file instructions are resolved only by the actor owner. */
+export type FabricActorCreateRequest = Omit<FabricActorRequest, "instructions"> & import("./instructions-file.js").FabricActorInstructionsSource;
 export interface FabricActorRequest {
   /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
   idempotencyKey?: string;

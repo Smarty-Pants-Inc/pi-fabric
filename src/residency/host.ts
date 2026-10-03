@@ -64,7 +64,7 @@ import {
   type ResidentHostConfig,
   type ResidentHostOwner,
 } from "./protocol.js";
-import { deliveryRoot, projectOf } from "../topology/project-identity.js";
+import { deliveryRoot, projectOf, recordedProjectLead, repositoryOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { canRemoveTerminalRun, compactTerminalRunEvents, retainedActorRunIds, runTreeExitVeto, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
@@ -386,7 +386,7 @@ export class ResidentHost {
       return participant ? participant.ownerHostId === this.hostId : undefined;
     };
     const lineageAlive = (rootId: string): boolean =>
-      this.participants.get(rootId) !== undefined;
+      this.participants.lineageAlive(rootId);
     const actorRoots = residentActorRoots(config);
     this.actors = new ActorDirectory([
       config.sessionId,
@@ -398,6 +398,7 @@ export class ResidentHost {
         if (!message.text) return;
         const mode = delivery === "steer" ? "steer" : "followUp";
         const triggers = delivery === "nextTurn" ? false : triggerTurn;
+        const project = actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd));
         this.#trackPublication(this.#queueDelivery(
           { id: actor.id, name: actor.name, kind: "actor" },
           message.text,
@@ -405,11 +406,19 @@ export class ResidentHost {
           triggers,
           message.data,
           undefined,
-          // smarty-dev#878: once the root is gone, to the project's live project agent.
-          deliveryRoot(
+          // smarty-dev#3662: lease lapse is not death; only the exact recorded integrator may inherit.
+          () => deliveryRoot(
             config.rootId,
             this.participants.list({ scope: "project", kinds: ["root"] }),
-            actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd)),
+            project,
+            {
+              lineageAlive,
+              boundIntegrator: () => {
+                const repository = repositoryOf(project);
+                const leadId = recordedProjectLead(config.cwd);
+                return { ...(repository ? { repository } : {}), ...(leadId ? { leadId } : {}) };
+              },
+            },
           ),
           message.source === "fabric-host" ? undefined : message.principal,
           message.source === "fabric-host" ? "fabric-host" : "actor-output",
@@ -555,6 +564,9 @@ export class ResidentHost {
         try {
           await this.agents?.close();
         } finally {
+          // Fenced actor deliveries may still be acquiring custody. Join them
+          // before releasing the host; closed hosts retain their durable outbox.
+          await Promise.allSettled([...this.#publications]);
           await this.#backgroundDeliveries.close();
           await this.#flushingDeliveries;
           await this.participants?.close().catch(() => undefined);
@@ -710,28 +722,36 @@ export class ResidentHost {
     triggerTurn: boolean,
     data?: unknown,
     agentCompletionId?: string,
-    rootId = this.config.rootId,
+    rootId: string | (() => string) = this.config.rootId,
     principal?: FabricPrincipal,
     source?: ResidentDeliveryRecord["source"],
   ): Promise<void> {
     const id = randomUUID();
-    const record: ResidentDeliveryRecord = {
-      format: RESIDENT_HOST_FORMAT,
-      id,
-      rootId,
-      from,
-      ...(source ? { source } : {}),
-      ...(principal ? { principal } : {}),
-      delivery,
-      triggerTurn,
-      message,
-      ...(data === undefined ? {} : { data }),
-      ...(agentCompletionId ? { agentCompletionId } : {}),
-      createdAt: Date.now(),
+    const persist = (target: string): void => {
+      const record: ResidentDeliveryRecord = {
+        format: RESIDENT_HOST_FORMAT,
+        id,
+        rootId: target,
+        from,
+        ...(source ? { source } : {}),
+        ...(principal ? { principal } : {}),
+        delivery,
+        triggerTurn,
+        message,
+        ...(data === undefined ? {} : { data }),
+        ...(agentCompletionId ? { agentCompletionId } : {}),
+        createdAt: Date.now(),
+      };
+      // Persist before handing off: idle exit/queue pressure must not drop custody.
+      // Agent completions use the fixed creating root and still persist before yielding.
+      writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record, { durable: true });
     };
-    // Persist before yielding: AgentManager has already marked this notification sent.
-    // Idle exit/queue pressure must not drop the host's ownership of the handoff.
-    writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record, { durable: true });
+    if (typeof rootId === "function") {
+      // Serialize proof+absence, target selection and the irreversible outbox
+      // write with resumed-root proof invalidation. Never persist a stale choice.
+      try { await this.mesh.exclusive(() => persist(rootId())); }
+      catch { persist(this.config.rootId); } // Unknown custody keeps the original mailbox.
+    } else persist(rootId);
     await this.#retryDeliveries();
   }
 

@@ -3,7 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { projectOf, repositoryOf } from "../src/topology/project-identity.js";
+import { residentDeliveryPrefix } from "../src/residency/protocol.js";
+import type { FabricParticipantRecord } from "../src/topology/types.js";
+import { removeParticipantFileIf, writeParticipantFile } from "../src/topology/participant-files.js";
+import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
 import { lockFile } from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
@@ -36,6 +42,176 @@ const fixture = () => {
   return { root, config, host, idle };
 };
 
+describe("#3662 resident actor delivery routing", () => {
+  it.each(["read-denied", "stat-denied", "invalid-json", "invalid-envelope", "invalid-participant"] as const)(
+    "S1 keeps file-only %s lineage at its mailbox until confirmed withdrawal", async (fault) => {
+      const { root, config, host } = fixture();
+      const integratorId = "session:11111111-1111-4111-8111-111111111111";
+      config.cwd = root;
+      config.projectRoot = root;
+      config.project = projectOf(root);
+      vi.stubEnv("SMARTY_LEAD_SESSION", "");
+      fs.mkdirSync(path.join(root, ".local"));
+      fs.writeFileSync(path.join(root, ".local", "lead"), integratorId);
+      let readFault: ReturnType<typeof vi.spyOn> | undefined;
+      let statFault: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        await host.start();
+        await host.mesh.put({ key: LIVENESS_POLICY_KEY, identity: host.identity, value: { version: 1, participants: "files" } });
+        const publishRoot = async (id: string) => {
+          const identity = { id, name: "main", kind: "main" as const };
+          const hash = createHash("sha256").update(id).digest("hex");
+          const key = `topology/participants/${hash}`;
+          const participant: FabricParticipantRecord = {
+            format: 1, id, rootId: id, kind: "root", ownerHostId: id, ownerIdentityId: id,
+            name: "main", status: "idle", runner: "pi", transport: "host", role: "project-agent",
+            project: config.project!, cwd: root, capabilities: ["steer", "followUp", "fabric"],
+            startedAt: 1, updatedAt: Date.now(), controlProtocol: "v1",
+          };
+          await host.mesh.put({ key: `topology/hosts/${hash}`, identity, value: {
+            format: 1, id, rootId: id, identity, startedAt: 1, updatedAt: Date.now(), expiresAt: Date.now() + 120_000,
+          } });
+          const entry = { key, value: participant, version: 1, updatedAt: Date.now(), updatedBy: identity };
+          writeParticipantFile(config.meshRoot, entry);
+          return { key, participant, file: path.join(config.meshRoot, "participants", `${hash}.json`), text: JSON.stringify({ format: 1, ...entry }) };
+        };
+        await publishRoot(integratorId);
+        const original = await publishRoot(config.rootId);
+        // No lookup warmed the root slot before the fault. Denials persist through every retry.
+        if (fault === "invalid-json") fs.writeFileSync(original.file, "{torn");
+        if (fault === "invalid-envelope") fs.writeFileSync(original.file, JSON.stringify({ format: 99 }));
+        if (fault === "invalid-participant") fs.writeFileSync(original.file, JSON.stringify({
+          format: 1, key: original.key, value: { ...original.participant, kind: "invalid" },
+          version: 1, updatedAt: Date.now(), updatedBy: host.identity,
+        }));
+        if (fault === "read-denied") {
+          const read = fs.readFileSync;
+          readFault = vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+            if (String(args[0]) === original.file) throw Object.assign(new Error("denied"), { code: "EACCES" });
+            return read(...args);
+          });
+        }
+        if (fault === "stat-denied") {
+          const stat = fs.statSync;
+          statFault = vi.spyOn(fs, "statSync").mockImplementation((...args: Parameters<typeof fs.statSync>) => {
+            if (String(args[0]) === original.file) throw Object.assign(new Error("denied"), { code: "EACCES" });
+            return stat(...args);
+          });
+        }
+        expect(host.mesh.get(original.key, { fresh: true })).toBeUndefined();
+        expect(host.participants.get(config.rootId, Date.now(), { fresh: true })).toBeUndefined();
+        expect(host.participants.lastKnown(config.rootId)).toBeUndefined();
+        expect(host.participants.get(integratorId, Date.now(), { fresh: true })?.id).toBe(integratorId);
+        const send = async (text: string, total: number) => {
+          host.actors.onDeliver({
+            actor: { id: "actor:supervisor", name: "supervisor", project: config.project } as Parameters<typeof host.actors.onDeliver>[0]["actor"],
+            message: { id: text, actorId: "actor:supervisor", actorName: "supervisor", direction: "out", source: "actor", createdAt: Date.now(), text },
+            delivery: "steer", triggerTurn: true,
+          });
+          await vi.waitFor(() => expect(host.mesh.listAll("residency/deliveries/", { fresh: true })).toHaveLength(total));
+        };
+        await send("while unknown", 1);
+        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(1);
+        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
+        readFault?.mockRestore();
+        statFault?.mockRestore();
+        fs.writeFileSync(original.file, original.text);
+        await send("after repair", 2);
+        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
+        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
+        // Confirmed withdrawal, not a parsing omission, finally permits exact-bound inheritance.
+        expect(await removeParticipantFileIf(host.mesh, original.key, () => true)).toBe(true);
+        expect(host.participants.lineageAlive(config.rootId)).toBe(true); // Removal is not positive proof.
+        await host.mesh.put({
+          key: `topology/lineage-closures/${createHash("sha256").update(config.rootId).digest("hex")}`,
+          identity: { id: config.rootId, name: "main", kind: "main" },
+          value: { format: 1, rootId: config.rootId, ownerHostId: config.rootId, ownerIdentityId: config.rootId, closedAt: Date.now() },
+        });
+        expect(host.participants.lineageAlive(config.rootId)).toBe(false);
+        await send("after withdrawal", 3);
+        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
+        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(1);
+      } finally {
+        readFault?.mockRestore();
+        statFault?.mockRestore();
+        await host.close();
+        vi.unstubAllEnvs();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+  it.each([
+    ["expired lease with live lineage", true, true, "root"],
+    ["dead root without bound integrator", false, false, "root"],
+    ["dead root with exact bound integrator", false, true, "integrator"],
+    ["dead root with actor repository different from host cwd", false, true, "integrator"],
+  ] as const)("routes %s through the host mailbox path", async (_case, rootPresent, bound, target) => {
+    const { root, config, host } = fixture();
+    const integratorId = "session:11111111-1111-4111-8111-111111111111";
+    config.cwd = root;
+    config.projectRoot = root;
+    let actorProject = root;
+    if (_case === "dead root with actor repository different from host cwd") {
+      actorProject = path.join(root, "actor-project");
+      fs.mkdirSync(actorProject);
+      for (const [cwd, origin] of [[root, "https://forge.test/team/host.git"], [actorProject, "https://forge.test/team/actors.git"]]) {
+        execFileSync("git", ["init", "-q"], { cwd, stdio: "ignore" });
+        execFileSync("git", ["config", "remote.origin.url", origin!], { cwd, stdio: "ignore" });
+      }
+    }
+    const project = projectOf(actorProject);
+    const repository = repositoryOf(project);
+    config.project = project;
+    vi.stubEnv("SMARTY_LEAD_SESSION", "");
+    if (bound) {
+      fs.mkdirSync(path.join(root, ".local"));
+      fs.writeFileSync(path.join(root, ".local", "lead"), integratorId);
+    }
+    try {
+      await host.start();
+      const publishRoot = async (id: string, startedAt: number, expiresAt: number) => {
+        const identity = { id, name: "main", kind: "main" as const };
+        const participant: FabricParticipantRecord = {
+          format: 1, id, rootId: id, kind: "root", ownerHostId: id, ownerIdentityId: id,
+          name: "main", status: "idle", runner: "pi", transport: "host", role: "project-agent",
+          project, ...(repository ? { repository } : {}), cwd: root, capabilities: ["steer", "followUp", "fabric"],
+          startedAt, updatedAt: Date.now(), controlProtocol: "v1",
+        };
+        const key = (prefix: string) => prefix + createHash("sha256").update(id).digest("hex");
+        await host.mesh.put({ key: key("topology/hosts/"), identity, value: {
+          format: 1, id, rootId: id, identity, startedAt, updatedAt: Date.now(), expiresAt,
+        } });
+        await host.mesh.put({ key: key("topology/participants/"), identity, value: participant });
+      };
+      if (rootPresent) await publishRoot(config.rootId, 1, Date.now() - 60_000);
+      else await host.mesh.put({
+        key: `topology/lineage-closures/${createHash("sha256").update(config.rootId).digest("hex")}`,
+        identity: { id: config.rootId, name: "main", kind: "main" },
+        value: { format: 1, rootId: config.rootId, ownerHostId: config.rootId, ownerIdentityId: config.rootId, closedAt: Date.now() },
+      });
+      if (bound) await publishRoot(integratorId, rootPresent ? 99 : 2, Date.now() + 120_000);
+      if (!rootPresent) await publishRoot("session:newer-project-agent", 99, Date.now() + 120_000);
+      const liveRoots = host.participants.list({ scope: "project", kinds: ["root"], fresh: true });
+      expect(liveRoots.some(candidate => candidate.id === config.rootId)).toBe(false);
+      if (rootPresent) expect(host.participants.lastKnown(config.rootId)?.participant.stale).toBe(true);
+      host.actors.onDeliver({
+        actor: { id: "actor:supervisor", name: "supervisor", project: config.project } as Parameters<typeof host.actors.onDeliver>[0]["actor"],
+        message: { id: "message", actorId: "actor:supervisor", actorName: "supervisor", direction: "out", source: "actor", createdAt: Date.now(), text: "directive" },
+        delivery: "steer", triggerTurn: true,
+      });
+      await vi.waitFor(() => expect(host.mesh.listAll("residency/deliveries/").length).toBe(1));
+      const expected = target === "integrator" ? integratorId : config.rootId;
+      const deliveries = host.mesh.listAll(residentDeliveryPrefix(expected));
+      expect(deliveries).toHaveLength(1);
+      expect(deliveries[0]?.value).toMatchObject({ rootId: expected, message: "directive", delivery: "steer" });
+      expect(host.mesh.listAll(residentDeliveryPrefix("session:newer-project-agent"))).toHaveLength(0);
+    } finally {
+      await host.close();
+      vi.unstubAllEnvs();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 describe("resident loaded-path census metadata", () => {
   it("publishes the startup generation rather than a later desired configuration", async () => {

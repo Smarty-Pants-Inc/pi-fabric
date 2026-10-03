@@ -6,6 +6,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { readHostLease } from "../src/topology/host-leases.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
+import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-recovery-"));
@@ -55,16 +56,32 @@ describe("resident recovery startup and lease fence (#3864)", () => {
     } finally { spy.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("stops actor, control and lifecycle cursor reads on failed renewal, then replays after recovery", async () => {
-    const { root, host } = fixture();
+  it.each(["confirmWritable", "writeBatch"] as const)("stops actor, control and lifecycle cursor reads on failed %s renewal, then replays after recovery", async (renewal) => {
+    const { root, config, host } = fixture();
     let writes: ReturnType<typeof vi.spyOn> | undefined;
+    let confirmations: ReturnType<typeof vi.spyOn> | undefined;
     let tail: ReturnType<typeof vi.spyOn> | undefined;
     let lifecycle: ReturnType<typeof vi.spyOn> | undefined;
     try {
       await host.start();
       await new Promise(resolve => setTimeout(resolve, 50));
+      // Unchanged heartbeats certify the shared lock without a batch (#411).
+      // Stall both acquisition paths so retries cannot reopen the cursor fence.
       writes = vi.spyOn(host.mesh, "writeBatch").mockRejectedValue(new Error("lease write stalled"));
+      confirmations = vi.spyOn(host.mesh, "confirmWritable").mockRejectedValue(new Error("lease write stalled"));
+      if (renewal === "writeBatch") {
+        // A new participant is a real change, forcing the locked write branch.
+        const participant: FabricParticipantRecord = {
+          format: 1, id: "agent:recovery-probe", kind: "agent", rootId: config.rootId,
+          ownerHostId: host.hostId, ownerIdentityId: host.identity.id, parentId: config.rootId,
+          name: "recovery-probe", status: "running", runner: "pi", transport: "process",
+          capabilities: [], cwd: root, startedAt: 1, updatedAt: 1, controlProtocol: "v1",
+        };
+        host.participants.registerSource(() => [participant]);
+      }
       await expect(host.participants.refresh()).rejects.toThrow("lease write stalled");
+      expect(renewal === "confirmWritable" ? confirmations : writes).toHaveBeenCalled();
+      expect(renewal === "confirmWritable" ? writes : confirmations).not.toHaveBeenCalled();
       tail = vi.spyOn(host.mesh, "tail");
       lifecycle = vi.spyOn(host.mesh, "read");
       const event = await host.mesh.publish({ topic: "fleet.recovery", kind: "probe", from: host.identity, data: {} });
@@ -73,10 +90,11 @@ describe("resident recovery startup and lease fence (#3864)", () => {
       expect(lifecycle).not.toHaveBeenCalled();
       expect(host.participants.canConsumeMesh()).toBe(false);
       writes.mockRestore();
+      confirmations.mockRestore();
       await host.participants.refresh();
       expect(host.participants.canConsumeMesh()).toBe(true);
       await vi.waitFor(() => expect(tail!.mock.results.some((result: { value?: { events?: Array<{ id: string }> } }) => result.value?.events?.some((row: { id: string }) => row.id === event.id))).toBe(true), { timeout: 3_000 });
       expect(host.participants.canConsumeMesh(host.participants.confirmedAt() + 10_001)).toBe(false);
-    } finally { writes?.mockRestore(); tail?.mockRestore(); lifecycle?.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { writes?.mockRestore(); confirmations?.mockRestore(); tail?.mockRestore(); lifecycle?.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 });

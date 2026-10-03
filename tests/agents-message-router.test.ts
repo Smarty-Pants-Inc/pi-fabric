@@ -2,6 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Agent, type AgentMessage, type QueueMode } from "@earendil-works/pi-agent-core";
+import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import principalDelivery from "../src/worker/principal-delivery.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
@@ -61,15 +65,96 @@ afterEach(async () => {
 });
 
 describe("running-task followUp advisory (#3005)", () => {
-  it("A1 local receipt warns after exactly one unchanged follow_up append", async () => {
+  it("A1 local receipt warns after exactly one tracked follow_up append with unchanged payload", async () => {
     const f = await running();
-    const data = { private: "unchanged" };
+    const data = { private: "unchanged" }, admittedAt = Date.now();
     const receipt = await router(f.manager).value.routeMessage(f.id, "later", data, "followUp");
-    expect(f.entries()).toEqual([{ type: "follow_up", message: "later", data, provenance: expect.any(Object), id: receipt.messageId, ts: expect.any(Number) }]);
+    expect(f.entries()).toEqual([{ type: "follow_up", message: "later", data, provenance: expect.any(Object),
+      followUpId: receipt.messageId, deadlineAt: receipt.deadlineAt, id: receipt.messageId, ts: expect.any(Number) }]);
     expect(f.entries()[0]).not.toHaveProperty("warning");
-    expect(receipt).toEqual({ queued: true, messageId: expect.any(String), routed: "local", warning: warning(f.id) });
+    expect(receipt).toEqual({ queued: true, messageId: expect.any(String), routed: "local", warning: warning(f.id), deadlineAt: expect.any(Number) });
+    expect(receipt.deadlineAt).toBeGreaterThanOrEqual(admittedAt + 600_000);
+    expect(receipt.deadlineAt).toBeLessThanOrEqual(Date.now() + 600_000);
+    expect(f.manager.status(f.id).followUpDeliveries).toEqual([{ messageId: receipt.messageId, deadlineAt: receipt.deadlineAt, state: "queued" }]);
   });
 
+  it.each([
+    { followUpMode: "all", steeringMode: "one-at-a-time", firstBatch: ["FOLLOW_FIRST", "FOLLOW_SECOND"] },
+    { followUpMode: "one-at-a-time", steeringMode: "all", firstBatch: ["FOLLOW_FIRST"] },
+  ] as const)("public tracked follow-ups honour $followUpMode independently of steering $steeringMode", async ({ followUpMode, steeringMode, firstBatch }) => {
+    const f = await running(), r = router(f.manager).value;
+    f.manager.setSteeringMode(f.id, steeringMode);
+    f.manager.setFollowUpMode(f.id, followUpMode);
+    const run = f.manager.runDirectory(f.id)!, directory = path.join(run, "deliveries");
+    fs.mkdirSync(directory, { recursive: true });
+    const previous = process.env.PI_FABRIC_DELIVERY_DIR;
+    const handlers = new Map<string, (...args: any[]) => any>();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const contexts: AgentMessage[][] = [];
+    const faux = createFauxCore({ tokensPerSecond: 100_000 });
+    faux.setResponses(Array.from({ length: 4 }, () => async (_context, _options, state) => {
+      if (state.callCount === 1) await gate;
+      return fauxAssistantMessage("done");
+    }));
+    const modes = f.entries();
+    const receiver = new Agent({
+      initialState: { model: faux.getModel() }, streamFn: faux.streamSimple,
+      steeringMode: modes[0].mode as QueueMode, followUpMode: modes[1].mode as QueueMode,
+      transformContext: async messages => {
+        const result = await handlers.get("context")?.({ messages }, {});
+        const consumed = result?.messages ?? messages;
+        contexts.push(consumed);
+        return consumed;
+      },
+    });
+    const send = vi.fn((text: string, options: { deliverAs: "steer" | "followUp" }) => {
+      const message: AgentMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+      if (options.deliverAs === "steer") receiver.steer(message);
+      else receiver.followUp(message);
+    });
+    process.env.PI_FABRIC_DELIVERY_DIR = directory;
+    try {
+      principalDelivery({
+        registerCommand: (_name: string, command: any) => handlers.set("command", command.handler),
+        on: (name: string, handler: any) => handlers.set(name, handler), sendUserMessage: send,
+      } as unknown as ExtensionAPI);
+    } finally {
+      if (previous === undefined) delete process.env.PI_FABRIC_DELIVERY_DIR;
+      else process.env.PI_FABRIC_DELIVERY_DIR = previous;
+    }
+    receiver.subscribe(async event => {
+      if (event.type === "turn_end") await handlers.get("turn_end")?.(event, { isIdle: () => false, signal: receiver.signal });
+    });
+    const processing = receiver.prompt("initial request");
+    try {
+      await vi.waitFor(() => expect(faux.state.callCount).toBe(1));
+      const receipts = [];
+      for (const marker of ["FOLLOW_FIRST", "FOLLOW_SECOND", "FOLLOW_CANCELLED"]) {
+        const receipt = await r.routeMessage(f.id, marker, undefined, "followUp");
+        receipts.push(receipt);
+        const entry = f.entries().at(-1)!;
+        expect(entry).toMatchObject({ followUpId: receipt.messageId, deadlineAt: receipt.deadlineAt });
+        fs.writeFileSync(path.join(directory, receipt.messageId + ".json"), JSON.stringify({
+          message: entry.message, delivery: "followUp", followUpId: entry.followUpId, provenance: entry.provenance,
+        }));
+        await handlers.get("command")!(receipt.messageId, { isIdle: () => false });
+      }
+      expect(send).not.toHaveBeenCalled();
+      expect(f.manager.status(f.id).followUpDeliveries?.map(d => d.state)).toEqual(["queued", "queued", "queued"]);
+      expect(f.manager.cancelFollowUp(f.id, receipts[2]!.messageId).state).toBe("cancelled");
+      release(); await processing;
+      const markers = (messages: AgentMessage[]) => messages.flatMap(m => m.role === "user" && Array.isArray(m.content)
+        ? m.content.flatMap(c => c.type === "text" && c.text.startsWith("FOLLOW_") ? [c.text] : []) : []);
+      expect(markers(contexts[1]!)).toEqual(firstBatch);
+      expect(markers(contexts.at(-1)!)).toEqual(["FOLLOW_FIRST", "FOLLOW_SECOND"]);
+      expect(send.mock.calls.map(call => call[1].deliverAs)).toEqual(["followUp", "followUp"]);
+      expect(f.manager.status(f.id).followUpDeliveries?.map(d => d.state)).toEqual(["delivered", "delivered", "cancelled"]);
+      expect(receipts.every(receipt => Number.isSafeInteger(receipt.deadlineAt))).toBe(true);
+    } finally {
+      release(); receiver.abort(); await processing;
+    }
+  });
   it("A2 ordinary remote owner ACK and replay retain the warning without re-enqueue", async () => {
     const f = await running();
     const meshRoot = path.join(f.root, "mesh");

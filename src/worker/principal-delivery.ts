@@ -83,8 +83,11 @@ export default function principalDelivery(pi: ExtensionAPI): void {
           submitted.add(id);
           const identified = typeof content === "string" ? followUpMessage(id, content)
             : [{ type: "text", text: followUpMessage(id, item.message as string) }, ...content.slice(1)];
+          // Tracking changes receipt ownership, not the native message class.
+          // Even at a busy turn boundary, use the follow-up queue so batching
+          // honours followUpMode and waits for completion, never steeringMode.
           pi.sendUserMessage(identified as Parameters<ExtensionAPI["sendUserMessage"]>[0],
-            fabricProvenanceOptions(pi, { deliverAs: ctx.isIdle() ? "followUp" : "steer" }, provenance));
+            fabricProvenanceOptions(pi, { deliverAs: "followUp" }, provenance));
         };
         if (followUpState(receipt) === "queued") {
           if (ctx.isIdle()) deliver();

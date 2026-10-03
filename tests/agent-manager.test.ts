@@ -933,31 +933,50 @@ describe("AgentManager", () => {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
     });
     managers.push(manager);
-    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    // Release admission through a real worker's natural completion. An unrelated
+    // Windows tree-helper failure must retain its permit, not strand this fixture.
+    const firstRelease = path.join(root, "release-first-worker");
+    const first = await manager.spawn({
+      task: `LIVE_WITH_PROGRESS ${JSON.stringify({ fakeWorkerReleasePath: firstRelease })}`, transport: "process",
+    });
     let release!: () => void;
     let ready!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const creating = new Promise<void>((resolve) => { ready = resolve; });
-    let stoppedAt: number | undefined;
+    let workerExited = false;
+    const stop = vi.fn(async () => {});
     const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementationOnce(async () => {
       ready(); await gate;
-      return { kind: "process", stop: async () => { stoppedAt = Date.now(); }, isAlive: async () => stoppedAt === undefined || Date.now() - stoppedAt < 150 };
+      return { kind: "process", stop, isAlive: async () => !workerExited };
     });
+    let stopped: Promise<AgentRunResult> | undefined;
     try {
       const queued = await manager.spawn({ task: "exit after termination", transport: "process" });
-      await manager.stop(first.id);
+      expect(queued.status).toBe("queued");
+      fs.writeFileSync(firstRelease, "complete");
+      expect(await manager.wait(first.id)).toMatchObject({ status: "completed" });
       await creating;
       let settled = false;
-      const stopped = manager.stop(queued.id).then((result) => { settled = true; return result; });
+      stopped = manager.stop(queued.id).then((result) => { settled = true; return result; });
       release();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(1));
+      // Successful stop acknowledgment is not exit proof. Hold the exit gate
+      // explicitly so scheduler delays cannot turn a 50ms check into 150ms.
       expect(settled).toBe(false);
       expect(fs.existsSync(path.join(root, queued.id, "task.txt"))).toBe(true);
+      await expect(manager.cleanup(queued.id)).rejects.toThrow("Cannot clean up a queued agent");
+      workerExited = true;
       expect(await stopped).toMatchObject({ status: "stopped", error: "Agent launch aborted" });
       expect(fs.existsSync(path.join(root, queued.id, "unresolved-worker.json"))).toBe(false);
       expect(await manager.cleanup(queued.id)).toEqual({ cleaned: true });
       expect(fs.existsSync(path.join(root, queued.id))).toBe(false);
-    } finally { release(); launch.mockRestore(); }
+    } finally {
+      workerExited = true;
+      release();
+      fs.writeFileSync(firstRelease, "complete");
+      await stopped;
+      launch.mockRestore();
+    }
   });
 
   it("reattaches completion notification when a queued wait reaches its bound after admission", async () => {

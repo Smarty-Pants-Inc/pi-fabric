@@ -310,7 +310,14 @@ export const spawnDetached = async (
               if (!exited) {
                 // A Windows parent-only kill cannot join its native descendants.
                 // Publish helper uncertainty before its fallback can emit exit.
-                if (process.platform === "win32") await terminateWindowsTree(child, unconfirmed);
+                if (process.platform === "win32") await new Promise<void>(resolve => {
+                  // Join the actual helper attempt, even when it failed. Failure
+                  // publishes immutable lost-contact debt BEFORE this join ends;
+                  // the owner retains files and native admission indefinitely.
+                  // Waiting out the whole seven-second bound after helper close
+                  // only delays logical stop, without adding any exit evidence.
+                  void terminateWindowsTree(child, unconfirmed, resolve);
+                });
                 else {
                   try { process.kill(-pid, "SIGTERM"); }
                   catch { /* still require captured native close */ }

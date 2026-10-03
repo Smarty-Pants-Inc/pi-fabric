@@ -61,9 +61,17 @@ export const terminatePosixGroup = (pgid: number | undefined): Promise<void> =>
  * Parent-only fallback limits damage but cannot confirm descendant termination.
  * Without a successful tree kill, retain an uncertain-tree fence indefinitely.
  */
-export const terminateWindowsTree = (child: ChildProcess, onUnconfirmedExit?: (reason: string) => void): Promise<void> =>
+// Attempt closure is not tree-exit proof. An owner using this notification must
+// keep the onUnconfirmedExit debt after an unsuccessful attempt, independently
+// of logical stop completion. Other callers still join only confirmed tree exit.
+export const terminateWindowsTree = (
+  child: ChildProcess, onUnconfirmedExit?: (reason: string) => void, onAttemptClosed?: () => void,
+): Promise<void> =>
   new Promise((resolve) => {
-    if (child.pid === undefined) { resolve(); return; }
+    const attemptClosed = (): void => {
+      try { onAttemptClosed?.(); } catch { /* notification cannot discharge tree custody */ }
+    };
+    if (child.pid === undefined) { attemptClosed(); resolve(); return; }
     let uncertain = false;
     const directKill = (): void => {
       try { child.kill("SIGKILL"); } catch { /* The owned child may already have exited. */ }
@@ -84,7 +92,7 @@ export const terminateWindowsTree = (child: ChildProcess, onUnconfirmedExit?: (r
         windowsHide: true, stdio: "ignore",
       });
     } catch {
-      fence("Windows tree helper could not start"); return;
+      fence("Windows tree helper could not start"); attemptClosed(); return;
     }
     const timeout = setTimeout(() => {
       fence("Windows tree helper timed out");
@@ -94,6 +102,7 @@ export const terminateWindowsTree = (child: ChildProcess, onUnconfirmedExit?: (r
     killer.once("close", (code) => {
       clearTimeout(timeout);
       if (code !== 0) fence("Windows tree helper exited unsuccessfully");
+      attemptClosed(); // Both success and failure close the helper, not necessarily its tree.
       if (!uncertain) resolve();
     });
   });

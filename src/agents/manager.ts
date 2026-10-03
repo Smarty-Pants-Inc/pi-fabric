@@ -1915,10 +1915,16 @@ export class AgentManager {
       managed.latestRecord = observed;
       if (observed.runnerSessionId) managed.runnerSessionId = observed.runnerSessionId;
     }
+    // A failed Windows tree attempt used to wait out the stop bound, allowing
+    // the monitor to publish failure first. Keep that failure contract when the
+    // closed attempt now permits prompt logical stop (never custody release).
+    const unconfirmedWindowsStop = process.platform === "win32" ? managed.lostContact : undefined;
     const record =
       terminal && terminalStatuses.has(terminal.status)
         ? (this.#withTransportMetadata(terminal, managed) as AgentRunResult)
-        : failedRecord(managed, "stopped", "Agent stopped");
+        : failedRecord(managed, unconfirmedWindowsStop ? "failed" : "stopped", unconfirmedWindowsStop
+          ? `Lost track of the worker: ${unconfirmedWindowsStop}. Fabric does not relaunch it or delete its files.`
+          : "Agent stopped");
     if (!terminal || !terminalStatuses.has(terminal.status)) writeRecord(managed.statusFile, record);
     this.#settle(managed, record);
     return record;

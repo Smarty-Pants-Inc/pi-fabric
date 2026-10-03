@@ -212,6 +212,40 @@ describe("spawnDetached", () => {
     }
   });
 
+  it("Windows failed helper close ends logical stop only after native close, with immutable debt", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn(), kill: vi.fn() });
+    const killer = Object.assign(new EventEmitter(), { pid: 5678, kill: vi.fn() });
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess).mockReturnValueOnce(killer as unknown as ChildProcess);
+    const debt = vi.fn();
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      const handle = await spawnDetached("worker.mjs", [], process.cwd(), { onUnconfirmedExit: debt });
+      let stopped = false;
+      const stopping = handle.stop().then(() => { stopped = true; });
+      killer.emit("error", new Error("failed attempt"));
+      child.emit("exit", null); child.emit("close", null);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stopped).toBe(false); // Native close alone cannot skip helper custody.
+      expect(debt).toHaveBeenCalledOnce();
+      killer.emit("close", 1);
+      await vi.advanceTimersByTimeAsync(0);
+      await stopping; // No unnecessary seven-second delay after both closes.
+      expect(stopped).toBe(true);
+      const lost = handle.lostContact();
+      expect(lost).toContain("Windows process tree termination is unconfirmed");
+      killer.emit("close", 0);
+      await handle.waitForClose();
+      expect(handle.lostContact()).toBe(lost); // Late success cannot erase debt.
+      expect(debt).toHaveBeenCalledOnce();
+    } finally {
+      killer.emit("close", 0); child.emit("close", null);
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
+
   it("stop returns only after the worker and its native child have exited", async () => {
     await withOwnedWorker(`import fs from "node:fs";
 import { spawn } from "node:child_process";

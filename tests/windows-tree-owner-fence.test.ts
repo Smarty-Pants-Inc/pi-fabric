@@ -367,6 +367,11 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
           if (outcome === "error" || outcome === "terminal-before-error") { killer.emit("error", new Error("helper failure")); killer.emit("close", 0); }
           if (outcome === "nonzero") killer.emit("close", 1);
           if (outcome === "timeout") { await vi.advanceTimersByTimeAsync(1_000); killer.emit("close", 0); }
+          await vi.advanceTimersByTimeAsync(0);
+          expect(stopped, "closed failed attempt must not add seven seconds to logical stop").toBe(true);
+          expect(hasUnresolvedWorker(run)).toBe(true);
+          expect(manager.retentionReferences().has(handle.id)).toBe(true);
+          await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
           // Parallel monitoring must be able to report failure, but not transfer custody.
           await vi.advanceTimersByTimeAsync(10_000);
         }

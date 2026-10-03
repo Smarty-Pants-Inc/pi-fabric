@@ -2846,8 +2846,9 @@ export class AgentManager {
       await managed.relaunching;
       await this.#waitForTransportExit(managed);
       // POSIX liveness only observes exit; it never runs the transport's
-      // native-close wrapper, which records this unscoped launch generation's
-      // worker completion for later age-gated holder proof. Windows retains
+      // native-close wrapper, which records this launch generation's worker
+      // completion. Unscoped collection keeps main's immediate policy; this
+      // close is not a descendant-exit proof. Windows retains
       // its separate permit-owning close join below (including tree-stop debt).
       if (process.platform !== "win32" && managed.transport.waitForClose && !managed.lostContact) {
         await managed.transport.waitForClose().catch(error => {

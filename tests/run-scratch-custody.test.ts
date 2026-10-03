@@ -20,6 +20,12 @@ const identity = (pid: number): string | undefined => {
   }
 };
 
+const delegated = (() => {
+  if (process.platform !== "linux") return false;
+  try { const membership = fs.readFileSync("/proc/self/cgroup", "utf8").match(/^0::(\/.*)$/m)![1]!; fs.accessSync(path.join("/sys/fs/cgroup", membership), fs.constants.W_OK); return true; }
+  catch { return false; }
+})();
+
 describe("scratch descendant custody (#369 F1)", () => {
   it.skipIf(process.platform === "win32")("keeps the persistent unresolved fence even if a writer removes its temporary directory", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-custody-"));
@@ -46,7 +52,7 @@ describe("scratch descendant custody (#369 F1)", () => {
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it.skipIf(process.platform !== "linux").each([false, true])("preserves redirected background tool scratch after worker exit (crash=%s)", async crash => {
+  it.skipIf(!delegated).each([false, true])("preserves redirected background tool scratch after worker exit (crash=%s)", async crash => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-custody-"));
     const ready = path.join(root, "ready");
     const release = path.join(root, "release");

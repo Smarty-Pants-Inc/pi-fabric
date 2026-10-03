@@ -163,14 +163,13 @@ fs.writeFileSync("native-ready", String(process.pid));`);
       expect(same(native!), "native child must exit, not merely its worker").toBe(false);
       expect(child!.signalCode, "worker must finish the child-close sequence cooperatively").toBeNull();
       expect(hasUnresolvedWorker(run)).toBe(false);
-      // The launch recorder installs NODE_OPTIONS before the attachment gate,
-      // so this fixture intentionally has no complete kernel scratch scope.
-      // Checked native teardown clears worker debt, not scratch writer custody.
-      expect(JSON.parse(fs.readFileSync(path.join(run, "unresolved-scratch.json"), "utf8")).version).toBe(1);
-      expect(canRemoveTerminalRun(run)).toBe(false);
-      if (action !== "close") await expect(manager.checkpointForRelease()).rejects.toThrow(/unresolved run tree/);
+      // The shell gate now contains runtime preloads on scoped hosts. With
+      // native teardown joined, both scoped custody and main-compatible
+      // unscoped collection permit checkpoint/cleanup immediately.
+      expect(fs.existsSync(path.join(run, "unresolved-scratch.json"))).toBe(false);
+      if (action !== "close") await expect(manager.checkpointForRelease()).resolves.toBeUndefined();
       await manager.close();
-      expect(fs.existsSync(run)).toBe(true);
+      expect(fs.existsSync(run)).toBe(false);
     } finally {
       // Revalidate native launch identity before cleanup; reap it while its
       // owning worker is alive, then join the exact captured worker instance.

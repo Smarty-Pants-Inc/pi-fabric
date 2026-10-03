@@ -6,7 +6,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { isUnscopedRun, proveUnscopedCollection } from "./unscoped-collection-contract.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -98,13 +97,6 @@ describe("real worker completion flow", () => {
     const handle = await h.manager.spawn({ task: "superseded", transport: "process" });
     h.manager.detachSignal(handle.id);
     await vi.waitFor(() => expect(h.completed).toHaveBeenCalledOnce(), { timeout: 5_000 });
-    const runDirectory = h.manager.runDirectory(handle.id)!;
-    if (operation === "cleanup" && isUnscopedRun(runDirectory)) {
-      await expect(h.manager.cleanup(handle.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
-      expect(h.consumed).not.toHaveBeenCalled(); // veto must not consume the pending completion
-      expect(h.sendMessage).not.toHaveBeenCalled();
-      await proveUnscopedCollection(runDirectory);
-    }
     await h.manager[operation](handle.id);
     h.boundary();
     expect(h.sendMessage).not.toHaveBeenCalled();

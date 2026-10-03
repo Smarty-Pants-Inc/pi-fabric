@@ -1,4 +1,3 @@
-import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,8 +11,6 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import * as runScratch from "../src/storage/run-scratch.js";
-import { pruneActorRunArchives } from "../src/storage/retention.js";
-import { UNSCOPED_SCRATCH_RETENTION_MS } from "../src/storage/scratch-process-census.js";
 import { scratchEvidence } from "./scratch-evidence.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -254,74 +251,11 @@ describe("round-four launch-preparation recovery (#3167)", () => {
       scratchEvidence(`actor-auth-${queued}-${recreate}-${responseMode}`, { containment: "native scoped",
         scope: allocation.value.scope, runId, runRemovedImmediately: true });
     } else {
-      // D4: native worker close is a generation receipt, not descendant proof.
-      expect(fs.readdirSync(runsDirectory)).toHaveLength(otherRuns + 1);
-      expect(fs.existsSync(path.join(runDirectory, "tmp"))).toBe(true);
-      const fenceFile = path.join(runDirectory, runScratch.UNRESOLVED_SCRATCH_FILE);
-      const fence = JSON.parse(fs.readFileSync(fenceFile, "utf8"));
-      const status = JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8"));
-      expect(agents.status(runId)).toMatchObject({ actorId: actor.id, status: "completed" });
-      expect(status).toMatchObject({ id: runId, status: "completed", transport: "process" });
-      expect(fence).toMatchObject({ version: 3, runDirectory, closedPid: Number(status.sessionId),
-        root: { dev: fs.statSync(runDirectory).dev, ino: fs.statSync(runDirectory).ino },
-        scratch: { dev: fs.statSync(path.join(runDirectory, "tmp")).dev, ino: fs.statSync(path.join(runDirectory, "tmp")).ino } });
-      expect(fence.scope).toBeUndefined();
-      expect(fence.launchNonce).toEqual(expect.any(String));
-      expect(fence.launchNonce.length).toBeGreaterThan(0);
-      expect(fence.lastLaunchAt).toBeGreaterThanOrEqual(fence.allocatedAt);
-      expect(fence.closedAt).toBeGreaterThanOrEqual(fence.lastLaunchAt);
-      expect(fence.hostEpoch.platform).toBe(process.platform);
-      expect(() => process.kill(fence.closedPid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
-
-      // Isolate the complete parsed census from unrelated fleet processes. Do
-      // not mock worker liveness, boot identity, or the collector's proof gate.
-      const nativeExec = childProcess.execFileSync;
-      let holder = false;
-      let censusCalls = 0;
-      const census = vi.spyOn(childProcess, "execFileSync").mockImplementation((file, args, options) => {
-        if (file !== "/bin/ps" && !(options as childProcess.ExecFileSyncOptions)?.env?.PI_FABRIC_CENSUS_PID) {
-          return nativeExec(file, args, options as childProcess.ExecFileSyncOptions);
-        }
-        censusCalls++;
-        if (process.platform === "win32") return JSON.stringify([
-          { pid: process.pid, ppid: process.ppid, birth: fence.allocatedAt - 60_000, zombie: false, query: false },
-          ...(holder ? [{ pid: fence.closedPid, ppid: process.pid, birth: fence.allocatedAt, zombie: false, query: false }] : []),
-        ]) as never;
-        const birth = (at: number) => new Date(at).toUTCString()
-          .replace(/^(\w+), (\d+) (\w+) (\d+) (.*) GMT$/, "$1 $3 $2 $5 $4");
-        return `${process.pid} ${process.ppid} ${process.getuid!()} S ${birth(fence.allocatedAt - 60_000)} node\n` +
-          (holder ? `${fence.closedPid} ${process.pid} ${process.getuid!()} S ${birth(fence.allocatedAt)} node\n` : "") as never;
-      });
-      const clock = vi.spyOn(Date, "now");
-      const collect = () => pruneActorRunArchives({ runsDirectory, retentionMs: 1 });
-      const retained = () => {
-        expect(collect()).not.toContain(runDirectory);
-        expect(fs.existsSync(path.join(runDirectory, "tmp"))).toBe(true);
-        expect(JSON.parse(fs.readFileSync(fenceFile, "utf8"))).toEqual(fence);
-      };
-      try {
-        retained(); // Even an empty holder population cannot bypass the age gate.
-        expect(censusCalls).toBe(0);
-        const ageGate = Math.max(fence.lastLaunchAt, fence.closedAt, status.finishedAt) + UNSCOPED_SCRATCH_RETENTION_MS;
-        clock.mockReturnValue(ageGate - 1);
-        retained();
-        // Older healthy/blocker siblings may already be due for collection.
-        censusCalls = 0;
-        clock.mockReturnValue(ageGate + 1);
-        holder = true;
-        retained(); // Age alone cannot bypass a potential surviving descendant.
-        expect(censusCalls).toBeGreaterThan(0);
-        holder = false;
-        censusCalls = 0;
-        expect(collect()).toContain(runDirectory);
-        expect(censusCalls).toBeGreaterThanOrEqual(2);
-        expect(fs.existsSync(runDirectory)).toBe(false);
-        scratchEvidence(`actor-auth-${queued}-${recreate}-${responseMode}`, { containment: "unscoped", runId, fence,
-          runRetainedImmediately: true, retainedBelowAgeGate: true, retainedWithPotentialHolder: true,
-          workerPidConfirmedAbsent: true, runRemovedAfterAgeAndEmptyCensus: true, finalCensusCalls: censusCalls,
-          retentionClock: "injected Date.now past 24-hour gate, not actual 24-hour elapsed time",
-          census: "isolated complete parsed census fixture; native worker liveness and boot identity unchanged" });
-      } finally { clock.mockRestore(); census.mockRestore(); }
+      // Unscoped hosts retain main's immediate terminal collection contract.
+      expect(fs.existsSync(runDirectory)).toBe(false);
+      expect(fs.readdirSync(runsDirectory)).toHaveLength(otherRuns);
+      scratchEvidence(`actor-auth-${queued}-${recreate}-${responseMode}`, { containment: "unscoped compatibility",
+        runId, runRemovedImmediately: true, descendantExitProved: false });
     }
   });
 
@@ -679,7 +613,11 @@ describe("actor preparation (#3167)", () => {
     for (const actor of all) actors.tell(actor.id, "HANG");
     await waitFor(() => all.slice(14).every((actor) => actors.status(actor.id).inFlightRun !== undefined));
     expect(all.slice(14).every((actor) => retryEvent(actors, actor.id, "presence") === undefined)).toBe(true);
-    await waitFor(() => all.every((actor) => actors.status(actor.id).inFlightRun !== undefined));
+    // Keep the first four healthy actors under the existing starvation guard.
+    // Joining all 18 durable native launches at nice 19 can take longer than
+    // one five-second observation; retain all retry/state/count assertions and
+    // the existing 20-second case ceiling.
+    await waitFor(() => all.every((actor) => actors.status(actor.id).inFlightRun !== undefined), 15_000);
     expect(agents.list().filter((run) => run.status === "running")).toHaveLength(18);
     expect(all.slice(0, 14).every((actor) => retryEvent(actors, actor.id, "presence") !== undefined)).toBe(true);
     expect(all.every((actor) => actors.status(actor.id).status === "running" && actors.status(actor.id).preparing === undefined)).toBe(true);
@@ -698,7 +636,9 @@ describe("actor preparation (#3167)", () => {
     await pause(200); // A legitimate permit wait is longer than the 80ms setup deadline.
     expect(all.every((actor) => actors.status(actor.id).status === "waiting")).toBe(true);
     await agents.stop(blockers[0]!.id);
-    await waitFor(() => all.every((actor) => actors.status(actor.id).lastRunId !== undefined) && actors.inFlightCount() === 0);
+    // Seven serial durable native launches are not a five-second performance
+    // budget at nice 19. Keep prompt waiter/position checks above unchanged.
+    await waitFor(() => all.every((actor) => actors.status(actor.id).lastRunId !== undefined) && actors.inFlightCount() === 0, 10_000);
     expect(all.every((actor) => actors.status(actor.id).queued === 0 && actors.status(actor.id).inFlightRun === undefined)).toBe(true);
   });
 });

@@ -132,6 +132,8 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
     heartbeatMs: 50,
     leaseMs: 300,
   });
+  // One Main runtime identity, not a different birth stamp on each heartbeat.
+  const runtimeStartedAt = Date.now();
   participants.registerSource(() => [{
     format: 1,
     id: identity.id,
@@ -147,7 +149,7 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
     capabilities: ["steer", "followUp", "fabric"],
     cwd: repo,
     sessionId: name,
-    startedAt: Date.now(),
+    startedAt: runtimeStartedAt,
     updatedAt: Date.now(),
     controlProtocol: "v1",
   }]);
@@ -421,6 +423,9 @@ describe("saturated durable spawn receipt consistency (#181 F2)", () => {
       expect(client.hasAgent(queued.id)).toBe(false);
       expect(client.listAgents().map((run) => run.id)).toEqual([blocker.id]);
       await hostManager.stop(blocker.id);
+      // Native teardown can outlast this fixture's accelerated 300ms lease.
+      // Publish the still-live Main before its next authority-bound request.
+      await state.participants.refresh();
       const successor = await client.spawnAgent({ task: "accepted after pool release", residency: "durable", transport: "process" });
       await expect(client.waitAgent(successor.id)).resolves.toMatchObject({ status: "completed" });
       expect(hostManager.runDirectory(queued.id)).toBeUndefined();

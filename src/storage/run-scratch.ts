@@ -1,11 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { windowsDataRoot } from "./windows-temp-root.js";
 import { posixDataRoot } from "./temp-root.js";
-import { localScratchVolume, noPotentialScratchHolders, scratchHostEpoch, UNSCOPED_SCRATCH_RETENTION_MS, type ScratchHostEpoch } from "./scratch-process-census.js";
+import type { ScratchHostEpoch } from "./scratch-process-census.js";
+import { processStartTime } from "../residency/process-identity.js";
 import { ownedStat } from "./scratch.js";
 import { checkedProcessScratchScope, createProcessScratchScope, removeEmptyProcessScratchScope, type ProcessScratchScope, type ScopedScratchLaunch } from "./process-scratch-scope.js";
 
@@ -62,14 +62,11 @@ const same = (file: string, stat: Pick<fs.Stats, "dev" | "ino"> | undefined): bo
 interface ScratchFence {
   version: 2 | 3; runDirectory: string; scope?: ProcessScratchScope; launchNonce?: string;
   root?: { dev: number; ino: number }; scratch?: { dev: number; ino: number };
-  allocatedAt?: number; allocatedUptime?: number; lastLaunchAt?: number; hostEpoch?: ScratchHostEpoch; closedPid?: number; closedAt?: number;
+  allocatedAt?: number; allocatedUptime?: number; lastLaunchAt?: number; hostEpoch?: ScratchHostEpoch; closedPid?: number; closedAt?: number; retryPending?: boolean;
 }
 const validUnscopedFence = (value: ScratchFence): boolean => value.version === 3 && value.scope === undefined &&
   typeof value.allocatedAt === "number" && Number.isFinite(value.allocatedAt) && value.allocatedAt >= 0 &&
-  typeof value.allocatedUptime === "number" && Number.isFinite(value.allocatedUptime) && value.allocatedUptime >= 0 &&
   typeof value.lastLaunchAt === "number" && Number.isFinite(value.lastLaunchAt) && value.lastLaunchAt >= value.allocatedAt &&
-  !!value.hostEpoch && typeof value.hostEpoch.boot === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value.hostEpoch.boot) &&
-  typeof value.hostEpoch.platform === "string" && typeof value.hostEpoch.hostname === "string" &&
   typeof value.launchNonce === "string" && value.launchNonce.length > 0;
 
 // Serialize allocation/refusal/disposal across processes. An abandoned or
@@ -94,41 +91,48 @@ const readFence = (runDirectory: string): ScratchFence | undefined => {
   } catch { return; }
 };
 
-/** Age only schedules a proof; it is never a writer-exit receipt. An unscoped
- * launch may be collected only after the worker and EVERY potential ordinary
- * descendant are absent (or an actual same-host reboot), with pinned namespace.
- * Legacy v1 has no allocation boundary and therefore cannot use this proof. */
+/** Compatibility scope cut (#3076): unscoped terminal runs collect immediately,
+ * as on main. Native close is generation-bound worker custody, NOT proof that
+ * ordinary descendants exited. Age-gated holder retention is deferred to #4010.
+ * Keep namespace identity, unsafe-content and unresolved-worker fences. */
 const disposeUnscopedRunTmp = (runDirectory: string, receipt: ScratchFence, expired: () => boolean): boolean => {
-  if (!validUnscopedFence(receipt) || expired() || !localScratchVolume(runDirectory)) return false;
+  if (!validUnscopedFence(receipt) || expired()) return false;
   const statusFile = path.join(runDirectory, "status.json"), statusStat = ownedStat(statusFile);
   if (!statusStat?.isFile() || statusStat.size > 1024 * 1024) return false;
   const status = JSON.parse(fs.readFileSync(statusFile, "utf8"));
-  if (status.transport !== "process" || !["completed", "failed", "stopped", "timed_out"].includes(status.status) ||
-      typeof status.finishedAt !== "number" || !Number.isFinite(status.finishedAt) || status.finishedAt < receipt.lastLaunchAt!) return false;
-  if (!Number.isSafeInteger(receipt.closedPid) || typeof receipt.closedAt !== "number" || !Number.isFinite(receipt.closedAt) || receipt.closedAt < receipt.lastLaunchAt!) return false;
-  if (Date.now() - Math.max(receipt.lastLaunchAt!, receipt.closedAt, status.finishedAt) < UNSCOPED_SCRATCH_RETENTION_MS) return false;
-  const pid = typeof status.sessionId === "string" && /^\d+$/.test(status.sessionId) ? Number(status.sessionId) : NaN;
-  if (!Number.isSafeInteger(pid) || pid <= 0 || pid !== receipt.closedPid) return false;
-  try { process.kill(pid, 0); return false; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false; }
+  if (status.transport !== "process" || !["completed", "failed", "stopped", "timed_out"].includes(status.status)) return false;
+  const closed = Number.isSafeInteger(receipt.closedPid) && receipt.closedPid! > 0 &&
+    typeof receipt.closedAt === "number" && Number.isFinite(receipt.closedAt) && receipt.closedAt >= receipt.lastLaunchAt!;
+  // A fresh launch has no old status to confuse with this generation. Offline
+  // collection uses main's persisted PID/birth proof even if its owner died
+  // before recording native close. A retry must join its own captured close.
+  if (receipt.retryPending && !closed) return false;
+  const savedPid = typeof status.sessionId === "string" && /^\d+$/.test(status.sessionId) ? Number(status.sessionId) : undefined;
+  if (status.sessionId !== undefined && (!Number.isSafeInteger(savedPid) || savedPid! <= 0)) return false;
+  const pid = savedPid ?? (closed ? receipt.closedPid : undefined);
+  if (!Number.isSafeInteger(pid) || pid! <= 0 || (closed && savedPid !== undefined && savedPid !== receipt.closedPid)) return false;
+  try {
+    process.kill(pid!, 0);
+    const savedStart = typeof status.processStartTime === "string" && /^\d+$/.test(status.processStartTime) ? status.processStartTime : undefined;
+    const currentStart = savedStart ? processStartTime(pid!) : undefined;
+    if (currentStart === undefined || currentStart === savedStart) return false;
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false; }
   for (const name of ["unresolved-worker.json", JOINED_SCRATCH_FILE]) {
     try { fs.lstatSync(path.join(runDirectory, name)); return false; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
   }
-  const epoch = scratchHostEpoch();
-  if (!epoch || epoch.hostname !== receipt.hostEpoch!.hostname || epoch.platform !== receipt.hostEpoch!.platform) return false;
   const directory = runTmpDirectory(runDirectory), fence = path.join(runDirectory, UNRESOLVED_SCRATCH_FILE), custody = ownedStat(fence);
   if (!safeRunTmpTree(directory, expired) || expired()) return false;
-  if (epoch.boot === receipt.hostEpoch!.boot && !noPotentialScratchHolders(receipt.allocatedAt!, directory, expired, receipt.allocatedUptime)) return false;
-  if (expired() || !same(runDirectory, receipt.root) || !same(directory, receipt.scratch) || !same(fence, custody) || !same(statusFile, statusStat)) return false;
+  if (!same(runDirectory, receipt.root) || !same(directory, receipt.scratch) || !same(fence, custody) || !same(statusFile, statusStat)) return false;
   fs.rmSync(directory, { recursive: true });
   fs.unlinkSync(fence);
   return true;
 };
 
-/** Remove scratch only with a pinned kernel scope's atomic empty/removal
- * receipt, or the age-gated complete unscoped holder proof. Unknown launches
- * and legacy scratch stay fenced; unsupported hosts never use PID-only deletion.
+/** Scoped scratch requires the pinned kernel scope's atomic empty/removal
+ * receipt. Unscoped terminal runs keep main's immediate collection policy;
+ * their native-close receipt proves only the worker, not descendant exit.
+ * Unknown launches and legacy scratch stay fenced.
  * Calling this later allows cleanup/retention after a background tool exits. */
 export const disposeRunTmpDirectory = (runDirectory: string, expired: () => boolean = () => false): boolean => {
   let unlock: (() => void) | undefined;
@@ -239,13 +243,12 @@ const allocateRunTmpDirectoryLocked = (runDirectory: string): { directory: strin
     } catch (error) { if (fresh) removeEmptyProcessScratchScope(scope); throw error; }
   }
   if (!scope && (fresh || prior?.version === 3)) {
-    const hostEpoch = prior?.hostEpoch ?? scratchHostEpoch();
-    if (hostEpoch && localScratchVolume(runDirectory)) {
-      const now = Date.now();
-      writeJsonAtomic(fence, { version: 3, reason: "uncontained process descendants", runDirectory: path.resolve(runDirectory),
-        launchNonce, hostEpoch, allocatedAt: prior?.allocatedAt ?? now, allocatedUptime: prior?.allocatedUptime ?? os.uptime(), lastLaunchAt: now,
-        root: { dev: root!.dev, ino: root!.ino }, scratch: { dev: scratch!.dev, ino: scratch!.ino } }, { durable: true });
-    }
+    // Unscoped custody is available on every supported host/filesystem. It
+    // does not require D4's deferred host-epoch or potential-holder inventory.
+    const now = Date.now();
+    writeJsonAtomic(fence, { version: 3, reason: "uncontained process descendants", runDirectory: path.resolve(runDirectory),
+      launchNonce, allocatedAt: prior?.allocatedAt ?? now, lastLaunchAt: now, retryPending: !fresh,
+      root: { dev: root!.dev, ino: root!.ino }, scratch: { dev: scratch!.dev, ino: scratch!.ino } }, { durable: true });
   }
   const custody = ownedStat(fence);
   // Pin the previous usable joined generation. Only a confirmed pre-spawn
@@ -288,7 +291,7 @@ const allocateRunTmpDirectoryLocked = (runDirectory: string): { directory: strin
         }
         if (!validUnscopedFence(current)) return;
         if (current.closedPid === pid && typeof current.closedAt === "number" && current.closedAt >= current.lastLaunchAt!) return;
-        writeJsonAtomic(fence, { ...current, closedPid: pid, closedAt: Date.now() }, { durable: true });
+        writeJsonAtomic(fence, { ...current, closedPid: pid, closedAt: Date.now(), retryPending: false }, { durable: true });
       } catch { /* unproved native completion remains fenced */ }
       finally { unlock?.(); }
     },

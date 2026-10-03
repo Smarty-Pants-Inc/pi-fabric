@@ -98,7 +98,6 @@ if (!failed) setInterval(() => {}, 1000);
     try {
       const handle = await manager.spawn({ task: "retry writer", transport: "process" });
       const directory = manager.runDirectory(handle.id)!;
-      const scoped = JSON.parse(fs.readFileSync(path.join(directory, "unresolved-scratch.json"), "utf8")).version === 2;
       await entering;
       await vi.waitFor(() => {
         const record = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"));
@@ -111,7 +110,7 @@ if (!failed) setInterval(() => {}, 1000);
       expect(fs.existsSync(path.join(directory, "tmp", "scratch"))).toBe(true);
       release();
       await stop;
-      expect(fs.existsSync(path.join(directory, "tmp"))).toBe(!scoped);
+      expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false);
       expect(calls).toBe(2);
     } finally {
       release();
@@ -120,7 +119,7 @@ if (!failed) setInterval(() => {}, 1000);
     }
   }, 20_000);
 
-  it("joins actual worker exit before disposing scratch, retaining it only without a complete scope receipt", async () => {
+  it("joins actual worker exit before disposing scratch on scoped and unscoped hosts", async () => {
     const root = sandbox();
     const release = path.join(root, "release");
     const worker = path.join(root, "terminal-writer.mjs");
@@ -136,7 +135,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(release)}))
     managers.push(manager);
     const handle = await manager.spawn({ task: "terminal writer", transport: "process" });
     const directory = manager.runDirectory(handle.id)!;
-    const scoped = JSON.parse(fs.readFileSync(path.join(directory, "unresolved-scratch.json"), "utf8")).version === 2;
     await vi.waitFor(() => expect(fs.existsSync(path.join(directory, "status.json"))).toBe(true));
     let completed = false;
     const result = manager.wait(handle.id).then(result => { completed = true; return result; });
@@ -146,8 +144,8 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(release)}))
     expect(fs.existsSync(path.join(directory, "tmp", "scratch"))).toBe(true);
     fs.writeFileSync(release, "exit now");
     expect((await result).status).toBe("completed");
-    expect(fs.existsSync(path.join(directory, "tmp"))).toBe(!scoped);
+    expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false);
     expect(fs.existsSync(path.join(directory, "status.json"))).toBe(true);
-    expect(fs.existsSync(path.join(directory, "unresolved-scratch.json"))).toBe(!scoped);
+    expect(fs.existsSync(path.join(directory, "unresolved-scratch.json"))).toBe(false);
   });
 });

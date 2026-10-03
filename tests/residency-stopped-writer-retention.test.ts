@@ -283,7 +283,9 @@ it.skipIf(process.platform === "win32").each([
     fs.writeFileSync(release, "finish nested");
     await waitFor(() => !processAlive(child.pid));
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ status: "completed", turns: 5 });
-    expect(host.agents.retentionReferences().has(actor.id)).toBe(false);
+    // Native process absence can precede the kernel's last scope release.
+    // Wait for the same production custody/ownership proof, not a fabricated exit.
+    await waitFor(() => !host.agents.retentionReferences().has(actor.id));
     const before = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);

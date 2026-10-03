@@ -41,7 +41,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     return manager.run({ task, transport: "process" });
   };
 
-  it("gives concurrent real worker/Pi runs distinct private TMPDIRs and disposes only proved-empty scopes", async () => {
+  it("gives concurrent real worker/Pi runs distinct private TMPDIRs and collects terminal scratch", async () => {
     process.env.FAKE_PI_BEHAVIOR = "run-tmpdir";
     const parentTmpdir = process.env.TMPDIR;
     const parentTmp = process.env.TMP;
@@ -52,11 +52,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       workerPath, piBinary, runRoot: root,
     });
     managers.push(manager);
-    const scopedRuns = new Set<string>();
-    const results = await Promise.all(["scratch one", "scratch two"].map(task => manager.run({ task, transport: "process" }, undefined, handle => {
-      const fence = path.join(manager.runDirectory(handle.id)!, "unresolved-scratch.json");
-      if (JSON.parse(fs.readFileSync(fence, "utf8")).version === 2) scopedRuns.add(handle.id);
-    })));
+    const results = await Promise.all(["scratch one", "scratch two"].map(task => manager.run({ task, transport: "process" })));
     const reports = results.map(result => {
       expect(result.status).toBe("completed");
       const report = JSON.parse(result.text);
@@ -66,8 +62,8 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       expect(path.dirname(report.scratch)).toBe(report.tmpdir); // real ordinary mktemp, without -p
       if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
       else expect(report.mode).toBe(0o700);
-      expect(fs.existsSync(report.tmpdir)).toBe(!scopedRuns.has(result.id));
-      expect(fs.existsSync(path.join(runDirectory, "unresolved-scratch.json"))).toBe(!scopedRuns.has(result.id));
+      expect(fs.existsSync(report.tmpdir)).toBe(false);
+      expect(fs.existsSync(path.join(runDirectory, "unresolved-scratch.json"))).toBe(false);
       expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8")).sessionId).toBe(result.sessionId);
       expect(fs.existsSync(path.join(runDirectory, "events.jsonl"))).toBe(true);
       return report;

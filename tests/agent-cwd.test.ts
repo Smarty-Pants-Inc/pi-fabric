@@ -6,7 +6,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { agentParticipantRecords } from "../src/topology/records.js";
-import { isUnscopedRun, proveUnscopedCollection } from "./unscoped-collection-contract.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -310,12 +309,6 @@ describe("one-shot agent cwd", () => {
     } finally {
       if (result) {
         await waitForWorkerExit(manager, result.id);
-        const runDirectory = manager.runDirectory(result.id)!;
-        if (isUnscopedRun(runDirectory)) {
-          await expect(manager.cleanup(result.id, true)).rejects.toThrow(/scratch writer exit is unconfirmed/);
-          expect(fs.existsSync(result.worktree!)).toBe(true);
-          await proveUnscopedCollection(runDirectory);
-        }
         expect(await manager.cleanup(result.id, true)).toEqual({ cleaned: true });
         expect(fs.existsSync(result.worktree!)).toBe(false);
       }
@@ -340,12 +333,6 @@ describe("one-shot agent cwd", () => {
     } finally {
       if (result) {
         await waitForWorkerExit(manager, result.id);
-        const runDirectory = manager.runDirectory(result.id)!;
-        if (isUnscopedRun(runDirectory)) {
-          await expect(manager.cleanup(result.id, true)).rejects.toThrow(/scratch writer exit is unconfirmed/);
-          expect(fs.existsSync(result.worktree!)).toBe(true);
-          await proveUnscopedCollection(runDirectory);
-        }
         expect(await manager.cleanup(result.id, true)).toEqual({ cleaned: true });
         expect(fs.existsSync(result.worktree!)).toBe(false);
       }

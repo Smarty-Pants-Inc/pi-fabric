@@ -103,26 +103,22 @@ describe("#369 D9 contained retry never-started receipt", () => {
   });
 });
 
-describe("#369 D4 bounded unsupported-host retention", () => {
-  it.skipIf(process.platform !== "linux")("collects an aged completed unscoped allocation only with no potential live holder", async () => {
+describe("#369 unscoped main-compatible collection", () => {
+  it.skipIf(process.platform !== "linux")("collects completed unscoped scratch immediately without querying potential holders", async () => {
     const temp = sandbox(), root = fs.mkdtempSync(path.join(temp, "pi-fabric-runs-")), run = path.join(root, "done");
-    const allocatedAt = Date.now();
-    fs.mkdirSync(run, {mode:0o700}); markRunRootActive(root, allocatedAt);
+    fs.mkdirSync(run, { mode: 0o700 }); markRunRootActive(root, Date.now() - 10);
     vi.spyOn(scopes, "createProcessScratchScope").mockReturnValue(undefined);
     const worker = path.join(temp, "unscoped-worker.mjs"), status = path.join(run, "status.json");
     fs.writeFileSync(worker, `import fs from "node:fs";fs.writeFileSync(process.env.TMPDIR+"/data","finished scratch");fs.writeFileSync(${JSON.stringify(status)},JSON.stringify({status:"completed",transport:"process",sessionId:String(process.pid),finishedAt:Date.now()}));`);
-    const handle = await new ProcessTransport().launch({id:"done",name:"done",cwd:temp,workerPath:worker,workerArguments:["--status-file",status]});
+    const handle = await new ProcessTransport().launch({ id: "done", name: "done", cwd: temp, workerPath: worker, workerArguments: ["--status-file", status] });
     await handle.waitForClose!(); expect(handle.lostContact?.()).toBeUndefined();
-    markRunRootClosed(root, allocatedAt, true);
-    expect(disposeRunTmpDirectory(run)).toBe(false);
-    const future = Date.now() + 24*60*60*1000 + 10;
-    vi.spyOn(Date, "now").mockReturnValue(future);
-    const birth = new Date(allocatedAt-60000).toUTCString().replace(/^(\w+), (\d+) (\w+) (\d+) (.*) GMT$/, "$1 $3 $2 $5 $4");
-    const census = vi.spyOn(childProcess, "execFileSync").mockReturnValue(`${process.pid} ${process.ppid} ${process.getuid!()} S ${birth} node\n` as never);
-    const sweep = sweepTempRunRoots({tempRoot:temp,oneShotRunRetentionMs:1,orphanedTempRunRetentionMs:1,now:future,budgetMs:1000});
+    const census = vi.spyOn(childProcess, "execFileSync");
+    expect(disposeRunTmpDirectory(run)).toBe(true);
+    expect(census).not.toHaveBeenCalled();
+    markRunRootClosed(root, Date.now() - 2, true);
+    const sweep = sweepTempRunRoots({ tempRoot: temp, oneShotRunRetentionMs: 1, orphanedTempRunRetentionMs: 1, now: Date.now() + 10, budgetMs: 1000 });
     expect(sweep.removedRoots).toContain(root);
     expect(fs.existsSync(root)).toBe(false);
-    expect(census).toHaveBeenCalled();
   });
 });
 

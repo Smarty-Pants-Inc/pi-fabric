@@ -6,8 +6,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { activeBudgetState, appendBudgetLedger, readBudgetLedger } from "../src/agents/budget-ledger.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
-import { hasUnresolvedWorker, runTreeExitVeto, pruneActorRunArchives, removeEmptyRunRoot } from "../src/storage/retention.js";
-import { isUnscopedRun, proveUnscopedCollection } from "./unscoped-collection-contract.js";
+import { hasUnresolvedWorker, runTreeExitVeto } from "../src/storage/retention.js";
 import { processAlive } from "../src/storage/scratch.js";
 
 const managers: AgentManager[] = [];
@@ -48,39 +47,18 @@ describe("AgentManager close storage", () => {
 
   it("honors retainRuns:false for a managed root after stopping a running worker", async () => {
     const { manager, root } = setup(false);
-    const running = await manager.spawn({ task: "HANG", runner: "pi", extensions: false });
-    const runDirectory = manager.runDirectory(running.id)!;
-    const unscoped = isUnscopedRun(runDirectory);
+    await manager.spawn({ task: "HANG", runner: "pi", extensions: false });
     expect(fs.readdirSync(root).length).toBeGreaterThan(1);
     await manager.close();
-    if (unscoped) {
-      expect(fs.existsSync(root)).toBe(true);
-      await proveUnscopedCollection(runDirectory);
-      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 1 })).toContain(runDirectory);
-      expect(removeEmptyRunRoot(root)).toBe(true);
-    }
     expect(fs.existsSync(root)).toBe(false);
   });
 
   it("retains closed managed run artifacts by default", async () => {
     const { manager, root } = setup(true);
-    const result = await manager.run({ task: "hello", runner: "pi", extensions: false });
-    const runDirectory = manager.runDirectory(result.id)!;
-    const unscoped = isUnscopedRun(runDirectory);
+    await manager.run({ task: "hello", runner: "pi", extensions: false });
     await manager.close();
     expect(fs.existsSync(root)).toBe(true);
-    const owner = JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"));
-    if (unscoped) {
-      // Native close alone cannot advertise descendant exit or root closure.
-      expect(owner.childrenStopped).toBeUndefined();
-      expect(owner.closedAt).toBeUndefined();
-      await proveUnscopedCollection(runDirectory);
-      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 1 })).toContain(runDirectory);
-      expect(removeEmptyRunRoot(root)).toBe(true);
-      expect(fs.existsSync(root)).toBe(false);
-    } else {
-      expect(owner).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });
-    }
+    expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"))).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });
   });
 
   it("preserves unknown managed-root contents even when deletion was requested", async () => {
@@ -206,14 +184,6 @@ describe("AgentManager close storage", () => {
     if (state === "exited") {
       await childManager.stop(child.id);
       expect(processAlive(pid), "checked child process exit").toBe(false);
-      if (isUnscopedRun(parentDirectory) || isUnscopedRun(childDirectory)) {
-        expect(runTreeExitVeto(parentDirectory, 0, undefined, true)).toMatch(/scratch writer exit is unconfirmed/);
-        expect(fs.existsSync(budget.file), "native close alone does not release shared accounting").toBe(true);
-        const retainedAccounting = fs.readFileSync(budget.file, "utf8");
-        await proveUnscopedCollection(childDirectory);
-        await proveUnscopedCollection(parentDirectory);
-        expect(fs.readFileSync(budget.file, "utf8")).toBe(retainedAccounting);
-      }
       expect(runTreeExitVeto(parentDirectory, 0, undefined, true)).toBeUndefined();
     } else {
       expect(runTreeExitVeto(parentDirectory, 0, undefined, true)).toMatch(state === "unknown" ? /unknown descendant identity/ : /descendant worker may still be running/);
@@ -235,20 +205,11 @@ describe("AgentManager close storage", () => {
 
   it("cancels queued admissions on close instead of launching after shutdown", async () => {
     const { manager, root } = setup(false);
-    const running = await manager.spawn({ task: "HANG", extensions: false });
-    const runDirectory = manager.runDirectory(running.id)!;
-    const unscoped = isUnscopedRun(runDirectory);
+    await manager.spawn({ task: "HANG", extensions: false });
     const queued = await manager.spawn({ task: "queued", extensions: false });
     expect(queued.status).toBe("queued");
     await manager.close();
     await expect(manager.wait(queued.id)).resolves.toMatchObject({ status: "stopped" });
-    if (unscoped) {
-      expect(fs.existsSync(root)).toBe(true);
-      expect(fs.existsSync(path.join(root, queued.id))).toBe(false); // cancelled before allocation
-      await proveUnscopedCollection(runDirectory);
-      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 1 })).toContain(runDirectory);
-      expect(removeEmptyRunRoot(root)).toBe(true);
-    }
     expect(fs.existsSync(root)).toBe(false);
   });
 

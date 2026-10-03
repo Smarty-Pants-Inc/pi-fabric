@@ -143,11 +143,16 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     (["text", "directive"] as const).map((responseMode) => ({ queued, recreate, responseMode }))));
   it.each(scenarios)("durably retries confirmed-unlaunched auth (queued=$queued, recreate=$recreate, mode=$responseMode) exactly once", async ({ queued, recreate, responseMode }) => {
     const gate = deferred<void>();
+    const authStarted = deferred<void>();
+    const recovered = deferred<void>();
     let calls = 0;
     let resolved = false;
     const { actors: before, agents: oldAgents, mesh, root } = setup({ preparationRetryMs: 1_000 }, 1, {
       preparePiModel: async (model) => {
-        if (model === "provider/stalled" && ++calls === 1) await gate.promise;
+        if (model === "provider/stalled" && ++calls === 1) {
+          authStarted.resolve();
+          await gate.promise;
+        }
         return model;
       },
     });
@@ -155,6 +160,12 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     const blocker = queued ? await oldAgents.spawn({ task: "HANG", model: "provider/healthy" }) : undefined;
     cleanups.push(async () => { if (blocker) await oldAgents.stop(blocker.id); });
     const actor = await before.create({ name: "auth-recovery", model: "provider/stalled", instructions: "Reply", responseMode, coalesce: false });
+    const publish = mesh.publish.bind(mesh);
+    vi.spyOn(mesh, "publish").mockImplementation(async request => {
+      const event = await publish(request);
+      if (request.topic === "fabric.actor.output" && request.from?.id === actor.id) recovered.resolve();
+      return event;
+    });
     const launches = vi.spyOn(oldAgents, "run");
     const accepted = before.tell(actor.id, "original accepted auth activation");
     let receiptId: string | undefined;
@@ -166,7 +177,7 @@ describe("round-four launch-preparation recovery (#3167)", () => {
       expect(before.status(actor.id).status).toBe("waiting");
       await oldAgents.stop(blocker.id);
     }
-    await waitFor(() => calls === 1);
+    await authStarted.promise;
     expect(before.status(actor.id)).toMatchObject({ status: "preparing", preparing: { phase: "launch" } });
     expect(before.status(actor.id).inFlightRun).toBeUndefined();
     await waitFor(() => before.inFlightCount() === 0);
@@ -182,9 +193,13 @@ describe("round-four launch-preparation recovery (#3167)", () => {
       expect(await oldAgents.wait(receiptId)).toMatchObject({ status: "failed", launchPreparationTimeoutMs: 80 });
       expect(oldAgents.status(receiptId).status).toBe("failed");
     }
+    // Keep the exact timeout snapshot unexecuted while a slow healthy worker
+    // proves permit reuse. Recreation, not a one-second retry race, owns recovery.
+    if (recreate) before.pauseForRelease();
     // A fresh admission can use the released permit while the old auth promise is unresolved.
     const healthy = await oldAgents.spawn({ task: "healthy admission", model: "provider/healthy" });
     await oldAgents.wait(healthy.id);
+    if (recreate) expect(launches).toHaveBeenCalledTimes(1);
     let actors = before;
     let agents = oldAgents;
     let executions = launches;
@@ -201,8 +216,11 @@ describe("round-four launch-preparation recovery (#3167)", () => {
         { actorRoot: path.join(root, "actors"), persistent: true });
       cleanups.push(async () => { await actors.close(); await agents.close(); });
     }
-    await waitFor(() => actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0 &&
-      actors.messages(actor.id).some((message) => message.direction === "out" && !message.error));
+    // Recovery boots a real worker. Join its output event instead of giving a
+    // loaded Windows runner five seconds to finish startup and journal recovery.
+    // Vitest's existing test timeout remains the hang guard.
+    await recovered.promise;
+    await waitFor(() => actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0);
     expect(resolved).toBe(false);
     expect(executions).toHaveBeenCalledTimes(recreate ? 1 : 2);
     expect(actors.messages(actor.id).filter((message) => message.direction === "out" && !message.error)).toHaveLength(1);

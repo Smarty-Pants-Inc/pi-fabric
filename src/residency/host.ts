@@ -65,6 +65,7 @@ import {
   type ResidentHostConfig,
   type ResidentHostOwner,
 } from "./protocol.js";
+import { completionRecipientFromRun, saveCompletion } from "../agents/completion-journal.js";
 import { deliveryRoot, projectOf, recordedProjectLead, repositoryOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { canRemoveTerminalRun, compactTerminalRunEvents, retainedActorRunIds, runTreeExitVeto, type TerminalRunEventsRetention } from "../storage/retention.js";
@@ -356,6 +357,9 @@ export class ResidentHost {
       fabricSessionId: config.sessionId,
       meshRoot: config.meshRoot,
       projectRoot: config.projectRoot,
+      completionRecipient: () => ({ rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd,
+        projectRoot: config.projectRoot, name: currentConfig().mainName ?? config.mainName ?? "main", role: config.role,
+        startedAt: config.mainStartedAt ?? this.participants.lastKnown?.(config.rootId)?.participant.startedAt ?? 0 }),
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: this.#retention,
@@ -374,8 +378,16 @@ export class ResidentHost {
         if (result.actorId) return;
         const file = residentResultPath(config.residencyRoot, result.id);
         fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-        try { writeJsonAtomic(file, result, { durable: true }); }
-        catch (error) { this.#publicationFailed = true; throw error; }
+        try {
+          writeJsonAtomic(file, result, { durable: true });
+          // Rejected queued durable spawns have no admitted worker/source.
+          if (!this.agents.runDirectory(result.id)) return;
+          // Retain/retry full sources on faults; logical settlement is recoverable
+          // even when inbox notifications are disabled.
+          const recipient = completionRecipientFromRun(config.meshRoot, this.agents.runDirectory(result.id)!);
+          if (!recipient) throw new Error(`Missing admitted completion recipient for ${result.id}`);
+          saveCompletion(config.meshRoot, recipient, result);
+        } catch (error) { this.#publicationFailed = true; throw error; }
       },
       onBackgroundComplete: (result) => {
         if (!config.agents.notifyOnComplete) return;

@@ -12,6 +12,8 @@ import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
+import { processStartTime } from "../residency/process-identity.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -354,6 +356,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
 }
 
 interface QueuedAgent {
+  /** Host-owned admission address, including terminal outcomes with no launch manifest. */
+  completionRecipient?: CompletionRecipient;
   routeSaveFailure?: string;
   routeOutcome?: (result: AgentRunResult) => void;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
@@ -653,15 +657,16 @@ export class AgentManager {
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
   readonly #projectRoot: string;
+  readonly #completionRecipient: CompletionRecipient | (() => CompletionRecipient) | undefined;
   readonly #hostId: string | undefined;
   readonly #identityId: string | undefined;
   readonly #taskReturnAddressArguments: string[];
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
-  readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
+  readonly #onBackgroundComplete: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
   readonly #onBeforeResultReturned: ((id: string) => void) | undefined;
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
-  readonly #onSettled: ((result: AgentRunResult) => void) | undefined;
+  readonly #onSettled: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
@@ -711,18 +716,20 @@ export class AgentManager {
       fabricSessionId?: string;
       meshRoot?: string;
       projectRoot?: string;
+      /** Root-owned return address; never inferred from a child request or inherited by nested agents. */
+      completionRecipient?: CompletionRecipient | (() => CompletionRecipient);
       hostId?: string;
       identityId?: string;
       /** Immediate caller's Pi session, distinct from the inherited root Fabric session. */
       spawnerSessionId?: string;
       retention?: FabricRetentionConfig;
-      onBackgroundComplete?: (result: AgentRunResult) => void;
+      onBackgroundComplete?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onResultConsumed?: (id: string) => void;
       /** Fail-closed durable fence before a foreground value reaches its caller. */
       onBeforeResultReturned?: (id: string) => void;
       onStoppedAtClose?: (results: AgentRunResult[]) => void;
       /** Every terminal result, foreground or background, before its run directory can be removed. */
-      onSettled?: (result: AgentRunResult) => void;
+      onSettled?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
       preparePiModel?: (model: string | undefined, requiredPin?: boolean) => Promise<string | void>;
       resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
@@ -766,6 +773,7 @@ export class AgentManager {
     this.#meshRoot = options.meshRoot ?? process.env.PI_FABRIC_MESH_ROOT;
     this.#projectRoot =
       options.projectRoot ?? process.env.PI_FABRIC_PROJECT_ROOT ?? cwd;
+    this.#completionRecipient = options.completionRecipient;
     this.#hostId = options.hostId ?? process.env.PI_FABRIC_HOST_ID;
     this.#identityId = options.identityId ?? process.env.PI_FABRIC_IDENTITY_ID;
     this.#taskReturnAddressArguments = taskReturnAddressArguments(
@@ -1006,6 +1014,11 @@ export class AgentManager {
       ...(request.actorName !== undefined ? { actorName: request.actorName } : {}),
       handoff: Boolean(request.sessionSeed),
     };
+    // Snapshot host-owned identity before any await/queue: later /name changes
+    // affect new spawns, never an already-admitted run or its retries.
+    const completionRecipient = this.#completionRecipient
+      ? { ...(typeof this.#completionRecipient === "function" ? this.#completionRecipient() : this.#completionRecipient) }
+      : undefined;
     if (request.model === "auto") throw new Error('Unresolved model: "auto" must go through agents.spawn routing');
     const routedActor = request.routeDecision?.mode === "shadow" && Boolean(request.actorId) &&
       request.routeDecision.actorId === request.actorId && Boolean(request.routeDecision.activationId) && Boolean(request.sessionFile);
@@ -1121,6 +1134,11 @@ export class AgentManager {
         this.#retentionTimer = setInterval(() => this.#scheduleRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
         this.#retentionTimer.unref();
         this.#scheduleRetentionSweep();
+      }
+      if (completionRecipient && this.#meshRoot && !request.actorId) {
+        writeJsonAtomic(path.join(runDirectory, "completion-recipient.json"),
+          { meshRoot: this.#meshRoot, recipient: completionRecipient,
+            supervisor: { pid: process.pid, processStartedAt: processStartTime(process.pid) } }, { durable: true });
       }
       const taskFile = path.join(runDirectory, "task.txt");
       const statusFile = path.join(runDirectory, "status.json");
@@ -1473,7 +1491,7 @@ export class AgentManager {
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
-    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome);
+    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient);
   }
 
   #enqueue(
@@ -1482,6 +1500,7 @@ export class AgentManager {
     start: (release: () => void, signal: AbortSignal) => Promise<AgentHandleInfo>,
     ownerSignal?: AbortSignal,
     routeOutcome?: (result: AgentRunResult) => void,
+    completionRecipient?: CompletionRecipient,
   ): AgentHandleInfo {
     const abort = new AbortController();
     // Guest receipts belong to the session, not a program deadline. Host-owned
@@ -1489,7 +1508,8 @@ export class AgentManager {
     const signal = AbortSignal.any([abort.signal, this.#closeAbort.signal, ...(ownerSignal ? [ownerSignal] : [])]);
     let resolve!: (result: AgentRunResult) => void;
     const result = new Promise<AgentRunResult>((done) => { resolve = done; });
-    const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false, ...(routeOutcome ? { routeOutcome } : {}) };
+    const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false,
+      ...(routeOutcome ? { routeOutcome } : {}), ...(completionRecipient ? { completionRecipient } : {}) };
     this.#queued.set(info.id, queued);
     const admission = this.#semaphore.acquire("native", signal);
     const pending = (async () => {
@@ -1533,7 +1553,7 @@ export class AgentManager {
     queued.resolve(record);
     this.#emitLifecycle(queued.info, `run.${status}`, now, { status });
     this.#invalidateUiList();
-    try { this.#onSettled?.(record); } catch { /* must not break settlement */ }
+    try { this.#onSettled?.(record, queued.completionRecipient); } catch { /* retain queued terminal result on publication failure */ }
     this.#notifyQueuedComplete(queued);
   }
 
@@ -1560,7 +1580,7 @@ export class AgentManager {
   #notifyQueuedComplete(queued: QueuedAgent): void {
     if (queued.terminal && queued.background && !queued.completionNotified && !this.#closing && this.config.notifyOnComplete) {
       queued.completionNotified = true;
-      try { this.#onBackgroundComplete?.(queued.terminal); } catch { /* must not break settlement */ }
+      try { this.#onBackgroundComplete?.(queued.terminal, queued.completionRecipient); } catch { /* must not break settlement */ }
     }
   }
 
@@ -1665,11 +1685,20 @@ export class AgentManager {
     });
   }
 
+  /** A terminal worker status is provisional until its retry supervisor settles the run. */
+  isSettled(id: string): boolean {
+    if (this.#previousRun(id)) return true;
+    const queued = this.#queued.get(id);
+    return queued ? queued.terminal !== undefined : this.#requireRun(id).settled;
+  }
+
   prepareForeground(id: string): void {
+    if (!this.isSettled(id)) return;
     this.#onBeforeResultReturned?.(id);
   }
 
   markForeground(id: string): void {
+    if (!this.isSettled(id)) return;
     this.prepareForeground(id);
     if (!this.#previousRun(id)) {
       const queued = this.#queued.get(id);
@@ -2564,6 +2593,10 @@ export class AgentManager {
       // the previous attempt published (token usage above all) before discarding
       // the journal it landed in.
       this.#drainLifecycle(managed);
+      // Once this attempt is superseded, a supervisor crash must not promote its old failure
+      // while the already-launched retry is still running. The previous worker has exited.
+      if (this.#meshRoot) discardWorkerCompletion(this.#meshRoot, managed.id);
+
       if (managed.runner === "pi") {
         // status.json must be removed to fence the new attempt from the old
         // terminal verdict. Hand off its native-session joins separately, after
@@ -2576,6 +2609,7 @@ export class AgentManager {
           setWorkerArgument(managed.launch.workerArguments, "runner-session-ids", JSON.stringify([...new Set(ids)]));
         }
       }
+
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
       managed.transport = await this.#launchTransport(managed.adapter, managed.launch);
@@ -2828,7 +2862,7 @@ export class AgentManager {
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
     try {
       managed.routeOutcome?.(result);
-      this.#onSettled?.(result);
+      this.#onSettled?.(this.#withTransportMetadata(result, managed, false) as AgentRunResult);
       delete managed.settlementSaveFailure;
       return true;
     } catch (error) {
@@ -3138,7 +3172,7 @@ export class AgentManager {
     return managed.nestedSnapshot ? structuredClone(managed.nestedSnapshot) : [];
   }
 
-  #withTransportMetadata(record: AgentRunRecord, managed: ManagedAgent): AgentRunRecord {
+  #withTransportMetadata(record: AgentRunRecord, managed: ManagedAgent, includeSaveFailure = true): AgentRunRecord {
     const nestedAgents = this.#nestedAgents(
       managed,
       terminalStatuses.has(record.status) && !managed.settled,
@@ -3151,7 +3185,7 @@ export class AgentManager {
     return {
       ...safeRecord,
       ...managed.runRoute,
-      ...(managed.settlementSaveFailure
+      ...(includeSaveFailure && managed.settlementSaveFailure
         ? { warnings: [...(record.warnings ?? []), managed.settlementSaveFailure.warning] }
         : {}),
       cwd: managed.cwd,

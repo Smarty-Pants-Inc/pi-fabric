@@ -25,7 +25,7 @@ import {
   writeHostLease,
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
-import { PARTICIPANT_NAME_PATTERN } from "./participant-name.js";
+import { rootParticipantName } from "./participant-name.js";
 import {
   participantFilePresent,
   participantFilesOnly,
@@ -169,7 +169,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "repository", "model", "thinking", "parentId"]) ||
+    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -950,7 +950,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   root(main: FabricMainAgentInfo, interactive = true, sessionName?: string): FabricParticipantRecord {
-    const name = sessionName?.trim();
     const role = participantRole();
     const project = main.cwd ? participantProject(main.cwd) : undefined;
     const repository = project ? repositoryOf(project) : undefined;
@@ -961,13 +960,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: main.id,
       ownerHostId: this.options.hostId,
       ownerIdentityId: this.options.identity.id,
-      name: name && PARTICIPANT_NAME_PATTERN.test(name) ? name : "main",
+      name: rootParticipantName(sessionName),
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",
       capabilities: interactive ? ["steer", "followUp", "fabric"] : ["fabric"],
       interactive,
-      ...(main.cwd ? { cwd: main.cwd } : {}),
+      ...(main.cwd ? { cwd: main.cwd, projectRoot: process.env.PI_FABRIC_PROJECT_ROOT ?? main.cwd } : {}),
       ...(project ? { project } : {}),
       ...(repository ? { repository } : {}),
       ...(role ? { role } : {}),

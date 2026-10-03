@@ -406,7 +406,7 @@ describe("Fabric configuration", () => {
       orphanedTempRunMs: 6 * 60 * 60 * 1_000,
       oneShotRunMs: 24 * 60 * 60 * 1_000,
       actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
-      terminalRunEventsAgeMs: 24 * 60 * 60 * 1_000,
+      terminalRunEventsAgeMs: 6 * 60 * 60 * 1_000,
       terminalRunEventsMaxBytes: 256 * 1024,
     });
     expect(

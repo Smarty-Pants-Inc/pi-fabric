@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -369,7 +370,7 @@ describe("round 4 completion fences", () => {
       expect(host.agents.status(long.id).status).toBe("running");
       await b.client.close(); h.setLive([h.participant("C", 400)]);
       const c = h.client("C", 400); c.client.start();
-      await new Promise(resolve => setTimeout(resolve, 80)); c.turn();
+      await waitFor(() => h.mesh.listAll("residency/completion-claims/").length === 0); c.turn();
       expect(c.client.listAgents()).toHaveLength(0);
       expect(c.completed).not.toHaveBeenCalled(); expect(c.sendMessage).not.toHaveBeenCalled();
       expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
@@ -637,6 +638,113 @@ describe("round 3 completion fences", () => {
   });
 });
 
+describe("Astra round 3 legacy retirement ordering", () => {
+  const claimKey = (id: string) => `residency/completion-claims/${createHash("sha256").update(id).digest("hex")}`;
+  const bodyPath = (h: ReturnType<typeof harness>, id: string) => path.join(h.meshRoot, "agent-completions", `${claimKey(id).split("/").at(-1)}.json`);
+  const address = (h: ReturnType<typeof harness>, session: string, startedAt: number) => ({ ...h.recipient, rootId: `session:${session}`, sessionId: session, startedAt });
+  const legacyClaim = async (h: ReturnType<typeof harness>, id: string) => {
+    await h.mesh.put({ key: claimKey(id), ifVersion: 0,
+      identity: { id: h.recipient.rootId, name: "main", kind: "main" },
+      value: { rootId: h.recipient.rootId, sessionId: h.recipient.sessionId } });
+    const claim = h.mesh.get(claimKey(id), { fresh: true })!;
+    expect(claim.value).not.toHaveProperty("recipient");
+    return claim;
+  };
+
+  it.each(["B", "C"])("pre-commit lock timeout retains legacy evidence; next drain as %s reclaims capacity", async successor => {
+    const h = harness(true); const enqueue = vi.fn();
+    const b = new CompletionJournal(h.meshRoot, address(h, "B", 200), h.participants, h.mesh, enqueue);
+    const retry = new CompletionJournal(h.meshRoot, address(h, successor, successor === "B" ? 200 : 300), h.participants, h.mesh, enqueue);
+    for (let index = 1; index <= 12; index++) {
+      const result = { ...h.result, id: index.toString(16).padStart(32, "0") };
+      saveCompletion(h.meshRoot, h.recipient, result);
+      const claim = await legacyClaim(h, result.id);
+      consumeCompletion(h.meshRoot, result.id, "B");
+      h.setLive([h.participant("B", 200)]);
+      const fault = vi.spyOn(h.mesh, "delete").mockRejectedValue(new Error("MeshStore lock timeout before commit"));
+      await b.drain();
+      expect(fault).toHaveBeenCalledExactlyOnceWith({ key: claim.key, ifVersion: claim.version });
+      expect(h.mesh.get(claim.key, { fresh: true })).toEqual(claim);
+      expect(fs.existsSync(bodyPath(h, result.id))).toBe(true);
+      expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
+      fault.mockRestore();
+      h.setLive([h.participant(successor, successor === "B" ? 200 : 300)]);
+      await retry.drain();
+      expect(h.mesh.get(claim.key, { fresh: true })).toBeUndefined();
+      expect(fs.existsSync(bodyPath(h, result.id))).toBe(false);
+      expect(enqueue).not.toHaveBeenCalled();
+      // New admission must succeed, not merely leave a consumed result fenced.
+      const next = { ...h.result, id: (100 + index).toString(16).padStart(32, "0") };
+      retry.save(next); await retry.drain(false);
+      expect(h.mesh.get(claimKey(next.id), { fresh: true })?.value).toMatchObject({ sessionId: successor });
+      consumeCompletion(h.meshRoot, next.id, successor); await retry.drain(false);
+      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
+      expect(fs.statSync(path.join(h.meshRoot, "state.json")).size).toBeLessThan(4096);
+    }
+  });
+
+  it("a crash after the legacy claim delete leaves a receipt-authorized envelope for the next Main to unlink", async () => {
+    const h = harness(true); saveCompletion(h.meshRoot, h.recipient, h.result);
+    const claim = await legacyClaim(h, h.result.id); consumeCompletion(h.meshRoot, h.result.id, "B");
+    h.setLive([h.participant("B", 200)]);
+    const body = bodyPath(h, h.result.id); const rm = fs.rmSync;
+    const crash = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target) === body) {
+        expect(h.mesh.get(claim.key, { fresh: true })).toBeUndefined();
+        throw new Error("stop after committed delete, before unlink");
+      }
+      rm(target, options);
+    });
+    const b = new CompletionJournal(h.meshRoot, address(h, "B", 200), h.participants, h.mesh, vi.fn());
+    await expect(b.drain()).rejects.toThrow("stop after committed delete, before unlink");
+    expect(h.mesh.get(claim.key, { fresh: true })).toBeUndefined(); expect(fs.existsSync(body)).toBe(true);
+    crash.mockRestore();
+    const receipt = path.join(path.dirname(body), "receipts", path.basename(body));
+    const open = vi.spyOn(fs.promises, "open"); const enqueue = vi.fn(); h.setLive([h.participant("C", 300)]);
+    await new CompletionJournal(h.meshRoot, address(h, "C", 300), h.participants, h.mesh, enqueue).drain();
+    expect(open.mock.calls.some(([file]) => String(file) === receipt)).toBe(true);
+    expect(fs.existsSync(body)).toBe(false); expect(fs.existsSync(receipt)).toBe(true); expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it.each(["acknowledge", "forget", "delivery"] as const)("%s: current owner process death before/after legacy CAS preserves recoverable evidence", async consumption => {
+    for (const stage of ["before delete", "after delete"] as const) {
+      const h = harness(true); saveCompletion(h.meshRoot, h.recipient, h.result);
+      const claim = await legacyClaim(h, h.result.id); const body = bodyPath(h, h.result.id);
+      // Exit the actual consuming process at the mesh-delete boundary. Its async
+      // retirement and same-session memory cannot help the successor recover.
+      const script = `
+        import fs from 'node:fs';
+        import {CompletionJournal, completionConsumed} from ${JSON.stringify(path.resolve("src/agents/completion-journal.ts"))};
+        import {MeshStore} from ${JSON.stringify(path.resolve("src/mesh/store.ts"))};
+        const mesh = new MeshStore(${JSON.stringify(h.meshRoot)}, 1024, 100, {maxStateBytes:4096, maxStateTombstones:2});
+        const remove = mesh.delete.bind(mesh);
+        mesh.delete = async input => {
+          if (input.key !== ${JSON.stringify(claim.key)} || input.ifVersion !== ${claim.version}) throw new Error('missing versioned CAS');
+          if (!fs.existsSync(${JSON.stringify(body)}) || !completionConsumed(${JSON.stringify(h.meshRoot)}, ${JSON.stringify(h.result.id)})) throw new Error('legacy evidence lost before delete');
+          if (${JSON.stringify(stage)} === 'after delete') await remove(input);
+          if (!fs.existsSync(${JSON.stringify(body)})) throw new Error('envelope unlinked before process stop');
+          console.log('stopped ${consumption}: ${stage}'); process.exit(0);
+        };
+        const journal = new CompletionJournal(${JSON.stringify(h.meshRoot)}, ${JSON.stringify(h.recipient)}, {list:()=>[]}, mesh, (_result, delivered)=>delivered());
+        if (${JSON.stringify(consumption)} === 'delivery') await journal.drain();
+        else journal[${JSON.stringify(consumption)}](${JSON.stringify(h.result.id)});
+        setTimeout(()=>{throw new Error('retirement checkpoint not reached')}, 3000);
+      `;
+      expect(execFileSync("bun", ["--eval", script], { encoding: "utf8", timeout: 15_000 })).toContain(`stopped ${consumption}: ${stage}`);
+      expect(fs.existsSync(body)).toBe(true); expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
+      expect(h.mesh.get(claim.key, { fresh: true })).toEqual(stage === "before delete" ? claim : undefined);
+      const enqueue = vi.fn(); h.setLive([h.participant("B", 200)]);
+      const b = new CompletionJournal(h.meshRoot, address(h, "B", 200), h.participants, h.mesh, enqueue);
+      await b.drain();
+      expect(h.mesh.get(claim.key, { fresh: true })).toBeUndefined(); expect(fs.existsSync(body)).toBe(false);
+      expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true); expect(enqueue).not.toHaveBeenCalled();
+      const next = { ...h.result, id: "b".repeat(32) }; b.save(next); await b.drain(false);
+      expect(h.mesh.get(claimKey(next.id), { fresh: true })?.value).toMatchObject({ sessionId: "B" });
+      consumeCompletion(h.meshRoot, next.id, "B"); await b.drain(false);
+    }
+  });
+});
+
 describe("round 2 completion security", () => {
   const legacyClaimKey = (id: string) => `residency/completion-claims/${createHash("sha256").update(id).digest("hex")}`;
   it.each(["cwd", "role"] as const)("F1: unrelated %s gets bounded list/status/wait, original live or dead", async lane => {
@@ -685,8 +793,9 @@ describe("round 2 completion security", () => {
     expect(b.client.statusAgent(h.result.id)).toMatchObject({ text: h.result.text });
     b.turn(); await waitFor(() => completionConsumed(h.meshRoot, h.result.id));
     expect(b.client.statusAgent(h.result.id)).toMatchObject({ text: h.result.text });
+    await waitFor(() => !fs.existsSync(path.join(h.meshRoot, "agent-completions", `${createHash("sha256").update(h.result.id).digest("hex")}.json`)));
     const c = h.client("C", 300); h.setLive([h.participant("C", 300)]);
-    expect(() => c.client.statusAgent(h.result.id)).toThrow(/Unknown durable Fabric agent/); // Consumed body was pruned.
+    expect(() => c.client.statusAgent(h.result.id)).toThrow(/Unknown durable Fabric agent/); // Async retirement has pruned the consumed body.
   });
 
   it("F1: legacy predecessor envelope survives a live lease and retires after expiry", async () => {

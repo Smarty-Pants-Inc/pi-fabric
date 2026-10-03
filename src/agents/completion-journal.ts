@@ -367,8 +367,6 @@ export class CompletionJournal {
     const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id);
     if (envelope && !this.#canRead(envelope)) return;
     consumeCompletion(this.meshRoot, id, this.recipient.sessionId);
-    fs.rmSync(envelopePath(this.meshRoot, id), { force: true });
-    fs.rmSync(candidatePath(this.meshRoot, id), { force: true });
     this.#enqueued.delete(id);
     this.#consumed.delete(id);
     void this.#retireClaim(id).catch(() => undefined); // A crash/failure is reconciled by drain.
@@ -395,7 +393,6 @@ export class CompletionJournal {
     if (envelope ? !this.#canRead(envelope) : !localRunSettled) return false;
     consumeCompletion(this.meshRoot, id, this.recipient.sessionId);
     if (envelope) this.#remember(envelope);
-    fs.rmSync(envelopePath(this.meshRoot, id), { force: true });
     this.#enqueued.delete(id);
     void this.#retireClaim(id).catch(() => undefined);
     return true;
@@ -408,7 +405,9 @@ export class CompletionJournal {
       if (!this.#canRetireClaim(claim)) continue;
       const receipt = readReceipt(path.join(directory(this.meshRoot), "receipts", `${claim.key.slice(claimPrefix.length)}.json`));
       if (typeof receipt?.id === "string" && claim.key === claimKey(receipt.id)) {
-        await this.#retireClaim(receipt.id, claim);
+        // A failed CAS/delete must leave its evidence for the next pass, not retry
+        // a replacement version through the envelope-pruning loop below.
+        if (!await this.#retireClaim(receipt.id, claim)) return;
         if (++retired === 128) break;
       }
     }
@@ -469,7 +468,6 @@ export class CompletionJournal {
           try {
             consumeCompletion(this.meshRoot, envelope.result.id, this.recipient.sessionId);
             this.#remember(envelope);
-            fs.rmSync(envelopePath(this.meshRoot, envelope.result.id), { force: true });
             void this.#retireClaim(envelope.result.id).catch(() => undefined);
           } finally { this.#enqueued.delete(envelope.result.id); }
         });
@@ -492,12 +490,12 @@ export class CompletionJournal {
     const successor = completionSuccessor(address, this.participants.list({ scope: "project", kinds: ["root"], fresh: true }));
     return successor?.id === recipient.rootId && successor.sessionId === recipient.sessionId && sameLane(recipient, successor);
   }
-  async #retireClaim(id: string, snapshot = this.mesh.get(claimKey(id), { fresh: true })): Promise<void> {
-    if (!snapshot || !this.#canRetireClaim(snapshot)) return;
+  async #retireClaim(id: string, snapshot = this.mesh.get(claimKey(id), { fresh: true })): Promise<boolean> {
+    if (snapshot && !this.#canRetireClaim(snapshot)) return false;
     // The versioned delete cannot erase a replacement owner/version.
     const file = receiptPath(this.meshRoot, id);
     const receipt = readReceipt(file, id);
-    if (!receipt) return;
+    if (!receipt) return false;
     // One fresh confirmation authorizes this consumed outcome's cleanup batch.
     // Do not retire its claim and then owe a second barrier before body unlink:
     // that barrier could fail after the claim was already lost.
@@ -508,8 +506,14 @@ export class CompletionJournal {
         ((address.rootId === recipient.rootId && address.sessionId === recipient.sessionId) || sameRecipientLane(address, recipient));
     });
     await confirmReceipt(file, receipt);
+    // The envelope is the last lane evidence for legacy claims. Keep it until the
+    // versioned deletion commits; a failed/interrupted delete is retried by drain.
+    if (snapshot) {
+      try { await this.mesh.delete({ key: snapshot.key, ifVersion: snapshot.version }); }
+      catch { return false; }
+    }
     for (const target of targets) fs.rmSync(target, { force: true });
-    try { await this.mesh.delete({ key: snapshot.key, ifVersion: snapshot.version }); } catch { /* next drain reconciles */ }
+    return true;
   }
   #canRead(envelope: CompletionEnvelope): boolean {
     // Unknown legacy fences block body access and acknowledgment as well as idle delivery.

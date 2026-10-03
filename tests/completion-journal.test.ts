@@ -122,7 +122,8 @@ describe("completion journal idle scans", () => {
       if (String(target) === h.file(result.id)) throw new Error("crash before unlink");
       rm(target, options);
     });
-    expect(() => journal.acknowledge(result.id)).toThrow("crash before unlink");
+    expect(journal.acknowledge(result.id)).toBe(true); // Consumption fences synchronously; cleanup is async.
+    await vi.waitFor(() => expect(unlink.mock.calls.some(([target]) => String(target) === h.file(result.id))).toBe(true));
     expect(completionConsumed(h.meshRoot, result.id)).toBe(true); expect(fs.existsSync(h.file(result.id))).toBe(true);
     unlink.mockRestore();
     const enqueue = vi.fn(); await h.journal(enqueue).drain();

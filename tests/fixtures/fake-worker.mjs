@@ -44,7 +44,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
   writeStatus(JSON.stringify({
     id: args.get("id"), name: args.get("name"), task, status: "running", runner: args.get("runner") ?? "pi",
-    transport: args.get("transport"), cwd: args.get("cwd"), startedAt: Date.now(), updatedAt: Date.now(),
+    transport: args.get("transport"), sessionId: args.get("transport") === "process" ? String(process.pid) : undefined, cwd: args.get("cwd"), startedAt: Date.now(), updatedAt: Date.now(),
     turns: 3, toolCalls: 1, text: "", exitCode: null, usage: { input: 30, output: 10, cacheRead: task.includes("HANG_WITH_PROGRESS_CACHE") ? 5 : 0, cacheWrite: task.includes("HANG_WITH_PROGRESS_CACHE") ? 7 : 0, cost: 0.001 },
   }));
   const stay = () => setTimeout(stay, 1_000);
@@ -62,7 +62,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
       task,
       status: "running",
       runner: args.get("runner") ?? "pi",
-      transport: args.get("transport"),
+      transport: args.get("transport"), sessionId: args.get("transport") === "process" ? String(process.pid) : undefined,
       cwd: args.get("cwd"),
       startedAt: Date.now(),
       updatedAt: Date.now(),
@@ -94,7 +94,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     task,
     status: "running",
     runner: args.get("runner") ?? "pi",
-    transport: args.get("transport"),
+    transport: args.get("transport"), sessionId: args.get("transport") === "process" ? String(process.pid) : undefined,
     cwd: args.get("cwd"),
     startedAt: Date.now(),
     updatedAt: Date.now(),
@@ -160,7 +160,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     task,
     status: "running",
     runner: args.get("runner") ?? "pi",
-    transport: args.get("transport"),
+    transport: args.get("transport"), sessionId: args.get("transport") === "process" ? String(process.pid) : undefined,
     cwd: args.get("cwd"),
     startedAt,
     updatedAt: startedAt,
@@ -207,7 +207,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     task,
     status: "running",
     runner: args.get("runner") ?? "pi",
-    transport: args.get("transport"),
+    transport: args.get("transport"), sessionId: args.get("transport") === "process" ? String(process.pid) : undefined,
     cwd: args.get("cwd"),
     startedAt,
     updatedAt: startedAt,
@@ -274,7 +274,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     task,
     status: fail ? "failed" : "completed",
     runner: args.get("runner") ?? "pi",
-    transport: args.get("transport"),
+    transport: args.get("transport"), sessionId: args.get("transport") === "process" ? String(process.pid) : undefined,
     fullCodeMode: args.get("full-code-mode"),
     mainAgentId: args.get("main-agent-id"),
     tools: JSON.parse(args.get("tools") ?? "[]"),

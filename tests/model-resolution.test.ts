@@ -108,8 +108,8 @@ describe("resolveAvailablePiModel", () => {
   it("resolves a mistaken generation to the closest visible same-provider model", () => {
     const state = { aliases: {}, available: codexModels };
     expect(resolveAvailablePiModel("openai-codex/gpt-5.6-sol", state)).toBe(codexModels[1]);
-    expect(resolveAvailablePiModel("openai-codex/gpt-6-sol", state)).toBe(codexModels[1]);
-    expect(resolveAvailablePiModel(" OPENAI-CODEX/GPT-6-SOL ", state)).toBe(codexModels[1]);
+    expect(resolveAvailablePiModel("openai-codex/gpt-6-sol", state)).toEqual({ ...codexModels[1], via: "closest" });
+    expect(resolveAvailablePiModel(" OPENAI-CODEX/GPT-6-SOL ", state)).toEqual({ ...codexModels[1], via: "closest" });
     expect(resolveAvailablePiModel("Sol", state)).toBe(codexModels[1]);
     expect(resolveAvailablePiModel("openai-codex/gpt-6-astra", state)).toBe(codexModels[0]);
   });
@@ -124,7 +124,7 @@ describe("resolveAvailablePiModel", () => {
     expect(resolveAvailablePiModel("openai-codex/gpt-6-sol", state)).toBe(exact);
     expect(resolveAvailablePiModel("openai-codex/gpt-6-sol", {
       ...state, available: state.available.filter(model => model !== exact),
-    })).toBe(codexModels[1]);
+    })).toEqual({ ...codexModels[1], via: "closest" });
   });
 
   it("uses recency then canonical key order to break same-provider similarity ties", () => {
@@ -132,10 +132,10 @@ describe("resolveAvailablePiModel", () => {
       { provider: "test", id: "alpha-one" },
       { provider: "test", id: "alpha-two" },
     ];
-    expect(resolveAvailablePiModel("test/alpha", { aliases: {}, available })).toBe(available[1]);
+    expect(resolveAvailablePiModel("test/alpha", { aliases: {}, available })).toEqual({ ...available[1], via: "latest" });
     expect(resolveAvailablePiModel("test/alpha", {
       aliases: {}, available, lastUsed: { "test/alpha-one": 100 },
-    })).toBe(available[0]);
+    })).toEqual({ ...available[0], via: "recent" });
   });
 
   it.each([
@@ -165,7 +165,7 @@ describe("resolveAvailablePiModel", () => {
     expect(resolveAvailablePiModel("sol", { aliases, available: [model] })).toBe(model);
     expect(resolveAvailablePiModel("fireworks/accounts/team/models/slo", {
       aliases: {}, available: [model],
-    })).toBe(model);
+    })).toEqual({ ...model, via: "closest" });
     expect(() => resolveAvailablePiModel("fireworks/accounts/team/models/sol", {
       aliases: {}, available: [{ provider: "other", id: "fireworks/accounts/team/models/sol" }],
     })).toThrow(/not available to this Pi session/);
@@ -185,6 +185,49 @@ describe("resolveAvailablePiModel", () => {
       aliases,
       available: AVAILABLE,
     })).toMatchObject({ provider: "google", id: "gemini-2.5-flash" });
+  });
+
+  describe("closest-match refusal for agents.spawn/create (smarty-dev#3326)", () => {
+    const sols = [
+      { provider: "cliproxyapi", id: "gpt-6-sol", name: "Sol 6.0" },
+      { provider: "cliproxyapi", id: "gpt-6.1-sol", name: "Sol 6.1" },
+      { provider: "anthropic", id: "claude-opus-4-5" },
+    ];
+
+    it("refuses an inexact name that needs closest-match, naming every candidate", () => {
+      const strict = { aliases: {}, available: sols, closest: false };
+      expect(() => resolveAvailablePiModel("sol", strict)).toThrow(
+        /"sol" is not an exact model id or configured alias.*Candidates: (?=.*cliproxyapi\/gpt-6-sol\b)(?=.*cliproxyapi\/gpt-6\.1-sol\b)/,
+      );
+      expect(() => resolveAvailablePiModel("cliproxyapi/gpt-6.2-sol", strict)).toThrow(
+        /closest-match resolution is refused.*cliproxyapi\/gpt-6\.1-sol/,
+      );
+    });
+
+    it("still resolves an exact id and an exact alias", () => {
+      const strict = {
+        aliases: normalizeModelAliases({ Sol: "cliproxyapi/gpt-6.1-sol" }),
+        available: sols,
+        closest: false,
+      };
+      expect(resolveAvailablePiModel("cliproxyapi/gpt-6-sol", strict)).toBe(sols[0]);
+      expect(resolveAvailablePiModel("gpt-6.1-sol", strict)).toBe(sols[1]);
+      expect(resolveAvailablePiModel("sol", strict)).toBe(sols[1]);
+    });
+
+    it.each(["closest", "recent", "latest"])("keeps exact marker-name alias %s authoritative", (name) => {
+      const state = { aliases: normalizeModelAliases({ [name]: "cliproxyapi/gpt-6.1-sol" }), available: sols };
+      for (const closest of [false, true]) {
+        expect(resolveAvailablePiModel(`  ${name.toUpperCase()}  `, { ...state, exact: true, closest })).toBe(sols[1]);
+      }
+    });
+
+    it("reports via closest wherever closest-match remains allowed", () => {
+      const state = { aliases: {}, available: sols };
+      expect(resolveAvailablePiModel("sol", state)).toEqual({ ...sols[0], via: "closest" });
+      expect(resolveAvailablePiModel("cliproxyapi/gpt-6.2-sol", state)).toMatchObject({ via: "closest" });
+      expect(resolveAvailablePiModel("cliproxyapi/gpt-6-sol", state)).not.toHaveProperty("via");
+    });
   });
 
   it("rejects unrelated IDs and exhausted aliases with a session error", () => {

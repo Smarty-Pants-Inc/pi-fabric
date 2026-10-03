@@ -6,6 +6,7 @@ import {
   resolveAvailablePiModel,
   type FabricModelAliases,
   type FabricModelCandidate,
+  type FabricResolvedPiModel,
 } from "./model-resolution.js";
 import { loadModelUsage } from "./model-usage.js";
 
@@ -113,7 +114,9 @@ export const resolvePiModel = (options: {
   defaultModel?: string | undefined;
   snapshot?: readonly FabricModelCandidate[] | undefined;
   policy?: FabricModelPolicy;
-}): Promise<FabricModelCandidate> => {
+  /** `false` refuses closest-match picks (agents.spawn/create, smarty-dev#3326). */
+  closest?: boolean;
+}): Promise<FabricResolvedPiModel> => {
   const query = options.selector?.trim() || options.defaultModel?.trim() || "";
   assertFabricModelAllowed(query, options.policy);
   return resolveWithModelRefresh(options.registry, (exact) => {
@@ -130,6 +133,7 @@ export const resolvePiModel = (options: {
       available,
       lastUsed: loadModelUsage(),
       exact,
+      ...(options.closest === false ? { closest: false } : {}),
     });
     assertFabricModelAllowed(`${resolved.provider}/${resolved.id}`, options.policy);
     return resolved;

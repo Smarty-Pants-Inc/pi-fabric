@@ -62,8 +62,8 @@ export class ActorRegistryStore {
     }
   }
 
-  /** The callback must be synchronous: release precedes promise assimilation. */
-  async withLock<T>(operation: () => T): Promise<T> {
+  /** Retains registry custody while an adoption also acquires the mesh resume fence. */
+  async withLock<T>(operation: () => T | Promise<T>): Promise<T> {
     const lockPath = `${this.#registryPath}.lock`;
     const ownerPath = path.join(lockPath, "owner");
     const deadline = Date.now() + ACTOR_REGISTRY_LOCK_TIMEOUT_MS;
@@ -118,7 +118,7 @@ export class ActorRegistryStore {
       }
     }
     try {
-      return operation();
+      return await operation();
     } finally {
       try {
         const owner = fs.readFileSync(ownerPath, "utf8");

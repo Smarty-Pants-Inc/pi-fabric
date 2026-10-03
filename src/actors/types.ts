@@ -293,6 +293,10 @@ export interface FabricActorInfo {
    */
   activationFilterError?: string;
   residency?: FabricParticipantResidency;
+  /** Resolution marker in selection action results; does not replace the effective model. */
+  via?: string;
+  /** Canonical selection when via is present; may differ from the session's effective model. */
+  selectedModel?: string;
   /** Effective value for this caller after session bindings overlay project defaults. */
   model?: string;
   /** Effective value for this caller after session bindings overlay project defaults. */

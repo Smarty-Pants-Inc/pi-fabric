@@ -854,16 +854,15 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // smarty-dev#774: a kill by name pattern kills other owners' processes on a shared host. Every
   // session that loads Fabric (Mains, task agents, actors) runs this, and fabric_exec's pi.bash
   // emits the same tool_call.
-  let literalGuard: Promise<typeof import("./core/literal-bash-guard.js")> | undefined;
+  let shellGuards: Promise<[typeof import("./core/pattern-kill.js"), typeof import("./guards/foreground-wait.js")]> | undefined;
   pi.on("tool_call", async (event) => {
     if (event.toolName !== "bash") return undefined;
     const { command, timeout } = event.input as { command?: unknown; timeout?: unknown };
     if (typeof command !== "string") return undefined;
-    const { bashGuardRefusal } = await (literalGuard ??= import("./core/literal-bash-guard.js"));
-    const { foregroundWaitRefusal } = await import("./guards/foreground-wait.js");
-    // Guard-time host input, not a TMPDIR assignment or expansion in the command being guarded.
-    const guardReason = bashGuardRefusal(command, process.env.TMPDIR);
-    if (guardReason) return { block: true, reason: guardReason };
+    const [{ killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp }, { foregroundWaitRefusal }] =
+      await (shellGuards ??= Promise.all([import("./core/pattern-kill.js"), import("./guards/foreground-wait.js")]));
+    if (killsByPattern(command)) return { block: true, reason: PATTERN_KILL_REASON };
+    if (wipesTmp(command)) return { block: true, reason: TMP_WIPE_REASON };
     const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);
     if (reason) return { block: true, reason };
     // smarty-dev#2184: judged on the caller's own timeout above, so the injected default never unblocks a wait.
@@ -1076,7 +1075,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // Pi omits its entire skill catalog when the active tool set lacks a tool
     // named read. Restore Pi's discovered catalog (already bound to one skill
     // tree); full code mode adapts its loader to Fabric's nested pi.read path.
-    const systemPrompt = restoreSkillsForFullCodePrompt(event.systemPrompt, skills, effectiveFullCodeMode);
+    if (skills.length) {
+      event.systemPromptOptions.sections.skills = restoreSkillsForFullCodePrompt("", skills, effectiveFullCodeMode).trim();
+    }
     // Pi expands the invoked skill into the user message, but wrappers may
     // delegate by name. Resolve only explicit invocation lines so full code
     // mode preserves Pi's progressive skill loading without exposing read.
@@ -1117,18 +1118,19 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // persistent message, not appended to the system prompt. Keeping the
     // system prompt byte-identical across turns is what lets provider prefix
     // caches (e.g. DeepSeek) stay warm.
-    if (!skillReferenceGuidance) return {
-      systemPrompt: `${systemPrompt}\n\n${guidance}`,
-    };
+    // Native prompt options produce journaled section deltas. Returning systemPrompt
+    // instead creates an unjournaled forced projection after context_with_system;
+    // activation dispatch then (correctly) rejects its mismatch with the witness.
+    event.systemPromptOptions.sections.fabric_execution = guidance;
+    if (!skillReferenceGuidance) return;
     const message = {
       customType: SKILL_REFERENCE_CUSTOM_TYPE,
       content: skillReferenceGuidance,
       display: false,
       details: {},
     };
-    if (!fabricProvenanceSupported(pi)) return { message, systemPrompt: `${systemPrompt}\n\n${guidance}` };
+    if (!fabricProvenanceSupported(pi)) return { message };
     sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
-    return { systemPrompt: `${systemPrompt}\n\n${guidance}` };
   });
 
   // Ambient skill prose that names hidden captured tools is not user intent,

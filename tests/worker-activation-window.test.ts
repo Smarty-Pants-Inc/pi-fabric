@@ -5,7 +5,7 @@ import http from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { SessionManager, buildSessionContext, convertToLlm, sessionEntryToContextMessages, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ActivationWindow } from "../src/worker/activation-window.js";
@@ -329,7 +329,7 @@ describe("native activation window (offline; opted-in success needs exact native
     return `${JSON.stringify(result)}\n${log.slice(-12_000)}`;
   };
   const setup = async (toolRounds = 0, oversizedRound = 0, toolTask?: string,
-    api: "openai-completions" | "google-generative-ai" = "openai-completions") => {
+    api: "openai-completions" | "google-generative-ai" = "openai-completions", fabric = false) => {
     const dir = root();
     const requests: Array<Record<string, any>> = [];
     let requestCount = 0;
@@ -371,7 +371,7 @@ describe("native activation window (offline; opted-in success needs exact native
     // Fake local credentials only. No model or fleet credential is read.
     fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({ providers: {
       "window-test": { baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "offline-only", api, models: [{
-        id: "offline", name: "offline", reasoning: false, input: ["text"], contextWindow: 8000, maxTokens: 1024,
+        id: "offline", name: "offline", reasoning: false, input: ["text"], contextWindow: fabric ? 128000 : 8000, maxTokens: 1024,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       }] },
     } }));
@@ -387,7 +387,7 @@ describe("native activation window (offline; opted-in success needs exact native
     const fabricExtensionPath = path.join(dir, "noop.ts");
     fs.writeFileSync(fabricExtensionPath, "export default function () {}\n");
     const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: HANG_GUARD_MS }, {
-      fabricExtensionPath,
+      fabricExtensionPath: fabric ? path.resolve(process.env.FABRIC_ACTIVATION_TEST_EXTENSION ?? "dist/index.js") : fabricExtensionPath,
       workerPath: path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER ?? "src/worker.ts"),
       piBinary: nativeBinary!, runRoot: path.join(dir, "runs"),
     });
@@ -938,6 +938,46 @@ describe("native activation window (offline; opted-in success needs exact native
     expectJournalAppended(journalFile, compacted, true);
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
   }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary)("3704 journals and replays full Fabric guidance during real actor activations", async () => {
+    const s = await setup(0, 0, "NO_TOOL_ROUNDS", "openai-completions", true);
+    const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
+    const actors = new ActorManager("fabric-window-test", {id: "owner", name: "owner", kind: "main", sessionId: "fabric-window-test"}, mesh,
+      {...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20}, s.manager, () => {},
+      {actorRoot: path.join(s.dir, "actors"), persistent: true});
+    managers.push(actors);
+    const actor = await actors.create({name: "fabric-actor", instructions: "Act on each event.", inferenceContext: "activation",
+      model: "window-test/offline", kernel: "typescript", tools: ["read", "bash"], extensions: true, transport: "process", delivery: "mailbox"});
+    const journal = path.join(s.dir, "actors", actor.id, "session.jsonl");
+    const run = vi.spyOn(s.manager, "run");
+    for (const task of ["FIRST_FABRIC_ACTIVATION", "SECOND_FABRIC_ACTIVATION"]) {
+      // Retain the failed run too, so release qualification records the exact refusal.
+      await actors.ask(actor.id, task).catch(() => undefined);
+      const result = await run.mock.results.at(-1)!.value;
+      const evidence = process.env.FABRIC_ACTIVATION_TEST_EVIDENCE_DIR;
+      if (evidence) {
+        fs.mkdirSync(evidence, { recursive: true });
+        fs.writeFileSync(path.join(evidence, task + "-result.json"), JSON.stringify(result, null, 2));
+        fs.copyFileSync(result.logFile!, path.join(evidence, task + "-events.jsonl"));
+        if (fs.existsSync(journal)) fs.copyFileSync(journal, path.join(evidence, task + "-session.jsonl"));
+        fs.writeFileSync(path.join(evidence, "requests.json"), JSON.stringify(s.requests, null, 2));
+      }
+      expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+      const records = buildSessionContext(SessionManager.open(journal).getBranch()).messages;
+      const system = getCurrentSystemMessage(records as never)!;
+      expect(system.content).toBe("");
+      expect(system.sections).toBeDefined();
+      expect(system.toolsAdded?.some(tool => tool.name === "fabric_exec")).toBe(true);
+      const wire = JSON.stringify(s.requests.at(-1));
+      expect(wire).toContain("Configured fabric_exec kernel");
+      expect(JSON.stringify(system)).toContain("Configured fabric_exec kernel");
+      // Witness every rendered section, not merely the presence of our guidance.
+      const wireSystem = s.requests.at(-1)!.messages.find((message: {role: string}) =>
+        message.role === "system" || message.role === "developer");
+      expect(wireSystem.content).toBe(getCurrentSystemPrompt(records as never));
+    }
+    expect(s.requests).toHaveLength(2);
+  }, 2 * HANG_GUARD_MS + 30_000);
 
   it.skipIf(!selectedNativeBinary)("two real activations retain full journals and current tool pairs, without Fabric tool enablement", async () => {
     const s = await setup();

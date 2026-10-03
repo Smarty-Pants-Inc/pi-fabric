@@ -39,6 +39,21 @@ const setup = () => {
   return { root, config, configPath, outbox: path.join(config.residencyRoot, "delivery-outbox"), mesh: new MeshStore(config.meshRoot, 65536, 1000) };
 };
 
+// Public durable spawns come from a live session Main, not the resident executor.
+const mainParticipants = (f: ReturnType<typeof setup>) => {
+  const identity = { id: f.config.rootId, name: "live Main", kind: "main" as const, sessionId: f.config.sessionId };
+  const participants = new ParticipantDirectory(f.mesh, {
+    enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false,
+  });
+  participants.registerSource(() => [{
+    format: 1, id: identity.id, rootId: identity.id, kind: "root", name: identity.name, status: "idle",
+    ownerHostId: identity.id, ownerIdentityId: identity.id, sessionId: identity.sessionId,
+    runner: "pi", transport: "host", capabilities: ["fabric"], controlProtocol: "v1",
+    startedAt: Date.now(), updatedAt: Date.now(),
+  }]);
+  return participants;
+};
+
 describe("resident producer durable outbox", () => {
   it("waits for a committed envelope instead of selecting its parseable atomic staging file", () => {
     const f = setup();
@@ -60,8 +75,7 @@ describe("resident producer durable outbox", () => {
     const launches = launchLog(f.root);
     for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
     const completions = vi.fn();
-    const participants = new ParticipantDirectory(f.mesh, { enabled: true, hostId: f.config.rootId, rootId: f.config.rootId,
-      identity: { id: f.config.rootId, name: "live Main", kind: "main" }, reapDeadHosts: false });
+    const participants = mainParticipants(f);
     const client = new ResidencyClient({
       config: f.config, mesh: f.mesh, participants,
       mainAgent: { local: true } as FabricMainAgentTarget,
@@ -143,23 +157,20 @@ describe("resident producer durable outbox", () => {
 
   it("retains a completed durable task beyond idle exit and delivers once after host restart", { timeout: 100_000 }, async () => {
     const f = setup();
+    const participants = mainParticipants(f);
+    const client = new ResidencyClient({
+      config: f.config, mesh: f.mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget,
+    });
     const controller = new AbortController();
     let running = runResidentHostFromConfigPath(f.configPath, controller.signal);
     let restarted: Promise<void> | undefined;
     const second = new AbortController();
     const lock = path.join(f.config.meshRoot, ".lock");
     try {
+      await participants.start();
       await wait(() => fs.existsSync(path.join(f.config.residencyRoot, "owner.json")));
-      const requestId = "completion";
-      fs.writeFileSync(path.join(f.config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({
-        format: RESIDENT_HOST_FORMAT, rootId: f.config.rootId, requestId, createdAt: Date.now(), operation: "spawn",
-        request: { task: "LIVE_WITH_PROGRESS", transport: "process", residency: "durable" },
-      }));
-      const response = path.join(f.config.residencyRoot, "responses", `${requestId}.json`);
-      await wait(() => fs.existsSync(response));
-      const spawned = JSON.parse(fs.readFileSync(response, "utf8"));
-      expect(spawned.ok, JSON.stringify(spawned)).toBe(true);
-      const id = spawned.handle.id;
+      const handle = await client.spawnAgent({ task: "LIVE_WITH_PROGRESS", transport: "process", residency: "durable" });
+      const id = handle.id;
       // Hold the actual default mesh lock, not a shortened or mocked acquisition.
       await f.mesh.exclusive(() => undefined);
       fs.mkdirSync(lock);
@@ -177,6 +188,9 @@ describe("resident producer durable outbox", () => {
       expect(fs.existsSync(path.join(f.outbox, entry))).toBe(true);
       expect(f.mesh.listAll(residentDeliveryPrefix(f.config.rootId), { fresh: true })).toHaveLength(0);
       fs.rmSync(lock, { recursive: true });
+      // Recovery replays the accepted completion, not a new spawn: no live Main is needed.
+      await client.close();
+      await participants.close();
       restarted = runResidentHostFromConfigPath(f.configPath, second.signal);
       await wait(() => f.mesh.listAll(residentDeliveryPrefix(f.config.rootId), { fresh: true }).length === 1);
       await wait(() => fs.readdirSync(f.outbox).length === 0);
@@ -186,8 +200,10 @@ describe("resident producer durable outbox", () => {
       expect(f.mesh.listAll(residentDeliveryPrefix(f.config.rootId), { fresh: true })).toHaveLength(1);
     } finally {
       fs.rmSync(lock, { recursive: true, force: true });
+      await client.close();
       controller.abort(); second.abort();
       await running; await restarted;
+      await participants.close();
       fs.rmSync(f.root, { recursive: true, force: true });
     }
   });

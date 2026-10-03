@@ -110,6 +110,12 @@ On the hub, run one bridge per remote host as the fleet user, under the service 
     mesh-bridge run --mesh ~/proj/.pi/fabric/mesh --name dev1 --remote forge \
       --cursor ~/.local/state/mesh-bridge/forge.json --ssh forge --ssh-key ~/.ssh/mesh-bridge
 
+Both modes accept `--max-state-bytes BYTES` for meshes larger than the default 32 MiB
+shared-state read ceiling. Set it explicitly on each side that needs the larger capacity;
+it must be a safe integer of at least 524,288 bytes. This changes only the state read ceiling,
+not event/frame limits or the default. For example, `--max-state-bytes 67108864` admits a
+50 MiB `state.json` while retaining a 64 MiB barrier.
+
 `--ssh-port` and `--ssh-known-hosts FILE` (which also sets `StrictHostKeyChecking=yes`) reach a
 host without a global `~/.ssh/config` entry.
 

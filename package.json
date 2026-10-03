@@ -44,6 +44,8 @@
   "files": [
     "bin/",
     "dist/",
+    "config/landlock-roles.json",
+    "native/fabric-landlock.c",
     "skillsets/",
     "docs/",
     "README.md",

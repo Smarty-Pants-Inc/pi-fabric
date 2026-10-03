@@ -23,6 +23,42 @@ import path from "node:path";
 
 export const FABRIC_AGENT_MARKER = "fabricagent-";
 
+/**
+ * Stable turn id shared by an actor journal entry and its usage re-export
+ * (smarty-dev#3327). Pi stamps every assistant message with a millisecond
+ * `timestamp` that its session journal preserves verbatim, so
+ * `<journal path>#<message.timestamp>` names one model turn in both sources.
+ */
+export const journalTurnId = (journal: string, message: unknown): string | undefined => {
+  const timestamp = (message as { timestamp?: unknown } | null | undefined)?.timestamp;
+  return typeof timestamp === "number" && Number.isFinite(timestamp) ? `${journal}#${timestamp}` : undefined;
+};
+
+/**
+ * Usage sum over journal and export JSONL lines that counts each turn once:
+ * an export entry's `reexportOf` and a journal entry's derived turn id
+ * collide, so summing both sources equals summing the journal alone.
+ */
+export const dedupedUsageTokens = (sources: readonly { file: string; lines: readonly unknown[] }[]): number => {
+  const seen = new Set<string>();
+  let total = 0;
+  for (const { file, lines } of sources) {
+    for (const line of lines) {
+      const entry = line as { type?: unknown; reexportOf?: unknown; message?: { role?: unknown; usage?: Record<string, unknown> } };
+      if (entry?.type !== "message" || entry.message?.role !== "assistant" || !entry.message.usage) continue;
+      const turn = typeof entry.reexportOf === "string" ? entry.reexportOf : journalTurnId(file, entry.message);
+      if (turn) {
+        if (seen.has(turn)) continue;
+        seen.add(turn);
+      }
+      const usage = entry.message.usage;
+      total += ["input", "output", "cacheRead", "cacheWrite"]
+        .reduce((sum, key) => sum + (typeof usage[key] === "number" ? usage[key] : 0), 0);
+    }
+  }
+  return total;
+};
+
 export interface SessionExportUsage {
   input: number;
   output: number;
@@ -55,9 +91,10 @@ export class SessionExporter {
    * so heartbeat-style emissions never write entries; the file and its header
    * are created lazily on the first real push so runs that never touch a model
    * leave nothing behind. Best-effort: any IO failure disables the exporter
-   * rather than failing the run.
+   * rather than failing the run. `reexportOf` marks a turn the actor journal
+   * already records (see journalTurnId) so usage readers can skip the copy.
    */
-  push(usage: SessionExportUsage, model?: string, provider?: string, at: number = Date.now()): void {
+  push(usage: SessionExportUsage, model?: string, provider?: string, at: number = Date.now(), reexportOf?: string): void {
     if (this.#disabled) return;
     const tokens = {
       input: nonNegative(usage.input),
@@ -76,6 +113,7 @@ export class SessionExporter {
         id,
         parentId: this.#lastEntryId,
         timestamp: new Date(at).toISOString(),
+        ...(reexportOf ? { reexportOf } : {}),
         message: {
           role: "assistant",
           model: model?.trim() ? model : "unknown",

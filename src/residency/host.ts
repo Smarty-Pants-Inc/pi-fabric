@@ -39,6 +39,7 @@ import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mes
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
+import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
@@ -215,6 +216,7 @@ export class ResidentHost {
   readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery");
   #flushingDeliveries: Promise<unknown> | undefined;
   readonly #token = randomUUID();
+  readonly #meshWrites = new AbortController();
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
@@ -224,6 +226,7 @@ export class ResidentHost {
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
   #ready = false;
+  #readinessPublished = false;
   #idleSince = Date.now();
   #admissions = 0;
   readonly #requestRetention: ResidentRequestRetention;
@@ -264,7 +267,7 @@ export class ResidentHost {
   #initialize(): void {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
+      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol, writeSignal: this.#meshWrites.signal });
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       hostId: this.hostId,
@@ -277,7 +280,7 @@ export class ResidentHost {
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
       bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
-      canConsumeMesh: () => this.participants.canConsumeMesh(),
+      canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
@@ -428,8 +431,9 @@ export class ResidentHost {
         ));
       },
       {
-        releasePaused: this.#staged,
-        canConsumeMesh: () => this.participants.canConsumeMesh(),
+        // Restoration must not launch queued work until owner publication commits.
+        releasePaused: true,
+        canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
         persistent: true,
         canManageActor,
         lineageAlive,
@@ -453,7 +457,7 @@ export class ResidentHost {
         enabled: true,
         pollMs: config.mesh.actorPollMs,
         maxReadEvents: config.mesh.maxReadEvents,
-        canConsumeMesh: () => this.participants.canConsumeMesh(),
+        canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
       },
       (subscription, event) => this.#deliverLifecycle(subscription, event),
     );
@@ -504,7 +508,18 @@ export class ResidentHost {
       this.control.start((command, from, signal, verification) =>
         this.#acceptControl(command, from, signal, verification));
       if (this.#staged) this.control.pause();
+      // Supervision identity, NOT business readiness. A live startup waiting
+      // for publication can renew its file lease without admitting mesh work.
+      atomicWrite(path.join(this.config.residencyRoot, "starting.json"), { format: RESIDENT_HOST_FORMAT,
+        hostId: this.hostId, pid: process.pid, processStartTime: processStartTime(process.pid), token: this.#token,
+        readyAt: Date.now() });
       await this.participants.start().catch(() => undefined);
+      // A publication failure is not readiness. Keep this same start pending,
+      // with requests/events untouched, until a real locked renewal confirms it.
+      while (!this.participants.canConsumeMesh()) {
+        if (this.#closed) throw new Error(HOST_CLOSING_RETRY);
+        await delay(20);
+      }
       this.lifecycle.start();
       if (this.#staged) {
         this.lifecycle.pause();
@@ -527,6 +542,7 @@ export class ResidentHost {
         token: this.#token,
         startedAt: now,
         readyAt: now,
+        maintenanceReady: 1, // client waits for the first normal post-lease tick receipt
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
         callerBoundSpawn: 1,
@@ -537,17 +553,20 @@ export class ResidentHost {
           ...(this.launch.attempt ? { attempt: this.launch.attempt } : {}) } : {}),
       };
       atomicWrite(this.#ownerPath, owner);
+      fs.rmSync(path.join(this.config.residencyRoot, "starting.json"), { force: true });
       fs.rmSync(this.#errorPath, { force: true });
+      // No fallible/awaited startup work remains. Open every delivery gate only
+      // after owner publication; a failed start leaves accepted work untouched.
+      this.#ready = true;
       // Removals a previous host accepted: their runs ended with it.
       if (!this.#staged) {
+      this.actors.resumeAfterRelease();
       void this.#backgroundDeliveries.enqueue(async () => {
         await this.actors.finishPendingRemovals();
         this.#writeRemovals();
       });
       void this.#retryDeliveries();
       }
-      await this.#pollRequests();
-      this.#ready = true;
     } catch (error) {
       await this.close();
       throw error;
@@ -557,6 +576,11 @@ export class ResidentHost {
   async close(): Promise<void> {
     if (this.#closed || !this.#started) return;
     this.#closed = true;
+    // Cooperative shutdown retires this host's publication waiters, not the
+    // lock holder. Durable actor queues/outbox already own accepted work.
+    // Otherwise sequential mesh timeouts exceed the native exit deadline and
+    // turn an ordinary idle exit into unproven watchdog recovery debt.
+    this.#meshWrites.abort(new MeshConsumptionPausedError());
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
     this.#requestRetention.close();
@@ -592,6 +616,7 @@ export class ResidentHost {
     if (this.#closed || this.#staged || this.#handover) {
       return { accepted: false, error: HOST_CLOSING_RETRY };
     }
+    assertMeshConsumption(() => this.participants.canConsumeMesh());
     this.#admissions++;
     try { return await this.#handleControl(command, from, signal, verification); }
     finally { this.#admissions--; }
@@ -666,9 +691,11 @@ export class ResidentHost {
       // Validate now without turning the resolved owner defaults into per-call overrides.
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
+      assertMeshConsumption(() => this.participants.canConsumeMesh());
       const result = this.actors.tell(command.targetId, message, command.data, { provenance, ...options });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
+      if (error instanceof MeshConsumptionPausedError) throw error;
       return { accepted: false, error: errorMessage(error) };
     }
   }
@@ -678,6 +705,7 @@ export class ResidentHost {
     event: FabricLifecycleEvent,
   ): Promise<void> {
     if (this.#closed || this.#staged || this.#handover) throw new Error(HOST_CLOSING_RETRY);
+    assertMeshConsumption(() => this.participants.canConsumeMesh());
     this.#admissions++;
     try { await this.#handleLifecycle(subscription, event); }
     finally { this.#admissions--; }
@@ -803,6 +831,7 @@ export class ResidentHost {
 
   async #pollRequests(): Promise<void> {
     if (this.#pollingRequests || this.#closed) return;
+    if (this.#ready && !this.#readinessPublished) this.#maintainRequests();
     if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
@@ -850,6 +879,13 @@ export class ResidentHost {
       if (removal.runId) live.add(removal.runId);
     }
     this.#requestRetention.sweep(now, live, 5, stoppedWritersGone);
+    if (!this.#readinessPublished) {
+      const owner = readJson<ResidentHostOwner>(this.#ownerPath);
+      if (owner?.token === this.#token) {
+        atomicWrite(path.join(this.config.residencyRoot, "maintenance-ready.json"), { token: this.#token, readyAt: now });
+        this.#readinessPublished = true;
+      }
+    }
   }
 
   #checkIdle(): void {
@@ -1359,8 +1395,16 @@ export class ResidentHost {
   #releaseLock(): void {
     if (this.#lockFd === undefined) return;
     // Remove our publication while still holding the fence; never unlink the Linux inode.
+    const startingPath = path.join(this.config.residencyRoot, "starting.json");
+    if (readJson<{ token?: string }>(startingPath)?.token === this.#token) fs.rmSync(startingPath, { force: true });
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (owner?.token === this.#token) fs.rmSync(this.#ownerPath, { force: true });
+    if (owner?.token === this.#token) {
+      // Final host-write receipt precedes owner withdrawal. It grants only a
+      // bounded native Pi-exit grace, never successor/whole-attempt exit proof.
+      atomicWrite(path.join(this.config.residencyRoot, "closed.json"), { format: 1, pid: owner.pid,
+        processStartTime: owner.processStartTime, token: owner.token, closedAt: Date.now() });
+      fs.rmSync(this.#ownerPath, { force: true });
+    }
     if (this.#fallbackLock && readJson<{ token?: string }>(this.#lockPath)?.token === this.#token) {
       fs.rmSync(this.#lockPath, { force: true });
     }

@@ -89,6 +89,41 @@ describe("resident watchdog fail-closed admission (F1)", () => {
   });
 });
 
+describe("Astra resident lease delivery fence", () => {
+  it("F2 binding resolution loses its lease without tell/sequence delivery, then resumes its owned claim once", async () => {
+    const { root, config, host } = fixture();
+    let sender: FabricControlPlane | undefined;
+    let release!: () => void, entered!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    let healthy = true;
+    let result: Promise<unknown> | undefined;
+    try {
+      await host.start();
+      vi.spyOn(host.participants, "canConsumeMesh").mockImplementation(() => healthy);
+      vi.spyOn(host.actors, "owns").mockReturnValue(true);
+      vi.spyOn(host.actors, "status").mockReturnValue({ rootId: config.rootId } as ReturnType<typeof host.actors.status>);
+      vi.spyOn(host.actors, "resolveActivationBinding").mockImplementation(async () => { entered(); await waiting; return {}; });
+      const tell = vi.spyOn(host.actors, "tell").mockReturnValue({ messageId: "lease-delivery-once" } as ReturnType<typeof host.actors.tell>);
+      const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+      sender = new FabricControlPlane(new MeshStore(config.meshRoot, 65536, 1000), identity, { enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 5000 });
+      sender.start(() => ({ accepted: false }));
+      result = sender.request(host.hostId, "actor", "followUp", { message: "accepted work" }).catch(error => error);
+      await preparing; healthy = false; release(); await delay(150);
+      expect(tell).not.toHaveBeenCalled();
+      const seenRoot = path.join(config.meshRoot, "control-seen", createHash("sha256").update(host.hostId).digest("hex").slice(0, 32));
+      const seen = new MeshStore(seenRoot, 65536, 1000);
+      expect(seen.listAll("topology/control-seen/").every(entry => !(entry.value as { sequence?: number }).sequence)).toBe(true);
+      healthy = true;
+      expect(await result).toMatchObject({ acknowledged: true, messageId: "lease-delivery-once" });
+      expect(tell).toHaveBeenCalledOnce();
+    } finally {
+      healthy = true; release?.(); await result; await sender?.close();
+      vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 15000);
+});
+
 describe("#3662 resident actor delivery routing", () => {
   it.each(["read-denied", "stat-denied", "invalid-json", "invalid-envelope", "invalid-participant"] as const)(
     "S1 keeps file-only %s lineage at its mailbox until confirmed withdrawal", async (fault) => {
@@ -640,6 +675,9 @@ describe("resident host ownership", () => {
       expect(residentProcessAlive(owner.pid, owner.processStartTime)).toBe(true);
       await host.close();
       expect(fs.existsSync(ownerPath)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "closed.json"), "utf8"))).toMatchObject({
+        format: 1, pid: owner.pid, processStartTime: owner.processStartTime, token: owner.token, closedAt: expect.any(Number),
+      });
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
   it("never follows mutable config alone without a Main intent and attested launcher custody", async () => {

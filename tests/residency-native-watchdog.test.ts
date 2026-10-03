@@ -23,6 +23,34 @@ const traces = (root: string): Array<Record<string, unknown>> => {
 };
 
 describe.skipIf(process.platform !== "linux" || !fs.existsSync(launcherPath))("native resident watchdog (#3864)", () => {
+  it("bounds cooperative close grace and still blocks a hung native Pi successor", { timeout: 35000 }, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-close-grace-"));
+    const fake = path.join(root, "host.mjs"), config = path.join(root, "config.json");
+    fs.writeFileSync(fake, `import fs from 'node:fs';import path from 'node:path';import {createHash} from 'node:crypto';
+const root=${JSON.stringify(root)},hostId='resident:close',rootId='session:close';
+const birth=fs.readFileSync('/proc/'+process.pid+'/stat','utf8').split(') ').at(-1).trim().split(/\\s+/)[19],readyAt=Date.now();
+fs.appendFileSync(path.join(root,'starts'),String(process.pid)+'\\n');
+fs.writeFileSync(path.join(root,'owner.json'),JSON.stringify({format:1,pid:process.pid,processStartTime:birth,hostId,token:String(process.pid),readyAt}));
+const leases=path.join(root,'mesh','host-leases');fs.mkdirSync(leases,{recursive:true});
+const lease=path.join(leases,createHash('sha256').update(hostId).digest('hex').slice(0,32)+'.json');let closed=false;
+const renew=()=>{if(closed)return;const updatedAt=Date.now();fs.writeFileSync(lease,JSON.stringify({format:1,id:hostId,rootId,identityId:hostId,updatedAt,expiresAt:updatedAt+60000}));};renew();setInterval(renew,200);
+setTimeout(()=>{closed=true;fs.writeFileSync(path.join(root,'closed.json'),JSON.stringify({format:1,pid:process.pid,processStartTime:birth,closedAt:Date.now()}));fs.rmSync(path.join(root,'owner.json'));},1500);
+process.on('SIGTERM',()=>{});`);
+    fs.writeFileSync(config, JSON.stringify({ cwd: root, piBinary: fake, meshRoot: path.join(root, "mesh"), rootId: "session:close" }));
+    const child = spawn(process.execPath, [launcherPath, "--config", config], { stdio: "ignore" });
+    const life = watchResidentChild(child);
+    try {
+      await until(() => fs.existsSync(path.join(root, "closed.json")));
+      await sleep(1200);
+      expect(life.exited).toBe(false); expect(traces(root).some(row => row.event === "watchdog-alarm")).toBe(false);
+      await until(() => life.exited, 27000);
+      expect(await life.exit).toEqual({ code: 1, signal: null });
+      expect(traces(root).filter(row => row.event === "watchdog-alarm")).toEqual([expect.objectContaining({ reason: "stale-lease" })]);
+      expect(fs.readFileSync(path.join(root, "starts"), "utf8").trim().split("\n")).toHaveLength(1);
+      expect(fs.existsSync(path.join(root, "watchdog-alarm.json"))).toBe(true);
+    } finally { if (!life.exited) child.kill("SIGKILL"); await life.exit; fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each(["stale-lease", "missing-owner"] as const)("alarms once, escalates a hung TERM and blocks recovery of its exact %s child", { timeout: 35_000 }, async fault => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-watchdog-"));
     const fake = path.join(root, "host.mjs");

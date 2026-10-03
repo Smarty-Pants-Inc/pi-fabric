@@ -40,8 +40,21 @@ stdin EOF. `pi-entry.js` starts `ResidentHost` on `session_start`, aborts it on
 - `src/index.ts` registers `residency/launcher.js`; this registration must not
   point back to `host.js`.
 
-The residency protocol is unchanged: `config.json`, `owner.json`, request,
-response, and mesh files remain the durable interface.
+`config.json`, `owner.json`, request, response, and mesh files remain the durable
+interface. New hosts advertise `maintenanceReady: 1` in their immutable owner
+record. The client also requires `maintenance-ready.json` with that exact owner
+token before treating the host as usable. This receipt follows the first normal
+post-lease maintenance slice; startup itself does not inspect archived runs.
+Older hosts without that optional flag retain their existing readiness contract.
+`starting.json` is a separate, birth-checked supervision identity while initial
+publication waits: it is never a usable owner or successor-admission receipt.
+The default usable-start observation budget includes the mandatory 30-second
+empty legacy mesh-lock grace plus bounded boot/acquisition time; explicit caller
+budgets and the fail-closed watchdog interval remain unchanged.
+Before withdrawing `owner.json`, the host writes a same-birth `closed.json`
+receipt. It grants only the existing bounded native Pi-exit grace, not
+whole-attempt exit proof or permission for a successor. If native Pi remains
+hung past that grace, the watchdog still latches its persistent alarm.
 
 ## Context and lifecycle
 
@@ -75,6 +88,38 @@ exit proof before an operator removes the alarm marker. Removing it merely
 because the parent exited or the lease expired is unsafe. Automatic watchdog
 recovery remains unavailable until attempt-owned containment and checked exit
 receipts cover detached/reparented descendants.
+
+### Lease-fenced consumption and accepted-work custody
+
+A file-only heartbeat is liveness, not permission to consume mesh work. Control,
+actor mesh, and lifecycle consumers require a confirmed shared-lock renewal.
+An overdue consumer requests a prompt renewal attempt, but stays fenced until
+that real acquisition succeeds. Initial publication failure keeps the same
+host start pending rather than publishing a usable owner prematurely.
+
+Control admission checks the lease under both the shared claim lock and the
+host-local claim lock. The resident rechecks after awaited binding resolution,
+before the actual actor delivery. Claims carry no event sequence until the
+outcome commit; sequence and ACK publication recheck under their actual locks.
+Completed handlers retain their result while fenced, including a sequence-free
+host-local outcome receipt, so renewal/restart does not run the handler again.
+Partially owned claims and pending outcomes also block release checkpoints.
+
+New actor queue snapshots record versioned evidence of an actual worker launch.
+Only an interrupted launched run consumes the restoration budget. Failed host
+starts, lease waits, and untouched queued events do not spend it. Legacy
+unmarked snapshots retain conservative interrupted-run handling. Startup does
+not pick up queued resident requests before the start succeeds. Restored actor
+queues stay release-paused, and control/lifecycle delivery gates remain closed,
+until owner publication commits. A failed start after confirmed lease publication
+therefore also preserves accepted, unlaunched work.
+
+Ordinary close retires only this host's mesh writers, including existing lock
+waiters. It neither signals nor removes another process's lock. Durable actor
+queues and the completion outbox retain accepted custody; worker exit is still
+joined within the existing native shutdown deadlines. This prevents sequential
+publication timeouts from turning a cooperative idle exit into watchdog alarm
+debt. It does not relax the fail-closed alarm/re-entry policy above.
 
 ## Validation
 

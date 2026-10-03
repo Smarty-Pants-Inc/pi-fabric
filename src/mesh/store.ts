@@ -77,6 +77,8 @@ export interface MeshStoreOptions {
   maxStateBytes?: number;
   maxStateTombstones?: number;
   lockTimeoutMs?: number;
+  /** Host-only retirement fence for all lock waiters/writers on this instance; reads stay usable. */
+  writeSignal?: AbortSignal | undefined;
   /** Grace for an empty ownerless directory; recorded live owners never expire. Default 30 s. */
   staleLockMs?: number;
   /**
@@ -510,6 +512,7 @@ export class MeshBatchConflictError extends Error {
 }
 
 export class MeshStore {
+  readonly writeSignal: AbortSignal | undefined;
   readonly #eventsPath: string;
   readonly #statePath: string;
   readonly #counterPath: string;
@@ -581,6 +584,7 @@ export class MeshStore {
       1,
       Math.floor(options.maxStateTombstones ?? DEFAULT_MAX_STATE_TOMBSTONES),
     );
+    this.writeSignal = options.writeSignal;
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
     this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
@@ -1576,6 +1580,7 @@ export class MeshStore {
   }
 
   async #withLock<T>(operation: () => T): Promise<T> {
+    this.writeSignal?.throwIfAborted();
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     const deadline = Date.now() + this.#lockTimeoutMs;
     const token = randomUUID();
@@ -1589,6 +1594,7 @@ export class MeshStore {
     let lastAttemptAt = Date.now();
     let retryCeilingMs = 20;
     while (true) {
+      this.writeSignal?.throwIfAborted();
       const attemptAt = Date.now();
       if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
       attempts += 1;
@@ -1657,6 +1663,7 @@ export class MeshStore {
       }
     }
     try {
+      this.writeSignal?.throwIfAborted();
       return operation();
     } catch (error) {
       // A failed write (a version conflict above all) means this store's view is behind: the

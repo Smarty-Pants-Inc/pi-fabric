@@ -82,8 +82,11 @@ interface ActorQueueItem {
   bindingVersion?: 2;
   resolve?: (message: FabricActorMessage) => void;
   reject?: (error: Error) => void;
-  /** Owner restorations without settlement; only #restoreQueue consumes this budget. */
+  /** Interrupted launched runs; untouched backlog never consumes this budget. */
   attempts?: number;
+  /** Versioned evidence: only an actual worker launch spends a restart attempt. */
+  launchEvidenceVersion?: 1;
+  executionStarted?: boolean;
   /** Unlaunched preparation failures, independent of the crash/drop budget (#3167). */
   preparationAttempts?: number;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
@@ -2514,6 +2517,9 @@ export class ActorManager {
             abortController.signal,
             (handle) => {
               workerLaunched = true;
+              item.launchEvidenceVersion = 1;
+              item.executionStarted = true;
+              this.#persistQueue(actor.id);
               delete actor.preparing;
               actor.status = "running";
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
@@ -3664,7 +3670,8 @@ export class ActorManager {
   // - Reads: its own file once per process, when the actor first loads; the predecessor files that
   //   its registry claim names, on adoption and again at that load. A regain reads nothing: memory
   //   already holds the work, without what was cancelled or finished (F4). An item can run twice
-  //   when its process died mid-run; one restored three times without finishing is dropped.
+  //   when its process died mid-run; three interrupted launched runs exhaust its budget.
+  //   Mere failed host starts do not spend the versioned launch-evidence budget.
   #lineageKey(parts: readonly string[]): string {
     return createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 16);
   }
@@ -3724,6 +3731,8 @@ export class ActorManager {
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
             attempts: item.attempts ?? 0,
+            launchEvidenceVersion: 1,
+            executionStarted: item.executionStarted === true,
             preparationAttempts: item.preparationAttempts ?? 0,
             ...(item === inFlight || item.resumed ? { resumed: true } : {}),
             ...(item.deferredHandoff ? { deferredHandoff: true } : {}),
@@ -3845,10 +3854,12 @@ export class ActorManager {
       // Include this snapshot's accepted IDs too, not only the work held on entry.
       held.add(value.id);
       const deferredHandoff = value.source === "child-completion" && value.deferredHandoff === true;
-      // A deliberate quiescent release is not a failed attempt at untouched backlog.
-      // Deferred child outcomes remain context-only and never spend restart attempts.
-      const attempts = deferredHandoff ? 0 : (typeof value.attempts === "number" ? value.attempts : 0) +
-        (saved.cleanHandover === true && (value as { resumed?: unknown }).resumed !== true ? 0 : 1);
+      // New snapshots prove whether a worker actually launched since the last
+      // restoration. Failed starts/preparation never consume accepted backlog.
+      // Unmarked legacy snapshots remain conservative: they may have run.
+      const interrupted = value.launchEvidenceVersion === 1 ? value.executionStarted === true
+        : !(saved.cleanHandover === true && (value as { resumed?: unknown }).resumed !== true);
+      const attempts = deferredHandoff ? 0 : (typeof value.attempts === "number" ? value.attempts : 0) + (interrupted ? 1 : 0);
       const provenance = copyFabricProvenance(value.provenance);
       // Old records may still name the launch requester after native-session steering.
       // Even an unmarked item can have run: older snapshots did not always mark in-flight work.
@@ -3873,6 +3884,8 @@ export class ActorManager {
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
         ...((value as { resumed?: unknown }).resumed === true ? { resumed: true } : {}),
         attempts,
+        launchEvidenceVersion: 1,
+        executionStarted: false, // this restoration has not launched a new worker
         preparationAttempts: counter(value.preparationAttempts),
       } as ActorQueueItem & { attempts: number };
       if (deferredHandoff) {

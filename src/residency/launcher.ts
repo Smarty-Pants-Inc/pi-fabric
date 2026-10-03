@@ -236,14 +236,26 @@ async function supervise(configPath: string): Promise<void> {
           const owner = readOwner(), childPid = attempt.child.pid;
           const otherOwner = owner && owner.pid !== childPid && residentProcessAlive(owner.pid, owner.processStartTime);
           if (childPid && !otherOwner) {
-            const own = owner?.pid === childPid && owner.processStartTime &&
-              processStartTime(childPid) === owner.processStartTime ? owner : undefined;
+            // Startup liveness is not a usable owner or successor-admission
+            // receipt. Only this native child's exact birth may supply it.
+            const starting = readHandoverJson<ResidentHostOwner>(path.join(root, "starting.json"));
+            const candidate = owner?.pid === childPid ? owner : starting;
+            const own = candidate?.pid === childPid && candidate.processStartTime &&
+              processStartTime(childPid) === candidate.processStartTime ? candidate : undefined;
             const lease = own ? readHostLease(config.meshRoot, own.hostId) : undefined;
             const ownLease = own && lease?.rootId === config.rootId && lease.identityId === own.hostId ? lease : undefined;
             const zombies = process.platform === "linux" ? processRows().filter(row => row.ppid === childPid && row.state === "Z") : [];
             // No owner/lease yet is also a stalled owned attempt, not an infinite
             // startup grace. The native handle still owns exactly this child.
-            const readyAt = own && own.readyAt > 0 ? own.readyAt : attempt.startedAt;
+            const closed = readHandoverJson<{ format: number; pid: number; processStartTime?: string; closedAt: number }>(path.join(root, "closed.json"));
+            const closedAt = !own && closed?.format === 1 && closed.pid === childPid &&
+              closed.processStartTime && processStartTime(childPid) === closed.processStartTime &&
+              Number.isFinite(closed.closedAt) && closed.closedAt >= attempt.startedAt && closed.closedAt <= Date.now()
+              ? closed.closedAt : undefined;
+            // Host writes/worker joins have finished, but native Pi may still be
+            // draining RPC. Give it only the existing watchdog exit grace; this
+            // is NOT containment or permission for an automatic successor.
+            const readyAt = own && own.readyAt > 0 ? own.readyAt : closedAt ?? attempt.startedAt;
             const reason = attempt.watchdog.observe(readyAt, ownLease, zombies);
             if (reason) {
               trace("watchdog-alarm", { pid: childPid, token: own?.token, reason });

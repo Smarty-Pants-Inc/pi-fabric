@@ -69,6 +69,10 @@ import {
 // extension loading can exceed 10s on slow runners (e.g. CI Windows), so give
 // startup a generous budget. Idle exit still reclaims the processes.
 const STARTUP_TIMEOUT_MS = 30_000;
+// Usable readiness now requires confirmed publication, which cannot recover an
+// empty legacy mesh lock before its mandatory 30 s grace. Include bounded boot
+// and post-grace acquisition time; explicit caller startup budgets stay exact.
+const HOST_READY_TIMEOUT_MS = 45_000;
 // smarty-dev#883: the start is CPU-bound process boot, so its wall time grows
 // with contention (a 1 s boot took 16 s at load 5 per core). Scale the budget
 // by the 1-minute load per core, capped. Windows reports no load average (0).
@@ -255,7 +259,7 @@ export class ResidencyClient {
     assertResidentWatchdogAdmission(this.options.config.residencyRoot);
     this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
-    const existing = this.#liveOwner();
+    const existing = this.#readyOwner();
     if (existing) return existing;
     // The detached launcher already owns the exact attempt/fallback. Neither
     // ensureHost nor the watchdog may become a competing handover executor.
@@ -268,7 +272,7 @@ export class ResidencyClient {
       await delay(STATUS_POLL_MS);
     }
     assertResidentWatchdogAdmission(this.options.config.residencyRoot);
-    const followed = this.#liveOwner();
+    const followed = this.#readyOwner();
     if (followed) return followed;
     fs.rmSync(this.#errorPath, { force: true });
     const launcher = await spawnDetached(
@@ -279,7 +283,7 @@ export class ResidencyClient {
     // The budget counts from the launcher's first sign of life (its
     // launcher-started trace), so its own boot does not consume it.
     const launcherBirth = processStartTime(launcher.pid);
-    const budget = startupBudgetMs(this.options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS);
+    const budget = startupBudgetMs(this.options.startupTimeoutMs ?? HOST_READY_TIMEOUT_MS);
     let deadline = Date.now() + budget;
     let started = false;
     let launcherExited = false;
@@ -288,7 +292,7 @@ export class ResidencyClient {
         await launcher.stop();
         throw new Error("Fabric residency client is closed");
       }
-      const owner = this.#liveOwner();
+      const owner = this.#readyOwner();
       if (owner) return owner;
       const failure = readJson<{ error?: unknown; launcherPid?: number; launcherBirth?: string }>(this.#errorPath);
       // An exiting prior launcher can race this start after error.json was
@@ -867,11 +871,19 @@ export class ResidencyClient {
     return owner;
   }
 
+  #readyOwner(): ResidentHostOwner | undefined {
+    const owner = this.#liveOwner();
+    if (owner?.maintenanceReady === 1 &&
+        readJson<{ token?: string }>(path.join(this.options.config.residencyRoot, "maintenance-ready.json"))?.token !== owner.token) return undefined;
+    return owner;
+  }
+
   async #watchdog(): Promise<void> {
     const now = Date.now();
     if (this.#closed || this.#startingHost || now < this.#nextWatchdogAt || !kernelFenceAvailable()) return;
     this.#nextWatchdogAt = now + WATCHDOG_INTERVAL_MS;
     if (this.#liveOwner()) {
+      if (!this.#readyOwner()) return;
       void this.reconcileRelease().catch((error) => this.#deferRelease(error));
       return;
     }

@@ -888,8 +888,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** Resident consumers fail closed on failed/overdue renewal, not just peer visibility.
    * A file-only liveness write is not confirmation that the mesh is writable. */
   canConsumeMesh(now = Date.now()): boolean {
-    return !this.options.enabled || (!this.#closed && !this.#quiescing && this.#leaseConfirmed &&
+    const confirmed = !this.options.enabled || (!this.#closed && !this.#quiescing && this.#leaseConfirmed &&
       this.#refreshError === undefined && now - this.#refreshedAt < this.#heartbeatMs * 2);
+    // A resumed/suspended process (or a forward wall-clock adjustment) must not
+    // wait a full heartbeat interval before trying to confirm its lapsed lease.
+    // This never grants admission: refresh still needs the real mesh lock.
+    if (!confirmed && !this.#closed && !this.#quiescing && this.#timer) {
+      void this.#backgroundRefresh.run(() => this.refresh(), false);
+    }
+    return confirmed;
   }
 
   /** When this host last committed its heartbeat: lapses before it happened on a working mesh. */

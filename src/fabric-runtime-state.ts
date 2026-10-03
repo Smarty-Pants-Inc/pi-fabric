@@ -84,6 +84,7 @@ import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
+import { rootParticipantName } from "./topology/participant-name.js";
 import type {
   FabricParticipantInfo,
   FabricParticipantListOptions,
@@ -604,6 +605,11 @@ export class FabricRuntimeState {
       hostId,
       rootId: mainAgentId,
       identity,
+      onRootCollision: collision => {
+        const warning = `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`;
+        console.warn(`[pi-fabric] ${warning}`);
+        if (context.hasUI) context.ui.notify(warning, "warning");
+      },
       ...(process.env.PI_FABRIC_OWNER_HOST_ID
         ? { selfOwnerHostId: process.env.PI_FABRIC_OWNER_HOST_ID }
         : {}),
@@ -680,9 +686,9 @@ export class FabricRuntimeState {
       };
     };
     // Task agents and actors share one single-flight refresh per registry (smarty-dev#1830).
-    const resolveParticipantPiModel = async (selector?: string, requiredPin = false) => {
+    const resolveParticipantPiModel = async (selector?: string, options: { requiredPin?: boolean; closest?: boolean } = {}) => {
       const defaultModel = context.model ? `${context.model.provider}/${context.model.id}` : undefined;
-      const resolved = requiredPin
+      const resolved = options.requiredPin
         ? await resolvePiRoutePin({ selector: selector!, registry: context.modelRegistry, aliases: {} })
         : await resolvePiModel({
             selector,
@@ -690,6 +696,7 @@ export class FabricRuntimeState {
             aliases: modelsConfig.aliases,
             defaultModel,
             policy: agentConfig,
+            closest: options.closest ?? true,
           });
       const model = visiblePiModels().find(
         (candidate) =>
@@ -722,6 +729,10 @@ export class FabricRuntimeState {
       projectRoot,
       hostId,
       identityId: identity.id,
+      ...(ownsPersistentActorRegistry ? { completionRecipient: () => ({
+        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.()), role: participantRole(),
+        startedAt: mainAgent.info(context).startedAt ?? Date.now(),
+      }) } : {}),
       spawnerSessionId: sessionId,
       retention: this.#config.retention,
       ...(this.#paths
@@ -759,7 +770,7 @@ export class FabricRuntimeState {
         };
       },
       preparePiModel: async (modelKey, requiredPin) => {
-        const resolved = await resolveParticipantPiModel(modelKey, requiredPin);
+        const resolved = await resolveParticipantPiModel(modelKey, { requiredPin: requiredPin ?? false });
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
@@ -768,12 +779,14 @@ export class FabricRuntimeState {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publishBackground(event);
       },
-      // Spool until consumption or handoff, independently of notification policy.
-      onSettled: (result) => {
+      // Retain terminal results until consumption, for both Main residency and actor children.
+      onSettled: (result, admittedRecipient) => {
+        this.#residency?.enqueueCompletion(result, admittedRecipient);
         if (actorChildStore && actorSpawner) actorChildStore.enqueue(result, actorSpawner, agentConfig.notifyOnComplete);
       },
-      onBackgroundComplete: (result) => {
-        completionInbox.enqueue(result,
+      onBackgroundComplete: (result, admittedRecipient) => {
+        if (this.#residency) this.#residency.enqueueCompletion(result, admittedRecipient);
+        else completionInbox.enqueue(result,
           actorChildStore ? () => actorChildStore.acknowledge(result.id) : undefined,
           actorChildStore ? () => actorChildStore.prepareLive(result.id) : undefined);
       },
@@ -789,6 +802,8 @@ export class FabricRuntimeState {
       },
       onResultConsumed: (id) => {
         completionInbox.acknowledge(id);
+        // The manager certifies logical settlement: fence even a temporarily failed journal save.
+        this.#residency?.acknowledgeCompletion(id, true);
         try { actorChildStore?.discard(id); } catch { /* Cleanup must not turn a returned outcome into a wait failure. */ }
         markStoppedDelivered(id);
       },
@@ -852,7 +867,7 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
+            resolvePiModel: async (model) => (await resolveParticipantPiModel(model, { closest: false })).key,
             acquireCapabilityView: acquireActorCapabilityView,
             // A /reload or restart of this session resumes its actors' mesh stream where the
             // last runtime stopped, so events published in between still reach them
@@ -871,7 +886,7 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
+            resolvePiModel: async (model) => (await resolveParticipantPiModel(model, { closest: false })).key,
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);
@@ -905,6 +920,8 @@ export class FabricRuntimeState {
             sessionId,
             cwd: context.cwd,
             projectRoot,
+            mainName: rootParticipantName(this.pi.getSessionName?.()),
+            mainStartedAt: mainAgent.info(context).startedAt ?? Date.now(),
             ...(participantRole() ? { role: participantRole()! } : {}),
             project: participantProject(context.cwd),
             meshRoot,
@@ -934,6 +951,7 @@ export class FabricRuntimeState {
           onBackgroundComplete: (result, delivered) => completionInbox.enqueue(result, delivered),
           onResultConsumed: (id) => completionInbox.acknowledge(id),
           piModelState,
+          mainName: () => rootParticipantName(this.pi.getSessionName?.()),
           ...(this.#paths ? { hostPath: this.#paths.residentHost } : {}),
         })
       : undefined;

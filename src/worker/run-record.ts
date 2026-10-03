@@ -51,6 +51,7 @@ export const createRunningRecord = (
   ...(options.transport === "process" ? workerProcessIdentity() : {}),
   cwd: options.cwd,
   ...(options.model ? { model: options.model, requestedModel: options.model } : {}),
+  ...(options.modelReason !== undefined ? { modelReason: options.modelReason } : {}),
   ...(thinking ? { thinking } : {}),
   ...(options.actorId ? { actorId: options.actorId } : {}),
   ...(options.actorName ? { actorName: options.actorName } : {}),

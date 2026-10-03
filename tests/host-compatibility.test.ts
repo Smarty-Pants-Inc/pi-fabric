@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   compareVersions,
+  fixturePiHostSupported,
+  MINIMUM_FIXTURE_PI_HOST_VERSION,
   detectPiHostVersion,
   MINIMUM_PI_HOST_VERSION,
   piHostCompatibilityWarning,
@@ -36,6 +38,17 @@ describe("Pi host compatibility", () => {
     expect(compareVersions("0.80.10", MINIMUM_PI_HOST_VERSION)).toBeGreaterThan(0);
     expect(compareVersions("0.80.6-beta.1", MINIMUM_PI_HOST_VERSION)).toBeLessThan(0);
     expect(compareVersions("invalid", MINIMUM_PI_HOST_VERSION)).toBeUndefined();
+  });
+
+  it.each([
+    ["0.80.6", false], ["0.85.1", false], ["0.86.0-beta.1", false],
+    [undefined, false], ["invalid", false], ["0.87.0garbage", false],
+    ["0.87.0-beta.1", false], ["0.087.0", false], ["0.87.0+bad..build", false],
+    ["0.86.0", true], ["0.87.0", true], ["0.87.1+fixture.1", true],
+  ])("requires a known shell-safe fixture host %j: %j", (version, supported) => {
+    expect(MINIMUM_FIXTURE_PI_HOST_VERSION).toBe("0.86.0");
+    expect(fixturePiHostSupported(version)).toBe(supported);
+    expect(MINIMUM_PI_HOST_VERSION).toBe("0.80.6");
   });
 
   it("detects the host package from the CLI path", () => {

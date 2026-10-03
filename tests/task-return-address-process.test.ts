@@ -243,6 +243,7 @@ describe.skipIf(process.platform === "win32")("durable public spawn return addre
         caller: { id: KATE }, returnAddress: { spawnerId: KATE },
       }, f.context) as { id: string };
       const result = await f.client.waitAgent(handle.id);
+      if (!("text" in result)) throw new Error("Expected the requesting Main's full result, not a completion summary");
       expect(result.status, result.error).toBe("completed");
       const report = JSON.parse(result.text);
       expect(report.main).toMatchObject({ id: SPAWNER, sessionId: SPAWNER.slice(8) });

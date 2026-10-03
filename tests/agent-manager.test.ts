@@ -1352,9 +1352,11 @@ describe("AgentManager", () => {
 
   // dev-lead review D1 on #26: lost contact is not an exit. The run fails as lost, once, and
   // neither cleanup nor shutdown deletes files that the still-running worker may use.
-  it("fails a run whose transport lost contact as lost, and keeps its worker's files", async () => {
+  it("preserves modelReason in the persisted terminal record and settlement callback for a lost worker", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
+    const modelReason = "Astra is required for this lost-worker audit regression";
+    const settled = vi.fn();
     const launch = ProcessTransport.prototype.launch;
     let launches = 0;
     const handles: Array<Awaited<ReturnType<typeof launch>>> = [];
@@ -1369,9 +1371,13 @@ describe("AgentManager", () => {
       const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
         workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
         runRoot: root,
+        onSettled: settled,
       });
       managers.push(manager);
-      const result = await manager.run({ task: "HANG until stopped", transport: "process" });
+      const result = await manager.run({ task: "HANG until stopped", transport: "process", model: "cliproxyapi/gpt-6-astra", modelReason });
+      const persisted = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "status.json"), "utf8"));
+      expect.soft(persisted).toMatchObject({ status: "failed", modelReason });
+      expect.soft(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: result.id, status: "failed", modelReason }));
       expect(launches).toBe(1);
       expect(result.status).toBe("failed");
       expect(result.error).toMatch(/^Lost track of the worker: the Herdr server has been unreachable/);
@@ -1406,9 +1412,11 @@ describe("AgentManager", () => {
     });
   };
 
-  it.each(["stop", "deadline"] as const)("marks a run whose worker was lost on the %s path, and refuses its cleanup", async (path_) => {
+  it.each(["stop", "deadline"] as const)("preserves modelReason in the persisted terminal record and settlement callback on the %s path", async (path_) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
+    const modelReason = "Astra is required for this stop/timeout audit regression";
+    const settled = vi.fn();
     const launched: Array<{ stop(): Promise<void> }> = [];
     const spy = lostOnStop(launched);
     try {
@@ -1418,12 +1426,17 @@ describe("AgentManager", () => {
       }, {
         workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
         runRoot: root,
+        onSettled: settled,
       });
       managers.push(manager);
-      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process", model: "cliproxyapi/gpt-6-astra", modelReason });
       const result = path_ === "stop" ? await manager.stop(handle.id) : await manager.wait(handle.id);
-      expect(result.status).toBe(path_ === "stop" ? "stopped" : "timed_out");
+      const status = path_ === "stop" ? "stopped" : "timed_out";
+      expect(result.status).toBe(status);
       const runDirectory = manager.runDirectory(handle.id)!;
+      const persisted = JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8"));
+      expect.soft(persisted).toMatchObject({ status, modelReason });
+      expect.soft(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: handle.id, status, modelReason }));
       expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8")).reason)
         .toMatch(/Herdr server has been unreachable/);
       await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);

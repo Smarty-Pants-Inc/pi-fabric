@@ -247,7 +247,8 @@ describe("resident retention config reload", () => {
       const run = path.join(config.residencyRoot, "runs", "reload-retention");
       fs.mkdirSync(run, { recursive: true });
       const log = Buffer.from((JSON.stringify({ text: "x".repeat(100) }) + "\n").repeat(3000));
-      const status = JSON.stringify({ status: "completed", finishedAt: Date.now() - 8 * 60 * 60 * 1000 });
+      const status = JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647",
+        finishedAt: Date.now() - 8 * 60 * 60 * 1000 });
       fs.writeFileSync(path.join(run, "status.json"), status);
       fs.writeFileSync(path.join(run, "events.jsonl"), log);
       fs.writeFileSync(path.join(run, "reply.json"), '{"text":"keep"}');
@@ -492,15 +493,19 @@ describe("resident orphan retention", () => {
     const make = (name: string, status: Record<string, unknown>, age = RESIDENT_RUN_RETENTION_MS + 60_000) => {
       const run = path.join(runs, name);
       fs.mkdirSync(run, { recursive: true });
-      fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(status));
+      // Positive fixtures need saved root exit evidence, not terminal status alone.
+      fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ transport: "process", sessionId: "2147483647", ...status }));
       fs.utimesSync(run, (now - age) / 1_000, (now - age) / 1_000);
       return run;
     };
+    expect(() => process.kill(2147483647, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
     const old = make("terminal-old", { status: "completed" });
     const actor = make("actor-old", { status: "completed", actorId: "actor-without-public-metadata" });
     const recent = make("terminal-recent", { status: "completed" }, 1_000);
     const live = make("live", { status: "completed", transport: "process", sessionId: String(process.pid) });
     const unknown = make("unknown", { status: "running" });
+    const recordlessIdentity = make("missing-root-identity", { status: "completed", sessionId: undefined });
+    const external = make("external", { status: "completed", transport: "herdr" });
     const malformed = make("malformed", { status: "completed", transport: "process", sessionId: "unknown" });
     const deadWithoutBirth = make("dead-without-birth", { status: "running", transport: "process", sessionId: "2147483647" });
     const unresolved = make("unresolved", { status: "completed" });
@@ -510,7 +515,7 @@ describe("resident orphan retention", () => {
       await host.start();
       expect(fs.existsSync(old)).toBe(false);
       expect(fs.existsSync(actor)).toBe(false);
-      for (const run of [recent, live, unknown, malformed, deadWithoutBirth, unresolved]) expect(fs.existsSync(run), run).toBe(true);
+      for (const run of [recent, live, unknown, recordlessIdentity, external, malformed, deadWithoutBirth, unresolved]) expect(fs.existsSync(run), run).toBe(true);
       // Inject the clock: a preserved terminal survivor becomes eligible on a later host start.
       expect(sweepResidentRuns(runs, now + RESIDENT_RUN_RETENTION_MS + 60_000)).toEqual([recent]);
       expect(sweepResidentRuns(runs, now + 10 * RESIDENT_RUN_RETENTION_MS, 0)).toEqual([]);

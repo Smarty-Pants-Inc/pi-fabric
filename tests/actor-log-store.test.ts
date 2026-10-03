@@ -36,7 +36,7 @@ describe("ActorLogStore", () => {
     expect(Buffer.byteLength(JSON.stringify(history.at(-1)))).toBeLessThanOrEqual(504);
     const directory = path.join(root, "actor", "runs", "old");
     fs.mkdirSync(directory, { recursive: true });
-    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ status: "completed", finishedAt: 1 }));
+    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" }));
     store.pruneRuns(actor, 1000);
     expect(store.retainedRunIds(actor)).toEqual(["old"]);
     retention.actorRunArchiveMs = 100;
@@ -52,7 +52,7 @@ describe("ActorLogStore", () => {
     for (const id of ["old", "latest"]) {
       const run = path.join(root, "actor", "runs", id);
       fs.mkdirSync(run, { recursive: true });
-      fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: 1 }));
+      fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" }));
       fs.writeFileSync(path.join(run, "events.jsonl"), log.repeat(100));
     }
     store.pruneRuns(actor, 1000);
@@ -80,7 +80,7 @@ describe("ActorLogStore", () => {
     for (const [id, status, finishedAt] of [["old", "completed", 1], ["latest", "completed", 1], ["active", "running", 1], ["recent", "failed", 950], ["unknown", undefined, 1]] as const) {
       const dir = path.join(root, "actor", "runs", id);
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ status, finishedAt }));
+      fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ status, finishedAt, transport: "process", sessionId: "2147483647" }));
     }
     store.pruneRuns(actor, 1000);
     expect(store.retainedRunIds(actor)).toEqual(["active", "latest", "recent", "unknown"]);

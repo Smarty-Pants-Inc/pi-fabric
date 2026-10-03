@@ -66,7 +66,7 @@ const boundedData = (value: unknown, maxChars = MAX_DATA_CHARS): unknown => {
 
 const kindForRef = (ref: string): FabricActivityKind => {
   if (ref.startsWith("agents.")) {
-    return ["agents.create", "agents.ask", "agents.tell", "agents.actorStatus"].includes(ref)
+    return ["agents.create", "agents.createActor", "agents.ask", "agents.tell", "agents.actorStatus"].includes(ref)
       ? "actor"
       : "agent";
   }

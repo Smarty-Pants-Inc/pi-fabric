@@ -137,7 +137,7 @@ describe("#3662 ParticipantDirectory lineage liveness", () => {
     expect(directory.lastKnown(id, expiredAt)?.participant.stale).toBe(true);
     expect(directory.lineageAlive(id, expiredAt)).toBe(true);
     expect(directory.lineageAlive("session:unknown", expiredAt)).toBe(true);
-    await directory.close();
+    await directory.closeLineage();
     expect(directory.lineageAlive(id)).toBe(false);
   });
 });

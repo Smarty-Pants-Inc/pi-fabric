@@ -71,7 +71,7 @@ describe("Astra R1 #3662 positive lineage evidence", () => {
     fs.rmSync(path.join(mesh.root, "participants", createHash("sha256").update(original).digest("hex") + ".json"));
     await mesh.delete({ key: "sessions/creating-root" });
     expect(directory.lineageAlive(original)).toBe(true); // Even total absence is unknown.
-    await directory.close();
+    await directory.closeLineage();
     expect(directory.lineageAlive(original)).toBe(false);
     const resumed = new ParticipantDirectory(mesh, { enabled: true, hostId: original, rootId: original, identity: identity(original) });
     resumed.registerSource(() => [record(original, root)]);

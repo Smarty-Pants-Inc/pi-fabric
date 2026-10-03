@@ -4100,7 +4100,9 @@ export class ActorManager {
     this.#adoptionPending.add(actor.id);
     try {
       const expectedRootId = actor.rootId;
-      const adopted = await this.#registry.withLock(() => {
+      // Lock order: registry, then mesh. Resume invalidates death proof under
+      // the mesh lock; retain both fences from the fresh recheck through commit.
+      const adopted = await this.#registry.withLock(() => this.mesh.exclusive(() => {
         const records = this.#registry.records();
         const current = records.find((record) => record.id === actor.id);
         // A racing adopter rewrote the lineage since we loaded it; they win.
@@ -4133,7 +4135,7 @@ export class ActorManager {
         this.#registry.write([...preserved, this.#serializedActor(actor)]);
         this.#registryFingerprint = this.#registry.fingerprint();
         return true;
-      });
+      }));
       if (adopted) {
         this.#persistedRoots.set(actor.id, this.#rootId);
         this.#takeOverPredecessors(this.#actors.get(actor.id) ?? actor);

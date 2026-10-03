@@ -39,7 +39,13 @@ const SHARED_SEEN_GRACE_MS = 10 * 60 * 1_000;
 /** Host-reserved policy key; { version: 1, sharedClaims: "expiry" } enables expiry reclamation. */
 export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
 
-export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel";
+// Legacy Main setter wire names remain parseable only so owners can refuse them clearly.
+export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel" | "setModel" | "setThinking";
+
+// Keep the reader free to deliver cancellation while asynchronous work waits at its
+// commit fence. These commands own their handler and outcome/ACK retries after the cursor.
+const detachedControlOperation = (operation: FabricControlOperation): boolean =>
+  operation === "ask";
 
 export interface FabricControlCommand {
   /** Hydrated from the admitted MeshEvent envelope, never event.data. */
@@ -173,7 +179,9 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
       data.operation !== "followUp" &&
       data.operation !== "stop" &&
       data.operation !== "ask" &&
-      data.operation !== "cancel") ||
+      data.operation !== "cancel" &&
+      data.operation !== "setModel" &&
+      data.operation !== "setThinking") ||
     typeof data.replyTo !== "string" ||
     typeof data.requestedAt !== "number" ||
     (data.deadlineAt !== undefined && typeof data.deadlineAt !== "number") ||
@@ -993,7 +1001,7 @@ export class FabricControlPlane {
     owned.running = true;
     const execution = this.#executeClaimedCommand(command, owned.event.from, key, owned, deadlineAt, owned.event.sequence, owned.event.verification)
       .finally(() => { owned.running = false; });
-    if (command.operation === "ask") {
+    if (detachedControlOperation(command.operation)) {
       this.#activeHandlers.add(execution);
       void execution.finally(() => this.#activeHandlers.delete(execution)).catch(() => undefined);
       return;

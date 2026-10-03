@@ -4,6 +4,8 @@ import path from "node:path";
 import http from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { processStartTime } from "../src/residency/process-identity.js";
+import { processAlive } from "../src/storage/scratch.js";
 import { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "../src/residency/host.js";
 import { findExecutable } from "../src/agents/transports/process-utils.js";
 import { decideModelRoute } from "../src/agents/model-route.js";
@@ -73,6 +75,11 @@ const productionRun = async (principal: boolean, retainRuns = true, nestedRunRoo
   });
   const run = path.dirname(result.logFile!); const runRoot = path.dirname(run); roots.push(runRoot);
   expect(result, JSON.stringify(result)).toMatchObject({ status: "completed", text: "production retention proof", exitCode: 0 });
+  // The manager returns a published terminal result, not an OS exit receipt.
+  // Copies preserve the worker PID, so even a successful archive must stay put
+  // while that PID is live. Confirm exit before using this tree as an expired,
+  // quiescent fixture; never weaken retention's independent live-writer fence.
+  await vi.waitFor(() => expect(processAlive(Number(result.sessionId))).toBe(false), { timeout: 7_000, interval: 50 });
   expect(requests).toHaveLength(1);
   expect(JSON.stringify(requests[0]!.messages.filter(message => message.role === "user"))).toContain(task);
   expect(fs.readdirSync(path.join(run, "deliveries"))).toEqual([]);
@@ -104,8 +111,9 @@ const makeUnsafe = (run: string, kind: UnsafeKind) => {
   if (kind === "directory-link") { fs.rmdirSync(delivery); fs.symlinkSync(path.join(run, "handoff-session"), delivery, "dir"); }
   if (kind === "pending-outcome") fs.writeFileSync(path.join(run, "pending-route-outcome.json"), "{}");
   if (kind === "live") {
+    // Replace the full identity: keeping the exited worker's birth time models PID reuse.
     const file = path.join(run, "status.json");
-    fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), sessionId: String(process.pid) }));
+    fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), sessionId: String(process.pid), processStartTime: processStartTime(process.pid) }));
   }
   if (kind === "unresolved") fs.writeFileSync(path.join(run, "unresolved-worker.json"), "{}");
   if (kind === "unknown-json") fs.writeFileSync(path.join(run, "unowned.provenance.json"), "{}");

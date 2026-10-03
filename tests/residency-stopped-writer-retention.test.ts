@@ -251,7 +251,10 @@ it.skipIf(process.platform === "win32").each([
         // The actual process is still live: terminal status is not exit evidence.
         const { sessionId: _pid, ...legacy } = JSON.parse(fs.readFileSync(child.statusFile, "utf8"));
         fs.writeFileSync(child.statusFile, JSON.stringify({ ...legacy, status: "completed" }));
-        expect(canRemoveTerminalRun(runDirectory)).toBe(true); // Otherwise collectable startup tree.
+        // Missing identity now vetoes collection as well as ownership release.
+        // Keep the restart probe: neither startup nor maintenance may erase the
+        // owning actor's reconciliation IDs before the child publishes exit.
+        expect(canRemoveTerminalRun(runDirectory)).toBe(false);
       }
       const aged = new Date(Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000);
       fs.utimesSync(runDirectory, aged, aged);

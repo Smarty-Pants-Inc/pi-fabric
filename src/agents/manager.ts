@@ -66,7 +66,7 @@ import type {
   AgentUsage,
 } from "./types.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
-import { followUpFile, followUpState, settleFollowUp } from "./follow-up-delivery.js";
+import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { WorktreeManager } from "./worktree-manager.js";
 import { writeHandoffSession } from "./handoff.js";
 import type { FabricCompactionBudget } from "../compaction/hook.js";
@@ -2095,7 +2095,8 @@ export class AgentManager {
     const delivery = this.#followUps.get(id)?.get(messageId);
     if (!delivery) throw new Error(`Unknown follow-up: ${messageId}`);
     delivery.state = settleFollowUp(followUpFile(managed.runDirectory, messageId), "cancelled");
-    this.#clearFollowUpTimer(messageId);
+    releaseFollowUpPayload(followUpFile(managed.runDirectory, messageId));
+    if (delivery.state === "delivered" || delivery.state === "cancelled") this.#clearFollowUpTimer(messageId);
     return structuredClone(delivery);
   }
 
@@ -2121,7 +2122,7 @@ export class AgentManager {
     if (!entries) return [];
     for (const delivery of entries.values()) {
       delivery.state = followUpState(followUpFile(managed.runDirectory, delivery.messageId));
-      if (delivery.state !== "queued" || delivery.alarm) { this.#clearFollowUpTimer(delivery.messageId); continue; }
+      if (delivery.state === "delivered" || delivery.state === "cancelled" || delivery.alarm) { this.#clearFollowUpTimer(delivery.messageId); continue; }
       if (Date.now() < delivery.deadlineAt) continue;
       const alarm: AgentFollowUpAlarm = {
         code: "FABRIC_FOLLOW_UP_DEADLINE", messageId: delivery.messageId,
@@ -2131,7 +2132,7 @@ export class AgentManager {
         options: ["wait", "steer", "cancel"],
         message: `Follow-up ${delivery.messageId} to ${managed.name} (${managed.id}) missed its delivery deadline; ` +
           `${record?.currentTool ? `busy in tool ${record.currentTool} since ${new Date(record.currentToolStartedAt ?? record.updatedAt).toISOString()}` : record?.status ?? "running"}. ` +
-          `It remains queued. Wait, use agents.steer, or agents.cancelFollowUp({ id: '${managed.id}', messageId: '${delivery.messageId}' }).`,
+          `${delivery.state === "settling" ? "Delivery remains uncertain and fenced." : "It remains queued."} Wait, use agents.steer, or agents.cancelFollowUp({ id: '${managed.id}', messageId: '${delivery.messageId}' }).`,
       };
       delivery.alarm = alarm; // Mark before calling observers: one alarm, even under reentrant status.
       this.#clearFollowUpTimer(delivery.messageId);

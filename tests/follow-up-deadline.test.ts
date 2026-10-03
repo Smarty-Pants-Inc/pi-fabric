@@ -53,15 +53,84 @@ async function setup(deadlineMs = 80) {
     await handlers.get("turn_end")?.({ outcome: aborted ? "aborted" : "completed" },
       { isIdle: () => false, signal: aborted ? AbortSignal.abort() : undefined });
   };
+  const consume = async (index = 0) => {
+    const content = sendUserMessage.mock.calls[index]![0];
+    const message = { role: "user", content: typeof content === "string" ? [{ type: "text", text: content }] : content };
+    return await handlers.get("context")?.({ messages: [message] }, {});
+  };
   const deliveries = () => (manager.status(handle.id) as any).followUpDeliveries;
-  return { manager, handle, run, receipt, alarm, ingest, boundary, sendUserMessage, deliveries };
+  return { manager, handle, run, receipt, alarm, ingest, boundary, sendUserMessage, deliveries, consume, handlers, directory };
 }
 
+describe("follow-up release checkpoint", () => {
+  it.each(["delivered", "cancelled"].flatMap(state => [false, true].map(leftover => ({ state, leftover }))))("accepts checked worker exit with $state artifacts (leftover envelope: $leftover)", async ({ state, leftover }) => {
+    const p = await setup(60_000); await p.ingest();
+    if (state === "delivered") { await p.boundary(); await p.consume(); }
+    else p.manager.cancelFollowUp(p.handle.id, p.receipt.messageId);
+    if (leftover) fs.writeFileSync(path.join(p.directory, p.receipt.messageId + ".json"), JSON.stringify({
+      message: "unique follow-up", delivery: "followUp", followUpId: p.receipt.messageId,
+      provenance: { v: 1, channel: "fabric", via: "followUp", sender: { id: "sender", kind: "main", verified: "mesh" } },
+    }));
+    await p.manager.stop(p.handle.id);
+    await expect(p.manager.checkpointForRelease()).resolves.toBeUndefined();
+  });
+  it("vetoes checked worker exit with an expired but still queued follow-up", async () => {
+    const p = await setup(); await p.ingest(); await p.manager.stop(p.handle.id);
+    await wait(() => p.alarm.mock.calls.length === 1);
+    await expect(p.manager.checkpointForRelease()).rejects.toThrow(/unresolved run tree/);
+  });
+});
 describe("task follow-up delivery deadlines", () => {
+  it("restores the receiver context gate on resume even when the envelope was already released", async () => {
+    const p = await setup(60_000); await p.ingest(); await p.boundary(); await p.consume();
+    const handlers = new Map<string, (...args: any[]) => any>();
+    const send = vi.fn();
+    principalDelivery({ registerCommand: vi.fn(), on: (name: string, handler: any) => handlers.set(name, handler), sendUserMessage: send } as unknown as ExtensionAPI);
+    await handlers.get("session_start")?.({}, {});
+    const text = p.sendUserMessage.mock.calls[0]![0];
+    const result = await handlers.get("context")?.({ messages: [{ role: "user", content: [{ type: "text", text }] }] }, {});
+    expect(result?.messages[0].content).toEqual([{ type: "text", text: "unique follow-up" }]);
+    expect(send).not.toHaveBeenCalled();
+  });
+  it("keeps deadline alarms for an uncertain crashed consumption claim", async () => {
+    const p = await setup(); await p.ingest();
+    fs.mkdirSync(path.join(p.run, "follow-ups", p.receipt.messageId + ".json.settled"));
+    expect(p.deliveries()[0].state).toBe("settling");
+    expect(p.manager.cancelFollowUp(p.handle.id, p.receipt.messageId).state).toBe("settling");
+    await wait(() => p.alarm.mock.calls.length === 1);
+    expect(p.deliveries()[0]).toMatchObject({ state: "settling", alarm: { code: "FABRIC_FOLLOW_UP_DEADLINE" } });
+    expect(fs.existsSync(path.join(p.directory, p.receipt.messageId + ".json"))).toBe(true);
+    await p.boundary(); expect(p.sendUserMessage).not.toHaveBeenCalled();
+  });
+  it("submission is not consumption: delayed admission remains alarmable and cancellable", async () => {
+    const p = await setup(); await p.ingest(); await p.boundary();
+    expect(p.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(p.deliveries()[0].state).toBe("queued");
+    await wait(() => p.alarm.mock.calls.length === 1);
+    expect(p.manager.cancelFollowUp(p.handle.id, p.receipt.messageId).state).toBe("cancelled");
+    const content = p.sendUserMessage.mock.calls[0]![0];
+    expect(await p.handlers.get("input")?.({ source: "extension", text: content }, {})).toEqual({ action: "handled" });
+    expect((await p.consume())?.messages).toEqual([]);
+  });
+  it("native one-at-a-time consumption leaves later submitted follow-ups queued during a long tool", async () => {
+    const p = await setup(500); await p.ingest();
+    const second = p.manager.followUp(p.handle.id, "unique follow-up", undefined, undefined, { deadlineMs: 80 });
+    fs.writeFileSync(path.join(p.directory, second.messageId + ".json"), JSON.stringify({
+      message: "unique follow-up", delivery: "followUp", followUpId: second.messageId,
+      provenance: { v: 1, channel: "fabric", via: "followUp", sender: { id: "sender", kind: "main", verified: "mesh" } },
+    }));
+    await p.handlers.get("command")!(second.messageId, { isIdle: () => false });
+    await p.boundary(); await p.consume(0);
+    expect(p.deliveries().map((d: any) => d.state)).toEqual(["delivered", "queued"]);
+    await wait(() => p.alarm.mock.calls.length === 1);
+    expect(p.alarm.mock.calls[0]![0].messageId).toBe(second.messageId);
+    expect(p.manager.cancelFollowUp(p.handle.id, second.messageId).state).toBe("cancelled");
+    expect((await p.consume(1))?.messages).toEqual([]);
+  });
   it("delivered before deadline: no alarm, no duplicate at later boundaries", async () => {
     const p = await setup(500); await p.ingest();
     expect(p.sendUserMessage).not.toHaveBeenCalled();
-    await p.boundary(); await p.boundary(); await sleep(600);
+    await p.boundary(); await p.consume(); await p.boundary(); await sleep(600);
     expect(p.sendUserMessage).toHaveBeenCalledTimes(1);
     expect(p.deliveries()[0]).toMatchObject({ messageId: p.receipt.messageId, state: "delivered" });
     expect(p.alarm).not.toHaveBeenCalled();
@@ -77,7 +146,7 @@ describe("task follow-up delivery deadlines", () => {
     });
     expect(p.deliveries()[0]).toMatchObject({ state: "queued", alarm: { code: "FABRIC_FOLLOW_UP_DEADLINE" } });
     await sleep(400); p.deliveries(); expect(p.alarm).toHaveBeenCalledTimes(1);
-    await p.boundary(); await p.boundary();
+    await p.boundary(); await p.consume(); await p.boundary();
     expect(p.sendUserMessage).toHaveBeenCalledTimes(1);
     expect(p.deliveries()[0]).toMatchObject({ state: "delivered", alarm: { code: "FABRIC_FOLLOW_UP_DEADLINE" } });
   });
@@ -96,7 +165,7 @@ describe("task follow-up delivery deadlines", () => {
     await sleep(300); expect(p.alarm).not.toHaveBeenCalled();
   });
   it("cannot cancel an already delivered message or a foreign id", async () => {
-    const p = await setup(500); await p.ingest(); await p.boundary();
+    const p = await setup(500); await p.ingest(); await p.boundary(); await p.consume();
     expect(p.manager.cancelFollowUp(p.handle.id, p.receipt.messageId)).toMatchObject({ state: "delivered" });
     expect(() => p.manager.cancelFollowUp(p.handle.id, "foreign")).toThrow(/Unknown follow-up/);
   });

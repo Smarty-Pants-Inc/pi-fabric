@@ -22,15 +22,26 @@ const ai = path.join(root, 'node_modules/@earendil-works/pi-ai/dist/index.js');
 fs.writeFileSync(extension, `
 import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { fauxProvider, fauxAssistantMessage, fauxToolCall } from ${JSON.stringify(ai)};
 export default function(pi) {
   const faux = fauxProvider({ provider: 'deadline-proof', models: [{ id: 'offline' }], tokensPerSecond: 100000 });
-  const factory = (context, options, state) => {
+  const factory = async (context, options, state) => {
     const run = process.env.PI_FABRIC_AGENT_RUN_DIR;
     fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ pid: process.pid, argv: process.argv, run, call: state.callCount, messages: context.messages }) + '\\n');
     if (run) {
-      if (state.callCount === 1) {
-        const gate = process.env.PROOF_GATE;
+      const signals=path.join(${JSON.stringify(scratch)},'signals',path.basename(run)); fs.mkdirSync(signals,{recursive:true});
+      const lane = JSON.stringify(context.messages).match(/PROOF_CHILD_([a-z-]+)/)?.[1];
+      if (lane?.startsWith('recovery') && !fs.existsSync(path.join(signals,'failed-once'))) {
+        fs.writeFileSync(path.join(signals,'recovery-wait'),'waiting');
+        while(!fs.existsSync(process.env.PROOF_GATE)) { if(options?.signal?.aborted) throw new Error('aborted'); await new Promise(r=>setTimeout(r,25)); }
+        fs.writeFileSync(path.join(signals,'failed-once'),'failed');
+        return fauxAssistantMessage('', {stopReason:'error',errorMessage:'503 server_is_overloaded'});
+      }
+      if (lane?.startsWith('recovery') && state.callCount===1) await new Promise(r=>setTimeout(r,350));
+      if (!lane?.startsWith('recovery') && (state.callCount === 1 || (lane==='multi' && state.callCount===2))) {
+        if (lane==='multi' && state.callCount===2) fs.writeFileSync(path.join(signals,'second-tool'),'waiting');
+        const gate = process.env.PROOF_GATE + (lane==='multi' && state.callCount===2 ? '-second' : '');
         const cmd = 'while ! test -f ' + JSON.stringify(gate) + '; do sleep 0.05; done';
         return fauxAssistantMessage([fauxToolCall('fabric_exec', { code: 'return await pi.bash({cmd:' + JSON.stringify(cmd) + ',timeout:60});', resultFormat: 'json' })]);
       }
@@ -41,6 +52,16 @@ export default function(pi) {
     return spec ? fauxAssistantMessage([fauxToolCall('fabric_exec', { code: spec.code, resultFormat: 'json' }, { id: spec.id })]) : fauxAssistantMessage('proof guest finished');
   };
   faux.setResponses(Array.from({length: 100}, () => factory)); pi.registerProvider(faux.provider);
+  pi.on('input', async (event, ctx) => {
+    const run=process.env.PI_FABRIC_AGENT_RUN_DIR;
+    const signals=run?path.join(${JSON.stringify(scratch)},'signals',path.basename(run)):undefined;
+    if(run && event.source==='extension' && event.text.includes('DELIVERY_delayed')) {
+      const matching=ctx.sessionManager.getBranch().filter(e=>e.type==='message'&&e.message?.role==='user'&&JSON.stringify(e.message.content).includes('DELIVERY_delayed')).length;
+      fs.writeFileSync(path.join(signals,'admission-held'),JSON.stringify({matching,text:event.text}));
+      await new Promise(r=>setTimeout(r,150));
+      fs.writeFileSync(path.join(signals,'admission-released'),'released');
+    }
+  });
   pi.on('session_start', (_event, ctx) => {
     if (!process.env.PI_FABRIC_AGENT_RUN_DIR) fs.writeFileSync(${JSON.stringify(ready)}, JSON.stringify({mode:ctx.mode,pid:process.pid,nice:os.getPriority(0)}));
   });
@@ -48,7 +69,7 @@ export default function(pi) {
 }
 `);
 const args = [path.resolve(cli), '--mode', 'rpc', '--offline', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--approve', '-e', path.join(root, 'dist/index.js'), '-e', extension, '--provider', 'deadline-proof', '--model', 'offline', '--thinking', 'off', '--tools', 'fabric_exec', '--session-dir', path.join(scratch, 'sessions')];
-const env = { PATH: process.env.PATH, HOME: home, TMPDIR: scratch, PI_OFFLINE: '1', PI_CODING_AGENT_DIR: agentDir, PI_FABRIC_PI_BINARY: path.resolve(cli), PI_FABRIC_RUN_ROOT: runRoot, PROOF_GATE: path.join(scratch, 'gate') };
+const env = { PATH: process.env.PATH, HOME: home, TMPDIR: scratch, PI_OFFLINE: '1', PI_CODING_AGENT_DIR: agentDir, PI_FABRIC_PI_BINARY: path.resolve(cli), PI_FABRIC_RUN_ROOT: runRoot, PI_FABRIC_TEST_RECOVERY_TIME_SCALE: '0.1', PROOF_GATE: path.join(scratch, 'gate') };
 record({ type: 'command', executable: process.execPath, args, cwd: scratch, env });
 const child = spawn(process.execPath, args, { cwd: scratch, env, stdio: ['pipe', 'pipe', 'pipe'] });
 const events = [], pending = new Map(); let buffer = '', serial = 0, exited = false;
@@ -73,43 +94,81 @@ const results=[]; let failure;
 try {
   await wait(()=>fs.existsSync(ready)); const started=JSON.parse(fs.readFileSync(ready)); assert.equal(started.mode,'rpc'); assert.equal(started.nice,19);
   await guest('return await agents.self();');
-  for (const lane of ['on-time','late','cancelled']) {
-    fs.rmSync(env.PROOF_GATE,{force:true});
+  for (const lane of ['on-time','late','cancelled','delayed','multi','recovery','recovery-cancelled']) {
+    fs.rmSync(env.PROOF_GATE,{force:true}); fs.rmSync(env.PROOF_GATE+'-second',{force:true});
     const handle=await guest(`return await agents.spawn({task:'PROOF_CHILD_${lane}',name:'deadline-${lane}',transport:'process',model:'deadline-proof/offline',thinking:'off',tools:['bash'],extensions:true});`);
-    const id=handle.id; assert(id,JSON.stringify(handle)); const run=path.join(runRoot,id);
-    await wait(()=>{try{return JSON.parse(fs.readFileSync(path.join(run,'status.json'))).currentTool==='fabric_exec';}catch{return false;}});
+    const id=handle.id; assert(id,JSON.stringify(handle)); const run=path.join(runRoot,id), signals=path.join(scratch,'signals',id);
+    await wait(()=>{try{return lane.startsWith('recovery') ? fs.existsSync(path.join(signals,'recovery-wait')) : JSON.parse(fs.readFileSync(path.join(run,'status.json'))).currentTool==='fabric_exec';}catch{return false;}});
     const marker='DELIVERY_'+lane;
     const admittedAt = Date.now();
-    const receipt=await guest(`return await agents.followUp({id:${JSON.stringify(id)},message:${JSON.stringify(marker)}${lane==='on-time'?'':',deadlineMs:100'}});`);
+    const receipt=await guest(`return await agents.followUp({id:${JSON.stringify(id)},message:${JSON.stringify(marker)}${lane==='on-time'?'':lane==='multi'?',deadlineMs:5000':',deadlineMs:100'}});`);
     if (lane==='on-time') assert(receipt.deadlineAt >= admittedAt + 600000 && receipt.deadlineAt <= Date.now() + 600000, 'default deadline must be ten minutes');
     assert(receipt.messageId&&receipt.deadlineAt,JSON.stringify(receipt));
-    if(lane!=='on-time') await wait(()=>fs.existsSync(path.join(scratch,'alarms.jsonl'))&&fs.readFileSync(path.join(scratch,'alarms.jsonl'),'utf8').includes(receipt.messageId));
+    if(lane==='late'||lane==='cancelled'||lane.startsWith('recovery')) await wait(()=>fs.existsSync(path.join(scratch,'alarms.jsonl'))&&fs.readFileSync(path.join(scratch,'alarms.jsonl'),'utf8').includes(receipt.messageId));
     const before=await guest(`return await agents.status({id:${JSON.stringify(id)}});`);
     assert.equal(before.followUpDeliveries[0].state,'queued');
-    if(lane==='cancelled') {
+    if(lane==='cancelled'||lane==='recovery-cancelled') {
       const cancelled=await guest(`return await agents.cancelFollowUp({id:${JSON.stringify(id)},messageId:${JSON.stringify(receipt.messageId)}});`); assert.equal(cancelled.state,'cancelled');
     }
+    let extras=[];
+    if(lane==='multi') {
+      for(const suffix of ['second','cancelled']) extras.push(await guest(`return await agents.followUp({id:${JSON.stringify(id)},message:${JSON.stringify('MULTI_'+suffix)},deadlineMs:100});`));
+    }
+    await sleep(350); // ensure the native command has ingested each private envelope
     fs.writeFileSync(env.PROOF_GATE,'release');
+    if(lane==='delayed') {
+      await wait(()=>fs.existsSync(path.join(signals,'admission-held')));
+      const held=JSON.parse(fs.readFileSync(path.join(signals,'admission-held')));
+      assert.equal(held.matching,0);
+      assert(!fs.existsSync(path.join(run,'follow-ups',receipt.messageId+'.json.settled','state')),'submission must not settle delivery');
+      record({type:'delayed-admission',lane,held,receiptState:'queued',delayMs:150});
+    }
+    if(lane==='multi') {
+      await wait(()=>fs.existsSync(path.join(signals,'second-tool')));
+      const mid=await guest(`return await agents.status({id:${JSON.stringify(id)}});`);
+      assert.equal(mid.currentTool,'fabric_exec');
+      assert.deepEqual(mid.followUpDeliveries.map(d=>d.state),['delivered','queued','queued']);
+      assert(mid.followUpDeliveries[1].alarm&&mid.followUpDeliveries[2].alarm);
+      assert.equal((await guest(`return await agents.cancelFollowUp({id:${JSON.stringify(id)},messageId:${JSON.stringify(extras[1].messageId)}});`)).state,'cancelled');
+      record({type:'one-at-a-time-long-tool',lane,states:mid.followUpDeliveries,extras});
+      fs.writeFileSync(env.PROOF_GATE+'-second','release');
+    }
     await wait(()=>{try{return ['completed','failed','stopped'].includes(JSON.parse(fs.readFileSync(path.join(run,'status.json'))).status);}catch{return false;}});
     await guest(`return await agents.wait({id:${JSON.stringify(id)}});`);
-    const after=await guest(`return await agents.status({id:${JSON.stringify(id)}});`); assert.equal(after.status,'completed',JSON.stringify(after));
+    const after=await guest(`return await agents.status({id:${JSON.stringify(id)}});`);
+    for(const file of ["events.jsonl","status.json"]) fs.copyFileSync(path.join(run,file),path.join(out,"native-child-"+lane+"-"+file));
+    assert.equal(after.status,'completed',JSON.stringify(after));
     const session=fs.readFileSync(path.join(run,'session.jsonl'),'utf8').trim().split('\n').map(l=>JSON.parse(l));
     const delivered=session.filter(e=>e.type==='message'&&e.message?.role==='user'&&JSON.stringify(e.message.content).includes(marker));
-    assert.equal(delivered.length,lane==='cancelled'?0:1);
+    assert.equal(delivered.length,(lane==='cancelled'||lane==='recovery-cancelled')?0:1);
     const alarmFile=path.join(scratch,'alarms.jsonl');
     const alarms=fs.existsSync(alarmFile)?fs.readFileSync(alarmFile,'utf8').trim().split('\n').filter(Boolean).map(l=>JSON.parse(l)).filter(a=>a.messageId===receipt.messageId):[];
-    assert.equal(alarms.length,lane==='on-time'?0:1);
-    if(alarms.length){assert.equal(alarms[0].currentTool,'fabric_exec');assert(alarms[0].currentToolStartedAt);assert.deepEqual(alarms[0].options,['wait','steer','cancel']);}
+    assert.equal(alarms.length,(lane==='on-time'||lane==='multi')?0:1);
+    if(alarms.length){if(lane==='late'||lane==='cancelled'){assert.equal(alarms[0].currentTool,'fabric_exec');assert(alarms[0].currentToolStartedAt);}assert.deepEqual(alarms[0].options,['wait','steer','cancel']);}
     const messages=(await request({type:'get_messages'})).messages;
     const notices=messages.filter(m=>m.customType==='pi-fabric-follow-up-alarm'&&m.details?.messageId===receipt.messageId); assert.equal(notices.length,alarms.length);
-    assert.equal(after.followUpDeliveries[0].state,lane==='cancelled'?'cancelled':'delivered');
+    assert.equal(after.followUpDeliveries[0].state,(lane==='cancelled'||lane==='recovery-cancelled')?'cancelled':'delivered');
+    if(lane==='multi') {
+      assert.deepEqual(after.followUpDeliveries.map(d=>d.state),['delivered','delivered','cancelled']);
+      const pc=fs.readFileSync(calls,'utf8').trim().split('\n').map(JSON.parse).filter(c=>c.run===run);
+      assert(pc.some(c=>JSON.stringify(c.messages).includes('MULTI_second')));
+      assert(!pc.some(c=>JSON.stringify(c.messages).includes('MULTI_cancelled')),'cancelled native queue entry must not reach receiver context');
+      assert.equal(session.filter(e=>e.type==='message'&&e.message?.role==='user'&&JSON.stringify(e.message.content).includes('MULTI_second')).length,1);
+      record({type:'one-at-a-time-final',lane,states:after.followUpDeliveries,secondDeliveryCount:1,cancelledReceiverConsumption:0});
+    }
+    if(lane.startsWith('recovery')) {
+      assert.equal(after.runnerSessionIds.length,1);
+      const log=fs.readFileSync(path.join(run,'events.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+      assert.equal(log.filter(e=>e.type==='fabric_provider_resume'&&e.phase==='starting').length,1);
+      record({type:'same-session-recovery',lane,runnerSessionIds:after.runnerSessionIds,deliveryCount:delivered.length});
+    }
     fs.copyFileSync(path.join(run,'session.jsonl'),path.join(out,'native-child-'+lane+'.jsonl'));
     results.push({lane,id,workerPid:Number(after.sessionId),messageId:receipt.messageId,alarmCount:alarms.length,deliveryCount:delivered.length,status:after.followUpDeliveries[0],senderSessionAlarms:notices.length}); record({type:'assertions',...results.at(-1)});
     await guest(`return await agents.stop({id:${JSON.stringify(id)}});`);
   }
 } catch(error) {failure=error;record({type:'failure',error:String(error.stack??error)});}
 finally {
-  fs.writeFileSync(env.PROOF_GATE,'release');
+  fs.writeFileSync(env.PROOF_GATE,'release'); fs.writeFileSync(env.PROOF_GATE+'-second','release');
   if(!exited){try{await request({type:'abort'});}catch{} child.stdin.end();}
   const closed=await Promise.race([exit,sleep(15000).then(()=>null)]);
   if(!closed){child.kill('SIGKILL');await exit;failure??=new Error('Pi required forced cleanup');}
@@ -124,6 +183,6 @@ finally {
   for(const call of providerCalls)record({type:'native-provider-call',...call});
   record({type:'cleanup',parentExited:true,exit:closed,ownedPids,remaining});
 }
-fs.writeFileSync(path.join(out,'native-proof.txt'), `Command: nice -n 19 node scripts/prove-follow-up-deadline.mjs ${cli} ${scratch} ${out}\nResult: ${failure?'FAIL '+failure.message:'PASS: real offline Pi RPC + fresh dist; on-time 0 alarms/1 delivery; late 1 sender-session alarm/1 delivery; cancelled 1 alarm/0 deliveries; all processes closed.'}\n`);
+fs.writeFileSync(path.join(out,'native-proof.txt'), `Command: nice -n 19 node scripts/prove-follow-up-deadline.mjs ${cli} ${scratch} ${out}\nResult: ${failure?'FAIL '+failure.message:'PASS: real offline Pi RPC + fresh dist; on-time, late, cancelled, delayed admission, multi/long-tool/cancellation, same-session recovery and cancelled recovery; all processes closed.'}\n`);
 if(failure)throw failure;
 console.log(JSON.stringify({result:'PASS',cases:results},null,2));

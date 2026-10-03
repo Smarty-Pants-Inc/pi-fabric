@@ -7,7 +7,23 @@ import { pathToFileURL } from "node:url";
 export async function loadActorInputEstimator(binary: string): Promise<((text: string) => number) | undefined> {
   let estimator: string;
   try {
-    const base = pathToFileURL(fs.realpathSync(binary));
+    const selected = fs.realpathSync(binary);
+    // Dependency resolution alone does not identify the executable: an opaque
+    // launcher can live beside (or import) pi-ai without speaking native history
+    // RPC. Only Pi's own enclosing package authorizes this admission protocol.
+    let nativeLauncher = false;
+    for (let directory = path.dirname(selected);;) {
+      const enclosing = path.join(directory, "package.json");
+      if (fs.existsSync(enclosing)) {
+        nativeLauncher = JSON.parse(fs.readFileSync(enclosing, "utf8")).name === "@earendil-works/pi-coding-agent";
+        break;
+      }
+      const parent = path.dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+    if (!nativeLauncher) return undefined;
+    const base = pathToFileURL(selected);
     const manifest = typeof nodeModule.findPackageJSON === "function"
       ? nodeModule.findPackageJSON("@earendil-works/pi-ai", base) : undefined;
     let packageFile = manifest;

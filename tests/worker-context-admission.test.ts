@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, it, vi } from "vitest";
 import { ActorContextAdmission, loadActorInputEstimator } from "../src/worker/context-admission.js";
@@ -69,6 +72,29 @@ it("loads the pure estimator from selected native launcher ancestry, not a worke
   expect(estimate).toBeTypeOf("function"); expect(estimate!("x".repeat(280_000 * 4))).toBeGreaterThan(272_000);
   expect(await loadActorInputEstimator("/missing/opaque-launcher")).toBeUndefined();
 });
+it.each(["fake-pi-session-id.mjs", "fake-pi-rpc.mjs"])("does not infer native Pi history RPC from dependencies beside %s", async name => {
+  expect(await loadActorInputEstimator(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)))).toBeUndefined();
+});
+it("keeps an opaque launcher opaque even when it has its own pi-ai dependency", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-opaque-launcher-"));
+  try {
+    fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "custom-launcher", type: "module" }));
+    const binary = path.join(root, "pi.mjs"); fs.writeFileSync(binary, "#!/usr/bin/env node\n");
+    const ai = path.join(root, "node_modules", "@earendil-works", "pi-ai");
+    fs.mkdirSync(path.join(ai, "dist", "utils"), { recursive: true });
+    fs.writeFileSync(path.join(ai, "package.json"), JSON.stringify({ name: "@earendil-works/pi-ai", type: "module", main: "dist/index.js" }));
+    fs.writeFileSync(path.join(ai, "dist", "index.js"), "export {};\n");
+    fs.writeFileSync(path.join(ai, "dist", "utils", "estimate.js"), "throw new Error('opaque launchers must not import the estimator');\n");
+    expect(await loadActorInputEstimator(binary)).toBeUndefined();
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+it.each([undefined, 0, NaN])("native admission still fails closed for an invalid model window (%s)", contextWindow => {
+  const f = fixture(); f.admission.start();
+  f.reply({ model: { contextWindow }, isStreaming: false, isCompacting: false });
+  expect(f.ready).not.toHaveBeenCalled();
+  expect(f.fail).toHaveBeenCalledWith("Actor context admission requires an idle Pi child and a model context window");
+});
+
 it("correlates responses and refuses non-idle model state", () => {
   const f = fixture(); f.admission.start();
   expect(f.admission.observe({ type: "response", command: "get_state", id: "other", success: true })).toBe(false);

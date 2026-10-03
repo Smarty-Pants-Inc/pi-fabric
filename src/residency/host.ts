@@ -623,9 +623,20 @@ export class ResidentHost {
         if (!this.actors.owns(command.targetId)) {
           return { accepted: false, error: `Resident host does not own ${command.targetId}` };
         }
-        // Legacy control traffic must not bypass resident lifecycle authority.
-        const caller = this.participants.get(from.id, Date.now(), { fresh: true });
-        this.#authorizeResidentSetter({ identity: from, hostId: caller?.ownerHostId ?? "" });
+        // The resident command path remains owner-only. Legacy mesh stop also
+        // serves a detached actor after its originating Main withdraws: a
+        // verified Main may stop it, without acquiring setter/reset authority.
+        // While the root is addressable (including reload), retain its fence.
+        const now = Date.now();
+        // One snapshot includes stale/reloading roots: a lease lapse is not
+        // withdrawal, and separate live/stale reads could race a renewal.
+        const root = this.participants.list({ scope: "project", kinds: ["root"], includeStale: true, fresh: true }, now)
+          .find(candidate => candidate.id === this.config.rootId);
+        const detachedMain = !root && from.kind === "main" && (verification === "mesh" || verification === "bridge");
+        if (!detachedMain) {
+          const caller = this.participants.get(from.id, now, { fresh: true });
+          this.#authorizeResidentSetter({ identity: from, hostId: caller?.ownerHostId ?? "" });
+        }
         await this.actors.stop(command.targetId);
         this.participants.scheduleRefresh();
         return { accepted: true, messageId: command.commandId };

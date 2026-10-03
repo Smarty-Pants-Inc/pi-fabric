@@ -59,7 +59,7 @@ const fixture = async () => {
   const actor = await host.actors.create({ name: "security", instructions: "Keep persona", residency: "durable", model: "fixture/visible", tools: [], topics: ["repair.events"] });
   await participants.refresh();
   const context = { cwd: root, signal: undefined, extensionContext: {}, parentToolCallId: "lifecycle", nestedToolCallId: "lifecycle", update() {} } as unknown as FabricInvocationContext;
-  return { root, config, host, client, passive, provider, actor, context, identity,
+  return { root, config, host, client, passive, provider, actor, context, identity, participants,
     close: async () => { await passive.close(); await host.close(); await client.close(); await participants.close(); fs.rmSync(root, { recursive: true, force: true }); } };
 };
 
@@ -284,6 +284,47 @@ it("resident control-plane stop cannot bypass the foreign-root authorization fen
     expect(f.host.actors.status(f.actor.id)).toEqual(before);
   } finally { await control.close(); await directory.close(); await f.close(); }
 });
+it.each(["closed", "reloading", "stale"] as const)("verified peer Main stop preserves detached compatibility without bypassing a %s root", async state => {
+  const f = await fixture();
+  const identity = { id: "session:peer", name: "Peer Main", kind: "main" as const, sessionId: "peer" };
+  const mesh = new MeshStore(f.config.meshRoot, 64 * 1024, 100);
+  const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
+  try {
+    if (state === "reloading") await f.participants.quiesce("reload");
+    if (state !== "stale") await f.participants.close();
+    else {
+      // Keep the real published root, but observe it after its lease expires.
+      // Omitting includeStale in the source guard would grant peer stop here.
+      const list = f.host.participants.list.bind(f.host.participants);
+      vi.spyOn(f.host.participants, "list").mockImplementation((options, now = Date.now()) => list(options, now + 60_000));
+      expect(f.host.participants.list({ scope: "project", kinds: ["root"], includeStale: true, fresh: true })
+        .find(root => root.id === f.identity.id)?.stale).toBe(true);
+    }
+    control.start(() => ({ accepted: false }));
+    const before = f.host.actors.status(f.actor.id);
+    const stop = control.request(f.host.hostId, f.actor.id, "stop", {}, f.host.identity.id);
+    if (state !== "closed") {
+      await expect(stop).rejects.toThrow(/owning Main/);
+      expect(f.host.actors.status(f.actor.id)).toEqual(before);
+    } else {
+      await expect(stop).resolves.toMatchObject({ acknowledged: true, routed: "mesh" });
+      expect(f.host.actors.status(f.actor.id).status).toBe("stopped");
+    }
+  } finally { vi.restoreAllMocks(); await control.close(); await f.close(); }
+});
+it.each(["actor", "agent"] as const)("withdrawn Main does not grant stop authority to a verified %s child", async kind => {
+  const f = await fixture();
+  const identity = { id: `child:${kind}`, name: "Child", kind, sessionId: "inherited" };
+  const mesh = new MeshStore(f.config.meshRoot, 64 * 1024, 100);
+  const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
+  try {
+    await f.participants.close(); control.start(() => ({ accepted: false }));
+    const before = f.host.actors.status(f.actor.id);
+    await expect(control.request(f.host.hostId, f.actor.id, "stop", {}, f.host.identity.id)).rejects.toThrow(/owning Main/);
+    expect(f.host.actors.status(f.actor.id)).toEqual(before);
+  } finally { await control.close(); await f.close(); }
+});
+
 it("owning Main repairs an active resident without dropping queued work or stopping its identity", async () => {
   const f = await fixture(); let entered!: () => void; let release!: () => void;
   const started = new Promise<void>(resolve => { entered = resolve; });

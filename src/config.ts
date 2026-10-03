@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import type { LandlockSettings } from "./core/landlock.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
 import { DEFAULT_RECORDS_CONFIG, normalizeRecordsConfig, type FabricRecordsConfig } from "./records/config.js";
 import { normalizeJevApprovalModel } from "./jev/model-key.js";
@@ -65,6 +66,8 @@ interface FabricExecutorConfig {
    * live output path while the process keeps running. `background: true`
    * detaches immediately. Explicit shell timeout remains a hard cap. */
   shellHangMs: number;
+  /** Linux filesystem confinement for local pi.bash; no audit-only kernel mode. */
+  landlock: LandlockSettings;
   memoryLimitBytes: number;
   maxOutputChars: number;
   maxNestedResultChars: number;
@@ -416,6 +419,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     mainMaxTimeoutMs: 600_000,
     hostCallTimeouts: {},
     shellHangMs: DEFAULT_SHELL_HANG_MS,
+    landlock: { mode: "off", disabled: false },
     memoryLimitBytes: 64 * 1024 * 1024,
     maxOutputChars: 50_000,
     maxNestedResultChars: 2_000_000,
@@ -746,6 +750,10 @@ const riskValue = (value: unknown, fallback: FabricRisk): FabricRisk =>
 export const normalizeFabricConfig = (input: Record<string, unknown>): FabricConfig => {
   const executor = objectValue(input.executor);
   const cpython = objectValue(executor.cpython);
+  const landlock = objectValue(executor.landlock);
+  if (landlock.mode !== undefined && landlock.mode !== "off" && landlock.mode !== "enforce") {
+    throw new Error("executor.landlock.mode must be off or enforce. Landlock has no honest warn/audit mode on kernel 6.8; use a one-lane enforce trial with logged PI_FABRIC_LANDLOCK_ESCAPE=1 commands.");
+  }
   const executorKernel = executorKernelValue(executor.kernel, DEFAULT_FABRIC_CONFIG.executor.kernel);
   const executorMaxTimeoutMs = boundedInteger(
     executor.maxTimeoutMs,
@@ -924,6 +932,10 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         0,
         Math.min(executorMaxTimeoutMs, SHELL_HANG_MAX_MS),
       ),
+      landlock: {
+        mode: landlock.mode === "enforce" ? "enforce" : "off",
+        disabled: landlock.disabled === true,
+      },
       memoryLimitBytes: boundedInteger(
         executor.memoryLimitBytes,
         DEFAULT_FABRIC_CONFIG.executor.memoryLimitBytes,
@@ -1565,6 +1577,11 @@ const resolveFabricConfig = (
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;
       document.agents = agents;
+      const executor = { ...objectValue(document.executor) };
+      const landlock = { ...objectValue(executor.landlock) };
+      delete landlock.disabled; // Host-only fleet kill switch wins over lane config.
+      executor.landlock = landlock;
+      document.executor = executor;
     }
     merged = mergeObjects(merged, document);
   }
@@ -1624,6 +1641,28 @@ export const loadFabricConfig = (options: {
 // The global configuration plus environment overrides, readable at extension load before a
 // session context exists (smarty-dev#459). Project configuration needs the trust decision
 // that only bootstrap has, so it is left out here.
+/**
+ * Host-only Landlock kill switch, read from the global fabric.json on every
+ * call so already-running lanes observe a fleet-wide flip without a reload.
+ * Unreadable/malformed host files keep the session's loaded value.
+ */
+export const readHostLandlockDisabled = (agentDir: string): boolean | undefined => {
+  try {
+    const document: unknown = JSON.parse(fs.readFileSync(path.join(agentDir, "fabric.json"), "utf8"));
+    const disabled = objectValue(objectValue(objectValue(document).executor).landlock).disabled;
+    return typeof disabled === "boolean" ? disabled : false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? false : undefined;
+  }
+};
+
+/** Session settings with the live host kill switch applied (F2: no cached value). */
+export const liveLandlockSettings = (settings: LandlockSettings, agentDir: string): LandlockSettings => {
+  if (settings.mode !== "enforce") return settings;
+  const disabled = readHostLandlockDisabled(agentDir);
+  return disabled === undefined ? settings : { mode: settings.mode, disabled };
+};
+
 export const loadGlobalFabricConfig = (agentDir: string): FabricConfig =>
   resolveFabricConfig({ cwd: agentDir, agentDir }, false, true);
 

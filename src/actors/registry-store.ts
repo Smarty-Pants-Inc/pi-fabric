@@ -37,6 +37,7 @@ const hasRemovalDecision = (actors: readonly unknown[]): boolean => actors.some(
 export class ActorRegistryStore {
   readonly #registryPath: string;
   readonly #actorRoot: string;
+  #parsedCache: { stamp: string; value: unknown } | undefined;
 
   constructor(actorRoot: string) {
     this.#actorRoot = actorRoot;
@@ -45,9 +46,7 @@ export class ActorRegistryStore {
 
   records(): Array<Record<string, unknown> & { id: string }> {
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.#registryPath, "utf8")) as {
-        actors?: unknown;
-      };
+      const parsed = this.#readCached() as { actors?: unknown };
       if (!Array.isArray(parsed.actors)) return [];
       return parsed.actors.flatMap((record) =>
         typeof record === "object" &&
@@ -141,7 +140,20 @@ export class ActorRegistryStore {
   }
 
   read(): unknown {
-    return JSON.parse(fs.readFileSync(this.#registryPath, "utf8"));
+    return this.#readCached();
+  }
+
+  #readCached(): unknown {
+    const stat = fs.statSync(this.#registryPath, { bigint: true });
+    const stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    if (this.#parsedCache?.stamp === stamp) return this.#parsedCache.value;
+    const value = JSON.parse(fs.readFileSync(this.#registryPath, "utf8"));
+    this.#parsedCache = { stamp, value };
+    return value;
+  }
+
+  #invalidate(): void {
+    this.#parsedCache = undefined;
   }
 
   /** Call within withLock for read-modify-write operations. Pending decisions are always durable. */
@@ -150,6 +162,7 @@ export class ActorRegistryStore {
     // accepted removal must establish its own barriers, including foreign/preserved rows.
     if (!options?.durable && !hasRemovalDecision(actors)) {
       writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2 });
+      this.#invalidate();
       return;
     }
     const previous = fs.readFileSync(this.#registryPath, "utf8");
@@ -168,7 +181,9 @@ export class ActorRegistryStore {
       // this replacement needs barriers too; otherwise the cleanup marker covers rollback.
       // Never report the failed commit as accepted.
       writeFileAtomic(this.#registryPath, previous, { durable: rollbackDurable });
+      this.#invalidate();
       throw error;
     }
+    this.#invalidate();
   }
 }

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readSessionText } from "./session-file-cache.js";
 import type { FabricExecutionOutcomeV1, FabricTraceJsonValue } from "../audit/trace.js";
 import {
   readFabricBranchSummaryDetails,
@@ -695,10 +696,8 @@ export const normalizeSession = (
   maxEntryChars: number,
   options: NormalizeSessionOptions = {},
 ): { entries: NormalizedEntry[]; header: SessionHeaderInfo | null; indexCoverage: NormalizationCoverage } => {
-  let content: string;
-  try {
-    content = fs.readFileSync(sessionFile, "utf8");
-  } catch {
+  const content = readSessionText(sessionFile);
+  if (content === undefined) {
     return { entries: [], header: null, indexCoverage: { complete: false, reasons: ["source_unavailable"] } };
   }
   const records: unknown[] = [];

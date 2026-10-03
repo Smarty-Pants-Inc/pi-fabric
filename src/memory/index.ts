@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { coverageComplete } from "../verified/policy.js";
 import fs from "node:fs";
+import { readSessionText } from "./session-file-cache.js";
 import path from "node:path";
 import { foldSessionDigest, type SessionDigest } from "./digest.js";
 import type { SessionRef } from "./discovery.js";
@@ -257,9 +258,9 @@ export interface SourceState {
 
 export const fingerprintSource = (file: string): SourceState | null => {
   try {
-    const content = fs.readFileSync(file);
+    const content = readSessionText(file);
     const stat = fs.statSync(file);
-    if (!stat.isFile()) return null;
+    if (content === undefined || !stat.isFile()) return null;
     return {
       mtime: stat.mtimeMs,
       size: stat.size,

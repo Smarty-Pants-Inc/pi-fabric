@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
+import { readSessionText } from "./session-file-cache.js";
 
 export type MemoryBranches = "active" | "all";
 
@@ -56,12 +56,8 @@ const fingerprint = (branches: MemoryBranches, leafId: string | null, ids: strin
   crypto.createHash("sha256").update(JSON.stringify({ branches, leafId, ids })).digest("hex");
 
 const readPersistedNodes = (sessionFile: string): PersistedNode[] => {
-  let content: string;
-  try {
-    content = fs.readFileSync(sessionFile, "utf8");
-  } catch {
-    return [];
-  }
+  const content = readSessionText(sessionFile);
+  if (content === undefined) return [];
   const records: unknown[] = [];
   for (const line of content.split("\n")) {
     if (!line.trim()) continue;

@@ -49,29 +49,46 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, maxConcurrent: 2, retainRuns: true }, {
-      workerPath, piBinary, runRoot: root,
+      workerPath: path.resolve("tests/fixtures/real-worker-close-gate.mjs"), piBinary, runRoot: root,
     });
     managers.push(manager);
-    const results = await Promise.all(["scratch one", "scratch two"].map(task => manager.run({ task, transport: "process" })));
-    const reports = results.map(result => {
-      expect(result.status).toBe("completed");
+    const releaseFile = path.join(root, "release-native-close");
+    let results: AgentRunResult[] = [];
+    try {
+      results = await Promise.all(["scratch one", "scratch two"].map(task => manager.run({ task, transport: "process" })));
+      const reports = results.map(result => {
+        expect(result.status).toBe("completed");
+        const report = JSON.parse(result.text);
+        const runDirectory = manager.runDirectory(result.id)!;
+        expect(report.tmpdir).toBe(path.join(runDirectory, "tmp"));
+        expect(report.osTmpdir).toBe(report.tmpdir);
+        expect(path.dirname(report.scratch)).toBe(report.tmpdir); // real ordinary mktemp, without -p
+        if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
+        else expect(report.mode).toBe(0o700);
+        // The explicit gate still owns native close: a result is not exit proof.
+        expect(fs.existsSync(report.tmpdir)).toBe(true);
+        expect(fs.existsSync(report.scratch)).toBe(true);
+        return report;
+      });
+      expect(reports[0].tmpdir).not.toBe(reports[1].tmpdir);
+      expect(process.env.TMPDIR).toBe(parentTmpdir);
+      expect(process.env.TMP).toBe(parentTmp);
+      expect(process.env.TEMP).toBe(parentTemp);
+    } finally {
+      // Always unblock the workers, even when a pre-close assertion fails.
+      fs.writeFileSync(releaseFile, "release");
+      // Unlike result observation, close joins native close AND scratch disposal.
+      await manager.close();
+    }
+    for (const result of results) {
       const report = JSON.parse(result.text);
       const runDirectory = manager.runDirectory(result.id)!;
-      expect(report.tmpdir).toBe(path.join(runDirectory, "tmp"));
-      expect(report.osTmpdir).toBe(report.tmpdir);
-      expect(path.dirname(report.scratch)).toBe(report.tmpdir); // real ordinary mktemp, without -p
-      if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
-      else expect(report.mode).toBe(0o700);
       expect(fs.existsSync(report.tmpdir)).toBe(false);
+      expect(fs.existsSync(report.scratch)).toBe(false);
       expect(fs.existsSync(path.join(runDirectory, "unresolved-scratch.json"))).toBe(false);
       expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8")).sessionId).toBe(result.sessionId);
       expect(fs.existsSync(path.join(runDirectory, "events.jsonl"))).toBe(true);
-      return report;
-    });
-    expect(reports[0].tmpdir).not.toBe(reports[1].tmpdir);
-    expect(process.env.TMPDIR).toBe(parentTmpdir);
-    expect(process.env.TMP).toBe(parentTmp);
-    expect(process.env.TEMP).toBe(parentTemp);
+    }
   });
 
   it("retains run artifacts when worker custody is unsettled, disposing scratch only with an independent scope receipt", async () => {
@@ -89,7 +106,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     });
     expect(result.status).toBe("completed");
     const report = JSON.parse(result.text);
-    expect(fs.existsSync(report.scratch)).toBe(!scoped);
+    // Scoped disposal also owes the owned native close, not just the result.
     await manager.close();
     expect(fs.existsSync(report.tmpdir)).toBe(!scoped);
     expect(fs.existsSync(report.scratch)).toBe(!scoped);

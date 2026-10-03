@@ -333,6 +333,8 @@ export interface AgentTransportLaunch {
   signal?: AbortSignal | undefined;
   /** Host activation generation check. Recheck after preparation, immediately before worker creation. */
   authorize?: () => boolean;
+  /** Persist unknown tree/native close before stop returns or a parent-only fallback reports exit. */
+  onUnconfirmedExit?: (reason: string) => void;
 }
 
 export interface AgentTransportObservationOptions {
@@ -358,13 +360,15 @@ export interface AgentTransportHandle {
    */
   relaunchable?: boolean;
   /**
-   * Why liveness gave up without proof that the worker exited (a Herdr server that stayed
-   * unreachable). The run then fails as "lost track of the worker", and Fabric neither
+   * Why worker/tree exit could not be confirmed (lost contact or uncertain teardown).
+   * Primary-worker exit alone does not clear process-tree debt. Fabric neither
    * relaunches it nor deletes its files. Undefined while contact holds or after a proven exit.
    */
   lostContact?(): string | undefined;
   /** Optional checked session observation; absence alone is NOT a worker exit receipt. */
   observe?(options?: AgentTransportObservationOptions): Promise<AgentTransportObservation>;
+  /** Bounded join of the captured process worker's native close (not PID absence). */
+  waitForClose?(): Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;
 }

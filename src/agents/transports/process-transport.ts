@@ -32,6 +32,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       kind: this.kind,
       sessionId: String(processHandle.pid),
       isAlive: processHandle.isAlive,
+      lostContact: processHandle.lostContact,
+      waitForClose: processHandle.waitForClose,
       stop: processHandle.stop,
     };
   }

@@ -4,13 +4,15 @@ import type { SessionBoundaryDraft, TurnEndEvent } from "@earendil-works/pi-codi
 const EXCERPT_CHARS = 1024;
 const SUMMARY = "Earlier tool outputs were compacted to bounded excerpts. The full outputs remain in the actor's audit journal at the indicated entry IDs. User directions, assistant decisions, and the latest tool exchange are unchanged.";
 
-/** Native boundary drafts: never rewrite the journal or touch the current batch. */
-export function compactActivationTools(event: TurnEndEvent): {
+const OVERFLOW_SUMMARY = "Tool outputs, including the latest oversized batch, were compacted to bounded excerpts before dispatch to fit the model window. Full outputs remain in the actor audit journal at the indicated entry IDs. User directions, assistant decisions and tool-call/result identities are unchanged.";
+
+/** Native boundary drafts: never rewrite raw journal entries. Latest results are protected unless they cannot fit. */
+export function compactActivationTools(event: TurnEndEvent, options: { includeLatest?: boolean } = {}): {
   entries: SessionBoundaryDraft[];
   messages: AgentMessage[];
   summary: string;
 } | undefined {
-  const protectedIds = new Set([event.messageEntryId, ...event.toolResultEntryIds]);
+  const protectedIds = new Set(options.includeLatest ? [] : [event.messageEntryId, ...event.toolResultEntryIds]);
   const edits: SessionBoundaryDraft[] = [];
   const messages: AgentMessage[] = [];
   let firstKeptEntryId: string | undefined;
@@ -40,9 +42,9 @@ export function compactActivationTools(event: TurnEndEvent): {
   }
   if (!edits.length || !firstKeptEntryId) return undefined;
   return {
-    entries: [{ type: "compaction", summary: SUMMARY, firstKeptEntryId,
+    entries: [{ type: "compaction", summary: options.includeLatest ? OVERFLOW_SUMMARY : SUMMARY, firstKeptEntryId,
       details: { compactor: "fabric-activation-tools", version: 1, editedEntryIds: edits.map(edit => edit.type === "context_edit" ? edit.targetId : ""), protectedEntryIds: [...protectedIds] } }, ...edits],
     messages,
-    summary: SUMMARY,
+    summary: options.includeLatest ? OVERFLOW_SUMMARY : SUMMARY,
   };
 }

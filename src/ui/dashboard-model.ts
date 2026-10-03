@@ -295,7 +295,7 @@ const entitiesFor = (
         panelAgents.some((agent) => linkedAgent(call, agent));
       const representedActorCreation =
         call.kind === "actor" &&
-        call.ref === "agents.create" &&
+        (call.ref === "agents.create" || call.ref === "agents.createActor") &&
         snapshot.actors.some((actor) => linkedEntityId(call.entityId, actor.id));
       return !representedAgentLaunch && !representedActorCreation;
     })
@@ -610,7 +610,7 @@ const activityEntitiesByPanel = (
           panelAgents.some((agent) => linkedAgent(call, agent));
         const representedActorCreation =
           call.kind === "actor" &&
-          call.ref === "agents.create" &&
+          (call.ref === "agents.create" || call.ref === "agents.createActor") &&
           snapshot.actors.some((actor) => linkedEntityId(call.entityId, actor.id));
         return !representedAgentLaunch && !representedActorCreation;
       })

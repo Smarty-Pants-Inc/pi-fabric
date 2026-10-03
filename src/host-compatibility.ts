@@ -30,6 +30,15 @@ export const assertFabricModelAllowed = (model: string | undefined, policy?: Fab
 
 export const MINIMUM_PI_HOST_VERSION = "0.80.6";
 
+/** Pi 0.86.0 intercepts both RPC/TUI user shell requests and propagates hook failures. */
+export const MINIMUM_FIXTURE_PI_HOST_VERSION = "0.86.0";
+
+/** Only verifiable releases establish the fixture contract; unknown/prerelease hosts fail closed. */
+export const fixturePiHostSupported = (version: string | undefined): boolean =>
+  version !== undefined &&
+  /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(version) &&
+  (compareVersions(version, MINIMUM_FIXTURE_PI_HOST_VERSION) ?? -1) >= 0;
+
 const PI_HOST_PACKAGE_NAMES = new Set([
   "@earendil-works/pi-coding-agent",
   "@mariozechner/pi-coding-agent",

@@ -16,7 +16,8 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker", () => {
-  const run = async (scenario: string, route = true) => {
+  const run = async (scenario: string, route = true,
+    facts: { routeClass?: string; protected?: boolean; actorId?: string; actorName?: string } = {}) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-worker-")); roots.push(root);
     const scenarioFile = path.join(root, "scenario"); fs.writeFileSync(scenarioFile, scenario);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
@@ -31,12 +32,30 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
       workerPath, piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), runRoot: path.join(root, "runs"),
     }); managers.push(manager);
     const result = await manager.run({ task: "harmless lookup", model: pin.model, thinking: pin.effort,
-      transport: "process", extensions: false, ...(route ? { routeDecision: decision } : {}) });
+      transport: "process", extensions: false, ...facts, ...(route ? { routeDecision: decision } : {}) });
     const events = fs.readFileSync(path.join(root,"runs",result.id,"events.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line));
     const launch = events.find(event => event.type === "fake_route_launch");
     const rows = route ? fs.readFileSync(path.join(root,"agent/fabric/model-routing.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
-    return { result, rows, launch, events, pin };
+    const saved = JSON.parse(fs.readFileSync(path.join(root, "runs", result.id, "status.json"), "utf8"));
+    return { result, rows, launch, events, pin, saved };
   };
+  it("R3 cleanup joins a process that publishes its terminal result before exiting", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-exit-")); roots.push(root);
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/terminal-before-exit-worker.mjs"), runRoot: path.join(root, "runs"),
+    }); managers.push(manager);
+    const result = await manager.run({ task: "terminal-before-exit", transport: "process", extensions: false });
+    expect(result.status).toBe("completed");
+    const pid = Number(result.sessionId);
+    expect(Number.isSafeInteger(pid)).toBe(true);
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    const directory = manager.runDirectory(result.id)!;
+    expect(fs.existsSync(directory)).toBe(true);
+    await manager.cleanup(result.id);
+    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    expect(fs.existsSync(directory)).toBe(false);
+  });
+
   it("R3 real-Pi routed worktree uses native tool cwd and committed worktree contents, not parent edits", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-real-cwd-")); roots.push(root);
     const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe" });
@@ -94,6 +113,22 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     expect(result.admittedThinking).toBeUndefined();
     expect(events.filter(event => event.type === "fake_received").some(event => event.frame.type === "prompt")).toBe(false);
     expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null });
+  });
+  it.each([
+    [{}, "task:pi:process", "derived"],
+    [{ routeClass: "custom-review", protected: true }, "custom-review", "explicit"],
+    [{ actorId: "trusted-actor", actorName: "fleet-review-astra", protected: true }, "actor:review", "derived"],
+    [{ actorId: "trusted-actor", actorName: "fleet-security-astra", protected: true }, "actor:security", "derived"],
+    [{ actorId: "trusted-actor", actorName: "supervisor", protected: false }, "actor:status-groom", "derived"],
+    [{ actorId: "trusted-actor", actorName: "fleet-worker" }, "actor:other", "derived"],
+  ] as const)("writes record-only class metadata in the fresh compiled worker: %j", async (facts, routeClass, routeClassSource) => {
+    const { result, saved, launch, rows } = await run("success", false, facts);
+    const expected = { routeClass, routeClassSource, status: "completed" };
+    expect(result).toMatchObject(expected);
+    expect(saved).toMatchObject(expected);
+    expect(saved.protected).toBe("protected" in facts ? facts.protected : undefined);
+    expect(rows).toEqual([]);
+    expect(launch.header).toBeNull();
   });
   it("R3 preserves ordinary non-auto effort clamping", async () => {
     const { result } = await run("effort-lower", false);

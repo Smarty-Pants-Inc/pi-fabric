@@ -188,6 +188,8 @@ for (const kind of ["Main", "proxy"] as const) {
     });
 
     const mutations: ResidentActorMutation[] = [
+      { operation: "resetSession", id: "" },
+      { operation: "stop", id: "" },
       { operation: "setInstructions", id: "", instructions: "New persona" },
       { operation: "setModel", id: "", model: "fixture/visible", scope: "project" },
       { operation: "setThinking", id: "", thinking: "high", scope: "session" },

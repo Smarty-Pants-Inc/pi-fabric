@@ -16,6 +16,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
 import { ActorDirectory } from "./actors/directory.js";
+import type { ActorModelRouteInput } from "./actors/manager.js";
 import { resolvePiBinary } from "./agents/pi-binary.js";
 import { isPiShellRef } from "./core/pi-tools.js";
 import { DEFAULT_SHELL_HANG_MS, FabricShellJobStore } from "./core/shell-jobs.js";
@@ -606,6 +607,11 @@ export class FabricRuntimeState {
       hostId,
       rootId: mainAgentId,
       identity,
+      onRootCollision: collision => {
+        const warning = `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`;
+        console.warn(`[pi-fabric] ${warning}`);
+        if (context.hasUI) context.ui.notify(warning, "warning");
+      },
       ...(process.env.PI_FABRIC_OWNER_HOST_ID
         ? { selfOwnerHostId: process.env.PI_FABRIC_OWNER_HOST_ID }
         : {}),
@@ -682,9 +688,9 @@ export class FabricRuntimeState {
       };
     };
     // Task agents and actors share one single-flight refresh per registry (smarty-dev#1830).
-    const resolveParticipantPiModel = async (selector?: string, requiredPin = false) => {
+    const resolveParticipantPiModel = async (selector?: string, options: { requiredPin?: boolean; closest?: boolean } = {}) => {
       const defaultModel = context.model ? `${context.model.provider}/${context.model.id}` : undefined;
-      const resolved = requiredPin
+      const resolved = options.requiredPin
         ? await resolvePiRoutePin({ selector: selector!, registry: context.modelRegistry, aliases: {} })
         : await resolvePiModel({
             selector,
@@ -692,6 +698,7 @@ export class FabricRuntimeState {
             aliases: modelsConfig.aliases,
             defaultModel,
             policy: agentConfig,
+            closest: options.closest ?? true,
           });
       const model = visiblePiModels().find(
         (candidate) =>
@@ -765,7 +772,7 @@ export class FabricRuntimeState {
         };
       },
       preparePiModel: async (modelKey, requiredPin) => {
-        const resolved = await resolveParticipantPiModel(modelKey, requiredPin);
+        const resolved = await resolveParticipantPiModel(modelKey, { requiredPin: requiredPin ?? false });
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
@@ -842,6 +849,18 @@ export class FabricRuntimeState {
       extensionContext: context,
       update() {},
     });
+    const prepareActorModelRoute = async (input: ActorModelRouteInput, signal: AbortSignal) => {
+      const { prepareModelRoute } = await import("./agents/model-route-prepare.js");
+      return prepareModelRoute({ ...input, signal, config: this.#config!.agents.modelRouting,
+        registry: context.modelRegistry, aliases: this.#config!.models.aliases,
+        assertModelAllowed: model => this.#agents!.assertModelAllowed(model, "pi"),
+        evaluate: (request, routeSignal) => {
+          if (!this.#agentsProvider) throw new Error("Jev routing unavailable");
+          return this.#agentsProvider.routeEvaluate(request, routeSignal, { cwd: context.cwd,
+            signal: routeSignal, parentToolCallId: "fabric-actor-route", nestedToolCallId: "fabric-actor-route",
+            extensionContext: context, update() {} });
+        } });
+    };
     this.#actors = new ActorDirectory([
       fabricSessionId,
       identity,
@@ -862,7 +881,8 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
+            resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
+            prepareModelRoute: prepareActorModelRoute,
             acquireCapabilityView: acquireActorCapabilityView,
             // A /reload or restart of this session resumes its actors' mesh stream where the
             // last runtime stopped, so events published in between still reach them
@@ -881,7 +901,8 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
+            resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
+            prepareModelRoute: prepareActorModelRoute,
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);
@@ -930,6 +951,8 @@ export class FabricRuntimeState {
             mesh: structuredClone(this.#config.mesh),
             retention: structuredClone(this.#config.retention),
             actors: structuredClone(this.#config.actors),
+            shadowRouting: { jev: structuredClone(this.#config.jev),
+              networkAllowed: this.#config.approvals.network === "allow", schemaEnforced: enforceSchema },
             workerPath: this.#paths?.worker ?? fileURLToPath(new URL("./worker.js", import.meta.url)),
             fabricExtensionPath: this.#paths?.extension ?? fileURLToPath(new URL("./index.js", import.meta.url)),
             piBinary: resolvePiBinary(),

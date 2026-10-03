@@ -425,8 +425,18 @@ export class CompletionJournal {
       const fence = path.join(directory(this.meshRoot), "receipts", file);
       const receipt = readReceipt(fence);
       if (!receipt) continue;
-      await confirmReceipt(fence, receipt);
-      fs.rmSync(target, { force: true });
+      // A legacy claim has no address of its own: the envelope is its last lane
+      // evidence. Do not unlink that evidence while an ineligible predecessor
+      // still owns the claim; otherwise no later Main can authorize retirement.
+      const claim = this.mesh.get(claimKey(receipt.id), { fresh: true });
+      if (claim) {
+        if (!this.#canRetireClaim(claim)) continue;
+        await this.#retireClaim(receipt.id, claim);
+        if (this.mesh.get(claimKey(receipt.id), { fresh: true })) continue;
+      } else {
+        await confirmReceipt(fence, receipt);
+        fs.rmSync(target, { force: true });
+      }
       if (++pruned === 128) break;
     }
     const pending = await scanPendingCompletions(this.meshRoot, recipient.projectRoot, accepts);
@@ -474,7 +484,8 @@ export class CompletionJournal {
     // Older claims can use the bounded envelope address; new claims retain this
     // address themselves, including after unlink. Never infer a lane from a session id.
     const address = owner.recipient ?? readRecipient(path.join(directory(this.meshRoot), `${snapshot.key.slice(claimPrefix.length)}.json`));
-    if (!address || address.rootId !== owner.rootId || address.sessionId !== owner.sessionId ||
+    if (!address ||
+      (owner.recipient && (address.rootId !== owner.rootId || address.sessionId !== owner.sessionId)) ||
       typeof address.cwd !== "string" || typeof address.projectRoot !== "string" || typeof address.name !== "string" ||
       typeof address.startedAt !== "number" || !Number.isFinite(address.startedAt) ||
       (address.role !== undefined && typeof address.role !== "string") || !sameRecipientLane(address, recipient)) return false;

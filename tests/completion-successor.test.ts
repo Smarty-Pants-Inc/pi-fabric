@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -637,6 +638,7 @@ describe("round 3 completion fences", () => {
 });
 
 describe("round 2 completion security", () => {
+  const legacyClaimKey = (id: string) => `residency/completion-claims/${createHash("sha256").update(id).digest("hex")}`;
   it.each(["cwd", "role"] as const)("F1: unrelated %s gets bounded list/status/wait, original live or dead", async lane => {
     for (const originalLive of [true, false]) {
       const h = harness(); saveCompletion(h.meshRoot, h.recipient, { ...h.result, task: "PRIVATE_TASK", error: "PRIVATE_ERROR", value: { secret: "PRIVATE_STRUCTURED" }, stderr: "PRIVATE_STDERR" });
@@ -685,6 +687,29 @@ describe("round 2 completion security", () => {
     expect(b.client.statusAgent(h.result.id)).toMatchObject({ text: h.result.text });
     const c = h.client("C", 300); h.setLive([h.participant("C", 300)]);
     expect(() => c.client.statusAgent(h.result.id)).toThrow(/Unknown durable Fabric agent/); // Consumed body was pruned.
+  });
+
+  it("F1: legacy predecessor envelope survives a live lease and retires after expiry", async () => {
+    const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); consumeCompletion(h.meshRoot, h.result.id, "A");
+    const key = legacyClaimKey(h.result.id);
+    await h.mesh.put({ key, ifVersion: 0, identity: { id: "session:A", name: "main", kind: "main" }, value: { rootId: "session:A", sessionId: "A" } });
+    h.setLive([h.participant("A", 100), h.participant("B", 200)]);
+    const b = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, h.participants, h.mesh, () => {});
+    await b.drain(false);
+    expect(fs.existsSync(path.join(h.meshRoot, "agent-completions", `${createHash("sha256").update(h.result.id).digest("hex")}.json`))).toBe(true);
+    expect(h.mesh.get(key)).toBeDefined();
+    h.setLive([h.participant("B", 200)]); await b.drain(false);
+    expect(h.mesh.get(key)).toBeUndefined(); expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(0);
+  });
+
+  it("F1: legacy A-addressed envelope with B-owned receipt is retired by C", async () => {
+    const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); consumeCompletion(h.meshRoot, h.result.id, "B");
+    const key = legacyClaimKey(h.result.id);
+    await h.mesh.put({ key, ifVersion: 0, identity: { id: "session:B", name: "main", kind: "main" }, value: { rootId: "session:B", sessionId: "B" } });
+    h.setLive([h.participant("C", 300)]);
+    const c = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:C", sessionId: "C", startedAt: 300 }, h.participants, h.mesh, () => {});
+    await c.drain(false);
+    expect(h.mesh.get(key)).toBeUndefined(); expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(0);
   });
 
   it.each(["failed", "stopped"] as const)("F2: retryable %s worker attempt is not a settled completion", async status => {

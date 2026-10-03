@@ -28,11 +28,15 @@ describe("smarty-role Main identity (#3860)", () => {
     [undefined, undefined, "main"], [undefined, "project-agent@abcdef123456", "main"],
     [undefined, "fabric-v2@abcdef123456", "main"], ["", "project-agent@x", "main"],
     ["  ", "project-agent@x", "main"], ["light", "project-agent@x", "light"],
-    [" capacity-lead ", "project-agent@x", "capacity-lead"],
+    [" capacity-lead ", "project-agent@x", "main"],
     ["fabric-v2", "project-agent@abcdef123456", "fabric-v2"],
     ["bad/name", "project-agent@x", "main"], ["fabric-v2@abcdef123456", undefined, "main"],
-    ["a".repeat(60), undefined, "a".repeat(60)], ["a".repeat(61), undefined, "main"],
-    ["_lead", undefined, "main"], ["lead\nother", undefined, "main"],
+    ["a".repeat(60), undefined, "a".repeat(60)], ["a".repeat(61), undefined, "a".repeat(61)],
+    ["a".repeat(64), undefined, "a".repeat(64)], ["a".repeat(65), undefined, "main"],
+    ["_lead", undefined, "_lead"], ["-lead", undefined, "-lead"], [".lead", undefined, "main"],
+    ["A", undefined, "A"], ["_", undefined, "_"], ["-", undefined, "-"],
+    [".", undefined, "main"], ["é", undefined, "main"], ["lead\r", undefined, "main"],
+    ["Lead One", undefined, "main"], ["lead\n", undefined, "main"], ["lead\nother", undefined, "main"],
   ])("resolves SMARTY_AGENT_NAME=%j SMARTY_ROLE=%j to %j on both identity paths", (agentName, role, name) => {
     const environment = { SMARTY_AGENT_NAME: agentName, SMARTY_ROLE: role, PI_FABRIC_ROLE: "project-agent" };
     const identity = { id: "session:current", name, kind: "main", sessionId: "current" };
@@ -41,6 +45,15 @@ describe("smarty-role Main identity (#3860)", () => {
       expect(resolve("current", environment)).toEqual({ identity, mainAgentId: identity.id });
     }
     expect(rootParticipantName(undefined, environment)).toBe(name);
+  });
+
+  it.each([
+    { PI_FABRIC_PARENT_RUN: "run-child" }, { PI_FABRIC_ACTOR_ID: "actor-child" },
+    { PI_FABRIC_TASK_PROCESS_CHILD: "1" }, { PI_FABRIC_DEPTH: "1" },
+  ])("ignores a parent's launch name in child environments %j", (markers) => {
+    const environment = { SMARTY_AGENT_NAME: "parent-lead", ...markers };
+    expect(rootParticipantName(undefined, environment)).toBe("main");
+    expect(rootParticipantName("child-session", environment)).toBe("child-session");
   });
 
   it("prefers the validated launch agent name without changing child identities", () => {

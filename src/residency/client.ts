@@ -1,3 +1,4 @@
+import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
 import { randomUUID } from "node:crypto";
 import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
@@ -34,6 +35,8 @@ import {
   acknowledgeResidentResponse,
   residentCommandForOwner,
   ResidentActorAuthorizationError,
+  assertResidentTaskCaller,
+  type ResidentTaskCaller,
   ResidentCommandUnsupportedError,
   assertResidentCommandSupported,
   prepareResidentCreationCommand,
@@ -160,6 +163,7 @@ export class ResidencyClient {
   readonly #responsesPath: string;
   readonly #agentsPath: string;
   readonly #inheritedToolAllowlist = readChildToolAllowlist();
+  readonly #spawnPolicy = snapshotTaskReturnAddress(undefined, undefined, undefined);
   readonly #deliveryPrefix: string;
   readonly #hostPath: string;
   readonly #completions: CompletionJournal;
@@ -460,6 +464,19 @@ export class ResidencyClient {
   }
 
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
+    // Capture at the public call from the host-owned participant, never from request fields.
+    // Snapshot policy at runtime construction, before a task can change ambient state.
+    const self = this.options.participants.self();
+    const caller: ResidentTaskCaller = {
+      id: self.id, rootId: self.rootId, sessionId: self.sessionId ?? "",
+      ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind,
+      returnAddress: {
+        spawnerId: self.id, spawnerSessionId: self.sessionId ?? "",
+        ancestors: [...new Set([...this.#spawnPolicy.ancestors, this.options.config.rootId])],
+        escalationTargets: [...this.#spawnPolicy.escalationTargets],
+      },
+    };
+    assertResidentTaskCaller(caller, self, this.options.config.rootId);
     // Explicit keys are checked against the loaded owner before dispatch.
     const { idempotencyKey, ...spawnRequest } = request;
     const resolvedRequest = spawnRequest.cwd === undefined
@@ -473,11 +490,12 @@ export class ResidencyClient {
     const response = await this.#command(
       {
         format: RESIDENT_HOST_FORMAT,
-        operation: "spawn",
+        operation: "spawnBound",
         ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
         requestId: randomUUID(),
         rootId: this.options.config.rootId,
         request: { ...resolvedRequest, ...(tools ? { tools } : {}), residency: "durable" },
+        caller,
         createdAt: Date.now(),
       },
       signal,
@@ -485,8 +503,8 @@ export class ResidencyClient {
     if (!response.handle) throw new Error("Fabric resident host returned no agent handle");
     await this.#waitForParticipant(response.handle.id, "agent", signal).catch((error) => {
       throw new ResidentOutcomeUnknownError({
-        format: RESIDENT_HOST_FORMAT, operation: "spawn", requestId: response.requestId,
-        rootId: this.options.config.rootId, request, createdAt: Date.now(),
+        format: RESIDENT_HOST_FORMAT, operation: "spawnBound", requestId: response.requestId,
+        rootId: this.options.config.rootId, request, caller, createdAt: Date.now(),
       }, { requestId: response.requestId, state: "committed", id: response.handle!.id, ownerHostId: this.hostId }, error, signal);
     });
     return response.handle;
@@ -674,7 +692,10 @@ export class ResidencyClient {
     if (!("startedAt" in status) || !terminal(status.status)) {
       throw new Error(`Cannot clean up running durable Fabric agent ${metadata.id}`);
     }
-    const exitVeto = runTreeExitVeto(metadata.runDirectory);
+    // A proven absent tree has no descendant files left to remove (saved-result
+    // cleanup). Other stat errors fail closed; every existing tree needs strict exit evidence.
+    const runDirectoryPresent = fs.lstatSync(metadata.runDirectory, { throwIfNoEntry: false }) !== undefined;
+    const exitVeto = runDirectoryPresent ? runTreeExitVeto(metadata.runDirectory, 0, undefined, true) : undefined;
     if (exitVeto) {
       throw new Error(
         `Cannot clean up durable Fabric agent ${metadata.id}: ${exitVeto} ` +
@@ -714,7 +735,7 @@ export class ResidencyClient {
         commit();
       }
       throwIfAborted(signal);
-      fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
+      if (runDirectoryPresent) fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
       fs.rmSync(this.#metadataPath(metadata.id), { force: true });
       fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
       this.#completions.forget(metadata.id);
@@ -761,7 +782,7 @@ export class ResidencyClient {
             }
             throw new Error(response.error ?? "Fabric resident host rejected request");
           }
-          if ((command.operation === "spawn" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
+          if ((command.operation === "spawnBound" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
             throw new Error("Fabric resident host returned no created entity");
           }
           return response;

@@ -1,5 +1,6 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { markUnresolvedWorker } from "../src/storage/retention.js";
+import { hasUnresolvedWorker, markUnresolvedWorker } from "../src/storage/retention.js";
+import { retainedProcessStates, retainedProcessWorker } from "./helpers/retained-process-worker.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -554,7 +555,7 @@ describe("durable completion receipts", () => {
     fs.mkdirSync(agentsPath, { recursive: true });
     const result = {
       id, name: "durable worker", status, text: "authoritative full result", task: "work",
-      runner: "pi", transport: "process", cwd: state.root, startedAt: 1, updatedAt: 2, finishedAt: 2,
+      runner: "pi", transport: "process", sessionId: "2147483647", cwd: state.root, startedAt: 1, updatedAt: 2, finishedAt: 2,
       turns: 1, toolCalls: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     };
     fs.writeFileSync(path.join(runDirectory, "status.json"), JSON.stringify(result));
@@ -1180,6 +1181,66 @@ describe("durable completion receipts", () => {
     }
   }, 15_000);
 
+  // smarty-dev#3148: public fallback must inspect process descendants, not only the parent.
+  it.each(retainedProcessStates.flatMap(state => (["closed", "unknown"] as const).map(route => ({ state, route }))))(
+    "vetoes public nested process $state cleanup after host $route until exit is confirmed", async ({ state: childState, route }) => {
+      const state = await rootHarness(`nested-process-cleanup-${childState}-${route}`);
+      const source = path.join(state.root, "source"); initRepository(source);
+      const seeded = await seedCompletion(state, "completed");
+      const branch = `pi-fabric/nested-process-${seeded.id.slice(0, 8)}`;
+      const worktree = path.join(source, ".pi", "fabric", "worktrees", seeded.id);
+      fs.mkdirSync(path.dirname(worktree), { recursive: true });
+      git(source, "worktree", "add", "-q", "-b", branch, worktree, "HEAD");
+      const record = { ...seeded.result, cwd: worktree };
+      fs.writeFileSync(path.join(seeded.runDirectory, "status.json"), JSON.stringify(record));
+      const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8"));
+      fs.writeFileSync(seeded.metadataPath, JSON.stringify({ ...metadata, handle: { ...record, worktree, branch }, worktreeGitRoot: source }));
+      const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
+      fs.mkdirSync(path.dirname(resultPath), { recursive: true }); fs.writeFileSync(resultPath, JSON.stringify(record));
+      const host = new ResidentHost(state.config);
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+      const agents = new AgentManager(repo, { ...state.config.agents, budgetUsd: 0, nice: 19 }, { workerPath: fakeWorker, runRoot: path.join(state.root, "session-runs") });
+      const actors = new ActorManager(state.config.sessionId, state.identity, state.mesh, state.meshConfig, agents, () => {}, { actorRoot: path.join(state.root, "session-actors"), persistent: true });
+      const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants, { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+      const provider = new AgentsProvider(agents, actors, new GlobalActorRegistry(state.root, 64 * 1024), state.mainAgent, state.participants, undefined, lifecycle, () => false, client);
+      const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "public-nested-process-cleanup", nestedToolCallId: "cleanup", extensionContext: {} as ExtensionContext, update() {} };
+      const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
+      const join = vi.spyOn(AgentManager.prototype, "join");
+      let child: Awaited<ReturnType<typeof retainedProcessWorker>> | undefined;
+      const invoke = () => provider.invoke("cleanup", { id: seeded.id, deleteBranch: true }, context);
+      try {
+        await host.start();
+        if (route === "closed") await host.close();
+        child = await retainedProcessWorker(path.join(seeded.runDirectory, "nested", "process-child"), worktree, childState);
+        if (childState === "missing-identity") {
+          const published = JSON.parse(fs.readFileSync(child.statusFile, "utf8"));
+          expect(published).toMatchObject({ status: "completed", transport: "process" });
+          expect(published).not.toHaveProperty("sessionId");
+        }
+        expect(hasUnresolvedWorker(seeded.runDirectory)).toBe(false);
+        await expect(invoke()).rejects.toThrow(/exit.*unconfirmed/);
+        expect(join).toHaveBeenCalledTimes(route === "unknown" ? 1 : 0);
+        expect(cleanup).not.toHaveBeenCalled();
+        expect(child.worker.exitCode).toBeNull(); expect(child.worker.signalCode).toBeNull();
+        for (const file of [seeded.runDirectory, child.taskFile, child.statusFile, seeded.metadataPath, resultPath, worktree]) expect(fs.existsSync(file)).toBe(true);
+        expect(worktreeBranches(source)).toContain(branch);
+        const decisions = path.join(state.config.residencyRoot, "decisions");
+        const committed = fs.existsSync(decisions) ? fs.readdirSync(decisions).map(name => JSON.parse(fs.readFileSync(path.join(decisions, name), "utf8"))).filter(decision => decision.state === "committed") : [];
+        expect(committed).toEqual([]);
+        await child.stop();
+        if (childState !== "terminal-live") await expect(invoke()).rejects.toThrow(/exit.*unconfirmed/);
+        child.confirmExit();
+        expect(await invoke()).toEqual({ cleaned: true });
+        for (const file of [seeded.runDirectory, seeded.metadataPath, resultPath, worktree]) expect(fs.existsSync(file)).toBe(false);
+        expect(worktreeBranches(source)).not.toContain(branch);
+        expect(git(source, "branch", "--list", branch)).toBe("");
+      } finally {
+        await child?.stop(); cleanup.mockRestore(); join.mockRestore();
+        await client.close(); await host.close(); await actors.close(); await agents.close(); await lifecycle.close(); await state.participants.close();
+      }
+    }, 20_000,
+  );
+
   it("refuses the fallback cleanup of a completed durable run whose nested child is marked", async () => {
     const state = await rootHarness("unresolved-nested-cleanup");
     const seeded = await seedCompletion(state, "completed");
@@ -1607,7 +1668,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     }
   });
 
-  it.skipIf(process.platform !== "linux")("replaces owner and host lock whose live PID has a different start time", { timeout: 45_000 }, async () => {
+  it.skipIf(process.platform !== "linux" || !fs.existsSync(`/proc/${process.pid}/stat`))("replaces owner and host lock whose live PID has a different start time", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-reused-pid");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh,
       participants: state.participants, mainAgent: state.mainAgent, hostPath });
@@ -2588,6 +2649,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       status: "completed",
       runner: "pi",
       transport: "process",
+      sessionId: "2147483647", // Confirmed-absent parent: exercise the worktree fence, not the exit veto.
       cwd: worktree,
       startedAt: 1,
       updatedAt: 1,

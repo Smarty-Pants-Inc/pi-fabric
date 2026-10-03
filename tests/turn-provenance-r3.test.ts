@@ -64,6 +64,10 @@ const recording = (turnProvenance: unknown = 1) => {
     ui: { notify: vi.fn(), setStatus: vi.fn() },
   } as unknown as ExtensionContext;
   const emit = async (name: string, event: any = {}) => {
+    if (name === "before_agent_start") {
+      event.systemPromptOptions ??= {};
+      event.systemPromptOptions.sections ??= {};
+    }
     const results = [];
     for (const handler of handlers.get(name) ?? []) results.push(await handler(event, context));
     return results;

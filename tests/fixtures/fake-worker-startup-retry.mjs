@@ -25,6 +25,12 @@ if (task === "Recover pinned Pi startup") {
   fs.appendFileSync(path.join(path.dirname(statusFile), "pi-launches.jsonl"), JSON.stringify({ binary, turnProvenance }) + "\n");
 }
 const failed = capabilityMissing || windowRefusal || (retryable ? attempts === 1 : true);
+// Terminal UI status is not an exit receipt: publish this worker's own identity.
+const identity = args.get("transport") === "process" ? { sessionId: String(process.pid) } : {};
+if (args.get("transport") === "process" && process.platform === "linux") {
+  const stat = fs.readFileSync("/proc/" + process.pid + "/stat", "utf8");
+  identity.processStartTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+}
 fs.writeFileSync(
   statusFile,
   JSON.stringify({
@@ -34,6 +40,7 @@ fs.writeFileSync(
     status: failed ? "failed" : "completed",
     runner: args.get("runner") ?? "pi",
     transport: args.get("transport"),
+    ...identity,
     cwd: args.get("cwd"),
     startedAt: now,
     updatedAt: now,

@@ -2,10 +2,25 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { AgentRunResult } from "../src/agents/types.js";
+
+// Capture the exact owned native instances, including taskkill helpers. A
+// manager's terminal result/liveness latch is not proof its handles closed.
+const ownedProcesses: Array<{ pid: number | undefined; closed: Promise<void>; didClose: () => boolean }> = [];
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn((...args: Parameters<typeof spawn>) => {
+    const child = actual.spawn(...args);
+    let didClose = false;
+    const closed = new Promise<void>(resolve => child.once("close", () => { didClose = true; resolve(); }));
+    ownedProcesses.push({ pid: child.pid, closed, didClose: () => didClose });
+    return child;
+  }) };
+});
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -21,6 +36,44 @@ const until = async (ready: () => boolean): Promise<void> => {
 const entries = (file: string): Array<Record<string, any>> => fs.existsSync(file)
   ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
 const events = (result: { logFile?: string }) => entries(result.logFile!);
+// Use the test's own timeout/abort, not a shorter startup+retry polling budget.
+// Watch the run directory so creating/replacing events.jsonl is observed too.
+const waitForEvent = async (manager: Pick<AgentManager, "wait">, id: string, file: string,
+  matches: (event: Record<string, any>) => boolean, signal: AbortSignal): Promise<void> => {
+  let active = true;
+  let check!: () => void;
+  const watcher = fs.watch(path.dirname(file), () => check());
+  const closed = new Promise<void>(resolve => watcher.once("close", resolve));
+  let abort!: () => void;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      check = () => {
+        if (!active) return;
+        try {
+          // A filesystem notification can race the final newline of an append.
+          const complete = fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").slice(0, -1) : [];
+          if (complete.filter(Boolean).map(line => JSON.parse(line)).some(matches)) resolve();
+        } catch (error) { reject(error); }
+      };
+      abort = () => reject(signal.reason ?? new Error("Native Pi event wait aborted"));
+      watcher.once("error", reject);
+      signal.addEventListener("abort", abort, { once: true });
+      // A terminal run cannot ever produce the required backoff evidence.
+      void manager.wait(id).then(result => {
+        if (!active) return;
+        check();
+        reject(new Error(`Native Pi exited before required backoff event: ${explain(result)}`));
+      }, reject);
+      check(); // Also cover an event written before the watcher was installed.
+      if (signal.aborted) abort();
+    });
+  } finally {
+    active = false;
+    signal.removeEventListener("abort", abort);
+    watcher.close();
+    await closed;
+  }
+};
 const explain = (result: AgentRunResult) => JSON.stringify(result) + "\n" + fs.readFileSync(result.logFile!, "utf8").slice(-16_000);
 const evidence = (name: string, result: AgentRunResult) => {
   const directory = process.env.FABRIC_OVERLOAD_TEST_EVIDENCE_DIR;
@@ -34,6 +87,7 @@ const evidence = (name: string, result: AgentRunResult) => {
 };
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
+  await Promise.all(ownedProcesses.splice(0).map(({ closed }) => closed));
   await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -99,6 +153,48 @@ const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "dis
   const spawn = () => manager.spawn({ task: "Finish ORIGINAL_TASK, preserving completed work.", model: "overload-test/offline", tools: [], extensions: false, transport: "process" });
   return { dir, manager, requests, settingsFile, settings, spawn, releaseOverload };
 };
+
+describe("native backoff evidence wait", () => {
+  const fixture = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-overload-event-")); roots.push(root);
+    const file = path.join(root, "events.jsonl");
+    const manager = { wait: vi.fn(() => new Promise<AgentRunResult>(() => {})) };
+    const matches = (event: Record<string, any>) => event.type === "auto_retry_start" && event.delayMs >= 4000;
+    return { file, manager, matches, abort: new AbortController() };
+  };
+  it("observes already-written retry evidence", async () => {
+    const s = fixture();
+    fs.writeFileSync(s.file, JSON.stringify({ type: "auto_retry_start", delayMs: 4000 }) + "\n");
+    await waitForEvent(s.manager, "test", s.file, s.matches, s.abort.signal);
+  });
+  it("keeps waiting beyond the old 30-second budget and requires a complete matching event", async () => {
+    const s = fixture();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const waiting = waitForEvent(s.manager, "test", s.file, s.matches, s.abort.signal);
+    let arrived = false;
+    void waiting.then(() => { arrived = true; });
+    try {
+      fs.writeFileSync(s.file, JSON.stringify({ type: "auto_retry_start", delayMs: 2000 }) + "\n");
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(arrived).toBe(false);
+      // The watcher may see a partial append; only the newline commits it.
+      fs.appendFileSync(s.file, JSON.stringify({ type: "auto_retry_start", delayMs: 4000 }));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(arrived).toBe(false);
+      fs.appendFileSync(s.file, "\n");
+      await waiting;
+      expect(arrived).toBe(true);
+    } finally { vi.useRealTimers(); s.abort.abort(); await waiting.catch(() => {}); }
+  });
+  it("disposes its watcher when the test timeout aborts the wait", async () => {
+    const s = fixture();
+    const waiting = waitForEvent(s.manager, "test", s.file, s.matches, s.abort.signal);
+    const assertion = expect(waiting).rejects.toThrow("test timed out");
+    s.abort.abort(new Error("test timed out"));
+    await assertion;
+    // afterEach can now delete the watched root even on Windows.
+  });
+});
 
 describe("real Pi process provider recovery (offline localhost)", () => {
   it("survives a 90-second scaled overload burst in one native session, with no kill", async () => {
@@ -234,20 +330,22 @@ describe("real Pi process provider recovery (offline localhost)", () => {
     expect(events(result).filter(event => event.type === "fabric_provider_resume" && event.phase === "starting").map(event => event.delayMs)).toEqual([1500, 3000, 6000]);
   }, 120_000);
 
-  it.each(["native retry", "transport resume"])("stops promptly during %s backoff, with no later resume", async backoff => {
+  it.for(["native retry", "transport resume"])("stops promptly during %s backoff, with no later resume", { timeout: 120_000 }, async (backoff, { signal }) => {
     const s = await setup("forever", backoff === "transport resume" ? { maxRetries: 0 } : undefined);
     const handle = await s.spawn();
     const logFile = path.join(s.dir, "runs", handle.id, "events.jsonl");
-    await until(() => entries(logFile).some(event => backoff === "native retry"
+    await waitForEvent(s.manager, handle.id, logFile, event => backoff === "native retry"
       ? event.type === "auto_retry_start" && event.delayMs >= 4000
-      : event.type === "fabric_provider_resume" && event.phase === "scheduled"));
+      : event.type === "fabric_provider_resume" && event.phase === "scheduled", signal);
+    const worker = ownedProcesses.find(child => String(child.pid) === handle.sessionId)!;
     const before = Date.now(); await s.manager.stop(handle.id);
+    expect(worker.didClose(), "stop must join the owned native worker close").toBe(true);
     const result = await s.manager.wait(handle.id); evidence(backoff.replace(" ", "-"), result);
     expect(result, explain(result)).toMatchObject({ status: "stopped" });
     expect(Date.now() - before).toBeLessThan(2000);
     expect(events(result).some(event => event.type === "fabric_provider_resume" && event.phase === "starting")).toBe(false);
     expect(result.runnerSessionIds).toHaveLength(1);
-  }, 120_000);
+  });
 
   it("never resumes a nonretryable 400 response", async () => {
     const s = await setup("400"); const handle = await s.spawn();

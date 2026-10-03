@@ -3,7 +3,7 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, writeFileAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
@@ -77,6 +77,7 @@ export interface MeshStoreOptions {
   maxStateBytes?: number;
   maxStateTombstones?: number;
   lockTimeoutMs?: number;
+  /** Grace for an empty ownerless directory; recorded live owners never expire. Default 30 s. */
   staleLockMs?: number;
   /**
    * Reads (get, list, listAll) reuse the last parsed state for up to this long, even when
@@ -165,19 +166,9 @@ const processAlive = (pid: number): boolean => {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return errorCode(error) === "EPERM"; // A process we cannot signal is not a dead holder.
-  }
-};
-
-/** Linux's PID incarnation; unavailable platforms/reads retain the legacy live-PID guard. */
-const processStartTime = (pid: number): string | undefined => {
-  if (process.platform !== "linux") return undefined;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const start = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
-    return start && /^\d+$/.test(start) ? start : undefined;
-  } catch {
-    return undefined;
+    // Only the native no-such-process result proves death. Permission denial and
+    // unexpected/unknown probe failures must not authorize detaching a live holder.
+    return errorCode(error) !== "ESRCH";
   }
 };
 
@@ -481,6 +472,8 @@ export type MeshBatchOperation =
       kind: "put";
       key: string;
       value: unknown | ((now: number) => unknown);
+      /** Overrides the batch identity for a multi-owner transaction (e.g. bridge presence). */
+      identity?: MeshIdentity;
       ifVersion?: number;
       onConflict?: "skip" | "abort" | ((current: MeshStateEntry | undefined) => "skip" | "abort");
     }
@@ -496,6 +489,13 @@ export type MeshBatchOperation =
        */
       condition?: (current: (key: string) => MeshStateEntry | undefined) => boolean;
     };
+
+export interface MeshBatchView {
+  get(key: string): MeshStateEntry | undefined;
+  listAll(prefix: string): MeshStateEntry[];
+  /** Includes an absent key's retained CAS tombstone. */
+  version(key: string): number;
+}
 
 export interface MeshBatchResult {
   key: string;
@@ -1383,13 +1383,18 @@ export class MeshStore {
   // compare-and-swap. On a version mismatch, `onConflict` decides: "skip" leaves that
   // key alone, "abort" writes nothing at all and rejects. A put value may be a function,
   // evaluated under the lock at commit time (for timestamps such as lease stamps).
+  // A synchronous prepare callback builds ops from the authoritative snapshot under the same lock. Its
+  // view returns copies, never mutable state. afterCommit runs under that lock after a successful
+  // commit (also for a no-op batch), for ownership-bound file leases; it must not call store writers.
   // Returns one result per operation, in order.
   async writeBatch(input: {
     identity: MeshIdentity;
     ops: MeshBatchOperation[];
+    prepare?: (view: MeshBatchView) => MeshBatchOperation[];
+    afterCommit?: (view: MeshBatchView) => void;
   }): Promise<MeshBatchResult[]> {
     for (const op of input.ops) this.#validateKey(op.key);
-    if (input.ops.length === 0) return [];
+    if (input.ops.length === 0 && !input.prepare && !input.afterCommit) return [];
     return this.#withLock(() => {
       // Each operation takes the same verified transition as put()/delete(), so a batch
       // advances the persistent clock exactly as the single writes would, and damaged
@@ -1402,7 +1407,15 @@ export class MeshStore {
       const now = Date.now();
       const current = (key: string): MeshStateEntry | undefined =>
         Object.hasOwn(state.entries, key) ? jsonClone(state.entries[key]) : undefined;
-      for (const op of input.ops) {
+      const view: MeshBatchView = {
+        get: current,
+        listAll: (prefix) => Object.keys(state.entries).filter((key) => key.startsWith(prefix))
+          .sort((left, right) => left.localeCompare(right)).map((key) => jsonClone(state.entries[key]!)),
+        version: (key) => stateSlot(state, key).version,
+      };
+      const ops = [...input.ops, ...(input.prepare?.(view) ?? [])];
+      for (const op of ops) this.#validateKey(op.key);
+      for (const op of ops) {
         const slot = stateSlot(state, op.key);
         const existing = state.entries[op.key];
         if (op.kind === "delete" && op.condition && !op.condition(current)) {
@@ -1425,7 +1438,7 @@ export class MeshStore {
             key: op.key,
             ifVersion: op.ifVersion,
             value: typeof op.value === "function" ? (op.value as (now: number) => unknown)(now) : op.value,
-            identity: input.identity,
+            identity: op.identity ?? input.identity,
           }, this.maxEventBytes);
         const plan = request.transition(slot.present, slot.version, slot.highWater);
         if (plan.kind === "unchanged") {
@@ -1451,11 +1464,12 @@ export class MeshStore {
       }
       if (!changed) {
         this.#cacheState(state, undefined);
-        return results;
+      } else {
+        state.tombstoneOrder = [...tombstones];
+        compactStateTombstones(state, this.#maxStateTombstones);
+        this.#commitState(state, reuse);
       }
-      state.tombstoneOrder = [...tombstones];
-      compactStateTombstones(state, this.#maxStateTombstones);
-      this.#commitState(state, reuse);
+      input.afterCommit?.(view);
       return results;
     });
   }
@@ -1566,7 +1580,7 @@ export class MeshStore {
     const deadline = Date.now() + this.#lockTimeoutMs;
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
-    const startTime = this.#lockProtocol === 2 ? processStartTime(process.pid) : undefined;
+    const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     // Attempts and the largest gap between two of them: a large gap means this waiter stalled
     // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -1581,11 +1595,27 @@ export class MeshStore {
       lastAttemptAt = attemptAt;
       try {
         if (this.#lockProtocol === 1) {
-          // B68 wire: exclusive canonical mkdir, then a three-line owner at that name.
+          // Keep the B68 three-line wire, but never overwrite an owner published by a
+          // successor while this initializer was stopped after canonical mkdir.
           fs.mkdirSync(this.#lockPath, { mode: 0o700 });
-          fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
-            encoding: "utf8", mode: 0o600,
+          const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
+            code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
           });
+          try {
+            const directory = fs.lstatSync(this.#lockPath);
+            fs.writeFileSync(ownerPath, ownerRecord, {
+              encoding: "utf8", flag: "wx", mode: 0o600,
+            });
+            // The exclusive create may itself have paused with an open descriptor to a
+            // recovered directory. Prove publication still belongs to the canonical lock
+            // before entering the critical section; never clean a successor on failure.
+            const current = fs.lstatSync(this.#lockPath);
+            if (!current.isDirectory() || current.dev !== directory.dev || current.ino !== directory.ino ||
+              fs.readFileSync(ownerPath, "utf8") !== ownerRecord) throw ownershipLost();
+          } catch (error) {
+            if (errorCode(error) === "EEXIST" || errorCode(error) === "ENOENT") throw ownershipLost();
+            throw error;
+          }
         } else {
           // Never expose an ownerless canonical directory: a stalled initializer must not
           // resume its owner write through a name that legacy recovery gave to a successor.
@@ -1615,7 +1645,7 @@ export class MeshStore {
         const code = errorCode(error);
         if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
           (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
-        if (this.#clearStaleLock(ownerPath)) continue;
+        if (await this.#clearStaleLock(ownerPath)) continue;
         if (Date.now() >= deadline) {
           throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
         }
@@ -1636,11 +1666,7 @@ export class MeshStore {
     } finally {
       try {
         const owner = fs.readFileSync(ownerPath, "utf8");
-        if (this.#lockProtocol === 1) {
-          if (owner.startsWith(`${token}\n`)) {
-            fs.rmSync(this.#lockPath, { recursive: true, force: true });
-          }
-        } else if (owner === ownerRecord) {
+        if (owner === ownerRecord) {
           // Detach the complete owned directory before unlinking anything inside it.
           // Interrupted/resumed recursive cleanup must never follow the canonical name.
           const released = `${this.#lockPath}.released.${token}`;
@@ -1653,10 +1679,11 @@ export class MeshStore {
     }
   }
 
-  // Dead holders are recoverable at once; only missing/corrupt records need the stale
-  // directory window. A live PID (including stopped/permission-denied) remains protected,
-  // unless Linux proves it is a different incarnation from the optional fourth owner line.
-  #clearStaleLock(ownerPath: string): boolean {
+  // Complete dead/different-incarnation receipts recover immediately. Empty ownerless
+  // directories recover only after the grace, using atomic rmdir (never recursive removal
+  // or rename): an owner published after our last comparison makes rmdir fail closed.
+  // Torn/corrupt receipts and nonempty unrecorded directories remain protected.
+  async #clearStaleLock(ownerPath: string): Promise<boolean> {
     try {
       const stat = fs.lstatSync(this.#lockPath);
       if (!stat.isDirectory()) return false;
@@ -1665,34 +1692,43 @@ export class MeshStore {
         catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
       };
       const owner = readOwner();
-      const [token, pidText, createdText, startText] = owner?.trim().split("\n") ?? [];
+      if (owner === undefined) {
+        if (Date.now() - stat.mtimeMs <= this.#staleLockMs) return false;
+        const current = fs.lstatSync(this.#lockPath);
+        if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino ||
+          current.mtimeMs !== stat.mtimeMs || readOwner() !== undefined) return false;
+        // Native emptiness is the final fence, including against an initializer that
+        // publishes and enters while this recoverer is paused at the removal syscall.
+        fs.rmdirSync(this.#lockPath);
+        // Retain a nonempty recovery receipt, without ever renaming a live canonical.
+        // Inode reuse may revisit the same receipt; that must not undo successful recovery.
+        const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:`).digest("hex")}`;
+        fs.mkdirSync(fence, { recursive: true, mode: 0o700 });
+        try { fs.writeFileSync(path.join(fence, ".recovery-fence"), "1\n", { flag: "wx", mode: 0o600 }); }
+        catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
+        return true;
+      }
+      const fields = owner.split("\n");
+      const [token, pidText, createdText, startText] = fields;
       // An in-flight/torn fourth line is not evidence of PID reuse.
       const recordedStart = owner?.endsWith("\n") ? startText : undefined;
       const pid = Number(pidText);
       const validPid = Number.isSafeInteger(pid) && pid > 0;
-      const validOwner = !!token && validPid && createdText !== undefined &&
+      const validOwner = owner?.endsWith("\n") && (fields.length === 4 || fields.length === 5) &&
+        !!token && validPid && createdText !== undefined &&
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
-      if (validPid && processAlive(pid)) {
-        if (!validOwner || !recordedStart || !/^\d+$/.test(recordedStart)) return false;
-        const actualStart = processStartTime(pid);
+      if (!validOwner) return false;
+      if (processAlive(pid)) {
+        if (!validProcessIncarnation(recordedStart)) return false;
+        const actualStart = await processIncarnation(pid);
         if (!actualStart || actualStart === recordedStart) return false;
-      } else if (!validOwner && Date.now() - stat.mtimeMs <= this.#staleLockMs) {
-        return false;
       }
       const unchanged = (): boolean => {
         const current = fs.lstatSync(this.#lockPath);
         return current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino && readOwner() === owner;
       };
       if (!unchanged()) return false;
-      if (owner === undefined) {
-        // An empty orphan must also leave a NONEMPTY fence. Never overwrite an owner;
-        // identity/owner rechecks reject a successor even if this marker raced its mkdir.
-        if (fs.statSync(this.#lockPath).mtimeMs !== stat.mtimeMs) return false;
-        try { fs.writeFileSync(path.join(this.#lockPath, ".recovery-fence"), "1\n", { flag: "wx", mode: 0o600 }); }
-        catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
-      }
-      if (!unchanged()) return false;
-      const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner ?? ""}`).digest("hex")}`;
+      const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
       // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner
       // cannot rename a successor over the same fence (native EEXIST/ENOTEMPTY). Deleting
       // it, or recursively deleting the canonical name after a re-read, reopens that race.

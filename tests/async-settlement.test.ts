@@ -7,6 +7,9 @@ import type { FabricSandboxResult } from "../src/runtime/kernel.js";
 import { commitResidentRequest, registerResidentCancellation, ResidentOutcomeUnknownError, type ResidentCommand } from "../src/residency/protocol.js";
 
 const roots: string[] = [];
+// Receipt-only fixture: no host dispatch. Keep the bound command's typed ABI.
+const caller = { id: "root", rootId: "root", sessionId: "native-main", ownerHostId: "root", ownerIdentityId: "root", kind: "root" as const,
+  returnAddress: { spawnerId: "root", spawnerSessionId: "native-main", ancestors: ["root"], escalationTargets: [] } };
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 describe("cancellation effect settlement", () => {
@@ -63,7 +66,7 @@ describe("cancellation effect settlement", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cancellation-effects-")); roots.push(root);
     const controller = new AbortController();
     for (const id of ["first", "second"]) {
-      const command: ResidentCommand = { format: 1, operation: "spawn", requestId: `request-${id}`, rootId: "root", createdAt: 1, request: { task: id } };
+      const command: ResidentCommand = { format: 1, operation: "spawnBound", requestId: `request-${id}`, rootId: "root", createdAt: 1, caller, request: { task: id } };
       registerResidentCancellation(controller.signal, root, command);
       commitResidentRequest(root, command, `entity-${id}`, "resident:owner");
     }
@@ -84,7 +87,7 @@ describe("cancellation effect settlement", () => {
     const result: FabricSandboxResult = { value: "lost handle", terminationReason: "runtime_error", logs: ["retained"], error: "verbose guest cause" };
     preserveCancellationOutcome(result, controller.signal);
     expect(result.residentOutcomes).toEqual(["first", "second"].map(id => ({
-      state: "committed", operation: "spawn", entityKind: "agent", requestId: `request-${id}`, id: `entity-${id}`, ownerHostId: "resident:owner",
+      state: "committed", operation: "spawnBound", entityKind: "agent", requestId: `request-${id}`, id: `entity-${id}`, ownerHostId: "resident:owner",
     })));
     // Repeated outer gates must not inflate or replace reconciliation metadata.
     preserveCancellationOutcome(result, controller.signal);
@@ -97,7 +100,7 @@ describe("cancellation effect settlement", () => {
     const unrelated = shareCancellationEffects(AbortSignal.any([shutdown.signal]));
     let fenced = false;
     registerCancellationEffect(child, () => { fenced = true; return new Error("successful sibling must not become uncertain"); });
-    const command: ResidentCommand = { format: 1, operation: "spawn", requestId: "handled-request", rootId: "root", createdAt: 1, request: { task: "work" } };
+    const command: ResidentCommand = { format: 1, operation: "spawnBound", requestId: "handled-request", rootId: "root", createdAt: 1, caller, request: { task: "work" } };
     const decision = { requestId: command.requestId, state: "committed" as const, id: "known-agent", ownerHostId: "resident:owner" };
     const handled = new ResidentOutcomeUnknownError(command, decision, new Error("client deadline"), child);
     const result: FabricSandboxResult = { value: { handle: "successful-sibling", error: String(handled) }, logs: [], terminationReason: "completed" };

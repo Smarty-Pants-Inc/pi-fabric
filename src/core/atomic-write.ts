@@ -1,6 +1,100 @@
 import { randomUUID } from "node:crypto";
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+
+const DARWIN_START = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) {1,2}\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
+
+/** Only identities from this platform's native reader are comparable; unknown stays live. */
+export const validProcessIncarnation = (value: string | undefined, platform = process.platform): boolean => {
+  if (!value) return false;
+  if (platform === "linux") return /^\d+$/.test(value);
+  if (platform === "win32") return /^win32:\d+$/.test(value);
+  if (platform === "darwin") return value.startsWith("darwin:") && DARWIN_START.test(value.slice(7));
+  return false;
+};
+
+export type IncarnationCommandRunner = (
+  executable: string,
+  args: string[],
+  options: { timeout: number; maxBuffer: number; windowsHide: boolean; signal: AbortSignal; env?: NodeJS.ProcessEnv },
+) => Promise<string>;
+
+const runIncarnationCommand: IncarnationCommandRunner = (executable, args, options) => new Promise((resolve, reject) => {
+  childProcess.execFile(executable, args, { ...options, encoding: "utf8" }, (error, stdout) => {
+    if (error) reject(error);
+    else resolve(stdout);
+  });
+});
+
+/** Injectable native reader. No commands run until read/own is actually used. */
+export const createProcessIncarnationReader = (options: {
+  platform: NodeJS.Platform;
+  systemRoot?: string | undefined;
+  run?: IncarnationCommandRunner;
+  timeoutMs?: number;
+}) => {
+  const { platform, systemRoot, run = runIncarnationCommand, timeoutMs = 2_000 } = options;
+  let own: Promise<string | undefined> | undefined;
+  const read = async (pid: number): Promise<string | undefined> => {
+    if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+    try {
+      if (platform === "linux") {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+        const start = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+        return validProcessIncarnation(start, platform) ? start : undefined;
+      }
+      let executable: string;
+      let args: string[];
+      if (platform === "darwin") {
+        executable = "/bin/ps";
+        args = ["-p", String(pid), "-o", "lstart="];
+      } else if (platform === "win32" && systemRoot) {
+        executable = path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+        args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+          `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks.ToString([System.Globalization.CultureInfo]::InvariantCulture)`];
+      } else return undefined;
+      const abort = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      // Independent deadline also bounds injected/broken runners. Abort kills the native
+      // child; late output never becomes evidence. No synchronous spawn on this path.
+      const timeout = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => { abort.abort(); resolve(undefined); }, timeoutMs);
+      });
+      try {
+        const start = await Promise.race([run(executable, args, {
+          timeout: timeoutMs, maxBuffer: 4_096, windowsHide: true, signal: abort.signal,
+          ...(platform === "darwin" ? { env: { ...process.env, LC_ALL: "C", TZ: "UTC" } } : {}),
+        }), timeout]);
+        if (start === undefined) return undefined;
+        const identity = `${platform}:${start.trim()}`;
+        return validProcessIncarnation(identity, platform) ? identity : undefined;
+      } finally { clearTimeout(timer); }
+    } catch { return undefined; }
+  };
+  return {
+    read,
+    // This PID's creation identity cannot change during our lifetime. UNKNOWN is safe
+    // for publication too: it can never justify recovering a live holder.
+    own: (): Promise<string | undefined> => own ??= read(process.pid),
+  };
+};
+
+const readers = new Map<string, ReturnType<typeof createProcessIncarnationReader>>();
+const nativeReader = () => {
+  const key = `${process.platform}:${process.env.SystemRoot ?? ""}`;
+  let reader = readers.get(key);
+  if (!reader) {
+    reader = createProcessIncarnationReader({ platform: process.platform, systemRoot: process.env.SystemRoot });
+    readers.set(key, reader);
+  }
+  return reader;
+};
+
+/** Fresh holder evidence; macOS second-resolution reuse stays conservative. */
+export const processIncarnation = (pid: number): Promise<string | undefined> => nativeReader().read(pid);
+/** Memoized lazily, not at import/registration/session start. */
+export const ownProcessIncarnation = (): Promise<string | undefined> => nativeReader().own();
 
 export interface AtomicWriteOptions {
   // File mode for the committed file (default 0o600) and for mkdir -p of its

@@ -31,7 +31,6 @@ import {
 import { ActorDirectory } from "../actors/directory.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
-import type { AgentRunRecord } from "../agents/types.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
@@ -49,6 +48,7 @@ import {
   RESIDENT_COMMANDS,
   isResidentCommandOperation,
   assertResidentActorMain,
+  assertResidentTaskCaller,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
   commitResidentRequest,
@@ -65,76 +65,43 @@ import {
   type ResidentHostOwner,
 } from "./protocol.js";
 import { completionRecipientFromRun, saveCompletion } from "../agents/completion-journal.js";
-import { deliveryRoot, projectOf } from "../topology/project-identity.js";
+import { deliveryRoot, projectOf, recordedProjectLead, repositoryOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
-import { canRemoveTerminalRun } from "../storage/retention.js";
+import { canRemoveTerminalRun, compactTerminalRunEvents, retainedActorRunIds, runTreeExitVeto, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
 import { ResidentRequestRetention } from "./retention.js";
-import { assertResidentRequestNotExpired, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
+import { hasPreservedResidentResult } from "./preserved-result.js";
+import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 
 export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 
-/** A worker can finish after its host dies, leaving status.json as the only completion copy. */
-const hasPreservedResidentResult = (runsRoot: string, id: string): boolean => {
-  const residencyRoot = path.dirname(runsRoot);
-  const metadataPath = path.join(residencyRoot, "agents", `${id}.json`);
-  // Only proven absence permits ordinary actor/untracked collection. Unreadable or unsafe
-  // metadata may still describe a public task, so uncertainty keeps its run directory.
-  try { fs.lstatSync(metadataPath); }
-  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
-  const readOwnedJson = <T>(file: string): T | undefined => {
-    const stat = ownedStat(file);
-    if (!stat?.isFile() || stat.size > 1024 * 1024) return undefined;
-    return readJson<T>(file);
-  };
-  const time = (value: unknown): value is number =>
-    typeof value === "number" && Number.isFinite(value) && value >= 0;
-  const metadata = readOwnedJson<ResidentAgentMetadata>(metadataPath);
-  if (metadata?.format !== RESIDENT_HOST_FORMAT || metadata.id !== id ||
-      typeof metadata.rootId !== "string" || metadata.handle?.id !== id ||
-      metadata.handle.residency !== "durable" || metadata.handle.actorId !== undefined ||
-      typeof metadata.handle.name !== "string" || typeof metadata.handle.cwd !== "string" ||
-      !["pi", "claude", "veda"].includes(metadata.handle.runner) ||
-      !["process", "tmux", "screen", "localterm", "herdr"].includes(metadata.handle.transport) ||
-      !["queued", "running", "completed", "failed", "stopped", "timed_out"].includes(metadata.handle.status) ||
-      !time(metadata.createdAt) || !time(metadata.updatedAt) ||
-      typeof metadata.runDirectory !== "string" ||
-      path.resolve(metadata.runDirectory) !== path.resolve(runsRoot, id)) return false;
-  const saved = readOwnedJson<AgentRunRecord>(residentResultPath(residencyRoot, id));
-  // Validate the terminal record, not just a matching id/status stub: deleting the run must
-  // leave a usable result (including its text) for client status/wait across restarts.
-  return !!saved && saved.id === id && saved.actorId === undefined &&
-    ["completed", "failed", "stopped", "timed_out"].includes(saved.status) &&
-    typeof saved.name === "string" && typeof saved.task === "string" &&
-    typeof saved.cwd === "string" && typeof saved.text === "string" &&
-    ["pi", "claude", "veda"].includes(saved.runner) &&
-    ["process", "tmux", "screen", "localterm", "herdr"].includes(saved.transport) &&
-    time(saved.startedAt) && time(saved.updatedAt) &&
-    (saved.finishedAt === undefined || time(saved.finishedAt)) &&
-    time(saved.turns) && time(saved.toolCalls) &&
-    (saved.error === undefined || typeof saved.error === "string") &&
-    !!saved.usage && [saved.usage.input, saved.usage.output, saved.usage.cacheRead,
-      saved.usage.cacheWrite, saved.usage.cost].every(time);
-};
-
 /** Called under the host fence, before constructing the manager: every existing run is untracked. */
-export const sweepResidentRuns = (runsRoot: string, now = Date.now(), budgetMs = 100): string[] => {
+export const sweepResidentRuns = (
+  runsRoot: string, now = Date.now(), budgetMs = 100,
+  options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean } = {},
+): string[] => {
   const removed: string[] = [];
   if (!ownedStat(runsRoot)?.isDirectory()) return removed;
   const started = performance.now();
   const expired = () => performance.now() - started >= budgetMs;
+  const retained = retainedActorRunIds(options.actorRoots ?? []);
+  if (retained.has("*")) return removed;
   let directory: fs.Dir;
   try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
   try {
     let entry: fs.Dirent | null;
     while (!expired() && (entry = directory.readSync())) {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory() || retained.has(entry.name)) continue;
       const run = path.join(runsRoot, entry.name);
       const stat = ownedStat(run);
-      if (!stat?.isDirectory() || now - stat.mtimeMs <= RESIDENT_RUN_RETENTION_MS) continue;
-      if (!canRemoveTerminalRun(run, expired) ||
-          !hasPreservedResidentResult(runsRoot, entry.name) || expired()) continue;
-      try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
+      if (!stat?.isDirectory()) continue;
+      if (!options.retainRuns && now - stat.mtimeMs > RESIDENT_RUN_RETENTION_MS &&
+          !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired) &&
+          hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
+        try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
+      } else {
+        compactTerminalRunEvents(run, { ...options, now, expired });
+      }
     }
   } finally { directory.closeSync(); }
   return removed;
@@ -266,6 +233,7 @@ export class ResidentHost {
   #reloadEvent: Promise<unknown> | undefined;
   readonly #publications = new Set<Promise<unknown>>();
   #effectiveConfig: (() => ResidentHostConfig) | undefined;
+  readonly #retention: ResidentHostConfig["retention"];
 
   constructor(
     readonly config: ResidentHostConfig,
@@ -285,8 +253,11 @@ export class ResidentHost {
     this.#agentsPath = path.join(config.residencyRoot, "agents");
     this.#removalsPath = residentRemovalsPath(config.residencyRoot);
     this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
+    // All resident collectors share one mutable policy, not the constructor's
+    // config snapshot (nor the process-wide default object).
+    this.#retention = { ...config.retention };
     this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
-      [...new Set(Object.values(residentActorRoots(config)))]);
+      [...new Set(Object.values(residentActorRoots(config)))], this.#retention);
   }
 
   #initialize(): void {
@@ -331,7 +302,8 @@ export class ResidentHost {
         ...(overlay.piModels ? { piModels: overlay.piModels } : {}),
         ...(overlay.modelGuidance ? { modelGuidance: overlay.modelGuidance } : {}),
         ...(overlay.kernel ? { kernel: overlay.kernel } : {}),
-        ...(overlay.pythonRuntime ? { pythonRuntime: overlay.pythonRuntime } : {}) };
+        ...(overlay.pythonRuntime ? { pythonRuntime: overlay.pythonRuntime } : {}),
+        ...(overlay.retention ? { retention: overlay.retention } : {}) };
     };
     const currentModelGuidance = () =>
       parseFabricOwnedModelGuidance(currentConfig().modelGuidance ?? config.modelGuidance);
@@ -380,7 +352,7 @@ export class ResidentHost {
         startedAt: config.mainStartedAt ?? this.participants.lastKnown?.(config.rootId)?.participant.startedAt ?? 0 }),
       hostId: this.hostId,
       identityId: this.identity.id,
-      retention: config.retention,
+      retention: this.#retention,
       preparePiModel: async (model) => resolveResidentPiModel(model),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;
@@ -426,7 +398,7 @@ export class ResidentHost {
       return participant ? participant.ownerHostId === this.hostId : undefined;
     };
     const lineageAlive = (rootId: string): boolean =>
-      this.participants.get(rootId) !== undefined;
+      this.participants.lineageAlive(rootId);
     const actorRoots = residentActorRoots(config);
     this.actors = new ActorDirectory([
       config.sessionId,
@@ -438,6 +410,7 @@ export class ResidentHost {
         if (!message.text) return;
         const mode = delivery === "steer" ? "steer" : "followUp";
         const triggers = delivery === "nextTurn" ? false : triggerTurn;
+        const project = actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd));
         this.#trackPublication(this.#queueDelivery(
           { id: actor.id, name: actor.name, kind: "actor" },
           message.text,
@@ -445,11 +418,19 @@ export class ResidentHost {
           triggers,
           message.data,
           undefined,
-          // smarty-dev#878: once the root is gone, to the project's live project agent.
-          deliveryRoot(
+          // smarty-dev#3662: lease lapse is not death; only the exact recorded integrator may inherit.
+          () => deliveryRoot(
             config.rootId,
             this.participants.list({ scope: "project", kinds: ["root"] }),
-            actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd)),
+            project,
+            {
+              lineageAlive,
+              boundIntegrator: () => {
+                const repository = repositoryOf(project);
+                const leadId = recordedProjectLead(config.cwd);
+                return { ...(repository ? { repository } : {}), ...(leadId ? { leadId } : {}) };
+              },
+            },
           ),
           message.source === "fabric-host" ? undefined : message.principal,
           message.source === "fabric-host" ? "fabric-host" : "actor-output",
@@ -467,7 +448,7 @@ export class ResidentHost {
         project: (typeof config.project === "string" ? config.project : projectOf(config.cwd)),
         role: typeof config.role === "string" ? config.role : undefined,
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
-        retention: config.retention,
+        retention: this.#retention,
         ...(typeof config.actors?.maxSessionBytes === "number" ? { maxSessionBytes: config.actors.maxSessionBytes } : {}),
         resolvePiModel: resolveResidentPiModel,
       },
@@ -490,7 +471,11 @@ export class ResidentHost {
     await this.#acquireLock();
     this.#started = true;
     try {
-      if (!this.config.agents.retainRuns) sweepResidentRuns(path.join(this.config.residencyRoot, "runs"));
+      sweepResidentRuns(path.join(this.config.residencyRoot, "runs"), Date.now(), 100, {
+        ...this.config.retention,
+        actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
+        retainRuns: this.config.agents.retainRuns,
+      });
       this.#initialize();
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
@@ -549,6 +534,7 @@ export class ResidentHost {
         readyAt: now,
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
+        callerBoundSpawn: 1,
         requestExpiry: 1,
         creationIdempotency: 1,
         ...(this.launch ? { releaseRoot: this.launch.spec.releaseRoot, configDigest: this.launch.spec.digest,
@@ -590,6 +576,9 @@ export class ResidentHost {
         try {
           await this.agents?.close();
         } finally {
+          // Fenced actor deliveries may still be acquiring custody. Join them
+          // before releasing the host; closed hosts retain their durable outbox.
+          await Promise.allSettled([...this.#publications]);
           await this.#backgroundDeliveries.close();
           await this.#flushingDeliveries;
           await this.participants?.close().catch(() => undefined);
@@ -745,28 +734,36 @@ export class ResidentHost {
     triggerTurn: boolean,
     data?: unknown,
     agentCompletionId?: string,
-    rootId = this.config.rootId,
+    rootId: string | (() => string) = this.config.rootId,
     principal?: FabricPrincipal,
     source?: ResidentDeliveryRecord["source"],
   ): Promise<void> {
     const id = randomUUID();
-    const record: ResidentDeliveryRecord = {
-      format: RESIDENT_HOST_FORMAT,
-      id,
-      rootId,
-      from,
-      ...(source ? { source } : {}),
-      ...(principal ? { principal } : {}),
-      delivery,
-      triggerTurn,
-      message,
-      ...(data === undefined ? {} : { data }),
-      ...(agentCompletionId ? { agentCompletionId } : {}),
-      createdAt: Date.now(),
+    const persist = (target: string): void => {
+      const record: ResidentDeliveryRecord = {
+        format: RESIDENT_HOST_FORMAT,
+        id,
+        rootId: target,
+        from,
+        ...(source ? { source } : {}),
+        ...(principal ? { principal } : {}),
+        delivery,
+        triggerTurn,
+        message,
+        ...(data === undefined ? {} : { data }),
+        ...(agentCompletionId ? { agentCompletionId } : {}),
+        createdAt: Date.now(),
+      };
+      // Persist before handing off: idle exit/queue pressure must not drop custody.
+      // Agent completions use the fixed creating root and still persist before yielding.
+      writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record, { durable: true });
     };
-    // Persist before yielding: AgentManager has already marked this notification sent.
-    // Idle exit/queue pressure must not drop the host's ownership of the handoff.
-    writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record, { durable: true });
+    if (typeof rootId === "function") {
+      // Serialize proof+absence, target selection and the irreversible outbox
+      // write with resumed-root proof invalidation. Never persist a stale choice.
+      try { await this.mesh.exclusive(() => persist(rootId())); }
+      catch { persist(this.config.rootId); } // Unknown custody keeps the original mailbox.
+    } else persist(rootId);
     await this.#retryDeliveries();
   }
 
@@ -840,10 +837,15 @@ export class ResidentHost {
   #maintainRequests(): void {
     const now = Date.now();
     if (this.#closed || !this.#requestRetention.due(now)) return;
+    // ensureHost/syncPiModels already publishes reloads to config.json. Apply
+    // only the same-release/root/session overlay at the next existing sweep;
+    // actor archives and agent collectors hold this same policy object.
+    Object.assign(this.#retention, this.#effectiveConfig?.().retention ?? this.config.retention);
     const live = this.agents.retentionReferences();
     for (const id of this.actors.inFlightActorIds()) live.add(id);
     const stoppedWritersGone = new Set<string>();
     for (const actor of this.actors.listOwned()) {
+      if (actor.lastRunId) live.add(actor.lastRunId);
       if (actor.status !== "stopped" || actor.inFlightRun) live.add(actor.id);
       else if (!live.has(actor.id) && !live.has("*")) stoppedWritersGone.add(actor.id);
     }
@@ -1080,11 +1082,17 @@ export class ResidentHost {
   }
 
   async #executeOnce(command: ResidentCommand): Promise<ResidentCommandResponse> {
-    if ((command.operation !== "spawn" && command.operation !== "createActor") || command.idempotencyKey === undefined) {
+    if ((command.operation !== "spawnBound" && command.operation !== "createActor") || command.idempotencyKey === undefined) {
       return this.#executeRequest(command);
     }
     if (typeof command.idempotencyKey !== "string" || !command.idempotencyKey.length || command.idempotencyKey.length > 256) {
       throw new Error("Resident idempotencyKey must be a string of 1 to 256 characters");
+    }
+    // Retry receipts must not bypass the trusted live-caller fence, even on cache hits.
+    if (command.operation === "spawnBound") {
+      const caller = command.caller;
+      assertResidentTaskCaller(caller,
+        caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
     }
     this.#pruneCreations();
     // Operation-scoped; this host already validates its one root before dispatch.
@@ -1111,7 +1119,11 @@ export class ResidentHost {
         }
       }
     }
-    return { ...response, requestId: command.requestId };
+    // Cache the entity/outcome, not the retry exchange's completion time. A
+    // later generation must be acknowledgeable without relaxing validAck.
+    return { ...response, requestId: command.requestId,
+      completedAt: response.requestId === command.requestId ? response.completedAt
+        : Math.max(Date.now(), residentRequestGeneration(command.requestId) ?? 0) };
   }
 
   async #executeRequest(command: ResidentCommand): Promise<ResidentCommandResponse> {
@@ -1123,7 +1135,7 @@ export class ResidentHost {
       if (command.operation === "releaseChange") {
         this.#prepareRelease(command);
         response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, completedAt: Date.now() };
-      } else if (command.operation === "spawn") {
+      } else if (command.operation === "spawnBound") {
         if (
           command.request.residentStartupProbe ||
           command.request.sessionSeed ||
@@ -1136,7 +1148,11 @@ export class ResidentHost {
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
         }
-        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit);
+        // No executor fallback: revalidate the captured caller before the mutation fence.
+        const caller = command.caller;
+        const returnAddress = assertResidentTaskCaller(caller,
+          caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
+        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, undefined, undefined, returnAddress);
         const runDirectory = this.agents.runDirectory(handle.id);
         if (!runDirectory) {
           // Durable metadata currently requires an admitted run directory. Never

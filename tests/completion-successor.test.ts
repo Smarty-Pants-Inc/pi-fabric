@@ -16,6 +16,7 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost } from "../src/residency/host.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { residentDeliveryPrefix, residentHostId, residentResultPath, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 
@@ -289,9 +290,17 @@ describe("round 4 completion fences", () => {
     fs.mkdirSync(cfg.residencyRoot, { recursive: true });
     fs.writeFileSync(path.join(cfg.residencyRoot, "config.json"), JSON.stringify(cfg));
     const host = new ResidentHost(cfg);
+    // Public durable spawns belong to Main, never the hidden resident executor.
+    const callerMesh = new MeshStore(cfg.meshRoot, cfg.mesh.maxEventBytes, cfg.mesh.maxReadEvents);
+    const callerParticipants = new ParticipantDirectory(callerMesh, {
+      enabled: true, hostId: cfg.rootId, rootId: cfg.rootId,
+      identity: { id: cfg.rootId, name: "main", kind: "main", sessionId: cfg.sessionId },
+    });
+    callerParticipants.registerSource(() => [h.participant("A", 100, { local: true })]);
     try {
+      await callerParticipants.start();
       await host.start(); h.setLive([h.participant("A", 100)]);
-      const launchClient = new ResidencyClient({ config: cfg, mesh: host.mesh, participants: host.participants,
+      const launchClient = new ResidencyClient({ config: cfg, mesh: callerMesh, participants: callerParticipants,
         mainAgent: { local: false } as any }); clients.push(launchClient);
       const long = await launchClient.spawnAgent({ task: "HANG", transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
       const child = await launchClient.spawnAgent({ task: "LARGE_RESULT", transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
@@ -309,6 +318,7 @@ describe("round 4 completion fences", () => {
       expect(h.mesh.listAll(residentDeliveryPrefix(cfg.rootId))).toHaveLength(0);
       expect(a.completed).not.toHaveBeenCalled(); expect(a.sendMessage).not.toHaveBeenCalled();
       // A disappears, but its resident host remains alive and owns the unrelated long run.
+      await callerParticipants.close();
       h.setLive([h.participant("B", 200), h.participant("other-role", 300, { role: "other-lane" }),
         h.participant("other-cwd", 300, { cwd: path.join(h.root, "other") })]);
       expect(pendingCompletions(h.meshRoot, h.root).map(value => value.result.id)).toEqual([child.id]);
@@ -338,7 +348,9 @@ describe("round 4 completion fences", () => {
       expect(c.client.listAgents()).toHaveLength(0);
       expect(c.completed).not.toHaveBeenCalled(); expect(c.sendMessage).not.toHaveBeenCalled();
       expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
-    } finally { await host.close(); }
+    } finally {
+      try { await host.close(); } finally { await callerParticipants.close(); }
+    }
   }, 15_000);
 
   it.each(legacyFenceFaults)("F4/journal: unknown legacy fence (%s) blocks claims, bodies and replacement receipts repeatedly", async fault => {

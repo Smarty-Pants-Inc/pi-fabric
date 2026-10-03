@@ -152,6 +152,81 @@ describe("directory availability for live Mains (#2386)", () => {
     expect(f.directory.canConsumeMesh()).toBe(false); // Routing did not weaken lease admission.
   });
 
+  it.each(["", "  ", "{", "{}", "null"])("never confirms damaged canonical bytes %j as absence of a published Main", async (damaged) => {
+    const f = await mainLeaseFixture(false);
+    const host = f.mesh.get(f.key("topology/hosts/"))!.value as Record<string, unknown>;
+    await f.mesh.put({ key: f.key("topology/hosts/"), identity: f.target, value: { ...host, expiresAt: Date.now() + 120_000 } });
+    expect(f.directory.get(f.target.id)?.kind).toBe("root");
+    const state = path.join(f.meshRoot, "state.json");
+    const healthy = fs.readFileSync(state, "utf8");
+    fs.writeFileSync(state, damaged);
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    try {
+      await expect(f.directory.refresh()).rejects.toThrow();
+      await expect(f.directory.refreshRoutingView()).rejects.toThrow();
+      expect(f.directory.routingUnavailable()).toBeDefined();
+      for (const kind of ["followUp", "steer"] as const) {
+        await expect(send.value.routeMessage(f.target.id, "must not publish", undefined, kind))
+          .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+      }
+      expect(request).not.toHaveBeenCalled();
+      expect(fs.readFileSync(state, "utf8")).toBe(damaged);
+    } finally {
+      fs.writeFileSync(state, healthy);
+    }
+  });
+
+  it.each(["cached-root", "fresh-root", "fresh-negative", "retained-list", "name-list", "retained-lastKnown", "lineage", "diagnostic-lastKnown", "diagnostic-peers"] as const)("classifies the late %s read with one bounded probe", async (readPath) => {
+    const target = { ...remote("session:live", "running", "root"), name: "live-name", rootId: "session:live", controlProtocol: "v1" } as FabricParticipantInfo;
+    for (const fails of [false, true]) {
+      let failed = true;
+      let cachedReads = 0;
+      let lists = 0;
+      let retainedReads = 0;
+      const badRead = () => { if (failed) throw new Error(`fresh ${readPath} read failed`); };
+      const get = vi.fn((id: string, _scope?: unknown, options?: { fresh?: boolean }) => {
+        if (id === target.id) {
+          if (options?.fresh && readPath === "fresh-root") badRead();
+          if (!options?.fresh && readPath === "cached-root" && ++cachedReads >= 2) badRead();
+          if (!["retained-list", "retained-lastKnown", "lineage"].includes(readPath)) return target;
+        }
+        if (options?.fresh && readPath === "fresh-negative") badRead();
+        return undefined;
+      });
+      const list = vi.fn(() => {
+        if (readPath === "retained-list" || (readPath === "name-list" && ++lists >= 2)) badRead();
+        return readPath.startsWith("diagnostic") || readPath === "fresh-negative" ? [] : [target];
+      });
+      const lastKnown = vi.fn(() => {
+        if (readPath === "retained-lastKnown" || (readPath === "diagnostic-lastKnown" && ++retainedReads >= 3)) badRead();
+        return readPath === "retained-lastKnown" ? { participant: target, lapsedMs: 1 } : undefined;
+      });
+      const peers = vi.fn(() => { if (readPath === "diagnostic-peers") badRead(); return []; });
+      const lineageAlive = vi.fn(() => { if (readPath === "lineage") badRead(); return true; });
+      const refreshRoutingView = vi.fn(async () => { if (fails) throw new Error("probe failed"); failed = false; });
+      const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+      const source = { get, ...(["retained-lastKnown", "diagnostic-lastKnown"].includes(readPath) ? {} : { list }),
+        lastKnown, peers, lineageAlive, scheduleRefresh: vi.fn(), routingUnavailable: () => undefined, refreshRoutingView };
+      const send = router(unknown, [], { request }, source);
+      const selector = ["name-list", "fresh-negative"].includes(readPath) ? "live-name"
+        : readPath.startsWith("diagnostic") ? "session:absent" : target.id;
+      const delivery = send.value.routeMessage(selector, "one bounded resolution", undefined, "followUp");
+      if (fails) {
+        await expect(delivery).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+        expect(request).not.toHaveBeenCalled();
+      } else if (readPath.startsWith("diagnostic") || readPath === "fresh-negative") {
+        await expect(delivery).rejects.toThrow("Unknown Fabric participant");
+        expect(request).not.toHaveBeenCalled();
+      } else {
+        await expect(delivery).resolves.toMatchObject({ queued: true });
+        expect(request).toHaveBeenCalledOnce();
+      }
+      expect(refreshRoutingView).toHaveBeenCalledOnce();
+      if (readPath === "fresh-root") expect(get.mock.calls.some(call => call[0] === target.id && !call[2]?.fresh)).toBe(true);
+    }
+  });
+
   it.each(["no confirmed view", "view overdue", "last refresh failed"])("probes once when the %s, for both delivery modes", async (reason) => {
     let unavailable: string | undefined = reason;
     const target = remote("session:live", "running", "root");
@@ -187,6 +262,28 @@ describe("directory availability for live Mains (#2386)", () => {
       expect(request).toHaveBeenCalledOnce();
     }
     expect(refreshRoutingView).toHaveBeenCalledOnce();
+  });
+
+  it("never retries a repeated fresh-root read failure or a post-publication ACK failure", async () => {
+    const target = remote("session:live", "running", "root");
+    const refreshRoutingView = vi.fn().mockResolvedValue(undefined);
+    const get = vi.fn((_id: string, _scope?: unknown, options?: { fresh?: boolean }) => {
+      if (options?.fresh) throw new Error("persistent fresh read failure");
+      return target;
+    });
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn(), routingUnavailable: () => undefined, refreshRoutingView });
+    await expect(send.value.routeMessage(target.id, "no publication", undefined, "followUp"))
+      .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+    expect(refreshRoutingView).toHaveBeenCalledOnce();
+    expect(request).not.toHaveBeenCalled();
+    get.mockImplementation(() => target);
+    refreshRoutingView.mockClear();
+    const ackFailure = new Error("Control acknowledgement timed out after publication");
+    request.mockRejectedValue(ackFailure);
+    await expect(send.value.routeMessage(target.id, "already published", undefined, "followUp")).rejects.toBe(ackFailure);
+    expect(request).toHaveBeenCalledOnce();
+    expect(refreshRoutingView).not.toHaveBeenCalled();
   });
 
   it("only a fresh view proves an actor id absent, and healthy actor routes are unchanged", async () => {

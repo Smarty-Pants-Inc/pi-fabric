@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, participantRole, repositoryOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
-import { MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { assertMeshStateReadable, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type {
   FabricHostRecord,
   FabricParticipantInfo,
@@ -942,6 +942,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#routingReadAt = 0;
     try {
       await this.mesh.exclusive(() => {
+        // MeshStore reads are intentionally tolerant for dashboards. Routing absence is
+        // stronger: a damaged canonical state must never be confirmed as an empty view.
+        assertMeshStateReadable(this.mesh.root);
         this.list({ scope: "project", includeStale: true, fresh: true });
         this.#routingReadAt = Date.now();
         this.#routingError = undefined;

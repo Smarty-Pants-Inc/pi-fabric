@@ -126,6 +126,8 @@ Execution references stay progressive: the model loads the selected kernel's ski
 
 Press **ctrl+shift+a** or run **`/fabric chat <agent-id-or-name>`** to open a live, full-screen child conversation with a multiline editor. Send steering or follow-ups directly, switch between nested agents, and return to Main without stopping its work. Drafts and scroll positions stay with each conversation. Completed one-shot agents are read-only; persistent actors accept further messages. Drag to select transcript text, use `/copy` or `/copy selection`, and type `/help` for the small set of preview-local commands with slash completion. See [focused conversations](docs/interface.md#focused-conversations) for controls and current limitations.
 
+For non-destructive actor repair, the owning Main calls `agents.resetSession({ id })` directly. An admitted activation settles at its fenced boundary while resident status and other commands remain serviceable; instructions, bindings and queued deliveries are retained. Explicit `agents.stop()` cancels work and any pending reset, drops queued deliveries, and leaves the actor stopped. It is not a prerequisite for reset. See [fresh actor sessions](docs/agents.md#fresh-actor-sessions).
+
 ## The dashboard
 
 Fabric includes a live activity surface in Pi:

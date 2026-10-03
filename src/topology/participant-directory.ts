@@ -14,6 +14,7 @@ import type {
 } from "./types.js";
 
 import { reapDeadHostRecords } from "./host-reaper.js";
+import { isLiveLegacyRootEntry, LEGACY_ROOT_LEASE_MS as PARTICIPANT_LEASE_MS } from "./legacy-root-liveness.js";
 import {
   fileLeasesOnly,
   hostLeaseExpiry,
@@ -45,7 +46,6 @@ const LINEAGE_CLOSURE_PREFIX = "topology/lineage-closures/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
-const PARTICIPANT_LEASE_MS = 15_000;
 /** Addressable across a live reload, but a failed reload stops accepting after this lease. */
 export const MAIN_RELOAD_LEASE_MS = 30_000;
 /**
@@ -285,20 +285,8 @@ const legacyRootFromEntry = (
   localRootId: string,
   now: number,
 ): FabricParticipantInfo | undefined => {
-  if (now - entry.updatedAt > PARTICIPANT_LEASE_MS || !isObject(entry.value)) return undefined;
+  if (!isLiveLegacyRootEntry(entry, now) || entry.value.id === localRootId) return undefined;
   const value = entry.value;
-  if (
-    typeof value.id !== "string" ||
-    value.id === localRootId ||
-    typeof value.sessionId !== "string" ||
-    entry.key !== `${LEGACY_SESSION_PREFIX}${value.sessionId}` ||
-    entry.updatedBy.id !== value.id ||
-    typeof value.cwd !== "string" ||
-    typeof value.startedAt !== "number" ||
-    (value.status !== "idle" && value.status !== "running")
-  ) {
-    return undefined;
-  }
   return {
     format: 1,
     id: value.id,
@@ -370,11 +358,22 @@ const legacyActorFromEntry = (
   };
 };
 
+/** Advisory only: names are lookup labels, not an exclusive authority claim. */
+export interface FabricRootCollision {
+  reason: "duplicate-name" | "duplicate-session";
+  name: string;
+  ids: string[];
+  sessionId?: string;
+}
+
+export const ROOT_COLLISION_TOPIC = "fabric.topology.root-collision";
+
 export interface ParticipantDirectoryOptions {
   enabled: boolean;
   hostId: string;
   rootId: string;
   identity: MeshIdentity;
+  onRootCollision?: (collision: FabricRootCollision) => void;
   selfOwnerHostId?: string;
   selfOwnerIdentityId?: string;
   heartbeatMs?: number;
@@ -399,6 +398,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #parsedCache: { token: object; files: readonly MeshStateEntry[]; value: ParsedDirectory } | undefined;
   #parsedEntries = new Map<string, { version: number; updatedAt: number; entry: MeshStateEntry }>();
   readonly #reportedCollisions = new Set<string>();
+  readonly #reportedRootCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
   #refreshing: Promise<void> | undefined;
@@ -706,6 +706,32 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#reportRefusal(participant.id, participant.remoteHost, "it collides with a local participant", {
       rootId: participant.rootId, ownerHostId: participant.ownerHostId,
     });
+  }
+
+  // Check initial registration AND heartbeat renames, using both file and legacy/state peers.
+  // This is an alert, not a race-free exclusive claim or a fork-ancestry inference.
+  #reportRootCollisions(root: FabricParticipantRecord): void {
+    for (const peer of this.list({ scope: "project", kinds: ["root"], fresh: true })) {
+      if (peer.id === root.id || !["idle", "running", "reloading"].includes(peer.status)) continue;
+      const sameSession = root.sessionId !== undefined && root.sessionId === peer.sessionId;
+      const sameName = root.name !== "main" && root.name === peer.name;
+      if (!sameSession && !sameName) continue;
+      const collision: FabricRootCollision = {
+        reason: sameSession ? "duplicate-session" : "duplicate-name",
+        name: root.name,
+        ids: [root.id, peer.id].sort(),
+        ...(sameSession ? { sessionId: root.sessionId } : {}),
+      };
+      const key = JSON.stringify([collision.reason, sameSession ? root.sessionId : root.name, collision.ids]);
+      if (this.#reportedRootCollisions.has(key) || this.#reportedRootCollisions.size >= 1_000) continue;
+      this.#reportedRootCollisions.add(key);
+      try { this.options.onRootCollision?.(collision); } catch { /* Advisory must not stop a heartbeat. */ }
+      void this.#notifications.enqueue(() => this.mesh.publish({
+        topic: ROOT_COLLISION_TOPIC, kind: "alert", from: this.options.identity,
+        text: `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`,
+        data: collision,
+      }));
+    }
   }
 
   // A record the bridge marked remoteHost that fails validation: dropped alone, logged once.
@@ -1088,6 +1114,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
         };
         desired.set(record.id, record);
       }
+    }
+    const candidateRoot = desired.get(this.options.rootId);
+    if (this.options.enabled && !this.#quiescing && candidateRoot?.kind === "root") {
+      this.#reportRootCollisions(candidateRoot);
     }
     // No resumed root is activated locally or published to a file while an old
     // death proof survives. Failure aborts this refresh before any root publication.

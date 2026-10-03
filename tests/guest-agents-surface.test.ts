@@ -33,6 +33,15 @@ describe("guest agents surface", () => {
       expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
     }
   });
+
+  it.each([false, true])("generated reset guidance never requires destructive stop (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const guidance = declarations.slice(declarations.lastIndexOf("/**", declarations.indexOf("resetSession(args:")), declarations.indexOf("resetSession(args:"));
+    expect(guidance).not.toMatch(/stop[ -]first|idle boundary/);
+    expect(guidance).toMatch(/owning Main.*directly/);
+    expect(guidance).toMatch(/activation.*settles.*fenced boundary/);
+    expect(guidance).toMatch(/stop.*cancels work/);
+  });
   it.each([false, true])("types and advertises modelReason on launch calls (fullCodeMode=%s)", fullCodeMode => {
     const result = typeCheckFabricCode(
       `const run = await agents.run({ task: "probe", model: "cliproxyapi/gpt-6-astra", modelReason: "Compatibility probe" });

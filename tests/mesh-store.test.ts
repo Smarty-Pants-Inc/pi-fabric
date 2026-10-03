@@ -732,6 +732,116 @@ describe("MeshStore lock recovery", () => {
     expect(fs.existsSync(lock)).toBe(false);
   }, 30_000);
 
+  it("a rejected default-v1 initializer cleans its own receipt in a recovery-first empty successor while still alive", { timeout: 30_000 }, async ({ signal }) => {
+    const store = createStore({ lockTimeoutMs: 150 });
+    const lock = path.join(store.root, ".lock");
+    const ownerPath = path.join(lock, "owner");
+    const finished = path.join(store.root, "initializer.finished");
+    const send = (name: string) => fs.writeFileSync(path.join(store.root, name), "");
+    const children: Array<{ child: ReturnType<typeof spawn>; closed: Promise<number | null>; output: () => { stdout: string; stderr: string } }> = [];
+    let originalDirectory: fs.Dir | undefined;
+    function start(role: "initializer" | "successor") {
+      const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-paused-recovery.mjs"), store.root, role, "write", "recovery-first"], {
+        cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", chunk => { stdout += chunk; });
+      child.stderr.on("data", chunk => { stderr += chunk; });
+      const closed = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+      closed.catch(() => undefined);
+      const owned = { child, closed, output: () => ({ stdout, stderr }) };
+      children.push(owned);
+      return owned;
+    }
+    const abort = () => { for (const { child } of children) child.kill("SIGKILL"); };
+    signal.addEventListener("abort", abort, { once: true });
+    const initializer = start("initializer");
+    const ready = async (name: string) => {
+      // Let the test timeout own cancellation. No synchronous wait on the test
+      // event loop, and no independent fixture clock racing the parent's clock.
+      const watcher = fs.watch(store.root);
+      const closed = new Promise<void>(resolve => watcher.once("close", resolve));
+      let cancel!: () => void;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const check = () => {
+            if (fs.existsSync(path.join(store.root, name))) resolve();
+            else if (name === "initializer.finished" && fs.existsSync(path.join(store.root, "initializer.entered"))) {
+              reject(new Error(`Initializer entered a replacement instead of rejecting it: ${fs.readFileSync(path.join(store.root, "initializer.entered"), "utf8")}`));
+            }
+          };
+          cancel = () => reject(signal.reason);
+          watcher.on("change", check);
+          watcher.once("error", reject);
+          signal.addEventListener("abort", cancel, { once: true });
+          void initializer.closed.then(() => { check(); reject(new Error(initializer.output().stderr || "Initializer exited before handshake")); }, reject);
+          check();
+          if (signal.aborted) cancel();
+        });
+      } finally { signal.removeEventListener("abort", cancel); watcher.close(); await closed; }
+    };
+    try {
+      await ready("initializer.ready");
+      // Keep the removed directory's identity allocated until both publications
+      // finish. Otherwise the filesystem may reuse its inode for the successor,
+      // accidentally exercising identity ABA instead of the intended rejection.
+      originalDirectory = fs.opendirSync(lock);
+      const original = fs.lstatSync(lock);
+      expect(fs.existsSync(ownerPath)).toBe(false);
+      const past = new Date(Date.now() - 60_000);
+      fs.utimesSync(lock, past, past);
+      const successor = start("successor");
+      await ready("initializer.finished");
+      expect(await successor.closed, successor.output().stderr).toBe(0);
+      const recovered = JSON.parse(successor.output().stdout.trim());
+      expect(recovered).toMatchObject({ ran: false, code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
+      expect([recovered.replacement.dev, recovered.replacement.ino]).not.toEqual([original.dev, original.ino]);
+      expect(JSON.parse(fs.readFileSync(finished, "utf8"))).toMatchObject({ ran: false, code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
+      expect(fs.existsSync(lock)).toBe(false);
+      expect(initializer.child.exitCode).toBeNull();
+      expect(process.kill(initializer.child.pid!, 0)).toBe(true);
+      const healthy = vi.fn(() => "progress");
+      await expect(store.exclusive(healthy)).resolves.toBe("progress");
+      expect(healthy).toHaveBeenCalledOnce();
+      expect(fs.existsSync(lock)).toBe(false);
+      expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.released."))).toEqual([]);
+    } finally {
+      try {
+        send("initializer.go");
+        send("initializer.release");
+        const exits = await Promise.all(children.map(async owned => ({ code: await owned.closed, ...owned.output() })));
+        for (const exit of exits) expect(exit.code, exit.stderr).toBe(0);
+      } finally {
+        signal.removeEventListener("abort", abort);
+        originalDirectory?.closeSync();
+      }
+    }
+    expect(JSON.parse(initializer.output().stdout.trim())).toMatchObject({ ran: false, code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
+  });
+
+  it("pre-entry cleanup preserves a changed full receipt even when its token still matches", async () => {
+    const store = createStore();
+    const lock = path.join(store.root, ".lock");
+    const ownerPath = path.join(lock, "owner");
+    const write = fs.writeFileSync.bind(fs);
+    let receipt: string | undefined;
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+      if (String(file) === ownerPath) {
+        const fields = String(data).split("\n");
+        fields[2] = String(Number(fields[2]) + 1); // same token and live PID, different full receipt
+        receipt = fields.join("\n");
+        return write(file, receipt, options);
+      }
+      return write(file, data, options);
+    });
+    const operation = vi.fn();
+    await expect(store.exclusive(operation)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
+    expect(operation).not.toHaveBeenCalled();
+    expect(receipt).toBeDefined();
+    expect(fs.readFileSync(ownerPath, "utf8")).toBe(receipt);
+    expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.released."))).toEqual([]);
+  });
+
   it.each([["write", 1], ["opened", 1], ["write", 2], ["rename", 2]] as const)("a paused native %s publication (protocol %s) preserves exclusion against live owners or successors", async (phase, lockProtocol) => {
     const store = createStore({ lockTimeoutMs: 1_000, ...(lockProtocol === 2 ? { lockProtocol } : {}) });
     const lock = path.join(store.root, ".lock");

@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getCurrentSystemMessage, getCurrentSystemPrompt } from "@earendil-works/pi-ai";
-import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
+import { estimateContextTokens, estimateTextTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { SessionManager, buildSessionContext, convertToLlm, sessionEntryToContextMessages, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ActivationWindow } from "../src/worker/activation-window.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -395,9 +395,76 @@ describe("native activation window (offline; opted-in success needs exact native
     return { dir, manager, requests, get requestCount() { return requestCount; }, settingsFile, settings };
   };
 
+  it.skipIf(!selectedNativeBinary)("full-history actor compacts overflow before dispatch, keeping the raw session journal", async () => {
+    const s = await setup();
+    fs.writeFileSync(s.settingsFile, JSON.stringify({ enableInstallTelemetry: false, compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1000 } }));
+    const journal = path.join(s.dir, "full-history-actor.jsonl");
+    const session = SessionManager.open(journal);
+    for (let index = 0; index < 10; index++) {
+      session.appendMessage(user(`OLD_OBJECTIVE_${index} ` + "x".repeat(8000)));
+      session.appendMessage(assistant(`old decision ${index}`));
+    }
+    const before = readJournal(journal);
+    const result = await s.manager.run({ task: "CURRENT_FULL_HISTORY_EVENT", model: "window-test/offline", actorId: "full-history-actor",
+      sessionFile: journal, tools: [], extensions: false, transport: "process" });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    const log = fs.readFileSync(result.logFile!, "utf8");
+    expect(log).toContain('"type":"fabric_context_compaction"');
+    const dispatch = s.requests.find(payload => JSON.stringify(payload.messages).includes("CURRENT_FULL_HISTORY_EVENT"));
+    expect(dispatch).toBeDefined();
+    expect(estimateTextTokens(JSON.stringify(dispatch))).toBeLessThan(8000);
+    expectJournalAppended(journal, before, true);
+    const entries = SessionManager.open(journal).getBranch();
+    expect(entries.some(entry => entry.type === "compaction")).toBe(true);
+    expect(fs.readFileSync(journal, "utf8")).toContain("OLD_OBJECTIVE_0");
+    expect(log).not.toContain('"type":"auto_retry_start"');
+  }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary).each(["reducible", "irreducible"])("over-cap full-history admission recovers explicitly and is bounded (%s)", async mode => {
+    const s = await setup();
+    fs.writeFileSync(s.settingsFile, JSON.stringify({ enableInstallTelemetry: false, compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1000 } }));
+    s.manager.config.timeoutMs = 20_000;
+    const journal = path.join(s.dir, "over-cap-history.jsonl");
+    const session = SessionManager.open(journal);
+    if (mode === "reducible") {
+      for (let index = 0; index < 60; index++) {
+        session.appendMessage(user(`OLD_OBJECTIVE_${index} ` + "x".repeat(80_000)));
+        session.appendMessage(assistant(`old decision ${index}`));
+      }
+      session.appendMessage(user("SMALL_PENDING_OBJECTIVE " + "x".repeat(8_000)));
+      session.appendMessage(assistant("small recent decision"));
+    } else {
+      session.appendMessage(user("UNFITTABLE_SINGLE_EVENT " + "x".repeat(4_500_000)));
+      session.appendMessage(assistant("recent reply"));
+    }
+    const before = readJournal(journal);
+    expect(before.bytes.length).toBeGreaterThan(4_194_304);
+    expect(before.bytes.length).toBeLessThan(20 * 1024 * 1024);
+    const result = await s.manager.run({ task: "CURRENT_OVER_CAP_EVENT", model: "window-test/offline", actorId: "over-cap-actor",
+      sessionFile: journal, tools: [], extensions: false, transport: "process", timeoutMs: 20_000 });
+    const evidence = process.env.FABRIC_CONTEXT_ADMISSION_EVIDENCE_DIR;
+    if (evidence) {
+      fs.mkdirSync(evidence, { recursive: true });
+      fs.writeFileSync(path.join(evidence, `native-cap-${mode}-result.json`), JSON.stringify({ historyBytes: before.bytes.length, requestCount: s.requestCount, result }, null, 2));
+      fs.copyFileSync(result.logFile!, path.join(evidence, `native-cap-${mode}-events.jsonl`));
+    }
+    const log = fs.readFileSync(result.logFile!, "utf8");
+    expect(log, explain(result)).toContain('"type":"fabric_context_compaction"');
+    expect(result.status, explain(result)).not.toBe("timed_out");
+    if (mode === "reducible") {
+      expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+      expect(s.requests.some(payload => JSON.stringify(payload.messages).includes("CURRENT_OVER_CAP_EVENT"))).toBe(true);
+      expectJournalAppended(journal, before, true);
+    } else {
+      expect(result, explain(result)).toMatchObject({ status: "failed", error: expect.stringMatching(/Context exceeds window|Actor context admission compact failed/) });
+      expect(log.match(/"type":"fabric_context_compaction"/g)).toHaveLength(1);
+      expect(s.requests.some(payload => JSON.stringify(payload.messages).includes("CURRENT_OVER_CAP_EVENT"))).toBe(false);
+    }
+  }, TEST_GUARD_MS);
+
   it.skipIf(!selectedNativeBinary).each(["google-generative-ai", "google-vertex"].flatMap(api =>
     ["stream", "streamSimple"].flatMap(method =>
-      ["success", "abort", "snapshot", "expand", "shrink", "non-json", "invalid-control"].map(mode => [api, method, mode])),
+      ["success", "abort", "snapshot", "late-write", "expand", "shrink", "non-json", "invalid-control"].map(mode => [api, method, mode])),
   ))("preserves native Google SDK payload and signal identity: %s %s %s", (api, method, mode) => {
     const dir = root();
     const resultFile = path.join(dir, "google-result.json");
@@ -423,12 +490,12 @@ describe("native activation window (offline; opted-in success needs exact native
       // fails admission. Its own serializer must never run, either.
       controller.signal.context = {cycle:controller.signal, big:1n};
       controller.signal.toJSON = () => {throw new Error('serialized SDK cancellation control')};
-      let observed, sdkCalls = 0, requests = 0, wire, disconnected = false, guardFired = false;
+      let observed, sdkCalls = 0, requests = 0, wire, disconnected = false, guardFired = false, lateWriteRan = false;
       // The SDK installs this public method as an instance arrow function. Wrap
       // that assignment to inspect the EXACT adapter input before SDK transforms.
       Object.defineProperty(Models.prototype, 'generateContentStream', {configurable:true, set(fn) {
         Object.defineProperty(this, 'generateContentStream', {value:async params => {
-          assert.equal(params, observed, 'replaced native SDK parameter object');
+          assert.notEqual(params, observed, 'dispatched the retained native SDK parameter object');
           assert.equal(params.config.abortSignal, controller.signal, 'lost native AbortSignal identity');
           sdkCalls++;
           fs.writeFileSync(${JSON.stringify(sdkCallFile)}, 'called');
@@ -475,6 +542,18 @@ describe("native activation window (offline; opted-in success needs exact native
             // An identically named value anywhere else is context, not a control.
             if (${JSON.stringify(mode)} === 'non-json') payload.config.extra = {abortSignal:controller.signal};
             if (${JSON.stringify(mode)} === 'invalid-control') payload.config.abortSignal = {aborted:false};
+            // smarty-dev#3337: schedule from the getter read DURING admission,
+            // so the retained root grows after the guard returns, before dispatch.
+            if (${JSON.stringify(mode)} === 'late-write') {
+              Object.defineProperty(payload, 'contents', {enumerable:true, configurable:true, get() {
+                queueMicrotask(() => {
+                  Object.defineProperty(payload, 'contents', {enumerable:true, configurable:true, writable:true,
+                    value:[{role:'user', parts:[{text:'x'.repeat(40_000)}]}]});
+                  lateWriteRan = true;
+                });
+                return [{role:'user', parts:[{text:'SMALL_GOOGLE_INPUT'}]}];
+              }});
+            }
             if (${JSON.stringify(mode)} === 'snapshot') {
               let reads = 0;
               Object.defineProperty(payload, 'contents', {enumerable:true, configurable:true, get() {
@@ -486,11 +565,15 @@ describe("native activation window (offline; opted-in success needs exact native
         assert.equal(sdkCalls, 1);
         assert.equal(requests, 1);
         assert.equal(JSON.stringify(wire).includes('abortSignal'), false);
-        assert.equal(JSON.stringify(wire).includes('SMALL_GOOGLE_INPUT'), true);
+        if (${JSON.stringify(mode)} === 'late-write') {
+          assert.equal(lateWriteRan, true, 'retained root write did not run');
+          assert.equal(observed.contents[0].parts[0].text, 'x'.repeat(40_000), 'retained root did not grow');
+        }
+        assert.deepEqual(wire.contents, [{role:'user', parts:[{text:'SMALL_GOOGLE_INPUT'}]}], 'dispatched data differs from admitted snapshot');
         if (${JSON.stringify(mode)} === 'abort') await connectionClosed;
         else assert.equal(result.content[0].text, 'GOOGLE_OK');
         assert.equal(guardFired, false, 'request/disconnect ended only because the hang guard fired');
-        fs.writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({sdkCalls, requests, samePayload:true, sameSignal:true,
+        fs.writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({sdkCalls, requests, detachedPayload:true, sameSignal:true,
           stopReason:result.stopReason, disconnected, wireKeys:Object.keys(wire)}));
       } finally {
         clearTimeout(timeout);
@@ -508,7 +591,7 @@ describe("native activation window (offline; opted-in success needs exact native
       expect(result.stderr).toContain(mode === "expand" ? "Context exceeds window" : "Fabric activation window failed");
       return;
     }
-    expect(JSON.parse(fs.readFileSync(resultFile, "utf8"))).toMatchObject({sdkCalls: 1, requests: 1, samePayload: true, sameSignal: true,
+    expect(JSON.parse(fs.readFileSync(resultFile, "utf8"))).toMatchObject({sdkCalls: 1, requests: 1, detachedPayload: true, sameSignal: true,
       stopReason: mode === "abort" ? "aborted" : "stop", ...(mode === "abort" ? {disconnected: true} : {})});
   }, TEST_GUARD_MS);
 
@@ -805,7 +888,7 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
   }, TEST_GUARD_MS);
 
-  it.skipIf(!selectedNativeBinary).each([false, true])("3238 compacts mid-run growth in a real activation (unfittable latest batch: %s)", async unfittable => {
+  it.skipIf(!selectedNativeBinary).each([false, true])("compacts mid-run growth and overflowing latest batch before dispatch (oversized: %s)", async unfittable => {
     const s = await setup(5, unfittable ? 4 : 0);
     const alarms: Array<{message: {text?: string}}> = [];
     const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
@@ -817,13 +900,12 @@ describe("native activation window (offline; opted-in success needs exact native
       model: "window-test/offline", tools: ["read"], extensions: false, transport: "process", delivery: "mailbox"});
     const run = vi.spyOn(s.manager, "run");
     const outcome = actors.ask(actor.id, "CURRENT_GROWING_ACTIVATION");
-    if (unfittable) await expect(outcome).rejects.toThrow(/Context exceeds window/);
-    else await expect(outcome).resolves.toMatchObject({text: "useful current result"});
+    await expect(outcome).resolves.toMatchObject({text: "useful current result"});
     await actors.close();
     expect(run).toHaveBeenCalledTimes(1);
-    expect(alarms).toHaveLength(unfittable ? 1 : 0);
-    expect(mesh.read({topic: "ops.owner"}).filter(event => event.kind === "actor.alarm")).toHaveLength(unfittable ? 1 : 0);
-    expect(s.requests).toHaveLength(unfittable ? 4 : 6);
+    expect(alarms).toHaveLength(0);
+    expect(mesh.read({topic: "ops.owner"}).filter(event => event.kind === "actor.alarm")).toHaveLength(0);
+    expect(s.requests).toHaveLength(6);
     const journal = readJournal(path.join(s.dir, "actors", actor.id, "session.jsonl"));
     const rawMessages = SessionManager.open(path.join(s.dir, "actors", actor.id, "session.jsonl")).getBranch()
       .flatMap(entry => entry.type === "message" ? sessionEntryToContextMessages(entry) : []);
@@ -835,14 +917,15 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(journal.entries.some(entry => entry.type === "compaction" || entry.type === "context_edit")).toBe(false);
     const raw = journal.bytes.toString("utf8");
     expect(raw).toContain("CURRENT_GROWING_ACTIVATION");
-    for (let round = 1; round <= (unfittable ? 4 : 5); round++) {
+    for (let round = 1; round <= 5; round++) {
       const full = fs.readFileSync(path.join(s.dir, `task-${round}.txt`), "utf8");
       expect(raw).toContain(full); // Full original output survives every inference compaction.
       const next = s.requests[round];
       if (!next) continue; // Latest oversized result was never dispatched.
       const tool = next.messages.find((message: any) => message.role === "tool" && message.tool_call_id === `read-${round}`);
       const text = typeof tool.content === "string" ? tool.content : tool.content.map((part: any) => part.text ?? "").join("");
-      expect(text).toBe(full); // Current batch is not compacted, even at the threshold.
+      if (unfittable && round === 4) expect(text).toContain("Compacted tool output");
+      else expect(text).toBe(full); // Latest batch stays exact unless it alone overflows.
       const call = next.messages.find((message: any) => message.tool_calls?.some((call: any) => call.id === `read-${round}`));
       expect(call.tool_calls.some((call: any) => call.id === tool.tool_call_id)).toBe(true);
     }

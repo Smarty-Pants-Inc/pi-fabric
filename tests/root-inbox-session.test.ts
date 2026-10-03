@@ -298,6 +298,34 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     while (!done() && Date.now() < deadline) await sleep(50);
   };
 
+  it.each(["during-error", "after-error"] as const)("wakes once for mailbox work queued %s, not for the stream error alone (#4012)", async (timing) => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    session.setAutoRetryEnabled(false);
+    const calls = faux.state.callCount;
+    faux.setResponses([
+      () => {
+        if (timing === "during-error") missedWork("Follow up after stream disconnect.");
+        return fauxAssistantMessage("partial answer", { stopReason: "error",
+          errorMessage: "stream disconnected before completion: stream closed before response.completed" });
+      },
+      fauxAssistantMessage("mailbox followUp processed"),
+    ]);
+    await session.prompt("fail the stream");
+    expect(session.isStreaming).toBe(false);
+    if (timing === "after-error") {
+      await sleep(300); // An error with no new work must not retry itself.
+      expect(faux.state.callCount).toBe(calls + 1);
+      missedWork("Follow up after stream disconnect.");
+    }
+    await until(() => inboxMessages().length > 0 && !session.isStreaming, 2_000);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(faux.state.callCount).toBe(calls + 2);
+    expect(JSON.stringify(session.messages.at(-1))).toContain("mailbox followUp processed");
+    await sleep(300);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(faux.state.callCount).toBe(calls + 2);
+  }, 60_000);
+
   it("wakes an idle Main for an addressed work event with one new turn, and only once", async () => {
     const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
     faux.setResponses([fauxAssistantMessage("woken"), fauxAssistantMessage("extra")]);

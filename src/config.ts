@@ -169,6 +169,8 @@ export interface FabricAgentConfig {
   /** Host-only fleet policy; workspace configuration cannot override these keys. */
   deniedModels: string[];
   deniedModelReplacement?: string;
+  /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
+  instructionsRoot?: string;
   claude: FabricClaudeRunnerConfig;
   veda: FabricVedaRunnerConfig;
   thinking: FabricThinking;
@@ -521,7 +523,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     orphanedTempRunMs: 6 * 60 * 60 * 1_000,
     oneShotRunMs: 24 * 60 * 60 * 1_000,
     actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
-    terminalRunEventsAgeMs: 24 * 60 * 60 * 1_000,
+    terminalRunEventsAgeMs: 6 * 60 * 60 * 1_000,
     terminalRunEventsMaxBytes: 256 * 1024,
   },
   actors: {
@@ -1053,7 +1055,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
         ? { modelRouting: (() => {
             const routing = agents.modelRouting as Record<string, unknown>;
+            if (routing.live !== undefined && routing.live !== false) throw new Error("Live model routing requires measured parity and Paul's floor approval (#2236); unavailable in shadow mode");
             return {
+              live: false as const,
               ...(typeof routing.pinModel === "string" ? { pinModel: routing.pinModel } : {}),
               ...(isFabricThinking(routing.pinThinking) ? { pinThinking: routing.pinThinking } : {}),
               shadowCandidates: Array.isArray(routing.shadowCandidates)
@@ -1135,6 +1139,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           ? agents.sessionExportDir
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
+      ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
     },
     jev: normalizeJevConfig(input.jev),
     records: normalizeRecordsConfig(input.records),
@@ -1570,6 +1575,7 @@ const resolveFabricConfig = (
       const agents = { ...objectValue(document.agents) };
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;
+      delete agents.instructionsRoot;
       document.agents = agents;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

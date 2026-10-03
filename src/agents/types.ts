@@ -42,6 +42,14 @@ export interface AgentSessionSeed {
   outerToolResult: AgentToolResultMessage;
 }
 
+/** Record-only host classification; it never grants permission to route. */
+export interface AgentRunRouteMetadata {
+  routeClass: string;
+  routeClassSource: "explicit" | "derived";
+  /** Trusted caller protection snapshot; absent means unknown, never known-clear. */
+  protected?: boolean;
+}
+
 export interface AgentSpawner {
   id: string;
   kind: "main" | "agent" | "actor";
@@ -50,6 +58,9 @@ export interface AgentSpawner {
 }
 
 export interface AgentRunRequest {
+  /** Explicit history class; routing still requires a separately prepared decision. */
+  routeClass?: string;
+  protected?: boolean;
   /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
   idempotencyKey?: string;
   /** Host-created shadow decision; never accepted from external argument normalization. */
@@ -70,6 +81,8 @@ export interface AgentRunRequest {
   pythonRuntime?: FabricPythonRuntime;
   transport?: FabricAgentTransport;
   model?: string;
+  /** Caller-supplied justification for an explicit model selection. */
+  modelReason?: string;
   /** Veda persona name; only used when runner is "veda". */
   persona?: string;
   thinking?: FabricThinking;
@@ -136,6 +149,10 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Always populated for new runs; optional for legacy records. */
+  routeClass?: string;
+  routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
+  protected?: boolean;
   /** Immediate caller, distinct from the lineage Main. */
   spawner?: AgentSpawner;
   /** Requested launch model; model below follows verified state/assistant attribution. */
@@ -155,6 +172,7 @@ export interface AgentRunRecord {
   transport: FabricAgentTransport;
   cwd: string;
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
   actorId?: string;
   actorName?: string;
@@ -201,6 +219,8 @@ export interface AgentRunRecord {
   nestedAgents?: AgentRunRecord[];
   pendingMessages?: { steering: string[]; followUp: string[] };
   compaction?: AgentCompactionStatus;
+  /** Unconsumed outcome, including recovery from a dead Main to its exact lane successor. */
+  completionDelivery?: { status: "undelivered"; addressedTo: string; redeliveredFrom?: string };
   /** Terminal event-log optimization was skipped; the full original log remains. */
   compactionSkipped?: string;
 }
@@ -217,6 +237,9 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  routeClass?: string;
+  routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
+  protected?: boolean;
   spawner?: AgentSpawner;
   /** Present on terminal status snapshots when the full log was retained. */
   compactionSkipped?: string;
@@ -231,6 +254,7 @@ export interface AgentHandleInfo {
   transport: FabricAgentTransport;
   cwd: string;
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
   actorId?: string;
   actorName?: string;
@@ -246,6 +270,10 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  /** Host-created record metadata, independent of the route header/decision. */
+  routeClass?: string;
+  routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
+  protected?: boolean;
   residentStartupProbe?: boolean;
   id: string;
   runner: FabricAgentRunner;
@@ -284,6 +312,7 @@ export interface AgentWorkerOptions {
   /** Host-only bounded judge: no ambient resources, compaction or retry. */
   judgment?: boolean;
   model?: string;
+  modelReason?: string;
   thinking?: string;
   systemPrompt?: string;
   sessionFile?: string;

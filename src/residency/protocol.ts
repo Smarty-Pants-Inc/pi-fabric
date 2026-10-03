@@ -12,7 +12,7 @@ import path from "node:path";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricModelAliases, FabricModelCandidate } from "../core/model-resolution.js";
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
-import type { FabricActorInfo, FabricActorRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorCreateRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
 import type { FabricThinking } from "../thinking.js";
 import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
 import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
@@ -290,7 +290,7 @@ export const residentHostStateNote = (residencyRoot: string, now = Date.now()): 
       const age = now - fs.statSync(file).mtimeMs;
       if (age < 2_000) continue;
       notes.push(`the host has been processing ${String(command.operation)}` +
-        `${typeof command.id === "string" ? ` of ${command.id}` : ""} for ${formatAge(age)}; this request waits behind it`);
+        `${typeof command.id === "string" ? ` of ${command.id}` : ""} for ${formatAge(age)}; its response may still be settling`);
     }
   } catch { /* nothing in process */ }
   try {
@@ -345,6 +345,9 @@ export interface ResidentHostConfig {
   sessionId: string;
   cwd: string;
   projectRoot: string;
+  /** Current host-owned Main name; each admitted run snapshots it in its launch manifest. */
+  mainName?: string;
+  mainStartedAt?: number;
   /** The root's fleet role; only a project agent's hosts adopt a project's orphans (smarty-dev#878). */
   role?: string;
   /** The root's project (participantProject), which can differ from its cwd's (smarty-dev#977). */
@@ -361,6 +364,8 @@ export interface ResidentHostConfig {
   retention: FabricRetentionConfig;
   /** Absent in a config an older release wrote: the defaults apply. */
   actors?: FabricActorsConfig;
+  /** Host-only shadow gates; old snapshots refuse optional inference. */
+  shadowRouting?: import("../agents/model-route-owner.js").ShadowRoutePolicy;
   workerPath: string;
   fabricExtensionPath: string;
   piBinary: string;
@@ -478,7 +483,7 @@ interface ResidentCreateActorCommand {
   idempotencyKey?: string;
   requestId: string;
   rootId: string;
-  request: FabricActorRequest;
+  request: FabricActorCreateRequest;
   createdAt: number;
 }
 
@@ -517,7 +522,9 @@ export const assertResidentActorToolCeiling = (tools: string[], ceiling: readonl
 
 /** Root-owned registry operations; these never start a resident host. */
 export type ResidentActorMutation =
-  | { operation: "setInstructions"; id: string; instructions: string }
+  | ({ operation: "setInstructions"; id: string; replace?: boolean } & import("../actors/instructions-file.js").FabricActorInstructionsSource)
+  | { operation: "resetSession"; id: string }
+  | { operation: "stop"; id: string }
   | { operation: "setTools"; id: string; tools: string[] }
   | { operation: "setModel"; id: string; model?: string; scope: FabricActorBindingScope }
   | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
@@ -564,7 +571,7 @@ export const residentCommandForOwner = (command: ResidentCommand, owner: Residen
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "setInstructions", "setModel",
-  "setThinking", "setTools", "setActivationFilter", "releaseChange",
+  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>
@@ -624,7 +631,7 @@ export interface ResidentCommandResponse {
   pending?: string;
   cleaned?: boolean;
   error?: string;
-  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED";
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED";
   /** Allowlisted policy-refusal payload, never arbitrary host Error properties. */
   modelDenied?: { model: string; replacement?: string };
   completedAt: number;

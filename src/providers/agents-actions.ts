@@ -31,6 +31,12 @@ const runProperties = {
     description:
       "Pi provider/id copied from agents.models({ runner: \"pi\" }), a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties). Reuse returned keys; never infer version numbers from agent names. Exact keys win; near-miss IDs resolve to the closest visible model on the same provider. Handles report the canonical model. Without host model policy, Claude runtime values and Veda backend models/aliases are forwarded verbatim. Under active policy, Claude aliases must resolve through its native CLI catalog; Veda requires backend pi and an exact visible provider/model (unresolved aliases/defaults are refused).",
   },
+  routeClass: { type: "string", pattern: "^[a-z][a-z0-9-]{0,63}$", description: "Explicit run-history class. Record-only unless spawn also requests model: auto; auto permits bounded-lookup or status-groom only." },
+  protected: { type: "boolean", description: "Trusted issue/PR protection snapshot, never task text: true for review/security/audit/named passes/needs-security-pass; false only for known-clear state. Omitted stays unknown and excluded from routing." },
+  modelReason: {
+    type: "string",
+    description: "Reason for an explicit model selection, recorded on the run. Required and non-blank for cliproxyapi/gpt-6-astra; named passes use cliproxyapi/gpt-6.1-sol thinking max, otherwise omit model (role default).",
+  },
   persona: {
     type: "string",
     description: "Veda persona name for this run, such as frontend, reviewer, worker, or a custom persona.",
@@ -113,10 +119,8 @@ const spawnSchema = {
     ...runProperties, residency: residencySchema,
     idempotencyKey: residentIdempotencyKeySchema,
     model: { ...runProperties.model, description: `${strictModelProperty.description} Spawn-only \"auto\" decides and records in shadow mode; the child still runs pinModel/pinThinking.` },
-    routeClass: { type: "string", pattern: "^[a-z][a-z0-9-]{0,63}$", description: "Opt-in auto route class; initially bounded-lookup. Unknown classes are excluded." },
     pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },
     pinThinking: { ...runProperties.thinking, description: "Role's required effort pin; overrides agents.modelRouting.pinThinking. Never inferred from the default medium effort." },
-    protected: { type: "boolean", description: "Caller supplies from trusted issue/PR state, never task text: true for review, security, audit, named passes or needs-security-pass; false only for known clear state. Omitted/unknown is excluded before Jev." },
   },
 };
 
@@ -160,6 +164,8 @@ const handoffSchema = {
       description: "Explicit Pi exact provider/id, model id, or configured alias target that will continue the inherited trajectory. Closest-match selectors are refused with candidate keys.",
     },
     thinking: runProperties.thinking,
+    routeClass: runProperties.routeClass,
+    protected: runProperties.protected,
     tools: runProperties.tools,
     timeoutMs: runProperties.timeoutMs,
     extensions: runProperties.extensions,
@@ -203,6 +209,17 @@ const activationFilterSchema = {
       { type: "object" },
     ],
   },
+};
+const actorInstructionsProperties = {
+  instructions: { type: "string" },
+  instructionsFile: { type: "string", minLength: 1, description: "Instructions file on the owning host under agents.instructionsRoot (default ~/.local/share/smarty-dev/factory/current/). Regular UTF-8 file, max 512 KB; no '..' or symlink escape." },
+  sha256: { type: "string", pattern: "^[a-f0-9]{64}$", description: "Exact lowercase SHA256 of the instructionsFile bytes. Required with instructionsFile; mutually exclusive with inline instructions." },
+};
+const actorInstructionsSourceSchema = {
+  oneOf: [
+    { required: ["instructions"], not: { anyOf: [{ required: ["instructionsFile"] }, { required: ["sha256"] }] } },
+    { required: ["instructionsFile", "sha256"], not: { required: ["instructions"] } },
+  ],
 };
 export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
@@ -400,12 +417,12 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "create",
     description:
-      'Create a persistent actor with independently selected session or project storage. Use scope "global" to save a reusable project-independent template instead of a live actor.',
+      'Create a persistent actor with inline instructions or instructionsFile + sha256 verified by its owning host (max 512 KB, factory root only). Use scope "global" for a reusable template.',
     inputSchema: {
       type: "object",
       properties: {
         name: { type: "string" },
-        instructions: { type: "string" },
+        ...actorInstructionsProperties,
         events: {
           type: "array",
           items: {
@@ -423,11 +440,14 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         coalesce: { type: "boolean" },
         coalesceKey: { type: "string", description: "Dotted path into a mesh event's data (such as payload.number). A queued event of the same topic with the same value there is replaced by the newer one." },
         activationFilter: activationFilterSchema,
+        routeClass: { type: "string", enum: ["status-groom"], description: "Per-activation shadow Choice for checks/grooming producing a status line or no-op; explicit model/thinking pins required." },
+        protected: { type: "boolean", description: "Trusted protection snapshot; true for review/security/audit/needs-security-pass. Omitted excludes before Jev." },
         residency: residencySchema,
         idempotencyKey: residentIdempotencyKeySchema,
         runner: runProperties.runner,
         kernel: runProperties.kernel,
         model: strictModelProperty,
+        modelReason: runProperties.modelReason,
         thinking: runProperties.thinking,
         tools: runProperties.tools,
         transport: runProperties.transport,
@@ -467,7 +487,8 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
           description: "session isolates the actor to the root Pi session; project shares it across sessions; global creates a non-live template.",
         },
       },
-      required: ["name", "instructions"],
+      required: ["name"],
+      allOf: [actorInstructionsSourceSchema],
       oneOf: [
         {
           properties: {
@@ -777,7 +798,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "resetSession",
     description:
-      "Start a persistent actor's next run on a fresh Pi session. An in-flight run finishes first; the old session is archived beside it (2 kept). Instructions, topics, bindings, the queue and messages are kept.",
+      "Start a persistent actor's next run on a fresh Pi session. The owning Main requests resident reset directly; an admitted activation settles at the fenced boundary while other resident commands remain serviceable. Explicit stop cancels work and any pending reset; it is not preparation for repair. The old session is archived beside it (2 kept). Instructions, topics, bindings, the queue and messages are kept.",
     inputSchema: idSchema,
     risk: "agent",
   },
@@ -799,16 +820,17 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "setInstructions",
     description:
-      'Replace an actor\'s default instruction (its persona / system-prompt body). Default scope "project" edits a live project actor; scope "global" edits a project-independent template. Takes effect on the actor\'s next queued message. A new body more than 80% shorter than the current one is refused unless replace is true.',
+      'Replace an actor\'s default instruction (its persona / system-prompt body). Default scope "project" edits a live project actor; scope "global" edits a project-independent template. Takes effect on the actor\'s next queued message. Pass inline instructions or instructionsFile + sha256 (owning-host factory root, max 512 KB). A new body more than 80% shorter than the current one is refused unless replace is true.',
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
-        instructions: { type: "string" },
+        ...actorInstructionsProperties,
         scope: { type: "string", enum: ["project", "global"] },
         replace: { type: "boolean" },
       },
-      required: ["id", "instructions"],
+      required: ["id"],
+      allOf: [actorInstructionsSourceSchema],
       additionalProperties: false,
     },
     risk: "agent",
@@ -879,3 +901,9 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "read",
   },
 ];
+
+// Explicit spelling for callers; keep create as the backwards-compatible API.
+AGENTS_ACTION_DESCRIPTORS.push({
+  ...AGENTS_ACTION_DESCRIPTORS.find(action => action.name === "create")!,
+  name: "createActor",
+});

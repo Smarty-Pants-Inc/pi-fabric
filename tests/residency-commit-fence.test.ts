@@ -710,7 +710,8 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
 
 const mainProvider = (state: Awaited<ReturnType<typeof harness>>, caller: "main" | "nested" = "main", acknowledgementTimeoutMs = 3_000) => {
   const manager = new AgentManager(state.root, state.config.agents, { runRoot: path.join(state.root, "local-runs") });
-  const identity = { id: state.config.rootId, name: "main", kind: "main" as const };
+  // Public lifecycle requires the actual Main session, not inherited root ID alone.
+  const identity = { id: state.config.rootId, name: "main", kind: "main" as const, sessionId: state.config.sessionId };
   const actors = new ActorDirectory(["caller", identity, state.client.options.mesh, state.config.mesh, manager, () => {}, {
     persistent: true, rootId: state.config.rootId, claimResidency: "session",
     canManageActor: (id) => {
@@ -955,15 +956,21 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       // 900 ms with a 250 ms client wait. Resident actorStatus now uses that same
       // serial exchange, so reconcile only after the held request finishes.
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      // The original 250 ms uncertainty deadline is unchanged. Fresh status and
+      // main's now-resident joined stop use an ordinary reconciliation budget.
+      state.client.options.commandTimeoutMs = 5_000;
       // Simulate the resumed wall clock for new reconciliation generations, not
       // the original execution deadline. The expiry watermark never rolls back.
       const realNow = Date.now.bind(Date);
       const reconciliationClock = originalDecisions.length ? vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000) : undefined;
+      // A resumed Main must renew its real root lease at the advanced clock before
+      // authorized public stop, not rely on the old pre-expiry directory presence.
+      if (reconciliationClock) await state.participants.refresh();
       // Reconcile live entities before assertions that deliberately fail on the old head.
       for (const decision of ending === "collected expiry" ? [] : decisions) {
         await waitFor(() => state.participants.get(decision.id)?.ownerHostId === residentHostId(state.config.rootId));
         expect((await main.invoke("agents.actorStatus", { id: decision.id })) as object).toMatchObject({ id: decision.id });
-        expect(await main.invoke("agents.stop", { id: decision.id })).toMatchObject({ acknowledged: true });
+        expect(await main.invoke("agents.stop", { id: decision.id })).toMatchObject({ id: decision.id, status: "stopped" });
       }
       reconciliationClock?.mockRestore();
       const settled = await executed.mock.results[0]!.value;
@@ -1049,6 +1056,8 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
       const realNow = Date.now.bind(Date);
       const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000);
+      state.client.options.commandTimeoutMs = 5_000;
+      await state.participants.refresh();
       const status = await state.client.actorStatus(decisions[0]!.id);
       expect(status).toMatchObject({ id: decisions[0]!.id });
       clock.mockRestore();
@@ -1135,7 +1144,7 @@ describe("round 4 registered fabric_exec committed-output priority", { timeout: 
         const reconciliation = await run(`return {status:await agents.actorStatus({id:"${id}"}),stop:await agents.stop({id:"${id}"})};`);
         expect(reconciliation.isError).not.toBe(true);
         const record = JSON.parse(visibleText(reconciliation));
-        expect(record.status.id).toBe(id); expect(record.stop).toMatchObject({ queued: true, acknowledged: true });
+        expect(record.status.id).toBe(id); expect(record.stop).toMatchObject({ id, status: "stopped" });
         await waitFor(() => state.participants.get(id)?.status === "stopped");
         const stopped = await run(`return await agents.actorStatus({id:"${id}"});`);
         expect(stopped.isError).not.toBe(true);
@@ -1246,6 +1255,9 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
       expect(mapped).toEqual([expect.objectContaining({ ok: true, handle: expect.objectContaining({ id: expect.any(String) }) }),
         expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") }),
         expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") })]);
+      // Initial handled-uncertainty calls keep their asserted 700 ms deadline;
+      // only the new status/joined-stop invocations use ordinary admission waits.
+      state.client.options.commandTimeoutMs = 5_000;
       const successful = decisions.find(decision => decision.id === mapped[0].handle.id)!;
       const uncertain = decisions.filter(decision => decision !== successful);
       const reconciled = [];
@@ -1257,7 +1269,7 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
           : `return {status:await agents.actorStatus({id:"${id}"}),stop:await agents.stop({id:"${id}"})};`);
         expect(reconciliation.isError).not.toBe(true);
         const record = JSON.parse(visibleText(reconciliation));
-        expect(record.status.id).toBe(id); expect(record.stop).toMatchObject({ queued: true, acknowledged: true });
+        expect(record.status.id).toBe(id); expect(record.stop).toMatchObject({ id, status: "stopped" });
         await waitFor(() => state.participants.get(id)?.status === "stopped");
         const stopped = await run(python ? `return await agents.actorStatus(id="${id}")` : `return await agents.actorStatus({id:"${id}"});`);
         expect(JSON.parse(visibleText(stopped))).toMatchObject({ id, status: "stopped" });
@@ -1350,7 +1362,7 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
           ? `return {"status": await agents.actorStatus(id="${decision.id}"), "stop": await agents.stop(id="${decision.id}")}`
           : `return {status:await agents.actorStatus({id:"${decision.id}"}),stop:await agents.stop({id:"${decision.id}"})};`);
         expect(reconciled.isError).not.toBe(true);
-        expect(JSON.parse(visibleText(reconciled))).toMatchObject({ status: { id: decision.id }, stop: { acknowledged: true } });
+        expect(JSON.parse(visibleText(reconciled))).toMatchObject({ status: { id: decision.id }, stop: { id: decision.id, status: "stopped" } });
         await waitFor(() => state.participants.get(decision.id)?.status === "stopped");
         expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
         if (process.env.FABRIC_RESIDENT_OUTPUT_EVIDENCE) {
@@ -1414,7 +1426,7 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
         const reconcile = await registeredExecution(state, main, 5_000, engine);
         const reconciled = await reconcile(`return {"status": await agents.actorStatus(id="${decision.id}"), "stop": await agents.stop(id="${decision.id}")}`);
         expect(reconciled.isError).not.toBe(true);
-        expect(JSON.parse(visibleText(reconciled))).toMatchObject({ status: { id: decision.id }, stop: { acknowledged: true } });
+        expect(JSON.parse(visibleText(reconciled))).toMatchObject({ status: { id: decision.id }, stop: { id: decision.id, status: "stopped" } });
         await waitFor(() => state.participants.get(decision.id)?.status === "stopped");
         expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
         if (process.env.FABRIC_RESIDENT_OUTPUT_EVIDENCE) {

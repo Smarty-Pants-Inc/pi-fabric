@@ -10,4 +10,6 @@ sweepTempRunRoots({
   ...(request.currentRoot ? { currentRoot: request.currentRoot } : {}),
   orphanedTempRunRetentionMs: request.orphanedTempRunRetentionMs,
   oneShotRunRetentionMs: request.oneShotRunRetentionMs,
+  ...(request.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: request.terminalRunEventsAgeMs } : {}),
+  ...(request.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: request.terminalRunEventsMaxBytes } : {}),
 });

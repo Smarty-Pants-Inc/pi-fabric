@@ -36,9 +36,15 @@ Fabric injections carry structured [turn provenance](turn-provenance.md) on capa
 
 Independent work can continue without polling. With `agents.notifyOnComplete` enabled (the default), a concise UI notice appears when a detached run finishes. Full outcomes remain in agent activity and logs. Unread results are batched into Main's context after the current assistant turn's entire tool batch, without waiting for its final answer. If Main is idle, unread results wake it once.
 
-`agents.wait`/`join`, terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop. Fabric refuses a foreground `bash` call, native or through `pi.bash`, whose sleeps add up to more than 5 minutes: a long `sleep`, a sleep in a counted `for` loop, a sleep in a `while` or `until` loop without a `timeout`, a sleep whose length is not a literal (`sleep $((t-now))`), or a `flock -w` wait. The tool call's own `timeout` or a literal `timeout N` bounds the estimate. A session that waits in the foreground takes no steer or ask. Start the poll detached, or wait for a completion message or a mesh event, and end the turn.
+`agents.wait`/`join`, supervisor-settled terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status, provisional terminal attempt status during retry/resume, and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop. Fabric refuses a foreground `bash` call, native or through `pi.bash`, whose sleeps add up to more than 5 minutes: a long `sleep`, a sleep in a counted `for` loop, a sleep in a `while` or `until` loop without a `timeout`, a sleep whose length is not a literal (`sleep $((t-now))`), or a `flock -w` wait. The tool call's own `timeout` or a literal `timeout N` bounds the estimate. A session that waits in the foreground takes no steer or ask. Start the poll detached, or wait for a completion message or a mesh event, and end the turn.
 
 Durable spawns use the same inbox. Undelivered envelopes survive disconnects; receipts survive reconnects. Escape or an errored Main turn parks pending results: Fabric does not start a turn to deliver them, and they join Main's next turn, whatever starts it (typed input, a peer message or another trigger). Explicit lifecycle subscriptions, actor messages, and trajectory handoffs retain their separate delivery policies. A terminal run can still report incomplete work; Main must inspect its result.
+
+Inbox delivery receipts require the completion carrier in Pi's actual session JSONL, with a matching session header and successful file/namespace durability barriers. Pi's in-memory entry list, a failed append, a fresh unflushed session, and tree navigation are not receipts; the durable source stays unread. In-memory-only hosts cannot confirm durable inbox delivery.
+
+Completion recovery keeps worker-attempt candidates separate from the supervisor's settled logical-run outcome. A failed startup or recoverable stop is not delivered or returned by a durable wait while its pinned supervisor can still retry it. An orphan candidate becomes eligible only after that supervisor process is gone; a settled outcome takes precedence. Legacy launch manifests without a supervisor identity cannot prove orphan settlement, so their worker status stays retained rather than being automatically promoted.
+
+Full journal results are readable only by the original recipient session or its validated, claimed exact-lane successor (same project root, cwd, name and role). Other sessions see bounded status metadata and the pending/addressed-to state, never private task, text, error, structured value, usage or log/session details; their reads do not acknowledge the recipient's result. Receipted outcomes do not replay to later successors; a successor cannot clean up or read logs for predecessor-owned runs. Journal result availability is not durable-run operational ownership: ordinary local runs continue to use their local manager for log and cleanup. Durable receipts fence replay. An unreadable, malformed, or identity-mismatched fence fails closed: no successor claim, private body access, delivery, or replacement receipt; the source is retained and a storage diagnostic is surfaced until repaired. Their live mesh claims are retired with ownership/version checks and crash leftovers are reconciled even when notifications are disabled.
 
 ### Actor children and reply targets
 
@@ -78,6 +84,7 @@ The `pi.agent_start` and terminal `run.*` lifecycle payloads carry
 Native identity comes from Pi's live session manager, not a pre-launch session
 header: Pi can replace a header-only session's seeded ID during startup.
 No new store or configuration is required.
+
 
 ### Stalled Pi error recovery
 
@@ -562,7 +569,22 @@ For a code-owned typed alternative to a reasoning actor, use [Jev Main-turn obse
 
 ## Persistent actors
 
-`agents.create()` makes a named actor. The actor has a fixed runner, persistent runner session, serial mailbox, and optional subscriptions to parent-session events or durable mesh topics:
+`agents.create()` (also spelled `agents.createActor()`) makes a named actor. It and `agents.setInstructions()` accept either inline `instructions` **or** the pair `instructionsFile` + `sha256`, never both:
+
+```ts
+return agents.createActor({
+  name: "reviewer",
+  instructionsFile: "/home/paul/.local/share/smarty-dev/factory/current/roles/reviewer.md",
+  sha256: "<lowercase 64-hex SHA256 of the file bytes>",
+});
+// The same pair works on agents.setInstructions({ id, instructionsFile, sha256 }).
+```
+
+The **owning host** (Main for local actors, resident for durable actors) resolves the file under the realpath of `agents.instructionsRoot`, defaulting to `~/.local/share/smarty-dev/factory/current/`. The root is configurable only in host configuration. Traversal components (`..`), outside-root paths, symlink escapes, non-regular or missing files, files over 512 KiB, invalid UTF-8, and digest mismatches are refused before actor state changes. Existing configured actor instruction size limits also apply. In-root symlinks are allowed, including a `current` symlink to a factory generation. The host reads one bounded byte snapshot and applies its text without BOM/newline normalization; `instructionsDigest` equals the supplied digest. Only the text is persisted, not a file reference; later file changes do not affect the actor. The existing >80% shrink guard still requires `replace: true` for intentional replacements.
+
+**Platform boundary:** File-backed instructions require Linux and a genuine, accessible `/proc/self/fd`. The owner pins the canonical root with an `O_DIRECTORY` handle, checks its identity, then opens each canonical path component relative to pinned directory descriptors with `O_NOFOLLOW`. An ancestor link swapped between containment checks and opening cannot redirect the read outside the root; all handles close on success or refusal. Static in-root symlinks still work because they are canonicalized before that no-follow walk. Node does not expose a portable handle-relative open or Windows reparse-safe equivalent, so Windows/macOS/other hosts refuse **all** file-backed sources (including reparse-point paths) before filesystem access or actor mutation; use inline `instructions` there. Missing/inaccessible procfs also fails closed; there is no pathname-only fallback. This assumes the host controls mount topology/procfs; it does not defend against a privileged mount replacement.
+
+The actor has a fixed runner, persistent runner session, serial mailbox, and optional subscriptions to parent-session events or durable mesh topics:
 
 ```ts
 return agents.create({
@@ -816,7 +838,7 @@ A persistent actor keeps one Pi session across activations. The session can grow
 const actor = await agents.resetSession({ id: "release-reviewer" });
 ```
 
-The call works only on an actor that this session or host owns. On an actor that another host owns, it throws `Fabric actor is owned by another host: <id>`. When a run is in progress, the call waits until the run settles. It does not interrupt the run. Fabric then moves `<actor dir>/session.jsonl` to `session.jsonl.<UTC stamp>.bak` in the same directory, for example `session.jsonl.20260927T145012345Z.bak`. Fabric keeps the two newest backups and deletes older ones. The next run starts a fresh Pi session. A Claude actor also drops its stored runner session ID. The call returns the new `FabricActorInfo` and publishes presence.
+For a session actor, the call works only on the owning session or host; a foreign owner receives `Fabric actor is owned by another host: <id>`. For a durable resident actor, the owning root Main routes the repair to its resident host; foreign roots and inherited task/actor lineage cannot reset it. When a run is in progress, the call waits at the fenced activation boundary until the run settles, then returns the same actor to service. It does not interrupt the run or clear its mailbox. Request reset directly; it is non-destructive repair, not terminal cancellation. An explicit `agents.stop()` cancels a pending boundary reset, terminates the owned activation, and drops queued work; the reset reports `ACTOR_SESSION_RESET_CANCELLED` without rotating the journal. Resident status and other commands remain serviceable while reset or stop waits for the activation fence. Resetting an explicitly stopped actor changes its history only; it does not resume it. Fabric then moves `<actor dir>/session.jsonl` to `session.jsonl.<UTC stamp>.bak` in the same directory, for example `session.jsonl.20260927T145012345Z.bak`. Fabric keeps the two newest backups and deletes older ones. The next run starts a fresh Pi session. A Claude actor also drops its stored runner session ID. The call returns the new `FabricActorInfo` and publishes presence.
 
 The reset keeps instructions, topics, bindings, events, the queue, the overflow, and the message log. Queued work goes to the fresh session. The message log records the reset as an `out` message from source `fabric-host`, with reason `session reset (requested)` or `session reset (size limit)` and data `{ sessionReset: { trigger: "requested" | "size", bytes, archived } }`. `archived` is the backup path, or `null` when there was no session file.
 

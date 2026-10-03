@@ -113,7 +113,7 @@ interface RootHarness {
   config: ResidentHostConfig;
 }
 
-const rootHarness = async (name: string): Promise<RootHarness> => {
+const rootHarness = async (name: string, leaseMs = 300): Promise<RootHarness> => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fabric-${name}-`));
   roots.push(root);
   const meshRoot = path.join(root, "mesh");
@@ -131,7 +131,7 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
     rootId: identity.id,
     identity,
     heartbeatMs: 50,
-    leaseMs: 300,
+    leaseMs,
   });
   participants.registerSource(() => [{
     format: 1,
@@ -389,7 +389,9 @@ describe("resident setter Main authorization", () => {
 
 describe("saturated durable spawn receipt consistency (#181 F2)", () => {
   it("revokes accepted queued work before reporting failure through the provider", { timeout: 15_000 }, async () => {
-    const state = await rootHarness("resident-saturated");
+    // This test joins real children; it tests queue revocation, not lease expiry.
+    // Keep its live caller valid while main checks the binding at effect time.
+    const state = await rootHarness("resident-saturated", 10_000);
     state.config.agents = { ...state.config.agents, maxConcurrent: 1 };
     fs.mkdirSync(state.config.residencyRoot, { recursive: true });
     const configPath = path.join(state.config.residencyRoot, "config.json");
@@ -410,6 +412,7 @@ describe("saturated durable spawn receipt consistency (#181 F2)", () => {
     const spawned = vi.spyOn(AgentManager.prototype, "spawn");
     try {
       await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
+      await state.participants.refresh();
       const blocker = await client.spawnAgent({ task: "HANG", residency: "durable", transport: "process" });
       await expect(provider.invoke("spawn", { task: "rejected durable activation", residency: "durable", transport: "process" }, context))
         .rejects.toThrow(/no run directory|cannot queue durable spawns/);
@@ -422,6 +425,9 @@ describe("saturated durable spawn receipt consistency (#181 F2)", () => {
       expect(client.hasAgent(queued.id)).toBe(false);
       expect(client.listAgents().map((run) => run.id)).toEqual([blocker.id]);
       await hostManager.stop(blocker.id);
+      // Renew the real caller after joining the old child, before effect-time admission.
+      await state.participants.refresh();
+      expect(state.participants.get(state.identity.id, Date.now(), { fresh: true })?.stale).toBe(false);
       const successor = await client.spawnAgent({ task: "accepted after pool release", residency: "durable", transport: "process" });
       await expect(client.waitAgent(successor.id)).resolves.toMatchObject({ status: "completed" });
       expect(hostManager.runDirectory(queued.id)).toBeUndefined();
@@ -621,8 +627,11 @@ describe("durable completion receipts", () => {
     const state = await rootHarness(`rejected-durable-${action}`);
     const seeded = await seedCompletion(state);
     const handlers = new Map<string, (...args: any[]) => unknown>();
-    const sendMessage = vi.fn();
-    const context = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+    const sessionFile = path.join(state.root, "main-session.jsonl");
+    fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", id: state.config.sessionId }) + "\n");
+    const sendMessage = vi.fn(message => fs.appendFileSync(sessionFile, JSON.stringify({ type: "custom_message", ...message }) + "\n"));
+    const context = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false,
+      sessionManager: { getSessionId: () => state.config.sessionId, getSessionFile: () => sessionFile } } as unknown as ExtensionContext;
     const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, context);
     const consumed = vi.fn((id: string) => inbox.acknowledge(id));
     const completed = vi.fn((result, delivered) => inbox.enqueue(result, delivered));
@@ -1348,15 +1357,17 @@ describe("durable completion receipts", () => {
     }
   });
 
-  it("honors disabled completion notifications for envelopes from an older resident host", async () => {
+  it("retains unread older-host envelopes when completion notifications are disabled", async () => {
     const state = await rootHarness("disabled-completion-resume");
-    await seedCompletion(state);
+    const seeded = await seedCompletion(state);
     state.config.agents.notifyOnComplete = false;
     const onBackgroundComplete = vi.fn();
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, onBackgroundComplete });
     try {
       client.start();
-      await waitFor(() => state.mesh.listAll(residentDeliveryPrefix(state.identity.id)).length === 0);
+      await delay(100);
+      expect(state.mesh.get(seeded.key)).toBeDefined();
+      expect(client.statusAgent(seeded.id)).toMatchObject({ completionDelivery: { status: "undelivered" } });
       expect(onBackgroundComplete).not.toHaveBeenCalled();
       expect(state.deliveries).toHaveLength(0);
     } finally {
@@ -1369,6 +1380,8 @@ describe("durable completion receipts", () => {
     const state = await rootHarness("f1-recovery-completion");
     const seeded = await seedCompletion(state);
     const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8"));
+    // Pin the exited predecessor: a replacement host cannot resume/retry this old run.
+    fs.writeFileSync(path.join(seeded.runDirectory, "completion-recipient.json"), JSON.stringify({ supervisor: { pid: 2147483647 } }));
     // The host died while the spawn handle still said running; only the worker's record advanced.
     fs.writeFileSync(seeded.metadataPath, JSON.stringify({ ...metadata, handle: { ...metadata.handle, status: "running", text: "", residency: "durable" } }));
     await state.mesh.delete({ key: seeded.key });
@@ -1422,12 +1435,16 @@ describe("durable completion receipts", () => {
   it("reports a run with no record, no run directory and no live host as failed, and a live run as running", async () => {
     const state = await rootHarness("lost-terminal-record");
     const seeded = await seedCompletion(state, "running");
+    const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8"));
+    const runClass = { routeClass: "custom-review", routeClassSource: "explicit", protected: true };
+    Object.assign(metadata.handle, runClass);
+    fs.writeFileSync(seeded.metadataPath, JSON.stringify(metadata));
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
       fs.rmSync(path.join(seeded.runDirectory, "status.json"));
       expect(client.statusAgent(seeded.id).status).toBe("running");
       fs.rmSync(path.join(state.config.residencyRoot, "runs"), { recursive: true, force: true });
-      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "failed", error: expect.stringMatching(/record lost/) });
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "failed", error: expect.stringMatching(/record lost/), ...runClass });
       expect((await client.waitAgent(seeded.id, AbortSignal.timeout(2_000))).status).toBe("failed");
     } finally {
       await client.close();

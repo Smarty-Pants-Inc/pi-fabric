@@ -3,7 +3,7 @@ import path from "node:path";
 import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
 const { MeshStore } = await jiti.import("../../src/mesh/store.ts");
-const [root, role, phase] = process.argv.slice(2);
+const [root, role, phase, order] = process.argv.slice(2);
 const lock = path.join(root, ".lock");
 const ownerPath = path.join(lock, "owner");
 const write = fs.writeFileSync.bind(fs);
@@ -11,13 +11,22 @@ const rename = fs.renameSync.bind(fs);
 const rmdir = fs.rmdirSync.bind(fs);
 const timer = globalThis.setTimeout;
 const wait = (file) => {
-  const deadline = Date.now() + 10_000;
-  while (!fs.existsSync(file) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-  if (!fs.existsSync(file)) throw new Error(`Timed out awaiting owned ${role} fixture signal: ${file}`);
+  // Only the recovery-first test owns cancellation and joins both children.
+  // Its handshake must not race a separate fixture clock while the test parent
+  // is descheduled. Keep the existing guard for the other fixture consumers.
+  const ownedRecovery = order === "recovery-first" && (role === "initializer" || role === "successor");
+  const deadline = ownedRecovery ? Infinity : Date.now() + 10_000;
+  const parent = process.ppid;
+  while (!fs.existsSync(file)) {
+    if (Date.now() >= deadline) throw new Error(`Timed out awaiting owned ${role} fixture signal: ${file}`);
+    try { process.kill(parent, 0); } catch { throw new Error(`Owned ${role} fixture lost its parent`); }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
 };
 let armed = true;
 let ran = false;
 let boundary;
+let replacement;
 if (role === "initializer") {
   fs.writeFileSync = (file, data, options) => {
     if (!armed || String(file) !== ownerPath) return write(file, data, options);
@@ -29,6 +38,19 @@ if (role === "initializer") {
       wait(path.join(root, "initializer.go"));
       return write(fd ?? file, data, options);
     } finally { if (fd !== undefined) fs.closeSync(fd); }
+  };
+} else if (role === "successor") {
+  fs.writeFileSync = (file, data, options) => {
+    if (armed && String(file) === ownerPath) {
+      armed = false;
+      // Recovery has acquired the empty successor. Join the original's rejected
+      // publication/cleanup before attempting our own exclusive owner create.
+      const stat = fs.lstatSync(lock);
+      replacement = { dev: stat.dev, ino: stat.ino };
+      write(path.join(root, "initializer.go"), "");
+      wait(path.join(root, "initializer.finished"));
+    }
+    return write(file, data, options);
   };
 } else {
   const pause = (at) => {
@@ -70,4 +92,10 @@ const result = await store.exclusive(() => {
     wait(path.join(root, "initializer.release"));
   }
 }).catch(error => error);
-console.log(JSON.stringify({ role, phase, boundary, ran, timeout: result?.code === "FABRIC_MESH_LOCK_TIMEOUT", code: result?.code }));
+const summary = { role, phase, boundary, ran, replacement, timeout: result?.code === "FABRIC_MESH_LOCK_TIMEOUT", code: result?.code };
+if (role === "initializer" && order === "recovery-first") {
+  // Keep the rejected holder genuinely alive while the parent checks immediate progress.
+  write(path.join(root, "initializer.finished"), JSON.stringify(summary));
+  wait(path.join(root, "initializer.release"));
+}
+console.log(JSON.stringify(summary));

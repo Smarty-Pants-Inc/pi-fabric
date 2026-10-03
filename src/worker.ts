@@ -13,6 +13,7 @@ import type {
   AgentRunStatus,
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
+import { saveWorkerCompletion } from "./agents/completion-journal.js";
 import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { retryableProviderError } from "./worker/provider-error.js";
@@ -695,6 +696,26 @@ const main = async (): Promise<void> => {
   };
   let activationWindowReady = false;
   let residentProbeReady = false;
+  // Optional worker-only edge: never load native estimation in Main registration.
+  const admissionModule = options.runner === "pi" && options.actorId && !activationWindow
+    ? await import(import.meta.url.endsWith(".ts") ? "./worker/context-admission.ts" : "./worker/context-admission.js") as typeof import("./worker/context-admission.js")
+    : undefined;
+  const estimateActorInput = admissionModule
+    ? await admissionModule.loadActorInputEstimator(options.piBinary) : undefined;
+  if (admissionModule && !estimateActorInput) appendLog(`${JSON.stringify({ type: "fabric_context_admission", mode: "launcher", reason: "native_estimator_unavailable" })}\n`);
+  let contextAdmission: InstanceType<NonNullable<typeof admissionModule>["ActorContextAdmission"]> | undefined;
+  const dispatchPiPrompt = (): void => {
+    if (terminalStatus) return;
+    const message = resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task;
+    if (taskProvenance?.principal) sendPiDelivery(message, taskProvenance, "steer", resumePrompt ? [] : images);
+    else child.stdin?.write(`${JSON.stringify({ type: "prompt", message, ...(!resumePrompt && images.length > 0 ? { images } : {}) })}\n`);
+    piControlLive = true;
+    const retained = retainedPiQueues;
+    retainedPiQueues = undefined;
+    for (const text of retained?.steering ?? []) sendPiDelivery(text, undefined, "steer");
+    for (const text of retained?.followUp ?? []) sendPiDelivery(text, undefined, "followUp");
+    pollSteer();
+  };
   const createModelControl = (): InstanceType<typeof PiModelControl> => new PiModelControl(options.id, options.model, thinking, {
     send(frame) {
       if (terminalStatus) return;
@@ -738,17 +759,19 @@ const main = async (): Promise<void> => {
         closeChild();
         return;
       }
-      const message = resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task;
-      if (taskProvenance?.principal) sendPiDelivery(message, taskProvenance, "steer", resumePrompt ? [] : images);
-      else child.stdin?.write(`${JSON.stringify({ type: "prompt", message, ...(!resumePrompt && images.length > 0 ? { images } : {}) })}\n`);
-      piControlLive = true;
-      // Native queues are not stored in the session file. Replay only the last
-      // unconsumed queue snapshot, after this replacement has passed admission.
-      const retained = retainedPiQueues;
-      retainedPiQueues = undefined;
-      for (const text of retained?.steering ?? []) sendPiDelivery(text, undefined, "steer");
-      for (const text of retained?.followUp ?? []) sendPiDelivery(text, undefined, "followUp");
-      pollSteer();
+      if (admissionModule && estimateActorInput) {
+        contextAdmission = new admissionModule.ActorContextAdmission(options.id,
+          resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task,
+          options.systemPrompt ?? "", estimateActorInput, {
+            send(frame) { if (!terminalStatus) child.stdin?.write(`${JSON.stringify(frame)}\n`); },
+            ready: dispatchPiPrompt,
+            fail(error) { modelControl.fail(error); },
+            compact(tokens, contextWindow, reason) {
+              appendLog(`${JSON.stringify({ type: "fabric_context_compaction", phase: "before_dispatch", tokens, contextWindow, reason })}\n`);
+            },
+          });
+        contextAdmission.start();
+      } else dispatchPiPrompt();
     },
     fail(error) {
       if (terminalStatus) return;
@@ -1191,6 +1214,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (modelControl.observe(event)) return;
+    if (contextAdmission?.observe(event)) return;
     if (event.type === "message_start" || event.type === "message_update") {
       const message = event.message;
       if (typeof message === "object" && message !== null && !Array.isArray(message)) {
@@ -1570,6 +1594,9 @@ const main = async (): Promise<void> => {
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
     process.stderr.write(`[pi-fabric] ${warning}\n`);
     record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    // Never strand a correlated admission response behind the event-line cap.
+    // Only its bounded envelope is inspected; the history remains discarded.
+    contextAdmission?.observeOversizedResponse(prefix, chars);
     if (type === "message_end" && (role === undefined || role === "assistant")) lostResult = warning;
     update();
   };
@@ -1726,6 +1753,7 @@ const main = async (): Promise<void> => {
     outputDecoder = new StringDecoder("utf8");
     stderrDecoder = new StringDecoder("utf8");
     eventProjection = new PiEventProjection();
+    contextAdmission = undefined;
     modelControl = createModelControl();
     compactControl = createCompactControl();
     child = spawnChild();
@@ -1907,6 +1935,8 @@ const main = async (): Promise<void> => {
     record.status = "failed";
     record.error = `${record.error ? record.error + "\n" : ""}Activation journal retention failed: ${String(error)}`;
   }
+  // The owning Main may already be dead. Publish through its immutable launch return address.
+  saveWorkerCompletion(options.statusFile, record);
   writeRunRecord(options.statusFile, record);
   terminalWritten = true;
   process.stdout.write(`\n[pi-fabric] ${record.status}\n`);

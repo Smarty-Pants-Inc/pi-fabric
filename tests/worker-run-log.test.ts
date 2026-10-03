@@ -2,6 +2,7 @@ import "./fixtures/conversation-host.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -171,7 +172,18 @@ describe.skipIf(!fs.existsSync(path.resolve("dist/worker.js")))("actual worker t
     ]);
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-worker-"));
     directories.push(directory);
-    const workerPath = path.resolve("dist/worker.js");
+    let workerPath = path.resolve("dist/worker.js");
+    const workClockReceipt = path.join(directory, "work-clock-receipt.json");
+    if (scenario === "near-deadline") {
+      // This fixture asserts compaction output near the independent manager
+      // deadline, not elapsed compaction work. A loaded CI host can consume the
+      // real 500ms bound. Freeze only the child worker's synchronous compaction;
+      // ordinary/pathological cases and dedicated product-bound tests stay real.
+      const fixtureUrl = new URL("./fixtures/worker-terminal-work-clock.mjs", import.meta.url).href;
+      const workerUrl = pathToFileURL(workerPath).href;
+      workerPath = path.join(directory, "worker-with-frozen-work-clock.mjs");
+      fs.writeFileSync(workerPath, `import { importWorkerWithFrozenTerminalClock } from ${JSON.stringify(fixtureUrl)};\nawait importWorkerWithFrozenTerminalClock(${JSON.stringify(workerUrl)}, ${JSON.stringify(workClockReceipt)});\n`);
+    }
     const binary = path.join(directory, "offline-rpc.mjs");
     const clockFile = path.join(directory, "clock.json");
     const receiptFile = path.join(directory, "before-terminal.json");
@@ -244,6 +256,11 @@ process.stdin.on("end", () => {
     try {
       const result = await manager.run({ task: "offline terminal log regression", model: "offline/terminal-log", thinking: "off", transport: "process" });
       expect(result).toMatchObject({ status: "completed", exitCode: 0, text: "original terminal result" });
+      if (scenario === "near-deadline") {
+        const clockReceipt = JSON.parse(fs.readFileSync(workClockReceipt, "utf8")) as { calls: number; restored: boolean };
+        expect(clockReceipt.calls).toBeGreaterThan(0);
+        expect(clockReceipt.restored).toBe(true);
+      }
       const file = path.join(runRoot, result.id, "events.jsonl");
       const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8")) as { ino: number; bytes: number; sha256: string };
       const bytes = fs.readFileSync(file);

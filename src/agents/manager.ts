@@ -12,6 +12,8 @@ import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
+import { processStartTime } from "../residency/process-identity.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -64,6 +66,8 @@ import type {
   AgentUsage,
 } from "./types.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE } from "./types.js";
+import { createRunRouteMetadata } from "../worker/run-record.js";
+import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager } from "./worktree-manager.js";
 import { writeHandoffSession } from "./handoff.js";
 import type { FabricCompactionBudget } from "../compaction/hook.js";
@@ -272,6 +276,7 @@ export const awaitAgentCwd = async (
   }
 };
 interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
+  runRoute: AgentRunRouteMetadata;
   id: string;
   name: string;
   task: string;
@@ -321,6 +326,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Set when the run failed because its transport lost contact: its worker may still run. */
   lostContact?: string;
   model?: string;
+  modelReason?: string;
   thinking?: AgentRunRequest["thinking"];
   routeOutcome?: (result: AgentRunResult) => void;
   /** Original authority for every attempt, never a prepared/observed replacement label. */
@@ -351,6 +357,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
 }
 
 interface QueuedAgent {
+  /** Host-owned admission address, including terminal outcomes with no launch manifest. */
+  completionRecipient?: CompletionRecipient;
   routeSaveFailure?: string;
   routeOutcome?: (result: AgentRunResult) => void;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
@@ -561,6 +569,7 @@ const failedRecord = (
     usage[key] = Math.max(usage[key], previous?.usage[key] ?? 0);
   }
   return {
+    ...managed.runRoute,
     id: managed.id,
     name: managed.name,
     task: managed.task,
@@ -582,6 +591,7 @@ const failedRecord = (
     error,
     usage,
     ...(managed.model ? { model: managed.model } : {}),
+    ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
     ...(managed.latestRecord?.admittedModel ? { admittedModel: managed.latestRecord.admittedModel } : {}),
     ...(managed.latestRecord?.admittedThinking ? { admittedThinking: managed.latestRecord.admittedThinking } : {}),
@@ -649,15 +659,16 @@ export class AgentManager {
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
   readonly #projectRoot: string;
+  readonly #completionRecipient: CompletionRecipient | (() => CompletionRecipient) | undefined;
   readonly #hostId: string | undefined;
   readonly #identityId: string | undefined;
   readonly #taskReturnAddressArguments: string[];
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
-  readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
+  readonly #onBackgroundComplete: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
   readonly #onBeforeResultReturned: ((id: string) => void) | undefined;
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
-  readonly #onSettled: ((result: AgentRunResult) => void) | undefined;
+  readonly #onSettled: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
@@ -707,18 +718,20 @@ export class AgentManager {
       fabricSessionId?: string;
       meshRoot?: string;
       projectRoot?: string;
+      /** Root-owned return address; never inferred from a child request or inherited by nested agents. */
+      completionRecipient?: CompletionRecipient | (() => CompletionRecipient);
       hostId?: string;
       identityId?: string;
       /** Immediate caller's Pi session, distinct from the inherited root Fabric session. */
       spawnerSessionId?: string;
       retention?: FabricRetentionConfig;
-      onBackgroundComplete?: (result: AgentRunResult) => void;
+      onBackgroundComplete?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onResultConsumed?: (id: string) => void;
       /** Fail-closed durable fence before a foreground value reaches its caller. */
       onBeforeResultReturned?: (id: string) => void;
       onStoppedAtClose?: (results: AgentRunResult[]) => void;
       /** Every terminal result, foreground or background, before its run directory can be removed. */
-      onSettled?: (result: AgentRunResult) => void;
+      onSettled?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
       preparePiModel?: (model: string | undefined, requiredPin?: boolean) => Promise<string | void>;
       resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
@@ -762,6 +775,7 @@ export class AgentManager {
     this.#meshRoot = options.meshRoot ?? process.env.PI_FABRIC_MESH_ROOT;
     this.#projectRoot =
       options.projectRoot ?? process.env.PI_FABRIC_PROJECT_ROOT ?? cwd;
+    this.#completionRecipient = options.completionRecipient;
     this.#hostId = options.hostId ?? process.env.PI_FABRIC_HOST_ID;
     this.#identityId = options.identityId ?? process.env.PI_FABRIC_IDENTITY_ID;
     this.#taskReturnAddressArguments = taskReturnAddressArguments(
@@ -993,11 +1007,27 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
+    // Snapshot trusted classification inputs before asynchronous preparation/queueing.
+    const explicitRouteClass = request.routeClass ?? request.routeDecision?.routeClass;
+    const routeFacts = {
+      ...(explicitRouteClass !== undefined ? { routeClass: explicitRouteClass } : {}),
+      ...(typeof request.protected === "boolean" ? { protected: request.protected } : {}),
+      ...(request.actorId !== undefined ? { actorId: request.actorId } : {}),
+      ...(request.actorName !== undefined ? { actorName: request.actorName } : {}),
+      handoff: Boolean(request.sessionSeed),
+    };
+    // Snapshot host-owned identity before any await/queue: later /name changes
+    // affect new spawns, never an already-admitted run or its retries.
+    const completionRecipient = this.#completionRecipient
+      ? { ...(typeof this.#completionRecipient === "function" ? this.#completionRecipient() : this.#completionRecipient) }
+      : undefined;
     if (request.model === "auto") throw new Error('Unresolved model: "auto" must go through agents.spawn routing');
+    const routedActor = request.routeDecision?.mode === "shadow" && Boolean(request.actorId) &&
+      request.routeDecision.actorId === request.actorId && Boolean(request.routeDecision.activationId) && Boolean(request.sessionFile);
     if (request.routeDecision && ((request.runner ?? this.config.runner) !== "pi" ||
       (request.transport ?? this.config.transport) !== "process" || (request.residency ?? "session") !== "session" ||
-      request.actorId || request.actorName || request.sessionSeed || request.sessionFile)) {
-      throw new Error("Shadow routing is only supported for new process/Pi task sessions");
+      request.sessionSeed || (!routedActor && (request.actorId || request.actorName || request.sessionFile)))) {
+      throw new Error("Shadow routing requires a new process/Pi task session or a host-prepared actor activation");
     }
     const kernel = this.resolveKernel({
       ...request,
@@ -1107,6 +1137,11 @@ export class AgentManager {
         this.#retentionTimer.unref();
         this.#scheduleRetentionSweep();
       }
+      if (completionRecipient && this.#meshRoot && !request.actorId) {
+        writeJsonAtomic(path.join(runDirectory, "completion-recipient.json"),
+          { meshRoot: this.#meshRoot, recipient: completionRecipient,
+            supervisor: { pid: process.pid, processStartedAt: processStartTime(process.pid) } }, { durable: true });
+      }
       const taskFile = path.join(runDirectory, "task.txt");
       const statusFile = path.join(runDirectory, "status.json");
       const lifecycleFile = path.join(runDirectory, "lifecycle.jsonl");
@@ -1156,8 +1191,9 @@ export class AgentManager {
               request.handoffCompact,
               request.handoffCompact ? await this.#resolveHandoffCompactionBudget?.(model, agentCwd) : undefined,
             )
-          : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
+          : routedActor ? request.sessionFile : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
         const adapter = await this.#resolveTransport(request.transport ?? this.config.transport);
+        const runRoute = createRunRouteMetadata({ ...routeFacts, runner, transport: adapter.kind });
         const timeoutMs = effectiveAgentTimeoutMs(
           this.config.timeoutMs,
           request.timeoutMs,
@@ -1247,10 +1283,14 @@ export class AgentManager {
           ...(nice > 0 ? ["--nice", String(nice)] : []),
           "--transport",
           adapter.kind,
+          "--route-class", runRoute.routeClass,
+          "--route-class-source", runRoute.routeClassSource,
+          ...(runRoute.protected !== undefined ? ["--protected", String(runRoute.protected)] : []),
           ...(recursive || inheritedFullCodeMode || requiresFabricKernel
             ? ["--fabric-extension", this.#fabricExtensionPath]
             : []),
           ...(model ? ["--model", model] : []),
+          ...(request.modelReason !== undefined ? ["--model-reason", request.modelReason] : []),
           ...(thinking ? ["--thinking", thinking] : []),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
           ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
@@ -1331,6 +1371,7 @@ export class AgentManager {
           });
         }
         const managed: ManagedAgent = {
+          runRoute,
           id,
           name,
           task: request.task,
@@ -1358,6 +1399,7 @@ export class AgentManager {
           abortSignal: queued && !authorize ? undefined : signal,
           abortHandler: undefined,
           ...(model ? { model } : {}),
+          ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
           ...(thinking ? { thinking } : {}),
           ...(routeDispatch ? { routeOutcome: routeDispatch.outcome } : {}),
           ...(routePin ? { routePin } : {}),
@@ -1416,7 +1458,11 @@ export class AgentManager {
           throw error;
         }
         try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
-        if (worktree && !runTreeExitVeto(runDirectory, 0, undefined, true)) await this.#worktrees.cleanup(id, true).catch(() => false);
+        // A launch rejected before publishing a worker record is rollback, not
+        // admitted-run collection. Any persisted record still needs saved exit proof.
+        if (worktree && !runTreeExitVeto(runDirectory, 0, undefined, fs.existsSync(path.join(runDirectory, "status.json")))) {
+          await this.#worktrees.cleanup(id, true).catch(() => false);
+        }
         throw error;
       }
     };
@@ -1440,10 +1486,12 @@ export class AgentManager {
     }
     if (release) return start(release).catch((error) => { release(); throw error; });
     return this.#enqueue({
+      ...createRunRouteMetadata({ ...routeFacts, runner, transport: request.transport ?? this.config.transport }),
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
       cwd: selectedCwd, residency, recursive: request.recursive === true,
       ...(kernel ? { kernel } : {}),
       ...(model ? { model } : {}),
+      ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
       ...(request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking
         ? { thinking: request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking } : {}),
       ...(request.actorId ? { actorId: request.actorId } : {}),
@@ -1452,7 +1500,7 @@ export class AgentManager {
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
-    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome);
+    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient);
   }
 
   #enqueue(
@@ -1461,6 +1509,7 @@ export class AgentManager {
     start: (release: () => void, signal: AbortSignal) => Promise<AgentHandleInfo>,
     ownerSignal?: AbortSignal,
     routeOutcome?: (result: AgentRunResult) => void,
+    completionRecipient?: CompletionRecipient,
   ): AgentHandleInfo {
     const abort = new AbortController();
     // Guest receipts belong to the session, not a program deadline. Host-owned
@@ -1468,7 +1517,8 @@ export class AgentManager {
     const signal = AbortSignal.any([abort.signal, this.#closeAbort.signal, ...(ownerSignal ? [ownerSignal] : [])]);
     let resolve!: (result: AgentRunResult) => void;
     const result = new Promise<AgentRunResult>((done) => { resolve = done; });
-    const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false, ...(routeOutcome ? { routeOutcome } : {}) };
+    const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false,
+      ...(routeOutcome ? { routeOutcome } : {}), ...(completionRecipient ? { completionRecipient } : {}) };
     this.#queued.set(info.id, queued);
     const admission = this.#semaphore.acquire("native", signal);
     const pending = (async () => {
@@ -1512,7 +1562,7 @@ export class AgentManager {
     queued.resolve(record);
     this.#emitLifecycle(queued.info, `run.${status}`, now, { status });
     this.#invalidateUiList();
-    try { this.#onSettled?.(record); } catch { /* must not break settlement */ }
+    try { this.#onSettled?.(record, queued.completionRecipient); } catch { /* retain queued terminal result on publication failure */ }
     this.#notifyQueuedComplete(queued);
   }
 
@@ -1539,7 +1589,7 @@ export class AgentManager {
   #notifyQueuedComplete(queued: QueuedAgent): void {
     if (queued.terminal && queued.background && !queued.completionNotified && !this.#closing && this.config.notifyOnComplete) {
       queued.completionNotified = true;
-      try { this.#onBackgroundComplete?.(queued.terminal); } catch { /* must not break settlement */ }
+      try { this.#onBackgroundComplete?.(queued.terminal, queued.completionRecipient); } catch { /* must not break settlement */ }
     }
   }
 
@@ -1644,11 +1694,20 @@ export class AgentManager {
     });
   }
 
+  /** A terminal worker status is provisional until its retry supervisor settles the run. */
+  isSettled(id: string): boolean {
+    if (this.#previousRun(id)) return true;
+    const queued = this.#queued.get(id);
+    return queued ? queued.terminal !== undefined : this.#requireRun(id).settled;
+  }
+
   prepareForeground(id: string): void {
+    if (!this.isSettled(id)) return;
     this.#onBeforeResultReturned?.(id);
   }
 
   markForeground(id: string): void {
+    if (!this.isSettled(id)) return;
     this.prepareForeground(id);
     if (!this.#previousRun(id)) {
       const queued = this.#queued.get(id);
@@ -1978,6 +2037,16 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
+    // On POSIX too, the worker can publish terminal status before exiting.
+    // Explicit cleanup must join that bounded obligation, not treat the result
+    // as exit proof or expose the incidental file/close ordering as a failure.
+    if (managed.transport.kind === "process") {
+      await this.#waitForTransportExit(managed);
+      await this.#noteUnconfirmedExit(managed);
+      if (managed.lostContact) {
+        throw new Error(`Cannot clean up agent ${id}: worker exit is unconfirmed (${managed.lostContact})`);
+      }
+    }
     const exitVeto = runTreeExitVeto(managed.runDirectory, 0, undefined, true);
     if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
     if (!this.#canCollect(managed)) {
@@ -2238,6 +2307,8 @@ export class AgentManager {
       currentRoot: this.#runRoot,
       orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
       oneShotRunRetentionMs: this.#retention.oneShotRunMs,
+      terminalRunEventsAgeMs: this.#retention.terminalRunEventsAgeMs,
+      terminalRunEventsMaxBytes: this.#retention.terminalRunEventsMaxBytes,
     };
     try {
       // A Bun-compiled Pi's execPath is Pi itself: resolve a real node/bun (the override, then PATH)
@@ -2543,6 +2614,10 @@ export class AgentManager {
       // the previous attempt published (token usage above all) before discarding
       // the journal it landed in.
       this.#drainLifecycle(managed);
+      // Once this attempt is superseded, a supervisor crash must not promote its old failure
+      // while the already-launched retry is still running. The previous worker has exited.
+      if (this.#meshRoot) discardWorkerCompletion(this.#meshRoot, managed.id);
+
       if (managed.runner === "pi") {
         // status.json must be removed to fence the new attempt from the old
         // terminal verdict. Hand off its native-session joins separately, after
@@ -2555,6 +2630,7 @@ export class AgentManager {
           setWorkerArgument(managed.launch.workerArguments, "runner-session-ids", JSON.stringify([...new Set(ids)]));
         }
       }
+
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
       managed.transport = await this.#launchTransport(managed.adapter, managed.launch);
@@ -2606,6 +2682,7 @@ export class AgentManager {
         toolCalls: Math.max(record.toolCalls, managed.observedProgress.toolCalls),
         error: `${record.error ?? "Agent run failed"} · relaunch failed: ${retryError}`,
       };
+      Object.assign(failed, managed.runRoute);
       writeRecord(managed.statusFile, failed);
       managed.latestRecord = failed;
       managed.relaunchFailure = failed;
@@ -2806,7 +2883,7 @@ export class AgentManager {
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
     try {
       managed.routeOutcome?.(result);
-      this.#onSettled?.(result);
+      this.#onSettled?.(this.#withTransportMetadata(result, managed, false) as AgentRunResult);
       delete managed.settlementSaveFailure;
       return true;
     } catch (error) {
@@ -3062,6 +3139,7 @@ export class AgentManager {
     const model = managed.latestRecord?.model ?? managed.model;
     const thinking = managed.latestRecord?.thinking ?? managed.thinking;
     return {
+      ...managed.runRoute,
       id: managed.id,
       name: managed.name,
       status,
@@ -3115,7 +3193,7 @@ export class AgentManager {
     return managed.nestedSnapshot ? structuredClone(managed.nestedSnapshot) : [];
   }
 
-  #withTransportMetadata(record: AgentRunRecord, managed: ManagedAgent): AgentRunRecord {
+  #withTransportMetadata(record: AgentRunRecord, managed: ManagedAgent, includeSaveFailure = true): AgentRunRecord {
     const nestedAgents = this.#nestedAgents(
       managed,
       terminalStatuses.has(record.status) && !managed.settled,
@@ -3127,7 +3205,8 @@ export class AgentManager {
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
     return {
       ...safeRecord,
-      ...(managed.settlementSaveFailure
+      ...managed.runRoute,
+      ...(includeSaveFailure && managed.settlementSaveFailure
         ? { warnings: [...(record.warnings ?? []), managed.settlementSaveFailure.warning] }
         : {}),
       cwd: managed.cwd,
@@ -3138,6 +3217,7 @@ export class AgentManager {
       ...(nestedAgents.length > 0 ? { nestedAgents } : {}),
       ...(budget ? { budget } : {}),
       ...(model ? { model } : {}),
+      ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
       ...(thinking ? { thinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),

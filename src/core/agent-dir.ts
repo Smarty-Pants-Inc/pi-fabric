@@ -19,8 +19,7 @@ const expandEnvDir = (envDir: string): string => {
   return envDir;
 };
 
-export const resolveAgentDir = (): string => {
-  const envDir = process.env[ENV_AGENT_DIR];
+export const resolveAgentDir = (envDir = process.env[ENV_AGENT_DIR]): string => {
   if (envDir) return expandEnvDir(envDir);
   return path.join(homedir(), CONFIG_DIR_NAME, "agent");
 };

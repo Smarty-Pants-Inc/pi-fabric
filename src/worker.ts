@@ -500,6 +500,12 @@ const main = async (): Promise<void> => {
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
   const childEnvironment = options.actorName ? { ...process.env } : taskAgentEnvironment();
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
+  // A task child has its own identity and reply contract, not its actor parent's.
+  for (const key of ["PI_FABRIC_ACTOR_ID", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_ACTOR_SESSION_FILE",
+    "PI_FABRIC_REPLY_SCHEMA_FILE", "PI_FABRIC_REPLY_FILE", "PI_FABRIC_REPLY_HOOK",
+    "PI_FABRIC_SPAWNER_ID", "PI_FABRIC_SPAWNER_KIND", "PI_FABRIC_SPAWNER_RUN"]) {
+    delete childEnvironment[key];
+  }
   // A nested explicit-model task must never inherit its parent's route attribution.
   delete childEnvironment.PI_FABRIC_ROUTE_HEADER;
   if (options.routeHeader) childEnvironment.PI_FABRIC_ROUTE_HEADER = options.routeHeader;
@@ -533,6 +539,11 @@ const main = async (): Promise<void> => {
       PI_FABRIC_DEPTH: String(options.depth),
       PI_FABRIC_PARENT_RUN: options.id,
       PI_FABRIC_AGENT_NAME: options.name,
+      ...(options.spawner ? {
+        PI_FABRIC_SPAWNER_ID: options.spawner.id,
+        PI_FABRIC_SPAWNER_KIND: options.spawner.kind,
+        PI_FABRIC_SPAWNER_RUN: options.spawner.runId ?? "",
+      } : {}),
       ...(options.mainAgentId ? { PI_FABRIC_MAIN_AGENT_ID: options.mainAgentId } : {}),
       ...(options.fabricSessionId ? { PI_FABRIC_SESSION_ID: options.fabricSessionId } : {}),
       PI_FABRIC_GRANTED_RISKS: options.grantedRisks.join(","),
@@ -550,6 +561,7 @@ const main = async (): Promise<void> => {
         : {}),
       ...(options.actorId ? { PI_FABRIC_ACTOR_ID: options.actorId } : {}),
       ...(options.actorName ? { PI_FABRIC_ACTOR_NAME: options.actorName } : {}),
+      ...(options.actorId && options.sessionFile ? { PI_FABRIC_ACTOR_SESSION_FILE: options.sessionFile } : {}),
       PI_FABRIC_CAPABILITY_REQUIREMENTS: JSON.stringify(
         options.capabilityRequirements ?? [],
       ),
@@ -759,6 +771,7 @@ const main = async (): Promise<void> => {
       cost: number;
     },
     attribution?: { model?: string | undefined; provider?: string | undefined },
+    journalMessage?: unknown,
   ): void => {
     const snapshot = record.usage;
     if (
@@ -798,6 +811,14 @@ const main = async (): Promise<void> => {
       },
       attribution?.model ?? record.model ?? options.model,
       attribution?.provider,
+      undefined,
+      // Only actor journals are a durable accounting source. Ordinary task
+      // sessions live in the disposable run directory, so their exports must
+      // remain countable. Activation turns are retained under sessionFile, not
+      // the isolated child session that retain() removes at settlement.
+      options.actorId && options.sessionFile && journalMessage
+        ? sessionExportHelpers.journalTurnId(options.sessionFile, journalMessage)
+        : undefined,
     );
     lastEmittedUsage.input = snapshot.input;
     lastEmittedUsage.output = snapshot.output;
@@ -1192,6 +1213,13 @@ const main = async (): Promise<void> => {
       toolCallStreamGuard.observe(event);
       if (terminalStatus) return;
     }
+    if (event.type === "message_update" && !terminalStatus) {
+      const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
+      if (delta && ["text_delta", "thinking_delta", "toolcall_delta"].includes(String(delta.type)) &&
+          typeof delta.delta === "string" && delta.delta.length > 0) {
+        if (!record.inferenceStarted) { record.inferenceStarted = true; update(); }
+      }
+    }
     if (!terminalStatus) recoveryWatchdog.observe(event);
     if (event.type === "agent_start") {
       emitLifecycle("pi.agent_start", {
@@ -1239,6 +1267,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_start") {
+      record.inferenceStarted = true;
       record.toolCalls++;
       if (typeof event.toolName === "string") {
         record.currentTool = event.toolName;
@@ -1284,6 +1313,9 @@ const main = async (): Promise<void> => {
       if (messageRecord.role !== "assistant") return;
       lostResult = undefined;
       const text = extractText(messageRecord);
+      if (text || (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted")) {
+        record.inferenceStarted = true;
+      }
       hasFinalText = Boolean(text) && messageRecord.stopReason !== "error" &&
         messageRecord.stopReason !== "aborted" && messageRecord.stopReason !== "toolUse";
       producedFinalAnswer ||= hasFinalText;
@@ -1296,7 +1328,7 @@ const main = async (): Promise<void> => {
       emitTokenUsage(usageDelta, {
         model: stringField(messageRecord.model),
         provider: stringField(messageRecord.provider),
-      });
+      }, messageRecord);
       modelControl.observeAssistant(messageRecord);
       enforceTokenLimit();
       if ((messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") && !terminalStatus) {

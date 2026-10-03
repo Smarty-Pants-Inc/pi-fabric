@@ -26,6 +26,7 @@ const router = (manager: Ports[0], entries: FabricParticipantInfo[] = [], contro
     }),
     owns: () => true, tell: vi.fn(() => ({ messageId: "mailbox" })),
     ask: vi.fn(), stop: vi.fn(), steerRemote: vi.fn(), resolveBinding: vi.fn(),
+    resolveActivationBinding: vi.fn(async () => ({})),
   } as unknown as Ports[1];
   const main = { id: identity.id, local: true, matches: (id: string) => id === "main" || id === identity.id,
     deliverAgent: vi.fn(() => ({ queued: true, messageId: "main-queue", routed: "main" })) } as unknown as Ports[2];

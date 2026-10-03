@@ -2,6 +2,7 @@
 import { build } from "esbuild";
 import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { buildLandlock } from "./build-landlock.mjs";
 
 const primaryEntryPoints = [
   "src/index.ts",
@@ -36,7 +37,8 @@ const primaryEntryPoints = [
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
   "src/judge/agent.ts",
-  "src/core/literal-bash-guard.ts",
+  "src/core/landlock.ts",
+  "src/core/pattern-kill.ts",
   "src/lifecycle/reload-target-profile.ts",
   "src/lifecycle/reload-slots.ts",
   "src/coordination/unverified-ids.ts",
@@ -90,6 +92,8 @@ const lazyEntryPoints = [
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
 ];
+
+buildLandlock();
 
 const result = await build({
   entryPoints: [...primaryEntryPoints, ...lazyEntryPoints],

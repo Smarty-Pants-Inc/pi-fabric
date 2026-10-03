@@ -16,6 +16,9 @@ import { closeWithActors } from "../src/actors/close-order.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { LIVENESS_POLICY_KEY, writeHostLease } from "../src/topology/host-leases.js";
 
 const roots: string[] = [];
 const actorManagers: ActorManager[] = [];
@@ -2031,6 +2034,173 @@ describe("ActorManager", () => {
 
     expect(other.status(actor.id).rootId).toBe(state.identity.id);
     expect(other.owns(actor.id)).toBe(false);
+  });
+
+  it.each((['session', 'durable'] as const).flatMap(residency =>
+    (['preflight', 'locked'] as const).flatMap(phase =>
+      (['read-denied', 'stat-denied', 'invalid-json', 'invalid-participant'] as const).map(fault => ({ residency, phase, fault })),
+    ),
+  ))("S1 preserves $residency orphan lineage with $fault evidence at $phase until withdrawal", async ({ residency, phase, fault }) => {
+    const state = setup(true);
+    await state.actors.close();
+    const project = state.root;
+    const owner = new ActorManager('test', state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, 'actors'), persistent: true, rootId: state.identity.id,
+      project, role: 'project-agent', claimResidency: residency,
+    });
+    actorManagers.push(owner);
+    const actor = await owner.create({ name: 'lineage-guard', instructions: 'Keep the creating root.', residency });
+    await owner.close();
+    await state.mesh.put({ key: LIVENESS_POLICY_KEY, identity: state.identity, value: { version: 1, participants: 'files' } });
+    const successorIdentity: MeshIdentity = { id: 'session:successor', name: 'main', kind: 'main', sessionId: 'successor' };
+    const directory = new ParticipantDirectory(state.mesh, {
+      enabled: true, hostId: successorIdentity.id, rootId: successorIdentity.id, identity: successorIdentity,
+    });
+    // A prior close receipt may allow preflight; newly uncertain evidence must
+    // veto the locked recheck even when that receipt remains in shared state.
+    await state.mesh.put({
+      key: `topology/lineage-closures/${createHash('sha256').update(state.identity.id).digest('hex')}`,
+      identity: state.identity,
+      value: { format: 1, rootId: state.identity.id, ownerHostId: state.identity.id, ownerIdentityId: state.identity.id, closedAt: Date.now() },
+    });
+    const hash = createHash('sha256').update(state.identity.id).digest('hex');
+    const key = `topology/participants/${hash}`;
+    const file = path.join(state.mesh.root, 'participants', `${hash}.json`);
+    let readFault: ReturnType<typeof vi.spyOn> | undefined;
+    let statFault: ReturnType<typeof vi.spyOn> | undefined;
+    let installed = false;
+    const installEvidence = () => {
+      installed = true;
+      writeParticipantFile(state.mesh.root, {
+        key, version: 1, updatedAt: Date.now(), updatedBy: state.identity,
+        value: {
+          format: 1, id: state.identity.id, kind: fault === 'invalid-participant' ? 'invalid' : 'root',
+          rootId: state.identity.id, ownerHostId: state.identity.id, ownerIdentityId: state.identity.id,
+          name: 'main', status: 'idle', runner: 'pi', transport: 'host', project,
+          cwd: state.root, capabilities: ['steer', 'followUp', 'fabric'], startedAt: 1, updatedAt: Date.now(), controlProtocol: 'v1',
+        },
+      });
+      if (fault === 'invalid-json') fs.writeFileSync(file, '{torn');
+      if (fault === 'read-denied') {
+        const read = fs.readFileSync;
+        readFault = vi.spyOn(fs, 'readFileSync').mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+          if (String(args[0]) === file) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+          return read(...args);
+        });
+      }
+      if (fault === 'stat-denied') {
+        const stat = fs.statSync;
+        statFault = vi.spyOn(fs, 'statSync').mockImplementation((...args: Parameters<typeof fs.statSync>) => {
+          if (String(args[0]) === file) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+          return stat(...args);
+        });
+      }
+    };
+    const registry = path.join(state.root, 'actors', 'actors.json');
+    const before = fs.readFileSync(registry, 'utf8');
+    const lineage = vi.fn((id: string) => {
+      const alive = directory.lineageAlive(id);
+      // Introduce evidence after the preflight answer, before the fenced write's recheck.
+      if (phase === 'locked' && !installed) installEvidence();
+      return alive;
+    });
+    try {
+      if (phase === 'preflight') installEvidence();
+      const successor = new ActorManager('successor', successorIdentity, state.mesh, state.meshConfig, state.agents, () => {}, {
+        actorRoot: path.join(state.root, 'actors'), persistent: true, claimResidency: residency,
+        rootId: successorIdentity.id, project, role: 'project-agent', adoptionGraceMs: 0,
+        canManageActor: id => { const participant = directory.get(id, Date.now(), { fresh: true }); return participant ? participant.ownerHostId === successorIdentity.id : undefined; },
+        lineageAlive: lineage,
+      });
+      actorManagers.push(successor);
+      successor.listOwned();
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(lineage).toHaveBeenCalled();
+      if (phase === 'locked') expect(lineage.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(successor.owns(actor.id)).toBe(false);
+      expect(successor.status(actor.id).rootId).toBe(state.identity.id);
+      expect(fs.readFileSync(registry, 'utf8')).toBe(before);
+      readFault?.mockRestore();
+      statFault?.mockRestore();
+      // Explicit removal models confirmed withdrawal/reaping; fault recovery alone is not death.
+      fs.unlinkSync(file);
+      await waitFor(() => successor.owns(actor.id));
+      expect(successor.status(actor.id).rootId).toBe(successorIdentity.id);
+      const saved = JSON.parse(fs.readFileSync(registry, 'utf8')).actors.find((row: { id: string }) => row.id === actor.id);
+      expect(saved).toMatchObject({ rootId: successorIdentity.id, adoptedAt: expect.any(Number) });
+    } finally {
+      readFault?.mockRestore();
+      statFault?.mockRestore();
+      await directory.close();
+    }
+  });
+
+  it.each(['session', 'durable'] as const)("Astra R1 refuses %s orphan adoption when the root renews between historical snapshots", async residency => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: 'renewing-root', instructions: 'Keep creating lineage.', residency });
+    await state.actors.close();
+    const id = state.identity.id;
+    const hash = createHash('sha256').update(id).digest('hex');
+    const directory = new ParticipantDirectory(state.mesh, { enabled: true, hostId: 'observer', rootId: 'observer', identity: state.identity });
+    await state.mesh.put({ key: `topology/hosts/${hash}`, identity: state.identity, value: {
+      format: 1, id, rootId: id, identity: state.identity, startedAt: 1, updatedAt: Date.now(), expiresAt: Date.now() - 60_000,
+    } });
+    await state.mesh.put({ key: `topology/participants/${hash}`, identity: state.identity, value: {
+      format: 1, id, rootId: id, kind: 'root', ownerHostId: id, ownerIdentityId: id,
+      name: 'main', status: 'idle', runner: 'pi', transport: 'host', cwd: state.root,
+      capabilities: ['steer', 'followUp', 'fabric'], startedAt: 1, updatedAt: Date.now(), controlProtocol: 'v1',
+    } });
+    const get = directory.get.bind(directory);
+    vi.spyOn(directory, 'get').mockImplementation((target, at, options) => {
+      const result = get(target, at, options);
+      if (target === id) writeHostLease(state.mesh.root, { id, rootId: id, identityId: id, updatedAt: Date.now(), expiresAt: Date.now() + 120_000 });
+      return result;
+    });
+    const successorIdentity: MeshIdentity = { id: 'session:successor', name: 'main', kind: 'main' };
+    const successor = new ActorManager('successor', successorIdentity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, 'actors'), persistent: true, claimResidency: residency,
+      rootId: successorIdentity.id, canManageActor: () => undefined, lineageAlive: rootId => {
+        // Reproduce renewal across both observations (preflight and locked recheck),
+        // not a one-off false that the second check happens to recover from.
+        writeHostLease(state.mesh.root, { id, rootId: id, identityId: id, updatedAt: Date.now(), expiresAt: Date.now() - 60_000 });
+        return directory.lineageAlive(rootId);
+      }, adoptionGraceMs: 0,
+    });
+    actorManagers.push(successor);
+    const registry = path.join(state.root, 'actors', 'actors.json');
+    const before = fs.readFileSync(registry, 'utf8');
+    try {
+      successor.listOwned();
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(successor.owns(actor.id)).toBe(false);
+      expect(successor.status(actor.id).rootId).toBe(id);
+      expect(fs.readFileSync(registry, 'utf8')).toBe(before);
+    } finally {
+      await directory.close();
+    }
+  });
+
+  it.each(['missing', 'undefined', 'throwing'] as const)("S1 refuses orphan adoption with a %s lineage hook", async fault => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: 'unknown-lineage', instructions: 'Do not inherit unknown lineage.', residency: 'session' });
+    await state.actors.close();
+    const registry = path.join(state.root, 'actors', 'actors.json');
+    const before = fs.readFileSync(registry, 'utf8');
+    const successorIdentity: MeshIdentity = { id: 'session:successor', name: 'main', kind: 'main' };
+    const successor = new ActorManager('successor', successorIdentity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, 'actors'), persistent: true, claimResidency: 'session',
+      rootId: successorIdentity.id, canManageActor: () => undefined,
+      ...(fault === 'missing' ? {} : { lineageAlive: (): boolean => {
+        if (fault === 'throwing') throw new Error('unknown lineage');
+        return undefined as unknown as boolean;
+      } }),
+    });
+    actorManagers.push(successor);
+    successor.listOwned();
+    await new Promise(resolve => setTimeout(resolve, 120));
+    expect(successor.owns(actor.id)).toBe(false);
+    expect(successor.status(actor.id).rootId).toBe(state.identity.id);
+    expect(fs.readFileSync(registry, 'utf8')).toBe(before);
   });
 
   it("adopts orphaned project actors after the creating root is gone", async () => {

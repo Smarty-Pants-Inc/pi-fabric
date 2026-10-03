@@ -60,7 +60,7 @@ describe("#369 D4 joined kernel scratch scope", () => {
     fs.writeFileSync(worker, `import fs from "node:fs";
 const args = new Map(); for (let i=2;i<process.argv.length;i+=2) args.set(process.argv[i],process.argv[i+1]);
 const file = process.env.TMPDIR + "/child-file"; fs.writeFileSync(file,"private child scratch");
-const now=Date.now(); fs.writeFileSync(args.get("--status-file"),JSON.stringify({id:args.get("--id"),name:args.get("--name"),task:"scratch",status:"completed",runner:"pi",transport:"process",cwd:args.get("--cwd"),startedAt:now,updatedAt:now,finishedAt:now,turns:1,toolCalls:1,text:JSON.stringify({tmpdir:process.env.TMPDIR,file,mode:fs.statSync(process.env.TMPDIR).mode & 0o777}),usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:0}}));`);
+const now=Date.now(); fs.writeFileSync(args.get("--status-file"),JSON.stringify({id:args.get("--id"),name:args.get("--name"),task:"scratch",status:"completed",runner:"pi",transport:"process",sessionId:String(process.pid),cwd:args.get("--cwd"),startedAt:now,updatedAt:now,finishedAt:now,turns:1,toolCalls:1,text:JSON.stringify({tmpdir:process.env.TMPDIR,file,mode:fs.statSync(process.env.TMPDIR).mode & 0o777}),usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:0}}));`);
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, budgetUsd: 0, sessionExport: false }, { runRoot: path.join(root, "runs"), workerPath: worker });
     managers.push(manager);
     const result = await manager.run({ task: "scratch", transport: "process" });

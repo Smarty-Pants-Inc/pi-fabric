@@ -173,10 +173,10 @@ export const parseFormattedNumericValue = (value: string): number => {
   if (normalized === "Off") return 0;
   if (normalized.startsWith("$")) return parseBudgetValue(normalized);
 
-  const bytes = normalized.match(/^([0-9]+(?:\.[0-9]+)?) (KB|MB|GB)$/);
+  const bytes = normalized.match(/^([0-9]+(?:\.[0-9]+)?) (KB|MB|GB|KiB|MiB|GiB)$/);
   if (bytes) {
     const amount = Number(bytes[1]);
-    const units = { KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3 } as const;
+    const units = { KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3 } as const;
     return Math.round(amount * units[bytes[2] as keyof typeof units]);
   }
 

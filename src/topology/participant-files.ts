@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, renameAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 
 // Participant records outside the shared state (smarty-dev#2004). Each record lived in the one
@@ -50,6 +50,7 @@ export const writeParticipantFileIf = async (
   mesh: ParticipantFileMesh,
   key: string,
   decide: (current: MeshStateEntry | undefined) => MeshStateEntry | undefined,
+  options: { durable?: boolean } = {},
 ): Promise<boolean> => {
   const file = fileOf(mesh.root, key);
   if (!file) throw new Error(`Not a participant key: ${key}`);
@@ -57,7 +58,10 @@ export const writeParticipantFileIf = async (
     const entry = decide(readFresh(file));
     if (!entry) return false;
     if (entry.key !== key) throw new Error(`Participant entry key mismatch: ${entry.key}`);
-    writeJsonAtomic(file, { format: 1, ...entry });
+    writeJsonAtomic(file, { format: 1, ...entry }, options);
+    if (options.durable && JSON.stringify(readFresh(file)) !== JSON.stringify(entry)) {
+      throw new Error(`Participant migration verification failed: ${key}`);
+    }
     rescan(path.dirname(file));
     return true;
   });
@@ -107,19 +111,8 @@ const readFresh = (file: string): MeshStateEntry | undefined => {
 
 const LOCK_WAIT_MS = 5_000;
 
-// A process's start time (Linux /proc), so a recycled PID does not keep a dead holder's lock.
-// ponytail: other platforms record none and compare the PID only.
-const startTimeOf = (pid: number): string => {
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? "";
-  } catch {
-    return "";
-  }
-};
-
-const holderAlive = (owner: string): boolean => {
-  const [pidText, startTime] = owner.split("\n");
+const holderAlive = async (owner: string): Promise<boolean> => {
+  const [pidText, startTime, token] = owner.split("\n");
   const pid = Number(pidText);
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
@@ -127,7 +120,10 @@ const holderAlive = (owner: string): boolean => {
   } catch (error) {
     if ((error as { code?: unknown }).code !== "EPERM") return false;
   }
-  return !startTime || startTimeOf(pid) === "" || startTimeOf(pid) === startTime;
+  // Read once: an unreadable or foreign/torn identity proves nothing about PID reuse.
+  if (!owner.endsWith("\n") || !token || !validProcessIncarnation(startTime)) return true;
+  const actual = await processIncarnation(pid);
+  return actual === undefined || actual === startTime;
 };
 
 // A per-key lock: participants/.locks/<hash>, a directory created with its owner record inside by
@@ -140,7 +136,7 @@ const withKeyLock = async <T>(mesh: ParticipantFileMesh, file: string, operation
   const locks = path.join(mesh.root, DIR, ".locks");
   const lock = path.join(locks, path.basename(file, ".json"));
   fs.mkdirSync(locks, { recursive: true, mode: 0o700 });
-  const token = `${process.pid}\n${startTimeOf(process.pid)}\n${randomUUID()}\n`;
+  const token = `${process.pid}\n${await ownProcessIncarnation() ?? ""}\n${randomUUID()}\n`;
   const deadline = Date.now() + LOCK_WAIT_MS;
   for (;;) {
     const staging = `${lock}.${process.pid}.${randomUUID()}.tmp`;
@@ -181,7 +177,7 @@ const readOwner = (lock: string): string | undefined => {
 
 const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string): Promise<void> => {
   const seen = readOwner(lock);
-  if (seen === undefined || holderAlive(seen)) return;
+  if (seen === undefined || await holderAlive(seen)) return;
   await mesh.exclusive(() => {
     // Compare, then delete by a rename to a unique name and a second compare: a lock that is not
     // the one judged dead goes back (it cannot be, while recoveries share the mesh lock).
@@ -345,8 +341,12 @@ export const participantFilePresent = (meshRoot: string, key: string): boolean =
  * Removes staging and tombstone directories of the per-key locks older than `olderThanMs`: a
  * process that died between creating one and renaming or removing it leaves it (security pass S5).
  */
-export const sweepParticipantLockLeftovers = (meshRoot: string, olderThanMs: number, now = Date.now()): void => {
-  const locks = path.join(meshRoot, DIR, ".locks");
+export const sweepParticipantLockLeftovers = (
+  mesh: ParticipantFileMesh, olderThanMs: number, now = Date.now(),
+): Promise<void> => mesh.exclusive(() => {
+  // Share recovery's lock for the entire scan/removal: never unlink the owner of
+  // a detached lock between recovery's rename and its compare/restore decision.
+  const locks = path.join(mesh.root, DIR, ".locks");
   let names: string[];
   try {
     names = fs.readdirSync(locks);
@@ -363,7 +363,7 @@ export const sweepParticipantLockLeftovers = (meshRoot: string, olderThanMs: num
       // Removed meanwhile.
     }
   }
-};
+});
 
 /** Changes whenever a participant file is added, replaced or removed (not on Windows: see above). */
 export const participantFilesStamp = (meshRoot: string): string | undefined => {

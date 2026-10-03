@@ -56,6 +56,17 @@ schemas, guest payloads, or discovery metadata.
   through an unfiltered runner. Closed-world managed hosts still execute their
   authorized override, not Fabric's native process backend.
 
+## Opt-in Linux filesystem confinement
+
+Fabric can put a static Landlock helper below the supplied local operations when
+`executor.landlock.mode` is `enforce`. Middleware still owns its prefix/spawn
+hook and output filters, but the actual shell starts only after kernel
+confinement. Reads remain unrestricted; writes use the reviewed per-role list.
+No kernel-6.8 audit-only mode exists: the fallback is off/enforce plus logged
+per-command escape and a host-only fleet kill switch. Opaque/managed backends
+are rejected when enforcement is selected; Fabric never substitutes an
+unconfined runner. See [Landlock policy, rollout and limits](landlock.md).
+
 Version 1 is intentionally bash-only. It is trusted extension cooperation, not a
 sandbox or a security boundary. Unrelated overrides and direct `extensions.bash`
 calls retain their original behavior.

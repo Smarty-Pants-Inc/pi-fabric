@@ -384,8 +384,8 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     fs.writeFileSync(path.join(lock, "owner"), `held-by-test\n${process.pid}\n${now}\n`);
     let entered!: () => void;
     const waiting = new Promise<void>((resolve) => { entered = resolve; });
-    const put = hub.put.bind(hub);
-    vi.spyOn(hub, "put").mockImplementation((input) => { entered(); return put(input); });
+    const batch = hub.writeBatch.bind(hub);
+    vi.spyOn(hub, "writeBatch").mockImplementation((input) => { entered(); return batch(input); });
     const pass = bridge.step();
     await waiting;
     // Real store lock contention, with 20 s of lease time advanced deterministically.
@@ -1488,22 +1488,22 @@ describe("mesh bridge", () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => (release = resolve));
     let entered!: () => void;
-    const inPut = new Promise<void>((resolve) => (entered = resolve));
-    const put = hub.put.bind(hub);
+    const inBatch = new Promise<void>((resolve) => (entered = resolve));
+    const batch = hub.writeBatch.bind(hub);
     let suspend = true;
-    hub.put = async (input) => {
+    hub.writeBatch = async (input) => {
       if (suspend) {
         suspend = false;
         entered();
         await held;
       }
-      return put(input);
+      return batch(input);
     };
     const { far, bridge, remote } = setup(undefined, { hub, stopMs: 200 });
     const forgeRoot = await addRoot(far, "forge-main");
     await bridge.start();
     const pass = bridge.step().catch((error: Error) => error);
-    await inPut;
+    await inBatch;
     remote.close(new Error("transport failed"));
     const stopped = bridge.stop();
     await new Promise((resolve) => setTimeout(resolve, 300));

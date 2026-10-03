@@ -32,7 +32,8 @@ const stable = [
 ];
 const lazy = [
   "judge/agent.js",
-  "core/literal-bash-guard.js",
+  "core/landlock.js",
+  "core/pattern-kill.js",
   "lifecycle/reload-target-profile.js",
   "lifecycle/reload-slots.js",
   "coordination/unverified-ids.js",
@@ -93,10 +94,14 @@ const required = [
   ...declarations,
   ...declarations.map((file) => `${file}.map`),
 ];
+if (process.platform === "linux") required.push("native/fabric-landlock");
 const missing = required.filter((file) => !existsSync(join(dist, file)));
 if (missing.length > 0) throw new Error(`Missing build artifacts:\n${missing.join("\n")}`);
 
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+if (!manifest.files?.includes("config/landlock-roles.json") || !existsSync(join(root, "config/landlock-roles.json"))) {
+  throw new Error("Landlock role policy is missing from the package");
+}
 const targets = (value) => typeof value === "string" ? [value]
   : value && typeof value === "object" ? Object.values(value).flatMap(targets) : [];
 for (const target of targets([manifest.main, manifest.types, manifest.exports, manifest.pi?.extensions])) {
@@ -167,7 +172,7 @@ if ([...startupFiles].some(file => /class ProviderOperations|Fabric provider ope
 const initialSource = [...startupFiles]
   .map((file) => readFileSync(file, "utf8"))
   .join("\n");
-for (const forbidden of ["src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/literal-bash-guard.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"']) {
+for (const forbidden of ["src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"']) {
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
   }

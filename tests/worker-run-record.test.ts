@@ -1,6 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { applyUsage, createRunningRecord, extractUsageDelta } from "../src/worker/run-record.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { applyUsage, createRunningRecord, extractUsageDelta, updateRunRecord, writeCrashRunRecord } from "../src/worker/run-record.js";
 import type { AgentRunRecord, AgentWorkerOptions } from "../src/agents/types.js";
+import { processStartTime } from "../src/residency/process-identity.js";
 
 const baseRecord = (): AgentRunRecord => ({
   id: "id",
@@ -32,7 +36,58 @@ describe("worker process exit identity", () => {
   });
 });
 
+describe("worker run-record process identity", () => {
+  const options = (transport: AgentWorkerOptions["transport"]): AgentWorkerOptions => ({
+    id: "id", name: "worker", runner: "pi", transport, cwd: os.tmpdir(),
+    taskFile: "task.txt", statusFile: "status.json", lifecycleFile: "lifecycle.jsonl", logFile: "events.jsonl",
+    piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda", vedaBackend: "", vedaPersona: "",
+    timeoutMs: 1000, depth: 0, fullCodeMode: false, extensions: false, tools: [], grantedRisks: [],
+  });
+
+  it("persists the publisher's PID and birth identity through terminal and crash publication", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-record-identity-"));
+    const file = path.join(root, "status.json");
+    try {
+      const record = createRunningRecord(options("process"), "task", undefined, 1);
+      expect(record.sessionId).toBe(String(process.pid));
+      expect(record.processStartTime).toBe(processStartTime(process.pid));
+      if (process.platform === "linux") expect(record.processStartTime).toMatch(/^\d+$/);
+      record.status = "completed";
+      updateRunRecord(file, record);
+      expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ sessionId: String(process.pid), status: "completed" });
+      writeCrashRunRecord(file, record, new Error("crash"));
+      const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+      expect(saved).toMatchObject({ sessionId: String(process.pid), status: "failed" });
+      expect(saved.processStartTime).toBe(record.processStartTime);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("keeps a usable PID when the birth identity cannot be read", () => {
+    const read = vi.spyOn(fs, "readFileSync").mockImplementation(() => { throw new Error("unreadable"); });
+    try {
+      const record = createRunningRecord(options("process"), "task", undefined, 1);
+      expect(record.sessionId).toBe(String(process.pid));
+      expect(record.processStartTime).toBeUndefined();
+    } finally { read.mockRestore(); }
+  });
+
+  it.each(["tmux", "screen"] as const)("does not claim a process PID for %s", transport => {
+    const record = createRunningRecord(options(transport), "task", undefined, 1);
+    expect(record.sessionId).toBeUndefined(); expect(record.processStartTime).toBeUndefined();
+  });
+});
+
 describe("worker run-record usage", () => {
+  it("persists the publishing process identity for process workers only", () => {
+    const options = { id: "identity", name: "identity", runner: "pi" as const, transport: "process" as const,
+      cwd: "/tmp", taskFile: "/tmp/task", statusFile: "/tmp/status", logFile: "/tmp/log", lifecycleFile: "/tmp/lifecycle",
+      piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda", vedaBackend: "", vedaPersona: "",
+      timeoutMs: 1000, depth: 0, fullCodeMode: false, extensions: false, tools: [], grantedRisks: [] };
+    const record = createRunningRecord(options, "task", undefined, Date.now());
+    expect(record.sessionId).toBe(String(process.pid));
+    if (process.platform === "linux") expect(record.processStartTime).toMatch(/^\d+$/);
+    expect(createRunningRecord({ ...options, transport: "tmux" }, "task", undefined, Date.now()).sessionId).toBeUndefined();
+  });
   it("extractUsageDelta returns per-message usage without mutating the record", () => {
     const record = baseRecord();
     const delta = extractUsageDelta({

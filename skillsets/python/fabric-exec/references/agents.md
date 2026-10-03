@@ -32,9 +32,19 @@ return await agents.wait(id=handle["id"])
 
 `agents.list(scope="local")` lists local children; lineage/project include federated participants. Peer is reserved for another root Pi session: query `await agents.peers()` first, not children. `agents.self`, `members`, and `main` expose participant identity and capabilities. Cross-process steer/followUp/stop route through the authenticated owner and return after acknowledgment; do not publish control topics yourself. Prefer steering useful running children over destroying their context. Check status before steering a finished child.
 
+In a process task, `await agents.main()` returns its spawn-bound immediate spawner's
+exact `id` and native `sessionId`; sends to `main` use that same immutable return
+address. Outside process tasks, the root view is unchanged. Process tasks may send
+steer/followUp/tell to a Main only if it is their spawner, an ancestor, or an explicit
+exact-session escalation target. Other sends fail before delivery and name the
+allowed ids. Report to `agents.main()`; never pick an org instance by role/name.
+The launcher sets `PI_FABRIC_TASK_ESCALATION_TARGETS` to a JSON array of exact
+`session:<id>` targets before runtime initialization. Mains, durable actors and
+task-to-task sends are unaffected.
+
 ## Lifecycle subscriptions
 
-`agents.subscribe` takes exact from/to participant ids (`main` aliases the caller's root), events, delivery (steer/followUp), explicit triggerTurn, and optional once. subscriptions/unsubscribe list and remove routes. Events include pi.input, pi.agent_start, pi.agent_end, pi.turn_end, pi.agent_settled, pi.tool_error, pi.session_compact, and runner-neutral run.completed/failed/stopped/timed_out. pi.agent_settled means no retries/queued continuations remain, not permanent termination. Subscriptions start at the current cursor; crash recovery is at-least-once, so deduplicate effects by event id.
+`agents.subscribe` takes exact from/to participant ids (`main` aliases the caller's bound return address, or its root outside a process task), events, delivery (steer/followUp), explicit triggerTurn, and optional once. subscriptions/unsubscribe list and remove routes. Events include pi.input, pi.agent_start, pi.agent_end, pi.turn_end, pi.agent_settled, pi.tool_error, pi.session_compact, and runner-neutral run.completed/failed/stopped/timed_out. pi.agent_settled means no retries/queued continuations remain, not permanent termination. Subscriptions start at the current cursor; crash recovery is at-least-once, so deduplicate effects by event id.
 
 ```python
 peers = await agents.peers()

@@ -390,6 +390,8 @@ describe("Fabric configuration", () => {
       orphanedTempRunMs: 6 * 60 * 60 * 1_000,
       oneShotRunMs: 24 * 60 * 60 * 1_000,
       actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
+      terminalRunEventsAgeMs: 24 * 60 * 60 * 1_000,
+      terminalRunEventsMaxBytes: 256 * 1024,
     });
     expect(
       normalizeFabricConfig({
@@ -397,16 +399,24 @@ describe("Fabric configuration", () => {
           orphanedTempRunMs: 2 * 60 * 60 * 1_000,
           oneShotRunMs: 2 * 24 * 60 * 60 * 1_000,
           actorRunArchiveMs: 30 * 24 * 60 * 60 * 1_000,
+          terminalRunEventsAgeMs: 48 * 60 * 60 * 1_000,
+          terminalRunEventsMaxBytes: 128 * 1024,
         },
       }).retention,
     ).toEqual({
       orphanedTempRunMs: 2 * 60 * 60 * 1_000,
       oneShotRunMs: 2 * 24 * 60 * 60 * 1_000,
       actorRunArchiveMs: 30 * 24 * 60 * 60 * 1_000,
+      terminalRunEventsAgeMs: 48 * 60 * 60 * 1_000,
+      terminalRunEventsMaxBytes: 128 * 1024,
     });
     expect(
       normalizeFabricConfig({ retention: { orphanedTempRunMs: 1 } }).retention.orphanedTempRunMs,
     ).toBe(60 * 60 * 1_000);
+    expect(normalizeFabricConfig({ retention: { terminalRunEventsAgeMs: 1, terminalRunEventsMaxBytes: 1 } }).retention)
+      .toMatchObject({ terminalRunEventsAgeMs: 60 * 60 * 1_000, terminalRunEventsMaxBytes: 1024 });
+    expect(normalizeFabricConfig({ retention: { terminalRunEventsAgeMs: 1e12, terminalRunEventsMaxBytes: 1e12 } }).retention)
+      .toMatchObject({ terminalRunEventsAgeMs: 365 * 24 * 60 * 60 * 1_000, terminalRunEventsMaxBytes: 16 * 1024 * 1024 });
   });
 
   it("bounds the configurable bridged command deadline to 30 s through 5 minutes", () => {

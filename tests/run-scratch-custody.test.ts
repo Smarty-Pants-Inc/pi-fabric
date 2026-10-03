@@ -71,7 +71,7 @@ const child = spawn(process.execPath, [${JSON.stringify(writer)}], {detached:tru
 child.unref();
 while (!fs.existsSync(${JSON.stringify(ready)})) await new Promise(resolve => setTimeout(resolve,10));
 const now=Date.now();
-fs.writeFileSync(args.get("--status-file"), JSON.stringify({id:args.get("--id"),name:args.get("--name"),task:"background tool",status:${JSON.stringify(crash ? "failed" : "completed")},runner:"pi",transport:"process",cwd:args.get("--cwd"),startedAt:now,updatedAt:now,finishedAt:now,turns:1,toolCalls:1,text:"done",usage:{input:1,output:1,cacheRead:0,cacheWrite:0,cost:0}}));
+fs.writeFileSync(args.get("--status-file"), JSON.stringify({id:args.get("--id"),name:args.get("--name"),task:"background tool",status:${JSON.stringify(crash ? "failed" : "completed")},runner:"pi",transport:"process",sessionId:String(process.pid),cwd:args.get("--cwd"),startedAt:now,updatedAt:now,finishedAt:now,turns:1,toolCalls:1,text:"done",usage:{input:1,output:1,cacheRead:0,cacheWrite:0,cost:0}}));
 ${crash ? 'process.kill(process.pid, "SIGKILL");' : 'process.exit(0);'}
 `);
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, timeoutMs: 10000, sessionExport: false }, {

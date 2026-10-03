@@ -221,7 +221,10 @@ describe("actor status-groom shadow routing", () => {
     expect(template.routeClass).toBe("status-groom");
     expect(reloaded.toRequest(reloaded.resolve(template.id)!)).toMatchObject({ routeClass: "status-groom", protected: true });
   });
-  it("wires the same Choice and pin through an actual resident owner activation", async () => {
+  it.each([
+    ["registered resident model", registry],
+    ["Main extension model absent from the bare resident registry", { getAvailable: () => [] }],
+  ])("wires the same Choice and pin through a resident owner: %s", async (_label, residentRegistry) => {
     const evaluate = vi.spyOn(JevClient.prototype, "evaluate").mockImplementation(async () => answer());
     const dir = root();
     const hostConfig: ResidentHostConfig = {
@@ -232,8 +235,14 @@ describe("actor status-groom shadow routing", () => {
       piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda", piModels: { available: [...registry.getAvailable()], aliases: {}, defaultModel: pin.model },
       shadowRouting: policy(),
     };
-    const host = new ResidentHost(hostConfig, () => {}, registry); closers.push(() => host.close());
+    const host = new ResidentHost(hostConfig, () => {}, residentRegistry); closers.push(() => host.close());
     await host.start();
+    // The synced catalog admits exact extension pins/candidates, never fuzzy or
+    // absent pins, even when the native resident registry cannot load extensions.
+    for (const model of ["sol", "test/missing"]) {
+      await expect(host.actors.create({ ...actorSpec, model })).rejects.toMatchObject({ code: "MODEL_ROUTE_PIN_UNAVAILABLE" });
+    }
+    expect(evaluate).not.toHaveBeenCalled();
     const actor = await host.actors.create(actorSpec);
     expect((await host.actors.ask(actor.id, "ECHO_MODEL", "test")).text).toContain(pin.model);
     expect(evaluate).toHaveBeenCalledTimes(1);

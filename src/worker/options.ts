@@ -63,6 +63,7 @@ export const parseWorkerOptions = (
 ): AgentWorkerOptions => {
   const args = argumentMap(argv);
   const model = optional(args, "model");
+  const modelReason = args.get("model-reason");
   const routeHeader = optional(args, "route-header");
   const thinking = optional(args, "thinking");
   const fabricExtensionPath = optional(args, "fabric-extension");
@@ -206,6 +207,7 @@ export const parseWorkerOptions = (
     transport: required(args, "transport") as AgentWorkerOptions["transport"],
     ...(fabricExtensionPath ? { fabricExtensionPath } : {}),
     ...(model ? { model } : {}),
+    ...(modelReason !== undefined ? { modelReason } : {}),
     ...(routeHeader ? { routeHeader } : {}),
     ...(thinking ? { thinking } : {}),
     ...(systemPrompt ? { systemPrompt } : {}),

@@ -169,7 +169,7 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
   "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
-  "reply.json", "relaunches.jsonl", "route-session.jsonl",
+  "reply.json", "relaunches.jsonl", "completion-recipient.json", "route-session.jsonl",
   // Native session of an unrouted process Pi task (worker.ts persistentPiTask); owned file only.
   "session.jsonl",
 ]);

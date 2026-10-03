@@ -70,6 +70,8 @@ export interface AgentRunRequest {
   pythonRuntime?: FabricPythonRuntime;
   transport?: FabricAgentTransport;
   model?: string;
+  /** Caller-supplied justification for an explicit model selection. */
+  modelReason?: string;
   /** Veda persona name; only used when runner is "veda". */
   persona?: string;
   thinking?: FabricThinking;
@@ -157,6 +159,7 @@ export interface AgentRunRecord {
   transport: FabricAgentTransport;
   cwd: string;
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
   actorId?: string;
   actorName?: string;
@@ -203,6 +206,8 @@ export interface AgentRunRecord {
   nestedAgents?: AgentRunRecord[];
   pendingMessages?: { steering: string[]; followUp: string[] };
   compaction?: AgentCompactionStatus;
+  /** Unconsumed outcome, including recovery from a dead Main to its exact lane successor. */
+  completionDelivery?: { status: "undelivered"; addressedTo: string; redeliveredFrom?: string };
   /** Terminal event-log optimization was skipped; the full original log remains. */
   compactionSkipped?: string;
 }
@@ -235,6 +240,7 @@ export interface AgentHandleInfo {
   transport: FabricAgentTransport;
   cwd: string;
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
   actorId?: string;
   actorName?: string;
@@ -290,6 +296,7 @@ export interface AgentWorkerOptions {
   /** Host-only bounded judge: no ambient resources, compaction or retry. */
   judgment?: boolean;
   model?: string;
+  modelReason?: string;
   thinking?: string;
   systemPrompt?: string;
   sessionFile?: string;

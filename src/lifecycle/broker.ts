@@ -19,6 +19,7 @@ export interface LifecycleBrokerOptions {
   enabled: boolean;
   pollMs: number;
   maxReadEvents: number;
+  canConsumeMesh?: () => boolean;
 }
 
 export type FabricLifecycleDeliveryHandler = (
@@ -210,7 +211,7 @@ export class LifecycleBroker {
   }
 
   async #poll(): Promise<void> {
-    if (this.#closed || this.#paused || !this.options.enabled) return;
+    if (this.#closed || this.#paused || !this.options.enabled || this.options.canConsumeMesh?.() === false) return;
     if (this.#polling) return this.#polling;
     const operation = this.#drain();
     this.#polling = operation;
@@ -226,6 +227,7 @@ export class LifecycleBroker {
     const listed = new Set<string>();
     let latestSequence: number | undefined;
     for (const entry of entries) {
+      if (this.options.canConsumeMesh?.() === false) return;
       const subscription = lifecycleSubscriptionFromValue(entry.value);
       if (!subscription || entry.key !== subscriptionKey(subscription.id)) continue;
       listed.add(subscription.id);
@@ -258,7 +260,8 @@ export class LifecycleBroker {
   // scans those events again and skips them again. A delivery, a matching event skipped for
   // good, and an error to set or clear are saved at once.
   #keepUnsaved(subscription: FabricLifecycleSubscription, cursor: number): boolean {
-    if (subscription.lastError !== undefined || cursor - subscription.afterSequence >= this.#maxReadEvents) return false;
+    if (this.options.canConsumeMesh?.() === false || subscription.lastError !== undefined ||
+        cursor - subscription.afterSequence >= this.#maxReadEvents) return false;
     this.#unsaved.set(subscription.id, cursor);
     return true;
   }
@@ -269,7 +272,7 @@ export class LifecycleBroker {
   ): Promise<void> {
     let entry = initialEntry;
     let subscription = initial;
-    while (!this.#closed && !this.#paused) {
+    while (!this.#closed && !this.#paused && this.options.canConsumeMesh?.() !== false) {
       const latestSequence = this.mesh.latestSequence();
       const from = this.#cursor(subscription);
       if (latestSequence <= from) return;
@@ -292,6 +295,7 @@ export class LifecycleBroker {
       let lastDeliveredAt = subscription.lastDeliveredAt;
       let lastEventId = subscription.lastEventId;
       for (const meshEvent of events) {
+        if (this.options.canConsumeMesh?.() === false) return;
         const lifecycle = lifecycleEventFromMesh(meshEvent);
         if (!lifecycle) {
           cursor = Math.max(cursor, meshEvent.sequence);
@@ -308,6 +312,7 @@ export class LifecycleBroker {
         try {
           await this.deliver(subscription, lifecycle);
         } catch (error) {
+          if (this.options.canConsumeMesh?.() === false) return;
           const failed: FabricLifecycleSubscription = {
             ...subscription,
             afterSequence: cursor,
@@ -324,6 +329,8 @@ export class LifecycleBroker {
         const delivered = { ...subscription, afterSequence: cursor, updatedAt: Date.now(), lastDeliveredAt, lastEventId };
         delete delivered.lastError;
         this.#delivered.set(subscription.id, { entry, subscription: delivered });
+        // Preserve the delivery receipt, not the cursor, across lease loss.
+        if (this.options.canConsumeMesh?.() === false) return;
         const confirmed = await this.#confirmDelivered(subscription.id).catch(rethrowMeshLockTimeout);
         if (subscription.once || !confirmed) return;
         entry = confirmed; subscription = delivered;
@@ -402,8 +409,11 @@ export class LifecycleBroker {
     const current = this.mesh.get(entry.key, { fresh: true });
     if (subscription.once) {
       if (!current || current.version !== entry.version) throw new Error("Lifecycle once deletion receipt is unconfirmed");
-      const result = await this.mesh.delete({ key: entry.key, ifVersion: current.version });
-      if (!result.deleted) throw new Error("Lifecycle once deletion is unconfirmed");
+      const deleted = this.options.canConsumeMesh
+        ? (await this.mesh.writeBatch({ identity: this.identity, ops: [{ kind: "delete", key: entry.key,
+            ifVersion: current.version, condition: () => this.options.canConsumeMesh!() }] }))[0]?.applied
+        : (await this.mesh.delete({ key: entry.key, ifVersion: current.version })).deleted;
+      if (!deleted) throw new Error("Lifecycle once deletion is unconfirmed");
       this.#delivered.delete(id); this.#unsaved.delete(id);
       return undefined;
     }
@@ -421,11 +431,21 @@ export class LifecycleBroker {
     entry: MeshStateEntry,
     subscription: FabricLifecycleSubscription,
   ): Promise<MeshStateEntry> {
-    return this.mesh.put({
-      key: entry.key,
-      value: subscription,
-      identity: this.identity,
-      ifVersion: entry.version,
+    if (!this.options.canConsumeMesh) return this.mesh.put({
+      key: entry.key, value: subscription, identity: this.identity, ifVersion: entry.version,
     });
+    let committedAt = 0;
+    const [result] = await this.mesh.writeBatch({ identity: this.identity, ops: [{
+      kind: "put", key: entry.key, ifVersion: entry.version,
+      // The lock wait may outlast renewal. Fence the actual commit, not just polling.
+      value: (now: number) => {
+        if (!this.options.canConsumeMesh!()) throw new Error("Resident host lease unavailable for lifecycle cursor commit");
+        committedAt = now;
+        return subscription;
+      },
+    }] });
+    if (!result?.applied) throw new Error("Lifecycle cursor commit is unconfirmed");
+    return { key: entry.key, value: subscription, version: result.version,
+      updatedAt: committedAt, updatedBy: this.identity };
   }
 }

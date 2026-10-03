@@ -222,6 +222,7 @@ export class ResidentHost {
   readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
+  #ready = false;
   #idleSince = Date.now();
   #admissions = 0;
   readonly #requestRetention: ResidentRequestRetention;
@@ -232,7 +233,7 @@ export class ResidentHost {
   #reloadEvent: Promise<unknown> | undefined;
   readonly #publications = new Set<Promise<unknown>>();
   #effectiveConfig: (() => ResidentHostConfig) | undefined;
-  readonly #retention: ResidentHostConfig["retention"];
+  readonly #retention: ResidentHostConfig["retention"] & { retainRuns: boolean };
 
   constructor(
     readonly config: ResidentHostConfig,
@@ -254,7 +255,7 @@ export class ResidentHost {
     this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
     // All resident collectors share one mutable policy, not the constructor's
     // config snapshot (nor the process-wide default object).
-    this.#retention = { ...config.retention };
+    this.#retention = { ...config.retention, retainRuns: config.agents.retainRuns };
     this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
       [...new Set(Object.values(residentActorRoots(config)))], this.#retention);
   }
@@ -275,6 +276,7 @@ export class ResidentHost {
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
       bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
+      canConsumeMesh: () => this.participants.canConsumeMesh(),
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
@@ -426,6 +428,7 @@ export class ResidentHost {
       },
       {
         releasePaused: this.#staged,
+        canConsumeMesh: () => this.participants.canConsumeMesh(),
         persistent: true,
         canManageActor,
         lineageAlive,
@@ -449,6 +452,7 @@ export class ResidentHost {
         enabled: true,
         pollMs: config.mesh.actorPollMs,
         maxReadEvents: config.mesh.maxReadEvents,
+        canConsumeMesh: () => this.participants.canConsumeMesh(),
       },
       (subscription, event) => this.#deliverLifecycle(subscription, event),
     );
@@ -459,11 +463,8 @@ export class ResidentHost {
     await this.#acquireLock();
     this.#started = true;
     try {
-      sweepResidentRuns(path.join(this.config.residencyRoot, "runs"), Date.now(), 100, {
-        ...this.config.retention,
-        actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
-        retainRuns: this.config.agents.retainRuns,
-      });
+      // Archived runs are read on demand, never walked before the host lease is up.
+      // The streaming request collector handles terminal retention after readiness.
       this.#initialize();
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
@@ -540,6 +541,7 @@ export class ResidentHost {
       void this.#retryDeliveries();
       }
       await this.#pollRequests();
+      this.#ready = true;
     } catch (error) {
       await this.close();
       throw error;
@@ -824,7 +826,7 @@ export class ResidentHost {
 
   #maintainRequests(): void {
     const now = Date.now();
-    if (this.#closed || !this.#requestRetention.due(now)) return;
+    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh() || !this.#requestRetention.due(now)) return;
     // ensureHost/syncPiModels already publishes reloads to config.json. Apply
     // only the same-release/root/session overlay at the next existing sweep;
     // actor archives and agent collectors hold this same policy object.
@@ -1401,21 +1403,36 @@ const runResidentHost = async (
     finishIdle = resolve;
   });
   const host = new ResidentHost(config, () => finishIdle?.(), modelRegistry, residentHostLaunchContext(config));
-  await host.start();
-  if (signal?.aborted) {
+  // Install before startup: TERM may arrive while initial mesh publication is stuck.
+  let deadline: NodeJS.Timeout | undefined;
+  let finishStop!: () => void;
+  const stopped = new Promise<void>(resolve => { finishStop = resolve; });
+  const armDeadline = (): void => {
+    if (deadline) return;
+    // Bounded native regression seam; production always uses the fixed grace.
+    const testMs = Number(process.env.PI_FABRIC_TEST_RESIDENT_SHUTDOWN_MS);
+    const grace = Number.isInteger(testMs) && testMs > 0 && testMs <= 10_000 ? testMs : 15_000;
+    deadline = setTimeout(() => {
+      console.error("Fabric resident host shutdown deadline exceeded; exiting with fence held");
+      process.exit(1);
+    }, grace);
+  };
+  const finish = (): void => { armDeadline(); finishStop(); };
+  signal?.addEventListener("abort", finish, { once: true });
+  process.on("SIGTERM", finish);
+  process.on("SIGINT", finish);
+  try {
+    if (signal?.aborted) finish();
+    await host.start();
+    if (!signal?.aborted) await Promise.race([idle, stopped]);
+    armDeadline();
     await host.close();
-    return;
+  } finally {
+    if (deadline) clearTimeout(deadline);
+    signal?.removeEventListener("abort", finish);
+    process.off("SIGTERM", finish);
+    process.off("SIGINT", finish);
   }
-  await Promise.race([
-    idle,
-    new Promise<void>((resolve) => {
-      const finish = (): void => resolve();
-      signal?.addEventListener("abort", finish, { once: true });
-      process.once("SIGTERM", finish);
-      process.once("SIGINT", finish);
-    }),
-  ]);
-  await host.close();
 };
 
 export const runResidentHostFromConfigPath = async (

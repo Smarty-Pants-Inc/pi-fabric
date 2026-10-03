@@ -17,6 +17,7 @@ import { reapDeadHostRecords } from "./host-reaper.js";
 import {
   fileLeasesOnly,
   hostLeaseExpiry,
+  HOST_LEASE_HEARTBEAT_MS,
   LIVENESS_POLICY_KEY,
   readHostLease,
   readHostLeases,
@@ -44,7 +45,7 @@ const HOST_PREFIX = "topology/hosts/";
 const LINEAGE_CLOSURE_PREFIX = "topology/lineage-closures/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
-const PARTICIPANT_HEARTBEAT_MS = 5_000;
+const PARTICIPANT_HEARTBEAT_MS = HOST_LEASE_HEARTBEAT_MS;
 const PARTICIPANT_LEASE_MS = 15_000;
 /** Addressable across a live reload, but a failed reload stops accepting after this lease. */
 export const MAIN_RELOAD_LEASE_MS = 30_000;
@@ -414,6 +415,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshedAt = Date.now();
   #refreshStartedAt: number | undefined;
   #refreshError: unknown;
+  #leaseConfirmed = false;
   #deadHostSweepAt = Date.now();
   #quiescing = false;
   #reloadUntil: number | undefined;
@@ -442,6 +444,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#timer) return;
     this.#closed = false;
     this.#refreshError = undefined;
+    this.#leaseConfirmed = false;
     this.#refreshedAt = Date.now();
     if (this.options.enabled) {
       // Start before the initial publish: its per-key work can contend too. The
@@ -454,6 +457,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         try {
           if (this.#refreshing && this.#fileWork > 0 && !this.#quiescing) this.#renewFileLease();
         } catch (error) {
+          this.#refreshError = error;
           this.#backgroundRefresh.failure(error);
           return;
         }
@@ -523,6 +527,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // write/confirmWritable acquisition ends the background path's lock outage.
       if (this.options.enabled) this.#backgroundRefresh.success();
       this.#refreshedAt = Date.now();
+      this.#leaseConfirmed = true;
       this.#refreshError = undefined;
       if (full) this.#sweepDeadHosts();
     } catch (error) {
@@ -878,6 +883,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
       `Fabric mesh is write-stalled: ${lapsed} peer lease${lapsed === 1 ? "" : "s"} lapsed while this host's ` +
         `heartbeat has not committed for ${((now - confirmed) / 1000).toFixed(1)} s, so peer visibility is unknown, not empty.`,
     );
+  }
+
+  /** Resident consumers fail closed on failed/overdue renewal, not just peer visibility.
+   * A file-only liveness write is not confirmation that the mesh is writable. */
+  canConsumeMesh(now = Date.now()): boolean {
+    return !this.options.enabled || (!this.#closed && !this.#quiescing && this.#leaseConfirmed &&
+      this.#refreshError === undefined && now - this.#refreshedAt < this.#heartbeatMs * 2);
   }
 
   /** When this host last committed its heartbeat: lapses before it happened on a working mesh. */

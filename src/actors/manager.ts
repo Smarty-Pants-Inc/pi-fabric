@@ -435,6 +435,7 @@ export class ActorManager {
   #mainIdle = true;
   #reloadingOwnership = false;
   #registryFingerprint: string | undefined;
+  readonly #canConsumeMesh: (() => boolean) | undefined;
 
   constructor(
     readonly sessionId: string,
@@ -463,6 +464,8 @@ export class ActorManager {
       project?: string | undefined;
       role?: string | undefined;
       meshCursorPath?: string;
+      /** Resident lease fence, also defers archive retention until initial publication. */
+      canConsumeMesh?: () => boolean;
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
       /** Per-await preparation deadline; independent of model/run and permit wait timeouts. */
@@ -508,6 +511,7 @@ export class ActorManager {
     this.#role = options.role;
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
     this.#deadSessionReap = options.reapDeadSessionPresence ?? true;
+    this.#canConsumeMesh = options.canConsumeMesh;
     this.#logs = new ActorLogStore(
       mesh,
       meshConfig,
@@ -529,9 +533,10 @@ export class ActorManager {
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
       cursorPath: options.meshCursorPath,
+      canConsumeMesh: options.canConsumeMesh,
       maxReplayAgeMs: options.meshReplayAgeMs,
       beforePoll: () => {
-        if (this.#releasePaused) return false;
+        if (this.#releasePaused || options.canConsumeMesh?.() === false) return false;
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();
         // Preserve deferred events while halted; fencing remains manager-owned.
@@ -3176,7 +3181,7 @@ export class ActorManager {
   }
 
   #sweepRetainedRuns(now = Date.now()): void {
-    if (this.#closing) return;
+    if (this.#closing || this.#canConsumeMesh?.() === false) return;
     this.#refreshOwnership();
     for (const actor of this.#actors.values()) {
       if (this.#canManage(actor.id)) {

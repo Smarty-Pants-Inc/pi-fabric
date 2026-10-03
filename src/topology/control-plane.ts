@@ -223,6 +223,7 @@ export interface FabricControlPlaneOptions {
   enabled: boolean;
   hostId: string;
   pollMs?: number;
+  canConsumeMesh?: () => boolean;
   acknowledgementTimeoutMs?: number;
   /** Remote-link command window; at least 30 s, also used for bridged cancellation. */
   bridgeTimeoutMs?: number;
@@ -733,7 +734,7 @@ export class FabricControlPlane {
   }
 
   async #poll(): Promise<void> {
-    if (this.#closed || this.#paused || !this.options.enabled) return;
+    if (this.#closed || this.#paused || !this.options.enabled || this.options.canConsumeMesh?.() === false) return;
     if (this.#polling) return this.#polling;
     const operation = this.#drain();
     this.#polling = operation;
@@ -748,10 +749,10 @@ export class FabricControlPlane {
     const now = Date.now();
     for (const [key, expiresAt] of this.#sharedClaims) if (expiresAt < now) this.#sharedClaims.delete(key);
     for (const [id, kept] of this.#unpublished) if (kept.expiresAt < now) this.#unpublished.delete(id);
-    while (true) {
+    while (this.options.canConsumeMesh?.() !== false) {
       const tail = this.mesh.tail(this.#offset, 100);
       for (const event of tail.events) {
-        if (this.#paused) return;
+        if (this.#paused || this.options.canConsumeMesh?.() === false) return;
         if (event.sequence <= this.#lastSequence) continue;
         // An event is consumed only once handled: a command that hit a lock timeout throws,
         // and the next poll reads this page again from it (smarty-dev#424). Each retry is
@@ -760,11 +761,13 @@ export class FabricControlPlane {
           if (event.topic === ACK_TOPIC) this.#acceptAcknowledgement(event);
           else if (event.topic === CONTROL_TOPIC) await this.#acceptCommand(event);
         }
+        if (this.options.canConsumeMesh?.() === false) return;
         this.#lastSequence = event.sequence;
       }
       this.#offset = tail.nextOffset;
       if (tail.events.length < 100) break;
     }
+    if (this.options.canConsumeMesh?.() === false) return;
     await this.#cleanupSeen(Date.now()).catch(rethrowMeshLockTimeout);
   }
 

@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { observeResidentOwner } from "./launcher-owner.js";
+import { readHostLease } from "../topology/host-leases.js";
+import { ResidentLauncherWatchdog } from "./launcher-watchdog.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
@@ -55,6 +57,9 @@ interface Attempt {
   closingInput: boolean;
   processes: Map<number, OwnedProcess>;
   stderr: string;
+  watchdog: ResidentLauncherWatchdog;
+  watchdogAt: number;
+  startedAt: number;
 }
 function processRows(): OwnedProcess[] {
   const rows: OwnedProcess[] = [];
@@ -160,7 +165,8 @@ async function supervise(configPath: string): Promise<void> {
         PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "" },
     });
     const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child),
-      seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
+      seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "",
+      watchdog: new ResidentLauncherWatchdog(), watchdogAt: 0, startedAt: Date.now() };
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
     void attempt.native.exit.then(({ code, signal }) => {
       // #2010: after a clean owned release this directory may already belong
@@ -218,9 +224,34 @@ async function supervise(configPath: string): Promise<void> {
       let plan: ResidentHandoverPlan | undefined;
       let custodyFd: number | undefined;
       let inode: fs.Stats | undefined;
+      let watchdogRestart = false;
       while (!attempt.native.exited && !stopping) {
         observe(attempt);
         const state = readHandoverJson<ResidentHandoverState>(handoverPath(root));
+        // Never confer release/fallback authority. Supervise only this native child,
+        // with its exact owner generation, outside a handover transaction.
+        if (!plan && !handoverActive(state) && config.meshRoot && Date.now() >= attempt.watchdogAt) {
+          attempt.watchdogAt = Date.now() + 1_000;
+          const owner = readOwner(), childPid = attempt.child.pid;
+          const otherOwner = owner && owner.pid !== childPid && residentProcessAlive(owner.pid, owner.processStartTime);
+          if (childPid && !otherOwner) {
+            const own = owner?.pid === childPid && owner.processStartTime &&
+              processStartTime(childPid) === owner.processStartTime ? owner : undefined;
+            const lease = own ? readHostLease(config.meshRoot, own.hostId) : undefined;
+            const ownLease = own && lease?.rootId === config.rootId && lease.identityId === own.hostId ? lease : undefined;
+            const zombies = process.platform === "linux" ? processRows().filter(row => row.ppid === childPid && row.state === "Z") : [];
+            // No owner/lease yet is also a stalled owned attempt, not an infinite
+            // startup grace. The native handle still owns exactly this child.
+            const readyAt = own && own.readyAt > 0 ? own.readyAt : attempt.startedAt;
+            const reason = attempt.watchdog.observe(readyAt, ownLease, zombies);
+            if (reason) {
+              trace("watchdog-alarm", { pid: childPid, token: own?.token, reason });
+              await stopAttempt(attempt);
+              watchdogRestart = true;
+              break;
+            }
+          }
+        }
         if (!plan && state?.phase === "custody" && ownHandoverPlan(state.plan, readOwner(), launcher, attempt.child.pid)) {
           try {
             custodyFd = await lockFile(path.join(root, "handover.lock"), 0, true);
@@ -268,6 +299,11 @@ async function supervise(configPath: string): Promise<void> {
       }
       const exit = await attempt.native.exit;
       if (stopping) { if (custodyFd !== undefined) fs.closeSync(custodyFd); return; }
+      if (watchdogRestart && !plan) {
+        trace("watchdog-restart", { previousPid: attempt.child.pid });
+        attempt = start(attempt.spec);
+        continue;
+      }
       if (!plan || !inode) {
         if (!attempt.seenOwner) writeFailure(root, attempt.stderr.trim() || `Pi resident host exited (${exit.signal ?? exit.code ?? "unknown"})`);
         process.exitCode = exit.code ?? 1;

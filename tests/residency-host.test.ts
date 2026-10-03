@@ -475,7 +475,7 @@ describe("resident orphan retention", () => {
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("F6 sweeps old terminal untracked runs at fenced host start, preserving recent/live/unknown/unresolved runs", async () => {
+  it("F6 sweeps old terminal untracked runs after lease publication, preserving recent/live/unknown/unresolved runs", async () => {
     const { root, config, host } = fixture();
     const runs = path.join(config.residencyRoot, "runs");
     const now = Date.now();
@@ -487,7 +487,8 @@ describe("resident orphan retention", () => {
       return run;
     };
     const old = make("terminal-old", { status: "completed" });
-    const actor = make("actor-old", { status: "completed", actorId: "actor-without-public-metadata" });
+    const actor = make("actor-old", { status: "completed", actorId: "actor-without-public-metadata",
+      transport: "process", sessionId: "2147483647", processStartTime: "1" });
     const recent = make("terminal-recent", { status: "completed" }, 1_000);
     const live = make("live", { status: "completed", transport: "process", sessionId: String(process.pid) });
     const unknown = make("unknown", { status: "running" });
@@ -498,8 +499,12 @@ describe("resident orphan retention", () => {
     fs.utimesSync(unresolved, (now - RESIDENT_RUN_RETENTION_MS - 60_000) / 1_000, (now - RESIDENT_RUN_RETENTION_MS - 60_000) / 1_000);
     try {
       await host.start();
-      expect(fs.existsSync(old)).toBe(false);
-      expect(fs.existsSync(actor)).toBe(false);
+      // Startup does not inspect archives; the streaming collector runs later.
+      expect(fs.existsSync(old)).toBe(true);
+      await vi.waitFor(() => {
+        expect(fs.existsSync(old)).toBe(false);
+        expect(fs.existsSync(actor)).toBe(false);
+      });
       for (const run of [recent, live, unknown, malformed, deadWithoutBirth, unresolved]) expect(fs.existsSync(run), run).toBe(true);
       // Inject the clock: a preserved terminal survivor becomes eligible on a later host start.
       expect(sweepResidentRuns(runs, now + RESIDENT_RUN_RETENTION_MS + 60_000)).toEqual([recent]);

@@ -99,6 +99,7 @@ const routing = () => {
     validateDirectMessage: vi.fn<Ports[1]["validateDirectMessage"]>(),
     tell: vi.fn<Ports[1]["tell"]>(), ask: vi.fn<Ports[1]["ask"]>(), stop: vi.fn<Ports[1]["stop"]>(),
     steerRemote: vi.fn<Ports[1]["steerRemote"]>(), resolveBinding: vi.fn<Ports[1]["resolveBinding"]>(),
+    resolveActivationBinding: vi.fn<Ports[1]["resolveActivationBinding"]>(async () => ({})),
   };
   const main = {
     id: "main", local: true, matches: (id: string) => id === "main",
@@ -276,7 +277,7 @@ describe("agents provider message routing service boundaries", () => {
   });
 
   // smarty-dev#447: a sender whose lease just lapsed may still be live; its owner host gets
-  // the reply. A long lapse or no record at all fails with the reason.
+  // the reply. Only confirmed lineage death or no record at all fails with the reason.
   it("replies to a peer root whose lease lapsed moments ago through its owner host", async () => {
     const { router, participants, control } = routing();
     const peer = { ...participant(), id: "session:peer", rootId: "session:peer", stale: true };
@@ -285,6 +286,52 @@ describe("agents provider message routing service boundaries", () => {
     control.request.mockResolvedValue({ queued: true, messageId: "delivered", routed: "mesh", acknowledged: true });
     await expect(router.routeMessage(peer.id, "reply", undefined, "followUp")).resolves.toMatchObject({ acknowledged: true, messageId: "delivered" });
     expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp", { message: "reply", data: undefined, triggerTurn: true }, "owner", { routedRemoteHost: null });
+  });
+
+  it.each(["steer", "followUp"] as const)("routes %s to a known Main regardless of lease age while its lineage is alive", async (kind) => {
+    const { router, participants, control } = routing();
+    const peer: FabricParticipantInfo = { ...participant(), id: "session:peer", rootId: "session:peer", stale: true, capabilities: ["steer", "followUp"] };
+    const lineageAlive = vi.fn(() => true);
+    Object.assign(participants, {
+      lastKnown: () => ({ participant: peer, lapsedMs: Number.POSITIVE_INFINITY }),
+      list: () => [peer], lineageAlive,
+    });
+    control.request.mockResolvedValue({ queued: true, messageId: "live-main", routed: "mesh", acknowledged: true });
+    await expect(router.routeMessage(peer.id, "reply", undefined, kind)).resolves.toMatchObject({ messageId: "live-main" });
+    expect(lineageAlive).toHaveBeenCalledWith(peer.rootId);
+    expect(control.request).toHaveBeenCalledWith("host", peer.id, kind,
+      { message: "reply", data: undefined, ...(kind === "followUp" ? { triggerTurn: true } : {}) }, "owner", { routedRemoteHost: null });
+  });
+
+  it.each(["steer", "followUp"] as const)("keeps %s routable when a cached native root's lease expires under the same authority", async (kind) => {
+    const { router, participants, control } = routing();
+    const peer: FabricParticipantInfo = { ...participant(), id: "session:peer", rootId: "session:peer", capabilities: ["steer", "followUp"] };
+    participants.get.mockImplementation((_id, _now, options) => options?.fresh ? undefined : peer);
+    Object.assign(participants, { list: () => [{ ...peer, stale: true }], lineageAlive: () => true });
+    control.request.mockResolvedValue({ queued: true, messageId: "late-heartbeat", routed: "mesh", acknowledged: true });
+    await expect(router.routeMessage(peer.id, "reply", undefined, kind)).resolves.toMatchObject({ messageId: "late-heartbeat" });
+    expect(control.request).toHaveBeenCalledOnce();
+  });
+
+  it("does not lose a Main renewed between lease-filtered get and lastKnown reads", async () => {
+    const { router, participants, control } = routing();
+    const peer = { ...participant(), id: "session:peer", rootId: "session:peer" };
+    const list = vi.fn(() => [peer]);
+    Object.assign(participants, { lastKnown: () => undefined, list, lineageAlive: () => true });
+    control.request.mockResolvedValue({ queued: true, messageId: "renewed", routed: "mesh", acknowledged: true });
+    await expect(router.routeMessage(peer.id, "reply", undefined, "followUp")).resolves.toMatchObject({ messageId: "renewed" });
+    expect(list).toHaveBeenCalledWith({ scope: "project", kinds: ["root"], includeStale: true, fresh: true });
+  });
+
+  it.each(["steer", "followUp"] as const)("rejects %s to a provably dead Main even with a recent last-known record", async (kind) => {
+    const { router, participants, control } = routing();
+    const peer = { ...participant(), id: "session:dead", rootId: "session:dead", stale: true };
+    Object.assign(participants, {
+      lastKnown: () => ({ participant: peer, lapsedMs: 20_000 }),
+      lineageAlive: () => false,
+    });
+    await expect(router.routeMessage(peer.id, "reply", undefined, kind)).rejects.toThrow("Unknown Fabric participant: session:dead");
+    expect(control.request).not.toHaveBeenCalled();
   });
 
   // review/astra on #44: a worker replies to its own remote Main through the same lookup.
@@ -333,7 +380,7 @@ describe("agents provider message routing service boundaries", () => {
     const root = { ...participant(), id: "session:main-root", rootId: "session:main-root", stale: true };
     participants.get.mockReturnValue(undefined);
     const lastKnown = vi.fn<(id: string) => { participant: FabricParticipantInfo; lapsedMs: number } | undefined>();
-    Object.assign(participants, { lastKnown });
+    Object.assign(participants, { lastKnown, lineageAlive: () => false });
     lastKnown.mockReturnValue({ participant: root, lapsedMs: 600_000 });
     await expect(router.routeMessage("main", "result", undefined, "followUp"))
       .rejects.toThrow("Unknown Fabric Main participant: session:main-root (its lease lapsed 600 s ago, so the session has probably ended)");
@@ -366,7 +413,7 @@ describe("agents provider message routing service boundaries", () => {
     const peer = { ...participant(), id: "session:gone", rootId: "session:gone", stale: true };
     participants.get.mockReturnValue(undefined);
     const lastKnown = vi.fn<(id: string) => { participant: FabricParticipantInfo; lapsedMs: number } | undefined>();
-    Object.assign(participants, { lastKnown });
+    Object.assign(participants, { lastKnown, lineageAlive: () => false });
     lastKnown.mockReturnValue({ participant: peer, lapsedMs: 600_000 });
     await expect(router.routeMessage(peer.id, "reply", undefined, "followUp"))
       .rejects.toThrow("Unknown Fabric participant: session:gone (its lease lapsed 600 s ago, so the session has probably ended)");

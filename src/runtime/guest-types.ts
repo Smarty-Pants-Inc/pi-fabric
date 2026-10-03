@@ -53,6 +53,10 @@ interface FabricAction {
   effect?: FabricActionEffect;
 }
 interface FabricAgentRequest {
+  /** Explicit run-history class; does not opt a non-auto task into routing. */
+  routeClass?: string;
+  /** Trusted protection snapshot; omitted remains unknown. */
+  protected?: boolean;
   /** Deduplicate durable spawns on the same host; reuse for retries within 10 minutes (last 256 results). */
   idempotencyKey?: string;
   /** Omitted/inherit uses caller executor.kernel; concrete choices require Pi with extensions. */
@@ -92,6 +96,8 @@ interface FabricHandoffFacts {
 }
 type FabricHandoffPredicate = (facts: Readonly<FabricHandoffFacts>) => boolean;
 interface FabricHandoffRequest {
+  routeClass?: string;
+  protected?: boolean;
   kernel?: FabricKernel | "inherit";
   /** Exact visible provider/id, model id, or configured alias; closest matches are refused. */
   model: string;
@@ -260,6 +266,9 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  routeClass?: string;
+  routeClassSource?: "explicit" | "derived";
+  protected?: boolean;
   /** Immediate spawning participant, distinct from rootId. */
   spawner?: { id: string; kind: "main" | "agent" | "actor"; runId?: string };
   /** Present on terminal status snapshots when the full log was retained. */
@@ -701,6 +710,10 @@ interface FabricActorRequestBase {
   coalesceKey?: string;
   /** Skip-only rules checked before a queued mesh or host event runs the model. */
   activationFilter?: FabricActorActivationFilter;
+  /** Per-activation shadow routing; requires explicit model/thinking. */
+  routeClass?: "status-groom";
+  /** Required clear trusted state; review/security/audit/needs-security-pass must be true. */
+  protected?: boolean;
   runner?: FabricAgentRunner;
   model?: string;
   /** Required and non-blank when explicitly selecting cliproxyapi/gpt-6-astra. */
@@ -775,6 +788,8 @@ interface FabricActorInfo {
   activationFilterError?: string;
   model?: string;
   thinking?: FabricThinking;
+  routeClass?: "status-groom";
+  protected?: boolean;
   binding?: FabricActorRunBinding & { scope: "session"; sessionId: string; updatedAt?: number };
   projectDefaults?: FabricActorRunBinding & { scope: "project" };
   tools?: string[];
@@ -898,7 +913,7 @@ interface FabricAgentsApi {
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
-  spawn(args: FabricAgentRequest & { routeClass?: string; pinModel?: string; pinThinking?: FabricThinking; protected?: boolean }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
+  spawn(args: FabricAgentRequest & { pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
   /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */
@@ -979,7 +994,7 @@ interface FabricAgentsApi {
   remove(args: { id: string }): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }>;
   /** Drop an actor's mailbox history without stopping the actor. */
   clearMessages(args: { id: string }): Promise<FabricActorInfo>;
-  /** Start an actor's next run on a fresh Pi session; waits for an in-flight run, keeps the mailbox. */
+  /** Fresh actor session, archived history and mailbox kept. The owning Main requests resident reset directly; an admitted activation settles at the fenced boundary while other commands remain serviceable. Explicit stop cancels work and any pending reset; it is not preparation for repair. */
   resetSession(args: { id: string }): Promise<FabricActorInfo>;
   /** Stamp a global template into the current project as a fresh live actor with no inherited history. */
   "import"(args: { id?: string; name?: string; as?: string }): Promise<FabricActorInfo>;

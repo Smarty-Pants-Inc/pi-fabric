@@ -316,6 +316,26 @@ describe("actor session reset (smarty-dev#1439)", () => {
     expect(runs[2]!.prior).toEqual([]);
   });
 
+  it("terminal stop cancels a pending reset without rotating or resuming the actor", async () => {
+    const { actors, runs, hold } = setup();
+    const actor = await actors.create({ name: "cancel repair", instructions: "Work." });
+    await actors.ask(actor.id, "first");
+    const header = sessionHeader(actor.sessionFile!);
+    const release = hold();
+    const active = actors.ask(actor.id, "held activation").catch(error => error);
+    await waitFor(() => runs.length === 2);
+    const reset = actors.resetSession(actor.id).catch(error => error);
+    try {
+      await actors.stop(actor.id);
+      expect(await reset).toMatchObject({ name: "ActorSessionResetCancelledError", code: "ACTOR_SESSION_RESET_CANCELLED", id: actor.id });
+      expect(backups(actor.sessionFile!)).toEqual([]);
+      expect(sessionHeader(actor.sessionFile!)).toEqual(header);
+    } finally { release(); await active; }
+    expect(resets(actors, actor.id)).toEqual([]);
+    expect(actors.status(actor.id).status).toBe("stopped");
+    expect(() => actors.ask(actor.id, "still stopped")).toThrow(/stopped/);
+  });
+
   it("waits for a run in flight: it finishes on the old session, queued work runs on the new one", async () => {
     const { actors, runs, hold } = setup();
     const actor = await actors.create({ name: "busy", instructions: "Work." });

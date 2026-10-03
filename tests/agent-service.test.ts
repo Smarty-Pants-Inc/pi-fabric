@@ -88,6 +88,18 @@ describe("hosted agents.wait bound", () => {
 });
 
 describe("hosted Fabric agent service", () => {
+  it.each([undefined, "custom-review"])("records hosted run history and protection without routing: %s", async routeClass => {
+    const events: AgentServiceEvent[] = [];
+    const instance = service({execute: async () => ({ status: "completed", text: "done" })}, {onEvent: event => { events.push(event); }});
+    const result = await instance.run("root", { task: "review security status-groom", protected: true,
+      ...(routeClass !== undefined ? { routeClass } : {}) });
+    const expected = { routeClass: routeClass ?? "task:pi:hosted", routeClassSource: routeClass !== undefined ? "explicit" : "derived", protected: true };
+    expect(result).toMatchObject(expected);
+    expect(await instance.status("root", result.id)).toMatchObject(expected);
+    expect(instance.snapshot().records[0]!.record).toMatchObject(expected);
+    expect(events.length).toBeGreaterThan(0);
+    for (const event of events) expect(event.record).toMatchObject(expected);
+  });
   it("shares native normalization/schema results, stable prepare identity, usage and private checkpoints", async () => {
     const events: AgentServiceEvent[] = [];
     const prepare = vi.fn(async (request) => ({authorizedId: request.id}));

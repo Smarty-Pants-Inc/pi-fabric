@@ -896,8 +896,14 @@ export class AgentsProvider implements FabricProvider {
         }
         try {
           const result = this.manager.status(id);
+          // Actor foreground values need main's durable consumption fence, but a worker
+          // candidate cannot consume this PR's logical-run outcome. Use the existing bounded
+          // wait path to settle that race before returning a terminal value to an actor.
+          if (terminalAgentStatuses.has(result.status) && !this.manager.isSettled(id) && this.actorManager.identity.kind === "actor") {
+            return this.invoke("wait", args, context);
+          }
           // Model-facing terminal status returns the result; UI polling must not acknowledge it.
-          if (terminalAgentStatuses.has(result.status)) {
+          if (terminalAgentStatuses.has(result.status) && this.manager.isSettled(id)) {
             this.manager.prepareForeground(id);
             if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.detachSignal(id));
             else this.manager.markForeground(id);
@@ -908,7 +914,7 @@ export class AgentsProvider implements FabricProvider {
         }
         if (this.residency?.hasAgent(id)) {
           const result = this.residency.statusAgent(id);
-          if (terminalAgentStatuses.has(result.status)) {
+          if (terminalAgentStatuses.has(result.status) && this.residency.completionSettled(id)) {
             if (context.deferResultConsumption) context.deferResultConsumption(() => this.residency!.acknowledgeCompletion(id));
             else this.residency.acknowledgeCompletion(id);
           }
@@ -1153,8 +1159,8 @@ export class AgentsProvider implements FabricProvider {
         return this.stopParticipant(String(args.id));
       case "cleanup": {
         const id = String(args.id);
-        return this.residency?.hasAgent(id)
-          ? this.residency.cleanupAgent(id, args.deleteBranch === true, context.signal)
+        return (this.residency?.ownsAgent?.(id) ?? this.residency?.hasAgent(id))
+          ? this.residency!.cleanupAgent(id, args.deleteBranch === true, context.signal)
           : this.manager.cleanup(id, args.deleteBranch === true);
       }
       case "create": {
@@ -1551,8 +1557,8 @@ export class AgentsProvider implements FabricProvider {
           if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
           /* not an actor — fall through to agent */
         }
-        if (this.residency?.hasAgent(id)) {
-          return this.residency.readAgentLog(id, { lines, ...cursor });
+        if (this.residency?.ownsAgent?.(id) ?? this.residency?.hasAgent(id)) {
+          return this.residency!.readAgentLog(id, { lines, ...cursor });
         }
         return this.manager.readLog(id, { lines, ...cursor });
       }
@@ -1765,7 +1771,11 @@ export class AgentsProvider implements FabricProvider {
     // An actor's activation run is the actor at work, not an agent: listed, it read as a new
     // root-less agent named after the actor with its run id (smarty-dev#2184). agents.actors lists
     // the actor; the shared directory already omits these runs (agentParticipantRecords).
-    if (scope === "local") return this.manager.list().filter((record) => !record.actorId);
+    if (scope === "local") {
+      const local = this.manager.list().filter((record) => !record.actorId);
+      const seen = new Set(local.map(record => record.id));
+      return [...local, ...(this.residency?.listAgents() ?? []).filter(record => !seen.has(record.id))];
+    }
     // Like agents.members: a mesh-dependent listing (project or lineage) during a write
     // stall is unknown, not short.
     const stalled = this.participants.writeStalled?.();

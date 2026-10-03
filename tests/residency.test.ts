@@ -584,8 +584,11 @@ describe("durable completion receipts", () => {
     const state = await rootHarness(`rejected-durable-${action}`);
     const seeded = await seedCompletion(state);
     const handlers = new Map<string, (...args: any[]) => unknown>();
-    const sendMessage = vi.fn();
-    const context = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+    const sessionFile = path.join(state.root, "main-session.jsonl");
+    fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", id: state.config.sessionId }) + "\n");
+    const sendMessage = vi.fn(message => fs.appendFileSync(sessionFile, JSON.stringify({ type: "custom_message", ...message }) + "\n"));
+    const context = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false,
+      sessionManager: { getSessionId: () => state.config.sessionId, getSessionFile: () => sessionFile } } as unknown as ExtensionContext;
     const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, context);
     const consumed = vi.fn((id: string) => inbox.acknowledge(id));
     const completed = vi.fn((result, delivered) => inbox.enqueue(result, delivered));
@@ -1311,15 +1314,17 @@ describe("durable completion receipts", () => {
     }
   });
 
-  it("honors disabled completion notifications for envelopes from an older resident host", async () => {
+  it("retains unread older-host envelopes when completion notifications are disabled", async () => {
     const state = await rootHarness("disabled-completion-resume");
-    await seedCompletion(state);
+    const seeded = await seedCompletion(state);
     state.config.agents.notifyOnComplete = false;
     const onBackgroundComplete = vi.fn();
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, onBackgroundComplete });
     try {
       client.start();
-      await waitFor(() => state.mesh.listAll(residentDeliveryPrefix(state.identity.id)).length === 0);
+      await delay(100);
+      expect(state.mesh.get(seeded.key)).toBeDefined();
+      expect(client.statusAgent(seeded.id)).toMatchObject({ completionDelivery: { status: "undelivered" } });
       expect(onBackgroundComplete).not.toHaveBeenCalled();
       expect(state.deliveries).toHaveLength(0);
     } finally {
@@ -1332,6 +1337,8 @@ describe("durable completion receipts", () => {
     const state = await rootHarness("f1-recovery-completion");
     const seeded = await seedCompletion(state);
     const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8"));
+    // Pin the exited predecessor: a replacement host cannot resume/retry this old run.
+    fs.writeFileSync(path.join(seeded.runDirectory, "completion-recipient.json"), JSON.stringify({ supervisor: { pid: 2147483647 } }));
     // The host died while the spawn handle still said running; only the worker's record advanced.
     fs.writeFileSync(seeded.metadataPath, JSON.stringify({ ...metadata, handle: { ...metadata.handle, status: "running", text: "", residency: "durable" } }));
     await state.mesh.delete({ key: seeded.key });

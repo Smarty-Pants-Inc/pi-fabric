@@ -104,17 +104,28 @@ describe("task agents stopped by a reload (smarty-dev#1602)", () => {
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     } as AgentRunResult;
     // One runtime start: a real inbox on an idle UI session, and the session entries Pi keeps.
-    const start = (entries: unknown[], notifyOnComplete: boolean) => {
-      const sendMessage = vi.fn();
+    const start = (entries: unknown[], notifyOnComplete: boolean, persistCarrier = true) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "stopped-replay-session-")); roots.push(root);
+      const sessionFile = path.join(root, "session.jsonl");
+      fs.writeFileSync(sessionFile, [JSON.stringify({ type: "session", id: "stopped-replay" }),
+        ...entries.map(value => JSON.stringify(value)), ""].join("\n"));
+      const sendMessage = vi.fn((message, _options: unknown) => {
+        if (persistCarrier) fs.appendFileSync(sessionFile, JSON.stringify({ type: "custom_message", ...message }) + "\n");
+      });
       const notify = vi.fn();
-      const context = { isIdle: () => true, hasPendingMessages: () => false, hasUI: true, ui: { notify } } as unknown as ExtensionContext;
+      const context = { isIdle: () => true, hasPendingMessages: () => false, hasUI: true, ui: { notify },
+        sessionManager: { getSessionId: () => "stopped-replay", getSessionFile: () => sessionFile },
+      } as unknown as ExtensionContext;
       const inbox = new AgentCompletionInbox({ on: () => () => {}, sendMessage } as unknown as ExtensionAPI, context);
       const next = manager();
       const markDelivered = restoreStoppedRuns({
         entries, notifyOnComplete,
         restore: (runs) => next.restorePreviousRuns(runs),
         enqueue: (run, delivered) => inbox.enqueue(run, delivered),
-        appendEntry: (data) => entries.push(entry(data)),
+        appendEntry: (data) => {
+          entries.push(entry(data));
+          fs.appendFileSync(sessionFile, JSON.stringify(entry(data)) + "\n");
+        },
       });
       return { next, inbox, sendMessage, notify, markDelivered };
     };
@@ -127,6 +138,21 @@ describe("task agents stopped by a reload (smarty-dev#1602)", () => {
       expect(run.sendMessage).not.toHaveBeenCalled();
       await expect(run.next.wait("old-run")).resolves.toMatchObject({ status: "stopped", error: stoppedRun.error });
       run.inbox.close();
+    });
+
+    it("does not receipt send admission without a persisted carrier; the next start retries once", async () => {
+      const entries: unknown[] = [entry({ stopped: [stoppedRun] })];
+      const first = start(entries, true, false);
+      await vi.waitFor(() => expect(first.sendMessage).toHaveBeenCalledOnce());
+      expect(readStoppedRuns(entries).undelivered).toHaveLength(1);
+      first.inbox.close();
+      const second = start(entries, true);
+      await vi.waitFor(() => expect(second.sendMessage).toHaveBeenCalledOnce());
+      expect(readStoppedRuns(entries).undelivered).toHaveLength(0);
+      second.inbox.close();
+      const third = start(entries, true);
+      await new Promise(resolve => setTimeout(resolve, 120));
+      expect(third.sendMessage).not.toHaveBeenCalled(); third.inbox.close();
     });
 
     it("with notices on delivers once, and not again at the start after", async () => {

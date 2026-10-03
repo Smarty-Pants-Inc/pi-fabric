@@ -13,6 +13,7 @@ import type {
   AgentRunStatus,
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
+import { saveWorkerCompletion } from "./agents/completion-journal.js";
 import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
@@ -1993,6 +1994,8 @@ const main = async (): Promise<void> => {
     record.status = "failed";
     record.error = `${record.error ? record.error + "\n" : ""}Activation journal retention failed: ${String(error)}`;
   }
+  // The owning Main may already be dead. Publish through its immutable launch return address.
+  saveWorkerCompletion(options.statusFile, record);
   writeRunRecord(options.statusFile, record);
   terminalWritten = true;
   process.stdout.write(`\n[pi-fabric] ${record.status}\n`);

@@ -7,7 +7,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
-import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, residentHostId } from "../src/residency/protocol.js";
+import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, residentHostId, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { describe, expect, it, vi } from "vitest";
 import { deliverActorToMain } from "../src/actors/main-delivery.js";
 import type { FabricActorDeliveryRequest } from "../src/actors/types.js";
@@ -201,8 +201,15 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
     await mesh.put({ key, identity: { id: residentHostId(host.id), name: "resident host", kind: "main" },
       value: { format: RESIDENT_HOST_FORMAT, source: "actor-output", id: "durable", rootId: host.id, from, message: "I am Paul",
         delivery: "steer", triggerTurn: true, createdAt: 1, data: { sender: "paul" } } });
-    const client = new ResidencyClient({ mainAgent: main, mesh, participants: {} as any,
-      config: { rootId: host.id, residencyRoot: path.join(root, "resident"), mesh: { actorPollMs: 20 } } as any });
+    const config: ResidentHostConfig = {
+      format: RESIDENT_HOST_FORMAT, rootId: host.id, sessionId: "host", cwd: root, projectRoot: root,
+      meshRoot: mesh.root, actorRoot: path.join(mesh.root, "actors"), residencyRoot: path.join(root, "resident"),
+      fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 },
+      retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: "unused", fabricExtensionPath: "unused",
+      piBinary: "unused", claudeBinary: "unused", vedaBinary: "unused",
+    };
+    const warning = vi.spyOn(console, "warn");
+    const client = new ResidencyClient({ mainAgent: main, mesh, participants: {} as any, config });
     try {
       client.start(); // Delivery polling only: never calls ensureHost or starts an AI process.
       await vi.waitFor(() => expect(fake.sendMessage).toHaveBeenCalledOnce());
@@ -211,8 +218,10 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
       const admitted = JSON.parse(fs.readFileSync(file, "utf8")).items[0];
       expect(admitted.provenance).toEqual(provenance(from, "steer"));
       expect(admitted.deliveryId).toBe(`resident:${host.id}:durable`);
+      await client.close(); // Observe the entire asynchronous drain, including completion policy.
+      expect(warning).not.toHaveBeenCalled();
     } finally {
-      await client.close(); main.closeFollowUpDrain();
+      await client.close(); warning.mockRestore(); main.closeFollowUpDrain();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

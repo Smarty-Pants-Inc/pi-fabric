@@ -9,7 +9,7 @@ import crossSpawn from "cross-spawn";
 import { observeResidentOwner } from "./launcher-owner.js";
 import { readHostLease } from "../topology/host-leases.js";
 import { ResidentLauncherWatchdog } from "./launcher-watchdog.js";
-import { assertResidentWatchdogAdmission, latchResidentWatchdogAlarm, RESIDENT_WATCHDOG_BLOCKED } from "./watchdog-admission.js";
+import { assertResidentWatchdogAdmission, reserveResidentWatchdogAttempt, releaseResidentWatchdogAttempt, latchResidentWatchdogAlarm, RESIDENT_WATCHDOG_BLOCKED } from "./watchdog-admission.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
@@ -61,6 +61,7 @@ interface Attempt {
   watchdog: ResidentLauncherWatchdog;
   watchdogAt: number;
   startedAt: number;
+  admissionToken: string;
 }
 function processRows(): OwnedProcess[] {
   const rows: OwnedProcess[] = [];
@@ -159,22 +160,29 @@ async function supervise(configPath: string): Promise<void> {
       "--no-prompt-templates", "--no-context-files", "--extension", launchEntry];
     // No shell/string argv. Runtime, entry and binary were resolved in the immutable snapshot.
     const script = NODE_SCRIPT_EXTENSIONS.has(path.extname(launchConfig.piBinary).toLowerCase());
+    // Durable negative debt is established before ANY native work can launch.
+    const admissionToken = reserveResidentWatchdogAttempt(root);
     const child = crossSpawn(script ? runtime : launchConfig.piBinary, script ? [launchConfig.piBinary, ...args] : args, {
       cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, PI_FABRIC_RESIDENT_CONFIG: snapshot,
+        PI_FABRIC_RESIDENT_ADMISSION_TOKEN: admissionToken,
         PI_FABRIC_RESIDENT_LAUNCHER: spec ? JSON.stringify(launcher) : "",
         PI_FABRIC_RESIDENT_SPEC_DIGEST: spec?.digest ?? "",
         PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "" },
     });
     const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child),
       seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "",
-      watchdog: new ResidentLauncherWatchdog(), watchdogAt: 0, startedAt: Date.now() };
+      admissionToken, watchdog: new ResidentLauncherWatchdog(), watchdogAt: 0, startedAt: Date.now() };
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
     void attempt.native.exit.then(({ code, signal }) => {
+      // A normal (non-watchdog) native exit keeps the existing cold-start
+      // policy. Alarm debt is already vetoed in memory before shutdown, so
+      // even an initial alarm open failure can NEVER take this release path.
+      releaseResidentWatchdogAttempt(root, attempt.admissionToken);
       // #2010: after a clean owned release this directory may already belong
       // to the next generation. Do not make a late diagnostic mutation there.
       if (!attempt.seenOwner || code !== 0 || signal) trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });
-    });
+    }).catch(error => writeFailure(root, error));
     child.once("spawn", () => {
       const birth = child.pid ? processStartTime(child.pid) : undefined;
       if (child.pid && birth) attempt.processes.set(child.pid, { pid: child.pid, processStartTime: birth, ppid: process.pid, state: "S" });
@@ -322,6 +330,7 @@ async function supervise(configPath: string): Promise<void> {
         await delay(50);
       }
       const exit = await attempt.native.exit;
+      releaseResidentWatchdogAttempt(root, attempt.admissionToken);
       if (stopping) { if (custodyFd !== undefined) fs.closeSync(custodyFd); return; }
       if (!plan || !inode) {
         if (!attempt.seenOwner) writeFailure(root, attempt.stderr.trim() || `Pi resident host exited (${exit.signal ?? exit.code ?? "unknown"})`);
@@ -403,7 +412,11 @@ async function supervise(configPath: string): Promise<void> {
   } finally {
     // A native exit may precede completion of the already-started observed
     // cleanup. Always join it; never abandon a concurrent shutdown pass.
-    if (stopping && current) await stopAttempt(current);
+    if (stopping && current) {
+      await stopAttempt(current);
+      await current.native.exit;
+      releaseResidentWatchdogAttempt(root, current.admissionToken);
+    }
   }
 }
 

@@ -75,8 +75,18 @@ exit and a free host fence cannot prove the exit of every attempt-owned helper.
 This follows worker stop's existing rule that uncertain descendant exit retains
 admission debt; no new process tracker or containment claim is introduced.
 
-Before stopping the alarmed child, the launcher durably latches
-`watchdog-alarm.json` in the residency root. The launcher, reconnecting residency
+Before spawning any child, the launcher durably reserves
+`watchdog-attempt.json` in the residency root. Reservation/write/sync failure
+prevents launch. Only that launcher’s exact native child may pass the startup
+guard using its launch token. Ready-host attachment is not successor admission.
+Ordinary non-watchdog native exit clears only the same launcher’s unalarmed
+attempt, preserving existing cold-start policy; a killed launcher or any
+alarmed exit retains it.
+
+Before stopping the alarmed child, the launcher vetoes admission in memory and
+tries to durably latch `watchdog-alarm.json` in the residency root. Even if its
+initial open fails before an inode exists, the already-durable attempt marker
+continues to block launcher, client and direct-host successor startup. The launcher, reconnecting residency
 client and direct host startup all refuse admission while that marker exists.
 The host checks again after acquiring its fence, before restoring actors or
 publishing its lease. Corrupt/unreadable markers also fail closed. Nothing in
@@ -84,7 +94,7 @@ cold-start retry, native shutdown or lease expiry clears the alarm. Ordinary
 unalarmed cold start and the existing shutdown deadlines are unchanged.
 
 Recovery requires the existing explicit installer drain and complete descendant
-exit proof before an operator removes the alarm marker. Removing it merely
+exit proof before an operator removes both the alarm and attempt markers. Removing it merely
 because the parent exited or the lease expired is unsafe. Automatic watchdog
 recovery remains unavailable until attempt-owned containment and checked exit
 receipts cover detached/reparented descendants.

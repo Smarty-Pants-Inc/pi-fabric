@@ -2,9 +2,57 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { assertResidentWatchdogAdmission, latchResidentWatchdogAlarm, residentWatchdogAlarmPath, RESIDENT_WATCHDOG_BLOCKED } from "../src/residency/watchdog-admission.js";
+import { assertResidentWatchdogAdmission, latchResidentWatchdogAlarm, residentWatchdogAlarmPath, residentWatchdogAttemptPath, reserveResidentWatchdogAttempt, releaseResidentWatchdogAttempt, RESIDENT_WATCHDOG_BLOCKED } from "../src/residency/watchdog-admission.js";
 
 describe("resident watchdog admission debt", () => {
+  it.each(["open", "write", "sync"] as const)("leaves no launch permission when prelaunch reservation %s fails", mode => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-watchdog-reserve-"));
+    const fail = () => { throw Object.assign(new Error("reservation fault"), { code: "EIO" }); };
+    const fault = mode === "open" ? vi.spyOn(fs, "openSync").mockImplementation(fail)
+      : mode === "write" ? vi.spyOn(fs, "writeFileSync").mockImplementation(fail)
+      : vi.spyOn(fs, "fsyncSync").mockImplementation(fail);
+    try {
+      expect(() => reserveResidentWatchdogAttempt(root)).toThrow("reservation fault");
+      fault.mockRestore();
+      // No token was returned, so caller could not spawn. A partially reserved
+      // inode is debt, never permission, and cannot be replaced on retry.
+      if (mode !== "open") {
+        expect(() => assertResidentWatchdogAdmission(root)).toThrow(RESIDENT_WATCHDOG_BLOCKED);
+        expect(() => reserveResidentWatchdogAttempt(root)).toThrow(RESIDENT_WATCHDOG_BLOCKED);
+      }
+    } finally { fault.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("does not clear the pre-established debt after an initial alarm open failure", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-watchdog-reserve-alarm-"));
+    const token = reserveResidentWatchdogAttempt(root);
+    const marker = fs.readFileSync(residentWatchdogAttemptPath(root), "utf8");
+    const open = fs.openSync;
+    const fault = vi.spyOn(fs, "openSync").mockImplementation((...args: Parameters<typeof fs.openSync>) => {
+      if (String(args[0]) === residentWatchdogAlarmPath(root)) throw new Error("initial alarm open failed");
+      return open(...args);
+    });
+    try {
+      expect(() => latchResidentWatchdogAlarm(root, {})).toThrow("initial alarm open failed");
+      fault.mockRestore(); releaseResidentWatchdogAttempt(root, token);
+      expect(fs.existsSync(residentWatchdogAlarmPath(root))).toBe(false);
+      expect(fs.readFileSync(residentWatchdogAttemptPath(root), "utf8")).toBe(marker);
+      expect(() => assertResidentWatchdogAdmission(root)).toThrow(RESIDENT_WATCHDOG_BLOCKED);
+    } finally { fault.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("ordinary unalarmed native exit releases only its own attempt, preserving cold-start policy", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-watchdog-ordinary-"));
+    try {
+      const token = reserveResidentWatchdogAttempt(root);
+      expect(() => assertResidentWatchdogAdmission(root)).toThrow(RESIDENT_WATCHDOG_BLOCKED);
+      expect(() => releaseResidentWatchdogAttempt(root, "wrong-token")).toThrow(RESIDENT_WATCHDOG_BLOCKED);
+      releaseResidentWatchdogAttempt(root, token);
+      expect(() => assertResidentWatchdogAdmission(root)).not.toThrow();
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+
   it("permits ordinary cold start only when no alarm exists", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-watchdog-admission-"));
     try {
@@ -15,6 +63,22 @@ describe("resident watchdog admission debt", () => {
       expect(() => latchResidentWatchdogAlarm(root, { pid: 456, reason: "unreaped-child" })).toThrow();
       expect(fs.readFileSync(residentWatchdogAlarmPath(root), "utf8")).toBe(alarm);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("vetoes in memory and on the next check when initial alarm creation fails", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-watchdog-open-"));
+    const open = fs.openSync;
+    const fault = vi.spyOn(fs, "openSync").mockImplementation((...args: Parameters<typeof fs.openSync>) => {
+      if (String(args[0]) === residentWatchdogAlarmPath(root)) throw Object.assign(new Error("no inode"), { code: "ENOSPC" });
+      return open(...args);
+    });
+    try {
+      expect(() => latchResidentWatchdogAlarm(root, { reason: "stale-lease" })).toThrow("no inode");
+      expect(fs.existsSync(residentWatchdogAlarmPath(root))).toBe(false);
+      expect(() => assertResidentWatchdogAdmission(root)).toThrow(RESIDENT_WATCHDOG_BLOCKED);
+      fault.mockRestore();
+      expect(() => assertResidentWatchdogAdmission(root)).toThrow(RESIDENT_WATCHDOG_BLOCKED);
+    } finally { fault.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it.each(["diagnostic-write", "file-sync"] as const)("retains admission debt after %s fails", mode => {

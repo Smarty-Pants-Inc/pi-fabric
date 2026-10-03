@@ -465,14 +465,14 @@ export class ResidentHost {
 
   async start(): Promise<void> {
     if (this.#started) return;
-    assertResidentWatchdogAdmission(this.config.residencyRoot);
+    assertResidentWatchdogAdmission(this.config.residencyRoot, process.env.PI_FABRIC_RESIDENT_ADMISSION_TOKEN);
     await this.#acquireLock();
     this.#started = true;
     try {
       // The alarm may have latched while the asynchronous fence was acquired.
       // A free fence is not an attempt-exit receipt: refuse before restoring
       // actors, starting control or publishing/renewing the host lease.
-      assertResidentWatchdogAdmission(this.config.residencyRoot);
+      assertResidentWatchdogAdmission(this.config.residencyRoot, process.env.PI_FABRIC_RESIDENT_ADMISSION_TOKEN);
       // Archived runs are read on demand, never walked before the host lease is up.
       // The streaming request collector handles terminal retention after readiness.
       this.#initialize();

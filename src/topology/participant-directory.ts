@@ -526,7 +526,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // An unchanged change-refresh proves nothing about the lock. Only a committed
       // write/confirmWritable acquisition ends the background path's lock outage.
       if (this.options.enabled) this.#backgroundRefresh.success();
-      this.#refreshedAt = Date.now();
+      // Preserve receipt age across post-commit copies and delayed continuations.
+      this.#refreshedAt = committed;
       this.#leaseConfirmed = true;
       this.#refreshError = undefined;
       if (full) this.#sweepDeadHosts();
@@ -1084,9 +1085,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
   }
 
-  // Returns whether it wrote. A change-only refresh (full false) writes nothing when no
-  // published record differs from the mesh.
-  async #refresh(full: boolean): Promise<boolean> {
+  // Return the actual shared commit/acquisition time, not the completion time
+  // of fallible post-commit file copies. An unchanged change-only refresh proves nothing.
+  async #refresh(full: boolean): Promise<number | false> {
     const now = Date.now();
     const desired = new Map<string, FabricParticipantRecord>();
     for (const source of this.#sources) {
@@ -1116,7 +1117,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     await this.#ensurePeerLabels(desired);
     this.#localRecords.clear();
     for (const [id, record] of desired) this.#localRecords.set(id, record);
-    if (!this.options.enabled) return true;
+    if (!this.options.enabled) return Date.now();
 
     const root = [...desired.values()].find(
       (participant) => participant.kind === "root" && participant.id === this.options.rootId,
@@ -1319,8 +1320,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
           // The file shows only that this host is alive. A committed heartbeat also certifies
           // that the shared state is writable (confirmedAt; peer-settle relies on it, #24), so
           // take the lock once without a write: a stalled mesh still stops confirmation.
-          await this.mesh.confirmWritable();
-          return true;
+          let acquiredAt = 0;
+          await this.mesh.confirmWritable(at => { acquiredAt = at; });
+          return acquiredAt;
         }
       }
     }
@@ -1342,13 +1344,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
         expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
       }),
     });
-    const results = await this.mesh.writeBatch({ identity: this.options.identity, ops });
+    let committedAt = 0;
+    const results = await this.mesh.writeBatch({ identity: this.options.identity, ops,
+      afterCommit: () => { committedAt = Date.now(); } });
     if (!filesOnly) this.#recordsWrittenAt = Date.now();
     // Each record the shared state committed goes to its file too, for runtimes that read files.
     for (const result of results) {
       if (result.applied && statePuts.has(result.key)) await this.#copyCommitted(result.key, result.version);
     }
-    return true;
+    return committedAt;
   }
 
   // One failed key does not abort other keys or the shared host heartbeat. No decision or

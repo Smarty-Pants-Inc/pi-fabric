@@ -6,6 +6,13 @@ import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { ResidentHost } from "../src/residency/host.js";
+import { ResidencyClient } from "../src/residency/client.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import type { FabricMainAgentTarget } from "../src/main-agent.js";
+import type { ResidentHostConfig } from "../src/residency/protocol.js";
+import { residentWatchdogAttemptPath, RESIDENT_WATCHDOG_BLOCKED } from "../src/residency/watchdog-admission.js";
 import { watchResidentChild } from "../src/residency/child-lifetime.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { launchLog, same, type Owned } from "./helpers/owned-processes.js";
@@ -93,15 +100,20 @@ fs.writeFileSync(countFile,String(count));`);
     }
   });
 
-  it.each(["normal", "alarm-write-failure"] as const)("refuses successor admission with a live setsid/reparented helper, even after launcher re-entry (%s)", { timeout: 25_000 }, async mode => {
+  it.each(["normal", "alarm-write-failure", "alarm-open-failure"] as const)("refuses successor admission with a live setsid/reparented helper, even after launcher re-entry (%s)", { timeout: 25_000 }, async mode => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-escaped-helper-"));
     const ownership = launchLog(root);
     const preload = path.join(root, "alarm-preload.mjs");
     fs.writeFileSync(preload, `import fs from 'node:fs';
-if(${JSON.stringify(mode)}==='alarm-write-failure'&&process.argv[1]===${JSON.stringify(launcherPath)}) {
+if(process.argv[1]===${JSON.stringify(launcherPath)}) {
+ const open=fs.openSync;
+ fs.openSync=function(file,...args){
+  if(${JSON.stringify(mode)}==='alarm-open-failure'&&file===${JSON.stringify(path.join(root, "watchdog-alarm.json"))}&&!fs.existsSync(${JSON.stringify(path.join(root, "fault-cleared"))})) throw Object.assign(new Error('injected initial alarm open failure'),{code:'ENOSPC'});
+  return open.call(this,file,...args);
+ };
  const write=fs.writeFileSync;
  fs.writeFileSync=function(file,...args){
-  if(typeof file==='number'&&fs.readlinkSync('/proc/self/fd/'+file)===${JSON.stringify(path.join(root, "watchdog-alarm.json"))}) throw Object.assign(new Error('injected alarm write failure'),{code:'EIO'});
+  if(${JSON.stringify(mode)}==='alarm-write-failure'&&typeof file==='number'&&fs.readlinkSync('/proc/self/fd/'+file)===${JSON.stringify(path.join(root, "watchdog-alarm.json"))}) throw Object.assign(new Error('injected alarm write failure'),{code:'EIO'});
   return write.call(this,file,...args);
  };
 }`);
@@ -147,12 +159,31 @@ process.on('SIGTERM',()=>process.exit(0));setInterval(()=>{},1000);`);
       expect(traces(root).filter(row => row.event === "watchdog-restart")).toHaveLength(0);
       expect(traces(root).filter(row => row.event === "watchdog-restart-blocked")).toHaveLength(1);
       expect(alive(helper)).toBe(true);
-      const alarm = fs.readFileSync(path.join(root, "watchdog-alarm.json"), "utf8");
+      const alarm = mode === "alarm-open-failure" ? undefined : fs.readFileSync(path.join(root, "watchdog-alarm.json"), "utf8");
+      if (mode === "alarm-open-failure") expect(fs.existsSync(path.join(root, "watchdog-alarm.json"))).toBe(false);
       if (mode === "alarm-write-failure") expect(alarm).toBe(""); // negative latch survives failed diagnostics
-      else expect(JSON.parse(alarm)).toMatchObject({ reason: "stale-lease" });
+      else if (alarm !== undefined) expect(JSON.parse(alarm)).toMatchObject({ reason: "stale-lease" });
       const leases = path.join(root, "mesh", "host-leases");
       const leasePath = path.join(leases, fs.readdirSync(leases)[0]!);
       const leaseBefore = fs.readFileSync(leasePath, "utf8"), effectsBefore = fs.statSync(effects).size;
+      fs.writeFileSync(path.join(root, "fault-cleared"), "cleared");
+      if (mode === "alarm-open-failure") {
+        expect(fs.existsSync(residentWatchdogAttemptPath(root))).toBe(true);
+        const cfg: ResidentHostConfig = { format: 1, rootId: "session:escaped", sessionId: "escaped", cwd: root, projectRoot: root,
+          residencyRoot: root, meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), fullCodeMode: true,
+          agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh, retention: DEFAULT_FABRIC_CONFIG.retention,
+          workerPath: "worker.js", fabricExtensionPath: "index.js", piBinary: fake, claudeBinary: "claude", vedaBinary: "veda" };
+        const mesh = new MeshStore(cfg.meshRoot, 65536, 1000);
+        const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: "caller", rootId: cfg.rootId, identity: { id: "caller", name: "caller", kind: "main" } });
+        const client = new ResidencyClient({ config: cfg, mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
+        const direct = new ResidentHost(cfg);
+        try {
+          await expect(client.ensureHost()).rejects.toThrow(RESIDENT_WATCHDOG_BLOCKED);
+          await expect(client.ensureHost()).rejects.toThrow(RESIDENT_WATCHDOG_BLOCKED);
+          await expect(direct.start()).rejects.toThrow(RESIDENT_WATCHDOG_BLOCKED);
+          expect(direct.actors).toBeUndefined();
+        } finally { await client.close(); await direct.close(); await participants.close(); }
+      }
       const second = launch();
       await until(() => second.life.exited);
       expect(await second.life.exit).toEqual({ code: 1, signal: null });
@@ -161,7 +192,22 @@ process.on('SIGTERM',()=>process.exit(0));setInterval(()=>{},1000);`);
       expect(alive(helper)).toBe(true);
       expect(fs.readFileSync(path.join(root, "starts"), "utf8").trim().split("\n")).toHaveLength(1);
       expect(fs.readFileSync(leasePath, "utf8")).toBe(leaseBefore); // no successor re-takes lease
-      expect(fs.readFileSync(path.join(root, "watchdog-alarm.json"), "utf8")).toBe(alarm);
+      if (alarm !== undefined) expect(fs.readFileSync(path.join(root, "watchdog-alarm.json"), "utf8")).toBe(alarm);
+      if (mode === "alarm-open-failure") {
+        // Explicit fixture drain uses launch-time birth receipts (not sampled ancestry).
+        for (const row of ownership.owned().filter(alive)) if (same(row)) process.kill(row.pid, "SIGKILL");
+        await until(() => ownership.owned().filter(alive).length === 0);
+        expect(alive(helper)).toBe(false);
+        fs.rmSync(residentWatchdogAttemptPath(root));
+        fs.rmSync(path.join(root, "owner.json"), { force: true });
+        fs.rmSync(leasePath);
+        // client wrote its full config: restore the original minimal native fixture config.
+        fs.writeFileSync(config, JSON.stringify({ cwd: root, piBinary: fake, meshRoot: path.join(root, "mesh"), rootId: "session:escaped" }));
+        const recovered = launch();
+        await until(() => fs.readFileSync(path.join(root, "starts"), "utf8").trim().split("\n").length === 2);
+        expect(recovered.life.exited).toBe(false);
+        expect(traces(root).filter(row => row.event === "child-spawned")).toHaveLength(2);
+      }
     } finally {
       // Fixture launch-time birth receipts, never ancestry/argv, own cleanup.
       for (const row of ownership.owned().filter(alive)) if (same(row)) {

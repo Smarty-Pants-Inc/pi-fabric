@@ -17,7 +17,6 @@ import { reapDeadHostRecords } from "./host-reaper.js";
 import {
   fileLeasesOnly,
   hostLeaseExpiry,
-  HOST_LEASE_HEARTBEAT_MS,
   LIVENESS_POLICY_KEY,
   readHostLease,
   readHostLeases,
@@ -45,7 +44,7 @@ const HOST_PREFIX = "topology/hosts/";
 const LINEAGE_CLOSURE_PREFIX = "topology/lineage-closures/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
-const PARTICIPANT_HEARTBEAT_MS = HOST_LEASE_HEARTBEAT_MS;
+const PARTICIPANT_HEARTBEAT_MS = 5_000;
 const PARTICIPANT_LEASE_MS = 15_000;
 /** Addressable across a live reload, but a failed reload stops accepting after this lease. */
 export const MAIN_RELOAD_LEASE_MS = 30_000;

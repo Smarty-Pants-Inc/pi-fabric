@@ -16,7 +16,6 @@ interface ResidentHostLaunchContext {
   attempt?: { id: string; kind: "target" | "fallback" };
 }
 import { lockFile, FileLockBusy } from "./file-lock.js";
-import { assertResidentWatchdogAdmission } from "./watchdog-admission.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -217,7 +216,6 @@ export class ResidentHost {
   readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery");
   #flushingDeliveries: Promise<unknown> | undefined;
   readonly #token = randomUUID();
-  readonly #meshWrites = new AbortController();
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
@@ -268,7 +266,7 @@ export class ResidentHost {
   #initialize(): void {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol, writeSignal: this.#meshWrites.signal });
+      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       hostId: this.hostId,
@@ -478,14 +476,9 @@ export class ResidentHost {
 
   async start(): Promise<void> {
     if (this.#started) return;
-    assertResidentWatchdogAdmission(this.config.residencyRoot, process.env.PI_FABRIC_RESIDENT_ADMISSION_TOKEN);
     await this.#acquireLock();
     this.#started = true;
     try {
-      // The alarm may have latched while the asynchronous fence was acquired.
-      // A free fence is not an attempt-exit receipt: refuse before restoring
-      // actors, starting control or publishing/renewing the host lease.
-      assertResidentWatchdogAdmission(this.config.residencyRoot, process.env.PI_FABRIC_RESIDENT_ADMISSION_TOKEN);
       // Archived runs are read on demand, never walked before the host lease is up.
       // The streaming request collector handles terminal retention after readiness.
       this.#initialize();
@@ -521,11 +514,6 @@ export class ResidentHost {
       this.control.start((command, from, signal, verification) =>
         this.#acceptControl(command, from, signal, verification));
       if (this.#staged) this.control.pause();
-      // Supervision identity, NOT business readiness. A live startup waiting
-      // for publication can renew its file lease without admitting mesh work.
-      atomicWrite(path.join(this.config.residencyRoot, "starting.json"), { format: RESIDENT_HOST_FORMAT,
-        hostId: this.hostId, pid: process.pid, processStartTime: processStartTime(process.pid), token: this.#token,
-        readyAt: Date.now() });
       await this.participants.start().catch(() => undefined);
       // A publication failure is not readiness. Keep this same start pending,
       // with requests/events untouched, until a real locked renewal confirms it.
@@ -566,19 +554,18 @@ export class ResidentHost {
           ...(this.launch.attempt ? { attempt: this.launch.attempt } : {}) } : {}),
       };
       atomicWrite(this.#ownerPath, owner);
-      fs.rmSync(path.join(this.config.residencyRoot, "starting.json"), { force: true });
       fs.rmSync(this.#errorPath, { force: true });
       // No fallible/awaited startup work remains. Open every delivery gate only
       // after owner publication; a failed start leaves accepted work untouched.
       this.#ready = true;
       // Removals a previous host accepted: their runs ended with it.
       if (!this.#staged) {
-      this.actors.resumeAfterRelease();
-      void this.#backgroundDeliveries.enqueue(async () => {
-        await this.actors.finishPendingRemovals();
-        this.#writeRemovals();
-      });
-      void this.#retryDeliveries();
+        this.actors.resumeAfterRelease();
+        void this.#backgroundDeliveries.enqueue(async () => {
+          await this.actors.finishPendingRemovals();
+          this.#writeRemovals();
+        });
+        void this.#retryDeliveries();
       }
     } catch (error) {
       await this.close();
@@ -589,11 +576,6 @@ export class ResidentHost {
   async close(): Promise<void> {
     if (this.#closed || !this.#started) return;
     this.#closed = true;
-    // Cooperative shutdown retires this host's publication waiters, not the
-    // lock holder. Durable actor queues/outbox already own accepted work.
-    // Otherwise sequential mesh timeouts exceed the native exit deadline and
-    // turn an ordinary idle exit into unproven watchdog recovery debt.
-    this.#meshWrites.abort(new MeshConsumptionPausedError());
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
     this.#requestRetention.close();
@@ -1408,16 +1390,8 @@ export class ResidentHost {
   #releaseLock(): void {
     if (this.#lockFd === undefined) return;
     // Remove our publication while still holding the fence; never unlink the Linux inode.
-    const startingPath = path.join(this.config.residencyRoot, "starting.json");
-    if (readJson<{ token?: string }>(startingPath)?.token === this.#token) fs.rmSync(startingPath, { force: true });
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (owner?.token === this.#token) {
-      // Final host-write receipt precedes owner withdrawal. It grants only a
-      // bounded native Pi-exit grace, never successor/whole-attempt exit proof.
-      atomicWrite(path.join(this.config.residencyRoot, "closed.json"), { format: 1, pid: owner.pid,
-        processStartTime: owner.processStartTime, token: owner.token, closedAt: Date.now() });
-      fs.rmSync(this.#ownerPath, { force: true });
-    }
+    if (owner?.token === this.#token) fs.rmSync(this.#ownerPath, { force: true });
     if (this.#fallbackLock && readJson<{ token?: string }>(this.#lockPath)?.token === this.#token) {
       fs.rmSync(this.#lockPath, { force: true });
     }
@@ -1466,36 +1440,21 @@ const runResidentHost = async (
     finishIdle = resolve;
   });
   const host = new ResidentHost(config, () => finishIdle?.(), modelRegistry, residentHostLaunchContext(config));
-  // Install before startup: TERM may arrive while initial mesh publication is stuck.
-  let deadline: NodeJS.Timeout | undefined;
-  let finishStop!: () => void;
-  const stopped = new Promise<void>(resolve => { finishStop = resolve; });
-  const armDeadline = (): void => {
-    if (deadline) return;
-    // Bounded native regression seam; production always uses the fixed grace.
-    const testMs = Number(process.env.PI_FABRIC_TEST_RESIDENT_SHUTDOWN_MS);
-    const grace = Number.isInteger(testMs) && testMs > 0 && testMs <= 10_000 ? testMs : 15_000;
-    deadline = setTimeout(() => {
-      console.error("Fabric resident host shutdown deadline exceeded; exiting with fence held");
-      process.exit(1);
-    }, grace);
-  };
-  const finish = (): void => { armDeadline(); finishStop(); };
-  signal?.addEventListener("abort", finish, { once: true });
-  process.on("SIGTERM", finish);
-  process.on("SIGINT", finish);
-  try {
-    if (signal?.aborted) finish();
-    await host.start();
-    if (!signal?.aborted) await Promise.race([idle, stopped]);
-    armDeadline();
+  await host.start();
+  if (signal?.aborted) {
     await host.close();
-  } finally {
-    if (deadline) clearTimeout(deadline);
-    signal?.removeEventListener("abort", finish);
-    process.off("SIGTERM", finish);
-    process.off("SIGINT", finish);
+    return;
   }
+  await Promise.race([
+    idle,
+    new Promise<void>((resolve) => {
+      const finish = (): void => resolve();
+      signal?.addEventListener("abort", finish, { once: true });
+      process.once("SIGTERM", finish);
+      process.once("SIGINT", finish);
+    }),
+  ]);
+  await host.close();
 };
 
 export const runResidentHostFromConfigPath = async (

@@ -46,15 +46,11 @@ record. The client also requires `maintenance-ready.json` with that exact owner
 token before treating the host as usable. This receipt follows the first normal
 post-lease maintenance slice; startup itself does not inspect archived runs.
 Older hosts without that optional flag retain their existing readiness contract.
-`starting.json` is a separate, birth-checked supervision identity while initial
-publication waits: it is never a usable owner or successor-admission receipt.
 The default usable-start observation budget includes the mandatory 30-second
 empty legacy mesh-lock grace plus bounded boot/acquisition time; explicit caller
-budgets and the fail-closed watchdog interval remain unchanged.
-Before withdrawing `owner.json`, the host writes a same-birth `closed.json`
-receipt. It grants only the existing bounded native Pi-exit grace, not
-whole-attempt exit proof or permission for a successor. If native Pi remains
-hung past that grace, the watchdog still latches its persistent alarm.
+budgets remain unchanged. A client attaching between owner publication and the
+maintenance receipt waits for that existing generation instead of launching
+a competitor.
 
 ## Context and lifecycle
 
@@ -66,38 +62,15 @@ and reconnection.
 The host exits after its normal idle grace once it owns no live durable actor or
 running durable agent.
 
-### Watchdog alarm: no automatic successor without complete exit proof
+### PR #394 scope cut: recovery supervision deferred
 
-The launcher alarms after three stale lease-renewal intervals or a persistently
-unreaped direct child. It retains owned-child TERM/KILL and native-exit joining,
-but **does not restart**: sampled ancestry, process-group cleanup, native parent
-exit and a free host fence cannot prove the exit of every attempt-owned helper.
-This follows worker stop's existing rule that uncertain descendant exit retains
-admission debt; no new process tracker or containment claim is introduced.
-
-Before spawning any child, the launcher durably reserves
-`watchdog-attempt.json` in the residency root. Reservation/write/sync failure
-prevents launch. Only that launcher’s exact native child may pass the startup
-guard using its launch token. Ready-host attachment is not successor admission.
-Ordinary non-watchdog native exit clears only the same launcher’s unalarmed
-attempt, preserving existing cold-start policy; a killed launcher or any
-alarmed exit retains it.
-
-Before stopping the alarmed child, the launcher vetoes admission in memory and
-tries to durably latch `watchdog-alarm.json` in the residency root. Even if its
-initial open fails before an inode exists, the already-durable attempt marker
-continues to block launcher, client and direct-host successor startup. The launcher, reconnecting residency
-client and direct host startup all refuse admission while that marker exists.
-The host checks again after acquiring its fence, before restoring actors or
-publishing its lease. Corrupt/unreadable markers also fail closed. Nothing in
-cold-start retry, native shutdown or lease expiry clears the alarm. Ordinary
-unalarmed cold start and the existing shutdown deadlines are unchanged.
-
-Recovery requires the existing explicit installer drain and complete descendant
-exit proof before an operator removes both the alarm and attempt markers. Removing it merely
-because the parent exited or the lease expired is unsafe. Automatic watchdog
-recovery remains unavailable until attempt-owned containment and checked exit
-receipts cover detached/reparented descendants.
+This change keeps cold startup without an archive walk and lease-fenced mesh
+consumption/cursor commits. It does not introduce a launcher watchdog, attempt
+debt/alarm markers, startup/shutdown supervision receipts, host writer retirement,
+or a forced host shutdown-deadline exit. The launcher and host shutdown paths
+retain main's existing behavior; no new bounded-close or whole-attempt containment
+guarantee is claimed. Those features require a separate fabric-v2 follow-up with
+checked whole-attempt exit and completed-drain proofs before recovery admission.
 
 ### Lease-fenced consumption and accepted-work custody
 
@@ -123,13 +96,6 @@ not pick up queued resident requests before the start succeeds. Restored actor
 queues stay release-paused, and control/lifecycle delivery gates remain closed,
 until owner publication commits. A failed start after confirmed lease publication
 therefore also preserves accepted, unlaunched work.
-
-Ordinary close retires only this host's mesh writers, including existing lock
-waiters. It neither signals nor removes another process's lock. Durable actor
-queues and the completion outbox retain accepted custody; worker exit is still
-joined within the existing native shutdown deadlines. This prevents sequential
-publication timeouts from turning a cooperative idle exit into watchdog alarm
-debt. It does not relax the fail-closed alarm/re-entry policy above.
 
 ## Validation
 

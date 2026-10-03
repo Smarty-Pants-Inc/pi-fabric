@@ -23,7 +23,6 @@ import {
   mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
 } from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
-import { assertResidentWatchdogAdmission, assertResidentWatchdogAlarmClear } from "./watchdog-admission.js";
 import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
@@ -277,7 +276,6 @@ export class ResidencyClient {
 
   async #startHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
-    assertResidentWatchdogAlarmClear(this.options.config.residencyRoot);
     this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
     const existing = this.#readyOwner();
@@ -292,10 +290,17 @@ export class ResidencyClient {
       }
       await delay(STATUS_POLL_MS);
     }
-    assertResidentWatchdogAlarmClear(this.options.config.residencyRoot);
-    const followed = this.#readyOwner();
-    if (followed) return followed;
-    assertResidentWatchdogAdmission(this.options.config.residencyRoot);
+    // Owner publication precedes the first maintenance slice. Attach to that
+    // live generation within the startup budget; never spawn a competing
+    // launcher merely because its same-token readiness receipt is pending.
+    const attachDeadline = Date.now() + startupBudgetMs(this.options.startupTimeoutMs ?? HOST_READY_TIMEOUT_MS);
+    while (this.#liveOwner()) {
+      if (this.#closed) throw new Error("Fabric residency client is closed");
+      const followed = this.#readyOwner();
+      if (followed) return followed;
+      if (Date.now() >= attachDeadline) throw new Error("Timed out waiting for Fabric resident host maintenance readiness");
+      await delay(STATUS_POLL_MS);
+    }
     fs.rmSync(this.#errorPath, { force: true });
     const launcher = await spawnDetached(
       this.#hostPath,

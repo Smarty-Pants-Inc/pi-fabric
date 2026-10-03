@@ -21,7 +21,6 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
-import { residentWatchdogAlarmPath, latchResidentWatchdogAlarm, RESIDENT_WATCHDOG_BLOCKED } from "../src/residency/watchdog-admission.js";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -43,49 +42,44 @@ const fixture = () => {
   return { root, config, host, idle };
 };
 
-describe("resident watchdog fail-closed admission (F1)", () => {
-  it.skipIf(process.platform !== "linux")("rechecks an alarm latched during asynchronous fence acquisition before restoring actors", async () => {
+describe("resident maintenance readiness attachment", () => {
+  it("waits for the published live generation before one accepted create, without another launcher", async () => {
     const { root, config, host } = fixture();
-    // lockFile yields before its native flock helper settles; latch during that
-    // yield to exercise the final admission check, not only the entry precheck.
-    const starting = host.start();
-    latchResidentWatchdogAlarm(config.residencyRoot, { reason: "stale-lease" });
-    try {
-      await expect(starting).rejects.toThrow(RESIDENT_WATCHDOG_BLOCKED);
-      expect(host.actors).toBeUndefined();
-      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
-      expect(fs.existsSync(path.join(config.meshRoot, "host-leases"))).toBe(false);
-      expect(fs.existsSync(residentWatchdogAlarmPath(config.residencyRoot))).toBe(true);
-      // The rejection releases the fence rather than leaving a live lock helper.
-      const fd = await lockFile(path.join(config.residencyRoot, "host.lock"), 0, true);
-      fs.closeSync(fd);
-    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
-  });
-
-  it.each(["latched", "torn", "directory"] as const)("blocks client and host startup with a %s alarm, without renewing the lease", async mode => {
-    const { root, config, host } = fixture();
+    const due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(false);
     const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
-    const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: "caller", rootId: config.rootId, identity: { id: "caller", name: "caller", kind: "main" } });
-    const client = new ResidencyClient({ config, mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
-    const alarmPath = residentWatchdogAlarmPath(config.residencyRoot);
-    if (mode === "latched") latchResidentWatchdogAlarm(config.residencyRoot, { reason: "stale-lease" });
-    else if (mode === "torn") fs.writeFileSync(alarmPath, "{");
-    else fs.mkdirSync(alarmPath);
-    const errorPath = path.join(config.residencyRoot, "error.json");
-    fs.writeFileSync(errorPath, '{"error":"prior alarm must survive"}');
-    const alarmBefore = mode === "directory" ? undefined : fs.readFileSync(alarmPath, "utf8");
+    const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: "caller", rootId: config.rootId,
+      identity: { id: "caller", name: "caller", kind: "main" } });
+    const client = new ResidencyClient({ config, mesh, participants, startupTimeoutMs: 2_000, commandTimeoutMs: 5_000,
+      mainAgent: { local: false } as FabricMainAgentTarget });
+    let creation: ReturnType<typeof client.createActor> | undefined;
     try {
-      await expect(client.ensureHost()).rejects.toThrow(RESIDENT_WATCHDOG_BLOCKED);
-      await expect(client.ensureHost()).rejects.toThrow(RESIDENT_WATCHDOG_BLOCKED); // client retry cannot clear debt
-      await expect(host.start()).rejects.toThrow(RESIDENT_WATCHDOG_BLOCKED); // direct host cannot bypass launcher
-      expect(host.actors).toBeUndefined(); // persisted actor work was not restored
-      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      await host.start();
+      const ownerPath = path.join(config.residencyRoot, "owner.json");
+      const owner = fs.readFileSync(ownerPath, "utf8");
+      expect(fs.existsSync(path.join(config.residencyRoot, "maintenance-ready.json"))).toBe(false);
+      const create = vi.spyOn(host.actors, "create");
+      let settled = false;
+      creation = client.createActor({ name: "attached-once", instructions: "Watch", residency: "durable" });
+      void creation.then(() => { settled = true; }, () => { settled = true; });
+      await delay(120);
+      expect(settled).toBe(false);
+      expect(create).not.toHaveBeenCalled();
       expect(fs.existsSync(path.join(config.residencyRoot, "launcher.log"))).toBe(false);
-      expect(fs.existsSync(path.join(config.residencyRoot, "host.lock"))).toBe(false);
-      expect(fs.existsSync(path.join(config.meshRoot, "host-leases"))).toBe(false);
-      expect(fs.readFileSync(errorPath, "utf8")).toBe('{"error":"prior alarm must survive"}');
-      if (alarmBefore !== undefined) expect(fs.readFileSync(alarmPath, "utf8")).toBe(alarmBefore);
-    } finally { await client.close(); await host.close(); await participants.close(); fs.rmSync(root, { recursive: true, force: true }); }
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      due.mockRestore();
+      const actor = await creation;
+      expect(host.actors.owns(actor.id)).toBe(true);
+      expect(participants.get(actor.id)?.ownerHostId).toBe(host.hostId);
+      expect(create).toHaveBeenCalledOnce();
+      expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "maintenance-ready.json"), "utf8"))).toMatchObject({
+        token: JSON.parse(owner).token,
+      });
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      expect(fs.existsSync(path.join(config.residencyRoot, "launcher.log"))).toBe(false);
+    } finally {
+      due.mockRestore(); await creation?.catch(() => undefined); await client.close(); await host.close();
+      vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -683,11 +677,11 @@ describe("resident host ownership", () => {
       expect(owner).toMatchObject({ requestFence: 1, callerBoundSpawn: 1, requestExpiry: 1, creationIdempotency: 1, commands: expect.arrayContaining(["spawnBound", "setModel", "setTools"]), pid: process.pid, hostId: host.hostId });
       expect(owner.processStartTime).toBe(processStartTime(process.pid));
       expect(residentProcessAlive(owner.pid, owner.processStartTime)).toBe(true);
+      const sharedHostKey = `topology/hosts/${createHash("sha256").update(host.hostId).digest("hex")}`;
+      expect(host.mesh.get(sharedHostKey, { fresh: true })).toBeDefined();
       await host.close();
       expect(fs.existsSync(ownerPath)).toBe(false);
-      expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "closed.json"), "utf8"))).toMatchObject({
-        format: 1, pid: owner.pid, processStartTime: owner.processStartTime, token: owner.token, closedAt: expect.any(Number),
-      });
+      expect(host.mesh.get(sharedHostKey, { fresh: true })).toBeUndefined();
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
   it("never follows mutable config alone without a Main intent and attested launcher custody", async () => {

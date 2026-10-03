@@ -172,5 +172,6 @@ export class ActorDirectory extends ActorManager {
   override pauseForRelease(): void { super.pauseForRelease(); this.#secondary.pauseForRelease(); }
   override resumeAfterRelease(): void { super.resumeAfterRelease(); this.#secondary.resumeAfterRelease(); }
   override async checkpointForRelease(): Promise<void> { await super.checkpointForRelease(); await this.#secondary.checkpointForRelease(); }
+  override hasCloseWriterVeto(): boolean { return super.hasCloseWriterVeto() || this.#secondary.hasCloseWriterVeto(); }
   override async close(): Promise<void> { await Promise.all([super.close(), this.#secondary.close()]); }
 }

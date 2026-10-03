@@ -2122,6 +2122,14 @@ export class ActorManager {
     this.#meshMonitor.checkpointForRelease();
   }
 
+  /** A grace-limited close can leave a finalizer running. Such writers KEEP the
+   * root: Main must not publish positive clean-close authority until none remain. */
+  hasCloseWriterVeto(): boolean {
+    return !this.#closing || this.inFlightActorIds().length > 0 || this.#pendingResets.size > 0 ||
+      this.#removals.size > 0 || this.#removeCalls.size > 0 || this.#finishCalls.size > 0 ||
+      this.#presenceChains.size > 0 || this.#adoptionPending.size > 0;
+  }
+
   async close(): Promise<void> {
     if (this.#closing) return;
     this.#closing = true;

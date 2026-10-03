@@ -62,7 +62,12 @@ const exitedProcess = process.platform === "linux" ? (() => {
 })() : undefined;
 const recordExitedMain = (meshRoot: string, rootId: string) => {
   const dir = residentRoot(meshRoot, rootId); fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "main-process.json"), JSON.stringify({ format: 1, meshRoot, rootId, ...exitedProcess }));
+  const generation = hash(`${meshRoot}:${rootId}:generation`), closeProof = hash(`${meshRoot}:${rootId}:close-proof`);
+  fs.writeFileSync(path.join(dir, "main-process.json"), JSON.stringify({ format: 1, meshRoot, rootId, ...exitedProcess,
+    legacyOwnershipUnknown: false, generation, closeCommitment: hash(closeProof) }));
+  // Directory-only doubles explicitly model successful orderly close, never inferred death.
+  fs.writeFileSync(path.join(dir, "main-clean-close.json"), JSON.stringify({ format: 1, meshRoot, rootId,
+    generation, closeProof, closedAt: Date.now() }));
 };
 const fixture = async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-prune-")); roots.push(root);
@@ -109,14 +114,14 @@ const fixture = async () => {
   return { root, mesh, owner, caller, project, session, run };
 };
 
-const nativeResume = (h: Awaited<ReturnType<typeof fixture>>) => {
+const nativeResume = (h: Awaited<ReturnType<typeof fixture>>, sessionId = "old-main") => {
   vi.stubEnv("PI_CODING_AGENT_DIR", path.join(h.root, "agent"));
   vi.stubEnv("PI_FABRIC_PROJECT_ROOT", h.root);
   vi.stubEnv("PI_FABRIC_MESH_ROOT", h.mesh.root);
   const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "off", sendMessage: vi.fn() } as unknown as ExtensionAPI;
   const context = { cwd: h.root, hasUI: false, isProjectTrusted: () => true, isIdle: () => true,
     hasPendingMessages: () => false, modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn() },
-    sessionManager: { getSessionId: () => "old-main", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined },
+    sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined },
     ui: { setStatus: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
   const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: {
     extension: path.resolve("tests/fixtures/fake-worker.mjs"), worker: path.resolve("tests/fixtures/fake-worker.mjs"),
@@ -125,7 +130,7 @@ const nativeResume = (h: Awaited<ReturnType<typeof fixture>>) => {
   const config = normalizeFabricConfig({ fullCodeMode: true, mesh: { enabled: true, actorPollMs: 60_000 },
     mcp: { enabled: false, cache: { enabled: false } }, memory: { enabled: false }, jev: { enabled: false },
     agents: { enabled: false }, residency: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false } });
-  return { runtime, start: () => runtime.initialize(context, config) };
+  return { runtime, pi, start: () => runtime.initialize(context, config) };
 };
 const deferred = () => {
   let resolve!: () => void;
@@ -134,6 +139,86 @@ const deferred = () => {
 };
 
 describe("agents.prune real Fabric path (#2184 item 7)", () => {
+  it.skipIf(process.platform !== "linux").each(["missing", "forged", "stale-generation", "wrong-root", "wrong-mesh", "malformed", "directory", "unreadable"])(
+    "scope cut rejects %s clean-close receipt despite positively exited Main", async fault => {
+      const h = await fixture(); await h.owner.close(); await expiredOwner(h);
+      const file = path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-clean-close.json");
+      if (fault === "missing") fs.rmSync(file, { force: true });
+      else {
+        const receipt = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+        if (fault === "forged") receipt.closeProof = "f".repeat(64);
+        if (fault === "stale-generation") receipt.generation = "e".repeat(64);
+        if (fault === "wrong-root") receipt.rootId = h.caller.identity.id;
+        if (fault === "wrong-mesh") receipt.meshRoot = path.join(h.root, "other-mesh");
+        fs.writeFileSync(file, JSON.stringify(receipt));
+        if (fault === "malformed") fs.writeFileSync(file, "{broken");
+        if (fault === "directory") { fs.rmSync(file); fs.mkdirSync(file); }
+      }
+      const before = snapshot(h.root);
+      if (fault === "unreadable") {
+        const read = fs.readFileSync;
+        vi.spyOn(fs, "readFileSync").mockImplementation(((at: fs.PathOrFileDescriptor, ...args: any[]) => {
+          if (String(at) === file) throw Object.assign(new Error("fixture receipt EIO"), { code: "EIO" });
+          return (read as any)(at, ...args);
+        }) as typeof fs.readFileSync);
+      }
+      for (const dryRun of [true, false]) {
+        const result = await h.run(`return await agents.prune({ root: "session:old-main", dryRun: ${dryRun} });`);
+        expect(result.success, result.error).toBe(false);
+        expect(result.error).toMatch(/clean.close/i);
+      }
+      vi.restoreAllMocks(); expect(snapshot(h.root)).toEqual(before);
+    });
+
+  it.skipIf(process.platform !== "linux")("scope cut rechecks clean-close receipt under the registry lock", async () => {
+    const h = await fixture(); await h.owner.close(); await expiredOwner(h);
+    const file = path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-clean-close.json");
+    const original = ActorRegistryStore.prototype.withLock;
+    vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function (this: ActorRegistryStore, operation) {
+      return original.call(this, () => { fs.rmSync(file, { force: true }); return operation(); }) as ReturnType<typeof original>;
+    });
+    const before = snapshot(path.join(h.mesh.root, "actors"));
+    const result = await h.run('return await agents.prune({ root: "session:old-main" });');
+    expect(result.success, result.error).toBe(false); expect(result.error).toMatch(/clean.close/i);
+    expect(snapshot(path.join(h.mesh.root, "actors"))).toEqual(before);
+  });
+  it.skipIf(process.platform !== "linux")("scope cut fresh native Main can certify orderly close but a still-live process keeps its root", async () => {
+    const h = await fixture(); await h.owner.close();
+    const resume = nativeResume(h, "fresh-main"); await resume.start();
+    const dir = residentRoot(h.mesh.root, "session:fresh-main");
+    const owner = JSON.parse(fs.readFileSync(path.join(dir, "main-process.json"), "utf8"));
+    expect(owner.legacyOwnershipUnknown).toBe(false);
+    const actor = await resume.runtime.actors.create({ name: "fresh-actor", instructions: "Wait.", scope: "session" });
+    await resume.runtime.shutdown("exit");
+    const receipt = JSON.parse(fs.readFileSync(path.join(dir, "main-clean-close.json"), "utf8"));
+    expect(receipt.generation).toBe(owner.generation); expect(hash(receipt.closeProof)).toBe(owner.closeCommitment);
+    const before = snapshot(path.join(h.mesh.root, "actors"));
+    const result = await h.run('return await agents.prune({ root: "session:fresh-main" });');
+    expect(result.success).toBe(false); expect(result.error).toMatch(/live lineage.*native Main process/i);
+    expect(snapshot(path.join(h.mesh.root, "actors"))).toEqual(before);
+    expect(new ActorRegistryStore(path.join(h.mesh.root, "actors", "fresh-main")).records().map(row => row.id)).toContain(actor.id);
+  });
+
+  it.skipIf(process.platform !== "linux").each(["actors", "agents"] as const)(
+    "scope cut unresolved %s writer custody vetoes an otherwise orderly close receipt", async writer => {
+      const h = await fixture(); await h.owner.close();
+      const resume = nativeResume(h); await resume.start();
+      vi.spyOn(resume.runtime[writer], "hasCloseWriterVeto").mockReturnValue(true);
+      await resume.runtime.shutdown("exit");
+      expect(fs.existsSync(path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-clean-close.json"))).toBe(false);
+      expect(fs.existsSync(path.join(h.owner.actorRoots.session, "actors.json"))).toBe(true);
+    });
+
+  it.skipIf(process.platform !== "linux")("scope cut failed late native activation cleanup cannot certify clean close", async () => {
+    const h = await fixture(); await h.owner.close();
+    const resume = nativeResume(h);
+    vi.spyOn(resume.pi.events, "emit").mockImplementation(() => { throw new Error("fixture late activation EIO"); });
+    await expect(resume.start()).rejects.toThrow("fixture late activation EIO");
+    await resume.runtime.shutdown();
+    expect(fs.existsSync(path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-clean-close.json"))).toBe(false);
+    expect(fs.existsSync(path.join(h.owner.actorRoots.session, "actors.json"))).toBe(true);
+  });
+
   it.skipIf(process.platform !== "linux")("F7 exact-root native resume waits for prune, loads post-prune rows and cannot resurrect them", async () => {
     const h = await fixture();
     await h.owner.close();
@@ -264,6 +349,9 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
       const resume = nativeResume(h); await resume.start();
       const file = path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-start.lock");
       const inode = fs.statSync(file);
+      const receiptFile = path.join(path.dirname(file), "main-clean-close.json");
+      const admitted = JSON.parse(fs.readFileSync(path.join(path.dirname(file), "main-process.json"), "utf8"));
+      expect(fs.existsSync(receiptFile)).toBe(false);
       await expect(lockFile(file, 0, true, false)).rejects.toBeInstanceOf(residentLocks.FileLockBusy);
       const entered = deferred(), release = deferred();
       const actors = resume.runtime.actors, close = actors.close.bind(actors);
@@ -273,9 +361,14 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
       const draining = mode === "reinitialize" ? resume.start() : resume.runtime.shutdown(mode === "reload" ? "reload" : undefined);
       try {
         await entered.promise;
+        expect(fs.existsSync(receiptFile)).toBe(false);
         await expect(lockFile(file, 0, true, false)).rejects.toBeInstanceOf(residentLocks.FileLockBusy);
       } finally { release.resolve(); await draining; }
+      if (mode === "reload") expect(fs.existsSync(receiptFile)).toBe(false);
+      if (mode === "shutdown") expect(JSON.parse(fs.readFileSync(receiptFile, "utf8")).generation).toBe(admitted.generation);
       if (mode === "reinitialize") {
+        expect(fs.existsSync(receiptFile)).toBe(false);
+        expect(JSON.parse(fs.readFileSync(path.join(path.dirname(file), "main-process.json"), "utf8")).generation).not.toBe(admitted.generation);
         await expect(lockFile(file, 0, true, false)).rejects.toBeInstanceOf(residentLocks.FileLockBusy);
         expect(resume.runtime.actors.listOwned().map(actor => actor.id)).toEqual(expect.arrayContaining([h.project.id, h.session.id]));
         await resume.runtime.shutdown();
@@ -291,6 +384,7 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
     const file = path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-start.lock");
     const fault = vi.spyOn(resume.runtime.actors, "close").mockRejectedValueOnce(new Error("fixture actor drain EIO"));
     await expect(resume.runtime.shutdown()).rejects.toThrow("fixture actor drain EIO");
+    expect(fs.existsSync(path.join(path.dirname(file), "main-clean-close.json"))).toBe(false);
     await expect(lockFile(file, 0, true, false)).rejects.toBeInstanceOf(residentLocks.FileLockBusy);
     fault.mockRestore(); await resume.runtime.shutdown();
     const fd = await lockFile(file, 0, true, false); fs.closeSync(fd);
@@ -306,8 +400,10 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
   };
   it.skipIf(process.platform !== "linux").each([
     { mode: true, legacy: false, upgraded: false }, { mode: false, legacy: false, upgraded: false }, { mode: "exited", legacy: false, upgraded: false },
+    { mode: "clean-exited", legacy: false, upgraded: false }, { mode: "reload-exited", legacy: false, upgraded: false },
     { mode: true, legacy: true, upgraded: false }, { mode: false, legacy: true, upgraded: false },
     { mode: false, legacy: true, upgraded: true },
+    { mode: false, legacy: true, upgraded: "changed-storage" },
   ] as const)(
     "S4 initialized native Main with expired leases: $mode legacy=$legacy upgraded=$upgraded honors process lifetime", async ({ mode, legacy, upgraded }) => {
       const h = await fixture(); await h.owner.close();
@@ -320,8 +416,13 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
         fs.mkdirSync(path.join(at!, id!), { recursive: true });
         for (const file of ["session.jsonl", "mailbox.json", "queue.json"]) fs.writeFileSync(path.join(at!, id!, file), `${file}-${id}\n`);
       }
+      if (upgraded === "changed-storage") {
+        // Round 5: old root actors exist ONLY in S_old. Successor uses S_new.
+        await store.withLock(() => store.write(store.records().filter(row => row.id !== h.project.id)));
+      }
       if (legacy) fs.rmSync(path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-process.json"));
-      const child = spawn("bun", [path.resolve("tests/fixtures/native-main-prune.ts"), h.root, h.mesh.root, legacy ? "legacy" : "current"],
+      const child = spawn("bun", [path.resolve("tests/fixtures/native-main-prune.ts"), h.root, h.mesh.root, legacy ? "legacy" : "current",
+        mode === "reload-exited" ? "reload" : "exit"],
         { stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "", stderr = "";
       child.stdout.on("data", chunk => { stdout += chunk; });
@@ -347,7 +448,7 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
         if (!legacy) expect(JSON.parse(fs.readFileSync(path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-process.json"), "utf8")))
           .toMatchObject({ format: 1, rootId: h.owner.identity.id, meshRoot: h.mesh.root, pid: child.pid,
             processStartTime: processStartTime(child.pid!), bootId: exitedProcess!.bootId });
-        expect(ready.actors).toEqual(expect.arrayContaining([h.project.id, h.session.id]));
+        expect(ready.actors).toEqual(expect.arrayContaining(upgraded === "changed-storage" ? [h.session.id] : [h.project.id, h.session.id]));
         if (legacy) expect(fs.existsSync(path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-start.lock"))).toBe(false);
         expect(child.kill("SIGSTOP")).toBe(true);
         await until(() => /^State:\s+T/m.test(fs.readFileSync(`/proc/${child.pid}/status`, "utf8")));
@@ -355,7 +456,8 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
           // A new Main cannot retroactively bless the old unfenced writer by
           // recording only its own PID, then exiting while that writer survives.
           const successor = spawn("bun", [path.resolve("tests/fixtures/native-main-prune.ts"), h.root, h.mesh.root, "current"],
-            { stdio: ["ignore", "pipe", "pipe"] });
+            { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env,
+              ...(upgraded === "changed-storage" ? { PI_FABRIC_SESSION_ID: "new-storage" } : {}) } });
           let output = "", errors = "";
           successor.stdout.on("data", chunk => { output += chunk; });
           successor.stderr.on("data", chunk => { errors += chunk; });
@@ -368,8 +470,10 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
             expect(output, errors).toContain('"ready":true');
             const successorRecord = JSON.parse(fs.readFileSync(path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-process.json"), "utf8"));
             expect(successorRecord).toMatchObject({ pid: successor.pid, legacyOwnershipUnknown: true });
-            expect(successor.kill("SIGKILL")).toBe(true); await ended;
+            expect(successor.kill("SIGTERM")).toBe(true); await ended;
+            expect(successor.exitCode, errors).toBe(0);
             expect(() => process.kill(successorRecord.pid, 0)).toThrow();
+            expect(fs.existsSync(path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-clean-close.json"))).toBe(false);
           } finally {
             if (successor.exitCode === null && successor.signalCode === null) successor.kill("SIGKILL");
             await ended;
@@ -386,13 +490,35 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
         expect(h.caller.participants.get(h.project.id, Date.now(), { fresh: true })).toBeUndefined();
         expect(readHostLeases(h.mesh.root).get(h.owner.identity.id)?.expiresAt).toBe(2);
         const actorBytes = snapshot(path.join(h.mesh.root, "actors"));
-        if (mode === "exited") {
-          expect(child.kill("SIGKILL")).toBe(true);
-          expect(await exited).toEqual({ code: null, signal: "SIGKILL" });
+        if (mode === "exited" || mode === "reload-exited") {
+          if (mode === "exited") {
+            expect(child.kill("SIGKILL")).toBe(true);
+            expect(await exited).toEqual({ code: null, signal: "SIGKILL" });
+          } else {
+            expect(child.kill("SIGCONT")).toBe(true); expect(child.kill("SIGTERM")).toBe(true);
+            expect(await exited, stderr).toEqual({ code: 0, signal: null });
+            await expiredOwner(h); await h.caller.participants.refresh();
+          }
+          const retainedActorBytes = snapshot(path.join(h.mesh.root, "actors"));
           expect(() => process.kill(ready.pid, 0)).toThrow();
+          expect(fs.existsSync(path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-clean-close.json"))).toBe(false);
+          for (const dryRun of [true, false]) {
+            const result = await h.run(`return await agents.prune({ root: "session:old-main", dryRun: ${dryRun} });`);
+            expect(result.success, result.error).toBe(false); expect(result.error).toMatch(/clean.close/i);
+          }
+          expect(snapshot(path.join(h.mesh.root, "actors"))).toEqual(retainedActorBytes);
+        } else if (mode === "clean-exited") {
+          expect(child.kill("SIGCONT")).toBe(true);
+          expect(child.kill("SIGTERM")).toBe(true);
+          expect(await exited, stderr).toEqual({ code: 0, signal: null });
+          await expiredOwner(h);
+          await h.caller.participants.refresh();
+          expect(() => process.kill(ready.pid, 0)).toThrow();
+          // Orderly owner shutdown legitimately persists final status/timestamps.
+          const closedActorBytes = snapshot(path.join(h.mesh.root, "actors"));
           const plan = await h.run('return await agents.prune({ root: "session:old-main", dryRun: true });');
           expect(plan.success, plan.error).toBe(true); expect((plan.value as any).actors).toHaveLength(2);
-          expect(snapshot(path.join(h.mesh.root, "actors"))).toEqual(actorBytes);
+          expect(snapshot(path.join(h.mesh.root, "actors"))).toEqual(closedActorBytes);
           const result = await h.run('return await agents.prune({ root: "session:old-main" });');
           expect(result.success, result.error).toBe(true); expect((result.value as any).removed.actors).toBe(2);
           expect(fs.existsSync(path.join(h.owner.actorRoots.project, h.project.id))).toBe(false);
@@ -405,7 +531,7 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
           const before = snapshot(h.root);
           const result = await h.run(`return await agents.prune({ root: "session:old-main", dryRun: ${mode} });`);
           expect(result.success, result.error).toBe(false);
-          expect(result.error).toMatch(legacy ? /cannot prove.*native Main.*identity/i : /live lineage.*native Main/i);
+          expect(result.error).toMatch(legacy ? /cannot prove.*native Main.*(?:identity|clean.close)/i : /live lineage.*native Main/i);
           expect(snapshot(h.root)).toEqual(before);
           expect(snapshot(path.join(h.mesh.root, "actors"))).toEqual(actorBytes);
           expect(() => process.kill(ready.pid, 0)).not.toThrow();
@@ -495,7 +621,7 @@ describe("agents.prune real Fabric path (#2184 item 7)", () => {
   });
 
   it.skipIf(process.platform !== "linux").each(["incarnation", "boot"])(
-    "S4 positive %s mismatch proves the recorded native process gone", async proof => {
+    "S4 positive %s mismatch only clears process veto with valid clean-close authority", async proof => {
       const h = await fixture(); await h.owner.close(); await expiredOwner(h);
       const file = path.join(residentRoot(h.mesh.root, h.owner.identity.id), "main-process.json");
       const owner = JSON.parse(fs.readFileSync(file, "utf8"));

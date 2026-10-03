@@ -6,7 +6,7 @@ import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type 
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
-import { acquireNativeMainStartupFence } from "./residency/main-startup-fence.js";
+import { acquireNativeMainStartupFence, type NativeMainOwnershipRelease } from "./residency/main-startup-fence.js";
 import { OutputArtifactStore } from "./output-budget.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import { recordMainRelease } from "./lifecycle/release-process.js";
@@ -220,7 +220,8 @@ export class FabricRuntimeState {
   #mainAgent: MainAgentController | undefined;
   #participants: ParticipantDirectory | undefined;
   // Acquired before first publication/actor load; kept until all ownership writers stop.
-  #releaseNativeMainOwnership: (() => void) | undefined;
+  #releaseNativeMainOwnership: NativeMainOwnershipRelease | undefined;
+  #orderlyCloseEligible = false;
   #control: FabricControlPlane | undefined;
   #lifecycle: LifecycleBroker | undefined;
   #residency: ResidencyClient | undefined;
@@ -430,6 +431,7 @@ export class FabricRuntimeState {
   }
 
   async initialize(context: ExtensionContext, bootstrapConfig?: FabricConfig): Promise<void> {
+    this.#orderlyCloseEligible = false;
     this.#suppressResidentGuidanceSync = true;
     try {
       await this.#closeInternal();
@@ -1189,6 +1191,7 @@ export class FabricRuntimeState {
     // A damaged artifact disables normalization and surfaces on demand.
     const compiled = this.#config.entropy.compile ? loadCompiledSurface(resolveAgentDir()) : {};
     setActiveCompiledSurface(compiled.file, this.#config.entropy.compile && !compiled.error);
+    this.#orderlyCloseEligible = true;
   }
 
   async #mountExecution(context: ExtensionContext, enforceSchema: boolean): Promise<void> {
@@ -1616,8 +1619,16 @@ export class FabricRuntimeState {
     } finally {
       await this.#participants?.close();
     }
-    // Closing participants is not enough: every actor/control writer above must drain
-    // before prune may obtain this persistent inode. A failed drain keeps us fenced.
+    // Only this Main's successful orderly shutdown grants positive cleanup authority.
+    // Reload/reinitialization and failed drains must never publish a clean-close receipt.
+    // Publish durably while still fenced, after every actor/control/participant writer drained.
+    // Grace-limited actor close and lost-contact child close may return with retained
+    // writers. They can only veto the receipt, never authorize pruning by inference.
+    if (this.#orderlyCloseEligible && reason !== "reload" &&
+        this.#actors?.hasCloseWriterVeto() === false && this.#agents?.hasCloseWriterVeto() === false) {
+      this.#releaseNativeMainOwnership?.cleanClose();
+    }
+    this.#orderlyCloseEligible = false;
     this.#releaseNativeMainOwnership?.();
     this.#releaseNativeMainOwnership = undefined;
     this.#registry = undefined;

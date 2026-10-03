@@ -36,9 +36,11 @@ afterEach(async () => {
 describe("AgentManager close storage", () => {
   it("removes empty managed roots immediately, without recreating them on repeated close", async () => {
     const { manager, root } = setup();
+    expect(manager.hasCloseWriterVeto()).toBe(true);
     const first = manager.close();
     expect(manager.close()).toBe(first);
     await first;
+    expect(manager.hasCloseWriterVeto()).toBe(false);
     expect(fs.existsSync(root)).toBe(false);
     await manager.close();
     expect(fs.existsSync(root)).toBe(false);
@@ -186,6 +188,7 @@ describe("AgentManager close storage", () => {
     const accounting = fs.readFileSync(budget.file, "utf8");
     expect(readBudgetLedger(budget.file).cost).toBeGreaterThanOrEqual(0.25);
     await manager.close();
+    expect(manager.hasCloseWriterVeto()).toBe(state !== "exited");
     if (state === "exited") {
       expect(fs.existsSync(path.dirname(budget.file)), "checked descendant exit releases owned budget").toBe(false);
     } else {

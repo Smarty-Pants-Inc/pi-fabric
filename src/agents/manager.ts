@@ -676,6 +676,7 @@ export class AgentManager {
     | undefined;
   #closing = false;
   #closePromise: Promise<void> | undefined;
+  #closeWriterVeto = true;
   readonly #closeAbort = new AbortController();
   readonly #spawns = new Set<Promise<AgentHandleInfo>>();
   readonly #unregisteredTransports = new Set<AgentTransportHandle>();
@@ -2108,6 +2109,9 @@ export class AgentManager {
     if (obligations()) throw new Error("Agent release quiescence changed while checking workers");
   }
 
+  /** Receipt-only veto: close may retain live/unknown descendants rather than fail. */
+  hasCloseWriterVeto(): boolean { return this.#closeWriterVeto; }
+
   close(): Promise<void> {
     this.#closing = true;
     this.#closeAbort.abort(new Error("Fabric agent manager is closing"));
@@ -2150,7 +2154,8 @@ export class AgentManager {
     const unresolved = all.some((managed) => managed.lostContact || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) ||
       [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasExitVeto(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
-    if (!alive.some(Boolean) && !unresolved) {
+    const writerVeto = alive.some(Boolean) || unresolved;
+    if (!writerVeto) {
       this.#unregisteredTransports.clear();
       const storageSafe = !this.#managedTempRoot || canRemoveManagedRunRoot(this.#runRoot);
       if (!this.config.retainRuns) {
@@ -2176,6 +2181,7 @@ export class AgentManager {
     }
     if (this.#budgetOwned) clearOwnedBudgetEnv();
     if (this.#managedTempRoot) await this.#startTempRunSweep();
+    this.#closeWriterVeto = writerVeto;
   }
 
   /**

@@ -1,5 +1,5 @@
-// Real native runtime/process; only the Pi API boundary is synthetic. No graceful
-// shutdown: the parent stops heartbeats with SIGSTOP, then checks native SIGKILL exit.
+// Real native runtime/process; only the Pi API boundary is synthetic. The parent
+// checks both SIGKILL (never clean close) and orderly SIGTERM writer draining.
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { pathToFileURL } from "node:url";
@@ -12,7 +12,7 @@ if (legacy && !source) {
   const builtin: string = "bun:test";
   const { mock } = await import(builtin) as { mock: { module: (file: string, factory: () => object) => void } };
   mock.module(path.resolve("src/residency/main-startup-fence.ts"), () => ({
-    acquireNativeMainStartupFence: async () => () => {},
+    acquireNativeMainStartupFence: async () => Object.assign(() => {}, { cleanClose() {} }),
   }));
 }
 const load = (file: string) => import(source ? pathToFileURL(path.join(source, "src", file)).href : `../../src/${file}`);
@@ -39,4 +39,9 @@ await runtime.initialize(context, normalizeFabricConfig({ fullCodeMode: true,
   residency: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false } }));
 console.log(JSON.stringify({ ready: true, initialized: runtime.initialized, pid: process.pid,
   actors: runtime.actors.listOwned().map(actor => actor.id) }));
-setInterval(noop, 60_000);
+const keepAlive = setInterval(noop, 60_000);
+process.once("SIGTERM", () => {
+  void runtime.shutdown(process.argv[5] === "reload" ? "reload" : "exit").then(() => { clearInterval(keepAlive); process.exit(0); }, error => {
+    console.error(error); clearInterval(keepAlive); process.exit(1);
+  });
+});

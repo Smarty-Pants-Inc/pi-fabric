@@ -7,7 +7,7 @@ import { residentRoot } from "../residency/protocol.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { assertPruneOwnershipDead } from "../topology/prune-ownership.js";
 import { FileLockBusy, kernelFenceAvailable, lockFile } from "../residency/file-lock.js";
-import { nativeMainProcessRecord, nativeMainStartupLock } from "../residency/main-startup-fence.js";
+import { assertNativeMainCleanClose, nativeMainProcessRecord, nativeMainStartupLock } from "../residency/main-startup-fence.js";
 import { ActorRegistryStore } from "./registry-store.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -47,7 +47,8 @@ const residentFence = async <T>(mesh: MeshStore, root: string, dryRun: boolean,
   let fd: number | undefined;
   let mainFd: number | undefined;
   const mainLocked = nativeMainStartupLock(mesh.root, root);
-  const checkMainProcess = () => {
+  // Process/boot/incarnation evidence can veto only. It never grants cleanup authority.
+  const checkMainProcessNotLive = () => {
     const file = nativeMainProcessRecord(mesh.root, root);
     let owner: Record<string, unknown> | undefined;
     try {
@@ -68,7 +69,7 @@ const residentFence = async <T>(mesh: MeshStore, root: string, dryRun: boolean,
     try { bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(); }
     catch { return unknown("unreadable native Main boot identity"); }
     if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(bootId)) unknown("invalid native Main boot identity");
-    // A previous boot or a positively read different incarnation proves the recorded process gone.
+    // A previous boot or different incarnation removes this veto only; clean close is still mandatory.
     if (bootId !== owner!.bootId) return;
     const pid = Number(owner!.pid);
     let stat: string;
@@ -91,6 +92,7 @@ const residentFence = async <T>(mesh: MeshStore, root: string, dryRun: boolean,
       throw new Error(`Cannot prune live lineage ${root}: native Main process is live`);
     }
   };
+  let closedGeneration: string | undefined;
   const checkOwner = () => {
     if (mainFd !== undefined) {
       const held = fs.fstatSync(mainFd);
@@ -128,7 +130,10 @@ const residentFence = async <T>(mesh: MeshStore, root: string, dryRun: boolean,
       if (process.platform !== "linux" || owner!.processStartTime === undefined ||
           started === undefined || started === owner!.processStartTime) refuse();
     }
-    checkMainProcess();
+    checkMainProcessNotLive();
+    const generation = assertNativeMainCleanClose(mesh.root, root);
+    if (closedGeneration !== undefined && generation !== closedGeneration) unknown("native Main clean-close generation changed");
+    closedGeneration = generation;
   };
   if (!dryRun && !kernelFenceAvailable()) unknown("resident startup fence unavailable; destructive prune requires Linux flock/setpriv");
   checkOwner();

@@ -472,29 +472,35 @@ This is the host-level equivalent of the `pi-model-switch` extension's `switch_m
 
 ### Changing this session's own live Main
 
-`agents.setThinking` and `agents.setModel` also accept this Main's exact `session:<id>`:
+`agents.setThinking` accepts this Main's exact `session:<id>`:
 
 ```ts
 const main = await agents.main();
 const effort = await agents.setThinking({ id: main.id, thinking: "high" });
-const model = await agents.setModel({ id: main.id, model: "provider/model" });
 ```
 
-These calls use Pi's own session setters: the in-flight inference stays unchanged,
-and the next model turn consumes the new binding. They return Main's native
-read-back state plus `previous: { model?, thinking? }` and `caller` (the exact
-calling Main ID); Pi's capability clamp is reflected in `thinking`. Model selection
-uses this session's authenticated registry, aliases and deny policy, without a
-closest-match fallback. Only session scope is supported; a Main binding cannot
-be cleared. Actor IDs and names (including an actor named `main`) keep their
-existing binding behavior.
+This call uses Pi's synchronous thinking setter: the in-flight inference stays
+unchanged, and the next model turn consumes the new effort. It returns Main's
+native read-back state plus `previous: { model?, thinking? }` and `caller` (the
+exact calling Main ID); Pi's capability clamp is reflected in `thinking`.
+Cancellation, deadline, authority and liveness are checked after the serialized
+queue wait, with no await between the final fence and native state/journal commit.
+Only session scope is supported; a Main thinking binding cannot be cleared.
+Actor IDs and names (including an actor named `main`) keep their existing binding
+behavior for both setters.
 
-Only this session's own live Main may change its binding. Cross-process changes
-to another Main are refused, even for a recorded lead or org/product owner:
+**Main `agents.setModel` is deferred entirely**, for own and remote targets:
+`Main setModel is not supported yet (own or remote); see smarty-dev#4153`.
+It refuses before registry resolution, native authentication, publication or
+mutation. Pi's native model setter awaits authentication before mutation without
+a requester cancellation/commit guard; same-process execution does not close
+that window. The pre-existing `agents.switchModel` API is unchanged by this cut.
+
+Only this session's own live Main may change thinking. Cross-process thinking
+changes are refused, even for a recorded lead or org/product owner:
 `remote Main model changes are not supported yet; see smarty-dev#4153`.
-Nothing is queued or mutated. Remote support needs a Pi commit-guard hook between
-native authentication and mutation and is tracked separately; this PR contains
-no Pi-core patch. Participant format-1 capabilities stay unchanged and
+Nothing is queued or mutated. Follow-up support is tracked separately; this PR
+contains no Pi-core patch. Participant format-1 capabilities stay unchanged and
 `mainBindings` is false. Ordinary discovery and messaging remain compatible.
 
 Successful own-session changes write a `pi-fabric.main-binding-change` entry in

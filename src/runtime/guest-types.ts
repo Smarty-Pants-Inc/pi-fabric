@@ -927,9 +927,9 @@ interface FabricAgentsApi {
   stop(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
   cleanup(args: FabricAgentTargetArgs & { deleteBranch?: boolean; delete_branch?: boolean }): Promise<{ cleaned: boolean }>;
   create(args: FabricActorRequest): Promise<FabricActorInfo>;
-  /** Only this session's own Main is supported; remote Main targets are refused. */
-  setModel(args: { id: \`session:\${string}\`; model: string; scope?: "session" }): Promise<FabricMainAgentBindingResult>;
-  setModel<Id extends string>(args: { id: Id; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<FabricBindingTargetResult<Id>>;
+  /** Main setModel (own or remote) is refused; deferred to smarty-dev#4153. Actor bindings are unchanged. */
+  setModel(args: { id: \`session:\${string}\`; model?: string; scope?: "session" }): Promise<never>;
+  setModel<Id extends string>(args: { id: Id; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
   /** Only this session's own Main is supported; remote Main targets are refused. */
   setThinking(args: { id: \`session:\${string}\`; thinking: FabricThinking; scope?: "session" }): Promise<FabricMainAgentBindingResult>;

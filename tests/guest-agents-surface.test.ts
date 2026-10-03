@@ -25,15 +25,18 @@ const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.nam
 describe("guest agents surface", () => {
   it.each([false, true])("types Main before/after readback without regressing literal actor targets (fullCodeMode=%s)", fullCodeMode => {
     const code = `const main = await agents.setThinking({ id: "session:root", thinking: "high" });
-      const model = await agents.setModel({ id: "session:root", model: "probe/b" });
       const actor = await agents.setModel({ id: "actor", model: "probe/b" });
       const caller: string = main.caller;
-      const previous: string | undefined = model.previous.model;
+      const previous: string | undefined = main.previous.model;
       const scope: "session" | "project" = actor.scope;
       const dynamic = await agents.setThinking({ id: (await agents.main()).id, thinking: "high" });
       if ("previous" in dynamic) return dynamic.previous.thinking;
       return { caller, previous, scope };`;
-    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    const refused = `const model = await agents.setModel({ id: "session:root", model: "probe/b" }); return model.previous;`;
+    expect(typeCheckFabricCode(refused, declarations, true).errors.map(error => error.message))
+      .toEqual([expect.stringContaining("does not exist on type 'never'")]);
   });
   it.each([false, true])("types model selection provenance without conflating effective models (fullCodeMode=%s)", fullCodeMode => {
     const declarations = guestTypeDeclarations(fullCodeMode);

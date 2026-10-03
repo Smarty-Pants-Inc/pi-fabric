@@ -405,7 +405,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     context: ExtensionContext,
     beforeCommit: () => void,
   ): Promise<FabricMainAgentBindingResult> {
-    const commit = async (): Promise<FabricMainAgentBindingResult> => {
+    // Defense in depth for direct/local callers: native model auth has no
+    // cancellation-aware commit boundary. Keep the legacy switchModel separate.
+    if (change.operation === "setModel") {
+      return Promise.reject(new Error("Main setModel is not supported yet (own or remote); see smarty-dev#4153"));
+    }
+    const commit = (): FabricMainAgentBindingResult => {
       beforeCommit();
       if (!this.local || !this.#bindingsLive || context.sessionManager.getSessionId() !== this.sessionId) {
         throw new Error(`Main ${this.id} is not live; no binding change was queued`);
@@ -415,13 +420,11 @@ export class MainAgentController implements FabricMainAgentTarget {
         return { ...(model ? { model } : {}), ...(thinking ? { thinking } : {}) };
       };
       const previous = snapshot();
-      // Pi snapshots inference at the turn boundary. Its native setters update the session
-      // now (and journal/clamp it); an in-flight request is unchanged and the next turn uses
-      // the read-back state. Waiting for our own turn_end inside a tool would deadlock Main.
-      if (change.operation === "setModel") {
-        const result = await this.switchModel(change.model, context);
-        if (!result.ok) throw new Error(result.error ?? "Main model switch failed");
-      } else this.pi.setThinkingLevel(change.thinking);
+      // Pi's thinking setter synchronously clamps, mutates and journals: no await
+      // separates the invocation/liveness fence above from the native commit.
+      // Its async event notification happens only after the state is committed.
+      // The in-flight inference is unchanged; the next turn uses read-back state.
+      this.pi.setThinkingLevel(change.thinking);
       const after = snapshot();
       this.pi.appendEntry("pi-fabric.main-binding-change", {
         action: `agents.${change.operation}`, target: this.id, caller, before: previous, after,

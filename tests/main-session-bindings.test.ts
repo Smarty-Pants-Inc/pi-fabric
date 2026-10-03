@@ -15,6 +15,8 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import { FabricExecutionService } from "../src/execution-service.js";
 
 const roots: string[] = [];
 const fixtures: Array<{ control: FabricControlPlane; main: MainAgentController; provider: AgentsProvider }> = [];
@@ -69,18 +71,38 @@ afterEach(async () => {
 });
 
 describe("live Main binding setters (smarty-dev#3626)", () => {
-  it("sets its own Main through the public provider with native before/after readback and caller audit", async () => {
+  it("sets its own Main thinking with native before/after readback and caller audit", async () => {
     const f = fixture(root());
     const effort = await f.provider.invoke("setThinking", { id: f.main.id, thinking: "high" }, f.invocation);
     expect(effort).toMatchObject({ id: f.main.id, kind: "main", thinking: "high", caller: f.main.id, previous: { model: "probe/a", thinking: "low" } });
     expect(f.pi.setThinkingLevel).toHaveBeenCalledWith("high");
-    const switched = await f.provider.invoke("setModel", { id: f.main.id, model: "probe/b" }, f.invocation);
-    expect(switched).toMatchObject({ model: "probe/b", thinking: "high", previous: { model: "probe/a", thinking: "high" } });
-    expect(f.pi.setModel).toHaveBeenCalledWith(models[1]);
+    expect(f.pi.setModel).not.toHaveBeenCalled();
     expect(f.entries).toEqual([
       { customType: "pi-fabric.main-binding-change", data: expect.objectContaining({ action: "agents.setThinking", caller: f.main.id, before: { model: "probe/a", thinking: "low" }, after: { model: "probe/a", thinking: "high" } }) },
-      { customType: "pi-fabric.main-binding-change", data: expect.objectContaining({ action: "agents.setModel", caller: f.main.id, before: { model: "probe/a", thinking: "high" }, after: { model: "probe/b", thinking: "high" } }) },
     ]);
+  });
+
+  it.each([undefined, "probe/b", "probe/denied", "probe/missing"])("defers own Main setModel (%s) before registry/auth/native entry", async model => {
+    const f = fixture(root());
+    const available = vi.spyOn(f.context.modelRegistry, "getAvailable");
+    const find = vi.spyOn(f.context.modelRegistry, "find");
+    const nativeAuth = vi.fn(async () => { throw new Error("native auth must never start"); });
+    vi.mocked(f.pi.setModel).mockImplementation(nativeAuth);
+    const commit = vi.spyOn(f.main, "setBinding");
+    await expect(f.provider.invoke("setModel", { id: f.main.id, model }, f.invocation))
+      .rejects.toThrow("Main setModel is not supported yet (own or remote); see smarty-dev#4153");
+    expect(available).not.toHaveBeenCalled(); expect(find).not.toHaveBeenCalled();
+    expect(commit).not.toHaveBeenCalled(); expect(nativeAuth).not.toHaveBeenCalled();
+    expect(f.pi.setThinkingLevel).not.toHaveBeenCalled(); expect(f.entries).toHaveLength(0);
+    expect(f.main.info(f.context)).toMatchObject({ model: "probe/a", thinking: "low" });
+  });
+
+  it("defers direct controller model changes as defense in depth", async () => {
+    const f = fixture(root()); const fence = vi.fn();
+    await expect(f.main.setBinding({ operation: "setModel", model: { provider: "probe", id: "b" } }, f.main.id, f.context, fence))
+      .rejects.toThrow(/Main setModel.*smarty-dev#4153/);
+    expect(fence).not.toHaveBeenCalled(); expect(f.pi.setModel).not.toHaveBeenCalled();
+    expect(f.entries).toHaveLength(0); expect(f.main.info(f.context)).toMatchObject({ model: "probe/a", thinking: "low" });
   });
 
   it.each([["setModel", undefined], ["setThinking", undefined], ["setModel", "another-machine"], ["setThinking", "another-machine"]] as const)("refuses a remote Main %s (%s) without publication or mutation, even with launch enrollment", async (operation, remoteHost) => {
@@ -88,17 +110,16 @@ describe("live Main binding setters (smarty-dev#3626)", () => {
     vi.stubEnv("SMARTY_LEAD_SESSION", callerId);
     vi.stubEnv("PI_FABRIC_MAIN_CONTROLLERS", JSON.stringify([callerId]));
     const target = fixture(mesh), caller = fixture(mesh, callerId);
-    target.self.mainBindings = true; // Even an older owner advertising support cannot enable this path.
+    target.self.mainBindings = true;
     if (remoteHost) target.self.remoteHost = remoteHost;
     const send = vi.spyOn(caller.control, "requestResult");
     await expect(caller.provider.invoke(operation, { id: target.main.id, model: "probe/b", thinking: "high" }, caller.invocation))
-      .rejects.toThrow("remote Main model changes are not supported yet; see smarty-dev#4153");
+      .rejects.toThrow(operation === "setModel" ? "Main setModel is not supported yet (own or remote); see smarty-dev#4153" : "remote Main model changes are not supported yet; see smarty-dev#4153");
     expect(send).not.toHaveBeenCalled();
     expect(caller.control.mesh.read({ topic: "fabric.control.command" })).toHaveLength(0);
     for (const f of [target, caller]) {
       expect(f.pi.setModel).not.toHaveBeenCalled(); expect(f.pi.setThinkingLevel).not.toHaveBeenCalled();
-      expect(f.entries).toHaveLength(0);
-      expect(f.main.info(f.context)).toMatchObject({ model: "probe/a", thinking: "low" });
+      expect(f.entries).toHaveLength(0); expect(f.main.info(f.context)).toMatchObject({ model: "probe/a", thinking: "low" });
     }
   });
 
@@ -112,70 +133,108 @@ describe("live Main binding setters (smarty-dev#3626)", () => {
     expect(f.pi.setModel).not.toHaveBeenCalled(); expect(f.pi.setThinkingLevel).not.toHaveBeenCalled(); expect(f.entries).toHaveLength(0);
   });
 
-  it("refuses own-session changes during reload/shutdown instead of queueing", async () => {
-    const f = fixture(root());
-    f.main.prepareReload();
+  it("refuses own-session thinking during reload/shutdown instead of queueing", async () => {
+    const f = fixture(root()); f.main.prepareReload();
     await expect(f.provider.invoke("setThinking", { id: f.main.id, thinking: "high" }, f.invocation)).rejects.toThrow(/not live/);
     f.main.closeFollowUpDrain();
     await expect(f.provider.invoke("setThinking", { id: f.main.id, thinking: "high" }, f.invocation)).rejects.toThrow(/not live/);
     expect(f.pi.setThinkingLevel).not.toHaveBeenCalled();
   });
 
-  it("refuses invalid, expired or cancelled own-session changes", async () => {
+  it("refuses invalid, expired or cancelled own-session thinking", async () => {
     const f = fixture(root());
-    await expect(f.provider.invoke("setModel", { id: f.main.id, model: "probe/b" }, { ...f.invocation, checkExecutionBudget: () => { throw new Error("Execution expired"); } })).rejects.toThrow();
+    await expect(f.provider.invoke("setThinking", { id: f.main.id, thinking: "high" }, { ...f.invocation, checkExecutionBudget: () => { throw new Error("Execution expired"); } })).rejects.toThrow();
     const abort = new AbortController(); abort.abort();
     await expect(f.provider.invoke("setThinking", { id: f.main.id, thinking: "high" }, { ...f.invocation, signal: abort.signal })).rejects.toThrow();
     for (const thinking of [undefined, "bogus"]) await expect(f.provider.invoke("setThinking", { id: f.main.id, thinking }, f.invocation)).rejects.toThrow(/Main thinking level/);
     for (const scope of ["project", "global"]) await expect(f.provider.invoke("setThinking", { id: f.main.id, thinking: "high", scope }, f.invocation)).rejects.toThrow(/Main bindings support only session scope/);
-    await expect(f.provider.invoke("setModel", { id: f.main.id }, f.invocation)).rejects.toThrow(/Main model is required/);
-    await expect(f.provider.invoke("setModel", { id: f.main.id, model: "probe/denied" }, f.invocation)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
-    expect(f.pi.setThinkingLevel).not.toHaveBeenCalled(); expect(f.pi.setModel).not.toHaveBeenCalled();
+    expect(f.pi.setThinkingLevel).not.toHaveBeenCalled(); expect(f.pi.setModel).not.toHaveBeenCalled(); expect(f.entries).toHaveLength(0);
   });
 
   it("reports Pi's clamped effort rather than pretending the requested effort was applied", async () => {
-    const f = fixture(root());
-    vi.mocked(f.pi.setThinkingLevel).mockImplementation(() => {}); // Native capability clamp retains low.
+    const f = fixture(root()); vi.mocked(f.pi.setThinkingLevel).mockImplementation(() => {});
     const result = await f.provider.invoke("setThinking", { id: f.main.id, thinking: "max" }, f.invocation);
     expect(f.pi.setThinkingLevel).toHaveBeenCalledWith("max");
     expect(result).toMatchObject({ thinking: "low", previous: { thinking: "low" } });
     expect(f.entries[0]).toMatchObject({ data: { after: { thinking: "low" } } });
   });
 
-  it("refuses an unavailable or unauthenticated model without claiming a successful change", async () => {
-    const f = fixture(root());
-    await expect(f.provider.invoke("setModel", { id: f.main.id, model: "probe/missing" }, f.invocation)).rejects.toThrow(/not available/);
-    expect(f.pi.setModel).not.toHaveBeenCalled();
-    vi.mocked(f.pi.setModel).mockResolvedValue(false);
-    await expect(f.provider.invoke("setModel", { id: f.main.id, model: "probe/b" }, f.invocation)).rejects.toThrow(/No authentication configured/);
-    expect(f.main.info(f.context).model).toBe("probe/a"); expect(f.entries).toHaveLength(0);
-  });
-
-  it.each(["reload", "cancel", "authority-loss"])("fences a model refresh before native mutation after %s", async loss => {
-    const f = fixture(root());
-    let release!: () => void;
-    const barrier = new Promise<void>(resolve => { release = resolve; });
-    const refresh = vi.fn(() => barrier);
-    Object.assign(f.context.modelRegistry, { refresh });
-    vi.spyOn(f.context.modelRegistry, "getAvailable").mockImplementationOnce(() => []);
-    const abort = new AbortController();
-    const pending = f.provider.invoke("setModel", { id: f.main.id, model: "probe/b" }, { ...f.invocation, signal: abort.signal });
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+  it.each(["reload", "cancel", "deadline", "authority-loss"])("fences the thinking queue before synchronous native commit after %s", async loss => {
+    const f = fixture(root()); const abort = new AbortController(); let expired = false;
+    const pending = f.provider.invoke("setThinking", { id: f.main.id, thinking: "high" }, { ...f.invocation, signal: abort.signal,
+      checkExecutionBudget: () => { if (expired) throw new Error("Execution expired"); } });
+    // The controller admitted the call, but its serialized Promise callback has not run.
+    expect(f.pi.setThinkingLevel).not.toHaveBeenCalled();
     if (loss === "reload") f.main.prepareReload();
     if (loss === "cancel") abort.abort();
+    if (loss === "deadline") expired = true;
     if (loss === "authority-loss") f.self.stale = true;
-    release();
     await expect(pending).rejects.toThrow();
-    expect(f.pi.setModel).not.toHaveBeenCalled(); expect(f.entries).toHaveLength(0);
+    expect(f.pi.setThinkingLevel).not.toHaveBeenCalled(); expect(f.pi.setModel).not.toHaveBeenCalled();
+    expect(f.entries).toHaveLength(0); expect(f.main.info(f.context)).toMatchObject({ model: "probe/a", thinking: "low" });
+    if (loss !== "reload") {
+      f.self.stale = false;
+      await expect(f.provider.invoke("setThinking", { id: f.main.id, thinking: "medium" }, f.invocation)).resolves.toMatchObject({ thinking: "medium" });
+    }
+  });
+
+  it("public fabric_exec cancellation after thinking admission cannot cross the queued commit fence", async () => {
+    const f = fixture(root()); const abort = new AbortController();
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
+    const registry = new ActionRegistry(); registry.register(f.provider);
+    const service = new FabricExecutionService(registry, config);
+    const original = f.main.setBinding.bind(f.main);
+    const admitted = vi.spyOn(f.main, "setBinding").mockImplementation((...args) => {
+      const queued = original(...args);
+      // Cancel after all provider checks and queue admission, before the native callback.
+      abort.abort(new Error("Escape"));
+      return queued;
+    });
+    const result = await service.execute({
+      code: `return await agents.setThinking({ id: ${JSON.stringify(f.main.id)}, thinking: "high" });`,
+      signal: abort.signal, parentToolCallId: "main-thinking-queued-cancel",
+      context: { ...f.context, hasUI: false } as ExtensionContext, onPartial() {},
+    });
+    expect(admitted).toHaveBeenCalledOnce(); expect(result.success).toBe(false);
+    expect(f.pi.setThinkingLevel).not.toHaveBeenCalled(); expect(f.pi.setModel).not.toHaveBeenCalled();
+    expect(f.main.info(f.context)).toMatchObject({ model: "probe/a", thinking: "low" });
+    expect(f.entries).toHaveLength(0);
+  });
+
+  it("public fabric_exec Main setModel reports deferral with no native mutation", async () => {
+    const f = fixture(root());
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
+    const registry = new ActionRegistry(); registry.register(f.provider);
+    const service = new FabricExecutionService(registry, config);
+    const result = await service.execute({
+      code: `return await agents.setModel({ id: ${JSON.stringify(f.main.id)}, model: "probe/b" });`,
+      signal: f.invocation.signal, parentToolCallId: "main-model-deferred", context: { ...f.context, hasUI: false } as ExtensionContext, onPartial() {},
+    });
+    expect(result.success).toBe(false); expect(JSON.stringify(result)).toContain("smarty-dev#4153");
+    expect(f.pi.setModel).not.toHaveBeenCalled(); expect(f.pi.setThinkingLevel).not.toHaveBeenCalled();
+    expect(f.entries).toHaveLength(0); expect(f.main.info(f.context)).toMatchObject({ model: "probe/a", thinking: "low" });
+  });
+
+  it("retains a thinking change already synchronously committed before cancellation", async () => {
+    const f = fixture(root()); const abort = new AbortController();
+    const result = await f.provider.invoke("setThinking", { id: f.main.id, thinking: "high" }, { ...f.invocation, signal: abort.signal });
+    abort.abort(); expect(result).toMatchObject({ thinking: "high" });
+    expect(f.main.info(f.context)).toMatchObject({ model: "probe/a", thinking: "high" }); expect(f.entries).toHaveLength(1);
+  });
+
+  it.each(["agent", "actor"] as const)("denies %s lineage own-Main thinking authority", async kind => {
+    const f = fixture(root(), session(), kind);
+    // A child in a local host still cannot claim the Main's binding authority.
+    Object.defineProperty(f.main, "local", { value: true });
+    await expect(f.provider.invoke("setThinking", { id: f.main.id, thinking: "high" }, f.invocation)).rejects.toThrow(/lineage is not Main authority/);
+    expect(f.pi.setThinkingLevel).not.toHaveBeenCalled(); expect(f.entries).toHaveLength(0);
   });
 
   it("keeps actor IDs on the existing ActorDirectory binding path", async () => {
     const f = fixture(root());
     const actor = await f.actors.create({ name: "main", instructions: "test", runner: "pi", model: "probe/a", responseMode: "text" });
-    const changed = await f.provider.invoke("setThinking", { id: actor.id, thinking: "high" }, f.invocation);
-    expect(changed).toMatchObject({ id: actor.id, thinking: "high" });
+    expect(await f.provider.invoke("setThinking", { id: actor.id, thinking: "high" }, f.invocation)).toMatchObject({ id: actor.id, thinking: "high" });
     expect(await f.provider.invoke("setModel", { id: actor.id, model: "probe/b" }, f.invocation)).toMatchObject({ id: actor.id, model: "probe/b" });
-    // "main" remains a valid actor name here; only session:<id> takes the new path.
     expect(await f.provider.invoke("setThinking", { id: "main", thinking: "low" }, f.invocation)).toMatchObject({ id: actor.id, thinking: "low" });
     expect(f.pi.setThinkingLevel).not.toHaveBeenCalled(); expect(f.pi.setModel).not.toHaveBeenCalled();
   });

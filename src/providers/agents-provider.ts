@@ -1618,7 +1618,7 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #applyMainBinding(
-    operation: "setModel" | "setThinking",
+    operation: "setThinking",
     args: Record<string, unknown>,
     from: MeshIdentity,
     checkCommit: () => void,
@@ -1629,18 +1629,9 @@ export class AgentsProvider implements FabricProvider {
       throw new Error(`Main ${this.mainAgent.id} is not live; no binding change was queued`);
     }
     checkCommit();
-    if (operation === "setThinking") {
-      const thinking = typeof args.thinking === "string" ? args.thinking.trim() : "";
-      if (!isFabricThinking(thinking)) throw new Error(`Invalid Main thinking level: ${thinking || "(missing)"}`);
-      return this.mainAgent.setBinding({ operation, thinking }, from.id, context, () => {
-        checkCommit(); this.#assertMainBindingCaller(from);
-      });
-    }
-    const selector = typeof args.model === "string" ? args.model.trim() : "";
-    if (!selector) throw new Error("Main model is required; a live session binding cannot be cleared");
-    const model = await resolvePiModel({ selector, registry: context.modelRegistry,
-      aliases: this.modelsConfig().aliases, policy: this.manager.config, closest: false });
-    return this.mainAgent.setBinding({ operation, model }, from.id, context, () => {
+    const thinking = typeof args.thinking === "string" ? args.thinking.trim() : "";
+    if (!isFabricThinking(thinking)) throw new Error(`Invalid Main thinking level: ${thinking || "(missing)"}`);
+    return this.mainAgent.setBinding({ operation, thinking }, from.id, context, () => {
       checkCommit(); this.#assertMainBindingCaller(from);
     });
   }
@@ -1648,6 +1639,11 @@ export class AgentsProvider implements FabricProvider {
   async #setMainBinding(
     operation: "setModel" | "setThinking", id: string, args: Record<string, unknown>, context: FabricInvocationContext,
   ): Promise<FabricMainAgentBindingResult> {
+    // Pi authenticates asynchronously before setModel mutates, without a requester
+    // commit guard. Defer every Main target before resolution or native entry.
+    if (operation === "setModel") {
+      throw new Error("Main setModel is not supported yet (own or remote); see smarty-dev#4153");
+    }
     if (args.scope !== undefined && args.scope !== "session") throw new Error("Main bindings support only session scope");
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();

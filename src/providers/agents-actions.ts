@@ -623,7 +623,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "setModel",
     description:
-      "Change or clear an actor model binding, or set this session's own live Main via session:<id>. Main changes use Pi native next-turn state, return previous/current readback, and support session scope only. Remote Main changes are not supported yet (smarty-dev#4153).",
+      "Change or clear an actor model binding. Main setModel targets (own or remote session:<id>) are refused before mutation; deferred to smarty-dev#4153 pending a cancellation-aware native commit guard.",
     inputSchema: {
       type: "object",
       properties: {

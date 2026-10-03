@@ -139,6 +139,8 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 const runFiles = new Set([
   "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
   "reply.json", "relaunches.jsonl", "route-session.jsonl",
+  // Native session of an unrouted process Pi task (worker.ts persistentPiTask); owned file only.
+  "session.jsonl",
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */

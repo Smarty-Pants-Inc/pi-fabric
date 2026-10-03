@@ -364,6 +364,7 @@ describe("AgentManager", () => {
       sweep!();
       await vi.waitFor(() => expect(fs.existsSync(ordinaryRun)).toBe(false), { timeout: 2_000 });
       expect(fs.existsSync(run), "unsaved completion stays tracked").toBe(true);
+      expect(manager.retentionReferences().has(result.id), "pending saved-result publication keeps its acknowledgement fence").toBe(true);
       expect(save.mock.calls.length).toBeGreaterThan(attempts);
       expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(worker);
       await expect(manager.cleanup(result.id)).rejects.toThrow(/Cannot clean up agent.*Terminal result save failed/);

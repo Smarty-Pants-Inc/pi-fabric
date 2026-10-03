@@ -57,4 +57,11 @@ while (!fs.existsSync(crash)) {
   if (Date.now() >= deadline) throw new Error("Primary crash gate was not released");
   await new Promise(resolve => setTimeout(resolve, 10));
 }
+// Public durable tasks need a non-recoverable primary failure, rather than the
+// actor stop fence used by the activation tests. Keep the same live descendant.
+if (task.includes('"primaryTerminalFailure":true')) {
+  const statusFile = args.get("status-file")!;
+  const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+  fs.writeFileSync(statusFile, JSON.stringify({ ...record, status: "failed", error: "controlled primary failure", finishedAt: Date.now(), updatedAt: Date.now() }));
+}
 process.exit(3);

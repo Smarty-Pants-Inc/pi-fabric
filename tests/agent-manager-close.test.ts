@@ -5,6 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { activeBudgetState, appendBudgetLedger, readBudgetLedger } from "../src/agents/budget-ledger.js";
+import { hasUnresolvedWorker, runTreeExitVeto } from "../src/storage/retention.js";
+import { processAlive } from "../src/storage/scratch.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -177,6 +180,81 @@ describe("AgentManager close storage", () => {
     expect(fs.readFileSync(path.join(caller, "mine"), "utf8")).toBe("caller data");
     expect(fs.existsSync(path.join(caller, ".fabric-owner.json"))).toBe(false);
   });
+
+  it.each(["live", "unknown", "exited"] as const)("keeps an evicted parent's owned budget until checked descendant exit (%s)", async (state) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manager-close-eviction-"));
+    roots.push(tempRoot);
+    vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+    vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
+    vi.stubEnv("PI_FABRIC_DEPTH", "0");
+    for (const key of ["PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(key, undefined);
+    const config = { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 100, maxConcurrent: 1, retainRuns: false, transport: "process" as const, sessionExport: false };
+    const workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    const manager = new AgentManager(process.cwd(), config, { workerPath, runRoot: path.join(tempRoot, "runs") });
+    managers.push(manager);
+    const budget = activeBudgetState()!;
+    expect(budget.budget).toBe(100);
+    appendBudgetLedger(budget.file, { id: "existing-spend", depth: 0, cost: 0.25, tokens: 25, ts: Date.now() });
+    const parent = await manager.run({ task: "recursive parent", recursive: true });
+    const parentDirectory = manager.runDirectory(parent.id)!;
+    // A real nested manager inherits the parent's ledger and launches a real worker.
+    vi.stubEnv("PI_FABRIC_DEPTH", "1");
+    const childManager = new AgentManager(process.cwd(), { ...config, retainRuns: true }, { workerPath, runRoot: path.join(parentDirectory, "nested") });
+    managers.push(childManager);
+    vi.stubEnv("PI_FABRIC_DEPTH", "0");
+    const child = await childManager.spawn({ task: "HANG_WITH_PROGRESS", extensions: false });
+    const childDirectory = childManager.runDirectory(child.id)!;
+    const childStatus = path.join(childDirectory, "status.json");
+    await vi.waitFor(() => expect(childManager.status(child.id)).toMatchObject({ status: "running", turns: 3 }), { timeout: 5_000 });
+    const pid = Number(child.sessionId);
+    expect(processAlive(pid)).toBe(true);
+    // Persist the real transport identity, as production workers do; UNKNOWN is
+    // an ordinary readable record with no identity and no unresolved marker.
+    const record = JSON.parse(fs.readFileSync(childStatus, "utf8"));
+    fs.writeFileSync(childStatus, JSON.stringify({ ...record, ...(state === "unknown" ? {} : { sessionId: String(pid) }) }));
+
+    // Exercise actual registration, settlement, and #pruneRetainedUiRecords:
+    // only pressure-run execution is substituted, never #runs or its handle cap.
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async (request) => {
+      const arg = (flag: string) => request.workerArguments[request.workerArguments.indexOf(flag) + 1]!;
+      fs.writeFileSync(arg("--status-file"), JSON.stringify({
+        id: request.id, name: request.name, task: "eviction pressure", status: "completed", runner: "pi", transport: "process",
+        cwd: request.cwd, startedAt: Date.now(), updatedAt: Date.now(), finishedAt: Date.now(), text: "done", turns: 1, toolCalls: 0,
+        exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      }));
+      return { kind: "process", isAlive: async () => false, stop: async () => {} };
+    });
+    try {
+      for (let index = 0; index < 1_000; index++) {
+        expect((await manager.run({ task: `eviction pressure ${index}`, extensions: false })).status).toBe("completed");
+      }
+    } finally { launch.mockRestore(); }
+    expect(manager.runDirectory(parent.id), "settled parent handle was really evicted").toBeUndefined();
+    expect(processAlive(Number(parent.sessionId)), "evicted primary process has exited").toBe(false);
+    expect(fs.existsSync(parentDirectory)).toBe(true);
+    expect(hasUnresolvedWorker(parentDirectory)).toBe(false);
+    if (state === "exited") {
+      await childManager.stop(child.id);
+      expect(processAlive(pid), "checked child process exit").toBe(false);
+      expect(runTreeExitVeto(parentDirectory, 0, undefined, true)).toBeUndefined();
+    } else {
+      expect(runTreeExitVeto(parentDirectory, 0, undefined, true)).toMatch(state === "unknown" ? /unknown descendant identity/ : /descendant worker may still be running/);
+    }
+    const accounting = fs.readFileSync(budget.file, "utf8");
+    expect(readBudgetLedger(budget.file).cost).toBeGreaterThanOrEqual(0.25);
+    await manager.close();
+    if (state === "exited") {
+      expect(fs.existsSync(path.dirname(budget.file)), "checked descendant exit releases owned budget").toBe(false);
+    } else {
+      expect(fs.existsSync(budget.file), "evicted live/unknown descendant still owns the ledger").toBe(true);
+      expect(fs.readFileSync(budget.file, "utf8")).toBe(accounting);
+      const before = readBudgetLedger(budget.file);
+      await childManager.stop(child.id);
+      expect(processAlive(pid)).toBe(false);
+      expect(readBudgetLedger(budget.file).cost, "descendant can still append its final accounting after parent close").toBeGreaterThan(before.cost);
+    }
+  }, 30_000);
 
   it("cancels queued admissions on close instead of launching after shutdown", async () => {
     const { manager, root } = setup(false);

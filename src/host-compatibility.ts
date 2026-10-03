@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
+import { rootParticipantName } from "./topology/participant-name.js";
 import path from "node:path";
 
 /** Trusted host policy for every Fabric participant model selection. */
@@ -333,5 +334,5 @@ export const fabricHostIdentity = (
   const agentId = environment.PI_FABRIC_PARENT_RUN?.trim();
   if (actorId) return { id: actorId, name: environment.PI_FABRIC_ACTOR_NAME?.trim() || actorId.slice(0, 8), kind: "actor", sessionId };
   if (agentId) return { id: agentId, name: environment.PI_FABRIC_AGENT_NAME?.trim() || agentId.slice(0, 8), kind: "agent", sessionId };
-  return { id: `session:${sessionId}`, name: "main", kind: "main", sessionId };
+  return { id: `session:${sessionId}`, name: rootParticipantName(undefined, environment), kind: "main", sessionId };
 };

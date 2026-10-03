@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
+import { syncPathNamespace, syncPathNamespaceAsync, writeJsonAtomic } from "../core/atomic-write.js";
 import { residentProcessAlive } from "../residency/process-identity.js";
 import type { MeshStore } from "../mesh/store.js";
 import type { AgentHandleInfo, AgentRunRecord, AgentRunResult } from "./types.js";
@@ -69,6 +69,52 @@ const files = (dir: string): string[] => {
   try { return fs.readdirSync(dir).filter(file => /^[a-f0-9]{64}\.json$/.test(file)); } catch { return []; }
 };
 interface CompletionReceipt { id: string; sessionId: string; consumedAt: number }
+interface CompletionClaim { rootId: string; sessionId: string; recipient?: CompletionRecipient }
+const fingerprint = (stat: fs.Stats): string => JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
+// Plain scans only read receipts. Every destructive cleanup confirms the full namespace
+// afresh: an unchanged endpoint inode is not evidence that its parent entries are durable.
+const confirmReceipt = async (file: string, value: CompletionReceipt): Promise<void> => {
+  const handle = await fs.promises.open(file, process.platform === "win32" ? "r+" : "r");
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || JSON.stringify(JSON.parse(await handle.readFile("utf8"))) !== JSON.stringify(value)) {
+      throw new Error(`Completion file changed before durability confirmation at ${file}`);
+    }
+    await handle.sync();
+    await syncPathNamespaceAsync(file, stat);
+    if (fingerprint(await handle.stat()) !== fingerprint(stat)) throw new Error(`Completion file changed during confirmation at ${file}`);
+  } finally { await handle.close(); }
+};
+// Journal writers put the address before the result. Read only that bounded prefix,
+// including old pretty-printed envelopes; never parse a foreign result body.
+const addressBuffer = Buffer.alloc(16 * 1024);
+const readRecipient = (file: string): CompletionRecipient | undefined => {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, "r");
+    const prefix = addressBuffer.toString("utf8", 0, fs.readSync(fd, addressBuffer, 0, addressBuffer.length, 0));
+    const start = /^\s*\{\s*"format"\s*:\s*1\s*,\s*"recipient"\s*:\s*/.exec(prefix)?.[0].length;
+    if (start === undefined || prefix[start] !== "{") return undefined;
+    let depth = 0, quoted = false, escaped = false;
+    for (let i = start; i < prefix.length; i++) {
+      const character = prefix[i];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') quoted = false;
+      } else if (character === '"') quoted = true;
+      else if (character === "{") depth++;
+      else if (character === "}" && --depth === 0) {
+        const address = JSON.parse(prefix.slice(start, i + 1)) as CompletionRecipient;
+        return typeof address.projectRoot === "string" && typeof address.cwd === "string" &&
+          typeof address.rootId === "string" && typeof address.sessionId === "string" &&
+          typeof address.name === "string" ? address : undefined;
+      }
+    }
+  } catch { /* Missing, torn or oversized addresses cannot authorize body/fence access. */ }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+  return undefined;
+};
 /** Only proven absence authorizes delivery. An unknown replay fence is a storage fault. */
 const readReplayFence = <T>(file: string, label = "Completion"): T | undefined => {
   try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; }
@@ -104,15 +150,15 @@ const readReceipt = (file: string, id?: string): CompletionReceipt | undefined =
     typeof value.consumedAt !== "number" || !Number.isFinite(value.consumedAt) || value.consumedAt <= 0) {
     throw new Error(`Completion replay fence is invalid at ${file}; retain the outcome for repair`);
   }
-  syncCompletionFile(file, value);
   return value;
 };
 export const completionConsumed = (meshRoot: string, id: string): boolean =>
   readReceipt(receiptPath(meshRoot, id), id) !== undefined;
 export const consumeCompletion = (meshRoot: string, id: string, sessionId: string): void => {
-  if (!completionConsumed(meshRoot, id)) {
-    writeJsonAtomic(receiptPath(meshRoot, id), { id, sessionId, consumedAt: Date.now() }, { durable: true });
-  }
+  const file = receiptPath(meshRoot, id);
+  const receipt = readReceipt(file, id);
+  if (receipt) syncCompletionFile(file, receipt);
+  else writeJsonAtomic(file, { id, sessionId, consumedAt: Date.now() }, { durable: true });
 };
 /** Stable run id fences committed outcomes. Settlement supersedes an uncommitted attempt. */
 export const saveCompletion = (meshRoot: string, recipient: CompletionRecipient, result: AgentRunResult): void => {
@@ -127,6 +173,9 @@ export const saveCompletion = (meshRoot: string, recipient: CompletionRecipient,
       // A preceding save may have renamed successfully but thrown before durability.
       syncCompletionFile(file, existing);
     }
+  } else {
+    // Candidate removal must not rely on a visible but failed receipt write.
+    consumeCompletion(meshRoot, result.id, recipient.sessionId);
   }
   fs.rmSync(candidatePath(meshRoot, result.id), { force: true });
 };
@@ -174,23 +223,32 @@ export const saveWorkerCompletion = (statusFile: string, result: AgentRunRecord)
     result.warnings = [...(result.warnings ?? []), `Completion remains in the worker status: journal save failed: ${String(error).slice(0, 500)}`];
   }
 };
-const promoteOrphans = (meshRoot: string, projectRoot: string): void => {
+const promoteOrphans = (meshRoot: string, projectRoot: string,
+  accepts: (recipient: CompletionRecipient) => boolean = () => true): void => {
+  const project = canonical(projectRoot);
   for (const file of files(path.join(directory(meshRoot), "attempts"))) {
-    const candidate = read<CompletionCandidate>(path.join(directory(meshRoot), "attempts", file));
+    const target = path.join(directory(meshRoot), "attempts", file);
+    const address = readRecipient(target);
+    if (!address || canonical(address.projectRoot) !== project || !accepts(address)) continue;
+    const fence = path.join(directory(meshRoot), "receipts", file);
+    if (readReceipt(fence)) continue; // Consumed attempts join drain's bounded async cleanup.
+    const candidate = read<CompletionCandidate>(target);
     if (candidate?.format !== 1 || !candidate.result || !candidate.recipient || !candidate.supervisor ||
       !Number.isSafeInteger(candidate.supervisor.pid) || candidate.supervisor.pid <= 0 ||
       typeof candidate.result.id !== "string" || file !== `${key(candidate.result.id)}.json` ||
       typeof candidate.recipient.projectRoot !== "string" || canonical(candidate.recipient.projectRoot) !== canonical(projectRoot)) continue;
-    if (completionConsumed(meshRoot, candidate.result.id)) {
-      fs.rmSync(candidatePath(meshRoot, candidate.result.id), { force: true });
-    } else if (!residentProcessAlive(candidate.supervisor.pid, candidate.supervisor.processStartedAt)) {
+    if (!completionConsumed(meshRoot, candidate.result.id) &&
+      !residentProcessAlive(candidate.supervisor.pid, candidate.supervisor.processStartedAt)) {
       saveCompletion(meshRoot, candidate.recipient, candidate.result);
     }
   }
 };
 const savedCompletion = (meshRoot: string, projectRoot: string, id: string): CompletionEnvelope | undefined => {
   promoteOrphans(meshRoot, projectRoot);
-  const value = read<CompletionEnvelope>(envelopePath(meshRoot, id));
+  const file = envelopePath(meshRoot, id);
+  const recipient = readRecipient(file);
+  if (!recipient || canonical(recipient.projectRoot) !== canonical(projectRoot)) return undefined;
+  const value = read<CompletionEnvelope>(file);
   if (value?.format !== 1 || value.result?.id !== id || typeof value.recipient?.projectRoot !== "string" ||
     canonical(value.recipient.projectRoot) !== canonical(projectRoot)) return undefined;
   return value;
@@ -207,12 +265,17 @@ export const legacyCompletionConsumed = (meshRoot: string, rootId: string, id: s
   }
   return metadata.completionConsumedAt !== undefined;
 };
-export const pendingCompletions = (meshRoot: string, projectRoot: string): CompletionEnvelope[] => {
-  promoteOrphans(meshRoot, projectRoot);
+export const pendingCompletions = (meshRoot: string, projectRoot: string,
+  accepts: (recipient: CompletionRecipient) => boolean = () => true): CompletionEnvelope[] => {
+  promoteOrphans(meshRoot, projectRoot, accepts);
+  const project = canonical(projectRoot);
   return files(directory(meshRoot)).flatMap(file => {
-    // Completed payloads can be large. Read only their small receipt during idle scans.
+    // The immutable address precedes the potentially huge body. Foreign lanes never touch fences.
+    const target = path.join(directory(meshRoot), file);
+    const recipient = readRecipient(target);
+    if (!recipient || canonical(recipient.projectRoot) !== project || !accepts(recipient)) return [];
     if (readReceipt(path.join(directory(meshRoot), "receipts", file))) return [];
-    const value = read<CompletionEnvelope>(path.join(directory(meshRoot), file));
+    const value = read<CompletionEnvelope>(target);
     if (value?.format !== 1 || !value.recipient || !value.result ||
       typeof value.recipient.rootId !== "string" || typeof value.recipient.sessionId !== "string" ||
       typeof value.recipient.projectRoot !== "string" || typeof value.recipient.cwd !== "string" ||
@@ -222,7 +285,7 @@ export const pendingCompletions = (meshRoot: string, projectRoot: string): Compl
       typeof value.result.name !== "string" || typeof value.result.text !== "string" || typeof value.result.startedAt !== "number" ||
       file !== `${key(value.result.id)}.json` ||
       !["completed", "failed", "stopped", "timed_out"].includes(value.result.status) ||
-      canonical(value.recipient.projectRoot) !== canonical(projectRoot) || completionConsumed(meshRoot, value.result.id)) return [];
+      canonical(value.recipient.projectRoot) !== project || completionConsumed(meshRoot, value.result.id)) return [];
     return legacyCompletionConsumed(meshRoot, value.recipient.rootId, value.result.id) ? [] : [value];
   });
 };
@@ -233,6 +296,12 @@ export const pendingCompletionResult = (envelope: CompletionEnvelope): AgentRunR
 
 export class CompletionJournal {
   readonly #enqueued = new Set<string>();
+  // Preserve same-session wait/status after unlink without retaining an unbounded disk journal.
+  readonly #consumed = new Map<string, CompletionEnvelope>();
+  #remember(envelope: CompletionEnvelope): void {
+    this.#consumed.set(envelope.result.id, envelope);
+    if (this.#consumed.size > 64) this.#consumed.delete(this.#consumed.keys().next().value!);
+  }
   constructor(readonly meshRoot: string, readonly recipientSource: CompletionRecipient | (() => CompletionRecipient),
     readonly participants: FabricParticipantSource, readonly mesh: MeshStore,
     readonly enqueue: (result: AgentRunResult, delivered: () => void) => void) {}
@@ -260,11 +329,12 @@ export class CompletionJournal {
     fs.rmSync(envelopePath(this.meshRoot, id), { force: true });
     fs.rmSync(candidatePath(this.meshRoot, id), { force: true });
     this.#enqueued.delete(id);
+    this.#consumed.delete(id);
     void this.#retireClaim(id).catch(() => undefined); // A crash/failure is reconciled by drain.
   }
   pending(): CompletionEnvelope[] { return pendingCompletions(this.meshRoot, this.recipient.projectRoot); }
   result(id: string): AgentRunResult | CompletionSummary | undefined {
-    const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id);
+    const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id) ?? this.#consumed.get(id);
     if (!envelope) return undefined;
     const consumed = completionConsumed(this.meshRoot, id) || legacyCompletionConsumed(this.meshRoot, envelope.recipient.rootId, id);
     if (!this.#canRead(envelope)) {
@@ -283,17 +353,44 @@ export class CompletionJournal {
     // failed/delayed journal publication. Observer status/wait cannot forge an early receipt.
     if (envelope ? !this.#canRead(envelope) : !localRunSettled) return false;
     consumeCompletion(this.meshRoot, id, this.recipient.sessionId);
+    if (envelope) this.#remember(envelope);
+    fs.rmSync(envelopePath(this.meshRoot, id), { force: true });
     this.#enqueued.delete(id);
     void this.#retireClaim(id).catch(() => undefined);
     return true;
   }
   async drain(deliver = true): Promise<void> {
-    // Receipts are the durable replay fence. Retire crash-left claims even with no pending body.
+    // Gate before reading a fence, even without a body. The authenticated claim retains
+    // its owner's lane so a dead Main's same-lane successor can reclaim bounded state.
+    let retired = 0;
     for (const claim of this.mesh.listAll(claimPrefix)) {
+      if (!this.#canRetireClaim(claim)) continue;
       const receipt = readReceipt(path.join(directory(this.meshRoot), "receipts", `${claim.key.slice(claimPrefix.length)}.json`));
-      if (typeof receipt?.id === "string" && claim.key === claimKey(receipt.id)) await this.#retireClaim(receipt.id, claim);
+      if (typeof receipt?.id === "string" && claim.key === claimKey(receipt.id)) {
+        await this.#retireClaim(receipt.id, claim);
+        if (++retired === 128) break;
+      }
     }
-    const pending = this.pending();
+    const recipient = this.recipient;
+    const accepts = (address: CompletionRecipient) =>
+      (address.rootId === recipient.rootId && address.sessionId === recipient.sessionId) || sameRecipientLane(address, recipient);
+    // Bound crash-left cleanup; receipt barriers use the async filesystem, never the UI thread.
+    let pruned = 0;
+    const project = canonical(recipient.projectRoot);
+    for (const target of [directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts")]
+      .flatMap(dir => files(dir).map(file => path.join(dir, file)))) {
+      const file = path.basename(target);
+      const address = readRecipient(target);
+      if (!address || canonical(address.projectRoot) !== project || !accepts(address)) continue;
+      const fence = path.join(directory(this.meshRoot), "receipts", file);
+      const receipt = readReceipt(fence);
+      if (!receipt) continue;
+      await confirmReceipt(fence, receipt);
+      fs.rmSync(target, { force: true });
+      if (++pruned === 128) break;
+      if (pruned % 16 === 0) await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    const pending = pendingCompletions(this.meshRoot, recipient.projectRoot, accepts);
     if (!pending.length) return;
     const roots = this.participants.list({ scope: "project", kinds: ["root"], fresh: true });
     for (const envelope of pending) {
@@ -306,7 +403,7 @@ export class CompletionJournal {
         try {
           await this.mesh.put({ key: ck, ifVersion: claim?.version ?? 0,
             identity: { id: this.recipient.rootId, name: "main", kind: "main" },
-            value: { rootId: this.recipient.rootId, sessionId: this.recipient.sessionId } });
+            value: { rootId: this.recipient.rootId, sessionId: this.recipient.sessionId, recipient: this.recipient } satisfies CompletionClaim });
         } catch { continue; } // Another live successor owns admission; leave the source pending.
       }
       if (completionConsumed(this.meshRoot, envelope.result.id)) { await this.#retireClaim(envelope.result.id); continue; }
@@ -322,17 +419,46 @@ export class CompletionJournal {
         } : {}) }, () => {
           try {
             consumeCompletion(this.meshRoot, envelope.result.id, this.recipient.sessionId);
+            this.#remember(envelope);
+            fs.rmSync(envelopePath(this.meshRoot, envelope.result.id), { force: true });
             void this.#retireClaim(envelope.result.id).catch(() => undefined);
           } finally { this.#enqueued.delete(envelope.result.id); }
         });
       } catch { this.#enqueued.delete(envelope.result.id); } // Source stays pending if admission failed.
     }
   }
+  #canRetireClaim(snapshot: NonNullable<ReturnType<MeshStore["get"]>>): boolean {
+    const owner = snapshot.value as Partial<CompletionClaim> | undefined;
+    if (typeof owner?.rootId !== "string" || typeof owner.sessionId !== "string" || snapshot.updatedBy.id !== owner.rootId) return false;
+    const recipient = this.recipient;
+    if (owner.rootId === recipient.rootId && owner.sessionId === recipient.sessionId) return true;
+    // Older claims can use the bounded envelope address; new claims retain this
+    // address themselves, including after unlink. Never infer a lane from a session id.
+    const address = owner.recipient ?? readRecipient(path.join(directory(this.meshRoot), `${snapshot.key.slice(claimPrefix.length)}.json`));
+    if (!address || address.rootId !== owner.rootId || address.sessionId !== owner.sessionId ||
+      typeof address.cwd !== "string" || typeof address.projectRoot !== "string" || typeof address.name !== "string" ||
+      typeof address.startedAt !== "number" || !Number.isFinite(address.startedAt) ||
+      (address.role !== undefined && typeof address.role !== "string") || !sameRecipientLane(address, recipient)) return false;
+    const successor = completionSuccessor(address, this.participants.list({ scope: "project", kinds: ["root"], fresh: true }));
+    return successor?.id === recipient.rootId && successor.sessionId === recipient.sessionId && sameLane(recipient, successor);
+  }
   async #retireClaim(id: string, snapshot = this.mesh.get(claimKey(id), { fresh: true })): Promise<void> {
-    if (!snapshot || !completionConsumed(this.meshRoot, id)) return;
-    const owner = snapshot.value as { rootId?: string; sessionId?: string };
-    // Only journal-owned claims; CAS cannot erase a replacement owner/version.
-    if (typeof owner?.rootId !== "string" || typeof owner.sessionId !== "string" || snapshot.updatedBy.id !== owner.rootId) return;
+    if (!snapshot || !this.#canRetireClaim(snapshot)) return;
+    // The versioned delete cannot erase a replacement owner/version.
+    const file = receiptPath(this.meshRoot, id);
+    const receipt = readReceipt(file, id);
+    if (!receipt) return;
+    // One fresh confirmation authorizes this consumed outcome's cleanup batch.
+    // Do not retire its claim and then owe a second barrier before body unlink:
+    // that barrier could fail after the claim was already lost.
+    const recipient = this.recipient;
+    const targets = [envelopePath(this.meshRoot, id), candidatePath(this.meshRoot, id)].filter(target => {
+      const address = readRecipient(target);
+      return address && canonical(address.projectRoot) === canonical(recipient.projectRoot) &&
+        ((address.rootId === recipient.rootId && address.sessionId === recipient.sessionId) || sameRecipientLane(address, recipient));
+    });
+    await confirmReceipt(file, receipt);
+    for (const target of targets) fs.rmSync(target, { force: true });
     try { await this.mesh.delete({ key: snapshot.key, ifVersion: snapshot.version }); } catch { /* next drain reconciles */ }
   }
   #canRead(envelope: CompletionEnvelope): boolean {

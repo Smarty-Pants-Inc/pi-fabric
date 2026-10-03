@@ -180,8 +180,7 @@ const sameInode = (left: Inode, right: Inode): boolean => left.dev === right.dev
  * A second walk detects replacements, including links retargeted to the SAME inode.
  * Windows skips unsupported directory fsync, but still binds the opened receipt.
  */
-export const syncPathNamespace = (target: string, receipt?: Inode): void => {
-  const walk = () => {
+const namespaceSnapshot = (target: string, receipt?: Inode) => {
     const absolute = path.isAbsolute(target) ? target : `${process.cwd()}${path.sep}${target}`;
     const split = (value: string) => value.split(path.sep === "\\" ? /[\\/]+/ : /\/+/);
     let current = path.parse(absolute).root;
@@ -236,8 +235,10 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
     if (receipt && !sameInode(receipt, endpoint)) throw new Error("Session receipt inode changed during namespace confirmation");
     parents.push(endpoint.isDirectory() ? current : path.dirname(current));
     return { entries, directories, parents };
-  };
-  const before = walk();
+};
+
+export const syncPathNamespace = (target: string, receipt?: Inode): void => {
+  const before = namespaceSnapshot(target, receipt);
   if (process.platform !== "win32") {
     const synced = new Set<string>();
     for (const parent of before.parents.reverse()) {
@@ -256,11 +257,30 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
       }
     }
   }
-  if (JSON.stringify(walk().entries) !== JSON.stringify(before.entries)) {
+  if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
     throw new Error("Namespace changed during durability barriers");
   }
 };
 
+/** Same namespace fence as the synchronous writer, with barriers off the event loop.
+ * Always confirm all parent entries: an unchanged ancestor inode does not prove
+ * that a newly created or replaced child directory is durably linked. */
+export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Promise<void> => {
+  const before = namespaceSnapshot(target, receipt);
+  if (process.platform !== "win32") {
+    for (const [directory, expected] of [...before.directories].reverse()) {
+      const handle = await fs.promises.open(directory, fs.constants.O_RDONLY);
+      try {
+        const opened = await handle.stat();
+        if (!opened.isDirectory() || !sameInode(opened, expected)) throw new Error("Namespace directory changed before barrier");
+        await handle.sync();
+      } finally { await handle.close(); }
+    }
+  }
+  if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
+    throw new Error("Namespace changed during durability barriers");
+  }
+};
 /** Existence is not a receipt; retry every required directory barrier without a cache. */
 export const syncDirectoryChain = (directory: string): void => {
   if (process.platform !== "win32") syncPathNamespace(directory);

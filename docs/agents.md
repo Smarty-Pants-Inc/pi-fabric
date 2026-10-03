@@ -569,7 +569,22 @@ For a code-owned typed alternative to a reasoning actor, use [Jev Main-turn obse
 
 ## Persistent actors
 
-`agents.create()` makes a named actor. The actor has a fixed runner, persistent runner session, serial mailbox, and optional subscriptions to parent-session events or durable mesh topics:
+`agents.create()` (also spelled `agents.createActor()`) makes a named actor. It and `agents.setInstructions()` accept either inline `instructions` **or** the pair `instructionsFile` + `sha256`, never both:
+
+```ts
+return agents.createActor({
+  name: "reviewer",
+  instructionsFile: "/home/paul/.local/share/smarty-dev/factory/current/roles/reviewer.md",
+  sha256: "<lowercase 64-hex SHA256 of the file bytes>",
+});
+// The same pair works on agents.setInstructions({ id, instructionsFile, sha256 }).
+```
+
+The **owning host** (Main for local actors, resident for durable actors) resolves the file under the realpath of `agents.instructionsRoot`, defaulting to `~/.local/share/smarty-dev/factory/current/`. The root is configurable only in host configuration. Traversal components (`..`), outside-root paths, symlink escapes, non-regular or missing files, files over 512 KiB, invalid UTF-8, and digest mismatches are refused before actor state changes. Existing configured actor instruction size limits also apply. In-root symlinks are allowed, including a `current` symlink to a factory generation. The host reads one bounded byte snapshot and applies its text without BOM/newline normalization; `instructionsDigest` equals the supplied digest. Only the text is persisted, not a file reference; later file changes do not affect the actor. The existing >80% shrink guard still requires `replace: true` for intentional replacements.
+
+**Platform boundary:** File-backed instructions require Linux and a genuine, accessible `/proc/self/fd`. The owner pins the canonical root with an `O_DIRECTORY` handle, checks its identity, then opens each canonical path component relative to pinned directory descriptors with `O_NOFOLLOW`. An ancestor link swapped between containment checks and opening cannot redirect the read outside the root; all handles close on success or refusal. Static in-root symlinks still work because they are canonicalized before that no-follow walk. Node does not expose a portable handle-relative open or Windows reparse-safe equivalent, so Windows/macOS/other hosts refuse **all** file-backed sources (including reparse-point paths) before filesystem access or actor mutation; use inline `instructions` there. Missing/inaccessible procfs also fails closed; there is no pathname-only fallback. This assumes the host controls mount topology/procfs; it does not defend against a privileged mount replacement.
+
+The actor has a fixed runner, persistent runner session, serial mailbox, and optional subscriptions to parent-session events or durable mesh topics:
 
 ```ts
 return agents.create({

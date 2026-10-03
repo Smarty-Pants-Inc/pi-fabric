@@ -1467,7 +1467,11 @@ export class AgentManager {
           throw error;
         }
         try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
-        if (worktree && !runTreeExitVeto(runDirectory, 0, undefined, true)) await this.#worktrees.cleanup(id, true).catch(() => false);
+        // A launch rejected before publishing a worker record is rollback, not
+        // admitted-run collection. Any persisted record still needs saved exit proof.
+        if (worktree && !runTreeExitVeto(runDirectory, 0, undefined, fs.existsSync(path.join(runDirectory, "status.json")))) {
+          await this.#worktrees.cleanup(id, true).catch(() => false);
+        }
         throw error;
       }
     };
@@ -2051,6 +2055,16 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
+    // On POSIX too, the worker can publish terminal status before exiting.
+    // Explicit cleanup must join that bounded obligation, not treat the result
+    // as exit proof or expose the incidental file/close ordering as a failure.
+    if (managed.transport.kind === "process") {
+      await this.#waitForTransportExit(managed);
+      await this.#noteUnconfirmedExit(managed);
+      if (managed.lostContact) {
+        throw new Error(`Cannot clean up agent ${id}: worker exit is unconfirmed (${managed.lostContact})`);
+      }
+    }
     const exitVeto = runTreeExitVeto(managed.runDirectory, 0, undefined, true);
     if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
     if (!this.#canCollect(managed)) {
@@ -2311,6 +2325,8 @@ export class AgentManager {
       currentRoot: this.#runRoot,
       orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
       oneShotRunRetentionMs: this.#retention.oneShotRunMs,
+      terminalRunEventsAgeMs: this.#retention.terminalRunEventsAgeMs,
+      terminalRunEventsMaxBytes: this.#retention.terminalRunEventsMaxBytes,
     };
     try {
       // A Bun-compiled Pi's execPath is Pi itself: resolve a real node/bun (the override, then PATH)

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
-import { hasNeverStartedReceipt, NEVER_STARTED_FILE, runScratchExitVeto } from "./run-scratch.js";
+import { runScratchExitVeto } from "./run-scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
@@ -24,6 +24,7 @@ interface RunRecordSummary {
   transport?: string;
   sessionId?: string;
   processStartTime?: string;
+  cleanupPending?: boolean;
 }
 export interface RetentionSweepResult {
   removedRoots: string[];
@@ -89,63 +90,48 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
   fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
   writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details });
 };
-/** A terminal record is not a descendant exit receipt. Share this persistent,
+/** A terminal record is not a worker exit receipt. Share this persistent,
  * tree-wide veto across tracked, recovered and offline cleanup before removing
  * worktrees or files; absence of an unresolved marker never proves worker exit.
  * Recordless pre-launch rollback remains distinct from an admitted process run.
- * Ownership retention additionally requires checked process exit for every
- * descendant, without coupling that proof to cleanup's artifact allowlist. */
+ * Ownership retention additionally requires persisted, checked process exit for
+ * the admitted root and every descendant, independently of the artifact allowlist.
+ * External transports currently have no durable native exit-receipt contract: skip
+ * them even when a surviving host once observed a terminal result. */
 export const runTreeExitVeto = (
-  directory: string, depth = 0, expired: Deadline = noDeadline, requireDescendantExit = false,
+  directory: string, depth = 0, expired: Deadline = noDeadline, requirePersistedExit = false,
 ): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
   // initial absence is safe; errors or changes during inspection veto cleanup.
   try { fs.lstatSync(directory); }
   catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" && !requireDescendantExit
+    return (error as NodeJS.ErrnoException).code === "ENOENT" && !requirePersistedExit
       ? undefined : "worker exit is unconfirmed: run-tree inspection failed";
   }
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
-    // A parent's populated=0 scope may still contain empty nested cgroups.
-    // Retire only checked nested run scopes bottom-up, before parent rmdir.
-    // Unknown children/receipts/identities veto the entire parent collection.
-    const nested = path.join(directory, "nested");
-    let hasNested = false;
-    try { fs.lstatSync(nested); hasNested = true; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    if (hasNested) {
-      if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
-      for (const name of fs.readdirSync(nested)) {
-        const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requireDescendantExit);
-        if (reason) return reason;
-      }
-    }
     if (fs.existsSync(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     const statusFile = path.join(directory, "status.json");
     const record = readJson<RunRecordSummary>(statusFile);
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (fs.existsSync(statusFile) && !record) return "worker exit is unconfirmed: unreadable run record";
+    if (record?.cleanupPending !== undefined && record.cleanupPending !== false) return "worker cleanup is not joined";
     if (record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
     }
-    // Tracked ownership and collection compose conservatively: the descendant
-    // ownership check must pass as well as the terminal PID/birth proof below.
-    // A surviving tracked root has its own transport exit evidence; descendants
-    // have no surviving handles and must retain their persisted identities.
-    if (requireDescendantExit && depth > 0) {
+    // Offline compaction/collection has no surviving transport handle. Require
+    // the saved root identity too; a free host flock, terminal status, exitCode,
+    // or absent unresolved marker does not prove the root writer has exited.
+    // Recordless pre-launch rollback uses the non-retention mode explicitly;
+    // missing persisted status is never evidence for an admitted worker.
+    if (requirePersistedExit) {
       const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
         ? Number(record.sessionId) : undefined;
-      if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) {
-        if (!hasNeverStartedReceipt(directory)) {
-          const reason = "worker exit is unconfirmed: unknown descendant identity";
-          const scratchVeto = runScratchExitVeto(directory, expired);
-          return scratchVeto ? `${reason}; ${scratchVeto}` : reason;
-        }
-      }
-      if (pid !== undefined && processAlive(pid)) return `worker exit is unconfirmed: its descendant worker may still be running (${directory})`;
+      const worker = depth > 0 ? "descendant" : "root";
+      if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return `worker exit is unconfirmed: unknown ${worker} identity`;
+      if (processAlive(pid)) return `worker exit is unconfirmed: its ${worker} worker may still be running (${directory})`;
     }
     if (record?.transport === "process") {
       if (!record.status || !TERMINAL_STATUSES.has(record.status)) {
@@ -174,6 +160,20 @@ export const runTreeExitVeto = (
         return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
       }
     }
+    // A parent's populated=0 scope may still contain empty nested cgroups.
+    // Retire only checked nested run scopes bottom-up, before parent rmdir.
+    // Unknown children/receipts/identities veto the entire parent collection.
+    const nested = path.join(directory, "nested");
+    let hasNested = false;
+    try { fs.lstatSync(nested); hasNested = true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (hasNested) {
+      if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
+      for (const name of fs.readdirSync(nested)) {
+        const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit);
+        if (reason) return reason;
+      }
+    }
     // Report a known worker/descendant obligation before the independent
     // scratch fence. Both still have to pass; native exit never bypasses it.
     const scratchVeto = runScratchExitVeto(directory, expired);
@@ -194,8 +194,10 @@ const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-eve
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
+  // Offline collection cannot establish never-launched custody from filenames
+  // or a host-wide childrenStopped marker. Only the live admission caller can
+  // authorize recordless pre-launch rollback through the non-retention mode.
   if (runTreeExitVeto(root, 0, expired, true)) return false;
-  const neverStarted = hasNeverStartedReceipt(root);
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   // Automatic retention keeps its independent live-writer fence. A mismatched
   // birth identity can clear explicit cleanup's exit veto, but never authorizes
@@ -205,7 +207,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
     ? Number(record.sessionId) : undefined;
   if (pid !== undefined && processAlive(pid)) return false;
   if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
-    if (!childrenStopped && !neverStarted) return false;
+    if (!childrenStopped) return false;
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
   }
   try {
@@ -214,7 +216,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       const file = path.join(root, name);
       const stat = ownedStat(file);
       if (!stat) return false;
-      if (stat.isFile() && (runFile(name) || (name === NEVER_STARTED_FILE && neverStarted))) continue;
+      if (stat.isFile() && runFile(name)) continue;
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
@@ -267,10 +269,11 @@ export const removeEmptyRunRoot = (root: string): boolean => {
 };
 const pruneClosedRunRoot = (
   root: string, owner: RunRootOwner, orphanMs: number, oneShotMs: number, now: number, expired: () => boolean,
+  eventsRetention: TerminalRunEventsRetention,
 ): string[] => {
   const removed: string[] = [];
   // Every run started after its root, so no run of a root younger than the shortest retention is due.
-  if (now - owner.startedAt < Math.min(orphanMs, oneShotMs)) return removed;
+  if (now - owner.startedAt < Math.min(orphanMs, oneShotMs, eventsRetention.terminalRunEventsAgeMs ?? 6 * 60 * 60 * 1_000)) return removed;
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
@@ -282,7 +285,10 @@ const pruneClosedRunRoot = (
     const terminal = !!record?.status && TERMINAL_STATUSES.has(record.status);
     const reference = terminal ? recordAgeReference(record!, ownedStat(directory)?.mtimeMs ?? now) : owner.closedAt!;
     const retention = terminal && !record?.actorId ? oneShotMs : orphanMs;
-    if (now - reference < retention) continue;
+    if (now - reference < retention) {
+      compactTerminalRunEvents(directory, { ...eventsRetention, now, expired });
+      continue;
+    }
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) continue;
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
@@ -302,17 +308,13 @@ export const claimTempRunSweep = (tempRoot: string, minIntervalMs: number, now =
   try { writeJsonAtomic(marker, { sweptAt: now }); } catch {}
   return true;
 };
-export interface TempRunSweepRequest {
+export interface TempRunSweepRequest extends TerminalRunEventsRetention {
   tempRoot: string;
   currentRoot?: string;
   orphanedTempRunRetentionMs: number;
   oneShotRunRetentionMs: number;
 }
-export const sweepTempRunRoots = (options: {
-  tempRoot: string;
-  currentRoot?: string;
-  orphanedTempRunRetentionMs: number;
-  oneShotRunRetentionMs: number;
+export const sweepTempRunRoots = (options: TempRunSweepRequest & {
   now?: number;
   /**
    * Skip when any process of this user swept the temp root within this interval. The sweep walks
@@ -350,7 +352,7 @@ export const sweepTempRunRoots = (options: {
     if (!validOwner(owner)) continue;
     if (owner.closedAt !== undefined) {
       result.removedRuns.push(...pruneClosedRunRoot(
-        root, owner, options.orphanedTempRunRetentionMs, options.oneShotRunRetentionMs, now, expired,
+        root, owner, options.orphanedTempRunRetentionMs, options.oneShotRunRetentionMs, now, expired, options,
       ));
       if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
       continue;
@@ -412,29 +414,32 @@ export interface TerminalRunEventsRetention {
   terminalRunEventsMaxBytes?: number;
 }
 
+const TERMINAL_EVENT_TAIL_LINES = 200;
 const EVENT_TAIL_MARKER = Buffer.from('{"fabricTruncated":true,"reason":"terminal run event retention"}\n');
 
 /** Compact only an owned, safely terminal run. Read a bounded suffix, keep complete JSONL
- * lines, and atomically replace only events.jsonl; status/reply/result remain byte-for-byte.
+ * lines (at most the last 200), and atomically replace only events.jsonl; status/reply/result remain byte-for-byte.
  * The marker counts against the byte cap. A single oversized final event may leave only
  * the marker rather than a corrupt JSON fragment. Already bounded logs are never rewritten.
  * Callers retain their ownership/latest-run vetoes before entering this shared predicate. */
 export const compactTerminalRunEvents = (
   directory: string,
-  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean } = {},
+  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean; dryRun?: boolean;
+    onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
 ): boolean => {
   const now = options.now ?? Date.now();
-  const ageMs = options.terminalRunEventsAgeMs ?? 24 * 60 * 60 * 1_000;
+  const ageMs = options.terminalRunEventsAgeMs ?? 6 * 60 * 60 * 1_000;
   const maxBytes = options.terminalRunEventsMaxBytes ?? 256 * 1024;
   const expired = options.expired ?? noDeadline;
+  const directoryStat = ownedStat(directory);
   if (!Number.isSafeInteger(ageMs) || ageMs < 0 || !Number.isSafeInteger(maxBytes) ||
-      maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !ownedStat(directory)?.isDirectory()) return false;
+      maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !directoryStat?.isDirectory()) return false;
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
   if (!record?.status || !TERMINAL_STATUSES.has(record.status) ||
       now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
   const file = path.join(directory, "events.jsonl");
   const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size <= maxBytes || runTreeExitVeto(directory, 0, expired, true) ||
+  if (!stat?.isFile() || stat.size === 0 || runTreeExitVeto(directory, 0, expired, true) ||
       !canRemoveTerminalRun(directory, expired)) return false;
   try {
     const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
@@ -443,8 +448,10 @@ export const compactTerminalRunEvents = (
       const opened = fs.fstatSync(fd);
       if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size ||
           opened.mtimeMs !== stat.mtimeMs) return false;
-      // One look-behind byte lets an exactly aligned final line survive the boundary.
-      const length = maxBytes - EVENT_TAIL_MARKER.length + 1;
+      // Establish whether the original satisfies both limits before reserving
+      // marker bytes. Reading at most the cap preserves near-limit unmarked logs
+      // and still includes the look-behind needed for the smaller marked tail.
+      const length = Math.min(stat.size, maxBytes);
       tail = Buffer.alloc(length);
       let read = 0;
       while (read < length) {
@@ -454,16 +461,82 @@ export const compactTerminalRunEvents = (
         read += count;
       }
     } finally { fs.closeSync(fd); }
-    const newline = tail.indexOf(0x0a);
-    const retained = newline < 0 ? Buffer.alloc(0) : tail.subarray(newline + 1);
+    // Skip a partial first line only when we did not read from the start.
+    let retained = tail;
+    if (tail.length < stat.size) {
+      const newline = tail.indexOf(0x0a);
+      retained = newline < 0 ? Buffer.alloc(0) : tail.subarray(newline + 1);
+    } else if (tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)) {
+      retained = tail.subarray(EVENT_TAIL_MARKER.length);
+    }
+    let lines = 0;
+    for (let index = retained.length - 1; index >= 0; index--) {
+      if (retained[index] === 0x0a && index !== retained.length - 1 && ++lines === TERMINAL_EVENT_TAIL_LINES) {
+        retained = retained.subarray(index + 1);
+        break;
+      }
+    }
+    // A full unmarked log of <=200 events, or our already bounded tail, is a no-op.
+    if (stat.size <= maxBytes && (retained.length === stat.size ||
+        (tail.length === stat.size && stat.size === EVENT_TAIL_MARKER.length + retained.length &&
+         tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)))) return false;
+    // Truncation is now known to be necessary. Reserve the marker's space and
+    // drop only complete prefix lines; look behind by one byte so an exactly
+    // aligned final event is kept. An oversized final event leaves only a marker.
+    const eventBytes = maxBytes - EVENT_TAIL_MARKER.length;
+    if (retained.length > eventBytes) {
+      const newline = retained.indexOf(0x0a, retained.length - eventBytes - 1);
+      retained = newline < 0 ? Buffer.alloc(0) : retained.subarray(newline + 1);
+    }
     const checked = ownedStat(file);
     if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
         checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
         runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
         expired() || options.isRetained?.()) return false;
-    writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained]));
+    if (!options.dryRun) {
+      try { writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained])); }
+      finally {
+        // Residency expiry (and legacy timestamp fallback) uses directory mtime.
+        // Creating/renaming the atomic tail must not restart that retention clock.
+        const current = ownedStat(directory);
+        if (current?.dev === directoryStat.dev && current.ino === directoryStat.ino) {
+          try { fs.utimesSync(directory, directoryStat.atimeMs / 1000, directoryStat.mtimeMs / 1000); }
+          catch { /* A failed timestamp restore only delays collection; it cannot authorize it. */ }
+        }
+      }
+    }
+    options.onCompact?.({ path: file, beforeBytes: stat.size, afterBytes: EVENT_TAIL_MARKER.length + retained.length });
     return true;
   } catch { return false; }
+};
+
+/** Immutable, ordinary rotation history only. Malformed-session orphan backups are
+ * recovery evidence, not rotation history, and keep their existing exemption. */
+export const pruneActorSessionBackups = (sessionFile: string, options: {
+  dryRun?: boolean; onPrune?: (change: { path: string; bytes: number }) => void;
+} = {}): string[] => {
+  const directory = path.dirname(sessionFile);
+  if (!ownedStat(directory)?.isDirectory()) return [];
+  const prefix = `${path.basename(sessionFile)}.`;
+  try {
+    const backups = fs.readdirSync(directory).flatMap(name => {
+      if (!name.startsWith(prefix)) return [];
+      const match = /^(\d{8}T\d{9}Z)(?:-(\d+))?\.bak$/.exec(name.slice(prefix.length));
+      const stat = ownedStat(path.join(directory, name));
+      return match && stat?.isFile() ? [{ name, stamp: match[1]!, suffix: Number(match[2] ?? 0), stat }] : [];
+    }).sort((a, b) => a.stamp.localeCompare(b.stamp) || a.suffix - b.suffix);
+    const removed: string[] = [];
+    for (const backup of backups.slice(0, -1)) {
+      const file = path.join(directory, backup.name);
+      const checked = ownedStat(file);
+      if (!checked || checked.dev !== backup.stat.dev || checked.ino !== backup.stat.ino ||
+          checked.size !== backup.stat.size || checked.mtimeMs !== backup.stat.mtimeMs) continue;
+      if (!options.dryRun) fs.unlinkSync(file);
+      options.onPrune?.({ path: file, bytes: backup.stat.size });
+      removed.push(file);
+    }
+    return removed;
+  } catch { return []; }
 };
 
 export const pruneActorRunArchives = (options: {

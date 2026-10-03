@@ -79,6 +79,10 @@ describe("identity-bound scratch scopes", () => {
     const child=path.join(root,"nested","child");fs.mkdirSync(child,{recursive:true,mode:0o700});
     fs.mkdirSync(path.join(child,"tmp"),{mode:0o700});
     fs.writeFileSync(path.join(child,UNRESOLVED_SCRATCH_FILE),JSON.stringify({version:2,runDirectory:child,scope:{...first.scope!,ino:first.scope!.ino+1},launchNonce:"unknown"}),{mode:0o600});
+    // Main's persisted descendant identity fence precedes scratch inspection.
+    expect(runTreeExitVeto(root,0,()=>false,true)).toMatch(/unknown descendant identity/);
+    expect(fs.existsSync(first.scope!.directory)).toBe(true);expect(fs.existsSync(first.directory)).toBe(true);
+    fs.writeFileSync(path.join(child,"status.json"),JSON.stringify({status:"completed",transport:"process",sessionId:"2147483647"}));
     expect(runTreeExitVeto(root,0,()=>false,true)).toMatch(/scratch/);
     expect(fs.existsSync(first.scope!.directory)).toBe(true);expect(fs.existsSync(first.directory)).toBe(true);
   });

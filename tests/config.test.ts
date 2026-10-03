@@ -64,6 +64,22 @@ describe("fleet model policy configuration (#2490)", () => {
   });
 });
 
+describe("host-only actor instruction root (#3819)", () => {
+  it("leaves the default implicit and normalizes the configured root", () => {
+    expect(normalizeFabricConfig({}).agents.instructionsRoot).toBeUndefined();
+    expect(normalizeFabricConfig({ agents: { instructionsRoot: " /factory/current " } }).agents.instructionsRoot).toBe("/factory/current");
+    expect(normalizeFabricConfig({ agents: { instructionsRoot: " " } }).agents.instructionsRoot).toBeUndefined();
+  });
+  it.each([true, false])("cannot be widened by workspace config (trusted: %s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/host/factory" } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/" } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBe("/host/factory");
+    fs.unlinkSync(path.join(agentDir, "fabric.json"));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBeUndefined();
+  });
+});
 describe("Fabric configuration", () => {
   it("defaults automatic per-host reload concurrency to six and preserves explicit unlimited mode", () => {
     expect(DEFAULT_FABRIC_CONFIG.selfReloadConcurrency).toBe(6);
@@ -390,7 +406,7 @@ describe("Fabric configuration", () => {
       orphanedTempRunMs: 6 * 60 * 60 * 1_000,
       oneShotRunMs: 24 * 60 * 60 * 1_000,
       actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
-      terminalRunEventsAgeMs: 24 * 60 * 60 * 1_000,
+      terminalRunEventsAgeMs: 6 * 60 * 60 * 1_000,
       terminalRunEventsMaxBytes: 256 * 1024,
     });
     expect(

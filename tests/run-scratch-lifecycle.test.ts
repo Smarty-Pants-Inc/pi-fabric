@@ -6,8 +6,8 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { WorktreeManager } from "../src/agents/worktree-manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { createRunTmpDirectory, UNRESOLVED_SCRATCH_FILE } from "../src/storage/run-scratch.js";
-import { markRunRootActive, markRunRootClosed, sweepTempRunRoots } from "../src/storage/retention.js";
+import { allocateRunTmpDirectory, createRunTmpDirectory, JOINED_SCRATCH_FILE, UNRESOLVED_SCRATCH_FILE } from "../src/storage/run-scratch.js";
+import { markRunRootActive, markRunRootClosed, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -16,6 +16,34 @@ afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.restoreAllMocks(); vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("#369 root custody precedes descendant scratch disposal", () => {
+  it.each(["missing-record", "cleanup-pending", "live-root"] as const)("preserves collectable child scratch when root custody is %s", fault => {
+    const root = sandbox(), child = path.join(root, "nested", "child");
+    fs.mkdirSync(child, { recursive: true, mode: 0o700 });
+    const allocation = allocateRunTmpDirectory(child);
+    fs.writeFileSync(path.join(child, "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647" }));
+    if (allocation.scope) fs.writeFileSync(path.join(child, JOINED_SCRATCH_FILE), JSON.stringify(allocation.scope), { mode: 0o600 });
+    else allocation.workerClosed(2147483647);
+    fs.writeFileSync(path.join(allocation.directory, "data"), "retain until root proof");
+    const fence = fs.readFileSync(path.join(child, UNRESOLVED_SCRATCH_FILE), "utf8");
+    const status = { status: "completed", transport: "process", sessionId: "2147483647" };
+    if (fault !== "missing-record") fs.writeFileSync(path.join(root, "status.json"), JSON.stringify({
+      ...status, ...(fault === "cleanup-pending" ? { cleanupPending: true } : { sessionId: String(process.pid) }),
+    }));
+    const reason = fault === "missing-record" ? /unknown root identity/ : fault === "cleanup-pending" ? /cleanup is not joined/ : /root worker may still be running/;
+    try {
+      expect(runTreeExitVeto(root, 0, undefined, true)).toMatch(reason);
+      expect(fs.readFileSync(path.join(allocation.directory, "data"), "utf8")).toBe("retain until root proof");
+      expect(fs.readFileSync(path.join(child, UNRESOLVED_SCRATCH_FILE), "utf8")).toBe(fence);
+    } finally {
+      // Release the fixture's checked empty scope only after root custody passes.
+      fs.writeFileSync(path.join(root, "status.json"), JSON.stringify(status));
+      expect(runTreeExitVeto(root, 0, undefined, true)).toBeUndefined();
+      expect(fs.existsSync(allocation.directory)).toBe(false);
+    }
+  });
 });
 
 describe("#369 D1 later descendant cleanup", () => {
@@ -81,7 +109,7 @@ describe("#369 D2 confirmed pre-worker refusal retention", () => {
     expect(fs.existsSync(path.join(run, "never-started.json"))).toBe(true);
   });
   for (const owner of ["closed", "orphan"] as const) {
-    it.skipIf(process.platform === "win32").each(["authorization", "runtime"] as const)(`${owner} retention collects a never-started allocation (%s)`, async failure => {
+    it.skipIf(process.platform === "win32").each(["authorization", "runtime"] as const)(`${owner} offline retention preserves a receipt-only never-started allocation (%s)`, async failure => {
       const tempRoot = sandbox();
       const root = fs.mkdtempSync(path.join(tempRoot, "pi-fabric-runs-"));
       markRunRootActive(root, 1);
@@ -99,8 +127,14 @@ describe("#369 D2 confirmed pre-worker refusal retention", () => {
       if (owner === "closed") markRunRootClosed(root, 2, false);
       else fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 2 }));
       const sweep = sweepTempRunRoots({ tempRoot, orphanedTempRunRetentionMs: 1, oneShotRunRetentionMs: 1, now: 100 });
-      expect(sweep.removedRoots).toContain(root);
-      expect(fs.existsSync(root)).toBe(false);
+      // Main's offline custody contract requires a persisted root identity;
+      // only the live admission caller can authorize recordless rollback.
+      expect(runTreeExitVeto(run)).toBeUndefined();
+      expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/unknown root identity/);
+      expect(sweep).toEqual({ removedRoots: [], removedRuns: [] });
+      expect(fs.existsSync(root)).toBe(true);
+      expect(fs.readFileSync(path.join(run, "task.txt"), "utf8")).toBe("never started");
+      expect(fs.existsSync(path.join(run, "never-started.json"))).toBe(true);
     });
   }
 

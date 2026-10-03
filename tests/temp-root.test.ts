@@ -104,7 +104,7 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
     for (const [directory, pid] of [[dead, 2147483647], [live, process.pid]] as const) {
       fs.writeFileSync(path.join(directory, ".fabric-owner.json"), JSON.stringify({ pid, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
       fs.mkdirSync(path.join(directory, "run"));
-      fs.writeFileSync(path.join(directory, "run", "status.json"), JSON.stringify({ status: "completed", finishedAt: 1 }));
+      fs.writeFileSync(path.join(directory, "run", "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647", finishedAt: 1 }));
     }
     const result = sweepTempRunRoots({ tempRoot: disk, currentRoot: runRoot, now: 100_000, orphanedTempRunRetentionMs: 1000, oneShotRunRetentionMs: 1000 });
     expect(result.removedRoots).toEqual([dead]);

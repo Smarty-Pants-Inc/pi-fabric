@@ -802,9 +802,19 @@ describe("AgentManager", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const creating = new Promise<void>((resolve) => { ready = resolve; });
     let stoppedAt: number | undefined;
-    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementationOnce(async () => {
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementationOnce(async (request) => {
       ready(); await gate;
-      return { kind: "process", stop: async () => { stoppedAt = Date.now(); }, isAlive: async () => stoppedAt === undefined || Date.now() - stoppedAt < 150 };
+      return { kind: "process", sessionId: "2147483647", stop: async () => { stoppedAt = Date.now(); }, isAlive: async () => {
+        const alive = stoppedAt === undefined || Date.now() - stoppedAt < 150;
+        if (!alive) {
+          // Model the worker's persisted terminal identity: a native handle's
+          // exit acknowledgment alone is not main's offline collection proof.
+          fs.writeFileSync(path.join(root, request.id, "status.json"), JSON.stringify({
+            status: "stopped", transport: "process", sessionId: "2147483647",
+          }));
+        }
+        return alive;
+      } };
     });
     try {
       const queued = await manager.spawn({ task: "exit after termination", transport: "process" });
@@ -1512,7 +1522,7 @@ describe("AgentManager", () => {
     }
   }, 45_000);
 
-  it.skipIf(process.platform === "win32")("R3 close preserves an untracked surviving worker directory and removes tracked terminal runs", async () => {
+  it.skipIf(process.platform === "win32")("R3 close preserves unknown untracked custody; explicit cleanup still collects a proven tracked terminal run", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-orphan-"));
     roots.push(root);
     const runRoot = path.join(root, "runs");
@@ -1532,7 +1542,13 @@ describe("AgentManager", () => {
       const tracked = manager.runDirectory(result.id)!;
       await manager.close();
       expect(child.exitCode).toBeNull();
+      // No saved status/identity for the previous host's worker: the global
+      // close/budget fence remains unknown, even with a joined tracked worker.
+      expect(fs.existsSync(tracked)).toBe(true);
+      expect(fs.existsSync(untracked)).toBe(true);
+      expect(await manager.cleanup(result.id)).toEqual({ cleaned: true });
       expect(fs.existsSync(tracked)).toBe(false);
+      expect(child.exitCode).toBeNull();
       expect(fs.existsSync(untracked)).toBe(true);
       expect(fs.readFileSync(path.join(untracked, "evidence"), "utf8")).toBe("still in use");
     } finally { child.kill(); await exited; }

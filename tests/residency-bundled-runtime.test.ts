@@ -27,7 +27,7 @@ describe.skipIf(process.platform !== "linux" || !fs.existsSync("dist/worker.js")
     const runtime = kind === "cold" ? realRuntime : successorRuntime;
     const spec = residentLaunchSpec(config, path.resolve("dist/residency/pi-entry.js"), runtime);
     const launcher = { pid: process.pid, processStartTime: processStartTime(process.pid)!, token: "fixture-launcher", entry: spec.entry, runtime: realRuntime };
-    fs.mkdirSync(config.residencyRoot);
+    fs.mkdirSync(config.residencyRoot, { mode: 0o700 });
     const file = path.join(config.residencyRoot, "config.json"); fs.writeFileSync(file, JSON.stringify(spec.config));
     const attempt = kind === "cold" ? undefined : { id: "bundled-transaction", kind };
     if (attempt) {

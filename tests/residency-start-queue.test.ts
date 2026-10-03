@@ -8,7 +8,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { ResidentHostConfig, ResidentCommand } from "../src/residency/protocol.js";
 import { newResidentRequestId, RESIDENT_EXPIRING_COMMAND_FORMAT } from "../src/residency/request-expiry.js";
 
-it.each(["pre-publication", "owner-publication"] as const)("Astra F3 preserves accepted unlaunched events and requests through four failed %s host starts, then runs once", async phase => {
+it.each(["pre-publication", "owner-publication", "readiness-publication"] as const)("Astra F3 preserves accepted unlaunched events and requests through four failed %s host starts, then runs once", async phase => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-start-backlog-"));
   const config: ResidentHostConfig = {
     format: 1, rootId: "session:start-backlog", sessionId: "start-backlog", cwd: process.cwd(), projectRoot: root,
@@ -44,7 +44,7 @@ it.each(["pre-publication", "owner-publication"] as const)("Astra F3 preserves a
     const fault = phase === "pre-publication"
       ? vi.spyOn(ParticipantDirectory.prototype, "registerSource").mockImplementation(() => { throw new Error("injected start failure"); })
       : vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
-        if (String(target) === path.join(config.residencyRoot, "owner.json")) throw new Error("injected start failure");
+        if (String(target) === path.join(config.residencyRoot, phase === "owner-publication" ? "owner.json" : "maintenance-ready.json")) throw new Error("injected start failure");
         return rename(source, target);
       });
     try {

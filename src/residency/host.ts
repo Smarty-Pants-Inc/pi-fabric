@@ -225,7 +225,6 @@ export class ResidentHost {
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
   #ready = false;
-  #readinessPublished = false;
   #idleSince = Date.now();
   #admissions = 0;
   readonly #requestRetention: ResidentRequestRetention;
@@ -442,7 +441,7 @@ export class ResidentHost {
         ));
       },
       {
-        // Restoration must not launch queued work until owner publication commits.
+        // Restoration must not launch queued work until owner and readiness publication commit.
         releasePaused: true,
         canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
         persistent: true,
@@ -543,7 +542,7 @@ export class ResidentHost {
         token: this.#token,
         startedAt: now,
         readyAt: now,
-        maintenanceReady: 1, // client waits for the first normal post-lease tick receipt
+        maintenanceReady: 1, // client requires the same-token startup receipt before business admission
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
         callerBoundSpawn: 1,
@@ -555,8 +554,13 @@ export class ResidentHost {
       };
       atomicWrite(this.#ownerPath, owner);
       fs.rmSync(this.#errorPath, { force: true });
-      // No fallible/awaited startup work remains. Open every delivery gate only
-      // after owner publication; a failed start leaves accepted work untouched.
+      // The originating client may cancel this owned attempt until it sees the
+      // required receipt. Commit it BEFORE opening any business gate or resuming
+      // restored queues: publication failure/timeout must remain a non-serving
+      // start, not shutdown of work that may already have escaped the attempt.
+      atomicWrite(path.join(this.config.residencyRoot, "maintenance-ready.json"), { token: this.#token, readyAt: now });
+      // No fallible/awaited startup work remains. Accepted backlog is untouched
+      // on failure; maintenance/collection stays on normal post-readiness ticks.
       this.#ready = true;
       // Removals a previous host accepted: their runs ended with it.
       if (!this.#staged) {
@@ -825,8 +829,7 @@ export class ResidentHost {
   }
 
   async #pollRequests(): Promise<void> {
-    if (this.#pollingRequests || this.#closed) return;
-    if (this.#ready && !this.#readinessPublished) this.#maintainRequests();
+    if (!this.#ready || this.#pollingRequests || this.#closed) return;
     if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
@@ -874,13 +877,6 @@ export class ResidentHost {
       if (removal.runId) live.add(removal.runId);
     }
     this.#requestRetention.sweep(now, live, 5, stoppedWritersGone);
-    if (!this.#readinessPublished) {
-      const owner = readJson<ResidentHostOwner>(this.#ownerPath);
-      if (owner?.token === this.#token) {
-        atomicWrite(path.join(this.config.residencyRoot, "maintenance-ready.json"), { token: this.#token, readyAt: now });
-        this.#readinessPublished = true;
-      }
-    }
   }
 
   #checkIdle(): void {

@@ -290,8 +290,8 @@ export class ResidencyClient {
       }
       await delay(STATUS_POLL_MS);
     }
-    // Owner publication precedes the first maintenance slice. Attach to that
-    // live generation within the startup budget; never spawn a competing
+    // Owner publication precedes the required startup readiness receipt. Attach
+    // to that live generation within the budget; never spawn a competing
     // launcher merely because its same-token readiness receipt is pending.
     const attachDeadline = Date.now() + startupBudgetMs(this.options.startupTimeoutMs ?? HOST_READY_TIMEOUT_MS);
     while (this.#liveOwner()) {

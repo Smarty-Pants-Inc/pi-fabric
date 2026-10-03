@@ -45,7 +45,6 @@ const fixture = () => {
 describe("resident maintenance readiness attachment", () => {
   it("waits for the published live generation before one accepted create, without another launcher", async () => {
     const { root, config, host } = fixture();
-    const due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(false);
     const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
     const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: "caller", rootId: config.rootId,
       identity: { id: "caller", name: "caller", kind: "main" } });
@@ -56,7 +55,11 @@ describe("resident maintenance readiness attachment", () => {
       await host.start();
       const ownerPath = path.join(config.residencyRoot, "owner.json");
       const owner = fs.readFileSync(ownerPath, "utf8");
-      expect(fs.existsSync(path.join(config.residencyRoot, "maintenance-ready.json"))).toBe(false);
+      // Simulate temporarily missing visibility for an already-owned generation.
+      // Independent attachment still waits without stopping or replacing it.
+      const receiptPath = path.join(config.residencyRoot, "maintenance-ready.json");
+      const receipt = fs.readFileSync(receiptPath, "utf8");
+      fs.rmSync(receiptPath);
       const create = vi.spyOn(host.actors, "create");
       let settled = false;
       creation = client.createActor({ name: "attached-once", instructions: "Watch", residency: "durable" });
@@ -66,7 +69,7 @@ describe("resident maintenance readiness attachment", () => {
       expect(create).not.toHaveBeenCalled();
       expect(fs.existsSync(path.join(config.residencyRoot, "launcher.log"))).toBe(false);
       expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
-      due.mockRestore();
+      fs.writeFileSync(receiptPath, receipt);
       const actor = await creation;
       expect(host.actors.owns(actor.id)).toBe(true);
       expect(participants.get(actor.id)?.ownerHostId).toBe(host.hostId);
@@ -77,7 +80,7 @@ describe("resident maintenance readiness attachment", () => {
       expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
       expect(fs.existsSync(path.join(config.residencyRoot, "launcher.log"))).toBe(false);
     } finally {
-      due.mockRestore(); await creation?.catch(() => undefined); await client.close(); await host.close();
+      await creation?.catch(() => undefined); await client.close(); await host.close();
       vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true });
     }
   });

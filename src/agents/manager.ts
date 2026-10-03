@@ -1,5 +1,6 @@
 import { copyFabricPrincipal, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
+import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
@@ -608,12 +609,14 @@ const hostStoppedResult = (result: AgentRunResult, lastEventAt: number | undefin
   return { ...rest, error: `${HOST_STOP_REASON}; last error: ${result.error ?? "none"}; last event: ${lastEvent}` };
 };
 
-const runRootHasUnresolvedWorker = (root: string): boolean => {
+// Settled handles can be evicted while their descendants still use the shared
+// budget. Inspect persisted trees too; marker absence is not checked child exit.
+const runRootHasExitVeto = (root: string): boolean => {
   try {
     return fs.readdirSync(root, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && hasUnresolvedWorker(path.join(root, entry.name)));
-  } catch {
-    return false;
+      .some((entry) => entry.isDirectory() && !!runTreeExitVeto(path.join(root, entry.name), 0, undefined, true));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
 };
 
@@ -643,6 +646,7 @@ export class AgentManager {
   readonly #projectRoot: string;
   readonly #hostId: string | undefined;
   readonly #identityId: string | undefined;
+  readonly #taskReturnAddressArguments: string[];
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
@@ -700,6 +704,8 @@ export class AgentManager {
       projectRoot?: string;
       hostId?: string;
       identityId?: string;
+      /** Immediate caller's Pi session, distinct from the inherited root Fabric session. */
+      spawnerSessionId?: string;
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult) => void;
       onResultConsumed?: (id: string) => void;
@@ -753,6 +759,11 @@ export class AgentManager {
       options.projectRoot ?? process.env.PI_FABRIC_PROJECT_ROOT ?? cwd;
     this.#hostId = options.hostId ?? process.env.PI_FABRIC_HOST_ID;
     this.#identityId = options.identityId ?? process.env.PI_FABRIC_IDENTITY_ID;
+    this.#taskReturnAddressArguments = taskReturnAddressArguments(
+      this.#identityId ?? process.env.PI_FABRIC_ACTOR_ID ?? process.env.PI_FABRIC_PARENT_RUN,
+      options.spawnerSessionId ?? process.env.PI_SESSION_ID ?? this.#fabricSessionId,
+      this.#mainAgentId,
+    );
     this.#spawner = resolveAgentSpawner(this.#identityId, this.#mainAgentId);
     const inheritedBudget = activeBudgetState();
     this.#budget =
@@ -946,10 +957,11 @@ export class AgentManager {
 
   /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
+   * callerReturnAddress is a validated resident caller snapshot, never a task request field.
    */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions): Promise<AgentHandleInfo> {
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
-    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation);
+    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, callerReturnAddress && structuredClone(callerReturnAddress));
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
@@ -970,7 +982,7 @@ export class AgentManager {
     }
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -1215,6 +1227,9 @@ export class AgentManager {
           ...(this.#spawner ? ["--spawner-id", this.#spawner.id, "--spawner-kind", this.#spawner.kind,
             ...(this.#spawner.runId ? ["--spawner-run", this.#spawner.runId] : [])] : []),
           ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
+          ...(adapter.kind === "process" && !request.actorId
+            ? callerReturnAddress ? ["--task-return-address", JSON.stringify(callerReturnAddress)] : this.#taskReturnAddressArguments
+            : []),
           "--extensions",
           String(extensions),
           "--tools",
@@ -1388,7 +1403,7 @@ export class AgentManager {
           throw error;
         }
         try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
-        if (worktree && !runTreeExitVeto(runDirectory)) await this.#worktrees.cleanup(id, true).catch(() => false);
+        if (worktree && !runTreeExitVeto(runDirectory, 0, undefined, true)) await this.#worktrees.cleanup(id, true).catch(() => false);
         throw error;
       }
     };
@@ -1783,7 +1798,7 @@ export class AgentManager {
     for (const managed of this.#runs.values()) {
       const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
       const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
-      if (!managed.settled || managed.lostContact || uncheckedExternalExit(managed.transport) ||
+      if (!managed.settled || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
           // Settlement and primary exit do not prove descendant exit. The
           // persistent tree veto checks every descendant's worker identity too.
           unconfirmedProcess || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) protect(managed.id, managed.actorId);
@@ -1811,7 +1826,7 @@ export class AgentManager {
         // establish exit; a terminal record with no PID is still uncertain.
         const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
           ? Number(record.sessionId) : undefined;
-        if (pid !== undefined && !processAlive(pid) && canRemoveTerminalRun(run, expired)) continue;
+        if (pid !== undefined && !processAlive(pid) && !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired)) continue;
         const actorId = record?.actorId;
         if (typeof actorId === "string" && /^[A-Za-z0-9_-]+$/.test(actorId)) protect(entry.name, actorId);
         else refs.add("*");
@@ -1929,7 +1944,7 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
-    const exitVeto = runTreeExitVeto(managed.runDirectory);
+    const exitVeto = runTreeExitVeto(managed.runDirectory, 0, undefined, true);
     if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
     if (!this.#canCollect(managed)) {
       throw new Error(`Cannot clean up agent ${id}: ${uncheckedExternalExit(managed.transport) ? "external transport has no checked worker exit receipt" : managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
@@ -2142,8 +2157,11 @@ export class AgentManager {
     const alive = await Promise.all(transports.map((transport) =>
       uncheckedExternalExit(transport) ? true :
         this.#transportAliveUntil(transport, observationDeadline).then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
-    const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
-      [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasUnresolvedWorker(this.#runRoot);
+    // Primary transport exit cannot release a surviving descendant's files or
+    // shared budget. Keep the persistent run tree (and its owning actor ID) for
+    // the next fenced owner whenever tree-wide exit evidence is incomplete.
+    const unresolved = all.some((managed) => managed.lostContact || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) ||
+      [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasExitVeto(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {
       this.#unregisteredTransports.clear();
@@ -2707,7 +2725,7 @@ export class AgentManager {
   }
 
   #canCollect(managed: ManagedAgent): boolean {
-    if (uncheckedExternalExit(managed.transport) || runTreeExitVeto(managed.runDirectory)) return false;
+    if (uncheckedExternalExit(managed.transport) || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) return false;
     // Settlement compacts UI caches. Retry only the original full result, never those caches.
     if (managed.settlementSaveFailure &&
         !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) return false;

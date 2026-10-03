@@ -9,12 +9,13 @@ export async function executeAfterAdmission<T>(
   execute: (signal: AbortSignal, startClock: () => void) => Promise<T>,
   admitted: () => boolean,
   onAdmitted?: () => void | Promise<void>,
+  hangGuardMs = 12_000,
 ): Promise<T> {
   const now = Date.now.bind(Date);
   const startedAt = now();
   const clock = vi.spyOn(Date, "now").mockReturnValue(startedAt);
   const safety = new AbortController();
-  const guard = setTimeout(() => safety.abort(new Error("Guest did not settle within the 12-second admission hang guard")), 12_000);
+  const guard = setTimeout(() => safety.abort(new Error(`Guest did not settle within the ${hangGuardMs / 1_000}-second admission hang guard`)), hangGuardMs);
   let execution: Promise<T> | undefined;
   let settled = false;
   let clockStarted = false;

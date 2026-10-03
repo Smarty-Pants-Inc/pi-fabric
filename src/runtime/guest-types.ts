@@ -91,6 +91,7 @@ interface FabricHandoffFacts {
 type FabricHandoffPredicate = (facts: Readonly<FabricHandoffFacts>) => boolean;
 interface FabricHandoffRequest {
   kernel?: FabricKernel | "inherit";
+  /** Exact visible provider/id, model id, or configured alias; closest matches are refused. */
   model: string;
   task?: string;
   when?: FabricHandoffPredicate;
@@ -301,6 +302,10 @@ interface FabricRemoteControlResult {
   acknowledged: true;
 }
 interface FabricAgentResult extends FabricAgentHandle {
+  /** Resolution marker (alias name or closest); does not replace the observed model. */
+  via?: string;
+  /** Canonical launch selection when via is present; may differ from observed model. */
+  selectedModel?: string;
   /** Terminal event-log optimization was skipped; the full original log remains. */
   compactionSkipped?: string;
   task: string;
@@ -728,6 +733,10 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
 type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped";
 interface FabricActorInfo {
+  /** Resolution marker (alias name or closest); does not replace the effective model. */
+  via?: string;
+  /** Canonical selection when via is present; session bindings may select a different model. */
+  selectedModel?: string;
   kernel?: FabricKernel;
   pythonRuntime?: "cpython" | "monty";
   id: string;

@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { kernelFenceAvailable } from "../residency/file-lock.js";
 import { processAlive } from "../storage/scratch.js";
+import { assertTaskMainTarget, readTaskReturnAddress } from "../agents/task-return-address.js";
 
 // MeshStore's default stale window; recovery waits, never weakens mesh locking.
 export const RESIDENT_MESH_STALE_WINDOW_MS = 30_000;
@@ -92,6 +93,7 @@ export class FabricRouteAuthorityError extends Error {
 }
 
 export class AgentMessageRouter {
+  readonly #taskReturnAddress = readTaskReturnAddress();
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding"> & { owns?: (id: string) => boolean },
@@ -287,12 +289,15 @@ export class AgentMessageRouter {
   ): Promise<FabricAgentMessageResult> {
     context?.signal?.throwIfAborted();
     const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
+    // In a task child, main is the immutable immediate return address, not a role lookup.
+    if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
     id = this.#messageTarget(id);
     const isMain = this.mainAgent.matches(id);
     const remoteRoot = isMain ? undefined : this.#rootRouteSnapshot(id);
     // Project members include peer roots, not just this host's Main and actors.
     // Resolve their current owner through the same capability/control path.
     if (isMain || remoteRoot?.kind === "root") {
+      assertTaskMainTarget(this.#taskReturnAddress, isMain ? this.mainAgent.id : remoteRoot!.id);
       if (remoteRoot?.interactive === false) throw new FabricParticipantNonInteractiveError(remoteRoot.id);
       if (isMain && this.mainAgent.local) {
         // Local delivery needs no remote authority snapshot, but print/JSON Main is never interactive.

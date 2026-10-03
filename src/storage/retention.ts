@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
+import { processStartTime } from "../residency/process-identity.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -21,6 +22,7 @@ interface RunRecordSummary {
   updatedAt?: number;
   transport?: string;
   sessionId?: string;
+  processStartTime?: string;
 }
 export interface RetentionSweepResult {
   removedRoots: string[];
@@ -86,9 +88,10 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
   fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
   writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details }, { durable: true });
 };
-/** A terminal external-pane record is not an exit receipt. Share this persistent,
+/** A terminal record is not a descendant exit receipt. Share this persistent,
  * tree-wide veto across tracked, recovered and offline cleanup before removing
- * worktrees or files; absence of an unresolved marker never proves pane exit.
+ * worktrees or files; absence of an unresolved marker never proves worker exit.
+ * Recordless pre-launch rollback remains distinct from an admitted process run.
  * Ownership retention additionally requires checked process exit for every
  * descendant, without coupling that proof to cleanup's artifact allowlist. */
 export const runTreeExitVeto = (
@@ -115,14 +118,42 @@ export const runTreeExitVeto = (
     if (record?.transport === "herdr" || record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
     }
-    // A surviving tracked root has its own transport exit evidence. Descendants
-    // have no surviving handles here: reuse the persisted process identities and
-    // processAlive check used by safeRunTree, not settlement or marker absence.
+    // Tracked ownership and collection compose conservatively: the descendant
+    // ownership check must pass as well as the terminal PID/birth proof below.
+    // A surviving tracked root has its own transport exit evidence; descendants
+    // have no surviving handles and must retain their persisted identities.
     if (requireDescendantExit && depth > 0) {
       const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
         ? Number(record.sessionId) : undefined;
       if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return "worker exit is unconfirmed: unknown descendant identity";
-      if (processAlive(pid)) return `its descendant worker may still be running (${directory})`;
+      if (processAlive(pid)) return `worker exit is unconfirmed: its descendant worker may still be running (${directory})`;
+    }
+    if (record?.transport === "process") {
+      if (!record.status || !TERMINAL_STATUSES.has(record.status)) {
+        return `worker exit is unconfirmed: nonterminal process record (${directory})`;
+      }
+      // A missing/invalid PID is unknown, not a never-launched record. ESRCH
+      // proves absence; a live PID is safe only if its checked start identity
+      // differs from the worker's saved identity (PID reuse). Query errors and
+      // unreadable birth identity never authorize removal.
+      const pid = typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
+        ? Number(record.sessionId) : NaN;
+      const validPid = Number.isSafeInteger(pid) && pid > 0;
+      let alive = false;
+      if (validPid) {
+        try { process.kill(pid, 0); alive = true; }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+            return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
+          }
+        }
+      }
+      const savedStart = typeof record.processStartTime === "string" && /^\d+$/.test(record.processStartTime)
+        ? record.processStartTime : undefined;
+      const currentStart = alive && savedStart ? processStartTime(pid) : undefined;
+      if (!validPid || (alive && (currentStart === undefined || currentStart === savedStart))) {
+        return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
+      }
     }
     const nested = path.join(directory, "nested");
     try { fs.lstatSync(nested); }
@@ -141,6 +172,8 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 const runFiles = new Set([
   "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
   "reply.json", "relaunches.jsonl", "route-session.jsonl",
+  // Native session of an unrouted process Pi task (worker.ts persistentPiTask); owned file only.
+  "session.jsonl",
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
@@ -148,11 +181,15 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   if (runTreeExitVeto(root, 0, expired)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
+  // Automatic retention keeps its independent live-writer fence. A mismatched
+  // birth identity can clear explicit cleanup's exit veto, but never authorizes
+  // a sweep to remove a run with a live or unknown saved PID. Apply this at
+  // every level, including descendants, alongside the recursive exit proof.
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;
   if (pid !== undefined && processAlive(pid)) return false;
   if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
-    if (!childrenStopped && pid === undefined) return false;
+    if (!childrenStopped) return false;
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
   }
   try {
@@ -189,13 +226,10 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
     return true;
   } catch { return false; }
 };
-/** Explicit resident roots have no managed-temp owner. No birth identity is recorded for
- * their process workers (only status.json's transport/sessionId), so require terminal status,
- * and still veto live/unknown workers, nested survivors and unresolved markers. */
+/** Explicit resident roots have no managed-temp owner. Require terminal status
+ * plus checked process absence, and veto nested survivors and unresolved markers. */
 export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline): boolean => {
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-  if (record?.transport === "process" && record.sessionId !== undefined &&
-      (typeof record.sessionId !== "string" || !/^\d+$/.test(record.sessionId) || Number(record.sessionId) <= 0)) return false;
   return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired);
 };
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {

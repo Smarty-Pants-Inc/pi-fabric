@@ -1,3 +1,5 @@
+import type { TaskReturnAddress } from "../agents/task-return-address.js";
+import type { FabricParticipantInfo } from "../topology/types.js";
 import type { FabricPrincipal } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { ResidentReleaseIntent, ResidentLauncherIdentity } from "./handover.js";
@@ -123,7 +125,7 @@ export const commitResidentRequest = (
   if (decideResidentRequest(residencyRoot, {
     requestId: command.requestId, state: "committed", operation: command.operation, id, ownerHostId,
     ...(command.format === RESIDENT_EXPIRING_COMMAND_FORMAT ? { requestFormat: RESIDENT_EXPIRING_COMMAND_FORMAT } : {}),
-    ...(("caller" in command && command.caller?.principal) ? { principal: command.caller.principal } : {}),
+    ...(("caller" in command && command.caller && "principal" in command.caller && command.caller.principal) ? { principal: command.caller.principal } : {}),
   })) {
     // A collector may advance expiry between the precheck and hard-link CAS.
     // Once it deletes a fence the watermark is already durable: recheck before mutation.
@@ -178,7 +180,7 @@ export class ResidentOutcomeUnknownError extends Error {
 
   constructor(command: ResidentCommand, decision: ResidentRequestDecision | undefined, cause: unknown, signal?: AbortSignal) {
     const id = decision?.id ?? ("id" in command ? command.id : undefined);
-    const kind = ["spawn", "foreground", "cleanup"].includes(command.operation) ? "agent" : "actor";
+    const kind = ["spawn", "spawnBound", "foreground", "cleanup"].includes(command.operation) ? "agent" : "actor";
     // Guest runtimes may preserve only message, so the classification and IDs live there too.
     super(`ResidentOutcomeUnknownError: Fabric residency ${command.operation} outcome unknown: requestId=${command.requestId}` +
       `, ${kind}Id=${id ?? "not yet known"}` +
@@ -383,6 +385,8 @@ export interface ResidentHostOwner {
   commands?: readonly string[];
   /** New clients must not dispatch mutations to an already-running pre-fence host. */
   requestFence?: 1;
+  /** Loaded executor validates and applies a trusted per-launch caller return address. */
+  callerBoundSpawn?: 1;
   /** Generation format 3 with durable expiry; absent on older fenced hosts. */
   requestExpiry?: 1;
   /** Operation-scoped retry keys implemented by this loaded host, not desired config. */
@@ -395,13 +399,48 @@ export interface ResidentHostOwner {
   attempt?: { id: string; kind: "target" | "fallback" };
 }
 
+/** Runtime caller binding on the trusted residency envelope, never AgentRunRequest. */
+export interface ResidentTaskCaller {
+  id: string;
+  rootId: string;
+  sessionId: string;
+  ownerHostId: string;
+  ownerIdentityId: string;
+  kind: FabricParticipantInfo["kind"];
+  returnAddress: TaskReturnAddress;
+}
+
+/** Verify the envelope against the same live owner directory used by native control. */
+export const assertResidentTaskCaller = (
+  caller: ResidentTaskCaller | undefined,
+  participant: FabricParticipantInfo | undefined,
+  rootId: string,
+): TaskReturnAddress => {
+  const address = caller?.returnAddress;
+  if (!caller || !participant || participant.stale || participant.remoteHost !== undefined ||
+      participant.id !== caller.id || participant.rootId !== rootId || caller.rootId !== rootId ||
+      participant.sessionId !== caller.sessionId || !caller.sessionId ||
+      participant.ownerHostId !== caller.ownerHostId || participant.ownerIdentityId !== caller.ownerIdentityId ||
+      participant.kind !== caller.kind || !address || address.spawnerId !== caller.id ||
+      address.spawnerSessionId !== caller.sessionId || !Array.isArray(address.ancestors) ||
+      !address.ancestors.includes(rootId) || address.ancestors.some(id => typeof id !== "string" || !id.trim()) ||
+      !Array.isArray(address.escalationTargets) || address.escalationTargets.some(id =>
+        typeof id !== "string" || !id.startsWith("session:") || !id.slice(8).trim())) {
+    throw new Error("Durable agents.spawn requires a trusted live caller return-address binding; absent or forged binding refused. Nothing was launched.");
+  }
+  return structuredClone(address);
+};
+
 interface ResidentSpawnCommand {
   format: typeof RESIDENT_HOST_FORMAT;
-  operation: "spawn";
+  // A distinct wire operation prevents rollback hosts from ignoring caller.
+  operation: "spawnBound";
   idempotencyKey?: string;
   requestId: string;
   rootId: string;
   request: AgentRunRequest;
+  /** Host-captured runtime binding, separate from all task-supplied run settings. */
+  caller: ResidentTaskCaller;
   createdAt: number;
 }
 
@@ -524,7 +563,7 @@ export const residentCommandForOwner = (command: ResidentCommand, owner: Residen
 // The only operations every format-1 host predating command negotiation understood.
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
-  ...LEGACY_RESIDENT_COMMANDS, "actors", "actorStatus", "setInstructions", "setModel",
+  "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "setInstructions", "setModel",
   "setThinking", "setTools", "setActivationFilter", "releaseChange",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
@@ -541,6 +580,16 @@ export class ResidentCommandUnsupportedError extends Error {
 
 /** Check the running owner's publication, never the caller's release/config. */
 export const assertResidentCommandSupported = (owner: ResidentHostOwner, operation: ResidentCommand["operation"]): void => {
+  // Negotiation and the new wire discriminant are independent fences: this
+  // check prevents dispatch to an old live owner; spawnBound prevents a queued
+  // request being run unbound if a rollback host later acquires the directory.
+  if (operation === "spawnBound" && (owner.callerBoundSpawn !== 1 ||
+      !Array.isArray(owner.commands) || !owner.commands.includes(operation))) {
+    throw new ResidentCommandUnsupportedError(
+      `The owning resident host ${owner.hostId} (pid ${owner.pid}${owner.releaseRoot ? `, release ${owner.releaseRoot}` : ""}) ` +
+      "lacks caller-bound spawn support. Reload Main and complete resident host handover to the current release before retrying. No request was dispatched.",
+    );
+  }
   const supported = owner.commands === undefined ? LEGACY_RESIDENT_COMMANDS : owner.commands;
   if (!isResidentCommandOperation(operation) || !Array.isArray(supported) ||
       !(supported as readonly string[]).includes(operation)) {
@@ -550,7 +599,7 @@ export const assertResidentCommandSupported = (owner: ResidentHostOwner, operati
 
 /** Fence explicit retry keys before publication; keep unkeyed calls compatible with older hosts. */
 export const prepareResidentCreationCommand = (owner: ResidentHostOwner, command: ResidentCommand): ResidentCommand => {
-  if (command.operation !== "spawn" && command.operation !== "createActor") return command;
+  if (command.operation !== "spawnBound" && command.operation !== "createActor") return command;
   if (owner.creationIdempotency !== 1) {
     if (command.idempotencyKey !== undefined) {
       throw new ResidentCommandUnsupportedError(

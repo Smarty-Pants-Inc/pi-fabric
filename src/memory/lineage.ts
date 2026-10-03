@@ -1,13 +1,11 @@
 import crypto from "node:crypto";
-import { readSessionDerived } from "./session-file-cache.js";
+import fs from "node:fs";
 
 export type MemoryBranches = "active" | "all";
 
 export interface LiveSessionBranch {
   entries: readonly unknown[];
   leafId: string | null;
-  /** Trusted host identity for an immutable ID path; absent uses array identity. */
-  revision?: string;
 }
 
 export interface SessionLineage {
@@ -57,31 +55,32 @@ const persistedNodesFromRecords = (records: readonly unknown[]): PersistedNode[]
 const fingerprint = (branches: MemoryBranches, leafId: string | null, ids: string[]): string =>
   crypto.createHash("sha256").update(JSON.stringify({ branches, leafId, ids })).digest("hex");
 
-interface PersistedNodes {
-  nodes: PersistedNode[];
-  ordinal: number;
-  lineage?: { length: number; liveLength: number | undefined; liveEntries: WeakRef<readonly unknown[]> | undefined; revision: string | undefined; leafId: string | null | undefined; value: SessionLineage };
-}
-const readPersistedNodes = (sessionFile: string): PersistedNodes | undefined =>
-  readSessionDerived(sessionFile, "lineage", () => ({ nodes: [], ordinal: 0 } as PersistedNodes), (state, value) => {
-    const record = asPersistedRecord(value);
-    if (!record || isHeaderRecord(record)) return;
-    if (hasParentLink(record)) state.nodes.push({
-      id: Buffer.from(record.id, "utf16le").toString("utf16le"),
-      parentId: record.parentId === null ? null : Buffer.from(record.parentId, "utf16le").toString("utf16le"),
-      ordinal: state.ordinal,
-    });
-    state.ordinal += 1;
-  });
+const readPersistedNodes = (sessionFile: string): PersistedNode[] => {
+  let content: string;
+  try {
+    content = fs.readFileSync(sessionFile, "utf8");
+  } catch {
+    return [];
+  }
+  const records: unknown[] = [];
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      records.push(JSON.parse(line));
+    } catch {
+      continue;
+    }
+  }
+  return persistedNodesFromRecords(records);
+};
 
-let cachedAllLineage: SessionLineage | undefined;
-const allLineage = (): SessionLineage => cachedAllLineage ??= {
+const allLineage = (): SessionLineage => ({
   branches: "all",
   leafId: null,
   entryOrdinals: null,
   fingerprint: fingerprint("all", null, []),
   coverageReasons: [],
-};
+});
 
 /**
  * Reconstruct Pi 0.80.6's persisted leaf semantics without treating append
@@ -94,22 +93,7 @@ export const reconstructSessionLineage = (
   branches: MemoryBranches,
   liveBranch?: LiveSessionBranch,
 ): SessionLineage =>
-  branches === "all" ? allLineage() : cachedActiveLineage(sessionFile, liveBranch);
-
-const cachedActiveLineage = (file: string, liveBranch?: LiveSessionBranch): SessionLineage => {
-  const state = readPersistedNodes(file);
-  if (!state) return buildActiveLineage([], liveBranch);
-  const cached = state.lineage;
-  // Never retain the live transcript. Native snapshots carry a trusted revision;
-  // custom branches without one preserve their exact array/ID-list semantics.
-  const sameLive = liveBranch?.revision !== undefined
-    ? cached?.revision === liveBranch.revision
-    : cached?.liveEntries?.deref() === liveBranch?.entries;
-  if (cached && sameLive && cached.length === state.nodes.length && cached.liveLength === liveBranch?.entries.length && cached.leafId === liveBranch?.leafId) return cached.value;
-  const value = buildActiveLineage(state.nodes, liveBranch);
-  state.lineage = { length: state.nodes.length, liveLength: liveBranch?.entries.length, liveEntries: liveBranch ? new WeakRef(liveBranch.entries) : undefined, revision: liveBranch?.revision, leafId: liveBranch?.leafId, value };
-  return value;
-};
+  branches === "all" ? allLineage() : buildActiveLineage(readPersistedNodes(sessionFile), liveBranch);
 
 const buildActiveLineage = (nodes: PersistedNode[], liveBranch?: LiveSessionBranch, selectedLeafId?: string | null): SessionLineage => {
   const byId = new Map(nodes.map((node) => [node.id, node]));

@@ -1,5 +1,4 @@
 import path from "node:path";
-import { sessionStamp } from "./session-file-cache.js";
 import { Worker } from "node:worker_threads";
 import type { FabricInvocationContext } from "../protocol.js";
 import { MemoryProvider, type MemoryProviderContext } from "../providers/memory-provider.js";
@@ -21,7 +20,7 @@ interface Request {
 }
 
 const sameBranch = (left: LiveSessionBranch, right: LiveSessionBranch): boolean =>
-  left === right || left.leafId === right.leafId && left.entries.length === right.entries.length &&
+  left.leafId === right.leafId && left.entries.length === right.entries.length &&
   left.entries.every((entry, index) =>
     (entry as { id?: string }).id === (right.entries[index] as { id?: string }).id);
 
@@ -34,7 +33,6 @@ export class WorkerMemoryProvider extends MemoryProvider {
   private stopping: Promise<void> | undefined;
   private closed = false;
   private nextId = 0;
-  private branchSnapshot: { stamp: string; leafId: string | null; branch: LiveSessionBranch } | undefined;
 
   constructor(
     private readonly workerContext: MemoryProviderContext,
@@ -85,24 +83,15 @@ export class WorkerMemoryProvider extends MemoryProvider {
     if (target !== undefined && target !== context.sessionId &&
         target !== path.basename(context.sessionFile, ".jsonl") &&
         path.resolve(target) !== path.resolve(context.sessionFile)) return undefined;
-    // No TTL: dispatch and final verification each make a fresh observation.
-    // Unchanged native sources skip getBranch(), ID mapping, and comparison walks.
-    const observed = context.getLiveLeafId ? sessionStamp(context.sessionFile) : undefined;
-    const leafId = context.getLiveLeafId?.();
-    const stamp = observed ? `${observed.dev}:${observed.ino}:${observed.size}:${observed.mtimeNs}:${observed.ctimeNs}` : undefined;
-    if (stamp && leafId !== undefined && this.branchSnapshot?.stamp === stamp && this.branchSnapshot.leafId === leafId) return this.branchSnapshot.branch;
     const branch = context.getLiveBranch();
     // Lineage needs IDs only. Never clone tool output, images, or the full transcript to the worker.
-    const snapshot: LiveSessionBranch = {
+    return {
       leafId: branch.leafId,
       entries: branch.entries.map(entry => {
         const id = entry !== null && typeof entry === "object" ? (entry as { id?: unknown }).id : undefined;
         return typeof id === "string" ? { id } : {};
       }),
-      ...(stamp && leafId === branch.leafId ? { revision: `${stamp}:${leafId}` } : {}),
     };
-    this.branchSnapshot = stamp && leafId === branch.leafId ? { stamp, leafId, branch: snapshot } : undefined;
-    return snapshot;
   }
 
   private start(): Worker {
@@ -206,7 +195,6 @@ export class WorkerMemoryProvider extends MemoryProvider {
 
   async close(): Promise<void> {
     this.closed = true;
-    this.branchSnapshot = undefined;
     const active = this.active;
     this.active = undefined;
     const requests = this.pending.splice(0);

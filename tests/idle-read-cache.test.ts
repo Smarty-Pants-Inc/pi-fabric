@@ -1,19 +1,16 @@
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
-import { clearSessionTextCache, readSessionDerived } from "../src/memory/session-file-cache.js";
-import { spawnSync } from "node:child_process";
-const readIds = (file: string) => readSessionDerived(file, "ids", () => [] as string[], (ids, record) => {
-  const id = (record as { id?: string }).id; if (id) ids.push(id);
-});
 import { MeshStore } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 
 const roots: string[] = [];
 afterEach(() => {
   vi.restoreAllMocks();
-  clearSessionTextCache();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -26,31 +23,7 @@ const temp = (): string => {
 const stateReadCount = (spy: { mock: { calls: unknown[][] } }): number =>
   spy.mock.calls.filter((args) => typeof args[0] === "string" && args[0].endsWith("/state.json")).length;
 
-describe("idle whole-file read caches", () => {
-  it("does not reread an unchanged session and follows appends", () => {
-    const file = path.join(temp(), "session.jsonl");
-    fs.writeFileSync(file, '{"id":"one"}\n');
-    expect(readIds(file)).toEqual(["one"]);
-    const spy = vi.spyOn(fs, "readSync");
-    expect(readIds(file)).toEqual(["one"]);
-    expect(spy).not.toHaveBeenCalled();
-    fs.appendFileSync(file, '{"id":"two"}\n');
-    expect(readIds(file)).toEqual(["one", "two"]);
-    expect(spy).toHaveBeenCalledTimes(1);
-  });
-
-  it("invalidates on inode replacement and truncation", () => {
-    const root = temp(), file = path.join(root, "session.jsonl");
-    fs.writeFileSync(file, '{"id":"old"}\n');
-    expect(readIds(file)).toEqual(["old"]);
-    const replacement = path.join(root, "replacement.jsonl");
-    fs.writeFileSync(replacement, '{"id":"new"}\n');
-    fs.renameSync(replacement, file);
-    expect(readIds(file)).toEqual(["new"]);
-    fs.writeFileSync(file, '{"id":"x"}\n');
-    expect(readIds(file)).toEqual(["x"]);
-  });
-
+describe("actor registry and participant snapshot caches", () => {
   it("reuses an unchanged actor registry and reloads its replacement", () => {
     const root = temp();
     const file = path.join(root, "actors.json");
@@ -69,6 +42,64 @@ describe("idle whole-file read caches", () => {
     expect(store.fingerprint()).not.toBe(beforeStamp);
     expect(store.records()[0]?.id).toBe("b");
     expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([false, true])("reloads after its own write (durable=%s)", async (durable) => {
+    const root = temp();
+    const file = path.join(root, "actors.json");
+    fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [{ id: "old" }] }));
+    const store = new ActorRegistryStore(root);
+    expect(store.records()).toEqual([{ id: "old" }]);
+    await store.withLock(() => store.write([{ id: "new" }], { durable }));
+    expect(store.records()).toEqual([{ id: "new" }]);
+    const spy = vi.spyOn(fs, "readFileSync");
+    expect(store.read()).toEqual({ format: 1, actors: [{ id: "new" }] });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("uses one canonical snapshot in ParticipantDirectory and sees the next replacement", () => {
+    const root = temp();
+    const file = path.join(root, "state.json");
+    const identity = { id: "h", name: "main", kind: "main" as const };
+    const key = "topology/participants/" + createHash("sha256").update("p").digest("hex");
+    const state = (name: string, version: number) => ({
+      format: 1, revisionFormat: 2, highWater: version,
+      entries: { [key]: { key, version, updatedAt: version, updatedBy: identity, value: {
+        format: 1, id: "p", name, kind: "root", rootId: "p", ownerHostId: "h",
+        ownerIdentityId: "h", status: "idle", runner: "pi", transport: "host",
+        capabilities: ["fabric"], startedAt: 1, updatedAt: version, controlProtocol: "v1",
+      } } },
+    });
+    fs.writeFileSync(file, JSON.stringify(state("before", 1)));
+    const mesh = new MeshStore(root, 64 * 1024, 0);
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: "h", rootId: "root", identity, heartbeatMs: 60_000, leaseMs: 120_000,
+    });
+    // A started directory has a local self record. Isolate the four-namespace scan
+    // from cold self()'s separate fallback scan, without starting heartbeat writers.
+    vi.spyOn(directory, "self").mockReturnValue(directory.self());
+    const select = mesh.listAllShared.bind(mesh);
+    let replaced = false;
+    const selections = vi.spyOn(mesh, "listAllShared").mockImplementation((prefix, options) => {
+      const result = select(prefix, options);
+      if (!replaced) {
+        replaced = true;
+        const replacement = path.join(root, "replacement.json");
+        fs.writeFileSync(replacement, JSON.stringify(state("after", 2)));
+        fs.renameSync(replacement, file);
+      }
+      return result;
+    });
+    const reads = vi.spyOn(fs, "readFileSync");
+    expect(directory.list({ fresh: true, includeStale: true }).find((p) => p.id === "p")?.name).toBe("before");
+    expect(stateReadCount(reads)).toBe(1);
+    expect(selections).toHaveBeenCalledTimes(4);
+    const snapshot = selections.mock.calls[0]![1]!.snapshot;
+    expect(snapshot).toBeDefined();
+    expect(selections.mock.calls.every(([, options]) => options?.snapshot === snapshot)).toBe(true);
+    expect(directory.list({ fresh: true, includeStale: true }).find((p) => p.id === "p")?.name).toBe("after");
+    expect(stateReadCount(reads)).toBe(2);
+    expect(selections.mock.calls[4]![1]!.snapshot).not.toBe(snapshot);
   });
 
   it("selects all namespaces from one fresh canonical state", () => {

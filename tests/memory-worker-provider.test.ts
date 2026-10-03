@@ -1,7 +1,4 @@
 import { setImmediate as yieldToHost } from "node:timers/promises";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { WorkerMemoryProvider } from "../src/memory/worker-provider.js";
@@ -120,32 +117,6 @@ describe("file memory worker ownership", () => {
   it("surfaces worker startup failure instead of silently falling back to blocking execution", async () => {
     const memory = provider({}, new URL("./fixtures/missing-memory-worker.mjs", import.meta.url));
     await expect(memory.invoke("recall", {}, invocation())).rejects.toThrow();
-  });
-
-  it("gates native snapshots on one stat and leaf observation, without idle branch walks", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-memory-snapshot-"));
-    const sessionFile = path.join(root, "session.jsonl"); fs.writeFileSync(sessionFile, "{}\n");
-    let leafId = "a";
-    const getLiveBranch = vi.fn(() => ({ leafId, entries: [{ id: leafId, message: { content: "not retained" } }] }));
-    const memory = provider({ sessionId: "current", sessionFile, getLiveLeafId: () => leafId, getLiveBranch });
-    try {
-      await memory.invoke("recall", {}, invocation()); expect(getLiveBranch).toHaveBeenCalledTimes(1);
-      getLiveBranch.mockClear(); const stat = vi.spyOn(fs, "statSync");
-      await memory.invoke("recall", {}, invocation());
-      expect(getLiveBranch).not.toHaveBeenCalled();
-      // One observation at dispatch, one independent final freshness fence.
-      expect(stat.mock.calls.filter(([p]) => p === sessionFile)).toHaveLength(2);
-      stat.mockRestore();
-      leafId = "b"; await memory.invoke("recall", {}, invocation()); expect(getLiveBranch).toHaveBeenCalledTimes(1);
-      const gate = new SharedArrayBuffer(4), progress = started();
-      const pending = memory.invoke("recall", { gate }, invocation(undefined, progress.update));
-      const rejected = expect(pending).rejects.toThrow("branch changed"); await progress.ready;
-      leafId = "c"; Atomics.store(new Int32Array(gate), 0, 1); Atomics.notify(new Int32Array(gate), 0); await rejected;
-      getLiveBranch.mockClear();
-      await memory.invoke("recall", {}, invocation());
-      const replacement = path.join(root, "replacement"); fs.writeFileSync(replacement, "{}\n"); fs.renameSync(replacement, sessionFile);
-      getLiveBranch.mockClear(); await memory.invoke("recall", {}, invocation()); expect(getLiveBranch).toHaveBeenCalledTimes(1);
-    } finally { await memory.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it("takes live lineage at dispatch, sends IDs only, and rejects navigation during retrieval", async () => {

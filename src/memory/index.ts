@@ -1,7 +1,6 @@
 import crypto from "node:crypto";
 import { coverageComplete } from "../verified/policy.js";
 import fs from "node:fs";
-import { sessionFingerprint, withSessionFileSnapshot } from "./session-file-cache.js";
 import path from "node:path";
 import { foldSessionDigest, type SessionDigest } from "./digest.js";
 import type { SessionRef } from "./discovery.js";
@@ -96,9 +95,6 @@ export const shardPolicy = (options: MemoryIndexOptions, lineage: SessionLineage
   `entry:${options.maxEntryChars};branches:${lineage.branches};lineage:${lineage.fingerprint};${policyPrivacy(options)}`;
 export const digestPolicy = (options: MemoryIndexOptions, lineage: SessionLineage): string =>
   `vocab:${options.maxColdVocabularyBytes ?? DEFAULT_MAX_COLD_VOCABULARY_BYTES};cache:${options.maxColdCacheBytes ?? DEFAULT_MAX_COLD_CACHE_BYTES};branches:${lineage.branches};lineage:${lineage.fingerprint};${policyPrivacy(options)}`;
-
-const observeIndexedSource = (sessionFile: string, options: MemoryIndexOptions) =>
-  withSessionFileSnapshot(sessionFile, () => ({ lineage: resolveLineage(sessionFile, options), state: fingerprintSource(sessionFile) }));
 
 const resolveLineage = (sessionFile: string, options: MemoryIndexOptions): SessionLineage =>
   reconstructSessionLineage(
@@ -259,7 +255,20 @@ export interface SourceState {
   sourceHash: string;
 }
 
-export const fingerprintSource = (file: string): SourceState | null => sessionFingerprint(file);
+export const fingerprintSource = (file: string): SourceState | null => {
+  try {
+    const content = fs.readFileSync(file);
+    const stat = fs.statSync(file);
+    if (!stat.isFile()) return null;
+    return {
+      mtime: stat.mtimeMs,
+      size: stat.size,
+      sourceHash: crypto.createHash("sha256").update(content).digest("hex"),
+    };
+  } catch {
+    return null;
+  }
+};
 
 const isCacheFresh = (
   cache: CacheRecord | null,
@@ -297,8 +306,9 @@ export const missingShard = (
 });
 
 export const loadShard = (ref: SessionRef, options: MemoryIndexOptions): Shard => {
-  const { lineage, state } = observeIndexedSource(ref.file, options);
+  const lineage = resolveLineage(ref.file, options);
   const filePath = shardPathForSession(ref.file, options.indexDir, lineage.branches);
+  const state = fingerprintSource(ref.file);
   if (!state) {
     removeCacheFile(filePath);
     return missingShard(ref, lineage);
@@ -315,7 +325,8 @@ export const loadShard = (ref: SessionRef, options: MemoryIndexOptions): Shard =
     options.maxEntryChars,
     normalizationOptions(options, lineage),
   );
-  const { state: finalState, lineage: finalLineage } = observeIndexedSource(ref.file, options);
+  const finalState = fingerprintSource(ref.file);
+  const finalLineage = resolveLineage(ref.file, options);
   if (
     !finalState ||
     finalState.sourceHash !== state.sourceHash ||
@@ -355,14 +366,16 @@ const hydrateShard = (
   options: MemoryIndexOptions,
   entryRange?: EntryRange,
 ): Shard => {
-  const { lineage, state } = observeIndexedSource(ref.file, options);
+  const lineage = resolveLineage(ref.file, options);
+  const state = fingerprintSource(ref.file);
   if (!state) return { ...missingShard(ref, lineage), tier: "cold" };
   const { entries, header, indexCoverage } = normalizeSession(
     ref.file,
     options.maxEntryChars,
     normalizationOptions(options, lineage),
   );
-  const { state: finalState, lineage: finalLineage } = observeIndexedSource(ref.file, options);
+  const finalState = fingerprintSource(ref.file);
+  const finalLineage = resolveLineage(ref.file, options);
   if (
     !finalState ||
     finalState.sourceHash !== state.sourceHash ||
@@ -470,8 +483,9 @@ export const fitDigestCache = (digest: DigestShard, maxBytes: number): DigestSha
 };
 
 export const loadDigest = (ref: SessionRef, options: MemoryIndexOptions): DigestShard => {
-  const { lineage, state } = observeIndexedSource(ref.file, options);
+  const lineage = resolveLineage(ref.file, options);
   const filePath = digestPathForSession(ref.file, options.indexDir, lineage.branches);
+  const state = fingerprintSource(ref.file);
   if (!state) {
     removeCacheFile(filePath);
     return missingDigest(ref, lineage);
@@ -491,7 +505,8 @@ export const loadDigest = (ref: SessionRef, options: MemoryIndexOptions): Digest
     Number.MAX_SAFE_INTEGER,
     normalizationOptions(options, lineage),
   );
-  const { state: finalState, lineage: finalLineage } = observeIndexedSource(ref.file, options);
+  const finalState = fingerprintSource(ref.file);
+  const finalLineage = resolveLineage(ref.file, options);
   if (
     !finalState ||
     finalState.sourceHash !== state.sourceHash ||

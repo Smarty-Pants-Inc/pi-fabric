@@ -142,7 +142,6 @@ export class RuntimeStateBuiltins {
         config: config.memory,
         sessionId,
         ...(sessionFile ? { sessionFile } : {}),
-        getLiveLeafId: () => context.sessionManager.getLeafId(),
         getLiveBranch: () => ({
           entries: context.sessionManager.getBranch(),
           leafId: context.sessionManager.getLeafId(),

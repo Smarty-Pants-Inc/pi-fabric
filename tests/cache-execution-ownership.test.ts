@@ -1,4 +1,5 @@
 import type { ChildProcess } from "node:child_process";
+import { setTimeout as realDelay } from "node:timers/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -72,15 +73,46 @@ const quiesce = () => new Promise(resolve => setTimeout(resolve, 200));
 
 describe("cache holds through the Node executor", () => {
   it("releases the hold of an execution that reaches its deadline", async () => {
-    const f = fixture(1_500);
-    const result = await f.run(holdThenHang, "deadline");
-    expect(result.success).toBe(false);
-    expect(result.error).toMatch(/timed out/);
-    expect(f.acquire).toHaveBeenCalledOnce();
-    expect(f.releaseNative).toHaveBeenCalledOnce();
-    expect(f.nativeOwners.size).toBe(0);
-    expect(await f.leases()).toEqual([]);
-    await f.provider.close();
+    const timeoutMs = 1_500;
+    // Freeze only host time: the real child must acquire a native hold before
+    // we advance the production shared deadline, regardless of startup speed.
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const f = fixture(timeoutMs);
+    const abort = new AbortController();
+    const readiness = new AbortController();
+    const execution = f.run(holdThenHang, "deadline", abort.signal);
+    try {
+      await Promise.race([
+        f.held,
+        execution.then(result => { throw new Error(`Execution settled before cache hold: ${result.error}`); }),
+        realDelay(10_000, undefined, { signal: readiness.signal }).then(() => { throw new Error("Cache hold readiness timed out"); }),
+      ]);
+      readiness.abort();
+      // Let the probe response reach the real child with no host call pending.
+      await realDelay(200);
+      expect(f.acquire).toHaveBeenCalledOnce();
+      expect(f.nativeOwners.size).toBe(1);
+      expect(await f.leases()).toHaveLength(1);
+      expect(f.releaseNative).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(timeoutMs - 1);
+      expect(f.nativeOwners.size).toBe(1);
+      expect(f.releaseNative).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await execution;
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/timed out/);
+      expect(f.acquire).toHaveBeenCalledOnce();
+      expect(f.releaseNative).toHaveBeenCalledOnce();
+      expect(f.nativeOwners.size).toBe(0);
+      expect(await f.leases()).toEqual([]);
+    } finally {
+      readiness.abort();
+      abort.abort();
+      vi.useRealTimers();
+      await execution;
+      await f.provider.close();
+    }
   }, 20_000);
 
   it("releases the hold of a cancelled execution", async () => {

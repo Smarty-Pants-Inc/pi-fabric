@@ -86,7 +86,7 @@ const mainLeaseFixture = async (files: boolean) => {
   const key = (prefix: string) => prefix + createHash("sha256").update(target.id).digest("hex");
   const presence: FabricParticipantRecord = {
     format: 1, id: target.id, rootId: target.id, kind: "root", ownerHostId: target.id, ownerIdentityId: target.id,
-    name: "Main", status: "running", runner: "pi", transport: "host", cwd: root, sessionId,
+    name: "lead-example", status: "running", runner: "pi", transport: "host", cwd: root, sessionId,
     capabilities: ["steer", "followUp", "fabric"], controlProtocol: "v1", startedAt: 1, updatedAt: Date.now(),
   };
   await mesh.put({ key: key("topology/hosts/"), identity: target, value: {
@@ -101,14 +101,19 @@ const mainLeaseFixture = async (files: boolean) => {
       { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000 });
     planes.push(value); return value;
   };
-  return { root, meshRoot, mesh, directory, target, sessionId, participantKey, key, plane };
+  const publishPresence = async (value: FabricParticipantRecord) => {
+    if (files) writeParticipantFile(meshRoot, { key: participantKey, value, version: 2, updatedAt: Date.now(), updatedBy: target });
+    else await mesh.put({ key: participantKey, identity: target, value });
+  };
+  return { root, meshRoot, mesh, directory, target, sessionId, participantKey, key, plane, presence, publishPresence };
 };
 
 describe("Main target lineage delivery (#3686)", () => {
   it.each([
     [false, "steer", false], [false, "followUp", false], [true, "steer", false], [true, "followUp", false],
     [false, "steer", true], [false, "followUp", true], [true, "steer", true], [true, "followUp", true],
-  ] as const)("queues %s file presence / %s / bare UUID=%s despite a ten-minute lease lapse", async (files, kind, bare) => {
+    [false, "steer", "name"], [false, "followUp", "name"], [true, "steer", "name"], [true, "followUp", "name"],
+  ] as const)("queues %s file presence / %s / selector=%s despite a ten-minute lease lapse", async (files, kind, selector) => {
     const f = await mainLeaseFixture(files);
     expect(f.directory.get(f.target.id, undefined, { fresh: true })).toBeUndefined();
     expect(f.directory.lastKnown(f.target.id)?.lapsedMs).toBeGreaterThanOrEqual(600_000);
@@ -117,7 +122,7 @@ describe("Main target lineage delivery (#3686)", () => {
     sender.start(() => ({ accepted: false }));
     const send = router(unknown, [], sender, f.directory);
     let error: unknown;
-    const pending = send.value.routeMessage(bare ? f.sessionId : f.target.id, "live Main reply", { proof: "unchanged" }, kind)
+    const pending = send.value.routeMessage(selector === "name" ? "lead-example" : selector ? f.sessionId : f.target.id, "live Main reply", { proof: "unchanged" }, kind)
       .catch(failure => { error = failure; return undefined; });
     try {
       await vi.waitFor(() => expect(error !== undefined || f.mesh.read({ topic: "fabric.control.command", limit: 10 }).length > 0).toBe(true));
@@ -161,11 +166,94 @@ describe("Main target lineage delivery (#3686)", () => {
     expect(f.directory.lineageAlive("session:unknown")).toBe(true); // Unknown lineage alone is not an address.
     const request = vi.fn();
     const send = router(unknown, [], { request }, f.directory);
-    for (const id of [f.target.id, "session:unknown"]) for (const kind of ["steer", "followUp"] as const) {
+    for (const id of [f.target.id, "lead-example", "session:unknown"]) for (const kind of ["steer", "followUp"] as const) {
       await expect(send.value.routeMessage(id, "not deliverable", undefined, kind)).rejects.toThrow(`Unknown Fabric participant: ${id}`);
     }
     expect(request).not.toHaveBeenCalled();
     expect(f.mesh.read({ topic: "fabric.control.command", limit: 10 })).toEqual([]);
+  });
+});
+
+describe.each([false, true])("stale Main name safeguards (files=%s)", (files) => {
+  it.each(["reloading", "stopping", "mirrored"] as const)("does not admit a %s root by stale name", async (state) => {
+    const f = await mainLeaseFixture(files);
+    await f.publishPresence({ ...f.presence, ...(state === "mirrored" ? { remoteHost: "peer-host" } : { status: state }) });
+    if (state === "mirrored") {
+      const host = f.mesh.get(f.key("topology/hosts/"))!.value as Record<string, unknown>;
+      await f.mesh.put({ key: f.key("topology/hosts/"), identity: f.target, value: { ...host, remoteHost: "peer-host" } });
+    }
+    expect(f.directory.list({ scope: "project", includeStale: true, fresh: true }))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ id: f.target.id, stale: true })]));
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    for (const kind of ["followUp", "steer"] as const) {
+      await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, kind))
+        .rejects.toThrow("Unknown Fabric participant: lead-example");
+    }
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each(["non-interactive", "missing-capability"] as const)("retains %s admission guards for a stale named root", async (state) => {
+    const f = await mainLeaseFixture(files);
+    await f.publishPresence({ ...f.presence, ...(state === "non-interactive" ? { interactive: false } : { capabilities: ["fabric"] }) });
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    for (const kind of ["followUp", "steer"] as const) {
+      await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, kind))
+        .rejects.toThrow(state === "non-interactive" ? "is non-interactive" : `does not support ${kind}`);
+    }
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("retains duplicate-name and actor-name ambiguity before publication", async () => {
+    const f = await mainLeaseFixture(files);
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    const status = vi.spyOn(send.actors, "status").mockReturnValue({ id: "actor:named", name: "lead-example", runner: "pi" } as ReturnType<Ports[1]["status"]>);
+    await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, "followUp"))
+      .rejects.toThrow(`Ambiguous Fabric participant: lead-example (actor actor:named, root ${f.target.id})`);
+    status.mockRestore();
+    const duplicate = { ...f.presence, id: "session:duplicate", rootId: "session:duplicate", ownerHostId: "session:duplicate", ownerIdentityId: "session:duplicate" };
+    const duplicateKey = "topology/participants/" + createHash("sha256").update(duplicate.id).digest("hex");
+    const duplicateIdentity: MeshIdentity = { id: duplicate.id, name: "Main", kind: "main" };
+    if (files) writeParticipantFile(f.meshRoot, { key: duplicateKey, value: duplicate, version: 1, updatedAt: Date.now(), updatedBy: duplicateIdentity });
+    else await f.mesh.put({ key: duplicateKey, identity: duplicateIdentity, value: duplicate });
+    for (const kind of ["followUp", "steer"] as const) {
+      const failure = await send.value.routeMessage("lead-example", "never guess", undefined, kind).catch(error => error);
+      expect(failure.message).toContain("Ambiguous Fabric participant: lead-example");
+      expect(failure.message).toContain(f.target.id);
+      expect(failure.message).toContain(duplicate.id);
+    }
+    expect(request).not.toHaveBeenCalled();
+    expect(f.mesh.read({ topic: "fabric.control.command", limit: 10 })).toEqual([]);
+  });
+
+  it.each(["dead-lineage", "write-stalled"] as const)("does not admit a %s root by stale name", async (state) => {
+    const f = await mainLeaseFixture(files);
+    const stalled = new Error("Fabric mesh write stalled");
+    if (state === "dead-lineage") vi.spyOn(f.directory, "lineageAlive").mockReturnValue(false);
+    else vi.spyOn(f.directory, "writeStalled").mockReturnValue(stalled);
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    for (const kind of ["followUp", "steer"] as const) {
+      await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, kind))
+        .rejects.toThrow(state === "write-stalled" ? stalled.message : "Unknown Fabric participant: lead-example");
+    }
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("reads the current stale name rather than a cached previous name", async () => {
+    const f = await mainLeaseFixture(files);
+    f.directory.list({ scope: "project", kinds: ["root"], includeStale: true });
+    await f.publishPresence({ ...f.presence, name: "renamed-lead" });
+    const request = vi.fn().mockResolvedValue({ queued: true, acknowledged: true, routed: "mesh" });
+    const send = router(unknown, [], { request }, f.directory);
+    await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, "followUp"))
+      .rejects.toThrow("Unknown Fabric participant: lead-example");
+    await expect(send.value.routeMessage("renamed-lead", "current name", undefined, "followUp"))
+      .resolves.toMatchObject({ queued: true, acknowledged: true });
+    expect(request).toHaveBeenCalledOnce();
+    expect(request.mock.calls[0]?.slice(0, 3)).toEqual([f.target.id, f.target.id, "followUp"]);
   });
 });
 

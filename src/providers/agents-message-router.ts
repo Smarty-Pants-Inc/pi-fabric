@@ -116,13 +116,18 @@ export class AgentMessageRouter {
       ? this.participants.list({ scope: "project", kinds: ["root"], includeStale: true, fresh: true })
         .find((participant) => participant.id === id)
       : this.participants.lastKnown?.(id)?.participant;
-    if (!root || root.kind !== "root") return undefined;
+    return root && this.#eligibleRetainedRoot(root) ? root : undefined;
+  }
+
+  #eligibleRetainedRoot(root: FabricParticipantInfo): boolean {
+    // Names and exact ids share the same lease-independent native eligibility. A stalled
+    // writer, reload/exit, dead lineage or lapsed bridge must never gain a new route by name.
+    if (this.participants.writeStalled?.() || root.kind !== "root") return false;
     // Reload leases are a hard bound, not an ordinary heartbeat flap; an exit is never routable.
-    if (["reloading", "stopping"].includes(root.status)) return undefined;
+    if (["reloading", "stopping"].includes(root.status)) return false;
     // A mirrored lease lapses when the mesh bridge stops: nothing would carry the reply, so the
     // sender gets the lapse error at once instead of an acknowledgement timeout (smarty-dev#2004).
-    if (root.remoteHost || this.participants.lineageAlive?.(root.rootId) === false) return undefined;
-    return root;
+    return !root.remoteHost && this.participants.lineageAlive?.(root.rootId) !== false;
   }
 
   #rootRouteSnapshot(id: string): FabricParticipantInfo | undefined {
@@ -158,8 +163,11 @@ export class AgentMessageRouter {
   #messageTarget(id: string): string {
     const target = this.#sessionTarget(id);
     if (this.mainAgent.matches(target) || this.#get(target) || this.#lapsedRoot(target)) return target;
-    const matches = this.participants.list?.({ scope: "project", kinds: ["root"], fresh: true })
-      .filter((participant) => participant.name === target) ?? [];
+    // A published name survives an ordinary lease lapse just like its exact session id.
+    // Use fresh raw presence, but add only eligible retained native roots to the live set.
+    const matches = this.participants.list?.({ scope: "project", kinds: ["root"], includeStale: true, fresh: true })
+      .filter((participant) => participant.name === target &&
+        (!participant.stale || this.#eligibleRetainedRoot(participant))) ?? [];
     if (matches.length > 1) {
       throw new Error(`Ambiguous Fabric participant: ${id} (${matches.map((participant) => participant.id).sort().join(", ")}); use an exact id`);
     }

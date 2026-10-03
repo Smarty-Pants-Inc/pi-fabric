@@ -116,6 +116,7 @@ describe("core override prompt guidance", () => {
         systemPromptOptions: { skills: [] },
       }, {});
       const prompt = (result as { systemPrompt: string }).systemPrompt;
+      expect(result.systemPromptOptions.sections.fabric_execution).toContain("pi.read");
       expect(prompt).toContain("pi.read");
       expect(prompt).toContain("structure-aware reads");
       expect(prompt).toContain("Prefer symbol IDs when available.");
@@ -162,6 +163,8 @@ describe("core override prompt guidance", () => {
         const guidedResult = await handler(guidedEvent, modelContext);
         const repeatedResult = await handler(guidedEvent, modelContext);
         const guidedPrompt = (guidedResult as { systemPrompt: string }).systemPrompt;
+        expect(guidedResult.systemPromptOptions.sections.skills).toContain("Use `pi.read` inside `fabric_exec`");
+        expect(guidedResult.systemPromptOptions.sections.skills).toContain("/skills/active/SKILL.md");
         expect((repeatedResult as { systemPrompt: string }).systemPrompt).toBe(guidedPrompt);
         expect(guidedPrompt).toContain("Pi Fabric full code mode");
         expect(guidedPrompt).toContain("Custom DeepSeek execution profile");

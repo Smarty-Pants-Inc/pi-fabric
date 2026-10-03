@@ -53,8 +53,8 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            # The hosted Windows image must already provide rg on PATH.
-            command -v rg || { echo "ripgrep is not provisioned on this Windows runner" >&2; exit 1; }
+            # Hosted windows-latest (Paul's PR-time exception) has choco; rg is not preinstalled.
+            command -v rg || choco install ripgrep -y --no-progress
           else
             sudo apt-get update
             sudo apt-get install -y ripgrep bubblewrap python3

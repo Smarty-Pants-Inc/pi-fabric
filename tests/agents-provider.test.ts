@@ -98,10 +98,10 @@ describe("explicit Astra launch guard (#3134)", () => {
   const model = "cliproxyapi/gpt-6-astra";
   const refusal = "named passes use cliproxyapi/gpt-6.1-sol thinking max; otherwise omit model (role default)";
   const reason = "  Explicit exception for a bounded compatibility probe  ";
-  const argsFor = (action: string): Record<string, unknown> => action === "create"
+  const argsFor = (action: string): Record<string, unknown> => action === "create" || action === "createActor"
     ? { name: "guard-probe", instructions: "Work." } : { task: "Work.", transport: "process" };
 
-  it.each(["run", "spawn", "create"] as const)("%s refuses missing, blank and non-string reasons before any side effect", async action => {
+  it.each(["run", "spawn", "create", "createActor"] as const)("%s refuses missing, blank and non-string reasons before any side effect", async action => {
     const { provider, agents, actors, globalActors } = setup();
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
@@ -139,20 +139,20 @@ describe("explicit Astra launch guard (#3134)", () => {
     expect(await provider.invoke("run", { task: "Work.", model: selection, modelReason: reason, transport: "process" }, context))
       .toMatchObject({ status: "completed", modelReason: reason });
   });
-  it("create retains the reason in persistent definitions and activation run records", async () => {
+  it.each(["create", "createActor"] as const)("%s retains the reason in persistent definitions and activation run records", async action => {
     const { provider, actors, agents, globalActors } = setup();
-    const actor = await provider.invoke("create", { ...argsFor("create"), model, modelReason: reason }, context) as FabricActorInfo;
+    const actor = await provider.invoke(action, { ...argsFor(action), model, modelReason: reason }, context) as FabricActorInfo;
     expect(actors.definition(actor.id)).toMatchObject({ model, modelReason: reason });
     const message = await provider.invoke("ask", { id: actor.id, message: "Work." }, context) as { runId: string };
     expect(agents.status(message.runId)).toMatchObject({ status: "completed", model, modelReason: reason });
     expect(agents.list()[0]).toMatchObject({ modelReason: reason });
-    const template = await provider.invoke("create", { ...argsFor("create"), name: "guard-template", scope: "global", model, modelReason: reason }, context) as FabricActorInfo;
+    const template = await provider.invoke(action, { ...argsFor(action), name: "guard-template", scope: "global", model, modelReason: reason }, context) as FabricActorInfo;
     globalActors.update(template.id, { instructions: "Updated." });
     const definition = globalActors.list().find(entry => entry.id === template.id)!;
     expect(globalActors.toRequest(definition)).toMatchObject({ model, modelReason: reason });
   });
 
-  it.each(["run", "spawn", "create"] as const)("%s leaves omitted, inherited, other and alias model selections unaffected", async action => {
+  it.each(["run", "spawn", "create", "createActor"] as const)("%s leaves omitted, inherited, other and alias model selections unaffected", async action => {
     const { provider, agents } = setup([], [], undefined, {
       agentsConfig: { model }, modelsConfig: { aliases: { probe: { targets: [model] } } },
     });
@@ -169,17 +169,22 @@ describe("explicit Astra launch guard (#3134)", () => {
     }
   });
 
-  it.each(["run", "spawn", "create"] as const)("public guest %s receives the exact refusal", async action => {
-    const { provider } = setup();
+  it.each(["run", "spawn", "create", "createActor"] as const)("public guest %s receives the exact refusal", async action => {
+    const { provider, agents, actors, globalActors } = setup();
     const registry = new ActionRegistry(); registry.register(provider);
     const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
     const service = new FabricExecutionService(registry, config);
-    const result = await service.execute({
-      code: `try { await agents.${action}(${JSON.stringify({ ...argsFor(action), model })}); return "unexpected admission"; } catch (error) { return error.message; }`,
-      signal: undefined, parentToolCallId: "astra-guard-guest", context: context.extensionContext, onPartial() {},
-    });
-    expect(result.success, result.error).toBe(true);
-    expect(result.value).toBe(refusal);
+    for (const modelReason of [undefined, " \t\n "]) {
+      const result = await service.execute({
+        code: `try { await agents.${action}(${JSON.stringify({ ...argsFor(action), model, modelReason })}); return "unexpected admission"; } catch (error) { return error.message; }`,
+        signal: undefined, parentToolCallId: "astra-guard-guest", context: context.extensionContext, onPartial() {},
+      });
+      expect(result.success, result.error).toBe(true);
+      expect(result.value).toBe(refusal);
+      expect(agents.list()).toEqual([]);
+      expect(actors.list()).toEqual([]);
+      expect(globalActors.list()).toEqual([]);
+    }
   });
 });
 

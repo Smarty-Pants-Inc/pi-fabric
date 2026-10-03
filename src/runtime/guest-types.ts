@@ -691,6 +691,10 @@ interface FabricActorActivationSkipRule {
 }
 type FabricActorActivationFilter = Array<"hold" | "never-message-events" | FabricActorActivationSkipRule>;
 type FabricActorValidWhile = (facts: Readonly<FabricActorValidityFacts>) => FabricActorValidityDecision;
+/** Exactly one instruction source; file bytes are verified on the owning host. */
+type FabricActorInstructionsSource =
+  | { instructions: string; instructionsFile?: never; sha256?: never }
+  | { instructions?: never; instructionsFile: string; sha256: string };
 interface FabricActorRequestBase {
   /** Deduplicate durable creates on the same host; reuse for retries within 10 minutes (last 256 results). */
   idempotencyKey?: string;
@@ -698,7 +702,6 @@ interface FabricActorRequestBase {
   kernel?: FabricKernel | "inherit";
   scope?: "session" | "project" | "global";
   name: string;
-  instructions: string;
   events?: FabricActorHostEvent[];
   topics?: string[];
   responseMode?: "text" | "directive";
@@ -728,13 +731,14 @@ interface FabricActorRequestBase {
   validWhile?: FabricActorValidWhile;
   residency?: FabricParticipantResidency;
 }
-type FabricActorRequest = FabricActorRequestBase & (
+type FabricActorRequest = FabricActorRequestBase & FabricActorInstructionsSource & (
   | { delivery?: "mailbox"; triggerTurn?: false }
   | { delivery: "nextTurn"; triggerTurn?: false }
   | { delivery: "steer" | "followUp"; triggerTurn: boolean }
 );
 /** A stored global template. The registry keeps validWhile as source; it is not callable. */
 type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_ms"> & {
+  instructions: string;
   id: string;
   createdAt: number;
   updatedAt: number;
@@ -939,6 +943,8 @@ interface FabricAgentsApi {
   stop(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
   cleanup(args: FabricAgentTargetArgs & { deleteBranch?: boolean; delete_branch?: boolean }): Promise<{ cleaned: boolean }>;
   create(args: FabricActorRequest): Promise<FabricActorInfo>;
+  /** Alias of create; file paths are resolved by the owning host. */
+  createActor(args: FabricActorRequest): Promise<FabricActorInfo>;
   setModel(args: { id: string; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
   setThinking(args: { id: string; thinking?: FabricThinking; scope?: FabricActorBindingScope | "global" }): Promise<FabricActorInfo>;
@@ -954,9 +960,8 @@ interface FabricAgentsApi {
     triggerTurn: boolean;
     scope?: "project" | "global";
   }): Promise<FabricActorInfo>;
-  setInstructions(args: {
+  setInstructions(args: FabricActorInstructionsSource & {
     id: string;
-    instructions: string;
     scope?: "project" | "global";
     /** Required to shrink the body by more than 80%. */
     replace?: boolean;

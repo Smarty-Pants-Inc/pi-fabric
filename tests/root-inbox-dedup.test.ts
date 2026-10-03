@@ -19,7 +19,7 @@ const setup = (maxEventBytes = 64 * 1024) => {
   const entries: unknown[] = [];
   let now = Date.now();
   vi.spyOn(Date, "now").mockImplementation(() => now);
-  const box = (options = {}, identity = me) => new RootInbox(mesh, identity, () => [identity.id], { now: () => now, steerGraceMs: 0, ...options });
+  const box = (options = {}, identity = me) => new RootInbox(mesh, identity, { now: () => now, steerGraceMs: 0, ...options });
   const pi = {
     sendMessage: (message: unknown) => entries.push({ type: "custom_message", timestamp: new Date(now).toISOString(), ...(message as object) }),
   } as unknown as ExtensionAPI;

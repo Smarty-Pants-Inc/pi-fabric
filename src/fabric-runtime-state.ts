@@ -595,17 +595,10 @@ export class FabricRuntimeState {
       this.#config.mesh.maxReadEvents,
       { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: this.#config.mesh.lockProtocol },
     );
-    // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
-    // Names are selectors, not ownership: admit a published alias only when the fresh project
-    // directory resolves it to this one root, just like ordinary name-addressed routing. In
-    // particular, two unnamed Mains must not both recover a shadow addressed to shared `main`.
-    // Exact ids remain recoverable independently of presence/name ambiguity.
+    // A Main reconciles missed work addressed to its exact root id (smarty-dev#754).
+    // Published names remain live routing selectors, never durable inbox addresses.
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
-      ? new RootInbox(this.#mesh, identity, () => {
-        const name = rootParticipantName(this.pi.getSessionName?.());
-        const matches = this.#participants?.list({ scope: "project", kinds: ["root"], name, fresh: true }) ?? [];
-        return matches.length === 1 && matches[0]!.id === mainAgentId ? [mainAgentId, name] : [mainAgentId];
-      })
+      ? new RootInbox(this.#mesh, identity)
       : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     this.#participants = new ParticipantDirectory(this.#mesh, {

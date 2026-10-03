@@ -206,7 +206,7 @@ describe("round-1 native root inbox read provenance", () => {
       const own: MeshIdentity = { ...identity, id: `session:${manager.getSessionId()}` };
       const store = new MeshStore(root, 64 * 1024, 100);
       const provider = new MeshProvider(store, own, {} as ConstructorParameters<typeof MeshProvider>[2]);
-      const inbox = new RootInbox(store, own, () => [own.id], { steerGraceMs: 0 });
+      const inbox = new RootInbox(store, own, { steerGraceMs: 0 });
       inbox.start();
       expect(await provider.invoke("publish", { topic: "fleet.report", to: own.id, text }, invocation(manager)))
         .toHaveProperty("notice", notice);

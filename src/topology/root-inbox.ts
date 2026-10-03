@@ -20,9 +20,9 @@ import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 export const ROOT_INBOX_PREFIX = "topology/inbox/";
 export const WORK_TOPIC_PREFIX = "fleet.";
 /**
- * The canonical id namespace of root sessions. A root accepts a name in it only when the name is
- * its own id, never a session name that looks like one: the mesh bridge routes ids in this
- * namespace to other hosts, so native name delivery must stay disjoint from it (smarty-dev#2004).
+ * The canonical id namespace of root sessions. Live name routing must stay disjoint from it:
+ * the mesh bridge routes these ids to other hosts (smarty-dev#2004). Inbox recovery accepts
+ * only its own exact id, never a published name or a name that looks like another root's id.
  */
 export const ROOT_ID_PREFIX = "session:";
 export const ROOT_INBOX_CUSTOM_TYPE = "pi-fabric-inbox";
@@ -131,8 +131,6 @@ export class RootInbox {
   constructor(
     readonly mesh: MeshStore,
     readonly identity: MeshIdentity,
-    /** Currently admitted ids/names (id first); callers must withdraw ambiguous name aliases. */
-    readonly names: () => readonly string[],
     readonly options: { now?: () => number; steerGraceMs?: number; pageSize?: number; wakeCooldownMs?: number; horizonMs?: number } = {},
   ) {}
 
@@ -161,10 +159,9 @@ export class RootInbox {
         const missing = state.pending.ids.filter((id) => !found.has(id) &&
           !this.#delivered.has(eventReceipt(id)) && !session.delivered?.has(eventReceipt(id)));
         // A native delivery can arrive after the pending save. Recheck it on recovery too.
-        const names = this.#deliveryNames();
         const events = pending.filter((event) => {
-          // A saved pending batch is not authority for a name which has since become ambiguous.
-          if (!this.#addressed(event, names)) return false;
+          // Legacy pending batches may contain names; only this exact root id is authority.
+          if (!this.#addressed(event)) return false;
           if (this.#stale(event)) { skippedStale++; return false; }
           if (!this.#steered(event, session)) return true;
           this.#remember(eventReceipts(event));
@@ -237,14 +234,12 @@ export class RootInbox {
     const state = this.#load();
     const pending = state.pending && !session.holdsBatch(state.pending.ids) ? state.pending : undefined;
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
-    const names = this.#deliveryNames();
     return [...(pending ? this.#reread(state.after, pending).filter((event) =>
-      this.#addressed(event, names) && !this.#stale(event) && !this.#steered(event, session)) : []), ...this.#scan(after, session, false).events];
+      this.#addressed(event) && !this.#stale(event) && !this.#steered(event, session)) : []), ...this.#scan(after, session, false).events];
   }
 
   #scan(after: number, session: RootInboxSession, bounded = true, onDelivered?: (event: MeshEvent) => void): RootInboxBatch {
     const now = this.#now();
-    const names = this.#deliveryNames();
     const cutoff = now - (this.options.steerGraceMs ?? STEER_GRACE_MS);
     const pageSize = this.options.pageSize ?? 500;
     const events: MeshEvent[] = [];
@@ -257,7 +252,7 @@ export class RootInbox {
       const page = this.mesh.read({ after: through, limit: pageSize });
       for (const event of page) {
         if (event.createdAt > cutoff) return result();
-        if (this.#addressed(event, names)) {
+        if (this.#addressed(event)) {
           if (this.#stale(event)) skippedStale++;
           else if (this.#steered(event, session)) onDelivered?.(event);
           else if (!eventReceipts(event).some((id) => seen.has(id))) {
@@ -276,13 +271,10 @@ export class RootInbox {
     }
   }
 
-  #deliveryNames(): ReadonlySet<string> {
-    return new Set(this.names().filter((name) =>
-      name.trim() && (name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX))));
-  }
-
-  #addressed(event: MeshEvent, names: ReadonlySet<string>): boolean {
-    return event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to);
+  #addressed(event: MeshEvent): boolean {
+    // Display names (including caller-relative `main`) are live routing selectors, not
+    // durable mailbox addresses. Recovery never bypasses that router's ambiguity rules.
+    return event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to === this.identity.id;
   }
 
   // Positive delivery evidence only, qualified by sender and this recipient's state key.

@@ -142,8 +142,6 @@ it("lists the Pi-named Main through agents.peers/members and reaches its current
   const owner = main(root, "aaaaaaaa-0000-4000-8000-000000000001", "lucky-ios-lead");
   const reviewer = main(root, "bbbbbbbb-0000-4000-8000-000000000002");
   const ownerId = "session:aaaaaaaa-0000-4000-8000-000000000001";
-  // A delivered batch is recorded before the following inbox read, as on a real Pi host.
-  const held = { holdsBatch: () => true, holdsSteer: () => false };
   try {
     await owner.runtime.initialize(owner.context, config);
     await reviewer.runtime.initialize(reviewer.context, config);
@@ -157,16 +155,10 @@ it("lists the Pi-named Main through agents.peers/members and reaches its current
     expect(await reviewer.invoke("agents.self")).toMatchObject({ name: "main", kind: "root" });
     const label = owner.runtime.participantInfos().find(p => p.id === ownerId)?.label;
     const deliverByName = async (name: string) => {
-      // Age the shadow, not the directory's live presence leases: recovery now validates
-      // the same unambiguous current project roster as routing.
-      const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() - 61_000);
-      try {
-        await reviewer.runtime.mesh.publish({ topic: "fleet.work.root-name", kind: "ask", to: name,
-          from: { id: "review-actor", name: "review-actor", kind: "actor" }, text: `hello ${name}` });
-      } finally { clock.mockRestore(); }
-      expect((await owner.runtime.nextRootInbox(held))?.events).toEqual(expect.arrayContaining([
-        expect.objectContaining({ to: name, text: `hello ${name}` }),
-      ]));
+      // Names remain live selectors after the mailbox-recovery scope cut.
+      await expect(reviewer.invoke("agents.followUp", { id: name, message: `hello ${name}` }))
+        .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+      received(owner, "session:bbbbbbbb-0000-4000-8000-000000000002", `hello ${name}`, "followUp");
     };
     await deliverByName("lucky-ios-lead");
     owner.rename("renamed-lead");

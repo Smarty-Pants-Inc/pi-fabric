@@ -115,7 +115,7 @@ describe.each([
   it.each(["first inference", "no settle wake", "no next-prompt duplicate"])("root inbox: %s", async check => {
     const h = await indexFixture(capability);
     const mesh = new MeshStore(path.join(root(), "mesh"), 64 * 1024, 100);
-    const inbox = new RootInbox(mesh, host, () => [host.id], { steerGraceMs: 0 });
+    const inbox = new RootInbox(mesh, host, { steerGraceMs: 0 });
     inbox.start();
     const events = [];
     for (const from of [host, remote]) events.push(await mesh.publish({ from, to: host.id,

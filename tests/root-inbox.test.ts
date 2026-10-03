@@ -29,7 +29,7 @@ const setup = () => {
   let offset = 0;
   const clock = { now: () => Date.now() + offset, advance: (ms: number) => { offset += ms; } };
   const inbox = (steerGraceMs = 0, wakeCooldownMs = 5 * 60_000) =>
-    new RootInbox(mesh, me, () => [me.id, "fabric-v2"], { now: clock.now, steerGraceMs, wakeCooldownMs });
+    new RootInbox(mesh, me, { now: clock.now, steerGraceMs, wakeCooldownMs });
   const work = (text: string, to = me.id, topic = "fleet.work.pi-fabric.1", key = text, kind = "ack") =>
     mesh.publish({ topic, to, kind, from: peer, text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key } });
   const texts = (events: MeshEvent[]) => events.map((event) => event.text);
@@ -41,7 +41,7 @@ afterEach(() => {
 });
 
 describe("RootInbox", () => {
-  it("starts at the present, then brings work events addressed to this root by id or name", async () => {
+  it("starts at the present, then brings work events addressed to this root by exact id only", async () => {
     const { clock, inbox, work, texts } = setup();
     await work("before the inbox existed");
     const box = inbox();
@@ -51,44 +51,44 @@ describe("RootInbox", () => {
     await work("to someone else", "session:other");
     await work("not a work topic", me.id, "ops.owner");
     clock.advance(1);
-    expect(texts((await box.next(held)).events)).toEqual(["by id", "by name"]);
+    expect(texts((await box.next(held)).events)).toEqual(["by id"]);
     expect((await box.next(held)).events).toEqual([]);
   });
 
-  it("revalidates name admission for pending retries and idle wakes, including a restart", async () => {
-    const { mesh, clock, work, texts } = setup();
-    let names = [me.id, "fabric-v2"];
-    const inbox = () => new RootInbox(mesh, me, () => names, { now: clock.now, steerGraceMs: 0 });
+  it("rejects legacy name-addressed pending work on retry and idle wake, retaining exact ids", async () => {
+    const { mesh, clock, inbox, work, texts } = setup();
     const first = inbox();
     first.start();
-    await work("name pending", "fabric-v2");
-    await work("exact pending");
+    const after = mesh.latestSequence();
+    const named = await work("legacy name pending", "fabric-v2");
+    const exact = await work("exact pending");
     clock.advance(1);
-    expect(texts((await first.next(notHeld)).events)).toEqual(["name pending", "exact pending"]);
-    // The runtime withdraws an alias when another live root publishes it. Persisted pending
-    // admission is not authority to retry an address which no longer resolves uniquely.
-    names = [me.id];
+    // Simulate durable pending admission by the pre-cut runtime, not a new alias API.
+    await mesh.put({ key: first.key, identity: me, value: {
+      after, pending: { through: exact.sequence, ids: [named.id, exact.id] },
+    } });
     const restarted = inbox();
     expect(texts((await restarted.wake(notHeld, () => true))!.events)).toEqual(["exact pending"]);
     expect(texts((await restarted.next(notHeld)).events)).toEqual(["exact pending"]);
     expect((await restarted.next(held)).events).toEqual([]);
-    names = [me.id, "fabric-v2"];
     expect((await inbox().next(notHeld)).events).toEqual([]);
     await restarted.close();
   });
 
-  it("does not wake for a pending batch whose name admission was withdrawn", async () => {
-    const { mesh, clock, work } = setup();
-    let names = [me.id, "fabric-v2"];
-    const box = new RootInbox(mesh, me, () => names, { now: clock.now, steerGraceMs: 0 });
-    box.start();
-    await work("only ambiguous pending", "fabric-v2");
+  it.each(["main", "fabric-v2", "conflicting-name"])("never wakes for a legacy pending name %s", async (name) => {
+    const { mesh, clock, inbox, work } = setup();
+    const first = inbox();
+    first.start();
+    const after = mesh.latestSequence();
+    const named = await work("legacy name must not inject", name);
     clock.advance(1);
-    expect((await box.next(notHeld)).events).toHaveLength(1);
-    names = [me.id];
-    expect(await box.wake(notHeld, () => true)).toBeUndefined();
-    expect((await box.next(notHeld)).events).toEqual([]);
-    await box.close();
+    await mesh.put({ key: first.key, identity: me, value: {
+      after, pending: { through: named.sequence, ids: [named.id] },
+    } });
+    const restarted = inbox();
+    expect(await restarted.wake(notHeld, () => true)).toBeUndefined();
+    expect((await restarted.next(notHeld)).events).toEqual([]);
+    await restarted.close();
   });
 
   it("leaves a young event for a later reconcile, and never moves past it", async () => {

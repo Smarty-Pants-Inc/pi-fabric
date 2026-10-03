@@ -108,6 +108,20 @@ export const runTreeExitVeto = (
   }
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
+    // A parent's populated=0 scope may still contain empty nested cgroups.
+    // Retire only checked nested run scopes bottom-up, before parent rmdir.
+    // Unknown children/receipts/identities veto the entire parent collection.
+    const nested = path.join(directory, "nested");
+    let hasNested = false;
+    try { fs.lstatSync(nested); hasNested = true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (hasNested) {
+      if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
+      for (const name of fs.readdirSync(nested)) {
+        const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requireDescendantExit);
+        if (reason) return reason;
+      }
+    }
     const scratchVeto = runScratchExitVeto(directory, expired);
     if (scratchVeto) return scratchVeto;
     if (fs.existsSync(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
@@ -157,17 +171,6 @@ export const runTreeExitVeto = (
       if (!validPid || (alive && (currentStart === undefined || currentStart === savedStart))) {
         return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
       }
-    }
-    const nested = path.join(directory, "nested");
-    try { fs.lstatSync(nested); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-    if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
-    for (const name of fs.readdirSync(nested)) {
-      // Preserve the caller's ownership mode through the whole tree. Removal
-      // callers explicitly require descendant exit; observational callers may
-      // use the independent terminal PID/birth proof without authorizing deletion.
-      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requireDescendantExit);
-      if (reason) return reason;
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
 };

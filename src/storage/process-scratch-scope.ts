@@ -5,6 +5,10 @@ import { randomUUID } from "node:crypto";
 const CGROUP_ROOT = "/sys/fs/cgroup";
 const PREFIX = "pi-fabric-scratch-";
 const CGROUP2_MAGIC = 0x63677270;
+// The shell gate is fixed, but its ELF/library initialization must also be
+// proved hook-free. Library search/charset hooks can run .init code just like
+// LD_PRELOAD, before the first shell builtin has attached to the scope.
+export const SCRATCH_GATE_LOADER_HOOKS = ["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "LD_ORIGIN_PATH", "GCONV_PATH"] as const;
 export interface ProcessScratchScope { directory: string; dev: number; ino: number; bootId: string }
 export interface ScopedScratchLaunch extends ProcessScratchScope { joinedFile: string; launchNonce: string }
 const bootId = (): string => fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
@@ -28,9 +32,10 @@ const scopeStat = (directory: string): fs.Stats => {
  * session-start work, systemd invocation, privilege elevation or PID signalling. */
 export const createProcessScratchScope = (): ProcessScratchScope | undefined => {
   if (process.platform !== "linux") return;
-  // Runtime/library preloads can fork before the self-attachment gate. Preserve
-  // inherited behavior, but do not advertise complete custody for those launches.
-  if (["NODE_OPTIONS", "BUN_OPTIONS", "LD_PRELOAD", "LD_AUDIT"].some(key => process.env[key]?.trim())) return;
+  // Library hooks can execute before the fixed shell gate. Runtime-only
+  // NODE_OPTIONS/BUN_OPTIONS and project preloads execute AFTER its attachment,
+  // so they no longer disable complete custody (including ordinary heap flags).
+  if (SCRATCH_GATE_LOADER_HOOKS.some(key => process.env[key]?.trim())) return;
   let directory: string | undefined;
   try {
     const membership = fs.readFileSync("/proc/self/cgroup", "utf8").trim().match(/^0::(\/[^\n]*)$/)?.[1];
@@ -72,9 +77,10 @@ export const removeEmptyProcessScratchScope = (scope: ProcessScratchScope): bool
   } catch { return false; }
 };
 
-/** Fixed pre-import gate. Only runtime builtins execute before self-attachment;
- * the worker (and every ordinary fork/exec, including setsid/detached tools)
- * inherits the kernel scope. Deliberate same-uid cgroup migration is outside
+/** Identity/receipt gate after the fixed shell gate attached before runtime
+ * startup (including configured preloads). The worker and every ordinary
+ * fork/exec, including setsid/detached tools, inherit the kernel scope.
+ * Deliberate same-uid cgroup migration is outside
  * the runner contract, just as deliberate tampering with its custody files is. */
 export const scopedWorkerArguments = (scope: ScopedScratchLaunch, worker: string, args: string[], cwd: string): string[] => {
   const source = `import fs from "node:fs"; import { pathToFileURL } from "node:url";

@@ -181,6 +181,14 @@ setInterval(() => {}, 1000);`, async (_handle, root) => {
 });
 
 describe("spawnDetached", () => {
+  it.each(["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "LD_ORIGIN_PATH", "GCONV_PATH"])("refuses a scoped launch before spawn when the explicit environment has %s", async key => {
+    vi.mocked(spawn).mockClear();
+    const scope = { directory: "unused", dev: 1, ino: 1, bootId: "unused", joinedFile: "unused", launchNonce: "unused" };
+    await expect(spawnDetached("worker.mjs", [], process.cwd(), undefined, { ...process.env, [key]: "synthetic-preload" }, scope))
+      .rejects.toMatchObject({ name: "WorkerNotStartedError", message: expect.stringContaining("launch gate has a loader hook") });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it.each(["confirmed", "timeout"] as const)("bounds the independent captured-close join (%s)", async outcome => {
     vi.useFakeTimers();
     const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn() });

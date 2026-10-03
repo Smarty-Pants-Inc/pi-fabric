@@ -20,7 +20,9 @@ const sandbox = () => {
   roots.push(root);
   const short = path.join(root, "short");
   const disk = path.join(root, "disk");
-  fs.mkdirSync(short);
+  // The mocked OS-selected allocation ancestor must meet the same custody
+  // policy as a real private OS TMPDIR, regardless of the invoking umask.
+  fs.mkdirSync(short, { mode: 0o700 });
   if (process.platform === "win32") fs.mkdirSync(disk);
   vi.spyOn(os, "tmpdir").mockReturnValue(process.platform === "win32" ? disk : short);
   vi.stubEnv("PI_FABRIC_TMPDIR", process.platform === "win32" ? undefined : disk);

@@ -1491,6 +1491,7 @@ export const writeJsonAtomic = (
     descriptor = fs.openSync(temporaryPath, "wx", mode);
     fs.writeFileSync(descriptor, `${JSON.stringify(document, null, 2)}\n`, "utf8");
     fs.fsyncSync(descriptor);
+    const publishedInode = fs.fstatSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
     if (expectedSource === null) {
@@ -1509,9 +1510,10 @@ export const writeJsonAtomic = (
       }
     }
     renameAtomic(temporaryPath, resolvedPath);
-    // Persist newly created ancestors and symlink parents too; POSIX barrier errors
-    // must not be mistaken for an accepted durable configuration update.
-    syncPathNamespace(filePath);
+    // Confirm the actual publication directory even if the caller namespace was
+    // retargeted, then require that namespace to identify the inode we published.
+    syncPathNamespace(resolvedPath, publishedInode);
+    if (filePath !== resolvedPath) syncPathNamespace(filePath, publishedInode);
   } catch (error) {
     if (descriptor !== undefined) fs.closeSync(descriptor);
     fs.rmSync(temporaryPath, { force: true });

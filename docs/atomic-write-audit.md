@@ -102,6 +102,33 @@ journal retirement. `atomic-archive-receipt.test.ts` and its unclean-exit fixtur
 cover process replacement with accepted backlog and unavailable confirmation,
 then storage-only recovery without new ingress or graceful close.
 
+## Round 3 reset finalization and caller identity
+
+- **F26:** a Claude reset journals its trigger and source byte count alongside
+  archive inode identity. Preservation confirmation does not retire that native
+  selector obligation. Boundary/idle retry clears `runnerSessionId`, durably
+  publishes the registry, then retires the journal and prunes. A replacement host
+  finishes the same reset without another size trigger. Pi header repair remains
+  preservation-only and retains its existing retirement ordering.
+- **S5:** the initial post-readiness request poll uses the same owned retry boundary
+  as timer polls. A failed response-file barrier retains the live host, its timer
+  and original completed response, without replaying the mutation.
+- **F27:** configuration confirmation binds the temporary file's inode to both the
+  actual publication path and the caller's original namespace. The publication
+  directory receives its barrier even if a configuration symlink was retargeted;
+  a namespace that identifies a different inode is rejected.
+- **Windows fixture:** archive failure intercepts the post-rename `lstatSync` walk,
+  not an unused `statSync` call. The fixture asserts the fault fired and its journal
+  remains. The successor test verifies blocked admission before storage recovery;
+  both native-platform and injected-win32 branches run without skipping Windows.
+
+Regressions in `actor-session-reset.test.ts`, `atomic-archive-receipt.test.ts`,
+`residency-host.test.ts` and `config-migrations.test.ts` cover live Claude recovery,
+failed registry publication, unclean process replacement, pre-start queued
+requests and three-directory configuration retargeting. Claude uses the actual
+source worker and fake native CLI; recovered launches must omit `--resume`.
+These are A's reset/config/resident-command receipts, not PR B's task terminals.
+
 ## Limits and before-merge holds
 
 Filesystems/devices must honor fsync. Windows skips unsupported directory barriers

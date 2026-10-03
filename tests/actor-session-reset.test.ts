@@ -97,6 +97,55 @@ afterEach(async () => {
 });
 
 describe("actor session rotation safety (smarty-dev#2847)", () => {
+  it.each(["archive", "registry"] as const)("#2479 R3 F26 finishes a Claude size reset after failed %s confirmation", async fault => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "claude-reset-")); roots.push(root);
+    const invocationLog = path.join(root, "claude.jsonl"), previousLog = process.env.FAKE_CLAUDE_LOG;
+    process.env.FAKE_CLAUDE_LOG = invocationLog;
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("src/worker.ts"), claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), runRoot: path.join(root, "runs"),
+    });
+    const actors = new ActorManager("claude-reset", { id: "session:claude-reset", name: "main", kind: "main" },
+      new MeshStore(path.join(root, "mesh"), 65536, 100), { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+      { actorRoot: path.join(root, "actors"), persistent: true, maxSessionBytes: 64, preparationRetryMs: 25 });
+    managers.push(actors, agents);
+    const launch = vi.spyOn(agents, "run"), namespace = atomic.syncPathNamespace, write = atomic.writeJsonAtomic;
+    let unavailable = true, failures = 0, archived: string | undefined;
+    try {
+      const actor = await actors.create({ name: "native size reset", instructions: "Work.", residency: "durable", runner: "claude", model: "claude/haiku", transport: "process" });
+      await actors.ask(actor.id, "first native context"); await waitFor(() => actors.inFlightCount() === 0, 15000);
+      const registry = path.join(root, "actors", "actors.json"), pending = `${actor.sessionFile}.archive-pending.json`;
+      expect(JSON.parse(fs.readFileSync(registry, "utf8")).actors[0].runnerSessionId).toBe("11111111-1111-4111-8111-111111111111");
+      expect(fs.statSync(actor.sessionFile!).size).toBeGreaterThan(64);
+      const contents = fs.readFileSync(actor.sessionFile!, "utf8");
+      const prior = ["20000101T000000000Z", "20000102T000000000Z", "20000103T000000000Z"].map(stamp => `${actor.sessionFile}.${stamp}.bak`);
+      for (const file of prior) fs.copyFileSync(actor.sessionFile!, file);
+      vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+        if (file.startsWith(`${actor.sessionFile}.`) && file.endsWith(".bak")) {
+          archived = file;
+          if (unavailable && fault === "archive") { failures++; throw new Error("archive reset confirmation unavailable"); }
+        }
+        namespace(file, inode);
+      });
+      vi.spyOn(atomic, "writeJsonAtomic").mockImplementation((file, value, options) => {
+        if (file === registry && archived && unavailable && fault === "registry") { failures++; throw new Error("reset registry unavailable"); }
+        write(file, value, options);
+      });
+      actors.tell(actor.id, "after native reset");
+      await waitFor(() => failures > 0, 15000); await new Promise(resolve => setTimeout(resolve, 150));
+      expect(launch).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(pending)).toBe(true);
+      expect(prior.every(file => fs.existsSync(file))).toBe(true);
+      unavailable = false;
+      await waitFor(() => launch.mock.calls.length === 2 && actors.inFlightCount() === 0, 15000);
+      expect(launch.mock.calls[1]![0].runnerSessionId).toBeUndefined();
+      const invocations = fs.readFileSync(invocationLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(invocations).toHaveLength(2); expect(invocations[1].argv).not.toContain("--resume");
+      expect(fs.existsSync(pending)).toBe(false);
+      expect(fs.readFileSync(archived!, "utf8")).toBe(contents);
+      expect(backups(actor.sessionFile!)).toHaveLength(2);
+    } finally { unavailable = false; if (previousLog === undefined) delete process.env.FAKE_CLAUDE_LOG; else process.env.FAKE_CLAUDE_LOG = previousLog; }
+  }, 40000);
+
   it.each(["size", "requested"] as const)("#2479 R2 F6 blocks %s boundary continuation until the complete archive receipt is confirmed", async (trigger) => {
     const { actors, runs, hold } = setup({ maxSessionBytes: trigger === "size" ? 64 : 0 });
     const actor = await actors.create({ name: `receipt boundary ${trigger}`, instructions: "Work.", residency: "durable", transport: "process" });

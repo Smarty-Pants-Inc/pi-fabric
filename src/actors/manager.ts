@@ -70,6 +70,8 @@ interface SessionArchiveReceipt {
   archived: string;
   dev: number;
   ino: number;
+  // Claude native-selector reset finalization is distinct from header preservation.
+  reset?: { trigger: "requested" | "size"; bytes: number };
 }
 
 interface ActorQueueItem {
@@ -1051,6 +1053,7 @@ export class ActorManager {
       });
     }
     this.#archiveSession(actor, "requested");
+    await this.#finishSessionReset(actor);
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
   }
@@ -1080,6 +1083,7 @@ export class ActorManager {
       // An absent source after a failed rename receipt is not launch authority.
       // Retry even without a reset waiter/size trigger (including after restart).
       this.#confirmSessionArchive(live.sessionFile);
+      trigger ??= this.#pendingSessionArchives.get(live.sessionFile)?.reset?.trigger;
       if (!trigger) return undefined;
       this.#archiveSession(live, trigger);
     } catch (error) {
@@ -1088,11 +1092,12 @@ export class ActorManager {
       // Propagate to the drain retry gate instead of continuing into admission.
       return Promise.reject(failure);
     }
-    return this.#publishDrainPresence(live).then(
+    return this.#finishSessionReset(live).then(() => this.#publishDrainPresence(live)).then(
       () => waiters?.forEach((waiter) => waiter.resolve(this.#publicInfo(this.#liveActor(live)))),
       (error: unknown) => {
         this.#recordPreparationFailure(live, error);
         waiters?.forEach((waiter) => waiter.reject(error instanceof Error ? error : new Error(String(error))));
+        throw error;
       },
     );
   }
@@ -1105,6 +1110,7 @@ export class ActorManager {
     }
     const file = actor.sessionFile;
     const recoveredArchive = this.#confirmSessionArchive(file);
+    const recoveredReset = this.#pendingSessionArchives.get(file)?.reset;
     // Preserve malformed content separately from the bounded rotation history.
     if (actor.runner === "pi" && fs.existsSync(file) && !this.#hasSessionHeader(file)) this.#ensurePiSession(actor);
     const dir = path.dirname(file);
@@ -1116,10 +1122,12 @@ export class ActorManager {
     };
     const listBackups = (): string[] => fs.readdirSync(dir)
       .filter((name) => name.startsWith(prefix) && name.endsWith(".bak") && !name.includes(".orphan-noheader"));
-    let bytes = 0;
-    let archived: string | null = null;
+    let bytes = recoveredReset?.bytes ?? 0;
+    let archived: string | null = recoveredArchive ?? null;
     let sourceFound = false;
-    try {
+    // A recovered reset already preserved the original transcript. A replacement
+    // Pi header published before a crash is not another transcript to rotate.
+    if (!recoveredReset) try {
       bytes = fs.statSync(file).size;
       sourceFound = true;
       const stamp = new Date().toISOString().replace(/[-:.]/g, "");
@@ -1127,7 +1135,7 @@ export class ActorManager {
       // that pruning left must not be reused: the new name would sort oldest and be pruned.
       const taken = listBackups().map(order).filter(([other]) => other === stamp).map(([, n]) => n);
       archived = taken.length === 0 ? `${file}.${stamp}.bak` : `${file}.${stamp}-${Math.max(...taken) + 1}.bak`;
-      this.#preserveSession(file, archived);
+      this.#preserveSession(file, archived, actor.runner === "claude" ? { trigger, bytes } : undefined);
     } catch (error) {
       // Only an absent source at the initial stat means there is nothing to
       // preserve. Namespace ENOENT after rename is a failed confirmation, not
@@ -1136,13 +1144,7 @@ export class ActorManager {
       archived = recoveredArchive ?? null;
       if (archived) bytes = fs.statSync(archived).size;
     }
-    const backups = listBackups()
-      .sort((left, right) => {
-        const [a, m] = order(left);
-        const [b, n] = order(right);
-        return a < b ? -1 : a > b ? 1 : m - n;
-      });
-    for (const name of backups.slice(0, -2)) fs.rmSync(path.join(dir, name), { force: true });
+    if (!this.#pendingSessionArchives.get(file)?.reset) this.#pruneSessionBackups(file);
     // Publish a complete header by temp + rename before a future writer can append.
     this.#ensurePiSession(actor);
     // A Claude-runner actor resumes by runner session id: drop it, too.
@@ -1162,8 +1164,23 @@ export class ActorManager {
     });
   }
 
+  #pruneSessionBackups(file: string): void {
+    const dir = path.dirname(file), prefix = `${path.basename(file)}.`;
+    const order = (name: string): [string, number] => {
+      const [stamp = "", n = "0"] = name.slice(prefix.length, -".bak".length).split("-");
+      return [stamp, Number(n) || 0];
+    };
+    const backups = fs.readdirSync(dir)
+      .filter(name => name.startsWith(prefix) && name.endsWith(".bak") && !name.includes(".orphan-noheader"))
+      .sort((left, right) => {
+        const [a, m] = order(left), [b, n] = order(right);
+        return a < b ? -1 : a > b ? 1 : m - n;
+      });
+    for (const name of backups.slice(0, -2)) fs.rmSync(path.join(dir, name), { force: true });
+  }
+
   /** Preserve the complete native append inode before replacement/pruning can depend on it. */
-  #preserveSession(file: string, archived: string): void {
+  #preserveSession(file: string, archived: string, reset?: SessionArchiveReceipt["reset"]): void {
     if (!this.#persistent) { fs.renameSync(file, archived); return; }
     const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
     try {
@@ -1172,12 +1189,12 @@ export class ActorManager {
       // Publish intent BEFORE rename: a successor must not mistake the missing
       // source/visible archive for a confirmed namespace. Bind it to this inode.
       const pending = `${file}.archive-pending.json`;
-      const receipt = { archived, dev: inode.dev, ino: inode.ino };
+      const receipt: SessionArchiveReceipt = { archived, dev: inode.dev, ino: inode.ino, ...(reset ? { reset } : {}) };
       this.#pendingSessionArchives.set(file, receipt);
       writeJsonAtomic(pending, receipt, { durable: true });
       fs.renameSync(file, archived);
       syncPathNamespace(archived, inode);
-      this.#retireSessionArchive(file);
+      if (!receipt.reset) this.#retireSessionArchive(file);
     } finally { fs.closeSync(fd); }
   }
 
@@ -1196,7 +1213,10 @@ export class ActorManager {
     }
     if (typeof receipt?.archived !== "string" || !receipt.archived.startsWith(`${file}.`) ||
       !receipt.archived.endsWith(".bak") || path.dirname(receipt.archived) !== path.dirname(file) ||
-      !Number.isFinite(receipt.dev) || !Number.isFinite(receipt.ino)) {
+      !Number.isFinite(receipt.dev) || !Number.isFinite(receipt.ino) ||
+      (receipt.reset !== undefined && (!receipt.reset ||
+        !["requested", "size"].includes(receipt.reset.trigger) ||
+        !Number.isFinite(receipt.reset.bytes) || receipt.reset.bytes < 0))) {
       throw new Error(`Invalid pending session archive receipt for ${file}`);
     }
     this.#pendingSessionArchives.set(file, receipt);
@@ -1218,9 +1238,17 @@ export class ActorManager {
       fs.fsyncSync(fd);
       if (source === file) fs.renameSync(file, receipt.archived);
       syncPathNamespace(receipt.archived, inode);
-      this.#retireSessionArchive(file);
+      if (!receipt.reset) this.#retireSessionArchive(file);
     } finally { fs.closeSync(fd); }
     return receipt.archived;
+  }
+
+  /** Clear and durably publish the native resume selector before retiring reset debt. */
+  async #finishSessionReset(actor: ManagedActor): Promise<void> {
+    if (!this.#pendingSessionArchives.get(actor.sessionFile)?.reset) return;
+    await this.#saveActors(new Set(), { durable: true });
+    this.#retireSessionArchive(actor.sessionFile);
+    this.#pruneSessionBackups(actor.sessionFile);
   }
 
   #retireSessionArchive(file: string): void {

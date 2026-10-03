@@ -10,6 +10,45 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 
+it("#2479 R3 F26 process replacement finishes the native Claude reset before launch", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-claude-receipt-")); roots.push(root);
+  const child = spawn("bun", [path.resolve("tests/fixtures/atomic-claude-reset-crash.ts"), root], { stdio: ["ignore", "pipe", "pipe"] });
+  const exited = once(child, "exit"); let output = "", errors = "";
+  child.stdout.on("data", chunk => { output += chunk.toString(); }); child.stderr.on("data", chunk => { errors += chunk.toString(); });
+  let status: unknown;
+  try { await until(() => child.exitCode !== null || child.signalCode !== null); status = await exited; }
+  finally { if (child.exitCode === null && child.signalCode === null) { child.kill("SIGKILL"); await exited; } }
+  expect(status, errors).toEqual([0, null]);
+  const produced = JSON.parse(output.trim()) as { actorId: string; file: string; archived: string; failures: number };
+  expect(produced.failures).toBeGreaterThan(0); expect(fs.existsSync(`${produced.file}.archive-pending.json`)).toBe(true);
+  const registry = path.join(root, "actors", "actors.json");
+  expect(JSON.parse(fs.readFileSync(registry, "utf8")).actors[0].runnerSessionId).toBe("11111111-1111-4111-8111-111111111111");
+  const namespace = atomic.syncPathNamespace; let unavailable = true, failures = 0;
+  vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+    if (file === produced.archived && unavailable) { failures++; throw new Error("native successor receipt unavailable"); }
+    namespace(file, inode);
+  });
+  const previousLog = process.env.FAKE_CLAUDE_LOG, log = path.join(root, "successor-claude.jsonl"); process.env.FAKE_CLAUDE_LOG = log;
+  const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { workerPath: path.resolve("src/worker.ts"), claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), runRoot: path.join(root, "successor-runs") }); managers.push(agents);
+  const run = agents.run.bind(agents);
+  const launch = vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
+    expect(JSON.parse(fs.readFileSync(registry, "utf8")).actors[0].runnerSessionId).toBeUndefined();
+    expect(fs.existsSync(`${produced.file}.archive-pending.json`)).toBe(false);
+    return run(request, signal);
+  });
+  const actors = new ActorManager("claude-crash", { id: "session:claude-crash", name: "main", kind: "main" },
+    new MeshStore(path.join(root, "mesh"), 65536, 100), { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+    { actorRoot: path.join(root, "actors"), persistent: true, maxSessionBytes: 64, preparationRetryMs: 25 }); managers.push(actors);
+  try {
+    await until(() => failures > 0 || launch.mock.calls.length > 0); await delay(150);
+    expect(launch).not.toHaveBeenCalled(); expect(fs.existsSync(`${produced.file}.archive-pending.json`)).toBe(true);
+    unavailable = false;
+    await until(() => launch.mock.calls.length > 0 && actors.inFlightCount() === 0);
+    expect(launch).toHaveBeenCalledTimes(1); expect(launch.mock.calls[0]![0].runnerSessionId).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(log, "utf8").trim()).argv).not.toContain("--resume");
+  } finally { unavailable = false; if (previousLog === undefined) delete process.env.FAKE_CLAUDE_LOG; else process.env.FAKE_CLAUDE_LOG = previousLog; }
+}, 30000);
+
 const roots: string[] = [], managers: Array<{ close(): Promise<void> }> = [];
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const until = async (predicate: () => boolean) => { for (let n = 0; !predicate(); n++) { if (n > 500) throw new Error("archive receipt probe timed out"); await delay(10); } };
@@ -19,9 +58,9 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-it("#2479 R2 F6 process replacement cannot use visible archive bytes as a receipt", async () => {
+it.each(["native", "win32"] as const)("#2479 R2 F6 process replacement cannot use visible archive bytes as a receipt (%s)", async platform => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-archive-receipt-")); roots.push(root);
-  const child = spawn("bun", [path.resolve("tests/fixtures/atomic-archive-crash.ts"), root], { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn("bun", [path.resolve("tests/fixtures/atomic-archive-crash.ts"), root, platform], { stdio: ["ignore", "pipe", "pipe"] });
   const exited = once(child, "exit");
   let output = "", errors = "";
   child.stdout.on("data", chunk => { output += chunk.toString(); }); child.stderr.on("data", chunk => { errors += chunk.toString(); });
@@ -29,7 +68,9 @@ it("#2479 R2 F6 process replacement cannot use visible archive bytes as a receip
   try { await until(() => child.exitCode !== null || child.signalCode !== null); status = await exited; }
   finally { if (child.exitCode === null && child.signalCode === null) { child.kill("SIGKILL"); await exited; } }
   expect(status, errors).toEqual([0, null]);
-  const produced = JSON.parse(output.trim()) as { actorId: string; file: string; archived: string; contents: string; prior: string[] };
+  const produced = JSON.parse(output.trim()) as { actorId: string; file: string; archived: string; contents: string; prior: string[]; failures: number };
+  expect(produced.failures).toBeGreaterThan(0);
+  expect(fs.existsSync(`${produced.file}.archive-pending.json`)).toBe(true);
   expect(fs.readFileSync(produced.archived, "utf8")).toBe(produced.contents);
   const namespace = atomic.syncPathNamespace, events: string[] = [];
   let unavailable = true, failures = 0;

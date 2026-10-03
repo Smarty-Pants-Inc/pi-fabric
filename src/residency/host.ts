@@ -557,7 +557,9 @@ export class ResidentHost {
       });
       void this.#retryDeliveries();
       }
-      await this.#pollRequests();
+      // Readiness transfers response custody to this live host, including requests
+      // queued before startup. A storage-only poll failure must retain its timer.
+      await this.#backgroundRequests.run(() => this.#pollRequests());
     } catch (error) {
       await this.close();
       throw error;

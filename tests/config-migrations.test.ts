@@ -175,6 +175,28 @@ describe("Fabric configuration migrations", () => {
     },
   );
 
+  it.skipIf(process.platform === "win32")("#2479 R3 F27 rejects a configuration symlink retargeted after publication", () => {
+    const paths = fixture(), root = path.dirname(paths.agentDir);
+    const oldDir = path.join(root, "old-target"), newDir = path.join(root, "new-target");
+    fs.mkdirSync(oldDir); fs.mkdirSync(newDir);
+    const oldTarget = path.join(oldDir, "fabric.json"), newTarget = path.join(newDir, "fabric.json");
+    const source = JSON.stringify({ subagents: { maxConcurrent: 5 } });
+    fs.writeFileSync(oldTarget, source); fs.writeFileSync(newTarget, source); fs.symlinkSync(oldTarget, paths.globalPath);
+    const rename = fs.renameSync.bind(fs), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    const descriptors = new Map<number, string>(), barriers: string[] = [];
+    let published = false;
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { if (published) barriers.push(descriptors.get(fd)!); sync(fd); });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (to === oldTarget) { published = true; fs.unlinkSync(paths.globalPath); fs.symlinkSync(newTarget, paths.globalPath); }
+    });
+    expect(() => loadFabricConfig({ cwd: paths.cwd, agentDir: paths.agentDir, projectTrusted: false })).toThrow(/inode changed|configuration changed/);
+    expect(published).toBe(true); expect(barriers).toContain(oldDir);
+    expect(JSON.parse(fs.readFileSync(oldTarget, "utf8"))).toMatchObject({ configVersion: 4, agents: { maxConcurrent: 5 } });
+    expect(fs.readFileSync(newTarget, "utf8")).toBe(source); expect(fs.realpathSync(paths.globalPath)).toBe(newTarget);
+  });
+
   it("does not replace a config concurrently created during its first save", () => {
     const paths = fixture();
     const fsyncSync = fs.fsyncSync.bind(fs);

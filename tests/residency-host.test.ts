@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
+import { ActorManager } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { spawn } from "node:child_process";
 import { lockFile } from "../src/residency/file-lock.js";
@@ -58,6 +59,33 @@ describe("resident loaded-path census metadata", () => {
 });
 
 describe("resident tracked result preservation", () => {
+  it("#2479 R3 S5 startup retains the completed response custodian after a file barrier failure", async () => {
+    const { root, config, host } = fixture();
+    const requestId = "startup-response", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    fs.mkdirSync(path.join(config.residencyRoot, "requests"));
+    fs.writeFileSync(path.join(config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({ format: 1, requestId, operation: "createActor", rootId: config.rootId, createdAt: Date.now(), request: { name: "startup retry", instructions: "Work", residency: "durable" } }));
+    const files = new Map<number, string>(), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let unavailable = true, failures = 0, original: unknown;
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); files.set(fd, String(file)); return fd; });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = files.get(fd) ?? "";
+      if (unavailable && file.startsWith(response + ".") && file.endsWith(".tmp")) { original = JSON.parse(fs.readFileSync(file, "utf8")); failures++; throw new Error("startup response barrier unavailable"); }
+      sync(fd);
+    });
+    const create = vi.spyOn(ActorManager.prototype, "create"), close = vi.spyOn(host, "close");
+    try {
+      await expect(host.start()).resolves.toBeUndefined();
+      expect(failures).toBeGreaterThan(0); expect(create).toHaveBeenCalledTimes(1); expect(close).not.toHaveBeenCalled();
+      expect(fs.existsSync(processing)).toBe(true); expect(fs.existsSync(response)).toBe(false);
+      await delay(150); expect(create).toHaveBeenCalledTimes(1);
+      unavailable = false;
+      for (let n = 0; (!fs.existsSync(response) || fs.existsSync(processing)) && n < 500; n++) await delay(10);
+      expect(JSON.parse(fs.readFileSync(response, "utf8"))).toEqual(original);
+      expect(original).toMatchObject({ ok: true, requestId, actor: { id: host.actors.listOwned()[0]!.id } });
+      expect(fs.existsSync(processing)).toBe(false); expect(create).toHaveBeenCalledTimes(1); expect(close).not.toHaveBeenCalled();
+    } finally { unavailable = false; synced.mockRestore(); opened.mockRestore(); create.mockRestore(); close.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 15000);
+
   it.each(process.platform === "win32" ? ["file", "retirement"] as const : ["file", "namespace", "retirement"] as const)("S5 retries completed response %s storage without repeating the mutation", async fault => {
     const { root, config, host } = fixture();
     const requestId = "response-retry", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);

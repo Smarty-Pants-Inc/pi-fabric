@@ -836,6 +836,10 @@ export class FabricRuntimeState {
       const participant = this.#participants?.get(actorId);
       return participant ? participant.ownerHostId === hostId : undefined;
     };
+    const snapshotActorOwnership = (): ReadonlyMap<string, boolean> => new Map(
+      (this.#participants?.list({ scope: "project" }) ?? [])
+        .map((participant) => [participant.id, participant.ownerHostId === hostId]),
+    );
     const lineageAlive = (rootId: string): boolean =>
       this.#participants?.lineageAlive(rootId) ?? true;
     const actorRoots = {
@@ -877,6 +881,7 @@ export class FabricRuntimeState {
             persistent: true,
             mainAgent,
             canManageActor,
+            snapshotActorOwnership,
             isOwnResidentActor: (id) => isOwnResidentActor(this.#participants!, id, mainAgentId),
             lineageAlive,
             claimResidency: "session",
@@ -898,6 +903,7 @@ export class FabricRuntimeState {
             persistent: false,
             mainAgent,
             canManageActor,
+            snapshotActorOwnership,
             lineageAlive,
             claimResidency: "session",
             rootId: mainAgentId,

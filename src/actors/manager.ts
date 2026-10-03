@@ -384,6 +384,9 @@ export class ActorManager {
   readonly #bindings: ActorBindingStore;
   readonly #mainAgent: FabricMainAgentTarget | undefined;
   readonly #canManageActor: ((id: string) => boolean | undefined) | undefined;
+  readonly #snapshotActorOwnership: (() => ReadonlyMap<string, boolean>) | undefined;
+  #directoryOwnership: ReadonlyMap<string, boolean> | undefined;
+  #directoryLineages: Map<string, boolean> | undefined;
   readonly #isOwnResidentActor: ((id: string) => boolean) | undefined;
   // Set while one mesh event is delivered synchronously after a single ownership refresh.
   #ownershipSnapshot = false;
@@ -417,6 +420,7 @@ export class ActorManager {
   readonly #adoptionGraceMs: number;
   readonly #listeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
+  #retentionSweep: Promise<void> | undefined;
   readonly #pendingPresence = new Set<string>();
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
@@ -469,6 +473,8 @@ export class ActorManager {
       persistent?: boolean;
       mainAgent?: FabricMainAgentTarget;
       canManageActor?: (id: string) => boolean | undefined;
+      /** Fresh directory decisions for one synchronous batch; never a custody-lock cache. */
+      snapshotActorOwnership?: () => ReadonlyMap<string, boolean>;
       /** Creation-only proof of a live actor owned by this Main's resident host. Never grants management. */
       isOwnResidentActor?: (id: string) => boolean;
       /** May refresh the model registry on a miss, so it is awaited (smarty-dev#1830). */
@@ -520,6 +526,7 @@ export class ActorManager {
     this.#maxSessionBytes = Math.max(0, options.maxSessionBytes ?? DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes);
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
+    this.#snapshotActorOwnership = options.snapshotActorOwnership;
     this.#isOwnResidentActor = options.isOwnResidentActor;
     this.#resolvePiModel = options.resolvePiModel;
     this.#prepareModelRoute = options.prepareModelRoute;
@@ -542,14 +549,16 @@ export class ActorManager {
       sessionId,
       this.#persistent && meshConfig.enabled ? this.#actorRoot : undefined,
     );
-    if (this.#persistent && meshConfig.enabled) this.#loadActors();
-    this.#registryFingerprint = this.#registry.fingerprint();
-    for (const actor of this.#actors.values()) {
-      this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
-    }
+    this.#withOwnershipRead(() => {
+      if (this.#persistent && meshConfig.enabled) this.#loadActors();
+      this.#registryFingerprint = this.#registry.fingerprint();
+      for (const actor of this.#actors.values()) {
+        this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
+      }
+    });
     this.#acquireCapabilityView = options.acquireCapabilityView;
-    this.#sweepRetainedRuns();
-    this.#retentionTimer = setInterval(() => this.#sweepRetainedRuns(), RETENTION_SWEEP_INTERVAL_MS);
+    this.#startRetentionSweep();
+    this.#retentionTimer = setInterval(() => this.#startRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
       cursorPath: options.meshCursorPath,
@@ -2162,10 +2171,11 @@ export class ActorManager {
     await this.#notifications.close();
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
+    await this.#retentionSweep;
     this.#listeners.clear();
     if (this.#persistent) {
       this.#refreshOwnership();
-      const owned = [...this.#actors.values()].filter((actor) => this.#canManage(actor.id));
+      const owned = [...this.#actors.values()].filter((actor) => this.#canManageCached(actor.id));
       for (const actor of owned) {
         actor.abortController?.abort();
         for (const item of actor.queue.splice(0)) {
@@ -3239,31 +3249,48 @@ export class ActorManager {
     await this.#logs.retainRun(actor, runId, this.agents.runDirectory(runId));
   }
 
-  #sweepRetainedRuns(now = Date.now()): void {
-    if (this.#closing || this.#canConsumeMesh?.() === false) return;
-    this.#refreshOwnership();
-    for (const actor of this.#actors.values()) {
-      if (this.#canManage(actor.id)) {
-        this.#logs.pruneRuns(actor, now);
-        const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
-          ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
-          .filter((item) => item?.source === "child-completion").map((item) => item!.id));
-        for (const handoff of this.#inFlight.get(actor.id)?.handoffContext ?? []) keepIds.add(handoff.id);
-        const store = this.#childCompletionStore(actor);
-        store.prune(this.#logs.retention.actorRunArchiveMs, now, keepIds);
-        // Deferred work shares the archive TTL, rather than exempting stale results
-        // forever. An active inference snapshot is protected until its run ends.
-        const deferred = this.#deferredHandoffs.get(actor.id);
-        if (deferred) {
-          const kept = deferred.filter((item) => fs.existsSync(store.resultFile(item.id)));
-          if (kept.length !== deferred.length) {
-            if (kept.length) this.#deferredHandoffs.set(actor.id, kept);
-            else this.#deferredHandoffs.delete(actor.id);
-            this.#persistQueue(actor.id);
+  #startRetentionSweep(): void {
+    if (this.#retentionSweep || this.#closing) return;
+    const sweep = this.#sweepRetainedRuns().catch(() => undefined);
+    this.#retentionSweep = sweep;
+    void sweep.finally(() => { if (this.#retentionSweep === sweep) this.#retentionSweep = undefined; });
+  }
+
+  async #sweepRetainedRuns(now = Date.now()): Promise<void> {
+    // A microtask is not a yield: let RPC/input run before touching archives,
+    // and again after every bounded actor batch. Intervals cannot overlap a sweep.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const actors = [...this.#actors.values()];
+    for (let offset = 0; offset < actors.length; offset += 8) {
+      if (this.#closing || this.#canConsumeMesh?.() === false) return;
+      this.#withOwnershipRead(() => {
+        for (const actor of actors.slice(offset, offset + 8)) {
+          if (this.#closing || this.#canConsumeMesh?.() === false) return;
+          // Reload/removal, cede and a newly published owner all veto maintenance.
+          if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;
+          this.#logs.pruneRuns(actor, now);
+          const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
+            ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
+            .filter((item) => item?.source === "child-completion").map((item) => item!.id));
+          for (const handoff of this.#inFlight.get(actor.id)?.handoffContext ?? []) keepIds.add(handoff.id);
+          const store = this.#childCompletionStore(actor);
+          store.prune(this.#logs.retention.actorRunArchiveMs, now, keepIds);
+          // Deferred work shares the archive TTL, rather than exempting stale results
+          // forever. An active inference snapshot is protected until its run ends.
+          const deferred = this.#deferredHandoffs.get(actor.id);
+          if (deferred) {
+            const kept = deferred.filter((item) => fs.existsSync(store.resultFile(item.id)));
+            if (kept.length !== deferred.length) {
+              if (kept.length) this.#deferredHandoffs.set(actor.id, kept);
+              else this.#deferredHandoffs.delete(actor.id);
+              this.#persistQueue(actor.id);
+            }
           }
         }
-      }
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
+    if (this.#closing || this.#canConsumeMesh?.() === false) return;
     if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
       void this.#notifications.enqueue(() => reapDeadSessionPresence(this.mesh, this.identity, {
         ownSessionId: this.sessionId,
@@ -3337,7 +3364,7 @@ export class ActorManager {
       return;
     }
     const actor = this.#actors.get(id);
-    if (actor && !this.#canManageCached(id)) {
+    if (actor && !this.#ownershipDecision(id)) {
       this.#pendingPresence.delete(id);                        // another host owns its presence
       return;
     }
@@ -3463,7 +3490,7 @@ export class ActorManager {
 
   async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean }): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
-    await this.#registry.withLock(() => {
+    await this.#registry.withLock(() => this.#withOwnershipRead(() => {
       // Finalization fences reloads and serialization, but only this save's explicit ids
       // are authorized to revoke: their own durable write-ahead markers already exist.
       // Preserve every other finalizer's current registry row, prepared or not.
@@ -3480,7 +3507,7 @@ export class ActorManager {
       for (const record of preserved) {
         if (typeof record.rootId === "string") this.#persistedRoots.set(record.id, record.rootId);
       }
-    });
+    }));
     // The locked merge can preserve a remote owner write that raced this host.
     // Force one reload so passive views reflect the exact records just written.
     this.#registryFingerprint = undefined;
@@ -3488,6 +3515,10 @@ export class ActorManager {
   }
 
   #syncActorsFromRegistry(): void {
+    this.#withOwnershipRead(() => this.#syncActorsFromRegistryNow());
+  }
+
+  #syncActorsFromRegistryNow(): void {
     if (!this.#persistent || this.#closing || this.#reloadingOwnership) return;
     const fingerprint = this.#registry.fingerprint();
     if (!fingerprint || fingerprint === this.#registryFingerprint) return;
@@ -3539,6 +3570,11 @@ export class ActorManager {
   }
 
   #loadActors(onlyMissing = false): void {
+    this.#withOwnershipRead(() => this.#loadActorsNow(onlyMissing));
+  }
+
+  #loadActorsNow(onlyMissing: boolean): void {
+    const loaded: ManagedActor[] = [];
     let added = 0;
     const firstLoads: ManagedActor[] = [];
     let parsed: unknown;
@@ -3710,8 +3746,15 @@ export class ActorManager {
         firstLoads.push(actor);
       }
       added++;
-      void this.#publishPresence(actor).catch(() => undefined);
+      loaded.push(actor);
     }
+    // Reading a registry must not save it once per row (or refresh every
+    // previously loaded actor). Publish owned presence through the existing
+    // retry queue after loading the complete registry, without rewriting it.
+    for (const actor of loaded) {
+      if (this.#ownershipDecision(actor.id)) this.#pendingPresence.add(actor.id);
+    }
+    this.#schedulePresenceRetry();
     // After every own file, whose counters the predecessors' activations shift against.
     for (const actor of firstLoads) this.#takeOverPredecessors(actor);
     if (added > 0) this.#emitChange();
@@ -4111,10 +4154,19 @@ export class ActorManager {
     }
   }
 
+  /** Reuse one directory read only within this synchronous slice; never across an await. */
+  #withOwnershipRead<T>(operation: () => T): T {
+    if (this.#directoryOwnership || !this.#snapshotActorOwnership) return operation();
+    this.#directoryOwnership = this.#snapshotActorOwnership();
+    this.#directoryLineages = new Map();
+    try { return operation(); }
+    finally { this.#directoryOwnership = undefined; this.#directoryLineages = undefined; }
+  }
+
   #ownershipDecision(id: string): boolean {
     if (this.#ceded.has(id)) return false;
     const actor = this.#actors.get(id);
-    const decision = this.#canManageActor?.(id);
+    const decision = this.#directoryOwnership ? this.#directoryOwnership.get(id) : this.#canManageActor?.(id);
 
     // The participant directory is authoritative when it has a live opinion.
     if (decision === false) return false;
@@ -4168,12 +4220,19 @@ export class ActorManager {
     // A record from before projects were recorded keeps the old rule.
     if (actor.project !== undefined && (this.#project !== actor.project || this.#role !== "project-agent")) return;
     // Only when the directory has no live opinion about the actor itself.
-    if (this.#canManageActor(actor.id) !== undefined) return;
+    if ((this.#directoryOwnership ? this.#directoryOwnership.get(actor.id) : this.#canManageActor(actor.id)) !== undefined) return;
     // Only when the lineage root itself is provably dead. This refuses
     // lineages a racing winner already claimed and advertised, even when the
     // winner persisted before we loaded and its actor presence has not
     // reached our tail yet.
-    if (this.#lineageMayBeAlive(actor.rootId)) return;
+    // Many retained actors share one root. Reuse its conservative provisional
+    // veto only for this synchronous slice; #confirmAdoption rechecks under both locks.
+    let alive = this.#directoryLineages?.get(actor.rootId);
+    if (alive === undefined) {
+      alive = this.#lineageMayBeAlive(actor.rootId);
+      this.#directoryLineages?.set(actor.rootId, alive);
+    }
+    if (alive) return;
     // Only against a disk view we are in sync with.
     if (this.#persistedRoots.get(actor.id) !== actor.rootId) return;
     // A lineage adopted this recently has a live adopter that may simply be
@@ -4261,6 +4320,10 @@ export class ActorManager {
   }
 
   #refreshOwnership(): void {
+    this.#withOwnershipRead(() => this.#refreshOwnershipNow());
+  }
+
+  #refreshOwnershipNow(): void {
     if (!this.#canManageActor || this.#reloadingOwnership) return;
     let acquired = false;
     for (const actor of this.#actors.values()) {

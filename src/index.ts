@@ -1075,7 +1075,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // Pi omits its entire skill catalog when the active tool set lacks a tool
     // named read. Restore Pi's discovered catalog (already bound to one skill
     // tree); full code mode adapts its loader to Fabric's nested pi.read path.
-    const systemPrompt = restoreSkillsForFullCodePrompt(event.systemPrompt, skills, effectiveFullCodeMode);
+    if (skills.length) {
+      event.systemPromptOptions.sections.skills = restoreSkillsForFullCodePrompt("", skills, effectiveFullCodeMode).trim();
+    }
     // Pi expands the invoked skill into the user message, but wrappers may
     // delegate by name. Resolve only explicit invocation lines so full code
     // mode preserves Pi's progressive skill loading without exposing read.
@@ -1116,18 +1118,19 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // persistent message, not appended to the system prompt. Keeping the
     // system prompt byte-identical across turns is what lets provider prefix
     // caches (e.g. DeepSeek) stay warm.
-    if (!skillReferenceGuidance) return {
-      systemPrompt: `${systemPrompt}\n\n${guidance}`,
-    };
+    // Native prompt options produce journaled section deltas. Returning systemPrompt
+    // instead creates an unjournaled forced projection after context_with_system;
+    // activation dispatch then (correctly) rejects its mismatch with the witness.
+    event.systemPromptOptions.sections.fabric_execution = guidance;
+    if (!skillReferenceGuidance) return;
     const message = {
       customType: SKILL_REFERENCE_CUSTOM_TYPE,
       content: skillReferenceGuidance,
       display: false,
       details: {},
     };
-    if (!fabricProvenanceSupported(pi)) return { message, systemPrompt: `${systemPrompt}\n\n${guidance}` };
+    if (!fabricProvenanceSupported(pi)) return { message };
     sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
-    return { systemPrompt: `${systemPrompt}\n\n${guidance}` };
   });
 
   // Ambient skill prose that names hidden captured tools is not user intent,

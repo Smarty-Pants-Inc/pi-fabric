@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -602,6 +603,9 @@ const main = async (): Promise<void> => {
   let child = spawnChild();
   let childExited = false;
   let piControlLive = false;
+  let nativeActivity = false;
+  let deferredFollowUpSettle = false;
+  let replayAfterStart = false;
   let retainedPiQueues: { steering: string[]; followUp: string[] } | undefined;
   let providerResumeAttempts = 0;
   let resumePrompt = false;
@@ -711,6 +715,33 @@ const main = async (): Promise<void> => {
     fs.writeFileSync(path.join(deliveryDirectory, id + ".json"), JSON.stringify({ message, provenance, delivery, images }), { mode: 0o600 });
     child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n");
   };
+  const hasUnsettledFollowUps = (): boolean => {
+    const directory = path.join(path.dirname(deliveryDirectory), "follow-ups");
+    try {
+      return fs.readdirSync(directory).some(name => {
+        if (!/^[0-9a-f-]{36}\.json$/.test(name)) return false;
+        const state = followUpState(path.join(directory, name));
+        return state !== "delivered" && state !== "cancelled";
+      });
+    } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+  };
+  const replayTrackedFollowUps = (): void => {
+    // The old native child's held map and input preflight disappear on resume.
+    // Its worker-owned envelopes do not. Reissue only unsettled tracked IDs;
+    // the replacement hook deduplicates command/steer-log replay by that ID.
+    for (const name of fs.readdirSync(deliveryDirectory)) {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/.test(name)) continue;
+      const file = path.join(deliveryDirectory, name);
+      try {
+        const item = JSON.parse(fs.readFileSync(file, "utf8"));
+        const id = name.slice(0, -5);
+        if (item.followUpId !== id || item.delivery !== "followUp") continue;
+        const receipt = followUpFile(path.dirname(deliveryDirectory), id);
+        if (followUpState(receipt) !== "queued") { releaseFollowUpPayload(receipt); continue; }
+        child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+      } catch { /* Retain malformed/uncertain envelopes; never invent delivery. */ }
+    }
+  };
   let activationWindowReady = false;
   let residentProbeReady = false;
   // Optional worker-only edge: never load native estimation in Main registration.
@@ -726,12 +757,9 @@ const main = async (): Promise<void> => {
     const message = resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task;
     if (taskProvenance?.principal) sendPiDelivery(message, taskProvenance, "steer", resumePrompt ? [] : images);
     else child.stdin?.write(`${JSON.stringify({ type: "prompt", message, ...(!resumePrompt && images.length > 0 ? { images } : {}) })}\n`);
-    piControlLive = true;
-    const retained = retainedPiQueues;
-    retainedPiQueues = undefined;
-    for (const text of retained?.steering ?? []) sendPiDelivery(text, undefined, "steer");
-    for (const text of retained?.followUp ?? []) sendPiDelivery(text, undefined, "followUp");
-    pollSteer();
+    // ctx.isIdle() remains true during asynchronous prompt preflight. Do not
+    // issue a second prompt in that gap; wait for the native agent_start.
+    replayAfterStart = true;
   };
   const createModelControl = (): InstanceType<typeof PiModelControl> => new PiModelControl(options.id, options.model, thinking, {
     send(frame) {
@@ -1268,6 +1296,20 @@ const main = async (): Promise<void> => {
     }
     if (!terminalStatus) recoveryWatchdog.observe(event);
     if (event.type === "agent_start") {
+      nativeActivity = true;
+      deferredFollowUpSettle = false;
+      if (options.runner === "pi" && replayAfterStart) {
+        replayAfterStart = false;
+        piControlLive = true;
+        const retained = retainedPiQueues;
+        retainedPiQueues = undefined;
+        // Tracked IDs replay from durable envelopes, never a second time as
+        // anonymous text from the old child's native queue snapshot.
+        for (const text of retained?.steering ?? []) if (!followUpMessageId(text)) sendPiDelivery(text, undefined, "steer");
+        for (const text of retained?.followUp ?? []) if (!followUpMessageId(text)) sendPiDelivery(text, undefined, "followUp");
+        replayTrackedFollowUps();
+        pollSteer();
+      }
       emitLifecycle("pi.agent_start", {
         ...(record.runnerSessionId ? { runnerSessionId: record.runnerSessionId } : {}),
         ...(record.fabricSessionId ? { fabricSessionId: record.fabricSessionId } : {}),
@@ -1317,6 +1359,7 @@ const main = async (): Promise<void> => {
       record.toolCalls++;
       if (typeof event.toolName === "string") {
         record.currentTool = event.toolName;
+        record.currentToolStartedAt = Date.now();
         process.stdout.write(`→ ${event.toolName}\n`);
       }
       update();
@@ -1330,6 +1373,7 @@ const main = async (): Promise<void> => {
         });
       }
       delete record.currentTool;
+      delete record.currentToolStartedAt;
       update();
       return;
     }
@@ -1400,12 +1444,13 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "agent_settled") {
+      nativeActivity = false;
       emitLifecycle("pi.agent_settled");
       if (!retryPending) {
         // Settlement ends automatic work, not necessarily successfully: native
         // compaction failures/aborts need not emit an assistant error message.
         // Older Pi frames omit outcome; retain their existing result checks.
-        piSettledSuccessfully = event.outcome !== "error" && event.outcome !== "aborted";
+        piSettledSuccessfully = event.outcome !== "error" && event.outcome !== "aborted" && !sawAgentError && !terminalError;
         providerAborted ||= event.outcome === "aborted";
         // Tool-only assistant events precede the tool's durable reply write.
         hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
@@ -1414,7 +1459,11 @@ const main = async (): Promise<void> => {
         // open until its correlated response and compaction_end are observed.
         if (!piSettledSuccessfully) piControlLive = false;
         pollSteer();
-        compactControl.childSettled();
+        // sendUserMessage may still be in asynchronous input admission. A
+        // completed native boundary is not proof that tracked payloads were
+        // consumed. Keep stdin alive for their deferred native turn/cancellation.
+        deferredFollowUpSettle = piSettledSuccessfully && hasUnsettledFollowUps();
+        if (!deferredFollowUpSettle) compactControl.childSettled();
       }
       return;
     }
@@ -1519,7 +1568,7 @@ const main = async (): Promise<void> => {
         const line = raw.trim();
         if (!line) continue;
         processedCommands += 1;
-        let command: { type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown };
+        let command: { type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown; followUpId?: string };
         try {
           command = JSON.parse(line);
         } catch {
@@ -1556,7 +1605,15 @@ const main = async (): Promise<void> => {
           } else if (command.type === "steer" && typeof command.message === "string") {
             sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "steer");
           } else if (command.type === "follow_up" && typeof command.message === "string") {
-            sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "followUp");
+            if (command.followUpId && /^[0-9a-f-]{36}$/.test(command.followUpId)) {
+              const id = command.followUpId;
+              const receipt = followUpFile(path.dirname(deliveryDirectory), id);
+              if (followUpState(receipt) !== "queued") { releaseFollowUpPayload(receipt); continue; }
+              fs.writeFileSync(path.join(deliveryDirectory, id + ".json"), JSON.stringify({
+                message: command.message, provenance: command.provenance, delivery: "followUp", followUpId: id,
+              }), { mode: 0o600 });
+              child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+            } else sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "followUp");
           } else if (command.type === "set_steering_mode" && typeof command.mode === "string") {
             child.stdin?.write(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
           } else if (command.type === "set_follow_up_mode" && typeof command.mode === "string") {
@@ -1572,7 +1629,13 @@ const main = async (): Promise<void> => {
       fs.closeSync(descriptor);
     }
   };
-  const steerTimer = options.steerFile ? setInterval(pollSteer, 200) : undefined;
+  const steerTimer = options.steerFile ? setInterval(() => {
+    pollSteer();
+    if (deferredFollowUpSettle && !nativeActivity && !hasUnsettledFollowUps()) {
+      deferredFollowUpSettle = false;
+      compactControl.childSettled();
+    }
+  }, 200) : undefined;
   steerTimer?.unref?.();
 
   // smarty-dev#1907: an event line above the cap is dropped, not fatal. The run

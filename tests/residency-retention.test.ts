@@ -67,8 +67,12 @@ describe("resident terminal event retention", () => {
       try { retention.sweep(now, new Set(phase === "streaming wildcard" ? ["*"] : []), 10000); }
       finally { retention.close(); }
     }
+    // Native byte equality preserves the full snapshot guarantee without Vitest's
+    // per-byte deep comparison of multi-megabyte Buffers consuming the CI timeout.
     for (const [index, run] of unknown.entries()) {
-      for (const [name, before] of snapshots[index]!) expect(fs.readFileSync(path.join(run, name))).toEqual(before);
+      for (const [name, before] of snapshots[index]!) {
+        expect(fs.readFileSync(path.join(run, name)).equals(before), `${run}/${name} must remain byte-identical`).toBe(true);
+      }
     }
     expect(fs.statSync(path.join(exited, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
   });

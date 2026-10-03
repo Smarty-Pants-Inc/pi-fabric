@@ -21,7 +21,9 @@ vi.mock("../src/storage/run-scratch.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../src/storage/run-scratch.js")>();
   return { ...actual,
     prepareRunRoot: (root: string) => { fs.mkdirSync(root, { recursive: true, mode: 0o700 }); return root; },
-    allocateRunTmpDirectory: (root: string) => ({ directory: path.join(root, "tmp"), neverStarted: () => {} }),
+    allocateRunTmpDirectory: (root: string): ReturnType<typeof actual.allocateRunTmpDirectory> => ({
+      directory: path.join(root, "tmp"), neverStarted: () => {}, workerClosed: () => {},
+    }),
   };
 });
 

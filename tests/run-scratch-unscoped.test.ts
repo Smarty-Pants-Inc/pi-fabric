@@ -5,6 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { AgentManager } from "../src/agents/manager.js";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { markRunRootActive, markRunRootClosed, sweepTempRunRoots } from "../src/storage/retention.js";
 import * as scopes from "../src/storage/process-scratch-scope.js";
 import * as census from "../src/storage/scratch-process-census.js";
 import { allocateRunTmpDirectory, disposeRunTmpDirectory, UNRESOLVED_SCRATCH_FILE } from "../src/storage/run-scratch.js";
@@ -34,6 +37,36 @@ describe.skipIf(process.platform!=="linux")("unscoped generation-safe bounded-ag
     if(fault==="host-changed")vi.spyOn(census,"scratchHostEpoch").mockReturnValue({platform:"linux",hostname:"other-host",boot:"other-boot"});
     if(fault!=="young")vi.spyOn(Date,"now").mockReturnValue(allocatedAt+census.UNSCOPED_SCRATCH_RETENTION_MS+1000);
     expect(disposeRunTmpDirectory(root)).toBe(false);expect(fs.readFileSync(path.join(first.directory,"data"),"utf8")).toBe("do not delete");expect(fs.existsSync(path.join(root,UNRESOLVED_SCRATCH_FILE))).toBe(true);
+  });
+  it("joins normal manager success to native close, retaining scratch through shutdown until aged offline proof", async () => {
+    const temp = sandbox(), root = fs.mkdtempSync(path.join(temp, "pi-fabric-runs-"));
+    markRunRootActive(root);
+    vi.spyOn(scopes, "createProcessScratchScope").mockReturnValue(undefined);
+    const manager = new AgentManager(process.cwd(), {
+      ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, budgetUsd: 0, sessionExport: false,
+    }, { runRoot: root, workerPath: path.resolve("tests/fixtures/fake-worker.mjs") });
+    try {
+      const result = await manager.run({ task: "normal unscoped manager completion", transport: "process" });
+      expect(result.status).toBe("completed");
+      const run = manager.runDirectory(result.id)!;
+      const fence = JSON.parse(fs.readFileSync(path.join(run, UNRESOLVED_SCRATCH_FILE), "utf8"));
+      expect(fence).toMatchObject({ version: 3, closedPid: Number(result.sessionId) });
+      expect(fence.closedAt).toBeGreaterThanOrEqual(fence.lastLaunchAt);
+      expect(fs.existsSync(path.join(run, "tmp"))).toBe(true);
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
+      await manager.close();
+      expect(fs.existsSync(path.join(run, "tmp"))).toBe(true);
+      expect(JSON.parse(fs.readFileSync(path.join(run, UNRESOLVED_SCRATCH_FILE), "utf8"))).toEqual(fence);
+      // Explicit roots have no automatic owner marker lifecycle. Model an
+      // external owner's checked close; this alone must NOT authorize deletion.
+      markRunRootClosed(root, Date.now(), true);
+      const options = { tempRoot: temp, oneShotRunRetentionMs: 1, orphanedTempRunRetentionMs: 1, budgetMs: 1000 };
+      expect(sweepTempRunRoots(options).removedRoots).toEqual([]);
+      emptyCensus(fence.allocatedAt);
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + census.UNSCOPED_SCRATCH_RETENTION_MS + 1000);
+      expect(sweepTempRunRoots(options).removedRoots).toContain(root);
+      expect(fs.existsSync(root)).toBe(false);
+    } finally { await manager.close(); }
   });
   it("restores completed unscoped custody after a checked pre-spawn retry refusal, without resetting its retention age",()=>{
     const root=sandbox();vi.spyOn(scopes,"createProcessScratchScope").mockReturnValue(undefined);

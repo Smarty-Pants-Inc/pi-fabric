@@ -2775,6 +2775,15 @@ export class AgentManager {
       // relaunch path sees settlement, stops that child and hands back custody.
       await managed.relaunching;
       await this.#waitForTransportExit(managed);
+      // POSIX liveness only observes exit; it never runs the transport's
+      // native-close wrapper, which records this unscoped launch generation's
+      // worker completion for later age-gated holder proof. Windows retains
+      // its separate permit-owning close join below (including tree-stop debt).
+      if (process.platform !== "win32" && managed.transport.waitForClose && !managed.lostContact) {
+        await managed.transport.waitForClose().catch(error => {
+          this.#markLost(managed, error instanceof Error ? error.message : String(error));
+        });
+      }
       await this.#noteUnconfirmedExit(managed);
       disposeRunTmpDirectory(managed.runDirectory);
     }

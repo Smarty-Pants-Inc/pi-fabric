@@ -1155,7 +1155,7 @@ describe("ParticipantDirectory", () => {
         // Drive the real heartbeat callback without incidental ticks during backoff.
         const heartbeat = intervals.mock.calls[0]![0] as () => void;
         const runs = vi.spyOn(MeshBackgroundRetry.prototype, "run");
-        const writes = vi.spyOn(mesh, "writeBatch");
+        const confirmations = vi.spyOn(mesh, "confirmWritable");
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
         const tick = async () => {
           heartbeat();
@@ -1181,7 +1181,7 @@ describe("ParticipantDirectory", () => {
         await Promise.resolve(); // run the queued change-only refresh
         expect(await runs.mock.results.at(-1)!.value).toBe("done");
         expect(source.mock.calls.length).toBeGreaterThan(readsBefore);
-        expect(writes).toHaveBeenCalledOnce(); // unchanged snapshot took no mesh lock
+        expect(confirmations).toHaveBeenCalledOnce(); // unchanged snapshot took no mesh lock
         expect(recovered).not.toHaveBeenCalled();
         expect(directory.writeStalled()).toBeDefined();
         expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(holder);
@@ -1191,11 +1191,11 @@ describe("ParticipantDirectory", () => {
         expect(retry.waitMs).toBeGreaterThan(0); // second timeout retained the doubled delay
         heartbeat();
         expect(await runs.mock.results.at(-1)!.value).toBe("skipped");
-        expect(writes).toHaveBeenCalledTimes(2);
+        expect(confirmations).toHaveBeenCalledTimes(2);
 
         fs.rmSync(lockPath, { recursive: true, force: true });
         await vi.advanceTimersByTimeAsync(retry.waitMs);
-        expect(await tick()).toBe("done"); // a real locked write confirms recovery
+        expect(await tick()).toBe("done"); // a real lock acquisition confirms recovery
         expect(directory.writeStalled()).toBeUndefined();
         expect(recovered).toHaveBeenCalledOnce();
         expect(retry.waitMs).toBe(0);
@@ -1226,10 +1226,14 @@ describe("ParticipantDirectory", () => {
       expect(writes.mock.calls.length).toBeLessThanOrEqual(2);
     });
 
-    it("still renews the lease on a heartbeat with unchanged records", async () => {
+    it("still renews the file lease on a heartbeat with unchanged records", async () => {
       const { directory, writes } = await changing();
+      const confirmed = vi.spyOn(directory.mesh, "confirmWritable");
       await directory.refresh();
-      expect(writes).toHaveBeenCalledTimes(1);
+      expect(writes).not.toHaveBeenCalled();
+      expect(confirmed).toHaveBeenCalledOnce();
+      expect(readHostLeases(directory.mesh.root).get(directory.options.hostId)?.expiresAt).toBeGreaterThan(Date.now());
+      confirmed.mockRestore();
     });
   });
 
@@ -1363,7 +1367,7 @@ describe("ParticipantDirectory", () => {
     await directory.refresh();
     const steady = again.mock.calls.filter(([, target]) => String(target).endsWith("state.json")).length;
     again.mockRestore();
-    expect(steady).toBe(1);
+    expect(steady).toBe(0); // the fresh host lease needs no shared-state rewrite
   });
 
   // smarty-dev#266: a stopped mesh lock holder expired every lease; sessions() said [].

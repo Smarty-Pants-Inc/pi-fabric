@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -69,8 +70,8 @@ it.each([
 ] as const)("public reset leaves status, other actors and terminal stop serviceable during a hanging activation ($kind, retried pickup: $retryPickup)", async ({ kind, retryPickup }) => {
   const f = await fixture();
   let pickupFailures = 0;
-  let pickupSync: ReturnType<typeof vi.spyOn> | undefined;
-  let pickupOpen: ReturnType<typeof vi.spyOn> | undefined;
+  let pickupAttempts = 0;
+  let pickupBarrier: ReturnType<typeof vi.spyOn> | undefined;
   const pending: Promise<unknown>[] = [];
   const observe = <T>(promise: Promise<T>) => {
     const outcome = promise.then(value => ({ value }), error => ({ error }));
@@ -90,15 +91,20 @@ it.each([
     const queued = observe(f.host.actors.ask(f.actor.id, "queued work cancelled only by explicit stop"));
     const proxy = new ResidentActorClient(f.config.meshRoot, f.config.rootId, 5_000);
     if (retryPickup) {
-      const files = new Map<number, string>(), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
-      pickupOpen = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
-        const fd = open(file, flags, mode); files.set(fd, String(file)); return fd;
-      });
-      pickupSync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
-        if (pickupFailures === 0 && files.get(fd) === path.join(f.config.residencyRoot, "processing")) {
-          pickupFailures++; throw new Error("reset pickup namespace unavailable");
+      const actualNamespace = atomic.syncPathNamespace;
+      // Windows skips directory fsync, but still confirms the pickup namespace.
+      // Fail that portable boundary after rename, before lifecycle admission.
+      // The next attempt must retain custody and confirm it before committing.
+      pickupBarrier = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+        if (path.dirname(file) === path.join(f.config.residencyRoot, "processing")) {
+          pickupAttempts++;
+          expect(fs.existsSync(file)).toBe(true);
+          expect(decisions(f.config.residencyRoot).some(entry => entry.operation === "resetSession")).toBe(false);
+          if (pickupFailures === 0) {
+            pickupFailures++; throw new Error("reset pickup namespace unavailable");
+          }
         }
-        sync(fd);
+        actualNamespace(file, inode);
       });
     }
     const reset = observe(kind === "Main"
@@ -107,7 +113,8 @@ it.each([
     await waitFor(() => decisions(f.config.residencyRoot).some(entry => entry.operation === "resetSession" && entry.state === "committed"));
     const resetDecision = decisions(f.config.residencyRoot).find(entry => entry.operation === "resetSession")!;
     expect(pickupFailures).toBe(retryPickup ? 1 : 0);
-    pickupSync?.mockRestore(); pickupOpen?.mockRestore();
+    expect(pickupAttempts).toBe(retryPickup ? 2 : 0);
+    pickupBarrier?.mockRestore();
     // All use the public provider, which routes to this resident's command dispatcher.
     const status = observe(f.provider.invoke("actorStatus", { id: f.actor.id }, f.context));
     const unrelated = observe(f.provider.invoke("setInstructions", { id: other.id, instructions: "Still serviceable" }, f.context));
@@ -134,7 +141,7 @@ it.each([
     expect(fs.readdirSync(path.join(f.config.residencyRoot, "responses"))).toEqual([]);
   } finally {
     // Failed assertions on the old dispatcher must not leave the real hanging child alive.
-    pickupSync?.mockRestore(); pickupOpen?.mockRestore();
+    pickupBarrier?.mockRestore();
     const actor = f.host.actors.status(f.actor.id);
     const runId = actor.inFlightRun?.id ?? actor.lastRunId;
     if (runId) await f.host.agents.stop(runId);

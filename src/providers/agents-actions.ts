@@ -31,6 +31,12 @@ const runProperties = {
     description:
       "Pi provider/id copied from agents.models({ runner: \"pi\" }), a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties). Reuse returned keys; never infer version numbers from agent names. Exact keys win; near-miss IDs resolve to the closest visible model on the same provider. Handles report the canonical model. Without host model policy, Claude runtime values and Veda backend models/aliases are forwarded verbatim. Under active policy, Claude aliases must resolve through its native CLI catalog; Veda requires backend pi and an exact visible provider/model (unresolved aliases/defaults are refused).",
   },
+  routeClass: { type: "string", pattern: "^[a-z][a-z0-9-]{0,63}$", description: "Explicit run-history class. Record-only unless spawn also requests model: auto; auto permits bounded-lookup or status-groom only." },
+  protected: { type: "boolean", description: "Trusted issue/PR protection snapshot, never task text: true for review/security/audit/named passes/needs-security-pass; false only for known-clear state. Omitted stays unknown and excluded from routing." },
+  modelReason: {
+    type: "string",
+    description: "Reason for an explicit model selection, recorded on the run. Required and non-blank for cliproxyapi/gpt-6-astra; named passes use cliproxyapi/gpt-6.1-sol thinking max, otherwise omit model (role default).",
+  },
   persona: {
     type: "string",
     description: "Veda persona name for this run, such as frontend, reviewer, worker, or a custom persona.",
@@ -113,10 +119,8 @@ const spawnSchema = {
     ...runProperties, residency: residencySchema,
     idempotencyKey: residentIdempotencyKeySchema,
     model: { ...runProperties.model, description: `${strictModelProperty.description} Spawn-only \"auto\" decides and records in shadow mode; the child still runs pinModel/pinThinking.` },
-    routeClass: { type: "string", pattern: "^[a-z][a-z0-9-]{0,63}$", description: "Opt-in auto route class; initially bounded-lookup. Unknown classes are excluded." },
     pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },
     pinThinking: { ...runProperties.thinking, description: "Role's required effort pin; overrides agents.modelRouting.pinThinking. Never inferred from the default medium effort." },
-    protected: { type: "boolean", description: "Caller supplies from trusted issue/PR state, never task text: true for review, security, audit, named passes or needs-security-pass; false only for known clear state. Omitted/unknown is excluded before Jev." },
   },
 };
 
@@ -160,6 +164,8 @@ const handoffSchema = {
       description: "Explicit Pi exact provider/id, model id, or configured alias target that will continue the inherited trajectory. Closest-match selectors are refused with candidate keys.",
     },
     thinking: runProperties.thinking,
+    routeClass: runProperties.routeClass,
+    protected: runProperties.protected,
     tools: runProperties.tools,
     timeoutMs: runProperties.timeoutMs,
     extensions: runProperties.extensions,
@@ -423,11 +429,14 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         coalesce: { type: "boolean" },
         coalesceKey: { type: "string", description: "Dotted path into a mesh event's data (such as payload.number). A queued event of the same topic with the same value there is replaced by the newer one." },
         activationFilter: activationFilterSchema,
+        routeClass: { type: "string", enum: ["status-groom"], description: "Per-activation shadow Choice for checks/grooming producing a status line or no-op; explicit model/thinking pins required." },
+        protected: { type: "boolean", description: "Trusted protection snapshot; true for review/security/audit/needs-security-pass. Omitted excludes before Jev." },
         residency: residencySchema,
         idempotencyKey: residentIdempotencyKeySchema,
         runner: runProperties.runner,
         kernel: runProperties.kernel,
         model: strictModelProperty,
+        modelReason: runProperties.modelReason,
         thinking: runProperties.thinking,
         tools: runProperties.tools,
         transport: runProperties.transport,
@@ -777,7 +786,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "resetSession",
     description:
-      "Start a persistent actor's next run on a fresh Pi session. An in-flight run finishes first; the old session is archived beside it (2 kept). Instructions, topics, bindings, the queue and messages are kept.",
+      "Start a persistent actor's next run on a fresh Pi session. The owning Main requests resident reset directly; an admitted activation settles at the fenced boundary while other resident commands remain serviceable. Explicit stop cancels work and any pending reset; it is not preparation for repair. The old session is archived beside it (2 kept). Instructions, topics, bindings, the queue and messages are kept.",
     inputSchema: idSchema,
     risk: "agent",
   },

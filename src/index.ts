@@ -3,6 +3,7 @@ import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type Roo
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
+import { registerFabricFixture } from "./guards/fixture-mode.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
@@ -181,21 +182,25 @@ export const FABRIC_MANAGED_HOST_VERSION = 1;
 export type { FabricManagedHostOptions } from "./managed-host.js";
 import type { FabricManagedHostOptions } from "./managed-host.js";
 
-// A run the user aborted, or one that failed, must not start another turn by itself. Newer Pi
-// names the outcome; for older Pi, the last assistant message's stop reason says it.
-const settledCompleted = (event: unknown, context: ExtensionContext): boolean => {
+// Newer Pi names the terminal outcome; older hosts expose the last assistant's stop reason.
+// Keep failure separate from owner cancellation: future mailbox input may wake an errored Main.
+const settledOutcome = (event: unknown, context: ExtensionContext): string => {
   const outcome = (event as { outcome?: unknown }).outcome;
-  if (typeof outcome === "string") return outcome === "completed";
-  if (context.signal?.aborted) return false;
+  if (typeof outcome === "string") return outcome;
+  if (context.signal?.aborted) return "aborted";
   const entries = context.sessionManager.getEntries();
   for (let index = entries.length - 1; index >= Math.max(0, entries.length - 50); index--) {
     const entry = entries[index] as { type?: string; message?: { role?: string; stopReason?: string } };
     if (entry.type === "message" && entry.message?.role === "assistant") {
-      return entry.message.stopReason !== "aborted" && entry.message.stopReason !== "error";
+      return entry.message.stopReason === "aborted" || entry.message.stopReason === "error"
+        ? entry.message.stopReason : "completed";
     }
   }
-  return true;
+  return "completed";
 };
+
+const settledCompleted = (event: unknown, context: ExtensionContext): boolean =>
+  settledOutcome(event, context) === "completed";
 
 // Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
 const inboxHeldBy = (context: ExtensionContext) => confirmedRootInboxSession(context.sessionManager);
@@ -228,6 +233,8 @@ const inboxWakeMs = (): number => {
 };
 
 export default async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions } = {}): Promise<void> {
+  // A fixture must never construct Fabric state, capture auth or join an inherited mailbox.
+  if (registerFabricFixture(pi)) return;
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
@@ -771,9 +778,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
   });
   const settle = async (event: unknown, context: ExtensionContext): Promise<void> => {
-    // A user's cancel (or a failed run) keeps the idle wake off until the next turn starts.
+    // Only an owner cancel disarms future mailbox work. A provider error must not leave
+    // addressed followUps waiting forever for a boundary that will never come (#4012).
+    // This arms the existing idle reader, not a retry: no pending work means no new turn.
+    // Error settlement itself still does not drain below; the inbox's grace/cooldown apply.
     inboxWake.context = context;
-    inboxWake.armed = settledCompleted(event, context);
+    inboxWake.armed = !context.signal?.aborted &&
+      ["completed", "error"].includes(settledOutcome(event, context));
     if (!state.initialized) {
       await compactAtConfiguredThreshold(context, state.config);
       return;
@@ -808,7 +819,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     await compactAtConfiguredThreshold(context, state.config);
     await state.publishHostLifecycle("pi.agent_settled", event);
     // A Main whose run completed takes the work events a steer missed as its next turn
-    // (smarty-dev#754). An aborted or failed run starts nothing: the batch waits for a turn.
+    // (smarty-dev#754). An aborted run waits for owner input; a failed run leaves its
+    // mailbox to the idle reader above, rather than retrying at the error boundary.
     if (settledCompleted(event, context)) {
       const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
       reportInboxExpiry(pi, inbox);

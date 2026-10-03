@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
-
+import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -776,6 +776,9 @@ export class ResidencyClient {
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           if (acknowledgeResidentResponse(this.options.config.residencyRoot, response, Date.now(), command.format)) fs.rmSync(responsePath, { force: true });
           if (!response.ok) {
+            if (command.operation === "resetSession" && response.errorCode === "ACTOR_SESSION_RESET_CANCELLED") {
+              throw new ActorSessionResetCancelledError(command.id, response.error, command.requestId);
+            }
             if (response.errorCode === "RESIDENT_REQUEST_EXPIRED") throw new ResidentRequestExpiredError(command.requestId);
             if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
             if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
@@ -798,6 +801,8 @@ export class ResidencyClient {
       throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}` +
         ` (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
+      // This acknowledged terminal response is known, unlike a lost post-commit reply.
+      if (error instanceof ActorSessionResetCancelledError) throw error;
       if (error instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.options.config.residencyRoot, command, signal);
       let decision;
       try {
@@ -865,6 +870,9 @@ export class ResidencyClient {
       name: handle.name,
       task: "",
       status: "failed",
+      ...(handle.routeClass !== undefined ? { routeClass: handle.routeClass } : {}),
+      ...(handle.routeClassSource !== undefined ? { routeClassSource: handle.routeClassSource } : {}),
+      ...(handle.protected !== undefined ? { protected: handle.protected } : {}),
       runner: handle.runner,
       transport: handle.transport,
       cwd: handle.cwd,
@@ -992,9 +1000,14 @@ export class ResidencyClient {
   }
 
   #recipient(config: ResidentHostConfig): CompletionRecipient {
-    const original = this.options.participants.lastKnown?.(config.rootId)?.participant;
+    const name = (config === this.options.config ? this.options.mainName?.() : undefined) ?? config.mainName;
+    // lastKnown performs a fresh full-fleet scan. Current Main configs already supply
+    // both fields; idle completion polls need that scan only for legacy metadata.
+    // Keep the live name callback uncached so renames still bind new admissions.
+    const original = name === undefined || config.mainStartedAt === undefined
+      ? this.options.participants.lastKnown?.(config.rootId)?.participant : undefined;
     return { rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd, projectRoot: config.projectRoot,
-      name: (config === this.options.config ? this.options.mainName?.() : undefined) ?? config.mainName ?? original?.name ?? "main", role: config.role,
+      name: name ?? original?.name ?? "main", role: config.role,
       startedAt: config.mainStartedAt ?? original?.startedAt ??
         (/^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-/.test(config.sessionId)
           ? Number.parseInt(config.sessionId.replaceAll("-", "").slice(0, 12), 16) : 0) };

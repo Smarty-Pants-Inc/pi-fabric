@@ -68,6 +68,8 @@ import type {
   AgentUsage,
 } from "./types.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE } from "./types.js";
+import { createRunRouteMetadata } from "../worker/run-record.js";
+import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager } from "./worktree-manager.js";
 import { writeHandoffSession } from "./handoff.js";
 import type { FabricCompactionBudget } from "../compaction/hook.js";
@@ -276,6 +278,7 @@ export const awaitAgentCwd = async (
   }
 };
 interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
+  runRoute: AgentRunRouteMetadata;
   id: string;
   name: string;
   task: string;
@@ -325,6 +328,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Set when the run failed because its transport lost contact: its worker may still run. */
   lostContact?: string;
   model?: string;
+  modelReason?: string;
   thinking?: AgentRunRequest["thinking"];
   routeOutcome?: (result: AgentRunResult) => void;
   /** Original authority for every attempt, never a prepared/observed replacement label. */
@@ -568,6 +572,7 @@ const failedRecord = (
     usage[key] = Math.max(usage[key], previous?.usage[key] ?? 0);
   }
   return {
+    ...managed.runRoute,
     id: managed.id,
     name: managed.name,
     task: managed.task,
@@ -589,6 +594,7 @@ const failedRecord = (
     error,
     usage,
     ...(managed.model ? { model: managed.model } : {}),
+    ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
     ...(managed.latestRecord?.admittedModel ? { admittedModel: managed.latestRecord.admittedModel } : {}),
     ...(managed.latestRecord?.admittedThinking ? { admittedThinking: managed.latestRecord.admittedThinking } : {}),
@@ -1011,16 +1017,27 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
+    // Snapshot trusted classification inputs before asynchronous preparation/queueing.
+    const explicitRouteClass = request.routeClass ?? request.routeDecision?.routeClass;
+    const routeFacts = {
+      ...(explicitRouteClass !== undefined ? { routeClass: explicitRouteClass } : {}),
+      ...(typeof request.protected === "boolean" ? { protected: request.protected } : {}),
+      ...(request.actorId !== undefined ? { actorId: request.actorId } : {}),
+      ...(request.actorName !== undefined ? { actorName: request.actorName } : {}),
+      handoff: Boolean(request.sessionSeed),
+    };
     // Snapshot host-owned identity before any await/queue: later /name changes
     // affect new spawns, never an already-admitted run or its retries.
     const completionRecipient = this.#completionRecipient
       ? { ...(typeof this.#completionRecipient === "function" ? this.#completionRecipient() : this.#completionRecipient) }
       : undefined;
     if (request.model === "auto") throw new Error('Unresolved model: "auto" must go through agents.spawn routing');
+    const routedActor = request.routeDecision?.mode === "shadow" && Boolean(request.actorId) &&
+      request.routeDecision.actorId === request.actorId && Boolean(request.routeDecision.activationId) && Boolean(request.sessionFile);
     if (request.routeDecision && ((request.runner ?? this.config.runner) !== "pi" ||
       (request.transport ?? this.config.transport) !== "process" || (request.residency ?? "session") !== "session" ||
-      request.actorId || request.actorName || request.sessionSeed || request.sessionFile)) {
-      throw new Error("Shadow routing is only supported for new process/Pi task sessions");
+      request.sessionSeed || (!routedActor && (request.actorId || request.actorName || request.sessionFile)))) {
+      throw new Error("Shadow routing requires a new process/Pi task session or a host-prepared actor activation");
     }
     const kernel = this.resolveKernel({
       ...request,
@@ -1191,8 +1208,9 @@ export class AgentManager {
               request.handoffCompact,
               request.handoffCompact ? await this.#resolveHandoffCompactionBudget?.(model, agentCwd) : undefined,
             )
-          : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
+          : routedActor ? request.sessionFile : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
         const adapter = await this.#resolveTransport(request.transport ?? this.config.transport);
+        const runRoute = createRunRouteMetadata({ ...routeFacts, runner, transport: adapter.kind });
         const timeoutMs = effectiveAgentTimeoutMs(
           this.config.timeoutMs,
           request.timeoutMs,
@@ -1282,10 +1300,14 @@ export class AgentManager {
           ...(nice > 0 ? ["--nice", String(nice)] : []),
           "--transport",
           adapter.kind,
+          "--route-class", runRoute.routeClass,
+          "--route-class-source", runRoute.routeClassSource,
+          ...(runRoute.protected !== undefined ? ["--protected", String(runRoute.protected)] : []),
           ...(recursive || inheritedFullCodeMode || requiresFabricKernel
             ? ["--fabric-extension", this.#fabricExtensionPath]
             : []),
           ...(model ? ["--model", model] : []),
+          ...(request.modelReason !== undefined ? ["--model-reason", request.modelReason] : []),
           ...(thinking ? ["--thinking", thinking] : []),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
           ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
@@ -1366,6 +1388,7 @@ export class AgentManager {
           });
         }
         const managed: ManagedAgent = {
+          runRoute,
           id,
           name,
           task: request.task,
@@ -1393,6 +1416,7 @@ export class AgentManager {
           abortSignal: queued && !authorize ? undefined : signal,
           abortHandler: undefined,
           ...(model ? { model } : {}),
+          ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
           ...(thinking ? { thinking } : {}),
           ...(routeDispatch ? { routeOutcome: routeDispatch.outcome } : {}),
           ...(routePin ? { routePin } : {}),
@@ -1475,10 +1499,12 @@ export class AgentManager {
     }
     if (release) return start(release).catch((error) => { release(); throw error; });
     return this.#enqueue({
+      ...createRunRouteMetadata({ ...routeFacts, runner, transport: request.transport ?? this.config.transport }),
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
       cwd: selectedCwd, residency, recursive: request.recursive === true,
       ...(kernel ? { kernel } : {}),
       ...(model ? { model } : {}),
+      ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
       ...(request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking
         ? { thinking: request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking } : {}),
       ...(request.actorId ? { actorId: request.actorId } : {}),
@@ -2732,6 +2758,7 @@ export class AgentManager {
         toolCalls: Math.max(record.toolCalls, managed.observedProgress.toolCalls),
         error: `${record.error ?? "Agent run failed"} · relaunch failed: ${retryError}`,
       };
+      Object.assign(failed, managed.runRoute);
       writeRecord(managed.statusFile, failed);
       managed.latestRecord = failed;
       managed.relaunchFailure = failed;
@@ -3250,6 +3277,7 @@ export class AgentManager {
     const model = managed.latestRecord?.model ?? managed.model;
     const thinking = managed.latestRecord?.thinking ?? managed.thinking;
     return {
+      ...managed.runRoute,
       id: managed.id,
       name: managed.name,
       status,
@@ -3315,6 +3343,7 @@ export class AgentManager {
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
     return {
       ...safeRecord,
+      ...managed.runRoute,
       ...(includeSaveFailure && managed.settlementSaveFailure
         ? { warnings: [...(record.warnings ?? []), managed.settlementSaveFailure.warning] }
         : {}),
@@ -3326,6 +3355,7 @@ export class AgentManager {
       ...(nestedAgents.length > 0 ? { nestedAgents } : {}),
       ...(budget ? { budget } : {}),
       ...(model ? { model } : {}),
+      ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
       ...(thinking ? { thinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),

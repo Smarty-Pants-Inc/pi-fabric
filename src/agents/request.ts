@@ -47,6 +47,8 @@ export const normalizeAgentRunRequest = (
   return {
     task: String(args.task),
     runner,
+    ...(typeof args.routeClass === "string" ? { routeClass: args.routeClass } : {}),
+    ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
     ...(kernel !== undefined ? { kernel } : {}),
     ...(typeof args.name === "string" ? { name: args.name } : {}),
     ...(transport ? { transport } : {}),
@@ -55,6 +57,7 @@ export const normalizeAgentRunRequest = (
       : inheritedModel
         ? { model: inheritedModel }
         : {}),
+    ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}),
     ...(typeof args.persona === "string" && args.persona.trim()
       ? { persona: args.persona.trim() }
       : {}),

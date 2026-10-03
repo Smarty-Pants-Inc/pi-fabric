@@ -1,6 +1,7 @@
 import { boundAgentSpawner } from "../agents/spawner.js";
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
+import { DEFAULT_FOLLOW_UP_DEADLINE_MS } from "../agents/follow-up-delivery.js";
 import type { ActorManager } from "../actors/manager.js";
 import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js";
 import type { FabricAgentMessageResult, FabricMainAgentTarget } from "../main-agent.js";
@@ -204,6 +205,7 @@ export class AgentMessageRouter {
       from?: MeshIdentity;
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
+      deadlineMs?: number;
     } = {},
   ): Promise<FabricAgentMessageResult> {
     // Resolve the child's bound target before recovery so retries retain the same
@@ -294,6 +296,7 @@ export class AgentMessageRouter {
       from?: MeshIdentity;
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
+      deadlineMs?: number;
     } = {},
   ): Promise<FabricAgentMessageResult> {
     context?.signal?.throwIfAborted();
@@ -301,6 +304,14 @@ export class AgentMessageRouter {
     // In a task child, main is the immutable immediate return address, not a role lookup.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
     id = this.#messageTarget(id);
+    if (options.deadlineMs !== undefined) {
+      // Do not silently lose the requested guarantee on a Main/actor/remote route.
+      let task: ReturnType<typeof this.manager.status> | undefined;
+      try { task = this.manager.status(id); } catch (error) {
+        if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
+      }
+      if (!task || task.runner !== "pi") throw new Error("Delivery deadlines require a local Pi task agent");
+    }
     const isMain = this.mainAgent.matches(id);
     const remoteRoot = isMain ? undefined : this.#rootRouteSnapshot(id);
     // Project members include peer roots, not just this host's Main and actors.
@@ -373,9 +384,12 @@ export class AgentMessageRouter {
       const result =
         kind === "steer"
           ? this.manager.steer(id, message, data, provenance)
-          : this.manager.followUp(id, message, data, provenance);
+          : status.runner === "pi"
+            ? this.manager.followUp(id, message, data, provenance, { deadlineMs: options.deadlineMs ?? DEFAULT_FOLLOW_UP_DEADLINE_MS })
+            : this.manager.followUp(id, message, data, provenance);
       return { queued: true, messageId: result.messageId, routed: "local",
-        ...(result.warning ? { warning: result.warning } : {}) };
+        ...(result.warning ? { warning: result.warning } : {}),
+        ...(result.deadlineAt !== undefined ? { deadlineAt: result.deadlineAt } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
     }

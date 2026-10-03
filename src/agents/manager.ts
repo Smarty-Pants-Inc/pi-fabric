@@ -65,7 +65,8 @@ import type {
   AgentTransportLaunch,
   AgentUsage,
 } from "./types.js";
-import { FOLLOW_UP_RUNNING_TASK_MESSAGE } from "./types.js";
+import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
+import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
 import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager } from "./worktree-manager.js";
@@ -672,6 +673,9 @@ export class AgentManager {
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
+  readonly #onFollowUpAlarm: ((alarm: AgentFollowUpAlarm) => void) | undefined;
+  readonly #followUps = new Map<string, Map<string, AgentFollowUpDelivery>>();
+  readonly #followUpTimers = new Map<string, NodeJS.Timeout>();
   readonly #preparePiModel:
     | ((model: string | undefined, requiredPin?: boolean) => Promise<string | void>)
     | undefined;
@@ -733,6 +737,7 @@ export class AgentManager {
       /** Every terminal result, foreground or background, before its run directory can be removed. */
       onSettled?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
+      onFollowUpAlarm?: (alarm: AgentFollowUpAlarm) => void;
       preparePiModel?: (model: string | undefined, requiredPin?: boolean) => Promise<string | void>;
       resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
       resolveParticipantGuidance?: AgentParticipantGuidanceResolver;
@@ -761,6 +766,7 @@ export class AgentManager {
     this.#onStoppedAtClose = options.onStoppedAtClose;
     this.#onSettled = options.onSettled;
     this.#onLifecycle = options.onLifecycle;
+    this.#onFollowUpAlarm = options.onFollowUpAlarm;
     this.#preparePiModel = options.preparePiModel;
     this.#resolveHandoffCompactionBudget = options.resolveHandoffCompactionBudget;
     this.#resolveParticipantGuidance = options.resolveParticipantGuidance;
@@ -1810,7 +1816,12 @@ export class AgentManager {
     const record = managed.settled
       ? readRecord(managed.statusFile) ?? managed.latestRecord
       : managed.latestRecord ?? readRecord(managed.statusFile);
-    if (!record) return this.#handleInfo(managed, "running");
+    if (!record) {
+      const info = this.#handleInfo(managed, "running");
+      const deliveries = this.#checkFollowUps(managed);
+      if (deliveries.length) info.followUpDeliveries = deliveries;
+      return info;
+    }
     managed.latestRecord = record;
     if (!managed.latestUiRecord) {
       managed.latestUiRecord = compactUiRecord(record);
@@ -1818,6 +1829,8 @@ export class AgentManager {
     }
     const result = structuredClone(this.#withTransportMetadata(record, managed));
     this.#pruneRetainedUiRecords();
+    const deliveries = this.#checkFollowUps(managed);
+    if (deliveries.length) result.followUpDeliveries = deliveries;
     return result;
   }
 
@@ -2058,6 +2071,8 @@ export class AgentManager {
       await removeTree(managed.runDirectory);
     }
     this.#runs.delete(id);
+    for (const messageId of this.#followUps.get(id)?.keys() ?? []) this.#clearFollowUpTimer(messageId);
+    this.#followUps.delete(id);
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
     return { cleaned: cleaned || !fs.existsSync(managed.runDirectory) };
@@ -2092,9 +2107,78 @@ export class AgentManager {
     return this.#appendSteer(id, { type: "steer", message, data, provenance });
   }
 
-  followUp(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance): AgentSteerResult {
+  followUp(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance,
+    options?: { deadlineMs: number }): AgentSteerResult {
     this.#requireSteerable(id);
-    return this.#appendSteer(id, { type: "follow_up", message, data, provenance });
+    if (!options) return this.#appendSteer(id, { type: "follow_up", message, data, provenance });
+    const managed = this.#requireRun(id);
+    if (managed.runner !== "pi") throw new Error("Delivery deadlines require a local Pi task agent");
+    if (!Number.isSafeInteger(options.deadlineMs) || options.deadlineMs < 1) throw new Error("deadlineMs must be a positive safe integer");
+    const messageId = randomUUID();
+    const deadlineAt = Date.now() + options.deadlineMs;
+    if (!Number.isSafeInteger(deadlineAt)) throw new Error("deadlineMs exceeds the safe timestamp range");
+    const file = followUpFile(managed.runDirectory, messageId);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, JSON.stringify({ messageId, deadlineAt }), { mode: 0o600 });
+    let receipt: AgentSteerResult;
+    try { receipt = this.#appendSteer(id, { type: "follow_up", message, data, provenance, followUpId: messageId, deadlineAt }); }
+    catch (error) { fs.unlinkSync(file); throw error; }
+    const entries = this.#followUps.get(id) ?? new Map<string, AgentFollowUpDelivery>();
+    entries.set(messageId, { messageId, deadlineAt, state: "queued" });
+    this.#followUps.set(id, entries);
+    this.#armFollowUpDeadline(managed, entries.get(messageId)!);
+    return { ...receipt, messageId, deadlineAt };
+  }
+
+  cancelFollowUp(id: string, messageId: string): AgentFollowUpDelivery {
+    const managed = this.#requireRun(id);
+    const delivery = this.#followUps.get(id)?.get(messageId);
+    if (!delivery) throw new Error(`Unknown follow-up: ${messageId}`);
+    delivery.state = settleFollowUp(followUpFile(managed.runDirectory, messageId), "cancelled");
+    releaseFollowUpPayload(followUpFile(managed.runDirectory, messageId));
+    if (delivery.state === "delivered" || delivery.state === "cancelled") this.#clearFollowUpTimer(messageId);
+    return structuredClone(delivery);
+  }
+
+  #clearFollowUpTimer(messageId: string): void {
+    clearTimeout(this.#followUpTimers.get(messageId));
+    this.#followUpTimers.delete(messageId);
+  }
+
+  #armFollowUpDeadline(managed: ManagedAgent, delivery: AgentFollowUpDelivery): void {
+    // Only message admission starts a timer. Keep it after receiver settlement,
+    // but never past sender teardown; long deadlines must not overflow setTimeout.
+    const timer = setTimeout(() => {
+      this.#followUpTimers.delete(delivery.messageId);
+      if (Date.now() < delivery.deadlineAt) this.#armFollowUpDeadline(managed, delivery);
+      else this.#checkFollowUps(managed);
+    }, Math.max(0, Math.min(delivery.deadlineAt - Date.now(), 2_147_483_647)));
+    timer.unref();
+    this.#followUpTimers.set(delivery.messageId, timer);
+  }
+
+  #checkFollowUps(managed: ManagedAgent, record = readRecord(managed.statusFile)): AgentFollowUpDelivery[] {
+    const entries = this.#followUps.get(managed.id);
+    if (!entries) return [];
+    for (const delivery of entries.values()) {
+      delivery.state = followUpState(followUpFile(managed.runDirectory, delivery.messageId));
+      if (delivery.state === "delivered" || delivery.state === "cancelled" || delivery.alarm) { this.#clearFollowUpTimer(delivery.messageId); continue; }
+      if (Date.now() < delivery.deadlineAt) continue;
+      const alarm: AgentFollowUpAlarm = {
+        code: "FABRIC_FOLLOW_UP_DEADLINE", messageId: delivery.messageId,
+        targetId: managed.id, targetName: managed.name, deadlineAt: delivery.deadlineAt,
+        status: record?.status ?? "running",
+        ...(record?.currentTool ? { currentTool: record.currentTool, currentToolStartedAt: record.currentToolStartedAt } : {}),
+        options: ["wait", "steer", "cancel"],
+        message: `Follow-up ${delivery.messageId} to ${managed.name} (${managed.id}) missed its delivery deadline; ` +
+          `${record?.currentTool ? `busy in tool ${record.currentTool} since ${new Date(record.currentToolStartedAt ?? record.updatedAt).toISOString()}` : record?.status ?? "running"}. ` +
+          `${delivery.state === "settling" ? "Delivery remains uncertain and fenced." : "It remains queued."} Wait, use agents.steer, or agents.cancelFollowUp({ id: '${managed.id}', messageId: '${delivery.messageId}' }).`,
+      };
+      delivery.alarm = alarm; // Mark before calling observers: one alarm, even under reentrant status.
+      this.#clearFollowUpTimer(delivery.messageId);
+      try { this.#onFollowUpAlarm?.(structuredClone(alarm)); } catch { /* Status retains the sender alarm. */ }
+    }
+    return structuredClone([...entries.values()]);
   }
 
   // Veda children run one headless prompt per invocation; there is no stdin
@@ -2144,7 +2228,7 @@ export class AgentManager {
       );
     }
     const steerFile = path.join(managed.runDirectory, "steer.jsonl");
-    const messageId = randomUUID();
+    const messageId = entry.followUpId ?? randomUUID();
     const line = JSON.stringify({ ...entry, id: messageId, ts: Date.now() }) + "\n";
     if (entry.type === "steer" || entry.type === "follow_up") {
       const incoming = copyFabricPrincipal(entry.provenance?.principal);
@@ -2227,6 +2311,8 @@ export class AgentManager {
 
   close(): Promise<void> {
     this.#closing = true;
+    for (const timer of this.#followUpTimers.values()) clearTimeout(timer);
+    this.#followUpTimers.clear();
     this.#closeAbort.abort(new Error("Fabric agent manager is closing"));
     return this.#closePromise ??= this.#close();
   }
@@ -2696,6 +2782,7 @@ export class AgentManager {
     while (!managed.settled) {
       this.#drainLifecycle(managed);
       const record = readRecord(managed.statusFile);
+      this.#checkFollowUps(managed, record);
       if (record) {
         this.#observeProgress(managed, record);
         const previous = managed.latestRecord;

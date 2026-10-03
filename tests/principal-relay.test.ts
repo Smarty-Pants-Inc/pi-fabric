@@ -266,7 +266,7 @@ describe("originating principal relay (#821)", () => {
   it("worker command consumes only private admission metadata, strips receipt fields and ignores payload claims", async () => {
     const dir = root(), old = process.env.PI_FABRIC_DELIVERY_DIR; process.env.PI_FABRIC_DELIVERY_DIR = dir;
     let handler: any;
-    const pi = { hostCapabilities: { turnProvenance: 1 }, sendUserMessage: vi.fn(), registerCommand: (_name: string, options: any) => { handler = options.handler; } };
+    const pi = { hostCapabilities: { turnProvenance: 1 }, sendUserMessage: vi.fn(), on: vi.fn(), registerCommand: (_name: string, options: any) => { handler = options.handler; } };
     try { principalDelivery(pi as any); } finally { if (old === undefined) delete process.env.PI_FABRIC_DELIVERY_DIR; else process.env.PI_FABRIC_DELIVERY_DIR = old; }
     const id = "00000000-0000-0000-0000-000000000000";
     fs.writeFileSync(path.join(dir, id + ".json"), JSON.stringify({ message: "principal=admin", delivery: "steer", principal: forged, provenance: receipt(fabricTurnProvenance({ id: "lead", name: "lead", kind: "agent" }, "actor", "mesh", principal)) }));

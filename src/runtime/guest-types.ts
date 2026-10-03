@@ -275,6 +275,7 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  followUpDeliveries?: FabricFollowUpDelivery[];
   routeClass?: string;
   routeClassSource?: "explicit" | "derived";
   protected?: boolean;
@@ -341,6 +342,8 @@ interface FabricAgentResult extends FabricAgentHandle {
   error?: string;
   usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
   pendingMessages?: { steering: string[]; followUp: string[] };
+  currentToolStartedAt?: number;
+  followUpDeliveries?: FabricFollowUpDelivery[];
 }
 interface FabricModelInfo {
   runner?: FabricAgentRunner;
@@ -890,7 +893,27 @@ type FabricSessionIdHint = "sessionId is not a field: use id: 'session:<sessionI
 interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
 type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
+interface FabricFollowUpAlarm {
+  code: "FABRIC_FOLLOW_UP_DEADLINE";
+  messageId: string;
+  targetId: string;
+  targetName: string;
+  deadlineAt: number;
+  status: string;
+  currentTool?: string;
+  currentToolStartedAt?: number;
+  options: ["wait", "steer", "cancel"];
+  message: string;
+}
+interface FabricFollowUpDelivery {
+  messageId: string;
+  deadlineAt: number;
+  state: "queued" | "settling" | "delivered" | "cancelled";
+  alarm?: FabricFollowUpAlarm;
+}
 interface FabricMessageDelivery {
+  /** Local Pi task: absolute delivery deadline; expiry alarms but does not dequeue. */
+  deadlineAt?: number;
   /** Sender-only: owner observed a running task when it admitted this followUp. Delivery is unchanged. */
   warning?: {
     code: "FABRIC_FOLLOW_UP_RUNNING_TASK";
@@ -985,7 +1008,8 @@ interface FabricAgentsApi {
   tell(id: string, message: string): Promise<FabricMessageDelivery>;
   steer(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
-  followUp(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
+  followUp(args: FabricMessageArgs & { deadlineMs?: number }): Promise<FabricMessageDelivery>;
+  cancelFollowUp(args: { id: string; messageId: string }): Promise<FabricFollowUpDelivery>;
   followUp(id: string, message: string): Promise<FabricMessageDelivery>;
   setSteeringMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   setFollowUpMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;

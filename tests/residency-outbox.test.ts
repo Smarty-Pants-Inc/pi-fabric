@@ -112,7 +112,8 @@ describe("resident producer durable outbox", () => {
       // not relative to our 25 ms polling loop's observation of it.
       await wait(() => ensure.mock.calls.length > 0, 10_000);
       await sleep(250);
-      expect(fs.existsSync(path.join(f.config.residencyRoot, "owner.json"))).toBe(false);
+      expect(fs.existsSync(path.join(f.config.residencyRoot, "owner.json")),
+        ["owner.json", "error.json", "launcher.log", "child-stderr.log"].map(file => { try { return `${file}: ${fs.readFileSync(path.join(f.config.residencyRoot, file), "utf8")}`; } catch { return `${file}: absent`; } }).join("\n")).toBe(false);
       expect(fs.existsSync(path.join(f.outbox, entry))).toBe(true);
       for (const root of [f.config.actorRoot, f.config.sessionActorRoot!]) {
         const registry = path.join(root, "actors.json");

@@ -24,14 +24,14 @@ import { processStartTime, residentProcessAlive } from "../src/residency/process
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const fixture = () => {
+const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-host-review-"));
   const config: ResidentHostConfig = {
     format: RESIDENT_HOST_FORMAT, rootId: "session:review", sessionId: "review",
     cwd: process.cwd(), projectRoot: process.cwd(), meshRoot: path.join(root, "mesh"),
     actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
     fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh,
-    retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("dist/agents/worker.js"),
+    retention: { ...DEFAULT_FABRIC_CONFIG.retention, ...retention }, workerPath: path.resolve("dist/agents/worker.js"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
   fs.mkdirSync(config.residencyRoot);
@@ -41,6 +41,85 @@ const fixture = () => {
   const host = new ResidentHost(config, idle);
   return { root, config, host, idle };
 };
+
+describe("resident maintenance readiness attachment", () => {
+  it("waits for the published live generation before one accepted create, without another launcher", async () => {
+    const { root, config, host } = fixture();
+    const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: "caller", rootId: config.rootId,
+      identity: { id: "caller", name: "caller", kind: "main" } });
+    const client = new ResidencyClient({ config, mesh, participants, startupTimeoutMs: 2_000, commandTimeoutMs: 5_000,
+      mainAgent: { local: false } as FabricMainAgentTarget });
+    let creation: ReturnType<typeof client.createActor> | undefined;
+    try {
+      await host.start();
+      const ownerPath = path.join(config.residencyRoot, "owner.json");
+      const owner = fs.readFileSync(ownerPath, "utf8");
+      // Simulate temporarily missing visibility for an already-owned generation.
+      // Independent attachment still waits without stopping or replacing it.
+      const receiptPath = path.join(config.residencyRoot, "maintenance-ready.json");
+      const receipt = fs.readFileSync(receiptPath, "utf8");
+      fs.rmSync(receiptPath);
+      const create = vi.spyOn(host.actors, "create");
+      let settled = false;
+      creation = client.createActor({ name: "attached-once", instructions: "Watch", residency: "durable" });
+      void creation.then(() => { settled = true; }, () => { settled = true; });
+      await delay(120);
+      expect(settled).toBe(false);
+      expect(create).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(config.residencyRoot, "launcher.log"))).toBe(false);
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      fs.writeFileSync(receiptPath, receipt);
+      const actor = await creation;
+      expect(host.actors.owns(actor.id)).toBe(true);
+      expect(participants.get(actor.id)?.ownerHostId).toBe(host.hostId);
+      expect(create).toHaveBeenCalledOnce();
+      expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "maintenance-ready.json"), "utf8"))).toMatchObject({
+        token: JSON.parse(owner).token,
+      });
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      expect(fs.existsSync(path.join(config.residencyRoot, "launcher.log"))).toBe(false);
+    } finally {
+      await creation?.catch(() => undefined); await client.close(); await host.close();
+      vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Astra resident lease delivery fence", () => {
+  it("F2 binding resolution loses its lease without tell/sequence delivery, then resumes its owned claim once", async () => {
+    const { root, config, host } = fixture();
+    let sender: FabricControlPlane | undefined;
+    let release!: () => void, entered!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    let healthy = true;
+    let result: Promise<unknown> | undefined;
+    try {
+      await host.start();
+      vi.spyOn(host.participants, "canConsumeMesh").mockImplementation(() => healthy);
+      vi.spyOn(host.actors, "owns").mockReturnValue(true);
+      vi.spyOn(host.actors, "status").mockReturnValue({ rootId: config.rootId } as ReturnType<typeof host.actors.status>);
+      vi.spyOn(host.actors, "resolveActivationBinding").mockImplementation(async () => { entered(); await waiting; return {}; });
+      const tell = vi.spyOn(host.actors, "tell").mockReturnValue({ messageId: "lease-delivery-once" } as ReturnType<typeof host.actors.tell>);
+      const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+      sender = new FabricControlPlane(new MeshStore(config.meshRoot, 65536, 1000), identity, { enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 5000 });
+      sender.start(() => ({ accepted: false }));
+      result = sender.request(host.hostId, "actor", "followUp", { message: "accepted work" }).catch(error => error);
+      await preparing; healthy = false; release(); await delay(150);
+      expect(tell).not.toHaveBeenCalled();
+      const seenRoot = path.join(config.meshRoot, "control-seen", createHash("sha256").update(host.hostId).digest("hex").slice(0, 32));
+      const seen = new MeshStore(seenRoot, 65536, 1000);
+      expect(seen.listAll("topology/control-seen/").every(entry => !(entry.value as { sequence?: number }).sequence)).toBe(true);
+      healthy = true;
+      expect(await result).toMatchObject({ acknowledged: true, messageId: "lease-delivery-once" });
+      expect(tell).toHaveBeenCalledOnce();
+    } finally {
+      healthy = true; release?.(); await result; await sender?.close();
+      vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 15000);
+});
 
 describe("#3662 resident actor delivery routing", () => {
   it.each(["read-denied", "stat-denied", "invalid-json", "invalid-envelope", "invalid-participant"] as const)(
@@ -235,10 +314,17 @@ describe("resident loaded-path census metadata", () => {
 });
 
 describe("resident retention config reload", () => {
-  it("applies a same-release client reload to an already-running host's next sweep without replacing its owner", async () => {
-    const { root, config, host } = fixture();
-    // Do not mutate the shared defaults, and leave the host's initial config immutable.
-    config.retention = { ...config.retention };
+  it.each([
+    { change: "age threshold", initial: { terminalRunEventsAgeMs: 12 * 60 * 60 * 1000, terminalRunEventsMaxBytes: 128 * 1024 },
+      reloaded: { terminalRunEventsAgeMs: 6 * 60 * 60 * 1000 } },
+    { change: "byte cap", initial: { terminalRunEventsMaxBytes: 512 * 1024 },
+      reloaded: { terminalRunEventsMaxBytes: 128 * 1024 } },
+  ])("applies a same-release client reload to an already-running host's next sweep without replacing its owner ($change)", async ({ initial, reloaded }) => {
+    // The streamed first sweep must genuinely retain this fixture: unlike the
+    // former startup sweep, it runs after the log is created. Set the initial
+    // policy before constructing the host, which takes its own shared copy.
+    const { root, config, host } = fixture(initial);
+    const initialRetention = { ...config.retention };
     let client: ResidencyClient | undefined;
     try {
       await host.start();
@@ -246,33 +332,42 @@ describe("resident retention config reload", () => {
       const owner = fs.readFileSync(ownerPath, "utf8");
       const run = path.join(config.residencyRoot, "runs", "reload-retention");
       fs.mkdirSync(run, { recursive: true });
-      const log = Buffer.from((JSON.stringify({ text: "x".repeat(100) }) + "\n").repeat(3000));
+      // Stay below the 200-line tail limit so the byte-cap case tests only bytes.
+      const log = Buffer.from((JSON.stringify({ text: "x".repeat(3000) }) + "\n").repeat(100));
       const status = JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647",
         finishedAt: Date.now() - 8 * 60 * 60 * 1000 });
       fs.writeFileSync(path.join(run, "status.json"), status);
       fs.writeFileSync(path.join(run, "events.jsonl"), log);
       fs.writeFileSync(path.join(run, "reply.json"), '{"text":"keep"}');
-      await delay(150);
+      // Observe a completed production scan, not merely elapsed wall time.
+      await vi.waitFor(() => expect(fs.existsSync(path.join(config.residencyRoot, "request-retention.json"))).toBe(true));
       expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(log);
       // The real reload creates a new client; ensureHost publishes desired config and reuses the owner.
-      const next = { ...config, retention: { ...config.retention,
-        terminalRunEventsAgeMs: 6 * 60 * 60 * 1000, terminalRunEventsMaxBytes: 128 * 1024 } };
+      // Each case changes only one threshold, making stale policy observable.
+      const next = { ...config, retention: { ...config.retention, ...reloaded } };
       client = new ResidencyClient({ config: next, mesh: host.mesh, participants: host.participants,
         mainAgent: { local: false } as FabricMainAgentTarget });
       expect((await client.ensureHost()).pid).toBe(process.pid);
       // Advance only the sample clock; keep the real host poll and its production 5-ms transaction.
       const due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
       const nativeSweep = ResidentRequestRetention.prototype.sweep;
+      const policies: Array<ResidentRequestRetention["retention"]> = [];
       const sweep = vi.spyOn(ResidentRequestRetention.prototype, "sweep").mockImplementation(function (this: ResidentRequestRetention, now, ...args) {
+        policies.push({ ...this.retention });
         return nativeSweep.call(this, now + 60_001, ...args);
       });
       const deadline = Date.now() + 2500;
       while (fs.statSync(path.join(run, "events.jsonl")).size > 128 * 1024 && Date.now() < deadline) await delay(10);
+      expect(sweep).toHaveBeenCalled();
+      expect(sweep.mock.calls.every(call => call[2] === 5)).toBe(true);
+      expect(policies).toContainEqual({ ...next.retention, retainRuns: config.agents.retainRuns });
       due.mockRestore(); sweep.mockRestore();
       expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(128 * 1024);
+      expect(config.retention).toEqual(initialRetention);
       expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(status);
       expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep"}');
       expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      expect(DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsAgeMs).toBe(6 * 60 * 60 * 1000);
       expect(DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsMaxBytes).toBe(256 * 1024);
     } finally {
       vi.restoreAllMocks(); await client?.close(); await host.close();
@@ -486,7 +581,7 @@ describe("resident orphan retention", () => {
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("F6 sweeps old terminal untracked runs at fenced host start, preserving recent/live/unknown/unresolved runs", async () => {
+  it("F6 sweeps old terminal untracked runs after lease publication, preserving recent/live/unknown/unresolved runs", async () => {
     const { root, config, host } = fixture();
     const runs = path.join(config.residencyRoot, "runs");
     const now = Date.now();
@@ -500,7 +595,8 @@ describe("resident orphan retention", () => {
     };
     expect(() => process.kill(2147483647, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
     const old = make("terminal-old", { status: "completed" });
-    const actor = make("actor-old", { status: "completed", actorId: "actor-without-public-metadata" });
+    const actor = make("actor-old", { status: "completed", actorId: "actor-without-public-metadata",
+      transport: "process", sessionId: "2147483647", processStartTime: "1" });
     const recent = make("terminal-recent", { status: "completed" }, 1_000);
     const live = make("live", { status: "completed", transport: "process", sessionId: String(process.pid) });
     const unknown = make("unknown", { status: "running" });
@@ -513,6 +609,13 @@ describe("resident orphan retention", () => {
     fs.utimesSync(unresolved, (now - RESIDENT_RUN_RETENTION_MS - 60_000) / 1_000, (now - RESIDENT_RUN_RETENTION_MS - 60_000) / 1_000);
     try {
       await host.start();
+      // Startup does not inspect archives; the streaming collector runs later.
+      expect(fs.existsSync(old)).toBe(true);
+      await vi.waitFor(() => {
+        expect(fs.existsSync(old)).toBe(false);
+        expect(fs.existsSync(actor)).toBe(false);
+      });
+      for (const run of [recent, live, unknown, malformed, deadWithoutBirth, unresolved]) expect(fs.existsSync(run), run).toBe(true);
       expect(fs.existsSync(old)).toBe(false);
       expect(fs.existsSync(actor)).toBe(false);
       for (const run of [recent, live, unknown, recordlessIdentity, external, malformed, deadWithoutBirth, unresolved]) expect(fs.existsSync(run), run).toBe(true);
@@ -618,8 +721,11 @@ describe("resident host ownership", () => {
       expect(owner).toMatchObject({ requestFence: 1, callerBoundSpawn: 1, requestExpiry: 1, creationIdempotency: 1, commands: expect.arrayContaining(["spawnBound", "setModel", "setTools"]), pid: process.pid, hostId: host.hostId });
       expect(owner.processStartTime).toBe(processStartTime(process.pid));
       expect(residentProcessAlive(owner.pid, owner.processStartTime)).toBe(true);
+      const sharedHostKey = `topology/hosts/${createHash("sha256").update(host.hostId).digest("hex")}`;
+      expect(host.mesh.get(sharedHostKey, { fresh: true })).toBeDefined();
       await host.close();
       expect(fs.existsSync(ownerPath)).toBe(false);
+      expect(host.mesh.get(sharedHostKey, { fresh: true })).toBeUndefined();
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
   it("never follows mutable config alone without a Main intent and attested launcher custody", async () => {

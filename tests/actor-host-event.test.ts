@@ -51,6 +51,7 @@ describe("Fabric actor host events", () => {
       "tool_error",
     ]);
     expect(FABRIC_ACTOR_HOST_EVENTS).not.toContain("project_trust");
+    expect(FABRIC_ACTOR_HOST_EVENTS).not.toContain("mcp_servers_change");
   });
 
   it("registers one asynchronous observer for every supported Pi event", () => {

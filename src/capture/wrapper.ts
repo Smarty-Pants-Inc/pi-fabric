@@ -1,4 +1,5 @@
 import type { ExtensionRunner, RegisteredTool, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createCapturedToolContext } from "./tool-context.js";
 
 // Local mirror of wrapRegisteredTool/wrapToolDefinition (pi 0.84.2,
 // core/extensions/wrapper.js and core/tools/tool-definition-wrapper.js).
@@ -27,7 +28,7 @@ export interface WrappedRegisteredTool {
 
 const wrapToolDefinition = (
   definition: ToolDefinition<any, any, any>,
-  ctxFactory: () => unknown,
+  ctxFactory: (toolCallId: string, signal: AbortSignal | undefined) => unknown,
 ): WrappedRegisteredTool => {
   const execute = definition.execute as unknown as WrappedExecute;
   return {
@@ -39,7 +40,8 @@ const wrapToolDefinition = (
     prepareArguments: definition.prepareArguments,
     executionMode: definition.executionMode,
     execute: (toolCallId, params, signal, onUpdate, ctx) =>
-      execute(toolCallId, params, signal, onUpdate, ctx ?? ctxFactory()),
+      execute(toolCallId, params, signal, onUpdate,
+        ctx ?? ctxFactory(toolCallId as string, signal as AbortSignal | undefined)),
   };
 };
 
@@ -50,7 +52,7 @@ export const wrapRegisteredToolForCapture = (
 ): WrappedRegisteredTool => {
   const tool = wrapToolDefinition(
     registeredTool.definition as ToolDefinition<any, any, any>,
-    () => runner.createContext(),
+    (toolCallId, signal) => createCapturedToolContext(runner, toolCallId, signal),
   );
   const execute = tool.execute;
   return {

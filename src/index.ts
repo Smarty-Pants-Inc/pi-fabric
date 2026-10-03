@@ -279,10 +279,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   const { reassert: reassertToolOwnership, schedule: scheduleOwnershipReassert } =
     createToolOwnershipReassertion({
       ready: () => state.cwd !== undefined,
-      active: () => {
-        const policy = capturePolicy();
-        return policy.enabled && policy.hideFromModel && fabricOwnsModelTools();
-      },
+      active: fabricOwnsModelTools,
       hiddenNames: hiddenCapturedToolNames,
       apply: (hidden) => toolOwnership.apply(true, hidden),
     });
@@ -316,13 +313,20 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     return { skillPaths: fabricSkillPaths(FABRIC_SKILLS_DIR, state.config.executor.kernel) };
   });
 
-  const fabricTool = createFabricExecTool(
+  const fabricToolLifecycle = new FabricToolLifecycle(
+    () => ownsFabricToolSource(pi.getAllTools(), FABRIC_EXTENSION_ENTRY_PATH),
+    () => state.initialized ? state.execution.authorizer : undefined,
+    () => state.initialized ? directToolApproval : undefined,
+    () => ownsRunReplyTool(pi.getAllTools()),
+    fabricOwnsModelTools,
+  );
+  const fabricTool = fabricToolLifecycle.bindExecution(createFabricExecTool(
     state,
     codePreviewSettings,
     pendingHandoffs,
     decorateShell,
     toolDisplay,
-  );
+  ));
   const refreshCodePreviewSettings = (): void => {
     Object.assign(codePreviewSettings, state.config.codePreview);
     configureHighlighting(
@@ -330,13 +334,6 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       codePreviewSettings.syntaxHighlighting,
     );
   };
-  const fabricToolLifecycle = new FabricToolLifecycle(
-    () => ownsFabricToolSource(pi.getAllTools(), FABRIC_EXTENSION_ENTRY_PATH),
-    () => state.initialized ? state.execution.authorizer : undefined,
-    () => state.initialized ? directToolApproval : undefined,
-    () => ownsRunReplyTool(pi.getAllTools()),
-  );
-
   const inactiveCapturePolicy = {
     ...structuredClone(DEFAULT_FABRIC_CONFIG.capture),
     enabled: false,
@@ -361,7 +358,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     toolCapture.setPolicy(capturePolicy());
     Object.assign(
       fabricTool,
-      createFabricExecTool(state, codePreviewSettings, pendingHandoffs, decorateShell, toolDisplay),
+      fabricToolLifecycle.bindExecution(createFabricExecTool(state, codePreviewSettings, pendingHandoffs, decorateShell, toolDisplay)),
     );
     pi.registerTool(fabricTool);
     toolOwnership.apply(
@@ -762,6 +759,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("agent_settled", async (event, context) => {
+    fabricToolLifecycle.clear();
     inboxWake.settling = true;
     try {
       await settle(event, context);

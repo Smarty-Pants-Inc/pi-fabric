@@ -3,7 +3,9 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import type { AgentToolResult, SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CapturedToolCatalog, type CapturedToolEntry } from "../capture/catalog.js";
-import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
+import { createCapturedToolContext } from "../capture/tool-context.js";
+import { classifyPiBashError, classifyPiBashResult, piBashResultError } from "../core/pi-bash-error.js";
+import { emitNestedToolResult } from "../core/tool-result.js";
 import { isPiShellToolName } from "../core/pi-tools.js";
 import type {
   FabricActionDescriptor,
@@ -183,7 +185,7 @@ export class CapturedToolsProvider implements FabricProvider {
       executionStarted = true;
       const requestedCwd = args.cwd;
       const executionContext = isPiShellToolName(entry.name) && typeof requestedCwd === "string"
-        ? { ...runner.createContext(), cwd: requestedCwd }
+        ? createCapturedToolContext(runner, toolCallId, context.signal, undefined, requestedCwd)
         : undefined;
       result = await runAbortable(context.signal, () =>
         wrappedTool.execute(toolCallId, args, context.signal, (partialResult) => {
@@ -202,6 +204,10 @@ export class CapturedToolsProvider implements FabricProvider {
           .catch(() => undefined);
         }, executionContext),
       );
+      isError = (result as AgentToolResult<unknown> & { isError?: boolean }).isError === true;
+      if (isError && isPiShellToolName(entry.name)) {
+        thrown = classifyPiBashResult(result as AgentToolResult<unknown> & { isError?: boolean; structuredContent?: unknown });
+      }
     } catch (error) {
       thrown = isPiShellToolName(entry.name) && executionStarted ? classifyPiBashError(error) : error;
       isError = true;
@@ -218,24 +224,12 @@ export class CapturedToolsProvider implements FabricProvider {
 
     await updateTail;
     throwIfAborted(context.signal);
-    const patch = await runAbortable(context.signal, () => runner.emitToolResult({
-      type: "tool_result",
-      toolName: entry.name,
-      toolCallId,
-      input: args,
-      content: result.content,
-      details: result.details,
-      isError,
-    }));
-    if (patch) {
-      result = {
-        ...result,
-        content: patch.content ?? result.content,
-        ...(patch.details !== undefined ? { details: patch.details } : {}),
-      };
-      isError = patch.isError ?? isError;
-    }
-
+    const effective = await emitNestedToolResult(
+      runner, { toolName: entry.name, toolCallId, input: args }, result, isError,
+      context, entry.definition.outputSchema !== undefined,
+    );
+    result = effective;
+    isError = effective.isError;
     await runAbortable(context.signal, () => runner.emit({
       type: "tool_execution_end",
       toolCallId,
@@ -254,7 +248,7 @@ export class CapturedToolsProvider implements FabricProvider {
       }
       const text = textFromContent(result.content).trim();
       throw new Error(
-        text || (thrown instanceof Error ? thrown.message : `Captured tool ${entry.name} failed`),
+        text || `Captured tool ${entry.name} failed`,
       );
     }
     return asInvocationResult(entry, result, false);

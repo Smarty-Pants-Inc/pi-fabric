@@ -69,7 +69,7 @@ Python defaults to [Monty](https://github.com/pydantic/monty), a sandboxed Pytho
 
 ## Install
 
-Requires Node.js 24+ and Pi 0.80.6+. Monty's optional native package installs on supported platforms; only the explicit CPython escape hatch requires CPython 3.10+. Fabric also checks a detectable Pi host version at startup and warns when an older host may ignore continuation APIs such as actor `triggerTurn`.
+Requires Node.js 24+ and Pi 0.80.6+. Development and migration checks target **Pi 1.0.0**; older hosts retain best-effort compatibility shims but are not certified by the 1.0 migration. See [Pi 1.0 compatibility](docs/pi-1.0.md) for native Codemode/MCP ownership and deployment gates. Monty's optional native package installs on supported platforms; only the explicit CPython escape hatch requires CPython 3.10+. Fabric also checks a detectable Pi host version at startup and warns when an older host may ignore continuation APIs such as actor `triggerTurn`.
 
 ```bash
 pi install npm:pi-fabric

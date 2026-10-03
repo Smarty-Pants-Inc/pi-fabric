@@ -29,6 +29,8 @@ export type { FabricActorActivationFilter } from "./activation-filter.js";
 //   - `provider_stream_event` (newer Pi) fires for every raw provider stream chunk: far
 //     too frequent for an actor mailbox. Excluding it is a no-op on Pi versions that
 //     do not define it.
+// `mcp_servers_change` is native MCP configuration/control, not an actor
+// observation. It can contain server configuration; do not fan it out to actors.
 // To observe one of these as an actor event, add it to
 // FABRIC_ACTOR_PI_HOST_EVENTS below and give it a FABRIC_LIFECYCLE_EVENTS topic.
 export type FabricActorPiHostEvent = Exclude<
@@ -38,6 +40,7 @@ export type FabricActorPiHostEvent = Exclude<
   | "agent_before_settle"
   | "context_with_system"
   | "provider_stream_event"
+  | "mcp_servers_change"
 >;
 
 const defineFabricActorPiHostEvents = <

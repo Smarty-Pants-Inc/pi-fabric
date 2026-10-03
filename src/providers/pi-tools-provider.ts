@@ -17,13 +17,15 @@ import {
 import { tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
 import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
+import { createCapturedToolContext } from "../capture/tool-context.js";
 import { readFabricBashMiddleware } from "../core/shell-middleware.js";
 import {
   isPiShellToolName,
   PI_CORE_TOOL_NAMES,
   type PiCoreToolName,
 } from "../core/pi-tools.js";
-import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
+import { classifyPiBashError, classifyPiBashResult, piBashResultError } from "../core/pi-bash-error.js";
+import { emitNestedToolResult } from "../core/tool-result.js";
 import {
   appendShellHangNotice,
   DEFAULT_SHELL_HANG_MS,
@@ -225,13 +227,14 @@ const normalizeResult = (
   };
 };
 
-// Shape of a pi core tool's execute() result. AgentToolResult<unknown> is
-// { content, details, terminate? }; pi core tools throw on error rather than
-// returning isError, so isError is tracked separately in #invokeWithEvents.
+// Older Pi throws on failure; Pi 0.99+ can return an error result with
+// structuredContent. Capture failure provenance before result middleware.
 interface PiToolResult {
   content: ToolContent;
   details: unknown;
   terminate?: boolean;
+  isError?: boolean;
+  structuredContent?: unknown;
 }
 
 export class PiToolsProvider implements FabricProvider {
@@ -425,12 +428,16 @@ export class PiToolsProvider implements FabricProvider {
   #executionContextFor(
     name: PiCoreToolName,
     args: Record<string, unknown>,
-    context: ExtensionContext,
-  ): ExtensionContext {
+    invocation: FabricInvocationContext,
+  ): Parameters<ToolDefinition<any, any, any>["execute"]>[4] {
     const cwd = args[PI_BASH_CWD_KEY];
-    return isPiShellToolName(name) && typeof cwd === "string"
-      ? { ...context, cwd }
-      : context;
+    return createCapturedToolContext(
+      this.#catalog?.runner,
+      invocation.nestedToolCallId,
+      invocation.signal,
+      invocation.extensionContext,
+      isPiShellToolName(name) && typeof cwd === "string" ? cwd : undefined,
+    );
   }
 
   #bashMiddleware(name: string) {
@@ -488,7 +495,7 @@ export class PiToolsProvider implements FabricProvider {
           args,
           context.signal,
           onUpdate,
-          this.#executionContextFor(name, args, context.extensionContext),
+          this.#executionContextFor(name, args, context),
         ),
       ) as PiToolResult;
     }
@@ -537,7 +544,7 @@ export class PiToolsProvider implements FabricProvider {
             if (spilled) return;
             onUpdate(partialResult as PiToolResult);
           },
-          this.#executionContextFor(name, args, context.extensionContext),
+          this.#executionContextFor(name, args, context),
         ),
     });
     if (outcome.status === "done") {
@@ -620,6 +627,12 @@ export class PiToolsProvider implements FabricProvider {
         throwIfAborted(context.signal);
         throw isPiShellToolName(name) ? classifyPiBashError(error) : error;
       });
+      if (isPiShellToolName(name)) {
+        const failure = classifyPiBashResult(result);
+        if (failure) throw failure;
+      } else if (result.isError) {
+        throw new Error(textContent(result.content).trim() || `Pi tool ${name} failed`);
+      }
       this.#attachReadMedia(name, result, context);
       this.#attachReadNote(name, result, context);
       this.#attachPreview(name, result, args, context);
@@ -633,7 +646,7 @@ export class PiToolsProvider implements FabricProvider {
   // core tools invoked through fabric_exec in full-code mode — exactly as
   // they would for a top-level call in the normal (non-codemode) flow, and
   // exactly as CapturedToolsProvider already does for captured extension
-  // tools. tool_result patches (content/details/isError) are applied, so
+  // tools. tool_result patches (including structured output) are applied, so
   // extensions like pi-vision-handoff can replace image blocks with text
   // descriptions before the result returns to the sandbox.
   async #invokeWithEvents(
@@ -689,6 +702,8 @@ export class PiToolsProvider implements FabricProvider {
         },
         middleware,
       );
+      isError = result.isError === true;
+      if (isError && isPiShellToolName(name)) thrown = classifyPiBashResult(result);
     } catch (error) {
       thrown = isPiShellToolName(name) && executionStarted ? classifyPiBashError(error) : error;
       isError = true;
@@ -708,23 +723,12 @@ export class PiToolsProvider implements FabricProvider {
     // nothing to re-attach for the kitty preview.
     this.#attachReadMedia(name, result, context);
 
-    const patch = await runAbortable(context.signal, () => runner.emitToolResult({
-      type: "tool_result",
-      toolName: name,
-      toolCallId,
-      input: args,
-      content: result.content,
-      details: result.details,
-      isError,
-    }));
-    if (patch) {
-      result = {
-        ...result,
-        content: patch.content ?? result.content,
-        ...(patch.details !== undefined ? { details: patch.details } : {}),
-      };
-      isError = patch.isError ?? isError;
-    }
+    const effective = await emitNestedToolResult(
+      runner, { toolName: name, toolCallId, input: args }, result, isError,
+      context, tool.outputSchema !== undefined,
+    );
+    result = effective;
+    isError = effective.isError;
 
     // Capture the read's clean text note AFTER the patch — the handoff strips
     // pi's non-vision note and swaps the image for a description, so the first
@@ -744,7 +748,7 @@ export class PiToolsProvider implements FabricProvider {
         throw piBashResultError(thrown, textContent(result.content));
       }
       const text = textContent(result.content).trim();
-      throw new Error(text || (thrown instanceof Error ? thrown.message : `Pi tool ${name} failed`));
+      throw new Error(text || `Pi tool ${name} failed`);
     }
     this.#attachPreview(name, result, args, context);
     return this.#normalizeResult(name, result, args);

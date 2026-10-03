@@ -66,7 +66,7 @@ describe.skipIf(!built)("Fabric across /reload in a real Pi session", () => {
               oldExec = undefined;
               if (!exec) return;
               lateCall = Promise.resolve()
-                .then(() => exec.execute("late", { code: "return 1" } as never, undefined, undefined, ctx))
+                .then(() => exec.execute("late", { code: "return 1" } as never, undefined, undefined, ctx as Parameters<typeof exec.execute>[4]))
                 .then(() => "completed", (error: unknown) => String(error));
               await lateCall;
             });
@@ -86,7 +86,9 @@ describe.skipIf(!built)("Fabric across /reload in a real Pi session", () => {
       oldExec = session.extensionRunner!.getToolDefinition("fabric_exec");
       expect(oldExec).toBeDefined();
       await session.reload();
-      expect(await lateCall).toMatch(/shut down/);
+      // Pi 1.0's ownership wrapper rejects this unadmitted saved definition before
+      // runtime creation, so the shutdown guard no longer supplies the diagnostic.
+      expect(await lateCall).toBe("Error: Fabric invocation authorization has ended");
 
       // The component watcher polls every 250 ms; a runtime left on the old ctx would see this.
       fs.writeFileSync(config, JSON.stringify({ components: [{ id: "missing-component", enabled: true }] }));

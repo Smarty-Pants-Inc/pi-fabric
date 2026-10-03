@@ -31,6 +31,23 @@ const context = {
 };
 
 describe("CapturedToolsProvider", () => {
+  it.each([false, true])("honors native isError results and explicit middleware recovery=%s", async recovery => {
+    const definition = defineTool({ name: "result_failure", label: "failure", description: "fixture",
+      parameters: Type.Object({}),
+      async execute() { return { content: [{ type: "text" as const, text: "native failure" }], details: {}, isError: true }; },
+    });
+    const runner = { createContext: () => ({ cwd: process.cwd() }), getActiveTools: () => [],
+      emit: vi.fn(async () => {}), emitToolCall: vi.fn(async () => undefined),
+      emitToolResult: vi.fn(async () => recovery ? { content: [{ type: "text" as const, text: "recovered" }], isError: false } : undefined),
+    } as unknown as ExtensionRunner;
+    const catalog = new CapturedToolCatalog();
+    catalog.replace([{ definition, sourceInfo: createSyntheticSourceInfo("/extensions/failure.ts", { source: "test" }) }], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/fabric.ts");
+    const invocation = new CapturedToolsProvider(catalog).invoke("result_failure", {}, context);
+    if (recovery) await expect(invocation).resolves.toMatchObject({ text: "recovered", isError: false });
+    else await expect(invocation).rejects.toThrow("native failure");
+    expect(runner.emitToolResult).toHaveBeenCalledWith(expect.objectContaining({ isError: true }));
+    expect(runner.emit).toHaveBeenLastCalledWith(expect.objectContaining({ type: "tool_execution_end", isError: !recovery, result: expect.objectContaining({ isError: !recovery }) }));
+  });
   it("attaches final captured images after result hooks without changing the tool result", async () => {
     const originalImage = { type: "image" as const, data: "original", mimeType: "image/png" };
     const finalImage = { type: "image" as const, data: "final", mimeType: "image/png" };
@@ -67,7 +84,7 @@ describe("CapturedToolsProvider", () => {
       code: 'await tools.call({ ref: "extensions.screenshot", args: {} }); await tools.call({ ref: "extensions.screenshot", args: {} }); return "done";',
     }, undefined, undefined, {
       cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId: () => "fixture" },
-    } as ExtensionContext);
+    } as Parameters<typeof tool.execute>[4]);
     expect(output).not.toMatchObject({ isError: true });
     expect(output.content.filter((part) => part.type === "image")).toEqual([finalImage, finalImage]);
     vi.mocked(runner.emitToolResult).mockResolvedValueOnce({ content: [text, finalImage], isError: true });
@@ -75,7 +92,7 @@ describe("CapturedToolsProvider", () => {
       code: 'return await tools.call({ ref: "extensions.screenshot", args: {} });',
     }, undefined, undefined, {
       cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId: () => "fixture" },
-    } as ExtensionContext);
+    } as Parameters<typeof tool.execute>[4]);
     expect(failedOutput).toMatchObject({ isError: true });
     expect(failedOutput.content.filter((part) => part.type === "image")).toEqual([finalImage]);
   });

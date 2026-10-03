@@ -49,6 +49,24 @@ afterEach(() => {
 });
 
 describe("registered extension tool capture", () => {
+  it("honors non-callable exposure while retaining deferred tools and native registration", () => {
+    const entries = ["direct", "codemode", "deferred", "hidden", "model-only"].map(exposure =>
+      registered(Object.assign(tool(`exposure_${exposure}`), { exposure: exposure as "direct" | "codemode" | "deferred" | "hidden" | "model-only" }), "/extensions/exposure.ts"));
+    entries.push(registered(tool("codemode"), "builtin:codemode"),
+      registered(tool("tool_search"), "builtin:tool-search"));
+    const runner = runnerWith(...entries);
+    const catalog = new CapturedToolCatalog();
+    catalog.replace(entries, runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/fabric.ts");
+    expect(catalog.list().map(entry => entry.name)).toEqual([
+      "exposure_codemode", "exposure_deferred", "exposure_direct",
+    ]);
+    expect(runner.getAllRegisteredTools()).toHaveLength(7);
+    expect(runner.getActiveTools).toBeDefined();
+    // Withdrawal or an exposure change is reflected on the next refresh.
+    entries[0]!.definition.exposure = "hidden";
+    catalog.replace(entries.slice(0, 1), runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/fabric.ts");
+    expect(catalog.size).toBe(0);
+  });
   it("captures every extension tool while keeping it in Pi's registry", async () => {
     // Captured tools must stay visible to pi.getAllTools() consumers (e.g.
     // permission systems validating tool_call events); hiding from the model is

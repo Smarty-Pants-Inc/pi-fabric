@@ -4,6 +4,7 @@ import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
+import { ActorSessionResetCancelledError } from "./session-reset-error.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
@@ -24,6 +25,8 @@ import type { FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
+import type { ModelRouteDecision } from "../agents/model-route.js";
+
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore } from "./child-completions.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
@@ -54,6 +57,12 @@ import { ActorRegistryStore } from "./registry-store.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
+import { ModelRoutePinError } from "../core/model-refresh.js";
+
+export interface ActorModelRouteInput {
+  routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown;
+  parentSessionId: string; actorId: string; activationId: string;
+}
 
 export interface ActorMessageBindingOptions {
   /** Host-only admitted requester snapshot, separate from payload and bindings. */
@@ -129,7 +138,10 @@ interface ManagedActor {
   pythonRuntime?: FabricPythonRuntime;
   runnerSessionId?: string;
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
+  routeClass?: "status-groom";
+  protected?: boolean;
   tools?: string[];
   transport?: FabricAgentTransport;
   timeoutMs?: number;
@@ -371,7 +383,8 @@ export class ActorManager {
   readonly #isOwnResidentActor: ((id: string) => boolean) | undefined;
   // Set while one mesh event is delivered synchronously after a single ownership refresh.
   #ownershipSnapshot = false;
-  readonly #resolvePiModel: ((model: string) => string | Promise<string>) | undefined;
+  readonly #resolvePiModel: ((model: string, requiredPin?: boolean) => string | Promise<string>) | undefined;
+  readonly #prepareModelRoute: ((input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
@@ -454,7 +467,9 @@ export class ActorManager {
       /** Creation-only proof of a live actor owned by this Main's resident host. Never grants management. */
       isOwnResidentActor?: (id: string) => boolean;
       /** May refresh the model registry on a miss, so it is awaited (smarty-dev#1830). */
-      resolvePiModel?: (model: string) => string | Promise<string>;
+      resolvePiModel?: (model: string, requiredPin?: boolean) => string | Promise<string>;
+      /** Host-owned shared shadow preparation; never supplied by public actor arguments. */
+      prepareModelRoute?: (input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>;
       lineageAlive?: (rootId: string) => boolean;
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
@@ -500,6 +515,7 @@ export class ActorManager {
     this.#canManageActor = options.canManageActor;
     this.#isOwnResidentActor = options.isOwnResidentActor;
     this.#resolvePiModel = options.resolvePiModel;
+    this.#prepareModelRoute = options.prepareModelRoute;
     this.#lineageAlive = options.lineageAlive;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
@@ -653,9 +669,18 @@ export class ActorManager {
       extensions: request.extensions ?? true,
     });
     const pythonRuntime = kernel ? this.agents.resolvePythonRuntime(request.pythonRuntime) : undefined;
+    if (request.routeClass !== undefined) {
+      if (request.routeClass !== "status-groom" || runner !== "pi" || (request.transport ?? this.agents.config.transport) !== "process") {
+        throw new Error("Actor shadow routing requires status-groom and process/Pi");
+      }
+      if (!request.model?.trim() || !isFabricThinking(request.thinking)) {
+        throw new ModelRoutePinError(request.model ?? "");
+      }
+      if (!this.#prepareModelRoute) throw new Error("Actor shadow routing host unavailable");
+    }
     const requestedModel = typeof request.model === "string" ? request.model.trim() : "";
     const effectiveModel = requestedModel || this.agents.defaultModel(runner);
-    const admittedModel = effectiveModel ? await this.#resolvedModel(runner, effectiveModel) : undefined;
+    const admittedModel = effectiveModel ? await this.#resolvedModel(runner, effectiveModel, request.routeClass !== undefined) : undefined;
     // No binding keeps actor defaults dynamic, but must still admit the current default.
     const model = requestedModel ? admittedModel : undefined;
     const requirements = normalizeCapabilityRequirements(request.requires);
@@ -697,7 +722,10 @@ export class ActorManager {
       ...(kernel ? { kernel } : {}),
       ...(pythonRuntime ? { pythonRuntime } : {}),
       ...(model ? { model } : {}),
+      ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
       ...(request.thinking ? { thinking: request.thinking } : {}),
+      ...(request.routeClass ? { routeClass: request.routeClass } : {}),
+      ...(typeof request.protected === "boolean" ? { protected: request.protected } : {}),
       ...(request.tools ? { tools: [...new Set(request.tools)] } : {}),
       ...(request.transport ? { transport: request.transport } : {}),
       ...(request.timeoutMs ? { timeoutMs: request.timeoutMs } : {}),
@@ -836,14 +864,14 @@ export class ActorManager {
     const actor = scope === "session" ? this.#requireActor(id) : this.#requireOwnedActor(id);
     const resolved = next
       ? scope === "project" || this.#canManage(actor.id) || this.agents.config.deniedModels.length > 0
-        ? await this.#resolvedModel(actor.runner, next)
+        ? await this.#resolvedModel(actor.runner, next, actor.routeClass !== undefined)
         : next
       : undefined;
     this.agents.assertModelAllowed(resolved);
     if (!resolved) {
       const fallback = scope === "session" ? actor.model ?? this.agents.defaultModel(actor.runner)
         : this.#bindings.get(actor.id)?.model ?? this.agents.defaultModel(actor.runner);
-      if (fallback) await this.#resolvedModel(actor.runner, fallback);
+      if (fallback) await this.#resolvedModel(actor.runner, fallback, actor.routeClass !== undefined);
       else await this.agents.prepareModelForAdmission(undefined, actor.runner);
     }
     // Fence after model refresh and (for session scope) binding-lock acquisition.
@@ -1015,18 +1043,20 @@ export class ActorManager {
    * finishes on the old session first; it is not interrupted. The session file is archived
    * beside it; instructions, topics, bindings, the queue and the message log are kept.
    */
-  async resetSession(id: string): Promise<FabricActorInfo> {
+  async resetSession(id: string, options: { beforeCommit?: (id: string) => void } = {}): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#draining.get(actor.id);
     // A drain owns admission before it installs its abort controller, including
     // while a boundary presence write or launch preparation is awaiting.
     if (actor.draining || running || this.#inFlight.has(actor.id) || actor.abortController) {
+      options.beforeCommit?.(actor.id);
       return new Promise((resolve, reject) => {
         const waiters = this.#pendingResets.get(actor.id) ?? [];
         waiters.push({ resolve, reject });
         this.#pendingResets.set(actor.id, waiters);
       });
     }
+    options.beforeCommit?.(actor.id);
     this.#archiveSession(actor, "requested");
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -1369,7 +1399,10 @@ export class ActorManager {
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       ...(actor.model ? { model: actor.model } : {}),
+      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
+      ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
+      ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(actor.tools ? { tools: [...actor.tools] } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
@@ -1659,16 +1692,27 @@ export class ActorManager {
     const running = this.#runningActor(id);
     if (!running) return;
     this.#stopRun(running);
+    // A caller abort detaches a worker that made progress. Public terminal stop
+    // must explicitly end that owned worker before joining its activation.
+    if (running.inFlightRun) await this.agents.stop(running.inFlightRun.id);
     await running.drain?.catch(() => undefined);
   }
 
-  async stop(id: string): Promise<FabricActorInfo> {
+  async stop(id: string, beforeCommit?: (id: string) => void, wait = false): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#runningActor(actor.id)!;
     const stopped = actor.status === "stopped";
+    beforeCommit?.(actor.id);
+    // Terminal stop cancels an unperformed repair, never rotates its journal.
+    const resets = this.#pendingResets.get(actor.id);
+    this.#pendingResets.delete(actor.id);
+    resets?.forEach(waiter => waiter.reject(new ActorSessionResetCancelledError(actor.id)));
     this.#stopRun(running);
     if (running !== actor) this.#stopRun(actor);
-    if (stopped && running === actor) return this.#publicInfo(actor);
+    if (stopped && running === actor) {
+      if (wait) await this.#joinStoppedRun(actor.id);
+      return this.#publicInfo(actor);
+    }
     this.#drop(actor, [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
     await this.#publishPresence(actor);
@@ -1679,6 +1723,7 @@ export class ActorManager {
         data: this.#publicInfo(actor),
       })
       .catch(() => undefined);
+    if (wait) await this.#joinStoppedRun(actor.id);
     return this.#publicInfo(actor);
   }
 
@@ -2497,15 +2542,25 @@ export class ActorManager {
           // A miss fails this activation with the resolver's error (ask rejects, lastError set).
           // Foreign caller views are already resolved: missing fields must reach the
           // runner/config fallback, never the owner's private session binding.
-          const launchBinding = await this.#prepare(actor, "binding", () => this.#resolvedRunBinding(actor, item.bindingMode === "resolved"
-            ? item.binding : this.#runBinding(actor, item.binding)));
+          const binding = item.bindingMode === "resolved" ? item.binding : this.#runBinding(actor, item.binding);
+          const routeDecision = actor.routeClass !== undefined
+            ? await this.#prepare(actor, "binding", () => {
+              if (!this.#prepareModelRoute) throw new Error("Actor shadow routing host unavailable");
+              return this.#prepareModelRoute({ routeClass: actor.routeClass!, protected: actor.protected,
+                pinModel: binding.model, pinThinking: binding.thinking, parentSessionId: this.sessionId,
+                actorId: actor.id, activationId: item.id }, abortController.signal);
+            })
+            : undefined;
+          const launchBinding = routeDecision ? { model: routeDecision.pin.model, thinking: routeDecision.pin.effort }
+            : await this.#prepare(actor, "binding", () => this.#resolvedRunBinding(actor, binding));
           // Admission is held, but no child writer has launched yet. Repair/create
           // the native session before handing its path to the process.
           this.#ensurePiSession(actor);
           if (actor.preparing) actor.preparing.phase = "launch";
           preLaunch = false; // AgentManager bounds model/auth setup after (not during) permit waiting.
           const result = await this.agents.run(
-            this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
+            { ...this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
+              ...(routeDecision ? { routeDecision } : {}) },
             abortController.signal,
             (handle) => {
               workerLaunched = true;
@@ -2851,6 +2906,8 @@ export class ActorManager {
       systemPrompt: this.#systemPrompt(actor),
       actorId: actor.id,
       actorName: actor.name,
+      ...(actor.routeClass !== undefined ? { routeClass: actor.routeClass } : {}),
+      ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(capabilityRequirements
         ? { capabilityRequirements: [...capabilityRequirements] }
         : {}),
@@ -2862,6 +2919,7 @@ export class ActorManager {
         : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(binding.model ? { model: binding.model } : {}),
+      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
       ...(binding.thinking ? { thinking: binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -3366,7 +3424,10 @@ export class ActorManager {
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(actor.model ? { model: actor.model } : {}),
+      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
+      ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
+      ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
@@ -3567,7 +3628,10 @@ export class ActorManager {
           ? { runnerSessionId: record.runnerSessionId }
           : {}),
         ...(typeof record.model === "string" ? { model: record.model } : {}),
+        ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
         ...(isFabricThinking(record.thinking) ? { thinking: record.thinking } : {}),
+        ...(typeof record.routeClass === "string" ? { routeClass: record.routeClass as "status-groom" } : {}),
+        ...(typeof record.protected === "boolean" ? { protected: record.protected } : {}),
         ...(Array.isArray(record.tools)
           ? { tools: record.tools.filter((tool): tool is string => typeof tool === "string") }
           : {}),
@@ -3895,9 +3959,9 @@ export class ActorManager {
     this.#persistQueue(actor.id);
   }
 
-  #resolvedModel(runner: FabricAgentRunner, model: string): string | Promise<string> {
+  #resolvedModel(runner: FabricAgentRunner, model: string, requiredPin = false): string | Promise<string> {
     this.agents.assertModelAllowed(model, runner);
-    const resolved = runner === "pi" && this.#resolvePiModel ? this.#resolvePiModel(model) : model;
+    const resolved = runner === "pi" && this.#resolvePiModel ? this.#resolvePiModel(model, requiredPin) : model;
     const admit = (key: string): string => { this.agents.assertModelAllowed(key, runner); return key; };
     return resolved instanceof Promise ? resolved.then(admit) : admit(resolved);
   }
@@ -3907,7 +3971,7 @@ export class ActorManager {
     binding: FabricActorRunBinding,
   ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
     if (!binding.model) return binding;
-    const model = this.#resolvedModel(actor.runner, binding.model);
+    const model = this.#resolvedModel(actor.runner, binding.model, actor.routeClass !== undefined);
     return model instanceof Promise
       ? model.then((resolved) => ({ ...binding, model: resolved }))
       : { ...binding, model };
@@ -3969,6 +4033,8 @@ export class ActorManager {
       triggerTurn: actor.triggerTurn,
       coalesce: actor.coalesce,
       residency: actor.residency,
+      ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
+      ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(effective.model ? { model: effective.model } : {}),
       ...(effective.thinking ? { thinking: effective.thinking } : {}),
       binding: {

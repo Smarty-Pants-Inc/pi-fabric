@@ -4049,6 +4049,15 @@ export class ActorManager {
     return this.#canManageActor === undefined;
   }
 
+  #lineageMayBeAlive(rootId: string): boolean {
+    try {
+      // As with delivery, only explicit confirmed death authorizes cross-root inheritance.
+      return this.#lineageAlive?.(rootId) !== false;
+    } catch {
+      return true;
+    }
+  }
+
   #maybeAdoptOrphan(actor: ManagedActor): void {
     if (
       !this.#persistent ||
@@ -4075,7 +4084,7 @@ export class ActorManager {
     // lineages a racing winner already claimed and advertised, even when the
     // winner persisted before we loaded and its actor presence has not
     // reached our tail yet.
-    if (this.#lineageAlive?.(actor.rootId) === true) return;
+    if (this.#lineageMayBeAlive(actor.rootId)) return;
     // Only against a disk view we are in sync with.
     if (this.#persistedRoots.get(actor.id) !== actor.rootId) return;
     // A lineage adopted this recently has a live adopter that may simply be
@@ -4098,8 +4107,8 @@ export class ActorManager {
         if (!current || current.rootId !== expectedRootId) return false;
         // A live owner opinion appeared while we waited for the lock.
         if (this.#canManageActor?.(actor.id) !== undefined) return false;
-        // The lineage root turned out to be alive after all.
-        if (this.#lineageAlive?.(expectedRootId) === true) return false;
+        // The lineage root turned out to be alive or unknown after all.
+        if (this.#lineageMayBeAlive(expectedRootId)) return false;
         // Another adoption just landed; its adopter deserves the grace window.
         if (
           typeof current.adoptedAt === "number" &&

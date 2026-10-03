@@ -94,6 +94,37 @@ afterEach(async () => {
 });
 
 describe("#3662 ParticipantDirectory lineage liveness", () => {
+  it.each([null, {}, { format: 1, id: "session:lineage", kind: "invalid" }])(
+    "S1 retains invalid raw shared-state lineage %j until withdrawal", async (value) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lineage-raw-"));
+      roots.push(root);
+      const identity: MeshIdentity = { id: "observer", name: "main", kind: "main" };
+      const directory = createDirectory(path.join(root, "mesh"), identity, identity.id, () => []);
+      const id = "session:lineage";
+      const key = "topology/participants/" + createHash("sha256").update(id).digest("hex");
+      await directory.mesh.put({ key, identity, value });
+      expect(directory.get(id, Date.now(), { fresh: true })).toBeUndefined();
+      expect(directory.lastKnown(id)).toBeUndefined();
+      expect(directory.lineageAlive(id)).toBe(true);
+      await directory.mesh.delete({ key });
+      expect(directory.lineageAlive(id)).toBe(true); // Removal alone is not a close receipt.
+    },
+  );
+
+  it("S1 treats a failed raw lineage read as unknown, never dead", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lineage-read-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "observer", name: "main", kind: "main" };
+    const directory = createDirectory(path.join(root, "mesh"), identity, identity.id, () => []);
+    const read = vi.spyOn(directory.mesh, "get").mockImplementation(() => { throw new Error("unreadable state"); });
+    try {
+      expect(directory.lineageAlive("session:lineage")).toBe(true);
+    } finally {
+      read.mockRestore();
+    }
+    expect(directory.lineageAlive("session:lineage")).toBe(true);
+  });
+
   it("does not treat lease expiry as lineage death, but observes withdrawal", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lineage-"));
     roots.push(root);
@@ -105,7 +136,7 @@ describe("#3662 ParticipantDirectory lineage liveness", () => {
     expect(directory.get(id, expiredAt)).toBeUndefined();
     expect(directory.lastKnown(id, expiredAt)?.participant.stale).toBe(true);
     expect(directory.lineageAlive(id, expiredAt)).toBe(true);
-    expect(directory.lineageAlive("session:unknown", expiredAt)).toBe(false);
+    expect(directory.lineageAlive("session:unknown", expiredAt)).toBe(true);
     await directory.close();
     expect(directory.lineageAlive(id)).toBe(false);
   });

@@ -8,6 +8,8 @@ import { createHash } from "node:crypto";
 import { projectOf, repositoryOf } from "../src/topology/project-identity.js";
 import { residentDeliveryPrefix } from "../src/residency/protocol.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
+import { removeParticipantFileIf, writeParticipantFile } from "../src/topology/participant-files.js";
+import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
 import { lockFile } from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
@@ -38,6 +40,103 @@ const fixture = () => {
 };
 
 describe("#3662 resident actor delivery routing", () => {
+  it.each(["read-denied", "stat-denied", "invalid-json", "invalid-envelope", "invalid-participant"] as const)(
+    "S1 keeps file-only %s lineage at its mailbox until confirmed withdrawal", async (fault) => {
+      const { root, config, host } = fixture();
+      const integratorId = "session:11111111-1111-4111-8111-111111111111";
+      config.cwd = root;
+      config.projectRoot = root;
+      config.project = projectOf(root);
+      vi.stubEnv("SMARTY_LEAD_SESSION", "");
+      fs.mkdirSync(path.join(root, ".local"));
+      fs.writeFileSync(path.join(root, ".local", "lead"), integratorId);
+      let readFault: ReturnType<typeof vi.spyOn> | undefined;
+      let statFault: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        await host.start();
+        await host.mesh.put({ key: LIVENESS_POLICY_KEY, identity: host.identity, value: { version: 1, participants: "files" } });
+        const publishRoot = async (id: string) => {
+          const identity = { id, name: "main", kind: "main" as const };
+          const hash = createHash("sha256").update(id).digest("hex");
+          const key = `topology/participants/${hash}`;
+          const participant: FabricParticipantRecord = {
+            format: 1, id, rootId: id, kind: "root", ownerHostId: id, ownerIdentityId: id,
+            name: "main", status: "idle", runner: "pi", transport: "host", role: "project-agent",
+            project: config.project!, cwd: root, capabilities: ["steer", "followUp", "fabric"],
+            startedAt: 1, updatedAt: Date.now(), controlProtocol: "v1",
+          };
+          await host.mesh.put({ key: `topology/hosts/${hash}`, identity, value: {
+            format: 1, id, rootId: id, identity, startedAt: 1, updatedAt: Date.now(), expiresAt: Date.now() + 120_000,
+          } });
+          const entry = { key, value: participant, version: 1, updatedAt: Date.now(), updatedBy: identity };
+          writeParticipantFile(config.meshRoot, entry);
+          return { key, participant, file: path.join(config.meshRoot, "participants", `${hash}.json`), text: JSON.stringify({ format: 1, ...entry }) };
+        };
+        await publishRoot(integratorId);
+        const original = await publishRoot(config.rootId);
+        // No lookup warmed the root slot before the fault. Denials persist through every retry.
+        if (fault === "invalid-json") fs.writeFileSync(original.file, "{torn");
+        if (fault === "invalid-envelope") fs.writeFileSync(original.file, JSON.stringify({ format: 99 }));
+        if (fault === "invalid-participant") fs.writeFileSync(original.file, JSON.stringify({
+          format: 1, key: original.key, value: { ...original.participant, kind: "invalid" },
+          version: 1, updatedAt: Date.now(), updatedBy: host.identity,
+        }));
+        if (fault === "read-denied") {
+          const read = fs.readFileSync;
+          readFault = vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+            if (String(args[0]) === original.file) throw Object.assign(new Error("denied"), { code: "EACCES" });
+            return read(...args);
+          });
+        }
+        if (fault === "stat-denied") {
+          const stat = fs.statSync;
+          statFault = vi.spyOn(fs, "statSync").mockImplementation((...args: Parameters<typeof fs.statSync>) => {
+            if (String(args[0]) === original.file) throw Object.assign(new Error("denied"), { code: "EACCES" });
+            return stat(...args);
+          });
+        }
+        expect(host.mesh.get(original.key, { fresh: true })).toBeUndefined();
+        expect(host.participants.get(config.rootId, Date.now(), { fresh: true })).toBeUndefined();
+        expect(host.participants.lastKnown(config.rootId)).toBeUndefined();
+        expect(host.participants.get(integratorId, Date.now(), { fresh: true })?.id).toBe(integratorId);
+        const send = async (text: string, total: number) => {
+          host.actors.onDeliver({
+            actor: { id: "actor:supervisor", name: "supervisor", project: config.project } as Parameters<typeof host.actors.onDeliver>[0]["actor"],
+            message: { id: text, actorId: "actor:supervisor", actorName: "supervisor", direction: "out", source: "actor", createdAt: Date.now(), text },
+            delivery: "steer", triggerTurn: true,
+          });
+          await vi.waitFor(() => expect(host.mesh.listAll("residency/deliveries/", { fresh: true })).toHaveLength(total));
+        };
+        await send("while unknown", 1);
+        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(1);
+        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
+        readFault?.mockRestore();
+        statFault?.mockRestore();
+        fs.writeFileSync(original.file, original.text);
+        await send("after repair", 2);
+        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
+        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
+        // Confirmed withdrawal, not a parsing omission, finally permits exact-bound inheritance.
+        expect(await removeParticipantFileIf(host.mesh, original.key, () => true)).toBe(true);
+        expect(host.participants.lineageAlive(config.rootId)).toBe(true); // Removal is not positive proof.
+        await host.mesh.put({
+          key: `topology/lineage-closures/${createHash("sha256").update(config.rootId).digest("hex")}`,
+          identity: { id: config.rootId, name: "main", kind: "main" },
+          value: { format: 1, rootId: config.rootId, ownerHostId: config.rootId, ownerIdentityId: config.rootId, closedAt: Date.now() },
+        });
+        expect(host.participants.lineageAlive(config.rootId)).toBe(false);
+        await send("after withdrawal", 3);
+        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
+        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(1);
+      } finally {
+        readFault?.mockRestore();
+        statFault?.mockRestore();
+        await host.close();
+        vi.unstubAllEnvs();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
   it.each([
     ["expired lease with live lineage", true, true, "root"],
     ["dead root without bound integrator", false, false, "root"],
@@ -82,6 +181,11 @@ describe("#3662 resident actor delivery routing", () => {
         await host.mesh.put({ key: key("topology/participants/"), identity, value: participant });
       };
       if (rootPresent) await publishRoot(config.rootId, 1, Date.now() - 60_000);
+      else await host.mesh.put({
+        key: `topology/lineage-closures/${createHash("sha256").update(config.rootId).digest("hex")}`,
+        identity: { id: config.rootId, name: "main", kind: "main" },
+        value: { format: 1, rootId: config.rootId, ownerHostId: config.rootId, ownerIdentityId: config.rootId, closedAt: Date.now() },
+      });
       if (bound) await publishRoot(integratorId, rootPresent ? 99 : 2, Date.now() + 120_000);
       if (!rootPresent) await publishRoot("session:newer-project-agent", 99, Date.now() + 120_000);
       const liveRoots = host.participants.list({ scope: "project", kinds: ["root"], fresh: true });

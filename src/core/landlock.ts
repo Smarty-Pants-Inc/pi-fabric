@@ -182,22 +182,28 @@ export const groupOperations = (shell: string, args: string[]): BashOperations =
     if (signal?.aborted) throw new Error("aborted");
     try { await fs.promises.access(cwd); }
     catch { throw new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`); }
+    // S3/F3: cancellation during the awaited preparation is honoured; never spawn.
+    if (signal?.aborted) throw new Error("aborted");
     if (!exitHook) {
       exitHook = true; // as Pi does for its tracked detached children
       process.once("exit", () => { for (const pgid of foreground) try { process.kill(-pgid, "SIGKILL"); } catch { /* gone */ } });
     }
     const child = spawn(shell, [...args, command], { cwd, detached: true, env, stdio: ["ignore", "pipe", "pipe"] });
     const pgid = child.pid;
-    if (pgid) { onGroup(pgid); foreground.add(pgid); }
+    // S5: kill/exit custody is established before any fallible observer (ledger) I/O.
+    if (pgid) foreground.add(pgid);
     const kill = (): void => {
       if (!pgid) return;
       try { process.kill(-pgid, "SIGKILL"); } catch { try { process.kill(pgid, "SIGKILL"); } catch { /* gone */ } }
     };
     let timedOut = false;
     const timer = timeout === undefined ? undefined : setTimeout(() => { timedOut = true; kill(); }, timeout * 1000);
-    if (signal) signal.addEventListener("abort", kill, { once: true });
+    if (signal) {
+      signal.addEventListener("abort", kill, { once: true });
+      if (signal.aborted) kill(); // AbortSignal does not replay an earlier abort
+    }
     try {
-      const exitCode = await new Promise<number | null>((resolve, reject) => {
+      const exited = new Promise<number | null>((resolve, reject) => {
         let exited = false; let status: number | null = null; let open = 2; let settled = false;
         let grace: NodeJS.Timeout | undefined;
         const done = (): void => {
@@ -215,6 +221,17 @@ export const groupOperations = (shell: string, args: string[]): BashOperations =
         child.once("exit", exitStatus => { exited = true; status = exitStatus; if (open === 0) done(); else idle(); });
         child.once("close", exitStatus => { status ??= exitStatus; done(); });
       });
+      if (pgid) {
+        try { onGroup(pgid); }
+        catch (error) {
+          // S5: custody persistence failed after spawn: kill the started group and confirm
+          // its exit before reporting failure. The group stays in the in-memory set.
+          kill();
+          await exited.catch(() => undefined);
+          throw error;
+        }
+      }
+      const exitCode = await exited;
       if (signal?.aborted) throw new Error("aborted");
       if (timedOut) throw new Error(`timeout:${timeout}`);
       const signalCode = child.signalCode;
@@ -250,6 +267,8 @@ export class LandlockBashConfinement {
   #unconfirmed = false;
   readonly #since = bootTicks();
   #closed = false;
+  /** Cleanup failed: kept for the next session's sweep; no further in-process attempts. */
+  #retained = false;
   #recheck: NodeJS.Timeout | undefined;
 
   constructor(readonly cwd: string) {
@@ -290,8 +309,21 @@ export class LandlockBashConfinement {
     this.#release();
   }
 
+  /**
+   * S4/F4: cleanup is housekeeping. A failure (e.g. EACCES on a non-writable nested
+   * directory) must never escape into close/settlement or a timer callback, where it
+   * would crash the live Pi process. Retain the directory and its custody ledger.
+   */
   #release(): void {
-    if (!this.#closed || !this.#ownsTmp || this.#pending > 0) return;
+    try { this.#tryRelease(); }
+    catch {
+      clearInterval(this.#recheck); this.#recheck = undefined;
+      this.#retained = true;
+    }
+  }
+
+  #tryRelease(): void {
+    if (this.#retained || !this.#closed || !this.#ownsTmp || this.#pending > 0) return;
     // Unknown process-group custody: never delete (the ledger also bars the sweep).
     if (this.#unconfirmed) { clearInterval(this.#recheck); this.#recheck = undefined; return; }
     // Identity discipline for cleanup too: remove only the directory we created.

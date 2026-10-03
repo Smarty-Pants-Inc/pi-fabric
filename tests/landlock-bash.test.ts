@@ -472,6 +472,77 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     await vi.waitFor(() => expect(fs.existsSync(temp)).toBe(false), { timeout: 5000 });
   });
 
+  it.each(["user cancel", "store close"] as const)("S3/F3: cancellation during awaited cwd preparation never starts the command (%s)", async variant => {
+    const h = harness();
+    const seeded = path.join(h.cwd, "seeded");
+    const access = fs.promises.access;
+    let entered!: () => void; let open!: () => void;
+    const reached = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { open = resolve; });
+    vi.spyOn(fs.promises, "access").mockImplementation(async (file, mode) => {
+      if (file === h.cwd) { entered(); await gate; }
+      return access(file, mode);
+    });
+    const controller = new AbortController();
+    const run = h.invoke({ command: `printf ran > ${quote(seeded)}; echo $$ > ${quote(seeded)}.pid; sleep 5`,
+      ...(variant === "store close" ? { background: true } : {}) }, controller.signal);
+    const settled = run.then(() => undefined, () => undefined);
+    await reached; // cwd preparation is pending
+    if (variant === "user cancel") controller.abort();
+    else await h.provider.shellJobs.close();
+    open();
+    await settled;
+    await new Promise(resolve => setTimeout(resolve, 400));
+    expect(fs.existsSync(seeded)).toBe(false);
+    expect(fs.existsSync(`${seeded}.pid`)).toBe(false);
+  });
+
+  it.each(["deferred", "direct"] as const)("S4/F4: failed temp cleanup is contained and retained; Pi and a new session stay alive (%s)", async variant => {
+    const h = harness();
+    vi.stubEnv("TMPDIR", "/tmp"); // not private: Fabric generates its own temp
+    vi.spyOn(os, "tmpdir").mockReturnValue(h.root);
+    const crashes: unknown[] = [];
+    const crash = (error: unknown): void => { crashes.push(error); };
+    process.on("uncaughtException", crash);
+    let temp = "";
+    try {
+      const child = variant === "deferred" ? '(sleep 1) </dev/null >/dev/null 2>&1 & ' : "";
+      temp = (await h.invoke({ command: `mkdir "$TMPDIR/locked"; printf x > "$TMPDIR/locked/input"; chmod 500 "$TMPDIR/locked"; ${child}printf "%s" "$TMPDIR"` })).output.trim();
+      expect(path.dirname(temp)).toBe(h.root);
+      await expect(h.registry.close()).resolves.toBeUndefined(); // old session/provider close
+      const next = harness(); // the replacement session
+      if (variant === "deferred") await new Promise(resolve => setTimeout(resolve, 3000)); // child exits; recheck runs
+      expect((await next.invoke({ command: "printf alive" })).output).toContain("alive");
+      expect(crashes).toEqual([]);
+      expect(fs.existsSync(path.join(temp, "locked/input"))).toBe(true); // safely retained
+      expect(fs.existsSync(`${temp}.custody`)).toBe(true); // retention evidence kept
+    } finally {
+      process.off("uncaughtException", crash);
+      if (temp) try { fs.chmodSync(path.join(temp, "locked"), 0o700); } catch { /* gone */ }
+    }
+  }, 10_000);
+
+  it("S5: a custody-ledger failure after spawn kills and reaps the started command", async () => {
+    const h = harness();
+    vi.stubEnv("TMPDIR", "/tmp"); // generated temp: the host owns a custody ledger
+    vi.spyOn(os, "tmpdir").mockReturnValue(h.root);
+    await h.invoke({ command: "true" }); // confinement constructed, ledger created
+    const seeded = path.join(h.cwd, "seeded");
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (typeof file === "string" && file.endsWith(".custody")) throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      return (open as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    await expect(h.invoke({ command: `echo $$ > ${quote(seeded)}.pid; sleep 0.5; printf late > ${quote(seeded)}` })).rejects.toThrow("ENOSPC");
+    await new Promise(resolve => setTimeout(resolve, 900));
+    expect(fs.existsSync(seeded)).toBe(false); // no delayed write
+    if (fs.existsSync(`${seeded}.pid`)) {
+      const pid = Number(fs.readFileSync(`${seeded}.pid`, "utf8"));
+      expect(() => process.kill(pid, 0)).toThrow(); // no surviving process
+    }
+    await expect(h.registry.close()).resolves.toBeUndefined();
+  });
+
   it("F2: a host kill-switch flip reaches already-active lanes on their next call; project cannot override", async () => {
     const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-host-"));
     roots.push(agentDir);

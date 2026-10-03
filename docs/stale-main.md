@@ -14,6 +14,15 @@ its `dist/worker-protocol.json` version matches the parent manager's
 `WORKER_PROTOCOL_VERSION`. An incompatible, unversioned, or incomplete active release
 falls back to the parent with one warning naming both releases. A missing selector
 falls back silently. Explicit source/custom worker paths remain caller-selected.
+Native Pi discovery is pinned before extension factories execute, in both the task SDK
+entry and native CLI entry. The pin is re-applied on startup, restart, project-trust
+bootstrap, and resource reload, so changing the selector cannot load a second Fabric
+generation. Other authorized profile/project extensions and package resources retain
+normal discovery and trust rules; the canonical agent/auth directory is unchanged.
+Explicit non-Fabric caller hooks are preserved rather than replaced by the release
+selector. Opaque/custom launchers with no discoverable native SDK fail closed on
+extension auto-discovery (explicit hooks still load), rather than risk mixing releases.
+
 Spawn handles, results, and new workers' status records expose the selected canonical
 root as `fabricRelease`. Existing resident hosts themselves retain their loaded
 generation; selecting a compatible worker does not migrate resident ownership or

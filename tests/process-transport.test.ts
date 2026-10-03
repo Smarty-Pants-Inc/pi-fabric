@@ -108,6 +108,22 @@ describe("process transport spawn-time Fabric release selection", () => {
     expect(JSON.parse(result.text).worker).toBe(pathToFileURL(custom).href);
   });
 
+  it("preserves an explicit non-Fabric hook while selecting the installed worker", async () => {
+    const f = fixture();
+    const hook = path.join(f.root, "custom-hook.mjs");
+    fs.writeFileSync(hook, "export default function () {}\n");
+    const current = f.release("custom-hook-current");
+    const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
+      workerPath: path.join(f.parent, "dist/worker.js"), fabricExtensionPath: hook,
+      fullCodeMode: true, runRoot: path.join(f.root, "custom-hook-runs"),
+    });
+    managers.push(manager); f.select(current);
+    const result = await manager.run({ task: "custom hook", transport: "process" });
+    expect(result.status).toBe("completed");
+    expect(result.fabricRelease).toBe(current);
+    expect(JSON.parse(result.text)).toMatchObject({ worker: pathToFileURL(path.join(current, "dist/worker.js")).href, extension: hook });
+  });
+
   it("selects the current worker without enabling Fabric when extensions are disabled", async () => {
     const f = fixture(false);
     const current = f.release("no-extensions-current");

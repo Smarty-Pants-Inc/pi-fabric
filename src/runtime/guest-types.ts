@@ -258,6 +258,8 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  /** Canonical Fabric release actually selected for this process child. */
+  fabricRelease?: string;
   /** Immediate spawning participant, distinct from rootId. */
   spawner?: { id: string; kind: "main" | "agent" | "actor"; runId?: string };
   /** Present on terminal status snapshots when the full log was retained. */

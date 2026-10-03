@@ -58,7 +58,12 @@ export class ProcessTransport implements AgentTransportAdapter {
       let pinned = false;
       for (let index = 0; index < workerArguments.length; index += 2) {
         if (workerArguments[index] === "--fabric-extension") {
-          workerArguments[index + 1] = selected.extensionPath;
+          const explicitExtension = workerArguments[index + 1]!;
+          // Only replace a Fabric generation. Explicit caller hooks are not
+          // release selectors (e.g. resident probes testing a broken factory).
+          if (loadedFabricRoot(pathToFileURL(path.resolve(explicitExtension)).href)) {
+            workerArguments[index + 1] = selected.extensionPath;
+          }
           pinned = true;
         }
       }

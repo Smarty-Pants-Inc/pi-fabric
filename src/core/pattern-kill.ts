@@ -24,7 +24,7 @@
 // `pattern` is `text` with each quoted or escaped glob character (* ? [ ]) masked (GLOB_MASK), a
 // double-quoted `$` as QUOTED and a single-quoted or escaped `$` as LITERAL, so the /tmp rule sees which
 // globs and expansions are live (smarty-dev#1998, round 1 on PR #148).
-type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean; pattern: string };
+type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean; pattern: string; ansiEscaped?: boolean };
 type Expansion = { subs: string[]; names: string[]; text?: string; dynamic?: boolean };
 
 let placeholders = 0;
@@ -36,7 +36,7 @@ function substitute(into: Expansion, sub: string): string {
   into.dynamic = true;
   return `\${${name}}`;
 }
-type Redirect = { redirect: Word; input: boolean };
+type Redirect = { redirect: Word; input: boolean; output: boolean };
 type Token = { op: string } | { word: Word } | Redirect | { heredoc: { body: string; quoted: boolean } };
 
 const OPERATORS = ["&&", "||", ";;", "|&", "|", "&", ";", "(", ")"];
@@ -107,8 +107,11 @@ function tokenize(source: string): Token[] {
   let word: Word | undefined;
   let target = false;
   let input = false;
+  let output = false;
+  let duplicate = false;
   const endWord = (): void => {
-    if (word) tokens.push(target ? { redirect: word, input } : { word });
+    if (word) tokens.push(target ? { redirect: word, input,
+      output: output && (!duplicate || (word.text !== "-" && !/^\d+$/.test(word.text))) } : { word });
     word = undefined;
     target = false;
   };
@@ -164,6 +167,9 @@ function tokenize(source: string): Token[] {
       endWord();
       // Only an explicit stdin source overrides feed. Output and descriptor duplication do not.
       input = c === "<" && (descriptor === undefined || descriptor === "0") && text[index + 1] !== "&";
+      // S4: distinguish a file write from fd duplication/closure and non-stdin inputs.
+      output = c === ">" || c === "&";
+      duplicate = c === ">" && text[index + 1] === "&";
       while (index < text.length && /[<>&|]/.test(text[index]!)) index += 1;
       while (text[index] === " " || text[index] === "\t") index += 1;
       // review/astra F2 on #105: the target is not an argument, but its substitutions run.
@@ -188,9 +194,14 @@ function tokenize(source: string): Token[] {
       w.text += text.slice(index + 1, end < 0 ? text.length : end);
       index = end < 0 ? text.length : end + 1;
     } else if (c === "$" && text[index + 1] === "'") {
-      const end = text.indexOf("'", index + 2);
-      w.text += text.slice(index + 2, end < 0 ? text.length : end);
-      index = end < 0 ? text.length : end + 1;
+      const start = index + 2;
+      let end = start;
+      while (end < text.length && text[end] !== "'") {
+        if (text[end] === "\\") { w.ansiEscaped = true; end += 2; }
+        else end += 1;
+      }
+      w.text += text.slice(start, end);
+      index = end < text.length ? end + 1 : end;
     } else if (c === "\"") {
       index = readDouble(text, index + 1, w);
     } else if ((c === "$" && text[index + 1] === "(") || c === "`") {
@@ -238,6 +249,8 @@ const VARIABLE = /\$\{?([A-Za-z_][A-Za-z0-9_]*|[0-9@*])/g;
 
 // smarty-dev#1998: deletes whose operand may be another agent's /tmp entry.
 const DELETERS = new Set(["rm", "unlink", "shred"]);
+// These receivers do not consume stdin; all other unsafe-fed captures need an explicit file.
+const CAPTURE_NON_READERS = new Set(["", "echo", "printf", ":", "true", "false", "kill", "mktemp"]);
 const TMP_ROOTS = [["tmp"], ["var", "tmp"], ["private", "tmp"], ["private", "var", "tmp"]];
 // A quoted glob character maps to a private-use character, so a variable's literal value can restore it.
 const GLOBS = "*?[]";
@@ -254,7 +267,10 @@ const MAX_VALUE = 4096;
 
 // Local nested scripts (sh -c, eval, substitutions) inherit the cwd and variables; ssh gets neither.
 // `owned` holds the placeholders of `mktemp` substitutions; `root` is the whole tool-call command.
-type Context = { root: string; owned: Set<string>; cwd?: string | undefined; values: ReadonlyMap<string, string>; unknown: ReadonlySet<string> };
+type Context = {
+  root: string; owned: Set<string>; cwd?: string | undefined; values: ReadonlyMap<string, string>;
+  unknown: ReadonlySet<string>; unsafeFiles: Set<string>; capture?: boolean | undefined;
+};
 
 /**
  * True when `pattern` (a word's pattern after variable expansion) names /tmp or /var/tmp itself, or has an
@@ -273,7 +289,7 @@ function tmpGlob(pattern: string, cwd: string | undefined): boolean {
 
 // `blocked`: a kill by pattern. `lookup`: runs a name lookup (LOOKUPS) anywhere.
 // `wipe`: a delete over a /tmp glob (smarty-dev#1998). `tmpList`: a stage or substitution may list other agents' dirs.
-type Verdict = { blocked: boolean; lookup: boolean; wipe: boolean; tmpList: boolean; sourceKnown?: boolean };
+type Verdict = { blocked: boolean; lookup: boolean; wipe: boolean; tmpList: boolean; sourceKnown?: boolean; uncertain?: boolean };
 type Feed = { lookup: boolean; tmp: boolean };
 type Command = { words: Word[]; redirects: Redirect[]; heredocs: Array<{ body: string; quoted: boolean }>; closed?: number };
 type InputScope = { target: Word; start?: Word };
@@ -339,17 +355,28 @@ function sourceScopes(tokens: Token[]): SourceScopes {
 }
 
 /** The command words after assignments and wrappers (sudo, env, timeout, xargs, …), and whether xargs feeds them. */
-function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word }>): { words: Word[]; fedByXargs: boolean; argFile: Word | undefined } {
+function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word }>): { words: Word[]; fedByXargs: boolean; argFile: Word | undefined; uncertain: boolean } {
   let words = stageWords;
   let fedByXargs = false;
   let argFile: Word | undefined;
+  let uncertain = false;
   for (;;) {
-    while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text)) words = words.slice(1);
+    while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text)) {
+      // An undecoded assignment can later supply a protected path or selector.
+      uncertain ||= words[0].ansiEscaped === true;
+      words = words.slice(1);
+    }
+    // #325 S6: check every receiver, including wrappers, before raw basename lookup.
+    if (words[0]?.ansiEscaped) return { words, fedByXargs, argFile, uncertain: true };
     const prefix = words[0]?.text.split("/").pop() ?? "";
+    if (prefix === "coproc") {
+      words = words.slice(words[2]?.text === "{" ? 2 : 1);
+      continue;
+    }
     const options = PREFIXES[prefix];
-    if (!options) return { words, fedByXargs, argFile };
+    if (!options) return { words, fedByXargs, argFile, uncertain };
     // `command -v pkill` names the command; it does not run it.
-    if (prefix === "command" && words[1] && /^-[a-zA-Z]*[vV]/.test(words[1].text)) return { words: [], fedByXargs, argFile };
+    if (prefix === "command" && words[1] && /^-[a-zA-Z]*[vV]/.test(words[1].text)) return { words: [], fedByXargs, argFile, uncertain };
     if (prefix === "xargs") fedByXargs = true;
     words = words.slice(1);
     while (words[0]?.text.startsWith("-") && words[0].text.length > 1) {
@@ -379,6 +406,7 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
         }
       }
       const source = takes ? words[1] : words[0];
+      uncertain ||= words[0].ansiEscaped === true || source?.ansiEscaped === true;
       if (takes) value = source?.text;
       if (prefix === "xargs" && file && value !== undefined && source) {
         argFile = { ...source, text: value, pattern: source.pattern.slice(source.text.length - value.length) };
@@ -388,6 +416,43 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
     }
     if (prefix === "timeout" && words[0]) words = words.slice(1);
   }
+}
+
+/** Native argv that the receiver executes or expands again, not ordinary field text. */
+function executionWords(name: string, args: Word[]): Word[] {
+  if (name === "trap") {
+    if (["-p", "-l"].includes(args[0]?.text ?? "")) return [];
+    const action = args[args[0]?.text === "--" ? 1 : 0];
+    return action && action.text !== "-" ? [action] : [];
+  }
+  if (name === "printf") {
+    const flag = args[0];
+    if (!flag?.text.startsWith("-v")) return [];
+    const destination = flag.text.length > 2 ? { ...flag, text: flag.text.slice(2) } : args[1];
+    return destination && destination.text.includes("[") ? [destination] : [];
+  }
+  if (!["rg", "complete", "compgen"].includes(name)) return [];
+  const actions: Word[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg.text === "--") break;
+    if (name === "rg") {
+      const match = /^--(?:pre|hostname-bin)(?:=(.*))?$/s.exec(arg.text);
+      if (!match) continue;
+      const action = match[1] === undefined ? args[++i] : { ...arg, text: match[1] };
+      if (action) actions.push(action);
+    } else if (name === "complete" || name === "compgen") {
+      if (!arg.text.startsWith("-")) continue;
+      for (let at = 1; at < arg.text.length; at++) {
+        const option = arg.text[at]!;
+        if (!"oACEFGPSWX".includes(option)) continue;
+        const action = at + 1 < arg.text.length ? { ...arg, text: arg.text.slice(at + 1) } : args[++i];
+        if (action && "CFW".includes(option)) actions.push(action);
+        break;
+      }
+    }
+  }
+  return actions;
 }
 
 /** Bash read/mapfile option values are not destinations; omitted destinations use shell defaults. */
@@ -423,8 +488,10 @@ function readDestinations(name: string, args: Word[]): string[] {
  * lookup in the calling script (review/astra F8 on #105: per operand, never the whole script).
  */
 function scan(script: string, depth: number, names: ReadonlySet<string> = new Set(), tmpIn: ReadonlySet<string> = new Set(),
-  context: Context = { root: script, owned: new Set(), values: new Map(), unknown: new Set() }, stdin?: Feed): Verdict {
-  if (depth > 6) return { blocked: false, lookup: false, wipe: false, tmpList: false };
+  context: Context = { root: script, owned: new Set(), values: new Map(), unknown: new Set(), unsafeFiles: new Set() }, stdin?: Feed): Verdict {
+  // ponytail (#325 S3): do not certify nonempty execution text that the depth bound leaves
+  // unexamined. Even a printing-only tail is refused; empty tails have nothing left to execute.
+  if (depth > 6) return { blocked: false, lookup: false, wipe: false, tmpList: false, uncertain: script.trim().length > 0 };
   // Security F4/F5: collect with the state at each command, then replay from the same entry state.
   // F6: retain fallback for unresolved feeds, but late redirects belong only to their own scope.
   const tokens = tokenize(script);
@@ -437,6 +504,7 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
     blocked: first.blocked || second.blocked, lookup: first.lookup || second.lookup,
     wipe: first.wipe || second.wipe, tmpList: first.tmpList || second.tmpList,
     sourceKnown: first.sourceKnown === true && second.sourceKnown === true,
+    uncertain: first.uncertain === true || second.uncertain === true,
   };
 }
 
@@ -458,13 +526,14 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   const unknown = new Set(context.unknown);
   let cwd = context.cwd;
 
-  const nested = (text: string, extra: Iterable<string> = [], tmpExtra: Iterable<string> = [], local = true, input?: Feed): Verdict => {
+  const nested = (text: string, extra: Iterable<string> = [], tmpExtra: Iterable<string> = [], local = true, input?: Feed, capture = context.capture): Verdict => {
     const inner = scan(text, depth + 1, new Set([...tainted, ...extra]), new Set([...tmpNames, ...tmpExtra]),
-      local ? { ...context, cwd, values, unknown } : { ...context, cwd: undefined, values: new Map(), unknown: new Set() },
+      local ? { ...context, cwd, values, unknown, capture } : { ...context, cwd: undefined, values: new Map(), unknown: new Set(), unsafeFiles: new Set(), capture },
       local ? input : undefined);
     verdict.blocked ||= inner.blocked;
     verdict.lookup ||= inner.lookup;
     verdict.wipe ||= inner.wipe;
+    verdict.uncertain ||= inner.uncertain === true;
     return inner;
   };
   const fromLookup = (text: string): boolean => [...text.matchAll(VARIABLE)].some((match) => tainted.has(match[1]!));
@@ -480,6 +549,11 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   const unknownOperand = (pattern: string): boolean =>
     [...pattern.matchAll(REFERENCE)].some((match) => match[1] === "$" && unknown.has(match[2]!)) && MENTIONS_TMP.test(context.root);
 
+  // #325 F7: initial environment bindings are unknown. A live expansion followed by a
+  // parent component can escape even a mktemp-owned path; inspect before resolving it.
+  const expandedParent = (pattern: string): boolean =>
+    [...pattern.matchAll(REFERENCE)].some((match) => /\/\.\.(\/|$)/.test(pattern.slice(match.index! + match[0].length)));
+
   // A known substitution output is a feed, not a known literal path for a later find root.
   const knownSubs = new Set<string>();
   const concrete = (word: Word): boolean => ![...expand(word.pattern).matchAll(REFERENCE)]
@@ -494,7 +568,19 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       compoundFeeds.set(scope, { lookup: feed.lookup || (previous?.lookup ?? false), tmp: feed.tmp || (previous?.tmp ?? false) });
     }
   };
+  // #325 S4: a concrete same-call unsafe output is not a preexisting recorded source.
+  // Keep facts monotonically through collection/replay and local inline scripts; do not
+  // attempt to certify overwrites, filesystem aliases, or shell state transitions.
+  const fileKey = (word: Word): string | undefined => {
+    const path = expand(word.pattern);
+    if (word.ansiEscaped || [...path.matchAll(REFERENCE)].length > 0 || /[*?[]/.test(path)) return undefined;
+    const literal = unmask(path).replaceAll(LITERAL, "$");
+    const absolute = literal.startsWith("/") ? literal : cwd ? `${cwd}/${literal}` : literal;
+    return (absolute.startsWith("/") ? "/" : "") + absolute.split("/").filter((part) => part !== "." && part !== "").join("/");
+  };
   const inputSource = (word: Word): Feed | undefined => {
+    const key = fileKey(word);
+    verdict.uncertain ||= word.ansiEscaped === true || (key !== undefined && context.unsafeFiles.has(key));
     const lookup = fromLookup(word.text);
     const tmp = tmpOperand(word.pattern);
     const known = word.text !== "-" && ![...expand(word.pattern).matchAll(REFERENCE)]
@@ -503,8 +589,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   };
 
   const runPipeline = (): void => {
-    // F7: an inherited fd is separate from replay's whole-script fallback. Substitutions never
-    // receive it implicitly; only an inline local receiver gets the actual stage's stdin.
+    // An inherited fd is separate from replay's whole-script fallback. Only real stdin,
+    // not unrelated whole-call lookup/listing fallback, enters a captured substitution.
     let actual = stdin;
     let pipeFeed = stdin?.lookup ?? fed.lookup;
     let pipeTmp = stdin?.tmp ?? fed.tmp;
@@ -531,7 +617,9 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       const expansions: Expansion[] = [...stage.words, ...stage.redirects.map((redirect) => redirect.redirect), ...heredocs];
       let captured = false;
       for (const expansion of expansions) expansion.subs.forEach((sub, k) => {
-        const inner = nested(sub);
+        // #325 S5: substitutions inherit effective stdin. Unproved consuming captures
+        // below refuse rather than inventing a recorded PID or owned-path source.
+        const inner = nested(sub, [], [], true, actual, true);
         if (/^\s*mktemp(\s|$)/.test(sub)) context.owned.add(expansion.names[k]!);
         const known = inner.sourceKnown && !inner.tmpList && !inner.lookup;
         if (known) knownSubs.add(expansion.names[k]!);
@@ -545,13 +633,22 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         captured = true;
         tainted.add(expansion.names[k]!);
       });
-      const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean; heredoc?: boolean }> = [];
+      const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean; heredoc?: boolean; uncertain?: boolean }> = [];
       const envScripts: Array<{ text: string; source: Word }> = [];
-      const { words, fedByXargs, argFile } = unwrap(stage.words, envScripts);
+      const { words, fedByXargs, argFile, uncertain } = unwrap(stage.words, envScripts);
+      verdict.uncertain ||= uncertain;
       // review/astra F6 on #105: an `env -S` script, with the placeholders of its word.
-      for (const { text } of envScripts) scripts.push({ text });
+      for (const { text, source } of envScripts) scripts.push({ text, uncertain: source.ansiEscaped === true });
       const name = words[0]?.text.split("/").pop() ?? "";
       const args = words.slice(1);
+      // #325 S6: undecoded argv at a protected boundary is not a proven operand,
+      // selector, or option. Ordinary echo/printf/grep field text remains DATA.
+      if (name === "kill" || KILL_BY_NAME.has(name) || DELETERS.has(name) || name === "find" ||
+        SHELLS.has(name) || name === "eval" || name === "ssh") {
+        verdict.uncertain ||= args.some((arg) => arg.ansiEscaped);
+      }
+      // #325 S1: native actions/selectors are execution boundaries, not quoted DATA.
+      for (const action of executionWords(name, args)) scripts.push({ text: action.text, uncertain: action.ansiEscaped === true });
       let lookup = LOOKUPS.has(name);
       if (KILL_BY_NAME.has(name)) verdict.blocked = true;
       // Assignments and loop variables that take lookup output.
@@ -626,10 +723,16 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       const simpleLs = args.every((arg) => !arg.text.startsWith("-") || arg.text === "--" || /^-[aAdFlLrRtU1]+$/.test(arg.text));
       const plainFind = !args.some((arg) => ["-exec", "-execdir", "-ok", "-okdir", "-printf", "-fprintf"].includes(arg.text));
       const explicit = name === "find" && plainFind ? roots : name === "cat" || (name === "ls" && simpleLs) ? files : [];
+      for (const word of explicit) inputSource(word);
       const independent = !fedByXargs && !captured && !args.some((arg) => arg.text === "-") && explicit.length > 0 && explicit.every((word) =>
         word.text !== "-" && concrete(word) && !fromLookup(word.text) && !tmpOperand(word.pattern));
+      // #325 S5: only explicit independent files and known non-consuming commands
+      // prove that a capture cannot read inherited unsafe stdin. Refuse the rest,
+      // including cat without a file, read/mapfile, and unmodelled stream filters.
+      if (context.capture && (actual?.lookup || actual?.tmp) && !independent &&
+        !CAPTURE_NON_READERS.has(name)) verdict.uncertain = true;
       let listsTmp = name !== "mktemp" && (stage.words.some((word) => tmpOperand(word.pattern)) ||
-        (piped && !independent && tmpGlob(".", cwd)));
+        ((piped || stage.redirects.some((redirect) => redirect.output)) && !independent && tmpGlob(".", cwd)));
       // An explicit producer does not read stdin. Do not clear an earlier real pipeline stage.
       if (position === 0 && piped && independent && !listsTmp && !lookup) {
         pipeFeed = false; pipeTmp = false; actual = { lookup: false, tmp: false };
@@ -645,12 +748,15 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (DELETERS.has(name)) {
         const end = args.findIndex((arg) => arg.text === "--");
         const operands = args.filter((arg, i) => (end >= 0 && i > end) || (!(arg.text.startsWith("-") && arg.text.length > 1) && (end < 0 || i < end)));
-        if (operands.some((arg) => tmpOperand(arg.pattern) || unknownOperand(arg.pattern)) || xargsTmp) verdict.wipe = true;
+        const recursive = name === "rm" && args.slice(0, end < 0 ? args.length : end)
+          .some((arg) => arg.text === "--recursive" || /^-[^-]*[rR]/.test(arg.text));
+        if (operands.some((arg) => tmpOperand(arg.pattern) || unknownOperand(arg.pattern) ||
+          (recursive && expandedParent(arg.pattern))) || xargsTmp) verdict.wipe = true;
       }
       if (name === "find") {
         const deletes = args.some((arg, i) => arg.text === "-delete" || (["-exec", "-execdir", "-ok", "-okdir"].includes(arg.text) &&
           /(^|[\s/])(rm|unlink|shred)(\s|$)/.test(args.slice(i + 1).map((a) => a.text).join(" ").split(/\s[;+](\s|$)/)[0]!)));
-        if (deletes && (roots.length ? roots.some((root) => tmpOperand(root.pattern)) : tmpGlob(".", cwd))) verdict.wipe = true;
+        if (deletes && (roots.length ? roots.some((root) => tmpOperand(root.pattern) || expandedParent(root.pattern)) : tmpGlob(".", cwd))) verdict.wipe = true;
       }
       // xargs appends its input: from a lookup, `{}` and every positional parameter hold it.
       const xargsFeed = fedByXargs && pipeFeed;
@@ -675,16 +781,20 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           positional.forEach((arg, k) => { if (tmpOperand(arg.pattern)) tmpExtra.push(String(k), "@", "*"); });
           if (xargsFeed) extra.push(..."123456789@*".split(""), "{}");
           if (xargsTmp) tmpExtra.push(..."123456789@*".split(""), "{}");
-          scripts.push({ text: payload.text, extra, tmpExtra });
+          scripts.push({ text: payload.text, extra, tmpExtra, uncertain: payload.ansiEscaped === true });
         }
       }
-      if (name === "eval") scripts.push({ text: args.map((arg) => arg.text).join(" ") });
+      if (name === "eval") scripts.push({ text: args.map((arg) => arg.text).join(" "), uncertain: args.some((arg) => arg.ansiEscaped) });
       if (name === "ssh") {
         let i = 0;
         while (args[i]?.text.startsWith("-")) i += SSH_VALUE_OPTIONS.has(args[i]!.text) ? 2 : 1;
-        scripts.push({ text: args.slice(i + 1).map((arg) => arg.text).join(" "), remote: true });
+        const payload = args.slice(i + 1);
+        scripts.push({ text: payload.map((arg) => arg.text).join(" "), remote: true, uncertain: payload.some((arg) => arg.ansiEscaped) });
       }
       for (const inner of scripts) {
+        // ponytail (#325 S2): ANSI-C escapes are not decoded here. Refuse them only at
+        // execution boundaries, rather than pretending the raw body is the script Bash runs.
+        verdict.uncertain ||= inner.uncertain === true;
         const result = nested(inner.text, inner.extra, inner.tmpExtra, !inner.remote,
           inner.heredoc ? undefined : receiverStdin);
         lookup = result.lookup || lookup;
@@ -728,6 +838,15 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           recordOutput(member, known, output);
         }
       }
+      const compound = stage.closed !== undefined ? compoundFeeds.get(stage.closed) : undefined;
+      const unsafeOutput = lookup || listsTmp || compound?.lookup || compound?.tmp ||
+        (!independent && (actual?.lookup || actual?.tmp));
+      if (unsafeOutput) for (const redirect of stage.redirects) {
+        if (!redirect.output) continue;
+        const key = fileKey(redirect.redirect);
+        if (key !== undefined) context.unsafeFiles.add(key);
+        else if (redirect.redirect.ansiEscaped) verdict.uncertain = true;
+      }
       verdict.sourceKnown = known;
     });
     stages = [];
@@ -755,17 +874,20 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
 
 /** True when the shell command kills processes by name pattern (smarty-dev#774). */
 export function killsByPattern(command: string): boolean {
-  return scan(command, 0).blocked;
+  const verdict = scan(command, 0);
+  return verdict.blocked || verdict.uncertain === true;
 }
 
 /** True when the shell command deletes by a glob over /tmp or /var/tmp, or deletes /tmp itself (smarty-dev#1998). */
 export function wipesTmp(command: string): boolean {
-  return scan(command, 0).wipe;
+  const verdict = scan(command, 0);
+  return verdict.wipe || verdict.uncertain === true;
 }
 
 export const TMP_WIPE_REASON =
   "Blocked (smarty-dev#1998): this deletes by a glob in /tmp or /var/tmp (or /tmp itself), which also " +
-  "deletes other agents' live dirs on a shared host. Record the path when you create it " +
+  "deletes other agents' live dirs on a shared host. Recursive deletion through .. after a path " +
+  "expansion is also refused: the parent is not an owned path. Record the path when you create it " +
   "(`D=$(mktemp -d)`), then delete only your own mktemp -d path by its exact name (\"$D\"), #1508/#1998. " +
   "A glob inside that dir is fine: `rm -f \"$D\"/*.json`.";
 

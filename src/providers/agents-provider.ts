@@ -1,5 +1,7 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
+import { readTaskReturnAddress } from "../agents/task-return-address.js";
+import type { RouteEvaluate } from "../agents/model-route.js";
 import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
@@ -398,6 +400,7 @@ export class AgentsProvider implements FabricProvider {
   readonly #toolCeiling = readChildToolAllowlist();
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
+  readonly #taskReturnAddress = readTaskReturnAddress();
   readonly name = "agents";
   readonly description =
     "The user-facing Main target, one-shot Pi or Claude Code agents, and persistent mailbox actors over process, tmux, screen, LocalTerm, or Herdr";
@@ -946,8 +949,14 @@ export class AgentsProvider implements FabricProvider {
       }
       case "self":
         return this.participants.self();
-      case "main":
-        return this.mainAgent.info(context.extensionContext);
+      case "main": {
+        const address = this.#taskReturnAddress;
+        const info = this.mainAgent.info(context.extensionContext);
+        return address?.spawnerId ? {
+          ...info, id: address.spawnerId, local: false, status: "remote",
+          sessionId: address.spawnerSessionId,
+        } : info;
+      }
       case "spawner":
         if (!this.#router.spawner) throw new Error("This worker has no bound Fabric spawner; specify an explicit reply target");
         return structuredClone(this.#router.spawner);
@@ -1782,7 +1791,7 @@ export class AgentsProvider implements FabricProvider {
 
   #participantAlias(value: string): string {
     const id = value.trim();
-    return id === "main" ? this.mainAgent.id : id;
+    return id === "main" ? this.#taskReturnAddress?.spawnerId || this.mainAgent.id : id;
   }
 
   #participantScope(

@@ -12,7 +12,7 @@ import path from "node:path";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricModelAliases, FabricModelCandidate } from "../core/model-resolution.js";
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
-import type { FabricActorInfo, FabricActorRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorCreateRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
 import type { FabricThinking } from "../thinking.js";
 import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
 import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
@@ -472,7 +472,7 @@ interface ResidentCreateActorCommand {
   idempotencyKey?: string;
   requestId: string;
   rootId: string;
-  request: FabricActorRequest;
+  request: FabricActorCreateRequest;
   createdAt: number;
 }
 
@@ -511,9 +511,9 @@ export const assertResidentActorToolCeiling = (tools: string[], ceiling: readonl
 
 /** Root-owned registry operations; these never start a resident host. */
 export type ResidentActorMutation =
+  | ({ operation: "setInstructions"; id: string; replace?: boolean } & import("../actors/instructions-file.js").FabricActorInstructionsSource)
   | { operation: "resetSession"; id: string }
   | { operation: "stop"; id: string }
-  | { operation: "setInstructions"; id: string; instructions: string }
   | { operation: "setTools"; id: string; tools: string[] }
   | { operation: "setModel"; id: string; model?: string; scope: FabricActorBindingScope }
   | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }

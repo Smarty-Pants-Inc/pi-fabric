@@ -307,7 +307,7 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
     }
   });
 
-  it.each(["error", "terminal-before-error", "resume-error", "nonzero", "timeout", "spawn-throw", "confirmed"] as const)(
+  it.each(["error", "terminal-before-error", "failed-before-error", "resume-error", "nonzero", "timeout", "spawn-throw", "confirmed"] as const)(
     "fences all owner-release paths until tree exit is confirmed (%s)", async outcome => {
       vi.useFakeTimers();
       vi.spyOn(process, "emitWarning").mockImplementation(() => {});
@@ -355,16 +355,19 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
           killer.emit("close", 0); workerExited = true; worker.emit("exit", 0); worker.emit("close", 0);
           await stopping;
         } else {
-          if (outcome === "terminal-before-error") {
+          if (outcome === "terminal-before-error" || outcome === "failed-before-error") {
             // A terminal file may race the helper outcome. Do not release its
             // permit or publish a collectible result while stop still owes a join.
-            fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ ...record, status: "completed", finishedAt: Date.now() }));
+            fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({
+              ...record, status: outcome === "failed-before-error" ? "failed" : "completed",
+              ...(outcome === "failed-before-error" ? { error: "real worker failure" } : {}), finishedAt: Date.now(),
+            }));
             let reported = false;
             void manager.wait(handle.id).then(() => { reported = true; });
             await vi.advanceTimersByTimeAsync(250);
             expect(reported, "terminal reporting cannot bypass an in-flight process stop").toBe(false);
           }
-          if (outcome === "error" || outcome === "terminal-before-error") { killer.emit("error", new Error("helper failure")); killer.emit("close", 0); }
+          if (outcome === "error" || outcome === "terminal-before-error" || outcome === "failed-before-error") { killer.emit("error", new Error("helper failure")); killer.emit("close", 0); }
           if (outcome === "nonzero") killer.emit("close", 1);
           if (outcome === "timeout") { await vi.advanceTimersByTimeAsync(1_000); killer.emit("close", 0); }
           await vi.advanceTimersByTimeAsync(0);
@@ -372,13 +375,14 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
           expect(hasUnresolvedWorker(run)).toBe(true);
           expect(manager.retentionReferences().has(handle.id)).toBe(true);
           await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
-          // Parallel monitoring must be able to report failure, but not transfer custody.
+          // Later monitoring must preserve the stop/terminal result without transferring custody.
           await vi.advanceTimersByTimeAsync(10_000);
         }
         // Keep Windows active through the later admission/close probe too;
         // restoring Linux here used to hide that launch's captured-close debt.
         const result = await manager.wait(handle.id);
-        expect(result.status).toBe(outcome === "terminal-before-error" ? "completed" : outcome === "confirmed" || outcome === "resume-error" ? "stopped" : "failed");
+        expect(result.status).toBe(outcome === "terminal-before-error" ? "completed" : outcome === "failed-before-error" ? "failed" : "stopped");
+        if (outcome === "failed-before-error") expect(result.error).toBe("real worker failure");
         if (outcome === "confirmed") {
           expect(hasUnresolvedWorker(run)).toBe(false);
           expect(manager.retentionReferences().has(handle.id)).toBe(false);

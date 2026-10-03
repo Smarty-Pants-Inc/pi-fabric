@@ -1915,16 +1915,13 @@ export class AgentManager {
       managed.latestRecord = observed;
       if (observed.runnerSessionId) managed.runnerSessionId = observed.runnerSessionId;
     }
-    // A failed Windows tree attempt used to wait out the stop bound, allowing
-    // the monitor to publish failure first. Keep that failure contract when the
-    // closed attempt now permits prompt logical stop (never custody release).
-    const unconfirmedWindowsStop = process.platform === "win32" ? managed.lostContact : undefined;
+    // Stop intent and tree custody are separate: uncertainty keeps the worker's
+    // files and native admission fenced, but does not turn an explicit stop into
+    // a worker failure. Preserve a genuine terminal result when one exists.
     const record =
       terminal && terminalStatuses.has(terminal.status)
         ? (this.#withTransportMetadata(terminal, managed) as AgentRunResult)
-        : failedRecord(managed, unconfirmedWindowsStop ? "failed" : "stopped", unconfirmedWindowsStop
-          ? `Lost track of the worker: ${unconfirmedWindowsStop}. Fabric does not relaunch it or delete its files.`
-          : "Agent stopped");
+        : failedRecord(managed, "stopped", "Agent stopped");
     if (!terminal || !terminalStatuses.has(terminal.status)) writeRecord(managed.statusFile, record);
     this.#settle(managed, record);
     return record;
@@ -2685,10 +2682,13 @@ export class AgentManager {
         if (!alive) {
           firstObservedDeadAt ??= livenessCheckedAt;
           if (livenessCheckedAt - firstObservedDeadAt >= TRANSPORT_EXIT_GRACE_MS) {
-            // Worker close can precede the Windows tree-helper outcome. As
-            // with a terminal file, join a requested stop before settlement
-            // may release native admission or make this run collectible.
-            if (managed.stopRequested && managed.transport.kind === "process") await this.#stopManagedTransport(managed);
+            // Worker exit can precede the tree-helper/native-close join. The
+            // explicit stop owns the no-result terminal status; joining it is
+            // still mandatory, but absence during teardown is not run failure.
+            if (managed.stopRequested && managed.transport.kind === "process") {
+              await this.#stopManagedTransport(managed);
+              return;
+            }
             const lost = managed.transport.lostContact?.();
             if (lost) {
               // Not an exit: never relaunched, retried or cleaned up automatically.

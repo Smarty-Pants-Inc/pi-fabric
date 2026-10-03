@@ -1742,6 +1742,85 @@ describe("AgentManager", () => {
   },
   30_000);
 
+  it.each(["clean", "uncertain", "failed-result"] as const)("keeps stop settlement separate from joined process custody (%s)", async outcome => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    let releaseHelper!: () => void;
+    let releaseWorker!: () => void;
+    const helper = new Promise<void>(resolve => { releaseHelper = resolve; });
+    const worker = new Promise<void>(resolve => { releaseWorker = resolve; });
+    let exited = false;
+    let helperJoined = false;
+    let workerJoined = false;
+    let statusFile = "";
+    const stop = vi.fn(async () => {
+      exited = true; // Native exit/PID absence is not captured close or tree-helper closure.
+      await helper;
+      helperJoined = true;
+      await worker;
+      workerJoined = true;
+      if (outcome === "failed-result") {
+        const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+        writeJsonAtomic(statusFile, { ...record, status: "failed", error: "real worker failure", finishedAt: Date.now() });
+      }
+    });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async () => {
+      return {
+        kind: "process", stop, isAlive: async () => !exited,
+        lostContact: () => outcome === "uncertain" && exited ? "tree helper closed without confirmed tree exit" : undefined,
+      };
+    });
+    let stopping: Promise<AgentRunResult> | undefined;
+    try {
+      const handle = await manager.spawn({ task: "joined stop", transport: "process" });
+      statusFile = path.join(manager.runDirectory(handle.id)!, "status.json");
+      writeJsonAtomic(statusFile, {
+        id: handle.id, name: "joined stop", task: "joined stop", status: "running", runner: "pi", transport: "process",
+        cwd: process.cwd(), startedAt: Date.now(), updatedAt: Date.now(), turns: 0, toolCalls: 0, text: "", exitCode: null,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      });
+      let settled = false;
+      stopping = manager.stop(handle.id).then(result => { settled = true; return result; });
+      // Cross the monitor's transport-exit grace while both captured joins are outstanding.
+      await new Promise(resolve => setTimeout(resolve, 1_800));
+      expect(stop).toHaveBeenCalledOnce();
+      expect(settled).toBe(false);
+      expect(manager.status(handle.id).status).toBe("running");
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/running|teardown is pending/);
+      await expect(manager.checkpointForRelease()).rejects.toThrow(/pending/);
+      releaseHelper();
+      await vi.waitFor(() => expect(helperJoined).toBe(true));
+      expect(workerJoined).toBe(false);
+      expect(settled).toBe(false);
+      releaseWorker();
+      const expected = outcome === "failed-result" ? "failed" : "stopped";
+      expect(await stopping).toMatchObject({ status: expected });
+      expect(await manager.wait(handle.id)).toMatchObject({ status: expected });
+      expect(manager.status(handle.id).status).toBe(expected);
+      // Let the monitor's queued continuation run: it must not overwrite the stop's terminal file.
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(JSON.parse(fs.readFileSync(statusFile, "utf8")).status).toBe(expected);
+      expect(workerJoined).toBe(true);
+      expect(launch).toHaveBeenCalledOnce();
+      if (outcome === "uncertain") {
+        expect(fs.existsSync(path.join(manager.runDirectory(handle.id)!, "unresolved-worker.json"))).toBe(true);
+        await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
+        await expect(manager.checkpointForRelease()).rejects.toThrow(/unresolved/);
+      } else {
+        if (outcome === "failed-result") expect((await manager.wait(handle.id)).error).toBe("real worker failure");
+        expect(await manager.cleanup(handle.id)).toEqual({ cleaned: true });
+      }
+    } finally {
+      releaseHelper(); releaseWorker();
+      await stopping;
+      launch.mockRestore();
+    }
+  });
+
   it.each(["terminal record", "settled result"])("joins process stop after a %s is available", async state => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

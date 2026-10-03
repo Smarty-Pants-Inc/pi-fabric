@@ -323,6 +323,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Set when the run failed because its transport lost contact: its worker may still run. */
   lostContact?: string;
   model?: string;
+  modelReason?: string;
   thinking?: AgentRunRequest["thinking"];
   routeOutcome?: (result: AgentRunResult) => void;
   /** Original authority for every attempt, never a prepared/observed replacement label. */
@@ -586,6 +587,7 @@ const failedRecord = (
     error,
     usage,
     ...(managed.model ? { model: managed.model } : {}),
+    ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
     ...(managed.latestRecord?.admittedModel ? { admittedModel: managed.latestRecord.admittedModel } : {}),
     ...(managed.latestRecord?.admittedThinking ? { admittedThinking: managed.latestRecord.admittedThinking } : {}),
@@ -1269,6 +1271,7 @@ export class AgentManager {
             ? ["--fabric-extension", this.#fabricExtensionPath]
             : []),
           ...(model ? ["--model", model] : []),
+          ...(request.modelReason !== undefined ? ["--model-reason", request.modelReason] : []),
           ...(thinking ? ["--thinking", thinking] : []),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
           ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
@@ -1376,6 +1379,7 @@ export class AgentManager {
           abortSignal: queued && !authorize ? undefined : signal,
           abortHandler: undefined,
           ...(model ? { model } : {}),
+          ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
           ...(thinking ? { thinking } : {}),
           ...(routeDispatch ? { routeOutcome: routeDispatch.outcome } : {}),
           ...(routePin ? { routePin } : {}),
@@ -1462,6 +1466,7 @@ export class AgentManager {
       cwd: selectedCwd, residency, recursive: request.recursive === true,
       ...(kernel ? { kernel } : {}),
       ...(model ? { model } : {}),
+      ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
       ...(request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking
         ? { thinking: request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking } : {}),
       ...(request.actorId ? { actorId: request.actorId } : {}),
@@ -3172,6 +3177,7 @@ export class AgentManager {
       ...(nestedAgents.length > 0 ? { nestedAgents } : {}),
       ...(budget ? { budget } : {}),
       ...(model ? { model } : {}),
+      ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
       ...(thinking ? { thinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),

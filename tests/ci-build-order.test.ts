@@ -14,7 +14,6 @@ type Job = {
 const workflow = parse(fs.readFileSync(fileURLToPath(new URL("../.github/workflows/test.yml", import.meta.url)), "utf8"));
 const jobs = workflow.jobs as Record<string, Job>;
 const sameRepoGuard = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository";
-const trustedMainGuard = "github.event_name == 'push' && github.ref == 'refs/heads/main'";
 
 describe.each(Object.entries(jobs))("CI build prerequisites for %s", (_id, job) => {
   const steps = job.steps;
@@ -54,8 +53,8 @@ describe("CI source and runner policy (smarty-dev#1246)", () => {
   it.each(["test.yml", "entropy.yml"])("excludes fork PR source and pull_request_target in %s", (name) => {
     const definition = parse(fs.readFileSync(fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)), "utf8"));
     expect(definition.on).not.toHaveProperty("pull_request_target");
-    for (const [id, job] of Object.entries(definition.jobs) as Array<[string, Job]>) {
-      expect(job.if).toBe(name === "test.yml" && id === "windows" ? trustedMainGuard : sameRepoGuard);
+    for (const job of Object.values(definition.jobs) as Job[]) {
+      expect(job.if).toBe(sameRepoGuard);
     }
   });
 
@@ -67,30 +66,39 @@ describe("CI source and runner policy (smarty-dev#1246)", () => {
     expect(jobs.check!.strategy).toEqual({
       "fail-fast": false,
       matrix: {
-        include: [{ name: "check (ubuntu-latest)", runner: ["self-hosted", "smarty-linux-x64"] }],
+        include: [{ name: "check (ubuntu-latest)", runner: ["smarty-linux-x64"] }],
       },
     });
   });
 
-  it("restricts the independent native Dev3 check to main push events before runner selection", () => {
-    expect(jobs.windows!.if).toBe(trustedMainGuard);
+  it("keeps the recorded hosted Windows check on PR, push and merge-queue heads", () => {
+    expect(jobs.windows!.if).toBe(sameRepoGuard);
     expect(jobs.windows!.name).toBe("check (windows-latest)");
-    expect(jobs.windows!["runs-on"]).toEqual(["self-hosted", "Windows", "X64", "smarty-ci-windows-x64"]);
+    expect(jobs.windows!["runs-on"]).toBe("windows-latest");
     expect(jobs.windows!.strategy).toBeUndefined();
-    expect(workflow.on).toEqual({ push: { branches: ["main"] }, pull_request: { branches: ["main"] } });
+    expect(workflow.on).toEqual({ push: { branches: ["main"] }, pull_request: { branches: ["main"] }, merge_group: {} });
     expect(jobs.windows!.steps).toEqual(jobs.check!.steps);
   });
 
+  it("matches group 13's custom-only labels without assuming runner availability", () => {
+    // No live labels fixture is checked in. R32's custom-only registrar is the
+    // explicit assumption here, not a live group/registration or capacity probe.
+    const assumedGroup13Labels = new Set(["smarty-linux-x64"]);
+    const eligible = (labels: string[]) => labels.every((label) => assumedGroup13Labels.has(label));
+    expect(eligible(["self-hosted", "smarty-linux-x64"])).toBe(false);
+    expect(eligible(jobs.check!.strategy!.matrix.include[0]!.runner)).toBe(true);
+  });
+
   it.each([
-    ["pull_request", "refs/pull/254/merge", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)"]],
-    ["pull_request", "refs/heads/main", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)"]],
+    ["pull_request", "refs/pull/254/merge", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)", "check (windows-latest)"]],
+    ["pull_request", "refs/heads/main", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)", "check (windows-latest)"]],
     ["pull_request", "refs/pull/254/merge", "fork/pi-fabric", []],
-    ["merge_group", "refs/heads/gh-readonly-queue/main/pr-254", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)"]],
-    ["merge_group", "refs/heads/main", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)"]],
+    ["merge_group", "refs/heads/gh-readonly-queue/main/pr-254", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)", "check (windows-latest)"]],
+    ["merge_group", "refs/heads/main", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)", "check (windows-latest)"]],
     ["push", "refs/heads/main", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)", "check (windows-latest)"]],
-    ["push", "refs/heads/feature", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)"]],
-    ["workflow_dispatch", "refs/heads/main", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)"]],
-    ["pull_request_target", "refs/heads/main", "fork/pi-fabric", ["check (ubuntu-latest)"]],
+    ["push", "refs/heads/feature", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)", "check (windows-latest)"]],
+    ["workflow_dispatch", "refs/heads/main", "Smarty-Pants-Inc/pi-fabric", ["check (ubuntu-latest)", "check (windows-latest)"]],
+    ["pull_request_target", "refs/heads/main", "fork/pi-fabric", ["check (ubuntu-latest)", "check (windows-latest)"]],
   ])("job conditions for %s on %s from %s request only %j", (event, ref, source, expected) => {
     // Evaluate the exact Actions predicates (this subset uses JS-compatible operators).
     // Non-triggered events are defense-in-depth probes, not workflow admission.
@@ -104,12 +112,12 @@ describe("CI source and runner policy (smarty-dev#1246)", () => {
       .filter((job) => runInNewContext(job.if, { github }, { timeout: 1_000 }))
       .flatMap((job) => job.strategy?.matrix.include.map((row) => row.name) ?? [job.name]);
     expect(requested).toEqual(expected);
-    if (event !== "push" || ref !== "refs/heads/main") {
-      expect(requested).not.toContain("check (windows-latest)");
+    if (event === "pull_request" && source !== github.repository) {
+      expect(requested).toEqual([]);
     }
   });
 
-  it("requires Linux, but never post-merge Windows, in both Mergify condition lists", () => {
+  it("preserves Linux-only Mergify conditions while restoring Windows PR coverage", () => {
     const mergify = parse(fs.readFileSync(fileURLToPath(new URL("../.mergify.yml", import.meta.url)), "utf8"));
     const queue = mergify.queue_rules[0];
     // Main (smarty-dev#2974) keeps queue_conditions and merge_conditions distinct; both must require Linux and never Windows.

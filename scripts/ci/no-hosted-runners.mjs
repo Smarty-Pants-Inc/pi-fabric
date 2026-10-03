@@ -1,7 +1,19 @@
-// smarty-dev#1246: no author-written exception can authorize hosted runners.
+// smarty-dev#1246: workflow-authored markers cannot authorize hosted runners.
+// The only reviewed exception is Paul's PR-time Windows check; remove it after
+// smarty-dev#3580 assigns the automatic fix-or-revert owner, then use Option A.
 import fs from "node:fs";
+import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { LineCounter, parseDocument, visit } from "yaml";
+
+const windowsException = {
+  workflow: "test.yml",
+  job: "windows",
+  name: "check (windows-latest)",
+  runner: "windows-latest",
+  condition: "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
+  marker: "# hosted-exception: PR-time windows-latest kept by Paul 2026-10-03 (pi-fabric#254 5964538892); exit: post-merge Windows run gets an automatic fix-or-revert owner (smarty-dev#3580), then Option A (Dev3 main-only)",
+};
 
 // Same label rule as the canonical factory detective check, smarty-dev setup/factory/actions_minutes.py HOSTED
 // (dev-lead, smarty-dev#1246): the two must never disagree.
@@ -119,12 +131,8 @@ for (const filename of process.argv.slice(2)) {
   };
   try {
     const source = fs.readFileSync(filename, "utf8");
-    source.split(/\r?\n/).forEach((text, index) => {
-      if (/^\s*#\s*hosted-exception\s*:/.test(text)) {
-        line = index + 1;
-        report("hosted-exception marker forbidden: no hosted exceptions are approved");
-      }
-    });
+    const sourceLines = source.split(/\r?\n/);
+    const approvedMarkers = new Set();
     line = 1;
     const lineCounter = new LineCounter();
     const document = parseDocument(source, { lineCounter, uniqueKeys: true, merge: false });
@@ -150,11 +158,28 @@ for (const filename of process.argv.slice(2)) {
           if (typeof job.get("uses") === "string" && job.get("uses").trim()) continue;
           fail(`job ${name} has no runs-on`);
         }
-        validateRunner(job.get("runs-on"), job, {});
+        // Bind the recorded marker to this exact workflow/job/selector/condition,
+        // immediately before runs-on. A copied marker cannot approve another job,
+        // a matrix, an expression, a label list, or another hosted image.
+        const approved = path.basename(filename) === windowsException.workflow
+          && name === windowsException.job
+          && job.get("name") === windowsException.name
+          && job.get("if") === windowsException.condition
+          && job.get("runs-on") === windowsException.runner
+          && !job.has("strategy")
+          && sourceLines[line - 2]?.trim() === windowsException.marker;
+        if (approved) approvedMarkers.add(line - 1);
+        else validateRunner(job.get("runs-on"), job, {});
       } catch (error) {
         report(error.message);
       }
     }
+    sourceLines.forEach((text, index) => {
+      if (/^\s*#\s*hosted-exception\s*:/.test(text) && !approvedMarkers.has(index + 1)) {
+        line = index + 1;
+        report("hosted-exception marker forbidden: not an allowlisted exception");
+      }
+    });
   } catch (error) {
     report(`cannot validate workflow: ${error.message}`);
   }

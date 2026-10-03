@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# smarty-dev#1246 policy: this repository has no approved hosted-runner exceptions.
+# smarty-dev#1246 policy: only test.yml/windows has the recorded Paul 2026-10-03
+# PR-time windows-latest exception (pi-fabric#254 5964538892); exit: smarty-dev#3580,
+# then Option A (Dev3 main-only). The parser enforces its exact allowlist.
 set -euo pipefail
 
 workflow_dir="${1:-.github/workflows}"

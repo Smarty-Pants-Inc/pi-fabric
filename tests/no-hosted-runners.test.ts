@@ -22,7 +22,43 @@ afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
+const approvedMarker = "# hosted-exception: PR-time windows-latest kept by Paul 2026-10-03 (pi-fabric#254 5964538892); exit: post-merge Windows run gets an automatic fix-or-revert owner (smarty-dev#3580), then Option A (Dev3 main-only)";
+const approvedWindows = `name: Test\non: [push, pull_request, merge_group]\njobs:\n  windows:\n    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository\n    name: check (windows-latest)\n    ${approvedMarker}\n    runs-on: windows-latest\n    steps:\n      - run: echo probe\n`;
+
 describe("no hosted runners guard", () => {
+  it("accepts only the recorded PR-time Windows hosted exception", () => {
+    const result = runGuard({ "test.yml": approvedWindows });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+  });
+
+  it.each([
+    ["wrong workflow", "entropy.yml", approvedWindows],
+    ["alternate extension", "test.yaml", approvedWindows],
+    ["wrong job", "test.yml", approvedWindows.replace("  windows:", "  other:")],
+    ["wrong check name", "test.yml", approvedWindows.replace("name: check (windows-latest)", "name: other")],
+    ["missing same-repo guard", "test.yml", approvedWindows.replace(/    if:.*\n/, "")],
+    ["weakened condition", "test.yml", approvedWindows.replace(/    if:.*\n/, "    if: always()\n")],
+    ["missing approval", "test.yml", approvedWindows.replace(`    ${approvedMarker}\n`, "")],
+    ["changed approval", "test.yml", approvedWindows.replace("5964538892", "0000000000")],
+    ["detached marker", "test.yml", approvedWindows.replace(`    ${approvedMarker}\n    runs-on:`, `    ${approvedMarker}\n    timeout-minutes: 30\n    runs-on:`)],
+    ["different Windows image", "test.yml", approvedWindows.replace("runs-on: windows-latest", "runs-on: windows-2025")],
+    ["other hosted OS", "test.yml", approvedWindows.replace("runs-on: windows-latest", "runs-on: ubuntu-latest")],
+    ["labels list", "test.yml", approvedWindows.replace("runs-on: windows-latest", "runs-on: [windows-latest]")],
+    ["labels object", "test.yml", approvedWindows.replace("runs-on: windows-latest", "runs-on: {labels: windows-latest}")],
+    ["constant expression", "test.yml", approvedWindows.replace("runs-on: windows-latest", "runs-on: ${{ 'windows-latest' }}")],
+    ["matrix expansion", "test.yml", approvedWindows.replace("    steps:", "    strategy: {matrix: {image: [windows-latest]}}\n    steps:")],
+    ["duplicate marker", "test.yml", `${approvedMarker}\n${approvedWindows}`],
+    ["extra hosted job", "test.yml", `${approvedWindows}  extra:\n    runs-on: macos-latest\n    steps: [{run: echo probe}]\n`],
+    ["copied approval on extra job", "test.yml", `${approvedWindows}  extra:\n    ${approvedMarker}\n    runs-on: windows-latest\n    steps: [{run: echo probe}]\n`],
+  ])("rejects exception widening: %s", (_reason, filename, contents) => {
+    const result = runGuard({ [filename]: contents });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(result.stderr).not.toBe("");
+  });
+
   it.each([
     ["pending approval", "ubuntu-latest"],
     ["unapproved", "windows-latest"],
@@ -31,7 +67,7 @@ describe("no hosted runners guard", () => {
     const result = runGuard({ "test.yml": workflow(`    # hosted-exception: ${approval}\n    runs-on: ${runner}`) });
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("hosted-exception marker forbidden: no hosted exceptions are approved");
+    expect(result.stderr).toContain("hosted-exception marker forbidden: not an allowlisted exception");
     expect(result.stderr).toContain(`unapproved hosted runner: ${runner}`);
   });
 
@@ -112,7 +148,7 @@ describe("no hosted runners guard", () => {
     expect(result.stderr).toBe("");
   });
 
-  it.each(["test.yml", "entropy.yml"])("accepts actual owned-runner workflow %s", (name) => {
+  it.each(["test.yml", "entropy.yml"])("accepts actual policy-compliant workflow %s", (name) => {
     const contents = fs.readFileSync(fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)), "utf8");
     const result = runGuard({ [name]: contents });
     expect(result.error).toBeUndefined();
@@ -140,7 +176,7 @@ describe("no hosted runners guard", () => {
     const result = runGuard({ "test.yml": workflow(`    # hosted-exception: ${approval}\n    runs-on: smarty-linux-x64`) });
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("hosted-exception marker forbidden: no hosted exceptions are approved");
+    expect(result.stderr).toContain("hosted-exception marker forbidden: not an allowlisted exception");
   });
 
   it("rejects hosted definitions in any workflow even if another file is safe", () => {

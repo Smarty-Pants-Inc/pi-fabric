@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { readSessionDerived } from "./session-file-cache.js";
 import type { FabricExecutionOutcomeV1, FabricTraceJsonValue } from "../audit/trace.js";
 import {
   readFabricBranchSummaryDetails,
@@ -115,17 +116,28 @@ export interface SessionHeaderInfo {
   parentSession?: string;
 }
 
+// A V8 sliced string can pin a multi-megabyte source line even after JSON is
+// discarded. Copy UTF-16 code units (including lone surrogates) into owned text.
+const ownedText = (text: string): string => Buffer.from(text, "utf16le").toString("utf16le");
+const ownDerivedStrings = <T>(value: T): T => {
+  if (typeof value === "string") return ownedText(value) as T;
+  if (Array.isArray(value)) return value.map(item => ownDerivedStrings(item)) as T;
+  if (value !== null && typeof value === "object") return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, ownDerivedStrings(item)]),
+  ) as T;
+  return value;
+};
 const truncate = (text: string, max: number): { text: string; truncated: boolean } => {
   const scalarLimit = Math.max(0, Math.floor(max));
-  if (scalarLimit >= text.length) return { text, truncated: false };
+  if (scalarLimit >= text.length) return { text: ownedText(text), truncated: false };
   let scalarCount = 0;
   let utf16End = 0;
   for (const scalar of text) {
-    if (scalarCount >= scalarLimit) return { text: text.slice(0, utf16End), truncated: true };
+    if (scalarCount >= scalarLimit) return { text: ownedText(text.slice(0, utf16End)), truncated: true };
     utf16End += scalar.length;
     scalarCount += 1;
   }
-  return { text, truncated: false };
+  return { text: ownedText(text), truncated: false };
 };
 
 const asString = (value: unknown): string =>
@@ -695,23 +707,54 @@ export const normalizeSession = (
   maxEntryChars: number,
   options: NormalizeSessionOptions = {},
 ): { entries: NormalizedEntry[]; header: SessionHeaderInfo | null; indexCoverage: NormalizationCoverage } => {
-  let content: string;
-  try {
-    content = fs.readFileSync(sessionFile, "utf8");
-  } catch {
-    return { entries: [], header: null, indexCoverage: { complete: false, reasons: ["source_unavailable"] } };
-  }
-  const records: unknown[] = [];
-  for (const line of content.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      records.push(JSON.parse(trimmed));
-    } catch {
-      continue;
+  const policy = privacyPolicy(options);
+  const key = `normalize:${maxEntryChars}:${policy.indexThinking}:${policy.indexToolOutput}`;
+  const state = readSessionDerived(sessionFile, key, () => ({
+    header: null as SessionHeaderInfo | null, ordinal: 0, revision: 0,
+    rows: [] as Array<{ ordinal: number; entries: NormalizedEntry[]; reasons: string[] }>,
+    projections: new Map<string, { revision: number; value: ReturnType<typeof normalizeRecords> }>(),
+  }), (value, record) => {
+    if (record === null || typeof record !== "object" || Array.isArray(record)) return;
+    const raw = record as Record<string, unknown>;
+    const identity = { sessionFile, sessionId: value.header?.sessionId ?? "" };
+    const normalized = ownDerivedStrings(normalizeRecords([record], identity, maxEntryChars, policy));
+    value.revision += 1;
+    if (raw.type === "session") { value.header = normalized.header; return; }
+    const ordinal = value.ordinal++;
+    // Only compact, bounded normalized outputs are retained, not parsed source records.
+    if (normalized.entries.length || normalized.indexCoverage.reasons.length) value.rows.push({ ordinal, entries: normalized.entries, reasons: normalized.indexCoverage.reasons });
+  });
+  if (!state) return { entries: [], header: null, indexCoverage: { complete: false, reasons: ["source_unavailable"] } };
+  const projectionKey = options.lineage?.fingerprint ?? "all";
+  const cached = state.projections.get(projectionKey);
+  if (cached?.revision === state.revision) return cached.value;
+  const entries: NormalizedEntry[] = [];
+  const reasons = new Set(options.lineage?.coverageReasons ?? []);
+  const entryIds = new Set<string>(), operationAddresses = new Set<string>(), branchFactAddresses = new Set<string>();
+  for (const row of state.rows) {
+    if (options.lineage?.entryOrdinals && !options.lineage.entryOrdinals.has(row.ordinal)) continue;
+    for (const reason of row.reasons) reasons.add(reason);
+    for (const entry of row.entries) {
+      if (entry.branchFact) {
+        if (branchFactAddresses.has(entry.branchFact.address)) continue;
+        branchFactAddresses.add(entry.branchFact.address);
+      }
+      if (entry.entryId !== null) {
+        if (entryIds.has(entry.entryId)) reasons.add("duplicate_entry_id");
+        entryIds.add(entry.entryId);
+      }
+      if (entry.operationAddress !== undefined) {
+        if (operationAddresses.has(entry.operationAddress)) reasons.add("duplicate_operation_address");
+        operationAddresses.add(entry.operationAddress);
+      }
+      entries.push({ ...entry, index: entries.length });
     }
   }
-  return normalizeRecords(records, { sessionFile }, maxEntryChars, options);
+  const sortedReasons = [...reasons].sort();
+  const result = { entries, header: state.header, indexCoverage: { complete: !sortedReasons.length, reasons: sortedReasons } };
+  state.projections.set(projectionKey, { revision: state.revision, value: result });
+  while (state.projections.size > 4) state.projections.delete(state.projections.keys().next().value!);
+  return result;
 };
 
 /** Read only the session header (first JSONL line). */

@@ -17,6 +17,8 @@ export interface MemoryProviderContext {
   sessionId?: string;
   sessionFile?: string;
   getLiveBranch?: () => LiveSessionBranch;
+  /** Native immutable-parent-tree leaf, cheap to observe without copying the branch. */
+  getLiveLeafId?: () => string | null;
   /** Registered portable memory sources; present enables host-backed calls. */
   sources?: MemorySourceRegistry;
 }

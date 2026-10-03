@@ -70,22 +70,36 @@ export class ActorChildCompletionStore {
 
   enqueue(result: AgentRunResult, spawner: AgentSpawner, notify = true): void {
     if (!ID.test(result.id) || spawner.kind !== "actor") throw new Error("Invalid actor child completion identity");
-    if (this.#consumed.has(result.id) || this.received(result.id)) return;
-    if (fs.existsSync(this.#file(result.id))) {
-      syncDirectoryChain(this.directory); // Retry an archive/envelope post-rename barrier too.
-      return;
-    }
-    writeJsonAtomic(this.resultFile(result.id), { ...result, spawner }, { durable: true });
-    if (!notify) return; // Unread, but no automatic mailbox activation was requested.
-    writeJsonAtomic(this.#file(result.id), {
-      format: 1, spawner,
-      result: {
-        id: result.id, name: result.name, status: result.status,
-        text: result.text.slice(0, 4000), startedAt: result.startedAt,
-        ...(result.finishedAt !== undefined ? { finishedAt: result.finishedAt } : {}),
-        ...(result.error !== undefined ? { error: result.error.slice(0, 4000) } : {}),
-      },
-    } satisfies ActorChildCompletion, { durable: true });
+    this.#withClaim(() => {
+      // Cancellation may precede both archive files. A failed rollback must keep
+      // the source's archive obligation, not let its prepared receipt discharge it.
+      this.#rollbackAbandoned(result.id);
+      const received = this.received(result.id);
+      const publication = received ? JSON.parse(fs.readFileSync(this.#receipt(result.id), "utf8")).publication : undefined;
+      if (this.#consumed.has(result.id) || (received && !publication)) {
+        // A finalized observation/claim still prevents replay. Fence a receipt
+        // whose rename was visible but whose durability barrier previously failed.
+        syncDirectoryChain(this.directory);
+        return;
+      }
+      // A publication fence is not delivery: retain a full recoverable archive
+      // even while other observers must continue to regard it as claimed.
+      if (fs.existsSync(this.#file(result.id)) && fs.existsSync(this.resultFile(result.id))) {
+        syncDirectoryChain(this.directory); // Retry an archive/envelope post-rename barrier too.
+        return;
+      }
+      writeJsonAtomic(this.resultFile(result.id), { ...result, spawner }, { durable: true });
+      if (!notify) return; // Unread, but no automatic mailbox activation was requested.
+      writeJsonAtomic(this.#file(result.id), {
+        format: 1, spawner,
+        result: {
+          id: result.id, name: result.name, status: result.status,
+          text: result.text.slice(0, 4000), startedAt: result.startedAt,
+          ...(result.finishedAt !== undefined ? { finishedAt: result.finishedAt } : {}),
+          ...(result.error !== undefined ? { error: result.error.slice(0, 4000) } : {}),
+        },
+      } satisfies ActorChildCompletion, { durable: true });
+    });
   }
 
   acknowledge(id: string, options: { handoff?: boolean } = {}): void {
@@ -275,6 +289,14 @@ export class ActorChildCompletionStore {
   #pending(options: { actorId?: string; inFlightRunId?: string }): ActorChildCompletion[] {
     let files: string[];
     try { files = fs.readdirSync(this.directory); } catch { return []; }
+    // Intent is independent of archival: neither an envelope nor even a result
+    // file need exist when a foreground publication is cancelled. Reconcile these
+    // under the claim lock on restart, including muted outcomes with no envelope.
+    for (const file of files) {
+      if (!file.endsWith(".abandon") || !ID.test(file.slice(0, -8))) continue;
+      try { this.#rollbackAbandoned(file.slice(0, -8)); }
+      catch { /* Keep the exact intent and publication fence for the next poll. */ }
+    }
     const envelopes = files.filter((file) => file.endsWith(".json") && ID.test(file.slice(0, -5)));
     const ids = new Set(envelopes.map((file) => file.slice(0, -5)));
     for (const id of this.#checked.keys()) if (!ids.has(id)) this.#checked.delete(id);

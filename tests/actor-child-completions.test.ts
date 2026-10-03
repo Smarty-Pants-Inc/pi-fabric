@@ -95,6 +95,37 @@ describe("actor child completion handoff storage", () => {
     expect(next.received(result.id)).toBe(finalized);
   });
 
+  it.each([true, false])("archives an unpublished receipt without treating it as durable delivery (notify=%s)", notify => {
+    const h = setup(); const result = h.result();
+    h.store.consume(result.id, { handoff: true, publication: true });
+    h.store.enqueue(result, h.spawner, notify);
+    expect(JSON.parse(fs.readFileSync(h.store.resultFile(result.id), "utf8"))).toMatchObject(result);
+    expect(fs.existsSync(path.join(h.store.directory, `${result.id}.json`))).toBe(notify);
+    expect(h.store.pending()).toEqual([]); // Still fenced from other observers until abandonment.
+    h.store.abandonForeground(result.id);
+    expect(h.store.pending()).toHaveLength(notify ? 1 : 0);
+    expect(h.store.received(result.id)).toBe(false);
+  });
+
+  it.each([false, true])("recovers standalone abandonment intent without an envelope, preserving finalized delivery (finalized=%s)", finalized => {
+    const h = setup(); const result = h.result();
+    h.store.consume(result.id, { handoff: true, publication: true });
+    const write = atomicWrites.writeJsonAtomic;
+    const blocked = vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, value, options) => {
+      if (file.endsWith(".receipt") && (value as { unread?: boolean }).unread) throw new Error("standalone rollback unavailable");
+      return write(file, value, options);
+    });
+    expect(() => h.store.abandonForeground(result.id)).toThrow("standalone rollback unavailable");
+    blocked.mockRestore();
+    if (finalized) h.store.discard(result.id);
+    const restarted = new ActorChildCompletionStore(h.sessionFile);
+    expect(restarted.pending()).toEqual([]);
+    expect(restarted.received(result.id)).toBe(finalized);
+    expect(fs.existsSync(path.join(h.store.directory, `${result.id}.abandon`))).toBe(false);
+    restarted.enqueue(result, h.spawner);
+    expect(restarted.pending()).toHaveLength(finalized ? 0 : 1);
+  });
+
   it("claims a live batch atomically without deleting its full outcomes before delivery", () => {
     const h = setup();
     const a = h.result();

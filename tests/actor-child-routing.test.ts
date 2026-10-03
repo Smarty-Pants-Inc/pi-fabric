@@ -431,6 +431,75 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 
+  it.each(["agents.wait", "agents.status", "agents.stop"])("%s preserves archive custody through failed archival, cancelled publication and failed abandonment until restart", async (action) => {
+    const h = await setup(residency);
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    const atomicWrite = atomicWrites.writeJsonAtomic;
+    let archiveAttempts = 0;
+    let rollbackAttempts = 0;
+    const failedStorage = vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, value, options) => {
+      if (file.startsWith(store.directory + path.sep) && file.endsWith(".result.json")) {
+        archiveAttempts++;
+        throw new Error("full-result archive unavailable");
+      }
+      if (file.startsWith(store.directory + path.sep) && file.endsWith(".receipt") && (value as { unread?: boolean }).unread) {
+        rollbackAttempts++;
+        throw new Error("unread receipt rewrite unavailable through close");
+      }
+      return atomicWrite(file, value, options);
+    });
+    const child = await h.spawn("LARGE_RESULT");
+    await vi.waitFor(() => {
+      expect(h.runtime.agents.status(child.id).status).toBe("completed");
+      expect(archiveAttempts).toBeGreaterThan(0);
+    }, { timeout: 5000 });
+    const source = h.runtime.agents.runDirectory(child.id)!;
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+    expect(fs.existsSync(path.join(store.directory, `${child.id}.json`))).toBe(false);
+    expect(runTreeExitVeto(source)).toMatch(/archive is pending/);
+    const abort = new AbortController();
+    const consume = ActorChildCompletionStore.prototype.consume;
+    const fence = vi.spyOn(ActorChildCompletionStore.prototype, "consume").mockImplementation(function(this: ActorChildCompletionStore, id, options) {
+      consume.call(this, id, options);
+      if (id === child.id && options?.publication) abort.abort(new Error("cancel unpublished archive observation"));
+    });
+    await expect(h.runtime.registry.invoke(action, { id: child.id }, { ...h.invocation, signal: abort.signal }))
+      .rejects.toThrow("cancel unpublished archive observation");
+    fence.mockRestore();
+    expect(rollbackAttempts).toBeGreaterThanOrEqual(3);
+    expect(JSON.parse(fs.readFileSync(path.join(store.directory, `${child.id}.receipt`), "utf8")).publication).toBeTruthy();
+    expect(fs.existsSync(path.join(store.directory, `${child.id}.abandon`))).toBe(true);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    await h.runtime.shutdown();
+    const closing = h.owner.close(); h.endActivation(); await closing;
+    expect(rollbackAttempts).toBeGreaterThanOrEqual(6);
+    expect(fs.existsSync(source)).toBe(true);
+    expect(fs.existsSync(path.join(source, "archive-pending.json"))).toBe(true);
+    expect(runTreeExitVeto(source)).toMatch(/archive is pending/);
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+    failedStorage.mockRestore();
+    const recovered = new ActorChildCompletionStore(h.actor.sessionFile!);
+    expect(recovered.pending({ actorId: h.actor.id })).toMatchObject([{ result: { id: child.id, status: "completed" } }]);
+    const saved = JSON.parse(fs.readFileSync(recovered.resultFile(child.id), "utf8"));
+    expect(saved.text).toHaveLength(100000);
+    expect(saved.value).toEqual({ output: "x".repeat(100000) });
+    expect(saved.spawner).toEqual({ id: h.actor.id, kind: "actor", runId: h.actorRunId });
+    expect(fs.existsSync(path.join(source, "archive-pending.json"))).toBe(false);
+    expect(runTreeExitVeto(source)).toBeUndefined();
+    expect(fs.existsSync(path.join(store.directory, `${child.id}.abandon`))).toBe(false);
+    const restarted = h.makeOwner(); cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "recover combined storage failure");
+    await vi.waitFor(() => expect(restarted.messages(h.actor.id).filter(m => m.id === child.id && m.direction === "in")).toHaveLength(1), { timeout: 5000 });
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(restarted.messages(h.actor.id).filter(m => m.source === "child-completion" && m.direction === "out" && !m.error)).toHaveLength(1);
+    restarted.tell(h.actor.id, "unrelated activation must not replay");
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(restarted.messages(h.actor.id).filter(m => m.id === child.id && m.direction === "in")).toHaveLength(1);
+    expect(recovered.pending()).toEqual([]);
+    expect(fs.existsSync(recovered.resultFile(child.id))).toBe(false);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
   it("does not replay consumed deferred context after a failed queue commit and owner restart", async () => {
     const h = await setup(residency);
     const child = await h.spawn("LARGE_RESULT");

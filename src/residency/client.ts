@@ -1,7 +1,9 @@
 import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
 import { randomUUID } from "node:crypto";
+import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
+
 import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -54,6 +56,7 @@ import {
   residentHostId,
   residentHostStateNote,
   residentResultPath,
+  residentRoot,
   sleepUnlessAborted,
   type ResidentAgentMetadata,
   type ResidentCommand,
@@ -145,6 +148,8 @@ export interface ResidencyClientOptions {
   participants: FabricParticipantSource;
   mainAgent: FabricMainAgentTarget;
   piModelState?: () => ResidentPiModelState;
+  /** Current normalized host-owned Main name; never supplied by a task request. */
+  mainName?: () => string;
   onBackgroundComplete?: (result: AgentRunResult, delivered: () => void) => void;
   onResultConsumed?: (id: string) => void;
   hostPath?: string;
@@ -166,9 +171,11 @@ export class ResidencyClient {
   readonly #spawnPolicy = snapshotTaskReturnAddress(undefined, undefined, undefined);
   readonly #deliveryPrefix: string;
   readonly #hostPath: string;
+  readonly #completions: CompletionJournal;
   #deliveryTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #drainingDeliveries = false;
+  #completionFault: string | undefined;
   readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup");
   #closed = false;
   #startingHost: Promise<ResidentHostOwner> | undefined;
@@ -190,6 +197,20 @@ export class ResidencyClient {
     this.#agentsPath = path.join(options.config.residencyRoot, "agents");
     this.#deliveryPrefix = residentDeliveryPrefix(options.config.rootId);
     this.#hostPath = options.hostPath ?? fileURLToPath(new URL("./launcher.js", import.meta.url));
+    this.#completions = new CompletionJournal(options.config.meshRoot,
+      options.mainName ? () => this.#recipient(options.config) : this.#recipient(options.config),
+      options.participants, options.mesh, (result, delivered) => {
+        const acknowledge = () => { delivered(); this.acknowledgeCompletion(result.id); };
+        if (options.onBackgroundComplete) options.onBackgroundComplete(result, acknowledge);
+        else {
+          options.mainAgent.deliverAgent({ from: { id: result.id, name: result.name, kind: "agent" },
+            verification: "mesh", message: `Fabric agent ${result.name} ${result.status}` +
+              (result.completionDelivery?.redeliveredFrom ? ` [re-delivered from dead Main session ${result.completionDelivery.redeliveredFrom}]` : "") +
+              `: ${result.error ?? result.text}`, delivery: "followUp", triggerTurn: true, data: result,
+            deliveryId: `agent-completion:${result.id}` });
+          acknowledge();
+        }
+      });
   }
 
   start(): void {
@@ -378,6 +399,7 @@ export class ResidencyClient {
   }
 
   #refreshPiModels(): void {
+    if (this.options.mainName) this.options.config.mainName = this.options.mainName();
     const state = this.options.piModelState?.();
     if (state) this.options.config.piModels = structuredClone(state);
   }
@@ -496,17 +518,33 @@ export class ResidencyClient {
     return response.handle;
   }
 
+  /** Persist session-scoped background outcomes before their retractable inbox admission. */
+  enqueueCompletion(result: AgentRunResult, admittedRecipient?: CompletionRecipient): void {
+    this.#completions.save(result, admittedRecipient);
+  }
+
   hasAgent(id: string): boolean {
+    return AGENT_ID_PATTERN.test(id) && (fs.existsSync(this.#metadataPath(id)) || this.#completions.result(id) !== undefined);
+  }
+
+  /** Operational ownership excludes recovered/journal-only ordinary runs. */
+  ownsAgent(id: string): boolean {
     return AGENT_ID_PATTERN.test(id) && fs.existsSync(this.#metadataPath(id));
   }
 
-  statusAgent(id: string): AgentRunRecord | AgentHandleInfo {
+  statusAgent(id: string): AgentRunRecord | AgentHandleInfo | CompletionSummary {
     const metadata = this.#metadata(id);
-    if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
+    if (!metadata) {
+      const completion = this.#completions.result(id);
+      if (completion) return completion;
+      throw new Error(`Unknown durable Fabric agent: ${id}`);
+    }
     const record = this.#record(metadata);
     if (!record) return structuredClone(metadata.handle);
     return {
       ...record,
+      ...(terminal(record.status) && !metadata.completionConsumedAt && !completionConsumed(this.options.config.meshRoot, id)
+        ? { completionDelivery: { status: "undelivered" as const, addressedTo: this.options.config.sessionId } } : {}),
       cwd: metadata.handle.cwd,
       ...(metadata.handle.kernel ? { kernel: metadata.handle.kernel } : {}),
       ...(metadata.handle.recursive ? { recursive: true } : {}),
@@ -537,9 +575,9 @@ export class ResidencyClient {
     try {
       entries = fs.readdirSync(this.#agentsPath);
     } catch {
-      return [];
+      entries = [];
     }
-    return entries
+    const records = entries
       .filter((entry) => entry.endsWith(".json"))
       .flatMap((entry) => {
         try {
@@ -548,25 +586,40 @@ export class ResidencyClient {
           return [];
         }
       });
+    const seen = new Set(records.map(record => record.id));
+    return [...records, ...this.#completions.pending().filter(value => !seen.has(value.result.id))
+      .flatMap(value => { const result = this.#completions.result(value.result.id); return result ? [result] : []; })];
   }
 
-  acknowledgeCompletion(id: string): void {
+  /** Status may be observed during retry backoff; only logical settlement permits consumption. */
+  completionSettled(id: string): boolean {
+    if (!this.hasAgent(id) || this.#attemptMayRetry(id)) return false;
+    const status = this.statusAgent(id);
+    return terminal(status.status) && "startedAt" in status;
+  }
+
+  /** localRunSettled is certified by the owning manager, including a failed journal save. */
+  acknowledgeCompletion(id: string, localRunSettled = false): void {
     const metadata = this.#metadata(id);
-    if (!metadata) return;
-    if (!metadata.completionConsumedAt) {
+    // The local-manager fallback is for its ordinary runs, never a resident worker attempt.
+    if ((metadata || !localRunSettled) && !this.completionSettled(id)) return;
+    const journalConsumed = this.#completions.acknowledge(id, localRunSettled);
+    if (metadata && !metadata.completionConsumedAt) {
       atomicWrite(this.#metadataPath(id), { ...metadata, completionConsumedAt: Date.now() });
     }
-    this.options.onResultConsumed?.(id);
+    // Journal-only ordinary outcomes have no durable metadata, but their wait still
+    // retracts an already admitted completion from this session's inbox.
+    if (metadata || journalConsumed) this.options.onResultConsumed?.(id);
   }
 
-  async waitAgent(id: string, signal?: AbortSignal, deferConsumption?: (consume: () => void, abandon?: () => void) => void): Promise<AgentRunResult> {
+  async waitAgent(id: string, signal?: AbortSignal, deferConsumption?: (consume: () => void, abandon?: () => void) => void): Promise<AgentRunResult | CompletionSummary> {
     while (true) {
       if (signal?.aborted) throw new Error(`Waiting for durable Fabric agent ${id} was aborted`);
       const status = this.statusAgent(id);
-      if (terminal(status.status) && "startedAt" in status) {
+      if (terminal(status.status) && "startedAt" in status && !this.#attemptMayRetry(id)) {
         if (deferConsumption) deferConsumption(() => this.acknowledgeCompletion(id));
         else this.acknowledgeCompletion(id);
-        return status as AgentRunResult;
+        return status as AgentRunResult | CompletionSummary;
       }
       await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
     }
@@ -632,6 +685,7 @@ export class ResidencyClient {
       throw error;
     }
     if (!response.ok) throw new Error(response.error ?? `Failed to clean durable Fabric agent ${id}`);
+    this.#completions.forget(id);
     this.options.onResultConsumed?.(id);
     return { cleaned: true };
   }
@@ -692,6 +746,7 @@ export class ResidencyClient {
       if (runDirectoryPresent) fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
       fs.rmSync(this.#metadataPath(metadata.id), { force: true });
       fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
+      this.#completions.forget(metadata.id);
       this.options.onResultConsumed?.(metadata.id);
       acknowledgeResidentResponse(this.options.config.residencyRoot, { format: 1, requestId: command.requestId, ok: true, completedAt: Date.now() }, Date.now(), command.format);
       return { cleaned: true };
@@ -780,6 +835,22 @@ export class ResidencyClient {
       await sleepUnlessAborted(STATUS_POLL_MS, signal);
     }
     throw new Error(`Timed out publishing durable Fabric ${kind} ${id} from ${this.hostId}`);
+  }
+
+  /** A replacement resident host does not supervise/retry the predecessor's old runs. */
+  #attemptMayRetry(id: string): boolean {
+    const metadata = this.#metadata(id);
+    if (!metadata) return false;
+    const saved = readJson<AgentRunRecord>(residentResultPath(this.options.config.residencyRoot, id));
+    if (saved?.id === id && terminal(saved.status)) return false;
+    const committed = this.#completions.result(id);
+    if (committed && "text" in committed) return false;
+    const manifest = readJson<{ supervisor?: { pid: number; processStartedAt?: string } }>(
+      path.join(metadata.runDirectory, "completion-recipient.json"));
+    // Legacy/missing pins do not prove settlement while a resident supervisor still owns work.
+    return manifest?.supervisor !== undefined
+      ? residentProcessAlive(manifest.supervisor.pid, manifest.supervisor.processStartedAt)
+      : this.#liveOwner() !== undefined;
   }
 
   /**
@@ -933,18 +1004,69 @@ export class ResidencyClient {
     return work.length ? JSON.stringify(work.sort()) : undefined;
   }
 
+  #recipient(config: ResidentHostConfig): CompletionRecipient {
+    const original = this.options.participants.lastKnown?.(config.rootId)?.participant;
+    return { rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd, projectRoot: config.projectRoot,
+      name: (config === this.options.config ? this.options.mainName?.() : undefined) ?? config.mainName ?? original?.name ?? "main", role: config.role,
+      startedAt: config.mainStartedAt ?? original?.startedAt ??
+        (/^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-/.test(config.sessionId)
+          ? Number.parseInt(config.sessionId.replaceAll("-", "").slice(0, 12), 16) : 0) };
+  }
+
+  /** Import authenticated legacy resident envelopes too: upgrading must not strand B72 work. */
+  async #adoptCompletion(entry: MeshStateEntry): Promise<void> {
+    const value = entry.value as Partial<ResidentDeliveryRecord> | undefined;
+    if (!value || value.format !== RESIDENT_HOST_FORMAT || typeof value.rootId !== "string" ||
+      !value.from || value.from.kind !== "agent" || !AGENT_ID_PATTERN.test(value.from.id) ||
+      entry.updatedBy.id !== residentHostId(value.rootId) ||
+      !entry.key.startsWith(residentDeliveryPrefix(value.rootId))) return;
+    const id = value.agentCompletionId ?? value.from.id;
+    if (id !== value.from.id) return;
+    if (completionConsumed(this.options.config.meshRoot, id)) {
+      await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
+      return;
+    }
+    const root = residentRoot(this.options.config.meshRoot, value.rootId);
+    const config = readJson<ResidentHostConfig>(path.join(root, "config.json"));
+    if (!config || config.rootId !== value.rootId || path.resolve(config.residencyRoot) !== root ||
+      typeof config.projectRoot !== "string" || typeof config.cwd !== "string" ||
+      !samePath(config.projectRoot, this.options.config.projectRoot)) return;
+    if (legacyCompletionConsumed(this.options.config.meshRoot, value.rootId, id)) {
+      consumeCompletion(this.options.config.meshRoot, id, config.sessionId);
+      return;
+    }
+    const result = readJson<AgentRunResult>(residentResultPath(root, id)) ??
+      readJson<AgentRunResult>(path.join(root, "runs", id, "status.json"));
+    if (!result || result.id !== id || !terminal(result.status)) return;
+    const admitted = completionRecipientFromRun(this.options.config.meshRoot, path.join(root, "runs", id));
+    saveCompletion(this.options.config.meshRoot, admitted ?? this.#recipient(config), result);
+  }
+
   async #drainDeliveries(): Promise<void> {
     if (this.#drainingDeliveries || this.#closed || !this.options.mainAgent.local) return;
     this.#drainingDeliveries = true;
     try {
-      const entries = this.options.mesh.listAll(this.#deliveryPrefix);
+      const entries = this.options.mesh.listAll("residency/deliveries/");
+      let fault: unknown;
       for (const entry of entries) {
-        try { await this.#deliver(entry); } catch (error) {
+        try {
+          if (entry.key.startsWith(this.#deliveryPrefix)) await this.#deliver(entry);
+          else await this.#adoptCompletion(entry);
+        } catch (error) {
           // The record remains durable. Back off a locked mesh; retain ordinary failed senders
           // without blocking the other entries in this pass.
           if (isMeshLockTimeout(error)) throw error;
+          fault ??= error;
         }
       }
+      await this.#completions.drain(this.options.config.agents.notifyOnComplete);
+      if (fault !== undefined) throw fault; // Legacy-import faults need the same deduplicated diagnostic.
+      this.#completionFault = undefined;
+    } catch (error) {
+      if (isMeshLockTimeout(error)) throw error; // Let the owned background retry back off the outage.
+      const diagnostic = `Fabric completion remains pending: ${String(error).slice(0, 1000)}`;
+      if (diagnostic !== this.#completionFault) console.warn(diagnostic);
+      this.#completionFault = diagnostic;
     } finally {
       this.#drainingDeliveries = false;
     }
@@ -975,19 +1097,18 @@ export class ResidencyClient {
       terminal(data.status) && typeof data.startedAt === "number" ? data.id : undefined);
     if (value.from.kind === "agent" && typeof completionId === "string" && completionId === value.from.id) {
       const metadata = this.#metadata(completionId);
-      if (!metadata || metadata.completionConsumedAt || !this.options.config.agents.notifyOnComplete) {
+      if (metadata?.completionConsumedAt) this.#completions.acknowledge(completionId);
+      if (metadata?.completionConsumedAt || completionConsumed(this.options.config.meshRoot, completionId)) {
         await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
         return;
       }
-      if (this.options.onBackgroundComplete) {
-        // Keep the durable envelope until Main actually consumes it, not merely
-        // until the TUI copies it into its retractable in-memory inbox.
-        const result = this.statusAgent(completionId);
-        if (terminal(result.status) && "startedAt" in result) {
-          this.options.onBackgroundComplete(result as AgentRunResult, () => this.acknowledgeCompletion(completionId));
-        }
-        return;
-      }
+      // No result/notifications disabled is not a receipt. Keep the source pending, never drop it.
+      if (!metadata || !this.options.config.agents.notifyOnComplete) return;
+      // One logical completion key across resident envelopes and the session inbox. Keep
+      // the source until Main consumes it, not just until its in-memory inbox accepts it.
+      const result = this.statusAgent(completionId);
+      if (terminal(result.status) && "startedAt" in result) this.#completions.save(result as AgentRunResult);
+      return;
     }
     // smarty-dev#2236: one record reached Main twice (a failed delete, or a second drainer that
     // listed it through the 2 s read cache before the delete). The record stays the durable copy

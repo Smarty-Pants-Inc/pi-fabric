@@ -33,6 +33,8 @@ export interface FabricParticipantRecord {
   role?: string;
   /** The checkout that owns the root's git common directory (smarty-dev#784). */
   project?: string;
+  /** Runtime project root, distinct from the shared checkout of linked worktrees. */
+  projectRoot?: string;
   /** Normalized origin identity, portable across checkout paths and hosts. */
   repository?: string;
   /** False for print/JSON roots: discoverable observers, never message or lead targets. */
@@ -132,6 +134,8 @@ export interface FabricParticipantSource {
    * False means get(id) is not local, so a caller can pass over the id without a mesh read.
    */
   publishes?(id: string): boolean;
+  /** Lease-independent lineage test shared by adoption and delivery; only positive closure proves death. */
+  lineageAlive?(rootId: string, now?: number): boolean;
   self(now?: number): FabricParticipantInfo;
   /** All live root Pi session agents, including the current lineage root. */
   sessions?(now?: number): FabricParticipantInfo[];

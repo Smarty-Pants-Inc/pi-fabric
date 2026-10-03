@@ -26,7 +26,7 @@ import {
   writeHostLease,
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
-import { PARTICIPANT_NAME_PATTERN } from "./participant-name.js";
+import { rootParticipantName } from "./participant-name.js";
 import {
   participantFilePresent,
   participantFilesOnly,
@@ -170,7 +170,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "repository", "model", "thinking", "parentId"]) ||
+    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -371,11 +371,22 @@ const legacyActorFromEntry = (
   };
 };
 
+/** Advisory only: names are lookup labels, not an exclusive authority claim. */
+export interface FabricRootCollision {
+  reason: "duplicate-name" | "duplicate-session";
+  name: string;
+  ids: string[];
+  sessionId?: string;
+}
+
+export const ROOT_COLLISION_TOPIC = "fabric.topology.root-collision";
+
 export interface ParticipantDirectoryOptions {
   enabled: boolean;
   hostId: string;
   rootId: string;
   identity: MeshIdentity;
+  onRootCollision?: (collision: FabricRootCollision) => void;
   selfOwnerHostId?: string;
   selfOwnerIdentityId?: string;
   heartbeatMs?: number;
@@ -400,6 +411,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #parsedCache: { token: object; files: readonly MeshStateEntry[]; value: ParsedDirectory } | undefined;
   #parsedEntries = new Map<string, { version: number; updatedAt: number; entry: MeshStateEntry }>();
   readonly #reportedCollisions = new Set<string>();
+  readonly #reportedRootCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
   #refreshing: Promise<void> | undefined;
@@ -714,6 +726,32 @@ export class ParticipantDirectory implements FabricParticipantSource {
     });
   }
 
+  // Check initial registration AND heartbeat renames, using both file and legacy/state peers.
+  // This is an alert, not a race-free exclusive claim or a fork-ancestry inference.
+  #reportRootCollisions(root: FabricParticipantRecord): void {
+    for (const peer of this.list({ scope: "project", kinds: ["root"], fresh: true })) {
+      if (peer.id === root.id || !["idle", "running", "reloading"].includes(peer.status)) continue;
+      const sameSession = root.sessionId !== undefined && root.sessionId === peer.sessionId;
+      const sameName = root.name !== "main" && root.name === peer.name;
+      if (!sameSession && !sameName) continue;
+      const collision: FabricRootCollision = {
+        reason: sameSession ? "duplicate-session" : "duplicate-name",
+        name: root.name,
+        ids: [root.id, peer.id].sort(),
+        ...(sameSession ? { sessionId: root.sessionId } : {}),
+      };
+      const key = JSON.stringify([collision.reason, sameSession ? root.sessionId : root.name, collision.ids]);
+      if (this.#reportedRootCollisions.has(key) || this.#reportedRootCollisions.size >= 1_000) continue;
+      this.#reportedRootCollisions.add(key);
+      try { this.options.onRootCollision?.(collision); } catch { /* Advisory must not stop a heartbeat. */ }
+      void this.#notifications.enqueue(() => this.mesh.publish({
+        topic: ROOT_COLLISION_TOPIC, kind: "alert", from: this.options.identity,
+        text: `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`,
+        data: collision,
+      }));
+    }
+  }
+
   // A record the bridge marked remoteHost that fails validation: dropped alone, logged once.
   #reportMalformedMirror(entry: MeshStateEntry): void {
     const value = isObject(entry.value) ? entry.value : undefined;
@@ -970,7 +1008,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   root(main: FabricMainAgentInfo, interactive = true, sessionName?: string): FabricParticipantRecord {
-    const name = sessionName?.trim();
     const role = participantRole();
     const project = main.cwd ? participantProject(main.cwd) : undefined;
     const repository = project ? repositoryOf(project) : undefined;
@@ -981,13 +1018,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: main.id,
       ownerHostId: this.options.hostId,
       ownerIdentityId: this.options.identity.id,
-      name: name && PARTICIPANT_NAME_PATTERN.test(name) ? name : "main",
+      name: rootParticipantName(sessionName),
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",
       capabilities: interactive ? ["steer", "followUp", "fabric"] : ["fabric"],
       interactive,
-      ...(main.cwd ? { cwd: main.cwd } : {}),
+      ...(main.cwd ? { cwd: main.cwd, projectRoot: process.env.PI_FABRIC_PROJECT_ROOT ?? main.cwd } : {}),
       ...(project ? { project } : {}),
       ...(repository ? { repository } : {}),
       ...(role ? { role } : {}),
@@ -1109,6 +1146,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
         };
         desired.set(record.id, record);
       }
+    }
+    const candidateRoot = desired.get(this.options.rootId);
+    if (this.options.enabled && !this.#quiescing && candidateRoot?.kind === "root") {
+      this.#reportRootCollisions(candidateRoot);
     }
     // No resumed root is activated locally or published to a file while an old
     // death proof survives. Failure aborts this refresh before any root publication.

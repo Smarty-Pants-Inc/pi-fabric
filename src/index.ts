@@ -3,6 +3,7 @@ import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type Roo
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
+import { registerFabricFixture } from "./guards/fixture-mode.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
@@ -50,6 +51,7 @@ import {
   effectiveToolCaptureConfig,
 } from "./config.js";
 import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
+import { COMPACTION_FAILED_ALARM, registerCompactionRecovery } from "./compaction/recovery.js";
 import { compactAtConfiguredThreshold } from "./compaction/threshold.js";
 import {
   createToolOwnershipReassertion,
@@ -227,6 +229,8 @@ const inboxWakeMs = (): number => {
 };
 
 export default async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions } = {}): Promise<void> {
+  // A fixture must never construct Fabric state, capture auth or join an inherited mailbox.
+  if (registerFabricFixture(pi)) return;
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
@@ -999,6 +1003,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   pi.on("session_compact", async (event, context) => {
     if (!state.initialized) return;
     await state.publishHostLifecycle("pi.session_compact", event);
+  });
+
+  registerCompactionRecovery(pi, {
+    enabled: () => true, // Leaf task agents may not have needed a Fabric tool yet.
+    alarm: async (data, context) => {
+      await state.ensure(context); // Failure is first use, never an eager idle import.
+      await state.publishOpsEvent(COMPACTION_FAILED_ALARM, COMPACTION_FAILED_ALARM, data);
+    },
   });
 
   // Deterministic, LLM-free compaction is registered unconditionally and is

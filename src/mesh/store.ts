@@ -1588,6 +1588,19 @@ export class MeshStore {
     const ownerPath = path.join(this.#lockPath, "owner");
     const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
+    const releaseOwned = (): void => {
+      try {
+        if (fs.readFileSync(ownerPath, "utf8") === ownerRecord) {
+          // Detach the complete owned directory before unlinking anything inside it.
+          // Interrupted/resumed recursive cleanup must never follow the canonical name.
+          const released = `${this.#lockPath}.released.${token}`;
+          fs.renameSync(this.#lockPath, released);
+          fs.rmSync(released, { recursive: true, force: true });
+        }
+      } catch {
+        // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
+      }
+    };
     // Attempts and the largest gap between two of them: a large gap means this waiter stalled
     // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
     let attempts = 0;
@@ -1620,6 +1633,9 @@ export class MeshStore {
             if (!current.isDirectory() || current.dev !== directory.dev || current.ino !== directory.ino ||
               fs.readFileSync(ownerPath, "utf8") !== ownerRecord) throw ownershipLost();
           } catch (error) {
+            // A resumed initializer may have published into an empty replacement before
+            // rejecting its directory identity. Remove only that attempt's exact receipt.
+            releaseOwned();
             if (errorCode(error) === "EEXIST" || errorCode(error) === "ENOENT") throw ownershipLost();
             throw error;
           }
@@ -1672,18 +1688,7 @@ export class MeshStore {
       this.#stateCache = undefined;
       throw error;
     } finally {
-      try {
-        const owner = fs.readFileSync(ownerPath, "utf8");
-        if (owner === ownerRecord) {
-          // Detach the complete owned directory before unlinking anything inside it.
-          // Interrupted/resumed recursive cleanup must never follow the canonical name.
-          const released = `${this.#lockPath}.released.${token}`;
-          fs.renameSync(this.#lockPath, released);
-          fs.rmSync(released, { recursive: true, force: true });
-        }
-      } catch {
-        // Another process already recovered or removed this lock.
-      }
+      releaseOwned();
     }
   }
 

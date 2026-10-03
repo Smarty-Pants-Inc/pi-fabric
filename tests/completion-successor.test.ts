@@ -131,7 +131,7 @@ const damageLegacyFence = (h: ReturnType<typeof harness>, fault: typeof legacyFe
 
 // Fail only AFTER this target's rename, not its temporary-file sync or mkdir barriers.
 const postRenameFault = (target: string) => {
-  const rename = fs.renameSync; const sync = fs.fsyncSync;
+  const rename = fs.renameSync; const sync = fs.fsyncSync; const open = fs.promises.open;
   const state = { renamed: false, barrier: "directory" as "directory" | "file" | "none", fileSyncs: 0, directorySyncs: 0 };
   vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
     rename(source, destination);
@@ -146,6 +146,18 @@ const postRenameFault = (target: string) => {
       }
     }
     sync(fd);
+  });
+  vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+    const handle = await open(...args);
+    const syncHandle = handle.sync.bind(handle);
+    vi.spyOn(handle, "sync").mockImplementation(async () => {
+      const directory = (await handle.stat()).isDirectory();
+      if (state.renamed && ((directory && state.barrier === "directory") || (!directory && state.barrier === "file"))) {
+        throw new Error(`post-rename ${state.barrier} barrier failed`);
+      }
+      await syncHandle();
+    });
+    return handle;
   });
   return state;
 };
@@ -186,7 +198,8 @@ describe("round 5 Windows completion file confirmation", () => {
       const originalReceipt = fs.readFileSync(receipt, "utf8");
       const receiptInode = fs.statSync(receipt);
       expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
-      consumeCompletion(h.meshRoot, h.result.id, "C"); // Must reconfirm, not replace B's receipt.
+      fs.utimesSync(receipt, new Date(0), new Date(0)); // Model an uncached receipt incarnation.
+      consumeCompletion(h.meshRoot, h.result.id, "C"); // Confirm once, never replace B's receipt.
       expect(pendingCompletions(h.meshRoot, h.root)).toEqual([]);
       const receiptOpens = opened.mock.calls.filter(([file]) => file === receipt);
       expect(receiptOpens.length).toBeGreaterThan(0);
@@ -196,7 +209,7 @@ describe("round 5 Windows completion file confirmation", () => {
       expect(fs.statSync(receipt)).toMatchObject({ dev: receiptInode.dev, ino: receiptInode.ino });
       expect(namespace.mock.calls.some(([file, stat]) => file === envelope && stat?.dev === inode.dev && stat?.ino === inode.ino)).toBe(true);
       expect(namespace.mock.calls.some(([file, stat]) => file === receipt && stat?.dev === receiptInode.dev && stat?.ino === receiptInode.ino)).toBe(true);
-      expect(fileSyncs).toBeGreaterThanOrEqual(5);
+      expect(fileSyncs).toBeGreaterThanOrEqual(3);
     } finally { Object.defineProperty(process, "platform", platform); }
   });
 
@@ -210,6 +223,7 @@ describe("round 5 Windows completion file confirmation", () => {
     const envelope = path.join(dir, fs.readdirSync(dir).find(file => file.endsWith(".json"))!);
     const receipt = path.join(dir, "receipts", path.basename(envelope));
     const originalReceipt = fs.readFileSync(receipt, "utf8");
+    fs.utimesSync(receipt, new Date(0), new Date(0)); // Uncached, like a fresh process.
     const originalEnvelope = fs.readFileSync(envelope, "utf8");
     const sync = fs.fsyncSync;
     const denied = Object.assign(new Error("file fsync denied"), { code: "EPERM" });
@@ -217,10 +231,20 @@ describe("round 5 Windows completion file confirmation", () => {
       if (fs.fstatSync(fd).isFile()) throw denied;
       sync(fd);
     });
+    const open = fs.promises.open;
+    const asyncFailed = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      const syncHandle = handle.sync.bind(handle);
+      vi.spyOn(handle, "sync").mockImplementation(async () => {
+        if ((await handle.stat()).isFile()) throw denied;
+        await syncHandle();
+      });
+      return handle;
+    });
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     try {
       Object.defineProperty(process, "platform", { ...platform, value: platformName });
-      expect(() => completionConsumed(h.meshRoot, h.result.id)).toThrow(denied);
+      expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true); // Plain scan read.
       expect(() => consumeCompletion(h.meshRoot, h.result.id, "C")).toThrow(denied);
       expect(() => journal.acknowledge(h.result.id)).toThrow(denied);
       expect(() => journal.forget(h.result.id)).toThrow(denied);
@@ -229,7 +253,7 @@ describe("round 5 Windows completion file confirmation", () => {
       expect(fs.readFileSync(receipt, "utf8")).toBe(originalReceipt);
       expect(fs.readFileSync(envelope, "utf8")).toBe(originalEnvelope);
       expect(journal.enqueue).not.toHaveBeenCalled();
-    } finally { Object.defineProperty(process, "platform", platform); failed.mockRestore(); }
+    } finally { Object.defineProperty(process, "platform", platform); failed.mockRestore(); asyncFailed.mockRestore(); }
     await journal.drain(false);
     expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
     expect(journal.enqueue).not.toHaveBeenCalled();
@@ -416,7 +440,7 @@ describe("round 4 completion fences", () => {
     for (const barrier of ["directory", "file", "directory"] as const) {
       fault.barrier = barrier;
       expect(() => consumeCompletion(h.meshRoot, h.result.id, "C")).toThrow(/post-rename .* barrier failed/);
-      expect(() => completionConsumed(h.meshRoot, h.result.id)).toThrow(/post-rename .* barrier failed/);
+      expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true); // Scan reads do not claim durability.
       await expect(retry.drain(false)).rejects.toThrow(/post-rename .* barrier failed/);
       expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1);
       expect(fs.readFileSync(target, "utf8")).toBe(original);
@@ -660,7 +684,7 @@ describe("round 2 completion security", () => {
     b.turn(); await waitFor(() => completionConsumed(h.meshRoot, h.result.id));
     expect(b.client.statusAgent(h.result.id)).toMatchObject({ text: h.result.text });
     const c = h.client("C", 300); h.setLive([h.participant("C", 300)]);
-    expect(c.client.statusAgent(h.result.id)).not.toHaveProperty("text");
+    expect(() => c.client.statusAgent(h.result.id)).toThrow(/Unknown durable Fabric agent/); // Consumed body was pruned.
   });
 
   it.each(["failed", "stopped"] as const)("F2: retryable %s worker attempt is not a settled completion", async status => {

@@ -583,6 +583,7 @@ const failedRecord = (
     error,
     usage,
     ...(managed.model ? { model: managed.model } : {}),
+    ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
     ...(managed.latestRecord?.admittedModel ? { admittedModel: managed.latestRecord.admittedModel } : {}),
     ...(managed.latestRecord?.admittedThinking ? { admittedThinking: managed.latestRecord.admittedThinking } : {}),

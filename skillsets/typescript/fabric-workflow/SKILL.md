@@ -13,7 +13,7 @@ Core surfaces:
 - `agent(prompt, { label, tools?, schema?, ... })` for a bounded worker; label every call.
 - `parallel(thunks, { concurrency })` for fan-out; pass functions, not promises.
 - `pipeline(items, ...stages)` for sequential stages per item with cross-item concurrency.
-- `workflow.configure`, `phase`, `workflow.item`, `workflow.event`, and `workflow.log` for dashboard progress.
+- `workflow.configure`, `phase`, `workflow.item`, `workflow.event`, and `workflow.log` for dashboard progress. Give `workflow.item` a stable `id` (≤128 chars of `[A-Za-z0-9._:/-]`) and optional plain `meta` (≤2 KiB) when host observers track items.
 - `workflow.budget` plus top-level `agentBudget`/`tokenBudget` for bounded runs.
 
 Use JSON Schema when machine-readable output makes aggregation safer. A reliable shape is discover → analyze in checked batches → verify available findings:

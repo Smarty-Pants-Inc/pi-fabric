@@ -1,9 +1,13 @@
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+<<<<<<< HEAD
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
+=======
+import { StringDecoder } from "node:string_decoder";
+>>>>>>> upstream-v0.105.0
 
 export interface ExecFileResult {
   stdout: string;
@@ -258,17 +262,24 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
+<<<<<<< HEAD
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
 ): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
+=======
+  options: { captureStderr?: boolean } = {},
+): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; readStderr(): string }> => {
+>>>>>>> upstream-v0.105.0
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
   const child = spawn(runtime, [workerPath, ...workerArguments], {
     cwd,
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
-    stdio: "ignore",
+    // Resident hosts must remain independent of the launching process's pipes.
+    stdio: ["ignore", "ignore", options.captureStderr ? "pipe" : "ignore"],
   });
+<<<<<<< HEAD
   if (!child.pid) throw new Error("Failed to launch Fabric worker process");
   const pid = child.pid;
   // Once the worker exited, its numeric id is no identity: after its group empties, the id
@@ -286,12 +297,35 @@ export const spawnDetached = async (
     lost = reason;
     try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
   };
+=======
+  // Drain throughout the run, retaining only a bounded UTF-8 tail in memory.
+  // No disk log can grow without bound or keep secrets after run cleanup.
+  const decoder = new StringDecoder("utf8");
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr = (stderr + decoder.write(chunk)).slice(-20_000);
+  });
+  child.stderr?.on("end", () => { stderr = (stderr + decoder.end()).slice(-20_000); });
+  child.stderr?.on("error", () => {});
+  await new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+  const pid = child.pid!;
+>>>>>>> upstream-v0.105.0
   child.unref();
+  // A diagnostic pipe must not keep the owner process alive on its own.
+  (child.stderr as (NodeJS.ReadableStream & { unref?: () => void }) | null)?.unref?.();
   return {
     pid,
+<<<<<<< HEAD
     lostContact: () => lost,
     async waitForClose() {
       let deadline: ReturnType<typeof setTimeout> | undefined;
+=======
+    readStderr: () => stderr,
+    async stop() {
+>>>>>>> upstream-v0.105.0
       try {
         await Promise.race([closed, new Promise<void>(resolve => {
           deadline = setTimeout(() => {

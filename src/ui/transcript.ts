@@ -1,3 +1,4 @@
+import type { FabricAgentRunner } from "../config.js";
 import { TranscriptAccumulator } from "./transcript-parser.js";
 import { AgentTranscriptReader } from "./transcript-reader.js";
 import { recordOf } from "./transcript-sanitization.js";
@@ -38,7 +39,7 @@ export interface FabricAgentToolPreviewNode {
   id: string;
   name: string;
   status?: string;
-  runner?: "pi" | "claude" | "veda";
+  runner?: FabricAgentRunner;
   owner?: "agent" | "actor";
   /** Most recent tool the agent was observed running, when known. */
   currentTool?: string;

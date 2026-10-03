@@ -168,6 +168,45 @@ describe("FabricModelSelector", () => {
     expect(selected).toBe(INHERIT_VALUE);
   });
 
+  it("omits the Inherit row when inheritRow is false", () => {
+    let selected: string | undefined;
+    const component = new FabricModelSelector({
+      theme,
+      source,
+      currentValue: INHERIT_VALUE,
+      headerText: "Prewalk executor model. Fabric hands off at the next matching mutation boundary.",
+      inheritRow: false,
+      onSelect: (value) => {
+        selected = value;
+      },
+      onCancel: () => {},
+    });
+    const text = render(component);
+    expect(text).toContain("Prewalk executor model. Fabric hands off at the next matching mutation boundary.");
+    expect(text).not.toContain("Inherit");
+    expect(text).toContain("claude-sonnet-4-5");
+    // No sentinel row: Enter picks the first (most recently used) model.
+    component.handleInput("\r");
+    expect(selected).toBe("anthropic/claude-sonnet-4-5");
+  });
+
+  it("exposes no inherit choice over RPC when inheritRow is false", () => {
+    const component = new FabricModelSelector({
+      theme,
+      source,
+      currentValue: "",
+      inheritRow: false,
+      onSelect: () => {},
+      onCancel: () => {},
+    });
+    const choices = component.rpcChoices();
+    expect(choices.some((choice) => choice.value === INHERIT_VALUE)).toBe(false);
+    expect(choices.map((choice) => choice.value)).toEqual([
+      "anthropic/claude-sonnet-4-5",
+      "openai/gpt-5.5",
+    ]);
+  });
+
   it("defaults to the global wording when headerText/inheritName are omitted", () => {
     const component = new FabricModelSelector({
       theme,

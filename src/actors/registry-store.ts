@@ -1,7 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+<<<<<<< HEAD
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+=======
+import {
+  writeJsonAtomic,
+  encodeOwnerIdentityLine,
+  lockOwnerLiveness,
+  SHORT_LOCK_MAX_HOLD_MS,
+} from "../core/atomic-write.js";
+>>>>>>> upstream-v0.105.0
 
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
 const ACTOR_REGISTRY_STALE_LOCK_MS = 30_000;
@@ -74,7 +83,11 @@ export class ActorRegistryStore {
     while (true) {
       try {
         fs.mkdirSync(lockPath, { mode: 0o700 });
+<<<<<<< HEAD
         fs.writeFileSync(ownerPath, ownerRecord, {
+=======
+        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n${encodeOwnerIdentityLine()}\n`, {
+>>>>>>> upstream-v0.105.0
           encoding: "utf8",
           mode: 0o600,
         });
@@ -85,6 +98,7 @@ export class ActorRegistryStore {
           const stat = fs.lstatSync(lockPath);
           if (!stat.isDirectory()) throw new Error("Invalid actor registry lock");
           const firstOwner = fs.readFileSync(ownerPath, "utf8");
+<<<<<<< HEAD
           const [holder, pidText, createdText, startText] = firstOwner.trim().split("\n");
           const pid = Number(pidText);
           const validPid = Number.isSafeInteger(pid) && pid > 0;
@@ -105,6 +119,17 @@ export class ActorRegistryStore {
               // canonical path after checking its owner (that would reopen the race).
               const fence = `${lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${firstOwner}`).digest("hex")}`;
               fs.renameSync(lockPath, fence);
+=======
+          const [, pidText, createdText, identityLine] = firstOwner.trim().split("\n");
+          const stale = Date.now() - Number(createdText) > ACTOR_REGISTRY_STALE_LOCK_MS;
+          if (stale && lockOwnerLiveness(Number(pidText), Number(createdText), identityLine, {
+            legacyAlive: processAlive,
+            maxHoldMs: Math.max(SHORT_LOCK_MAX_HOLD_MS, ACTOR_REGISTRY_STALE_LOCK_MS),
+          }) === "dead") {
+            const secondOwner = fs.readFileSync(ownerPath, "utf8");
+            if (secondOwner === firstOwner) {
+              fs.rmSync(lockPath, { recursive: true, force: true });
+>>>>>>> upstream-v0.105.0
               continue;
             }
           }

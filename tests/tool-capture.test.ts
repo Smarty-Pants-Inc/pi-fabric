@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   createSyntheticSourceInfo,
   defineTool,
@@ -52,7 +52,7 @@ describe("registered extension tool capture", () => {
   it("captures every extension tool while keeping it in Pi's registry", async () => {
     // Captured tools must stay visible to pi.getAllTools() consumers (e.g.
     // permission systems validating tool_call events); hiding from the model is
-    // handled through the active tool set by FabricToolOwnership, not here.
+    // handled through native prepareLoadout, not here.
     const fabricTool = tool("fabric_exec");
     const customTool = tool("deploy_release");
     const readOverride = tool("read");
@@ -84,6 +84,52 @@ describe("registered extension tool capture", () => {
       "read",
     ]);
     expect(catalog.size).toBe(0);
+  });
+
+  it("shares one patch across controllers, restores the last lease, and reinstalls without recursion", async () => {
+    const original = ExtensionRunner.prototype.getAllRegisteredTools;
+    const anchorA = tool("fabric_exec"), anchorB = tool("fabric_exec");
+    let refreshes = 0;
+    const install = async (anchor: ReturnType<typeof tool>) => {
+      const controller = await installRegisteredToolCapture({ anchorDefinition: anchor, catalog: new CapturedToolCatalog(), onCatalogRefresh: () => { refreshes++; } });
+      controllers.push(controller);
+      return controller;
+    };
+    const first = await install(anchorA);
+    const patched = ExtensionRunner.prototype.getAllRegisteredTools;
+    const second = await install(anchorB);
+    expect(ExtensionRunner.prototype.getAllRegisteredTools).toBe(patched);
+    runnerWith(registered(anchorA, "/fabric/a")).getAllRegisteredTools();
+    expect(refreshes).toBe(1);
+    first.dispose();
+    expect(ExtensionRunner.prototype.getAllRegisteredTools).toBe(patched);
+    second.dispose(); second.dispose();
+    expect(ExtensionRunner.prototype.getAllRegisteredTools).toBe(original);
+    const third = await install(tool("fabric_exec"));
+    expect(ExtensionRunner.prototype.getAllRegisteredTools).not.toBe(patched);
+    third.dispose();
+    expect(ExtensionRunner.prototype.getAllRegisteredTools).toBe(original);
+  });
+
+  it("does not overwrite a subsequent extension wrapper on disposal", async () => {
+    const original = ExtensionRunner.prototype.getAllRegisteredTools;
+    const anchor = tool("fabric_exec");
+    const controller = await installRegisteredToolCapture({ anchorDefinition: anchor, catalog: new CapturedToolCatalog() });
+    controllers.push(controller);
+    const patched = ExtensionRunner.prototype.getAllRegisteredTools;
+    const outer = function (this: ExtensionRunner) { return patched.call(this); };
+    ExtensionRunner.prototype.getAllRegisteredTools = outer;
+    try {
+      controller.dispose();
+      expect(ExtensionRunner.prototype.getAllRegisteredTools).toBe(outer);
+      const next = await installRegisteredToolCapture({ anchorDefinition: tool("fabric_exec"), catalog: new CapturedToolCatalog() });
+      controllers.push(next);
+      expect(ExtensionRunner.prototype.getAllRegisteredTools).toBe(outer);
+      // Simulate the other extension releasing its own layer first.
+      ExtensionRunner.prototype.getAllRegisteredTools = patched;
+      next.dispose();
+      expect(ExtensionRunner.prototype.getAllRegisteredTools).toBe(original);
+    } finally { ExtensionRunner.prototype.getAllRegisteredTools = original; }
   });
 
   it("refresh() repopulates after a suspended-pass clear, as on /reload (#73)", async () => {
@@ -237,6 +283,37 @@ describe("registered extension tool capture", () => {
     controller.dispose();
     runner.getAllRegisteredTools();
     expect(refreshes).toBe(2);
+  });
+
+  it("observes and restores the actual Pi 1.0 bundled runner, not only the native SDK identity", async () => {
+    const hostRoot = path.dirname(path.dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))));
+    const constructors = await bundleExtensionRunnerConstructors(path.join(hostRoot, "dist/bundle"));
+    expect(constructors.length).toBeGreaterThan(0);
+    expect(constructors.every(Runner => Runner !== ExtensionRunner)).toBe(true);
+    const originals = constructors.map(Runner => Runner.prototype.getAllRegisteredTools);
+    const savedRoot = process.env.PI_PACKAGE_DIR;
+    process.env.PI_PACKAGE_DIR = hostRoot;
+    try {
+      const anchor = tool("fabric_exec");
+      const catalog = new CapturedToolCatalog();
+      const controller = await installRegisteredToolCapture({ anchorDefinition: anchor, catalog });
+      controllers.push(controller);
+      for (const [index, Runner] of constructors.entries()) {
+        expect(Runner.prototype.getAllRegisteredTools).not.toBe(originals[index]);
+        const runner = Object.create(Runner.prototype) as ExtensionRunner;
+        (runner as unknown as { extensions: Array<{ tools: Map<string, RegisteredTool> }> }).extensions = [{ tools: new Map([
+          ["fabric_exec", registered(anchor, "/fabric/compiled.js")],
+          ["actual_bundle_tool", registered(tool("actual_bundle_tool"), "/fixture.js")],
+        ]) }];
+        expect(runner.getAllRegisteredTools()).toHaveLength(2);
+        expect(catalog.require("actual_bundle_tool").runner).toBe(runner);
+      }
+      controller.dispose();
+      for (const [index, Runner] of constructors.entries()) expect(Runner.prototype.getAllRegisteredTools).toBe(originals[index]);
+    } finally {
+      if (savedRoot === undefined) delete process.env.PI_PACKAGE_DIR;
+      else process.env.PI_PACKAGE_DIR = savedRoot;
+    }
   });
 
   it("discovers the bundled runtime's distinct ExtensionRunner identity (pi >= 0.84.3)", async () => {

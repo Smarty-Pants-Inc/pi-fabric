@@ -20,7 +20,7 @@ const stableProviderActions = {
   memory: ["recall", "expand", "sessions"],
   state: ["transition", "get", "history", "complexity", "verify", "goal", "checkGoal"],
   schema: ["status", "hypothesize", "verify", "commit", "abort"],
-  compact: ["request", "status", "cancel"],
+  compact: ["request", "status", "pressure", "carry", "cancel"],
   jev: ["evaluate", "run", "spawn", "status", "wait", "join", "advise", "stop"],
 } as const;
 
@@ -46,7 +46,7 @@ describe("fabric-exec skill provider contracts", () => {
 
   it("keeps detailed execution caveats in the progressive skill", () => {
     const skill = fs.readFileSync("skillsets/typescript/fabric-exec/SKILL.md", "utf8");
-    const extension = fs.readFileSync("src/index.ts", "utf8");
+    const extension = fs.readFileSync("src/extension.ts", "utf8");
 
     expect(skill).toContain("multiline or syntax-heavy payloads");
     expect(skill).toContain("Every `π.key` must exist in the same call's top-level `payloads` map");

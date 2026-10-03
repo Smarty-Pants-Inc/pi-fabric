@@ -13,7 +13,10 @@ export const SUMMARY_SECTIONS: { key: keyof Sections; header: string; maxBytes: 
   { key: "status", header: "[Current Status]", maxBytes: 2048 },
 ];
 
+export const CARRY_FORWARD_HEADER = "[Carry Forward]";
+
 const REQUEST_MAX_BYTES = 3072;
+const CARRY_MAX_BYTES = 3072;
 const TRANSCRIPT_MAX_BYTES = 5120;
 const FOOTER_MAX_BYTES = 1536;
 const MAX_INPUT_LINES_PER_SECTION = 128;
@@ -24,6 +27,8 @@ export interface RenderOptions {
   lastEntryId: string;
   lastTimestamp: string;
   requestLines?: string[];
+  /** Persistent carry-forward focus; rendered in every summary until cleared. */
+  carryLines?: string[];
   summaryKind?: "compaction" | "branch";
 }
 
@@ -109,6 +114,7 @@ export interface RenderedSummary {
   summary: string;
   requestOmittedBytes: number;
   dialogueOmittedBytes: number;
+  carryOmittedBytes: number;
 }
 
 export const renderSummaryWithMetadata = (sections: Sections, options: RenderOptions): RenderedSummary => {
@@ -116,11 +122,18 @@ export const renderSummaryWithMetadata = (sections: Sections, options: RenderOpt
   const history: HistoryBlock[] = [];
   let requestOmittedBytes = 0;
   let dialogueOmittedBytes = 0;
+  let carryOmittedBytes = 0;
   const request = (): void => {
-    if (!options.requestLines?.length) return;
-    const rendered = protectedBlock("[Compaction Request]", options.requestLines, REQUEST_MAX_BYTES);
-    blocks.push(rendered.text);
-    requestOmittedBytes = rendered.omittedBytes;
+    if (options.requestLines?.length) {
+      const rendered = protectedBlock("[Compaction Request]", options.requestLines, REQUEST_MAX_BYTES);
+      blocks.push(rendered.text);
+      requestOmittedBytes = rendered.omittedBytes;
+    }
+    if (options.carryLines?.length) {
+      const rendered = protectedBlock(CARRY_FORWARD_HEADER, options.carryLines, CARRY_MAX_BYTES);
+      blocks.push(rendered.text);
+      carryOmittedBytes = rendered.omittedBytes;
+    }
   };
   for (const { key, header, maxBytes } of SUMMARY_SECTIONS) {
     const lines = sections[key];
@@ -158,6 +171,7 @@ export const renderSummaryWithMetadata = (sections: Sections, options: RenderOpt
     summary: utf8Bytes(summary) <= MAX_SUMMARY_BYTES ? summary : `${clipUtf8(summary, MAX_SUMMARY_BYTES - 1, "")}\n`,
     requestOmittedBytes,
     dialogueOmittedBytes,
+    carryOmittedBytes,
   };
 };
 

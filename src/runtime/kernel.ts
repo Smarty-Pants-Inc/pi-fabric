@@ -55,6 +55,9 @@ export interface FabricSandboxOptions {
     ref: string,
     args: Record<string, unknown>,
   ): number | undefined;
+  /** True for a host call that waits for a person (executor.humanWaitRefs).
+   * The program deadline is paused while any such call is in flight. */
+  isHumanWaitHostCall?(ref: string, args: Record<string, unknown>): boolean;
   /** Declared core override fields must not be consumed as built-in aliases. */
   piToolCanonicalFields?: Record<string, string[]>;
   /** False in orchestration-only mode, where the guest has no usable `pi`; guides runtime hints. */

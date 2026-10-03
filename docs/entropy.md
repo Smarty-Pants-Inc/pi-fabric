@@ -67,11 +67,31 @@ changes still update the report. These caches are session-owned, retain at most
 16 windows, and are discarded on session start/shutdown. Cached snapshot inputs
 must not be mutated by callers.
 
+<<<<<<< HEAD
 The background compile reads only the active session's file, from a
 complete-line cursor: a partial tail is left for the next read, so a live
 session is never re-read from byte 0. Reads and scoring stop at once when the
 session ends; shutdown does not wait for them. Explicit `/fabric entropy`
 inspection remains machine-wide and immediately fresh. Advisory enum/overload/sequence analysis runs only on the inspection path,
+=======
+Persistence contention is advisory, not a compilation failure. Pool updates
+reload and merge the latest evidence under the shared lock so sibling Pi
+processes cannot overwrite each other's contributions. A busy pool does not
+stop normal-form compilation; a busy artifact store does not prevent activation
+of freshly proved plans. One coalesced background retry uses exponential backoff
+with jitter (capped at 30 seconds), re-reading current evidence on each attempt.
+Retry timers do not keep Pi alive and are canceled on session start/shutdown;
+turn hooks never wait for them. Old locks from dead owners, incomplete writes,
+or malformed metadata recover automatically after the 30-second grace period.
+Live owners (including permission-denied process probes) are never evicted just
+because a lock is old. Damaged pool/artifact data is still preserved and reported,
+not silently rebuilt or treated as ordinary contention.
+
+Background machine-wide discovery runs at most once per 30 seconds, with the
+active session file included on every compile. Selected files are still checked
+for changes each time. Explicit `/fabric entropy` inspection remains immediately
+fresh. Advisory enum/overload/sequence analysis runs only on the inspection path,
+>>>>>>> upstream-v0.105.0
 not in background compilation. No normalizations or historical outcomes change.
 `bun run benchmark:turn-cpu` compares cached/uncached source paths using synthetic
 evidence and reports process CPU separately from wall time.

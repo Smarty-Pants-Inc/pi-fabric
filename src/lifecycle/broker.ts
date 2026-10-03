@@ -224,12 +224,22 @@ export class LifecycleBroker {
 
   async #drain(): Promise<void> {
     const entries = this.mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX);
+<<<<<<< HEAD
     const listed = new Set<string>();
     let latestSequence: number | undefined;
+=======
+    if (entries.length === 0) return;
+    // One directory rebuild serves every subscription in this cycle. Each
+    // get() rebuilds the whole project directory from mesh state, so a
+    // per-subscription lookup costs O(subscriptions x state entries) and
+    // competes with terminal input on the main thread.
+    let directory: Map<string, FabricParticipantInfo> | undefined;
+>>>>>>> upstream-v0.105.0
     for (const entry of entries) {
       if (this.options.canConsumeMesh?.() === false) return;
       const subscription = lifecycleSubscriptionFromValue(entry.value);
       if (!subscription || entry.key !== subscriptionKey(subscription.id)) continue;
+<<<<<<< HEAD
       listed.add(subscription.id);
       if (this.#delivered.has(subscription.id)) {
         // Retry only the cursor/delete receipt; use a fresh poll after success.
@@ -244,6 +254,12 @@ export class LifecycleBroker {
       latestSequence ??= this.mesh.latestSequence();
       if (latestSequence <= this.#cursor(subscription)) continue;
       const target = this.participants.get(subscription.to);
+=======
+      directory ??= new Map(
+        this.participants.list({ scope: "project" }).map((record) => [record.id, record]),
+      );
+      const target = directory.get(subscription.to) ?? this.participants.get(subscription.to);
+>>>>>>> upstream-v0.105.0
       if (!target || target.stale || !target.local) continue;
       await this.#drainSubscription(entry, subscription);
     }

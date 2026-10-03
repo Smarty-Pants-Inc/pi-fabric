@@ -152,11 +152,11 @@ describe("native conversation chrome", () => {
     const agentDir = path.join(root, "agent");
     fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
     fs.mkdirSync(agentDir);
-    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ editorPaddingX: 1, outputPad: 1, markdown: { codeBlockIndent: "  " } }));
-    fs.writeFileSync(path.join(cwd, ".pi", "settings.json"), JSON.stringify({ editorPaddingX: 3, outputPad: 0, markdown: { codeBlockIndent: "    " } }));
+    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ editorPaddingX: 1, outputPad: 1, markdown: { codeBlockIndent: "  " }, fullscreenScrollbar: "hidden" }));
+    fs.writeFileSync(path.join(cwd, ".pi", "settings.json"), JSON.stringify({ editorPaddingX: 3, outputPad: 0, markdown: { codeBlockIndent: "    " }, fullscreenScrollbar: "always" }));
     try {
-      expect(readConversationAppearance(cwd, agentDir, true)).toMatchObject({ editorPaddingX: 3, outputPad: 0, codeBlockIndent: "    " });
-      expect(readConversationAppearance(cwd, agentDir, false)).toMatchObject({ editorPaddingX: 1, outputPad: 1, codeBlockIndent: "  " });
+      expect(readConversationAppearance(cwd, agentDir, true)).toMatchObject({ editorPaddingX: 3, outputPad: 0, codeBlockIndent: "    ", scrollbar: "always" });
+      expect(readConversationAppearance(cwd, agentDir, false)).toMatchObject({ editorPaddingX: 1, outputPad: 1, codeBlockIndent: "  ", scrollbar: "hidden" });
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 });

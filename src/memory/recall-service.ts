@@ -225,7 +225,7 @@ export async function processMemoryRecall(
   const cached = offset === undefined
     ? undefined
     : cache.cachedRecallContinuation(
-        recallContinuationKey(baseRequestArgs),
+        recallContinuationKey(baseRequestArgs, context.fabricScope?.digest),
         observationsBefore,
       );
   if (cached) {
@@ -366,7 +366,7 @@ export async function processMemoryRecall(
     sameSourceObservations(observationsBefore, observationsAfter)
   ) {
     cache.rememberRecallContinuation({
-      key: recallContinuationKey(requestArgs),
+      key: recallContinuationKey(requestArgs, context.fabricScope?.digest),
       result,
       coverage,
       requestArgs,

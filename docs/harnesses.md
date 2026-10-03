@@ -48,9 +48,13 @@ bounds/deadlines, and close stdin/terminate it during cleanup. Run that script
 through the authorized shell, e.g. `pi.bash({cmd:"node ./desktop-task.mjs"})`.
 This does not change Fabric's configured kernel or grant an unrestricted fallback.
 
-`pi.bash` is not an interactive stdin handle. Do not launch `serve` as an isolated
-background command and expect `tasks.watch` to become RPC. Monitors and log tails
-are bounded observations and may omit/truncate data. Do not restart the server
+`pi.bash` is not an interactive stdin handle, and monitors and log tails are
+bounded observations, not RPC. On macOS and Linux with jev-fabric, hold the
+harness's `serve` process as an interactive child instead:
+`sessions.open({argv:["macos-harness","serve","--app","com.apple.TextEdit"]})`,
+then `sessions.write` one request line and `sessions.read` from the returned
+offset until its response line arrives (see [shell composition](shell-composition.md)).
+Correlate response IDs yourself; the read window is bounded and discloses loss. Do not restart the server
 between observe and act: native controller handles do not survive process exit.
 For one-shot deterministic work, the harness's ordinary CLI/library can keep the
 whole observe/act/check sequence in one invocation.
@@ -83,7 +87,11 @@ Remove unneeded `browser-harness` / `macos-harness` entries from your Fabric
 configuration and stop loading their optional `pi/` extensions when switching
 to CLI composition. Do this deliberately after stopping their work: no automatic
 configuration rewrite or cleanup is performed. Replace `browser.*` / `macos.*`
+<<<<<<< HEAD
 program grants with only the shell and task actions the program needs.
+=======
+program grants with only the needed shell/task actions.
+>>>>>>> upstream-v0.105.0
 
 There are no concrete harness exports in `pi-fabric/jev` and no compatibility
 bridge to maintain. The generic [component protocol](components.md) remains

@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mainExecutionCeilingAbortReason, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
 import { guestSetupSource } from "./quickjs-runtime.js";
 import type { FabricHostCall, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
 import { NODE_PROCESS_CHILD_SOURCE } from "./node-process-child-source.js";
@@ -144,6 +145,7 @@ export class NodeProcessRuntime {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
         resolve(result);
       };
+<<<<<<< HEAD
       const expireDeadline = (): void => {
         if (settled) return;
         hostAbortController.abort(executionDeadline.reason);
@@ -175,7 +177,42 @@ export class NodeProcessRuntime {
       const extendDeadline = (ref: string, args: Record<string, unknown>): void => {
         const requested = options.minimumTimeoutMsForHostCall?.(ref, args);
         if (executionDeadline.extend(requested)) scheduleDeadline();
+=======
+      const scheduleDeadline = (): void => {
+        clearTimeout(deadline);
+        if (settled || finishing || !Number.isFinite(deadlineAt)) return;
+        deadline = setTimeout(() => {
+          const error = `Execution timed out after ${effectiveTimeoutMs}ms`;
+          finish({ value: undefined, logs: [], terminationReason: "timed_out", error });
+        }, Math.min(2_147_483_647, Math.max(0, deadlineAt - Date.now())));
+        deadline.unref?.();
       };
+      const extendDeadline = (ref: string, args: Record<string, unknown>): void => {
+        const requested = options.minimumTimeoutMsForHostCall?.(ref, args);
+        if (typeof requested !== "number" || !Number.isFinite(requested)) return;
+        if (humanWait.paused) {
+          humanWait.raise(requested);
+          return;
+        }
+        const nextDeadlineAt = Date.now() + Math.max(1, Math.floor(requested));
+        if (nextDeadlineAt <= deadlineAt) return;
+        deadlineAt = nextDeadlineAt;
+        effectiveTimeoutMs = deadlineAt - startedAt;
+        scheduleDeadline();
+>>>>>>> upstream-v0.105.0
+      };
+
+      const humanWait = new HumanWaitDeadlinePause({
+        remainingMs: () => deadlineAt - Date.now(),
+        suspend: () => {
+          clearTimeout(deadline);
+          deadlineAt = Infinity;
+        },
+        resume: (remainingMs) => {
+          deadlineAt = Date.now() + remainingMs;
+          scheduleDeadline();
+        },
+      });
 
       abortHandler = () => {
         // Preserve only the Main watchdog reason for host observers (e.g. a local actor ASK).
@@ -252,8 +289,11 @@ export class NodeProcessRuntime {
           });
           return;
         }
+        const waitsForHuman = options.isHumanWaitHostCall?.(message.ref, message.args) === true;
+        if (waitsForHuman) humanWait.enter();
         const task = runAbortable(hostAbortController.signal, () =>
           hostCall(message.ref, message.args, hostAbortController.signal),
+<<<<<<< HEAD
         ).then(
           (value) => {
             if (settled || finishing || !child.connected) return;
@@ -267,6 +307,14 @@ export class NodeProcessRuntime {
         ).catch((error) => {
           if (executionDeadline.reached) { expireDeadline(); return; }
           send({
+=======
+        ).finally(() => {
+          if (waitsForHuman) humanWait.leave();
+        }).then(
+          (value) => send(child, { type: "response", id: message.id, ok: true, value }),
+          (error) =>
+            send(child, {
+>>>>>>> upstream-v0.105.0
               type: "response",
               id: message.id,
               ok: false,

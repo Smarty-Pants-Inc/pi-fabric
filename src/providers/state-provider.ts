@@ -4,7 +4,12 @@ import type {
   FabricProvider,
   FabricProviderListRequest,
 } from "../protocol.js";
+import type { FabricSchemaMode } from "../config.js";
 import type { MeshIdentity, MeshStore } from "../mesh/store.js";
+import {
+  STATE_BINDING_MAX_KEYS,
+  STATE_BINDING_VALUE_MAX_CHARS,
+} from "../state/binding.js";
 import { StateStore, type StateTransitionKind } from "../state/store.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 
@@ -75,6 +80,13 @@ const verifySchema = {
       description: "Also replay evidence from labels before the last representation transition.",
     },
     timeoutMs: { type: "number", minimum: 1, description: "Per-command timeout (default 30s)" },
+    binding: {
+      type: "object",
+      maxProperties: STATE_BINDING_MAX_KEYS,
+      additionalProperties: { type: "string", maxLength: STATE_BINDING_VALUE_MAX_CHARS },
+      description:
+        "Claims the certificate is bound to; keys match [a-z][a-zA-Z0-9_.-]{0,63}. Well-known: commit (checked against the observed git HEAD; a mismatch fails closed), specDigest, nodeAddress, criteriaDigest.",
+    },
   },
   additionalProperties: false,
 };
@@ -203,7 +215,9 @@ export class StateProvider implements FabricProvider {
 
   readonly #store: StateStore;
   readonly #identity: MeshIdentity;
+  readonly #schemaMode: FabricSchemaMode | undefined;
 
+<<<<<<< HEAD
   // Whether `pi` exists inside fabric_exec; selects the recovery hint wording.
   readonly #piTools: () => boolean;
 
@@ -211,6 +225,16 @@ export class StateProvider implements FabricProvider {
     this.#store = new StateStore(store);
     this.#identity = identity;
     this.#piTools = piTools;
+=======
+  constructor(
+    store: MeshStore,
+    identity: MeshIdentity,
+    options: { schemaMode?: FabricSchemaMode } = {},
+  ) {
+    this.#store = new StateStore(store);
+    this.#identity = identity;
+    this.#schemaMode = options.schemaMode;
+>>>>>>> upstream-v0.105.0
   }
 
   get state(): StateStore {
@@ -332,6 +356,8 @@ export class StateProvider implements FabricProvider {
           : undefined;
         const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
         const includeArchived = args.includeArchived === true;
+        // The store validates the binding and fails closed on malformed input.
+        const binding = args.binding as Record<string, string> | undefined;
         context.activity?.({
           type: "entity",
           id: STATE_ENTITY_ID,
@@ -345,6 +371,9 @@ export class StateProvider implements FabricProvider {
           ...(timeoutMs !== undefined ? { timeoutMs } : {}),
           ...(context.signal ? { signal: context.signal } : {}),
           identity: this.#identity,
+          ...(binding !== undefined ? { binding } : {}),
+          requestedBy: "program",
+          ...(this.#schemaMode !== undefined ? { schemaMode: this.#schemaMode } : {}),
         });
         context.update(
           result.certified

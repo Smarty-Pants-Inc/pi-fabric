@@ -12,6 +12,7 @@ import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
 import { CPYTHON_CHILD_SOURCE } from "./cpython-child-source.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
 import { linuxCPythonNetworkFilter } from "./cpython-linux-sandbox.js";
 
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
@@ -222,6 +223,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         }
         resolve({ ...result, logs });
       };
+<<<<<<< HEAD
       const abort = (): void => {
         const reason = mainExecutionCeilingAbortReason(options.signal);
         if (reason && !hostAbort.signal.aborted) hostAbort.abort(reason);
@@ -257,6 +259,30 @@ export class CPythonRuntime implements FabricKernelRuntime {
       };
       const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(expireDeadline, true);
       const send = (message: any, delivered?: () => void): void => {
+=======
+      const abort = (): void => void finish({ value: undefined, terminationReason: "aborted", error: "Execution cancelled" });
+      const fail = (message: string): void => void finish({ value: undefined, terminationReason: "runtime_error", error: message });
+      const scheduleDeadline = (): void => {
+        if (deadline) clearTimeout(deadline);
+        if (settled || !Number.isFinite(deadlineAt)) return;
+        deadline = setTimeout(() => void finish({
+          value: undefined, terminationReason: "timed_out", error: `Execution timed out after ${deadlineAt - startedAt}ms`,
+        }), Math.max(0, deadlineAt - Date.now()));
+        deadline.unref?.();
+      };
+      const humanWait = new HumanWaitDeadlinePause({
+        remainingMs: () => deadlineAt - Date.now(),
+        suspend: () => {
+          if (deadline) clearTimeout(deadline);
+          deadlineAt = Infinity;
+        },
+        resume: (remainingMs) => {
+          deadlineAt = Date.now() + remainingMs;
+          scheduleDeadline();
+        },
+      });
+      const send = (message: unknown): void => {
+>>>>>>> upstream-v0.105.0
         // A terminal guest result closes its reply channel while issued host
         // work may still be settling. Its late replies are no longer consumed.
         if (settled || finishing || !channel || channel.destroyed) return;
@@ -330,13 +356,31 @@ export class CPythonRuntime implements FabricKernelRuntime {
         const ref = message.ref;
         const args = message.args;
         callIds.add(id);
+        let waitsForHuman = false;
         try {
           const floor = options.minimumTimeoutMsForHostCall?.(ref, args);
+<<<<<<< HEAD
           if (executionDeadline.extend(floor)) scheduleDeadline();
         } catch (error) { fail(`CPython deadline policy failed: ${errorText(error)}`); return; }
         if (executionDeadline.reached) { expireDeadline(); return; }
         const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal)).then(
           (value) => send({ type: "response", id, ok: true, value }, () => options.onHostResultDelivered?.(args)),
+=======
+          if (typeof floor === "number" && Number.isFinite(floor)) {
+            if (humanWait.paused) humanWait.raise(floor);
+            else if (Date.now() + floor > deadlineAt) {
+              deadlineAt = Date.now() + Math.max(1, Math.floor(floor));
+              scheduleDeadline();
+            }
+          }
+          waitsForHuman = options.isHumanWaitHostCall?.(ref, args) === true;
+        } catch (error) { fail(`CPython deadline policy failed: ${errorText(error)}`); return; }
+        if (waitsForHuman) humanWait.enter();
+        const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal)).finally(() => {
+          if (waitsForHuman) humanWait.leave();
+        }).then(
+          (value) => send({ type: "response", id, ok: true, value }),
+>>>>>>> upstream-v0.105.0
           (error) => send({ type: "response", id, ok: false, error: errorText(error), ...(isPiShellRef(ref) ? { bashExit: piBashExitMetadata(error) } : {}) }),
         ).finally(() => { hostTasks.delete(task); callIds.delete(id); });
         hostTasks.add(task);

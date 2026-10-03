@@ -1,5 +1,5 @@
 import { parentPort, workerData } from "node:worker_threads";
-import type { FabricInvocationContext } from "../protocol.js";
+import type { FabricInvocationContext, FabricScope } from "../protocol.js";
 import { MemoryProvider, type MemoryProviderContext } from "../providers/memory-provider.js";
 import type { LiveSessionBranch } from "./lineage.js";
 
@@ -8,6 +8,7 @@ interface MemoryWorkerRequest {
   action: string;
   args: Record<string, unknown>;
   branch?: LiveSessionBranch;
+  scope?: FabricScope;
 }
 
 export type MemoryWorkerReply =
@@ -30,6 +31,7 @@ if (port) {
         parentToolCallId: "memory-worker",
         nestedToolCallId: String(request.id),
         extensionContext: {} as FabricInvocationContext["extensionContext"],
+        ...(request.scope ? { scope: request.scope } : {}),
         update: text => port.postMessage({ id: request.id, type: "progress", text } satisfies MemoryWorkerReply),
       });
       port.postMessage({ id: request.id, type: "result", value } satisfies MemoryWorkerReply);

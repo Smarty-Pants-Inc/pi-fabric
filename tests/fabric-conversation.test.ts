@@ -30,6 +30,8 @@ const theme = {
 const editorStatusRow = (lines: string[]): number =>
   lines.findIndex((line) => /^── [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working ─+$/.test(line));
 
+const historyText = (line: string): string => stripTerminalSequences(line).replace(/[│┃█]$/, "").trimEnd();
+
 const flush = async (): Promise<void> => {
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
 };
@@ -226,10 +228,11 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     const border = lines.findIndex((line) => /^─+$/.test(line));
     const scroll = h.state.view("b").scroll;
     expect(h.state.view("b").following).toBe(false);
-    expect(lines.slice(1, border)).toEqual(history.slice(scroll, scroll + border - 1));
+    expect(lines.slice(1, border - 1).map(historyText)).toEqual(history.slice(scroll, scroll + border - 2));
+    expect(lines[border - 1]).toContain("Jump to latest message");
     h.view.handleInput("\x1b[F");
     const latest = h.view.render(100);
-    expect(latest.slice(border - 2, border)).toEqual(["history 99", ""]);
+    expect(latest.slice(border - 2, border).map(historyText)).toEqual(["history 99", ""]);
     expect(history).toHaveLength(100);
   });
 
@@ -248,13 +251,14 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     editorTop = editorStatusRow(lines);
     expect(editorTop).toBeGreaterThan(0);
     // Scrolled back: the transcript end left the window, the dock kept the status.
-    expect(lines[editorTop - 1]).toMatch(/^history \d+$/);
-    expect(lines[editorTop - 1]).not.toBe("history 99");
+    expect(historyText(lines[editorTop - 2]!)).toMatch(/^history \d+$/);
+    expect(lines[editorTop - 1]).toContain("Jump to latest message");
+    expect(lines[editorTop - 1]).not.toContain("history 99");
     h.view.handleInput("\x1b[F");
     lines = h.view.render(100);
     editorTop = editorStatusRow(lines);
-    expect(lines[editorTop - 2]).toBe("history 99");
-    expect(lines[editorTop - 1]).toBe("");
+    expect(historyText(lines[editorTop - 2]!)).toBe("history 99");
+    expect(historyText(lines[editorTop - 1]!)).toBe("");
   });
 
   it("keeps the dock indicator out of an older page's transcript end", () => {
@@ -268,7 +272,8 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     const editorTop = editorStatusRow(lines);
     expect(editorTop).toBeGreaterThan(0);
     expect(lines.slice(0, editorTop).join("\n")).not.toContain("Working");
-    expect(lines[editorTop - 1]).toBe("history 99");
+    expect(lines[editorTop - 1]).toContain("history 99");
+    expect(lines[editorTop - 1]).toContain("Jump to latest message");
   });
 
   it("preserves the prepend anchor when Working ends during a page load", () => {
@@ -285,7 +290,7 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
       return true;
     });
     h.view.handleInput("\x1b[<64;4;4M");
-    expect(h.view.render(100)[1]).toBe("older 7");
+    expect(historyText(h.view.render(100)[1]!)).toBe("older 7");
     expect(h.state.view("a").scroll).toBe(7);
   });
 
@@ -490,6 +495,129 @@ const renderText = (view: FabricConversationView, width = 80): string =>
 const type = (view: FabricConversationView, text: string): void => {
   for (const char of text) view.handleInput(char);
 };
+
+describe.each(["regular", "fullscreen"] as const)("grouped conversation picker in %s mode", (mode) => {
+  const pickerLines = (view: FabricConversationView): string[] => view.render(100)
+    .map(stripTerminalSequences)
+    .filter((line) => /^  (Active|Inactive)$/.test(line) || /^  (→ |  ).*\((native session|agent ·|actor ·|peer ·)/.test(line))
+    .map((line) => line.trim().replace(/^→ /, "").replace(/ ●$/, ""));
+  const pickerNames = (view: FabricConversationView): string[] => pickerLines(view)
+    .map((line) => line.replace(/ \(.*/, ""));
+
+  it("groups active targets including idle Main above inactive targets, newest first regardless of ancestry", () => {
+    const targets = makeTargets();
+    Object.assign(targets[0]!, { status: "idle", updatedAt: 50 });
+    targets[1]!.updatedAt = 20;
+    targets[2]!.updatedAt = 90;
+    Object.assign(targets[3]!, { updatedAt: 70, parentId: "b" });
+    targets.push(
+      { ...targets[1]!, id: "peer", name: "Peer", kind: "peer", status: "loading", updatedAt: 60 },
+      { ...targets[1]!, id: "actor", name: "Actor", kind: "actor", status: "queued", updatedAt: 40 },
+      { ...targets[1]!, id: "stale", name: "Stale", stale: true, updatedAt: 100 },
+      { ...targets[1]!, id: "failed", name: "Failed", status: "failed", updatedAt: 80 },
+      { ...targets[1]!, id: "idle", name: "Idle", status: "idle", updatedAt: 30 },
+    );
+    const originalIds = targets.map((target) => target.id);
+    const h = makeHarness({ mode, targets: () => targets });
+    h.view.handleInput("\x0e");
+    expect(pickerNames(h.view)).toEqual([
+      "Active", "Nested", "Peer", "Main", "Actor", "Agent A",
+      "Inactive", "Stale", "Agent B", "Failed", "Idle",
+    ]);
+    expect(targets.map((target) => target.id)).toEqual(originalIds);
+  });
+
+  it("keeps equal and missing timestamps in source order", () => {
+    const targets = makeTargets();
+    targets[1]!.updatedAt = 5;
+    targets[3]!.updatedAt = 5;
+    targets.push({ ...targets[0]!, id: "peer", name: "Peer", kind: "peer" });
+    const h = makeHarness({ mode, targets: () => targets });
+    h.view.handleInput("\x0e");
+    expect(pickerNames(h.view)).toEqual(["Active", "Agent A", "Nested", "Main", "Peer", "Inactive", "Agent B"]);
+  });
+
+  it("freezes groups, order and arrivals during a visit but updates metadata and re-sorts on reopening", () => {
+    const targets = makeTargets();
+    [30, 20, 40, 10].forEach((updatedAt, index) => targets[index]!.updatedAt = updatedAt);
+    const transcript = vi.fn(() => nativeTranscript([]));
+    const h = makeHarness({ mode, targets: () => targets, transcript });
+    h.view.handleInput("\x0e");
+    transcript.mockClear();
+    const names = pickerNames(h.view);
+    expect(names).toEqual(["Active", "Main", "Agent A", "Nested", "Inactive", "Agent B"]);
+    targets[0]!.updatedAt = 1;
+    targets[1] = { ...targets[1]!, status: "completed", updatedAt: 100 };
+    Object.assign(targets[2]!, { status: "running", updatedAt: 300 });
+    targets[3]!.updatedAt = 999;
+    targets.push({ ...targets[3]!, id: "new", name: "New arrival", updatedAt: 2000 });
+    targets.reverse();
+    h.view.refresh();
+    expect(pickerNames(h.view)).toEqual(names);
+    expect(pickerLines(h.view)).toContain("Agent A (agent · completed)");
+    expect(pickerLines(h.view)).toContain("Agent B (agent · running)");
+    expect(h.view.render(100).find((line) => line.includes("Agent B"))).toContain("●");
+    expect(h.view.render(100).find((line) => line.includes("→ Agent A"))).toBeDefined();
+    type(h.view, "agent");
+    expect(pickerNames(h.view)).toEqual(["Active", "Agent A", "Nested", "Inactive", "Agent B"]);
+    h.view.handleInput("\x15"); // clear search without refreshing the snapshot
+    expect(pickerNames(h.view)).toEqual(names);
+    expect(transcript).not.toHaveBeenCalled();
+    h.view.handleInput("\x1b");
+    h.view.handleInput("\x0e");
+    expect(pickerNames(h.view)).toEqual([
+      "Active", "New arrival", "Nested", "Agent B", "Main", "Inactive", "Agent A",
+    ]);
+  });
+
+  it("keeps filtering in group order and skips headers for arrows, wheel and Enter", () => {
+    const h = makeHarness({ mode });
+    h.view.handleInput("\x0e");
+    type(h.view, "agent");
+    expect(pickerNames(h.view)).toEqual(["Active", "Agent A", "Nested", "Inactive", "Agent B"]);
+    h.view.handleInput("\x1b[B");
+    h.view.handleInput("\x1b[<65;4;4M");
+    expect(h.view.render(100).find((line) => line.includes("→ Agent B"))).toBeDefined();
+    h.view.handleInput("\r");
+    expect(h.state.selectedId).toBe("b");
+    h.view.handleInput("\x0e");
+    type(h.view, "no-such-target");
+    expect(renderText(h.view)).toContain("no matching targets");
+    h.view.handleInput("\r");
+    expect(h.state.selectedId).toBe("b");
+    expect(h.close).not.toHaveBeenCalled();
+  });
+
+  it("drops removed targets before handling input without selecting a stale row", () => {
+    const targets = makeTargets();
+    const h = makeHarness({ mode, targets: () => targets });
+    h.view.handleInput("\x0e");
+    targets.splice(1, 1);
+    // No intervening render: input itself must reconcile the removed selection.
+    h.view.handleInput("\x1b[B");
+    h.view.handleInput("\r");
+    expect(h.state.selectedId).toBe("child");
+    expect(h.close).not.toHaveBeenCalled();
+  });
+
+  it.each([5, 6, 7, 8, 12])("keeps the selected target visible across groups in a %i-row viewport", (rows) => {
+    const targets = makeTargets();
+    for (let index = 0; index < 12; index++) {
+      targets.push({ ...targets[1]!, id: `extra-${index}`, name: `Extra ${index}`, status: index < 6 ? "running" : "completed" });
+    }
+    const h = makeHarness({ mode, rows, targets: () => targets });
+    h.view.handleInput("\x0e");
+    for (let index = 0; index <= targets.length; index++) {
+      for (const width of [24, 100]) {
+        const lines = h.view.render(width);
+        expect(lines).toHaveLength(rows);
+        expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+        expect(lines.filter((line) => line.includes("→ "))).toHaveLength(1);
+      }
+      h.view.handleInput("\x1b[B");
+    }
+  });
+});
 
 describe("FabricConversationView", () => {
   it("keeps native queue rows until an actual new user message is observed", async () => {

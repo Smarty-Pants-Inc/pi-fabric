@@ -14,6 +14,7 @@ type ToolCaptureListener = (tools: RegisteredTool[], runner: ExtensionRunner) =>
 
 interface ToolCaptureHub {
   listeners: Set<ToolCaptureListener>;
+  restore?: () => void;
 }
 
 export interface RegisteredToolCaptureController {
@@ -29,8 +30,11 @@ export interface RegisteredToolCaptureOptions {
   // active-tool ownership. Tools are deliberately left in Pi's registry — the
   // listener observes rather than filters — because extensions that gate tool
   // calls against `pi.getAllTools()` (e.g. permission systems) must still see
-  // captured tools as registered; hiding from the model happens exclusively in
-  // the active tool set (see FabricToolOwnership).
+  // captured tools as registered. Pi 1.0 prepareLoadout/context_with_system
+  // own model visibility; this observer retains full definitions/renderers and
+  // the owning runner for Fabric-specific shell middleware and prepared args.
+  // Neither ctx.tools nor getAllTools exposes that metadata, so this bridge is
+  // still needed (and must patch the live SDK or bundled CLI class identity).
   onCatalogRefresh?: () => void;
 }
 
@@ -112,14 +116,22 @@ const captureHub = (Runner: ExtensionRunnerConstructor): ToolCaptureHub => {
   const hub: ToolCaptureHub = { listeners: new Set() };
   Object.defineProperty(prototype, HUB_SYMBOL, {
     value: hub,
-    configurable: false,
+    configurable: true,
     enumerable: false,
     writable: false,
   });
-  prototype.getAllRegisteredTools = function getFabricVisibleTools(): RegisteredTool[] {
+  const wrapped = function getFabricRegisteredTools(this: ExtensionRunner): RegisteredTool[] {
     let tools = original.call(this);
     for (const listener of [...hub.listeners]) tools = listener(tools, this);
     return tools;
+  };
+  prototype.getAllRegisteredTools = wrapped;
+  hub.restore = () => {
+    // Other extensions may have wrapped us. Never overwrite their patch;
+    // keep the inert hub in that case so the next install reuses it.
+    if (hub.listeners.size > 0 || prototype.getAllRegisteredTools !== wrapped) return;
+    prototype.getAllRegisteredTools = original;
+    delete prototype[HUB_SYMBOL];
   };
   return hub;
 };
@@ -255,7 +267,10 @@ export const installRegisteredToolCapture = async (
     dispose() {
       if (disposed) return;
       disposed = true;
-      for (const hub of hubs) hub.listeners.delete(listener);
+      for (const hub of hubs) {
+        hub.listeners.delete(listener);
+        hub.restore?.();
+      }
       options.catalog.clear();
     },
   };

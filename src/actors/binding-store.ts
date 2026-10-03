@@ -1,7 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import {
+  writeJsonAtomic,
+  encodeOwnerIdentityLine,
+  lockOwnerLiveness,
+  SHORT_LOCK_MAX_HOLD_MS,
+} from "../core/atomic-write.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 
 export interface ActorSessionBindingRecord {
@@ -199,7 +204,7 @@ export class ActorBindingStore {
     while (true) {
       try {
         fs.mkdirSync(lockPath, { mode: 0o700 });
-        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
+        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n${encodeOwnerIdentityLine()}\n`, {
           encoding: "utf8",
           mode: 0o600,
         });
@@ -208,9 +213,12 @@ export class ActorBindingStore {
         if (errorCode(error) !== "EEXIST") throw error;
         try {
           const firstOwner = fs.readFileSync(ownerPath, "utf8");
-          const [, pidText, createdText] = firstOwner.trim().split("\n");
+          const [, pidText, createdText, identityLine] = firstOwner.trim().split("\n");
           const stale = Date.now() - Number(createdText) > BINDING_STALE_LOCK_MS;
-          if (stale && !processAlive(Number(pidText))) {
+          if (stale && lockOwnerLiveness(Number(pidText), Number(createdText), identityLine, {
+            legacyAlive: processAlive,
+            maxHoldMs: Math.max(SHORT_LOCK_MAX_HOLD_MS, BINDING_STALE_LOCK_MS),
+          }) === "dead") {
             const secondOwner = fs.readFileSync(ownerPath, "utf8");
             if (secondOwner === firstOwner) {
               fs.rmSync(lockPath, { recursive: true, force: true });

@@ -34,9 +34,9 @@ afterEach(() => {
 describe("Pi host compatibility", () => {
   it("compares release and prerelease versions", () => {
     expect(compareVersions("0.80.5", MINIMUM_PI_HOST_VERSION)).toBeLessThan(0);
-    expect(compareVersions("0.80.6", MINIMUM_PI_HOST_VERSION)).toBe(0);
-    expect(compareVersions("0.80.10", MINIMUM_PI_HOST_VERSION)).toBeGreaterThan(0);
-    expect(compareVersions("0.80.6-beta.1", MINIMUM_PI_HOST_VERSION)).toBeLessThan(0);
+    expect(compareVersions("1.0.0", MINIMUM_PI_HOST_VERSION)).toBe(0);
+    expect(compareVersions("1.0.1", MINIMUM_PI_HOST_VERSION)).toBeGreaterThan(0);
+    expect(compareVersions("1.0.0-beta.1", MINIMUM_PI_HOST_VERSION)).toBeLessThan(0);
     expect(compareVersions("invalid", MINIMUM_PI_HOST_VERSION)).toBeUndefined();
   });
 
@@ -52,13 +52,13 @@ describe("Pi host compatibility", () => {
   });
 
   it("detects the host package from the CLI path", () => {
-    expect(detectPiHostVersion(fakeHost("0.80.10"))).toBe("0.80.10");
+    expect(detectPiHostVersion(fakeHost("1.0.1"))).toBe("1.0.1");
     expect(detectPiHostVersion("/does/not/exist")).toBeUndefined();
   });
 
   it("warns only for a detected unsupported host", () => {
-    expect(piHostCompatibilityWarning("0.80.5")).toContain("requires Pi >= 0.80.6");
-    expect(piHostCompatibilityWarning("0.80.6")).toBeUndefined();
+    expect(piHostCompatibilityWarning("0.80.5")).toContain("requires Pi >= 1.0.0");
+    expect(piHostCompatibilityWarning("1.0.0")).toBeUndefined();
     expect(piHostCompatibilityWarning(undefined)).toBeUndefined();
   });
 });

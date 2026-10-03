@@ -1,6 +1,7 @@
 // Portable memory sources: a versioned, host-embeddable interface that feeds
 // explicit authorized session snapshots into the existing memory engine. This
 // module stays lightweight: no extension, UI, command, or provider runtime.
+import type { FabricScope } from "../protocol.js";
 
 export const MEMORY_SOURCE_INTERFACE_VERSION = 1;
 
@@ -62,9 +63,11 @@ export interface PortableMemorySource {
     sessionKey: string,
     request: MemorySourceRequestContext,
   ): Promise<MemorySourceSnapshot | null>;
+  /** `scope` is the caller's host-issued scope, so a source can filter before content enters context. */
   authorize?(
     action: MemorySourceAction,
     sessionKey: string | null,
+    scope?: Readonly<FabricScope>,
   ): boolean | Promise<boolean>;
 }
 

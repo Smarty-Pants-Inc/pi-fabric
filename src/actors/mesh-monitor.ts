@@ -19,6 +19,8 @@ const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_
 export class ActorMeshMonitor {
   readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
   #timer: NodeJS.Timeout | undefined;
+  #dueTimer: NodeJS.Timeout | undefined;
+  #dueAt: number | undefined;
   #watcher: FSWatcher | undefined;
   #offset: number;
   #scheduled = false;
@@ -40,7 +42,12 @@ export class ActorMeshMonitor {
   #lastCheckpointAt = Date.now();
 
   constructor(
+<<<<<<< HEAD
     readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter" | "latestCursor">>,
+=======
+    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> &
+      Partial<Pick<MeshStore, "nextScheduleDueAt" | "releaseDueSchedules">>,
+>>>>>>> upstream-v0.105.0
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
@@ -86,7 +93,9 @@ export class ActorMeshMonitor {
     }
     try {
       const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
-        if (filename !== null && path.basename(filename.toString()) !== "events.jsonl") return;
+        const name = filename === null ? undefined : path.basename(filename.toString());
+        // schedules.json re-arms the due timer when another process schedules.
+        if (name !== undefined && name !== "events.jsonl" && name !== "schedules.json") return;
         this.schedule();
       });
       this.#watcher = watcher;
@@ -111,6 +120,8 @@ export class ActorMeshMonitor {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    if (this.#dueTimer) clearTimeout(this.#dueTimer);
+    this.#dueTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     if (this.#started) this.#persistCursor(true);
@@ -134,6 +145,22 @@ export class ActorMeshMonitor {
     this.schedule();
   }
 
+  // A schedule falling due changes no file, so wake at its due time instead of
+  // waiting for the reconcile interval.
+  #armDue(dueAt: number | undefined): void {
+    if (dueAt === this.#dueAt) return;
+    if (this.#dueTimer) clearTimeout(this.#dueTimer);
+    this.#dueTimer = undefined;
+    this.#dueAt = dueAt;
+    if (dueAt === undefined || this.#closed) return;
+    this.#dueTimer = setTimeout(() => {
+      this.#dueTimer = undefined;
+      this.#dueAt = undefined;
+      this.schedule();
+    }, Math.min(Math.max(0, dueAt - Date.now()), 2_147_000_000));
+    this.#dueTimer.unref();
+  }
+
   #startTimer(delay: number): void {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = setInterval(() => this.schedule(), delay);
@@ -145,6 +172,7 @@ export class ActorMeshMonitor {
     if (!this.callbacks.beforePoll() || this.callbacks.canConsumeMesh?.() === false) return;
     this.#polling = true;
     try {
+<<<<<<< HEAD
       if (this.#archiveAfter !== undefined && !this.#catchUpArchive()) return;
       // Live and catch-up both read whole pages. A throwing dispatch restores the boundary
       // before its event, so an empty later poll cannot checkpoint past failed work.
@@ -223,6 +251,23 @@ export class ActorMeshMonitor {
       // Yield to the event loop between catch-up pages, so timers such as the lease
       // heartbeat keep running through a long backlog.
       if (catchingUp) setImmediate(() => this.schedule());
+=======
+      // Whichever process polls first releases due schedules; the store lock
+      // makes the release exactly-once, and this poll's tail then sees them.
+      // The lockless due check keeps an idle poll synchronous.
+      let dueAt: number | undefined;
+      try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
+      if (dueAt !== undefined && dueAt <= Date.now()) {
+        await this.mesh.releaseDueSchedules?.().catch(() => undefined);
+        if (this.#closed) return;
+        try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
+      }
+      this.#armDue(dueAt);
+      const tail = this.mesh.tail(this.#offset, this.config.maxReadEvents);
+      this.#offset = tail.nextOffset;
+      for (const event of tail.events) this.callbacks.onEvent(event);
+      this.#writeCursor();
+>>>>>>> upstream-v0.105.0
     } finally {
       this.#polling = false;
     }

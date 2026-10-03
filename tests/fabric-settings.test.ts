@@ -18,6 +18,7 @@ import {
   populateClaudeModelSource,
 } from "../src/ui/settings.js";
 import { buildMcpSection } from "../src/ui/settings-sections-execution.js";
+import { coerceValue } from "../src/ui/settings-values.js";
 import { SectionSubmenu } from "../src/ui/settings-submenus.js";
 
 const theme = {
@@ -78,6 +79,13 @@ describe("FabricSettingsComponent", () => {
     });
     const submenu = item.submenu!("", () => {}) as SectionSubmenu;
     const ids = submenu.items.map((row) => row.id);
+    expect(ids).toContain("mcp.nativeServers");
+    const native = submenu.items.find(row => row.id === "mcp.nativeServers")!;
+    expect(native.currentValue).toBe("");
+    expect(native.description).toContain("no automatic fallback");
+    expect(native.submenu).toBeTypeOf("function");
+    expect(coerceValue("mcp.nativeServers", " docs-api, issues ", DEFAULT_FABRIC_CONFIG)).toEqual(["docs-api", "issues"]);
+    expect(coerceValue("mcp.nativeServers", "", DEFAULT_FABRIC_CONFIG)).toEqual([]);
     expect(ids).toContain("mcp.jev.semanticSearch");
     expect(ids).toContain("mcp.jev.blockedServers");
     expect(submenu.items.find((row) => row.id === "mcp.jev.semanticSearch")?.currentValue).toBe("false");
@@ -870,6 +878,7 @@ describe("FabricSettingsComponent", () => {
     } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+<<<<<<< HEAD
   it("persists terminal event byte cap and age through the real settings dialog and reload", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-retention-"));
     const cwd = path.join(root, "project"); const agentDir = path.join(root, "agent");
@@ -905,6 +914,42 @@ describe("FabricSettingsComponent", () => {
       expect(config.retention).toMatchObject(saved.retention);
       expect(loadFabricConfig(location).retention).toMatchObject(saved.retention);
       expect(state.reloadConfig).toHaveBeenCalledTimes(2);
+=======
+  it("opens the settings screen as a centered overlay", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-overlay-"));
+    const cwd = path.join(root, "project");
+    const agentDir = path.join(root, "agent");
+    fs.mkdirSync(cwd, { recursive: true });
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    const state = {
+      config, kernelReloadRequired: false,
+      ensure: vi.fn(async () => {}),
+      reloadConfig: vi.fn(),
+      agents: { claudeModels: vi.fn(async () => []) },
+    };
+    const custom = vi.fn(async (_factory: unknown, _options?: unknown) => {});
+    const context = {
+      mode: "tui", cwd, isProjectTrusted: () => true,
+      modelRegistry: { getAvailable: () => fakeModelSource.models },
+      ui: { notify: vi.fn(), custom },
+    } as unknown as ExtensionContext;
+    try {
+      await openFabricSettings(context, {
+        state: state as unknown as FabricState,
+        applyFabricMode: vi.fn(),
+        capturedTools: { list: () => [] } as unknown as CapturedToolCatalog,
+      });
+      // The overlay path is what makes pi composite the panel and clear native
+      // image placements; the transcript must not shine through it.
+      expect(custom).toHaveBeenCalledWith(
+        expect.any(Function),
+        expect.objectContaining({
+          overlay: true,
+          overlayOptions: expect.objectContaining({ anchor: "center", width: "94%", maxHeight: "90%" }),
+        }),
+      );
+>>>>>>> upstream-v0.105.0
     } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 

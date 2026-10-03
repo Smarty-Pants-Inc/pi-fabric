@@ -218,6 +218,7 @@ def _error_text(error, source):
         if isinstance(original, SyntaxError) and original.filename == "fabric-exec.py":
             frames = []
         current.stack = traceback.StackSummary.from_list(frames)
+<<<<<<< HEAD
         if type(original) is _HostError:
             # Python 3.14 derives read-only exc_type_str from these name fields.
             if hasattr(current, "exc_type_qualname"):
@@ -225,6 +226,13 @@ def _error_text(error, source):
                 current.exc_type_module = "builtins"
             elif hasattr(current, "exc_type_str"):
                 current.exc_type_str = "RuntimeError"
+=======
+        if isinstance(original, _HostError):
+            # Python 3.13+ formats these attributes; exc_type is read-only in 3.14.
+            if hasattr(current, "exc_type_qualname"):
+                current.exc_type_qualname = "RuntimeError"
+                current.exc_type_module = "builtins"
+>>>>>>> upstream-v0.105.0
             else:
                 current.exc_type = RuntimeError
         if len(seen) >= 8:
@@ -291,7 +299,11 @@ async def _main():
         function.body = parsed.body or function.body
         function.end_lineno = max(2, len(source.splitlines()))
         program = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+<<<<<<< HEAD
         namespace = {name: _Proxy(name) for name in ("pi", "tools", "mcp", "extensions", "memory", "state", "schema", "components", "compact", "cache", "prewalk", "agents", "mesh", "records")}
+=======
+        namespace = {name: _Proxy(name) for name in ("pi", "tools", "mcp", "extensions", "memory", "state", "schema", "components", "compact", "cache", "thinking", "decisions", "programs", "prewalk", "agents", "mesh")}
+>>>>>>> upstream-v0.105.0
         payloads = _Payloads(request.get("strings", {}))
         namespace.update({"π": payloads, "payloads": payloads, "asyncio": asyncio, "__name__": "__fabric_guest__"})
         exec(compile(program, "fabric-exec.py", "exec"), namespace)

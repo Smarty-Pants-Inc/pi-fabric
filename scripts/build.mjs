@@ -6,6 +6,7 @@ import { buildLandlock } from "./build-landlock.mjs";
 
 const primaryEntryPoints = [
   "src/index.ts",
+  "src/extension-bootstrap.ts",
   "src/memory.ts",
   "src/mesh.ts",
   "src/mesh-bridge.ts",
@@ -14,7 +15,14 @@ const primaryEntryPoints = [
   "src/releases-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
+  // Runner adapter registration; never reachable from the extension entry.
+  "src/runners.ts",
+  // Opt-in durable Pi adapter; never reachable from the extension entry.
+  "src/durable.ts",
   "src/jev.ts",
+  "src/assessment.ts",
+  // Public `pi-fabric/scope`; also the extension's first-use scope parser.
+  "src/scope.ts",
   "src/protocol.ts",
   "src/residency/host.ts",
   "src/residency/launcher.ts",
@@ -29,19 +37,35 @@ const primaryEntryPoints = [
   "src/memory/normalize.ts",
   "src/memory/worker-provider.ts",
   "src/providers/memory-provider.ts",
+<<<<<<< HEAD
   "src/records/service-main.ts",
+=======
+  // Standalone `pi-fabric` bin; never reachable from the extension entry.
+  "src/cli/index.ts",
+>>>>>>> upstream-v0.105.0
 ];
 
 // Every package-local dynamic import is also an entry point. Its stable output
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+<<<<<<< HEAD
   "src/judge/agent.ts",
   "src/core/landlock.ts",
   "src/core/pattern-kill.ts",
   "src/lifecycle/reload-target-profile.ts",
   "src/lifecycle/reload-slots.ts",
   "src/coordination/unverified-ids.ts",
+=======
+  "src/type-error-guidance.ts",
+  "src/cli/mesh.ts",
+  "src/cli/decisions.ts",
+  "src/thinking-control.ts",
+  "src/compaction/owner.ts",
+  "src/compaction/orphan-repair.ts",
+  "src/decisions/command.ts",
+  "src/programs/host.ts",
+>>>>>>> upstream-v0.105.0
   "src/core/provider-operations.ts",
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
@@ -50,6 +74,8 @@ const lazyEntryPoints = [
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
   "src/agents/veda-cli.ts",
+  // Also loaded by the worker as a Pi extension (-e) for confined children.
+  "src/agents/write-guard.ts",
   "src/fabric-runtime-state.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
@@ -57,6 +83,11 @@ const lazyEntryPoints = [
   "src/jev/client.ts",
   "src/jev/routes.ts",
   "src/jev/observation.ts",
+  "src/jev-fabric/client.ts",
+  "src/jev-fabric/registry.ts",
+  "src/jev-fabric/operations.ts",
+  "src/jev-fabric/resolve.ts",
+  "src/jev-fabric/serve.ts",
   "src/runtime/core-override-guest-types.ts",
   "src/runtime/dynamic-guest-types.ts",
   "src/runtime/guest-types.ts",
@@ -71,6 +102,7 @@ const lazyEntryPoints = [
   "src/speculation/python-scanner.ts",
   "src/ui/dashboard.ts",
   "src/ui/shell-tasks.ts",
+  "src/ui/image-overlays.ts",
   "src/ui/languages/bend.ts",
   "src/ui/conversation.ts",
   "src/ui/conversation-host.ts",
@@ -88,10 +120,15 @@ const lazyEntryPoints = [
   "src/worker/model-control.ts",
   "src/worker/context-admission.ts",
   "src/worker/options.ts",
+  "src/worker/questions.ts",
   "src/worker/recovery-watchdog.ts",
+<<<<<<< HEAD
   "src/worker/retry-profile.ts",
   "src/worker/task-entry.ts",
   "src/worker/run-log.ts",
+=======
+  "src/worker/result.ts",
+>>>>>>> upstream-v0.105.0
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
 ];
@@ -206,6 +243,29 @@ const bundledPackages = [
 ];
 if (bundledPackages.length > 0) {
   throw new Error(`Package code was bundled unexpectedly:\n${bundledPackages.join("\n")}`);
+}
+
+// Only the standalone worker gets a private, stateless TypeBox validator.
+// Pi deliberately omits physical host peers; the extension graph above must
+// continue to use Pi's mapped TypeBox, never this isolated artifact.
+const workerResult = await build({
+  entryPoints: ["src/worker/result.ts"],
+  outfile: "dist/worker/result.js",
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: true,
+  metafile: true,
+  banner: { js: "// Worker-only TypeBox validator. MIT (c) 2017-2026 Haydn Paterson; see THIRD_PARTY_NOTICES.md." },
+});
+for (const input of Object.keys(workerResult.metafile.inputs)) {
+  if (input.includes("node_modules/") && !input.includes("node_modules/typebox/")) {
+    throw new Error(`Unexpected worker validator dependency: ${input}`);
+  }
+}
+if (Object.values(workerResult.metafile.outputs).some(output => output.imports.length > 0)) {
+  throw new Error("Worker validator must be self-contained");
 }
 
 const unstableLazyImports = Object.entries(result.metafile.outputs).flatMap(

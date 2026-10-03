@@ -7,6 +7,7 @@ import { MAX_EXECUTOR_TIMEOUT_MS } from "../config.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
 import { montyBindings } from "./monty-bridge.js";
 import { MONTY_BOOTSTRAP_SOURCE, montyErrorText, prepareMontySource } from "./monty-source.js";
 import { montyInput, normalizeMontyValue } from "./monty-values.js";
@@ -93,12 +94,33 @@ export class MontyRuntime implements FabricKernelRuntime {
       kill();
     };
     const abort = (): void => stop("aborted");
+<<<<<<< HEAD
     const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(() => stop("timed_out"));
     const checkDeadline = (): void => {
       if (executionDeadline.reached) stop("timed_out");
       if (hostAbort.signal.aborted) throw hostAbort.signal.reason;
+=======
+    const scheduleDeadline = (): void => {
+      if (timer) clearTimeout(timer);
+      if (stopped || !Number.isFinite(deadlineAt)) return;
+      timer = setTimeout(() => {
+        if (Date.now() < deadlineAt) scheduleDeadline();
+        else stop("timed_out");
+      }, Math.min(2_147_483_647, Math.max(0, deadlineAt - Date.now())));
+>>>>>>> upstream-v0.105.0
     };
     scheduleDeadline();
+    const humanWait = new HumanWaitDeadlinePause({
+      remainingMs: () => deadlineAt - Date.now(),
+      suspend: () => {
+        if (timer) clearTimeout(timer);
+        deadlineAt = Infinity;
+      },
+      resume: (remainingMs) => {
+        deadlineAt = Date.now() + remainingMs;
+        scheduleDeadline();
+      },
+    });
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();
     let result: FabricSandboxResult | undefined;
@@ -147,8 +169,20 @@ export class MontyRuntime implements FabricKernelRuntime {
         const settle = isPiShellRef(ref) && args.settle === true;
         if (isPiShellRef(ref)) delete args.settle;
         const floor = options.minimumTimeoutMsForHostCall?.(ref, args);
+<<<<<<< HEAD
         if (executionDeadline.extend(floor)) scheduleDeadline();
         checkDeadline();
+=======
+        if (typeof floor === "number" && Number.isFinite(floor)) {
+          if (humanWait.paused) humanWait.raise(floor);
+          else if (Date.now() + floor > deadlineAt) {
+            deadlineAt = Date.now() + Math.max(1, Math.floor(floor));
+            scheduleDeadline();
+          }
+        }
+        const waitsForHuman = options.isHumanWaitHostCall?.(ref, args) === true;
+        if (waitsForHuman) humanWait.enter();
+>>>>>>> upstream-v0.105.0
         const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal));
         tasks.add(task);
         try {
@@ -169,7 +203,10 @@ export class MontyRuntime implements FabricKernelRuntime {
             return montyInput({ id, responseId: ++nextResponseId, __fabric_response_token: responseToken, value: { ok: false, ...exit, details: null, error: montyErrorText(error) } });
           }
           throw error;
-        } finally { tasks.delete(task); }
+        } finally {
+          tasks.delete(task);
+          if (waitsForHuman) humanWait.leave();
+        }
       };
       class PayloadValues {}
       const attributes = new PayloadValues();

@@ -39,6 +39,16 @@ const cleanText = (value: unknown, maxChars: number): string | undefined => {
   return text.slice(0, maxChars);
 };
 
+export const WORKFLOW_ITEM_ID_MAX_CHARS = 128;
+const WORKFLOW_ITEM_ID_PATTERN = /^[A-Za-z0-9._:/-]+$/;
+
+/** Stable `workflow.item` id grammar (kept here so the store stays off the lazy workflow-items module). */
+export const isWorkflowItemId = (value: unknown): value is string =>
+  typeof value === "string" &&
+  value.length > 0 &&
+  value.length <= WORKFLOW_ITEM_ID_MAX_CHARS &&
+  WORKFLOW_ITEM_ID_PATTERN.test(value);
+
 const cleanId = (value: unknown, fallback: string): string => {
   const text = cleanText(value, 160);
   if (!text) return fallback;
@@ -304,7 +314,8 @@ export class FabricActivityStore {
 
   upsertItem(runId: string, input: FabricActivityItemInput): FabricActivityItem {
     const run = this.#require(runId);
-    const id = cleanId(input.id, `item-${run.items.length + 1}`);
+    // Stable workflow item ids (validated by the execution bridge) stay verbatim.
+    const id = isWorkflowItemId(input.id) ? input.id : cleanId(input.id, `item-${run.items.length + 1}`);
     const label = cleanText(input.label, MAX_NAME_CHARS);
     if (!label) throw new Error("Workflow activity item label must not be empty");
     const now = Date.now();

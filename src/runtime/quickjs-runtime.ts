@@ -7,6 +7,7 @@ import { cancellationError, preserveCancellationOutcome, runAbortable, settleWit
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
 import { transpileFabricCodeWithSourceMap } from "./type-checker.js";
 
@@ -467,6 +468,9 @@ globalThis.schema = __providerProxy("schema");
 globalThis.components = __providerProxy("components");
 globalThis.compact = __providerProxy("compact");
 globalThis.cache = __providerProxy("cache");
+globalThis.thinking = __providerProxy("thinking");
+globalThis.decisions = __providerProxy("decisions");
+globalThis.programs = __providerProxy("programs");
 globalThis.prewalk = __providerProxy("prewalk");
 globalThis.records = __providerProxy("records");
 globalThis.jev = __providerProxy("jev");
@@ -576,6 +580,11 @@ globalThis.mesh = Object.freeze({
   list: (args = {}) => __call("mesh.list", args),
   put: (args) => __call("mesh.put", args),
   delete: (args) => __call("mesh.delete", args),
+  scheduled: (args = {}) => __call("mesh.scheduled", args),
+  unschedule: (args) => __call("mesh.unschedule", args),
+  grant: (args) => __call("mesh.grant", args),
+  revoke: (args) => __call("mesh.revoke", args),
+  grants: () => __call("mesh.grants", {}),
 });
 // The mcp proxy itself stays schema-less — the registry validates args at
 // dispatch — but guestTypeDeclarations renders per-server argument types from
@@ -1020,7 +1029,13 @@ export class QuickJsRuntime {
     };
     const scheduleDeadline = (): void => {
       if (!rejectDeadline || closing || cancelled || timedOut) return;
+<<<<<<< HEAD
       executionDeadline.scheduleDeadline(expireDeadline);
+=======
+      clearTimeout(timeout);
+      if (!Number.isFinite(executionDeadlineAt)) return;
+      timeout = setTimeout(expireDeadline, Math.min(2_147_483_647, Math.max(0, executionDeadlineAt - Date.now())));
+>>>>>>> upstream-v0.105.0
     };
     const extendExecutionTimeout = (
       ref: string,
@@ -1033,8 +1048,34 @@ export class QuickJsRuntime {
       ) {
         return;
       }
+<<<<<<< HEAD
       if (executionDeadline.extend(requestedTimeoutMs)) scheduleDeadline();
+=======
+      const requestedDurationMs = Math.max(1, Math.floor(requestedTimeoutMs));
+      if (humanWait.paused) {
+        humanWait.raise(requestedDurationMs);
+        return;
+      }
+      const nextDeadlineAt = Date.now() + requestedDurationMs;
+      const nextTimeoutMs = nextDeadlineAt - executionStartedAt;
+      if (nextDeadlineAt <= executionDeadlineAt) return;
+      effectiveTimeoutMs = nextTimeoutMs;
+      executionDeadlineAt = nextDeadlineAt;
+      scheduleDeadline();
+>>>>>>> upstream-v0.105.0
     };
+
+    const humanWait = new HumanWaitDeadlinePause({
+      remainingMs: () => executionDeadlineAt - Date.now(),
+      suspend: () => {
+        clearTimeout(timeout);
+        executionDeadlineAt = Infinity;
+      },
+      resume: (remainingMs) => {
+        executionDeadlineAt = Date.now() + remainingMs;
+        scheduleDeadline();
+      },
+    });
 
     try {
       const hostFunction = context.newFunction(
@@ -1075,12 +1116,23 @@ export class QuickJsRuntime {
             void promise.settled.then(() => pendingTimers.delete(timer));
             return promise.handle;
           }
+<<<<<<< HEAD
           const task = runAbortable(hostAbortController.signal, () => {
             // Argument decoding and deadline policy also consume wall time.
             // Recheck immediately before admitting actual host work.
             if (deadlineReached()) { expireDeadline(); throw executionDeadline.reason; }
             return hostCall(reference, args, hostAbortController.signal);
           })
+=======
+          const waitsForHuman = options.isHumanWaitHostCall?.(reference, args) === true;
+          if (waitsForHuman) humanWait.enter();
+          const task = runAbortable(hostAbortController.signal, () =>
+            hostCall(reference, args, hostAbortController.signal),
+          )
+            .finally(() => {
+              if (waitsForHuman) humanWait.leave();
+            })
+>>>>>>> upstream-v0.105.0
             .then((value) => {
               if (closing || promise.alive === false) return;
               if (deadlineReached()) { expireDeadline(); return; }

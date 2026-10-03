@@ -22,10 +22,15 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
+<<<<<<< HEAD
 import { ResidentHost, RESIDENT_RUN_RETENTION_MS } from "../src/residency/host.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 import { projectOf } from "../src/topology/project-identity.js";
+=======
+import { registerAgentRunner } from "../src/runners.js";
+import { normalizeScope, type FabricScope } from "../src/scope.js";
+>>>>>>> upstream-v0.105.0
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import {
   RESIDENT_HOST_FORMAT,
@@ -270,6 +275,38 @@ describe("durable cwd validation", () => {
       expect(fs.existsSync(path.join(state.config.residencyRoot, "owner.json"))).toBe(false);
       expect(fs.existsSync(path.join(state.config.residencyRoot, "requests"))).toBe(false);
     } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  it("refuses a durable custom runner that the resident host could not load", async () => {
+    const state = await rootHarness("resident-runner-module");
+    const unregister = registerAgentRunner({
+      kind: "worker",
+      id: "local-only",
+      label: "Local only",
+      capabilities: {
+        recursiveFabric: false, steer: false, followUp: false, persistentSessions: false,
+        kernels: false, handoff: false, modelDiscovery: false, imageInput: false,
+        compaction: false, questions: false, sleep: false, writePolicy: false,
+      },
+      launch: () => ({ workerPath: "/bin/true", workerArguments: [] }),
+    });
+    const client = new ResidencyClient({
+      config: state.config,
+      mesh: state.mesh,
+      participants: state.participants,
+      mainAgent: state.mainAgent,
+      hostPath,
+    });
+    try {
+      await expect(
+        client.spawnAgent({ task: "durable", runner: "local-only", residency: "durable" }),
+      ).rejects.toThrow(/declares no residentModule/);
+      expect(fs.existsSync(path.join(state.config.residencyRoot, "owner.json"))).toBe(false);
+    } finally {
+      unregister();
       await client.close();
       await state.participants.close();
     }
@@ -2655,6 +2692,33 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
 
     await client.cleanupAgent(first.id);
     await client.cleanupAgent(second.id);
+    await client.close();
+    await state.participants.close();
+  });
+
+  it("launches durable agents with the forwarded scope and records it", { timeout: 45_000 }, async () => {
+    const state = await rootHarness("resident-scope");
+    const client = new ResidencyClient({
+      config: state.config,
+      mesh: state.mesh,
+      participants: state.participants,
+      mainAgent: state.mainAgent,
+      hostPath,
+    });
+    const scope = normalizeScope({ principal: { id: "user:alice" }, grants: [{ resource: "fs:/repo/**", actions: ["read"] }] });
+    const handle = await client.spawnAgent({
+      task: "Scoped durable agent", transport: "process", residency: "durable", inheritedScope: scope,
+    });
+    const metadata = JSON.parse(fs.readFileSync(
+      path.join(state.config.residencyRoot, "agents", `${handle.id}.json`), "utf8",
+    )) as { scope?: FabricScope };
+    expect(metadata.scope).toEqual(JSON.parse(JSON.stringify(scope)));
+    await expect(client.spawnAgent({
+      task: "Forged", transport: "process", residency: "durable",
+      inheritedScope: { ...scope, grants: [{ resource: "fs:*", actions: ["write"] }] },
+    })).rejects.toThrow(/Invalid forwarded Fabric scope/);
+    await client.waitAgent(handle.id);
+    await client.cleanupAgent(handle.id);
     await client.close();
     await state.participants.close();
   });

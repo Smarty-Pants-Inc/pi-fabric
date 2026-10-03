@@ -256,7 +256,14 @@ export class JevProgramManager {
           clearTimeout(timer);
           observation?.close();
           context.signal?.removeEventListener("abort", abort);
+<<<<<<< HEAD
           // Bound the unread-result hold from termination, not asynchronous lease cleanup.
+=======
+          // Providers release what this run acquired (interactive sessions, leases),
+          // exactly as they do when a fabric_exec invocation ends.
+          await registry.endInvocation(`jev:${id}`).catch(() => undefined);
+          await runLease.release();
+>>>>>>> upstream-v0.105.0
           info.endedAt = Date.now();
           await runLease.release();
           this.#prune();

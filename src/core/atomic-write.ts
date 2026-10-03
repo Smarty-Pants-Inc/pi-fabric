@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const DARWIN_START = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) {1,2}\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
@@ -395,6 +396,7 @@ export const writeJsonAtomicAsync = async (
   await writeFileAtomicAsync(filePath, serialized, options);
 };
 
+<<<<<<< HEAD
 export const MESH_LOCK_TIMEOUT_CODE = "FABRIC_MESH_LOCK_TIMEOUT";
 
 /** A failed acquisition wrote nothing. Foreground callers must see this error, not a retry. */
@@ -537,3 +539,309 @@ export class MeshBackgroundQueue {
     for (const item of this.#pending.splice(0)) item.attempted();
   }
 }
+=======
+// ---------------------------------------------------------------------------
+// Namespace-safe owner liveness. It shares this module with the atomic
+// writers whose files it guards: a separate module would become its own
+// shared chunk in the eager startup graph, which is at its file budget.
+//
+// `process.kill(pid, 0)` only answers for the
+// caller's own PID namespace and boot: inside containers the same number can
+// name an unrelated process (or nothing), and after PID reuse it names a
+// stranger. Owners therefore record who they are (host, PID namespace, boot,
+// process start time) and long-lived owners refresh a heartbeat. A probe only
+// trusts the signal answer when the record shares the caller's namespace and
+// boot; otherwise the heartbeat decides. Records without identity fields keep
+// the caller's pre-identity behaviour exactly.
+
+/** Long-lived owners refresh `heartbeatAt` this often. */
+export const OWNER_HEARTBEAT_INTERVAL_MS = 10_000;
+/** A heartbeat older than this proves the owner dead. */
+export const OWNER_HEARTBEAT_TTL_MS = 45_000;
+/**
+ * Short-lived locks carry no heartbeat. Across namespaces their creation time
+ * stands in for one, so a crashed foreign holder cannot strand a lock forever.
+ */
+export const SHORT_LOCK_MAX_HOLD_MS = 10 * 60_000;
+// Linux reports process start in clock ticks since boot; the wall-clock
+// conversion of each side may disagree by up to a btime rounding second.
+const PID_START_TOLERANCE_MS = 2_000;
+// Linux USER_HZ is 100 on every mainstream architecture. Both sides of a
+// comparison use the same conversion, so only consistency matters.
+const CLOCK_TICKS_PER_SECOND = 100;
+const MAX_IDENTITY_JSON_CHARS = 1_024;
+
+export type OwnerLiveness = "alive" | "dead" | "unknown";
+
+export interface OwnerIdentity {
+  pid: number;
+  hostname: string;
+  pidNamespace?: string;
+  bootId?: string;
+  startedAt: number;
+}
+
+/** A persisted owner. Identity fields are optional so old records still parse. */
+export interface OwnerRecord {
+  pid: number;
+  hostname?: string;
+  pidNamespace?: string;
+  bootId?: string;
+  startedAt?: number;
+}
+
+export interface LivenessProbes {
+  self?: () => OwnerIdentity;
+  /** `kill(pid, 0)`: ESRCH dead, EPERM alive, anything else unknown. */
+  signal?: (pid: number) => OwnerLiveness;
+  /** Wall-clock start of `pid` when the platform reports it (Linux procfs). */
+  processStartedAt?: (pid: number) => number | undefined;
+  now?: () => number;
+}
+
+export interface OwnerLivenessOptions {
+  heartbeatAt?: number;
+  heartbeatTtlMs?: number;
+  /** The caller's exact pre-identity probe, used only for legacy records. */
+  legacyAlive?: (pid: number) => boolean;
+  probes?: LivenessProbes;
+}
+
+const readTrimmed = (file: string): string | undefined => {
+  try {
+    const value = fs.readFileSync(file, "utf8").trim();
+    return value === "" ? undefined : value;
+  } catch {
+    return undefined;
+  }
+};
+
+let bootTimeSeconds: number | undefined | null = null;
+const readBootTimeSeconds = (): number | undefined => {
+  if (bootTimeSeconds !== null) return bootTimeSeconds;
+  const line = readTrimmed("/proc/stat")?.split("\n").find((entry) => entry.startsWith("btime "));
+  const value = Number(line?.slice("btime ".length).trim());
+  bootTimeSeconds = Number.isSafeInteger(value) && value > 0 ? value : undefined;
+  return bootTimeSeconds;
+};
+
+/** Parses `/proc/<pid>/stat` (field 22, starttime) into wall-clock ms. */
+export const parseProcStartedAt = (stat: string, bootSeconds: number): number | undefined => {
+  // The command name is parenthesised and may contain spaces or parentheses.
+  const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  const ticks = Number(fields[19]);
+  if (!Number.isSafeInteger(ticks) || ticks < 0) return undefined;
+  return bootSeconds * 1_000 + Math.round((ticks * 1_000) / CLOCK_TICKS_PER_SECOND);
+};
+
+const procStartedAt = (pid: number | "self"): number | undefined => {
+  if (process.platform !== "linux") return undefined;
+  const boot = readBootTimeSeconds();
+  const stat = readTrimmed(`/proc/${pid}/stat`);
+  return boot === undefined || stat === undefined ? undefined : parseProcStartedAt(stat, boot);
+};
+
+const signalProbe = (pid: number): OwnerLiveness => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return "dead";
+  try {
+    process.kill(pid, 0);
+    return "alive";
+  } catch (error) {
+    const code = errorCode(error);
+    if (code === "ESRCH") return "dead";
+    return code === "EPERM" ? "alive" : "unknown";
+  }
+};
+
+let cachedIdentity: OwnerIdentity | undefined;
+/** This process's identity, computed once on first use (never at import). */
+export const currentOwnerIdentity = (): OwnerIdentity => {
+  if (cachedIdentity) return { ...cachedIdentity };
+  let pidNamespace: string | undefined;
+  let bootId: string | undefined;
+  let startedAt: number | undefined;
+  if (process.platform === "linux") {
+    try {
+      pidNamespace = fs.readlinkSync("/proc/self/ns/pid");
+    } catch {
+      pidNamespace = undefined;
+    }
+    bootId = readTrimmed("/proc/sys/kernel/random/boot_id");
+    // PID-reuse detection compares procfs start times, so record ours the
+    // same way. Without a boot id, readers skip that comparison.
+    if (bootId !== undefined) startedAt = procStartedAt("self");
+    if (startedAt === undefined) bootId = undefined;
+  }
+  cachedIdentity = {
+    pid: process.pid,
+    hostname: os.hostname(),
+    ...(pidNamespace === undefined ? {} : { pidNamespace }),
+    ...(bootId === undefined ? {} : { bootId }),
+    startedAt: startedAt ?? Math.round(performance.timeOrigin),
+  };
+  return { ...cachedIdentity };
+};
+
+const boundedString = (value: unknown, max: number): value is string =>
+  typeof value === "string" && value.length > 0 && value.length <= max;
+
+/** Identity fields of a persisted record, or undefined for legacy/malformed ones. */
+export const ownerIdentityFields = (
+  value: unknown,
+): Omit<OwnerIdentity, "pid"> | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (!boundedString(record.hostname, 255)) return undefined;
+  if (record.pidNamespace !== undefined && !boundedString(record.pidNamespace, 128)) return undefined;
+  if (record.bootId !== undefined && !boundedString(record.bootId, 128)) return undefined;
+  if (typeof record.startedAt !== "number" || !Number.isFinite(record.startedAt)) return undefined;
+  return {
+    hostname: record.hostname,
+    ...(record.pidNamespace === undefined ? {} : { pidNamespace: record.pidNamespace as string }),
+    ...(record.bootId === undefined ? {} : { bootId: record.bootId as string }),
+    startedAt: record.startedAt,
+  };
+};
+
+/** One JSON line appended to line-oriented lock owner files. */
+export const encodeOwnerIdentityLine = (): string => {
+  const { pid: _pid, ...identity } = currentOwnerIdentity();
+  return JSON.stringify(identity);
+};
+
+/** The identity line of a lock owner file; absent or malformed is legacy. */
+export const decodeOwnerIdentityLine = (
+  line: string | undefined,
+): Omit<OwnerIdentity, "pid"> | undefined => {
+  if (!line || line.length > MAX_IDENTITY_JSON_CHARS || !line.startsWith("{")) return undefined;
+  try {
+    return ownerIdentityFields(JSON.parse(line));
+  } catch {
+    return undefined;
+  }
+};
+
+/** Optional heartbeat field of a persisted record. */
+const heartbeatField = (value: unknown): number | undefined =>
+  typeof value === "object" && value !== null &&
+  typeof (value as { heartbeatAt?: unknown }).heartbeatAt === "number" &&
+  Number.isFinite((value as { heartbeatAt: number }).heartbeatAt)
+    ? (value as { heartbeatAt: number }).heartbeatAt
+    : undefined;
+
+/** Additive fields a long-lived JSON owner record carries. */
+export interface OwnerHeartbeatFields {
+  identity?: Omit<OwnerIdentity, "pid">;
+  heartbeatAt?: number;
+}
+
+/** Identity and first heartbeat for a JSON owner record being acquired. */
+export const ownerHeartbeatFields = (now = Date.now()): Required<OwnerHeartbeatFields> => {
+  const { pid: _pid, ...identity } = currentOwnerIdentity();
+  return { identity, heartbeatAt: now };
+};
+
+/**
+ * Liveness of a persisted JSON owner record `{ pid, identity?, heartbeatAt? }`.
+ * Malformed identity is treated as legacy; a non-numeric pid is dead.
+ */
+export const recordOwnerLiveness = (
+  record: unknown,
+  options: Omit<OwnerLivenessOptions, "heartbeatAt"> = {},
+): OwnerLiveness => {
+  if (typeof record !== "object" || record === null) return "dead";
+  const { pid, identity: rawIdentity } = record as { pid?: unknown; identity?: unknown };
+  if (typeof pid !== "number") return "dead";
+  const identity = ownerIdentityFields(rawIdentity);
+  const heartbeatAt = heartbeatField(record);
+  return ownerLiveness(identity ? { ...identity, pid } : { pid }, {
+    ...options,
+    ...(heartbeatAt === undefined ? {} : { heartbeatAt }),
+  });
+};
+
+export const ownerLiveness = (
+  record: OwnerRecord,
+  options: OwnerLivenessOptions = {},
+): OwnerLiveness => {
+  const probes = options.probes ?? {};
+  const signal = probes.signal ?? signalProbe;
+  if (typeof record.hostname !== "string") {
+    return options.legacyAlive
+      ? (options.legacyAlive(record.pid) ? "alive" : "dead")
+      : signal(record.pid);
+  }
+  const self = (probes.self ?? currentOwnerIdentity)();
+  const sameHost = record.hostname === self.hostname;
+  if (
+    sameHost &&
+    record.pidNamespace === self.pidNamespace &&
+    record.bootId === self.bootId
+  ) {
+    const answer = signal(record.pid);
+    if (answer !== "alive") return answer;
+    // Same boot: a different start time under the same PID is reuse.
+    if (record.bootId !== undefined && record.startedAt !== undefined) {
+      const actual = (probes.processStartedAt ?? procStartedAt)(record.pid);
+      if (actual !== undefined && Math.abs(actual - record.startedAt) > PID_START_TOLERANCE_MS) {
+        return "dead";
+      }
+    }
+    return "alive";
+  }
+  // Another namespace, host, or boot: the signal answer means nothing here.
+  if (options.heartbeatAt !== undefined) {
+    const now = (probes.now ?? Date.now)();
+    return now - options.heartbeatAt <= (options.heartbeatTtlMs ?? OWNER_HEARTBEAT_TTL_MS)
+      ? "alive"
+      : "dead";
+  }
+  // No process outlives its kernel boot (containers share the host's boot id).
+  if (
+    sameHost &&
+    record.bootId !== undefined &&
+    self.bootId !== undefined &&
+    record.bootId !== self.bootId
+  ) return "dead";
+  return "unknown";
+};
+
+/**
+ * Liveness of a line-oriented lock owner (`[token\n]pid\ncreated\n{identity}`).
+ * Short locks never heartbeat, so their creation time is the heartbeat with a
+ * generous hold ceiling.
+ */
+export const lockOwnerLiveness = (
+  pid: number,
+  createdAt: number,
+  identityLine: string | undefined,
+  options: Pick<OwnerLivenessOptions, "legacyAlive" | "probes"> & { maxHoldMs?: number } = {},
+): OwnerLiveness => {
+  const identity = decodeOwnerIdentityLine(identityLine);
+  return ownerLiveness(identity ? { ...identity, pid } : { pid }, {
+    ...options,
+    ...(Number.isFinite(createdAt) ? { heartbeatAt: createdAt } : {}),
+    heartbeatTtlMs: options.maxHoldMs ?? SHORT_LOCK_MAX_HOLD_MS,
+  });
+};
+
+/**
+ * Runs `refresh(now)` on an unref'd interval until the returned stop function
+ * is called. Refresh failures are swallowed: a missed beat only ages the
+ * record toward the TTL.
+ */
+export const startOwnerHeartbeat = (
+  refresh: (heartbeatAt: number) => void,
+  intervalMs = OWNER_HEARTBEAT_INTERVAL_MS,
+): (() => void) => {
+  const timer = setInterval(() => {
+    try {
+      refresh(Date.now());
+    } catch {
+      // The next beat retries; a stale heartbeat is the failure signal.
+    }
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+};
+>>>>>>> upstream-v0.105.0

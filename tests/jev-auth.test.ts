@@ -9,6 +9,8 @@ describe("Jev native login", () => {
     const provider = registerProvider.mock.calls[0]![0];
     expect(provider.id).toBe("jev"); expect(provider.getModels()).toEqual([]);
     expect(provider.auth.apiKey.login).toBeTypeOf("function");
+    expect(() => provider.stream()).toThrow("not chat generation");
+    expect(() => provider.streamSimple()).toThrow("not chat generation");
   });
   // Newer Pi's createProvider rejects a provider without any api/images/classifiers
   // implementation, so the login-only provider carries a stream that only ever errors.

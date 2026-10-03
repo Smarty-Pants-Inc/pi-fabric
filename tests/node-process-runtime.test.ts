@@ -108,6 +108,7 @@ describe("process runtime startup ownership", () => {
 });
 
 describe("NodeProcessRuntime", () => {
+<<<<<<< HEAD
   it("rejects unencodable host results without committing their observation", async () => {
     let delivered = 0;
     const result = await new NodeProcessRuntime().execute("return tools.providers();", async () => ({ value: 1n }), {
@@ -121,6 +122,12 @@ describe("NodeProcessRuntime", () => {
     const result = await new NodeProcessRuntime().execute('return records.read({after:3});',
       async (ref, args) => ({ref, args}), options);
     expect(result).toMatchObject({terminationReason:"completed", value:{ref:"records.read", args:{after:3}}});
+=======
+  it("routes the thinking primitive through the shared guest setup", async () => {
+    const result = await new NodeProcessRuntime().execute('return thinking.status();',
+      async (ref, args) => ({ref, args}), options);
+    expect(result).toMatchObject({terminationReason:"completed", value:{ref:"thinking.status", args:{}}});
+>>>>>>> upstream-v0.105.0
   });
 
   it("routes the cache primitive through the shared guest setup", async () => {

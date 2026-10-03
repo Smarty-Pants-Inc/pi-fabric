@@ -4,9 +4,13 @@ import fs from "node:fs";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+<<<<<<< HEAD
 import { randomUUID } from "node:crypto";
+=======
+>>>>>>> upstream-v0.105.0
 import type { ChildProcess, SpawnOptions } from "node:child_process";
-import crossSpawn from "cross-spawn";
+import { assertWorkerRuntime, writeWorkerStartupFailure } from "./worker/startup.js";
+
 import { StringDecoder } from "node:string_decoder";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type {
@@ -20,6 +24,8 @@ import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { retryableProviderError } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
+
+let crossSpawn: typeof import("cross-spawn");
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -87,6 +93,7 @@ const loadWorkerRecovery = async (): Promise<WorkerRecoveryModule> => {
   return import(sourceModulePath) as Promise<WorkerRecoveryModule>;
 };
 
+<<<<<<< HEAD
 type WorkerToolCallStreamGuardModule = typeof import("./worker/tool-call-stream-guard.js");
 const loadToolCallStreamGuard = async (): Promise<WorkerToolCallStreamGuardModule> => {
   if (!import.meta.url.endsWith(".ts")) return import("./worker/tool-call-stream-guard.js");
@@ -95,11 +102,22 @@ const loadToolCallStreamGuard = async (): Promise<WorkerToolCallStreamGuardModul
 };
 
 type AgentResultModule = typeof import("./agents/result.js");
+=======
+type AgentResultModule = typeof import("./worker/result.js");
+>>>>>>> upstream-v0.105.0
 
 const loadAgentResult = async (): Promise<AgentResultModule> => {
-  if (!import.meta.url.endsWith(".ts")) return import("./agents/result.js");
-  const sourceModulePath = "./agents/result.ts";
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/result.js");
+  const sourceModulePath = "./worker/result.ts";
   return import(sourceModulePath) as Promise<AgentResultModule>;
+};
+
+type WorkerQuestionsModule = typeof import("./worker/questions.js");
+
+const loadWorkerQuestions = async (): Promise<WorkerQuestionsModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/questions.js");
+  const sourceModulePath = "./worker/questions.ts";
+  return import(sourceModulePath) as Promise<WorkerQuestionsModule>;
 };
 
 const loadWorkerOptions = async (): Promise<WorkerOptionsModule> => {
@@ -233,10 +251,18 @@ let runRecordHelpers: WorkerRunRecordModule | undefined;
 let terminalWritten = false;
 let flushRunLog: (() => void) | undefined;
 const writeCrashStatus = (error: unknown): void => {
+<<<<<<< HEAD
   flushRunLog?.();
   if (!crashContext || !runRecordHelpers || terminalWritten) return;
+=======
+  if (terminalWritten) return;
+>>>>>>> upstream-v0.105.0
   try {
-    runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);
+    if (crashContext && runRecordHelpers) {
+      runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);
+    } else {
+      writeWorkerStartupFailure(process.argv, error);
+    }
   } catch {
     // Best effort: if the crash-status write itself fails, #monitor falls back
     // to "Agent transport exited without a result".
@@ -254,7 +280,13 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
+<<<<<<< HEAD
   const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog, PI_PROVIDER_RESUME_DELAYS_MS, recoveryTimeScale }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
+=======
+  assertWorkerRuntime();
+  crossSpawn = (await import("cross-spawn")).default;
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }] = await Promise.all([
+>>>>>>> upstream-v0.105.0
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
@@ -401,6 +433,7 @@ const main = async (): Promise<void> => {
     piArguments.push("-e", hookPath, "--no-auto-compaction");
   }
   if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
+<<<<<<< HEAD
   const deliveryHook = fileURLToPath(new URL(
     import.meta.url.endsWith(".ts") ? "./worker/principal-delivery.ts" : "./worker/principal-delivery.js", import.meta.url));
   piArguments.push("-e", deliveryHook);
@@ -447,6 +480,15 @@ const main = async (): Promise<void> => {
   }
   const piTools = replyTool ? [...options.tools, "fabric_reply"] : options.tools;
   if (piTools.length > 0) piArguments.push("--tools", piTools.join(","));
+=======
+  if (options.writePolicy) {
+    // The guard loads even with --no-extensions; other runners cannot enforce it.
+    if (options.runner !== "pi") throw new Error(`Write confinement requires the Pi runner, not ${options.runner}`);
+    const guard = import.meta.url.endsWith(".ts") ? "./agents/write-guard.ts" : "./agents/write-guard.js";
+    piArguments.push("-e", fileURLToPath(new URL(guard, import.meta.url)));
+  }
+  if (options.tools.length > 0) piArguments.push("--tools", options.tools.join(","));
+>>>>>>> upstream-v0.105.0
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
   if (options.model) piArguments.push("--model", options.model);
   if (thinking) piArguments.push("--thinking", thinking);
@@ -466,7 +508,8 @@ const main = async (): Promise<void> => {
       ? claudeCli!.buildClaudeArguments({
           tools: options.tools,
           extensions: options.extensions,
-          persistentSession: Boolean(options.sessionFile),
+          // Actors and handoffs already have a session file; one-shot Claude runs opt in explicitly.
+          persistentSession: Boolean(options.sessionFile) || options.persistSession === true,
           ...(options.model ? { model: options.model } : {}),
           ...(thinking ? { thinking } : {}),
           ...(options.systemPrompt ? { systemPrompt: options.systemPrompt } : {}),
@@ -545,6 +588,8 @@ const main = async (): Promise<void> => {
       PI_FABRIC_AGENT_RUN_DIR: path.dirname(options.statusFile),
       PI_FABRIC_DEPTH: String(options.depth),
       PI_FABRIC_PARENT_RUN: options.id,
+      // A child Fabric intersects its own thinking.bounds with these.
+      ...(options.thinkingBounds ? { PI_FABRIC_THINKING_BOUNDS: options.thinkingBounds } : {}),
       PI_FABRIC_AGENT_NAME: options.name,
       ...(options.spawner ? {
         PI_FABRIC_SPAWNER_ID: options.spawner.id,
@@ -580,6 +625,12 @@ const main = async (): Promise<void> => {
         ? { PI_FABRIC_OWNER_IDENTITY_ID: options.ownerIdentityId }
         : {}),
       ...(options.runRoot ? { PI_FABRIC_RUN_ROOT: options.runRoot } : {}),
+      // Supported child contract (docs/agents.md "Child environment contract").
+      ...(options.lineage ? { PI_FABRIC_LINEAGE: options.lineage } : {}),
+      ...(options.writePolicy ? { PI_FABRIC_WRITE_POLICY: options.writePolicy } : {}),
+      // Exactly the manager's derived scope; undefined drops an inherited value.
+      PI_FABRIC_SCOPE: options.scope,
+      PI_FABRIC_SCOPE_FILE: undefined,
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -619,6 +670,18 @@ const main = async (): Promise<void> => {
   let producedFinalAnswer = false;
 
   const update = (): void => updateRunRecord(options.statusFile, record);
+  // agents.childQuestions "route": child dialogs wait for a parent ui_response.
+  const questionRelay = options.childQuestionTimeoutMs !== undefined && options.runner === "pi" && options.steerFile
+    ? new (await loadWorkerQuestions()).ChildQuestionRelay(options.childQuestionTimeoutMs, {
+        emit: (question) => emitLifecycle("question", { ...question }),
+        send: (frame) => child.stdin?.write(`${JSON.stringify(frame)}\n`),
+        blocked: (since) => {
+          if (since === undefined) delete record.blockedOn;
+          else record.blockedOn = { since };
+          update();
+        },
+      })
+    : undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let closeTimer: NodeJS.Timeout | undefined;
   const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error), recoveryScale);
@@ -810,8 +873,12 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
+<<<<<<< HEAD
   }, activationWindow, options.residentStartupProbe === true, Boolean(options.routeHeader));
   let modelControl = createModelControl();
+=======
+  }, options.modelAdmission);
+>>>>>>> upstream-v0.105.0
 
   // Attributed token telemetry. Every usage-bearing child event emits one
   // tokens.usage lifecycle entry identified by this run/actor/runner/depth.
@@ -1329,7 +1396,8 @@ const main = async (): Promise<void> => {
       const method = event.method;
       if (
         typeof event.id === "string" &&
-        (method === "select" || method === "confirm" || method === "input" || method === "editor")
+        (method === "select" || method === "confirm" || method === "input" || method === "editor") &&
+        !questionRelay?.request(event)
       ) {
         child.stdin?.write(
           `${JSON.stringify({ type: "extension_ui_response", id: event.id, cancelled: true })}\n`,
@@ -1551,7 +1619,11 @@ const main = async (): Promise<void> => {
         const line = raw.trim();
         if (!line) continue;
         processedCommands += 1;
+<<<<<<< HEAD
         let command: { type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown; followUpId?: string };
+=======
+        let command: { type?: string; message?: string; mode?: string; instructions?: string; requestId?: string };
+>>>>>>> upstream-v0.105.0
         try {
           command = JSON.parse(line);
         } catch {
@@ -1603,6 +1675,8 @@ const main = async (): Promise<void> => {
             child.stdin?.write(JSON.stringify({ type: "set_follow_up_mode", mode: command.mode }) + "\n");
           } else if (command.type === "compact") {
             compactControl.queue(command.instructions);
+          } else if (command.type === "ui_response") {
+            questionRelay?.respond(command);
           }
         } catch {
           /* stdin closed (settled/stopped child); a late steer is dropped */
@@ -1826,6 +1900,8 @@ const main = async (): Promise<void> => {
   }
 
   if (steerTimer) clearInterval(steerTimer);
+  questionRelay?.close();
+  delete record.blockedOn;
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);
   if (killTimer) clearTimeout(killTimer);

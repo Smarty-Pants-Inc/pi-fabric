@@ -361,10 +361,17 @@ export class AgentMessageRouter {
           principal: options.principal,
           message,
           data,
+<<<<<<< HEAD
           // Carry the local Main default across runtime generations (#3015).
           ...(kind === "followUp"
             ? { triggerTurn: options.triggerTurn ?? true }
             : typeof options.triggerTurn === "boolean" ? { triggerTurn: options.triggerTurn } : {}),
+=======
+          ...(typeof options.triggerTurn === "boolean"
+            ? { triggerTurn: options.triggerTurn }
+            : {}),
+          ...(participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {}),
+>>>>>>> upstream-v0.105.0
         },
         participant.ownerIdentityId,
         {
@@ -394,6 +401,7 @@ export class AgentMessageRouter {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
     }
 
+<<<<<<< HEAD
     // An agent another host owns (a durable child in its spawner's resident host, or a peer's
     // task agent) takes steer and follow-up through its owner (smarty-dev#1323).
     const remoteAgent = this.#get(id);
@@ -408,6 +416,30 @@ export class AgentMessageRouter {
         { message, data, principal: options.principal },
         remoteAgent.ownerIdentityId,
         { routedRemoteHost: remoteAgent.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
+=======
+    // Remote root sessions have no local Main match and are not actors.
+    const remoteRoot = this.participants.get(id);
+    if (remoteRoot?.kind === "root" && !remoteRoot.local) {
+      if (!remoteRoot.capabilities.includes(kind)) {
+        throw new Error(`Fabric participant ${remoteRoot.id} does not support ${kind}`);
+      }
+      if (!this.control || remoteRoot.controlProtocol !== "v1") {
+        throw new Error(`Fabric root ${remoteRoot.id} has no control channel`);
+      }
+      return this.control.request(
+        remoteRoot.ownerHostId,
+        remoteRoot.id,
+        kind,
+        {
+          message,
+          data,
+          ...(typeof options.triggerTurn === "boolean"
+            ? { triggerTurn: options.triggerTurn }
+            : {}),
+          ...(remoteRoot.ownerIncarnation ? { ownerIncarnation: remoteRoot.ownerIncarnation } : {}),
+        },
+        remoteRoot.ownerIdentityId,
+>>>>>>> upstream-v0.105.0
       );
     }
 
@@ -471,7 +503,11 @@ export class AgentMessageRouter {
           ? { triggerTurn: options.triggerTurn }
           : {}),
         ...(needsBinding && resolvedBinding ? { binding: resolvedBinding } : {}),
+<<<<<<< HEAD
         ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
+=======
+        ...(participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {}),
+>>>>>>> upstream-v0.105.0
       },
       participant.ownerIdentityId,
       { routedRemoteHost: participant.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
@@ -536,7 +572,11 @@ export class AgentMessageRouter {
           message,
           command.data,
           signal,
+<<<<<<< HEAD
           { provenance, ...controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId) },
+=======
+          { ...(command.binding !== undefined ? { binding: command.binding } : {}), sender: command.sender ?? null },
+>>>>>>> upstream-v0.105.0
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -598,11 +638,20 @@ export class AgentMessageRouter {
       if (ownership && !ownership.local) {
         return { accepted: false, error: `Participant ${actor.id} is owned by ${ownership.ownerHostId}` };
       }
+<<<<<<< HEAD
       const options = controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId);
       // Refuse inexact owner-side model selections before acknowledging a synchronous tell.
       // Validate without promoting the owner's current defaults into fixed per-call overrides.
       await this.actorManager.resolveActivationBinding(actor.id, options);
       const result = this.actorManager.tell(actor.id, message, command.data, { provenance, ...options });
+=======
+      const result = this.actorManager.tell(
+        actor.id,
+        message,
+        command.data,
+        { ...(command.binding !== undefined ? { binding: command.binding } : {}), sender: command.sender ?? null },
+      );
+>>>>>>> upstream-v0.105.0
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) {

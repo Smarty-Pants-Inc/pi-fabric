@@ -1,14 +1,20 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  createBashToolDefinition,
+  type BashOperations,
   type ExtensionContext,
   type ExtensionRunner,
+  type RegisteredTool,
 } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { FabricExecutionTraceRecorder } from "../src/audit/trace.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { FABRIC_BASH_MIDDLEWARE, type FabricBashMiddlewareV1 } from "../src/protocol.js";
+import { CapturedToolsProvider } from "../src/providers/captured-tools-provider.js";
 import { ActionRegistry, type FabricCallAudit } from "../src/core/action-registry.js";
 import { NESTED_TOOL_CALL_ID_PREFIX } from "../src/core/action-registry.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
@@ -41,10 +47,16 @@ const makeRunner = (overrides: Record<string, unknown> = {}): ExtensionRunner =>
     ...overrides,
   }) as unknown as ExtensionRunner;
 
-const registerWithRunner = (runner: ExtensionRunner) => {
+const registerWithRunner = (runner: ExtensionRunner, operations?: BashOperations) => {
   const catalog = new CapturedToolCatalog();
+  const tools: RegisteredTool[] = operations ? [{
+    definition: Object.assign(createBashToolDefinition(process.cwd()), {
+      [FABRIC_BASH_MIDDLEWARE]: { version: 1, wrapOperations: () => operations } satisfies FabricBashMiddlewareV1,
+    }),
+    sourceInfo: { path: "/extensions/test-bash.ts", source: "test", scope: "user", origin: "package" },
+  } as RegisteredTool] : [];
   catalog.replace(
-    [],
+    tools,
     runner,
     DEFAULT_FABRIC_CONFIG.capture,
     "/extensions/pi-fabric/index.ts",
@@ -100,7 +112,12 @@ describe("PiToolsProvider lifecycle", () => {
         event.input.command = `export EXAMPLE=true\n${String(event.input.command)}`;
       }),
     });
-    const registry = registerWithRunner(runner);
+    // Test argument propagation, not the platform shell's initialization output.
+    const exec = vi.fn<BashOperations["exec"]>(async (_command, _cwd, options) => {
+      options.onData(Buffer.from("executed:true\n"));
+      return { exitCode: 0 };
+    });
+    const registry = registerWithRunner(runner, { exec });
     const audits: FabricCallAudit[] = [];
     const events: unknown[] = [];
     const trace = new FabricExecutionTraceRecorder();
@@ -118,6 +135,8 @@ describe("PiToolsProvider lifecycle", () => {
 
     const executedCommand = `export EXAMPLE=true\nprintf "executed:$EXAMPLE\n"`;
     expect(result.output).toBe("executed:true\n");
+    expect(exec).toHaveBeenCalledOnce();
+    expect(exec.mock.calls[0]?.[0]).toContain(executedCommand);
     expect(audits[0]?.args).toEqual({ command: executedCommand });
     expect(audits[0]?.preview).toMatchObject({ bashCommand: executedCommand });
     expect(events).toContainEqual(expect.objectContaining({
@@ -181,7 +200,7 @@ describe("PiToolsProvider lifecycle", () => {
 
     await provider.invoke(
       "bash",
-      { command: "printf first; sleep 0.15; printf second" },
+      { command: "printf first" },
       {
         ...baseContext,
         update(message) { updates.push(message); },
@@ -210,10 +229,10 @@ describe("PiToolsProvider lifecycle", () => {
     try {
       const registry = new ActionRegistry();
       registry.register(new PiToolsProvider(root, undefined, undefined));
-      const result = await registry.invoke(
+      await registry.invoke(
         "pi.bash",
         {
-          command: `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} -e "process.stdout.write(process.cwd())"`,
+          command: `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} -e "require('node:fs').writeFileSync('cwd.txt', process.cwd())"`,
           cwd: "nested",
         },
         {
@@ -222,8 +241,8 @@ describe("PiToolsProvider lifecycle", () => {
           extensionContext: { ...baseContext.extensionContext, cwd: root } as ExtensionContext,
           audits: [],
         },
-      ) as { output: string };
-      expect(fs.realpathSync.native(result.output.trim())).toBe(
+      );
+      expect(fs.realpathSync.native(fs.readFileSync(path.join(nested, "cwd.txt"), "utf8"))).toBe(
         fs.realpathSync.native(nested),
       );
     } finally {
@@ -540,5 +559,161 @@ describe("extension hijack contract for nested core tools", () => {
     await expect(
       registry.invoke("pi.grep", { pattern: "anything" }, baseContext),
     ).rejects.toThrow("grep requires an audit note");
+  });
+});
+
+describe("tool_call preflight coverage for nested bash", () => {
+  const roots: string[] = [];
+  const worktrees: Array<{ repository: string; path: string }> = [];
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const initRepository = (): string => {
+    const repository = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-preflight-wt-"));
+    roots.push(repository);
+    git(repository, "init", "-q");
+    git(repository, "config", "user.email", "pi-fabric-tests@example.invalid");
+    git(repository, "config", "user.name", "Pi Fabric tests");
+    fs.writeFileSync(path.join(repository, "README.md"), "ok\n");
+    git(repository, "add", ".");
+    git(repository, "commit", "-qm", "initial");
+    return fs.realpathSync(repository);
+  };
+  const blockBash = () =>
+    vi.fn(async (event: { toolName: string }) =>
+      event.toolName === "bash" ? { block: true, reason: "blocked" } : undefined,
+    );
+
+  afterEach(() => {
+    for (const worktree of worktrees.splice(0)) {
+      try {
+        git(worktree.repository, "worktree", "remove", "--force", worktree.path);
+      } catch {
+        // The worktree may never have been created (the point of these tests).
+      }
+    }
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  // Case 1 (regression guard): a nested bash command routed through the normal
+  // event lifecycle is blocked by the tool_call preflight, and the shell
+  // operations never run.
+  it("blocks a nested bash command through the preflight without running the shell", async () => {
+    const execSpy = vi.fn(async () => ({ exitCode: 0 }));
+    const wrapOperations = vi.fn(() => ({ exec: execSpy }));
+    const middleware: FabricBashMiddlewareV1 = { version: 1, wrapOperations };
+    const cwd = process.cwd();
+    const runner = makeRunner({ emitToolCall: blockBash() });
+    const definition = Object.assign(
+      { ...createBashToolDefinition(cwd) },
+      { [FABRIC_BASH_MIDDLEWARE]: middleware },
+    );
+    const catalog = new CapturedToolCatalog();
+    catalog.replace(
+      [{ definition, sourceInfo: { path: "/extensions/guard-bash.ts", source: "test", scope: "user", origin: "package" } } as RegisteredTool],
+      runner,
+      DEFAULT_FABRIC_CONFIG.capture,
+      "/extensions/pi-fabric/index.ts",
+    );
+    const registry = new ActionRegistry();
+    registry.register(new PiToolsProvider(cwd, catalog, new CapturedToolsProvider(catalog)));
+    try {
+      await expect(
+        registry.invoke("pi.bash", { command: "rm -rf /tmp/x" }, baseContext),
+      ).rejects.toThrow(/blocked/);
+      expect(wrapOperations).not.toHaveBeenCalled();
+      expect(execSpy).not.toHaveBeenCalled();
+    } finally {
+      await registry.close();
+    }
+  });
+
+  // Case 2: a well-formed `git worktree add` is intercepted before the normal
+  // lifecycle, so it must emit the same preflight first. A block stops it with
+  // no worktree effect. Without the fix this executes and creates a worktree.
+  it("blocks a git worktree add intercept before any worktree effect", async () => {
+    const repository = initRepository();
+    const dest = path.join(repository, "wt");
+    worktrees.push({ repository, path: dest });
+    const runner = makeRunner({ emitToolCall: blockBash() });
+    const catalog = new CapturedToolCatalog();
+    catalog.replace([], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+    const registry = new ActionRegistry();
+    registry.register(new PiToolsProvider(repository, catalog, new CapturedToolsProvider(catalog)));
+    const context = {
+      ...baseContext,
+      cwd: repository,
+      extensionContext: { ...baseContext.extensionContext, cwd: repository } as ExtensionContext,
+      audits: [],
+    };
+    try {
+      await expect(
+        registry.invoke("pi.bash", { command: "git worktree add -b topic wt HEAD" }, context),
+      ).rejects.toThrow(/blocked/);
+      expect(fs.existsSync(dest)).toBe(false);
+      expect(git(repository, "worktree", "list", "--porcelain")).not.toContain("branch refs/heads/topic");
+    } finally {
+      await registry.close();
+    }
+  });
+
+  // Case 3: a catalog is installed but its runner is not yet available (the
+  // window before the first tool refresh). Mutating tools would otherwise run
+  // with no tool_call preflight, so they fail closed; read tools still run.
+  it("fails closed for mutating tools until the catalog runner is available", async () => {
+    const cwd = process.cwd();
+    const catalog = new CapturedToolCatalog(); // never replaced: runner is undefined
+    const provider = new PiToolsProvider(cwd, catalog, new CapturedToolsProvider(catalog));
+    for (const [tool, args] of [
+      ["bash", { command: "echo hi" }],
+      ["write", { path: "scratch.txt", content: "x" }],
+      ["edit", { path: "scratch.txt", oldText: "a", newText: "b" }],
+    ] as const) {
+      await expect(provider.invoke(tool, args, baseContext)).rejects.toThrow(
+        /until extension tool hooks initialize/,
+      );
+    }
+    // A read tool has nothing to guard and still resolves through direct execute.
+    await expect(provider.invoke("ls", { path: cwd }, baseContext)).resolves.toEqual(
+      expect.any(String),
+    );
+  });
+
+  // Case 4 (Gap C guard): the tool_call event's input already carries the
+  // effective per-call cwd, so cwd-aware guards evaluate against the right base.
+  it("exposes the effective per-call cwd on the tool_call event input", async () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-preflight-cwd-")));
+    roots.push(root);
+    const nested = path.join(root, "nested");
+    fs.mkdirSync(nested);
+    let capturedCwd: unknown;
+    const runner = makeRunner({
+      emitToolCall: vi.fn(async (event: { toolName: string; input: Record<string, unknown> }) => {
+        if (event.toolName === "bash") capturedCwd = event.input.cwd;
+        return undefined;
+      }),
+    });
+    const catalog = new CapturedToolCatalog();
+    catalog.replace([], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+    const registry = new ActionRegistry();
+    registry.register(new PiToolsProvider(root, catalog, new CapturedToolsProvider(catalog)));
+    try {
+      await registry.invoke(
+        "pi.bash",
+        {
+          command: `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} -e "require('node:fs').writeFileSync('cwd.txt', process.cwd())"`,
+          cwd: "nested",
+        },
+        {
+          ...baseContext,
+          cwd: root,
+          extensionContext: { ...baseContext.extensionContext, cwd: root } as ExtensionContext,
+          audits: [],
+        },
+      );
+      expect(fs.realpathSync.native(String(capturedCwd))).toBe(fs.realpathSync.native(nested));
+      expect(fs.realpathSync.native(fs.readFileSync(path.join(nested, "cwd.txt"), "utf8"))).toBe(fs.realpathSync.native(nested));
+    } finally {
+      await registry.close();
+    }
   });
 });

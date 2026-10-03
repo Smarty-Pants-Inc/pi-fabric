@@ -127,6 +127,7 @@ describe("Fabric runtime provider components", () => {
           "fabric.provider.agents",
           "fabric.provider.cache",
           "fabric.provider.compact",
+          "fabric.provider.decisions",
           "fabric.provider.extensions",
           "fabric.provider.jev",
           "fabric.provider.mcp",
@@ -134,9 +135,13 @@ describe("Fabric runtime provider components", () => {
           "fabric.provider.mesh",
           "fabric.provider.pi",
           "fabric.provider.prewalk",
+          "fabric.provider.programs",
           "fabric.provider.schema",
+          // Interactive sessions need jev-fabric, which is not offered on Windows.
+          ...(process.platform === "win32" ? [] : ["fabric.provider.sessions"]),
           "fabric.provider.state",
           "fabric.provider.tasks",
+          "fabric.provider.thinking",
         ],
       }]);
       const discovery = componentDiscovery;
@@ -161,7 +166,9 @@ describe("Fabric runtime provider components", () => {
             "schema",
             "compact",
             "cache",
+            "thinking",
             "prewalk",
+            "programs",
             "agents",
             "memory",
             "jev",
@@ -213,6 +220,12 @@ describe("Fabric runtime provider components", () => {
       expect(cacheProbe.value).toEqual({supported:false,hold:"unsupported"});
       await runtime.registry.invoke("components.reload", {id:"fabric.provider.cache"}, invocation);
       expect(await runtime.registry.invoke("cache.status", {}, invocation)).toMatchObject({supported:false,leases:[]});
+      const thinkingProbe = await runtime.execution.execute({
+        code: "const status = await thinking.status(); return {level: status.level, override: status.override ?? null};",
+        context, signal: undefined, parentToolCallId: "thinking-probe", onPartial() {},
+      });
+      expect(thinkingProbe.success, thinkingProbe.error ?? JSON.stringify(thinkingProbe.typeErrors)).toBe(true);
+      expect(thinkingProbe.value).toMatchObject({override: null});
       // Configuration can precede extension discovery. The host knows no device API.
       expect(runtime.components.status("optional-device").state).toBe("waiting");
       expect(runtime.registry.has("devicefixture")).toBe(false);

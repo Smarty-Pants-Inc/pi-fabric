@@ -195,6 +195,11 @@ export const projectFabricAuditArgs = (
       });
     case "fabric.discovery.search":
       return projected(args, (output) => copyNumber(output, args, "limit"));
+    case "fabric.participant.stop":
+      return projected(args, (output) => {
+        copyIdentifier(output, args, "ref");
+        copyIdentifier(output, args, "reason");
+      });
     case "fabric.discovery.describe":
       return projected(args, (output) => copyIdentifier(output, args, "ref"));
     case "fabric.workflow.configure":
@@ -221,6 +226,11 @@ export const projectFabricAuditArgs = (
       });
     case "fabric.workflow.event":
       return projected(args, (output) => copyIdentifier(output, args, "level"));
+    case "fabric.program.run":
+      return projected(args, (output) => {
+        copyString(output, args, "program");
+        copyIdentifier(output, args, "invokedBy");
+      });
     case "fabric.workflow.parallel":
     case "fabric.workflow.pipeline":
       return projected(args, (output) => {
@@ -284,7 +294,8 @@ export const projectFabricAuditArgs = (
 
 /**
  * Results are omitted except for the exact boolean creation outcome emitted by
- * pi.write. No provider details or output text accompany that flag.
+ * pi.write and Fabric's own auto-approval and owned-work stop outcomes. No
+ * provider details or output text accompany them.
  */
 export const projectFabricAuditResult = (
   ref: string,
@@ -301,6 +312,12 @@ export const projectFabricAuditResult = (
       copyIdentifier(output, record, "decision");
       copyIdentifier(output, record, "model");
       copyNumber(output, record, "at");
+    });
+  }
+  if (ref === "fabric.participant.stop") {
+    return projected(record, (output) => {
+      copyIdentifier(output, record, "outcome");
+      copyIdentifier(output, record, "detail");
     });
   }
   if (ref !== "pi.write") return undefined;

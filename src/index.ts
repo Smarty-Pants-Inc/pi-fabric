@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import type { Usage } from "@earendil-works/pi-ai";
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
@@ -1284,6 +1285,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     reloadTargetUiHold,
   });
 }
+=======
+import { createFabricExtension } from "./extension.js";
+export { FABRIC_MANAGED_HOST_VERSION } from "./extension.js";
+export type { FabricManagedHostOptions } from "./managed-host.js";
+export default createFabricExtension(import.meta.url);
+>>>>>>> upstream-v0.105.0
 
 export * from "./audit/index.js";
 export * from "./entropy/index.js";

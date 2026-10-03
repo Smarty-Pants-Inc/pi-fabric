@@ -3,11 +3,22 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+<<<<<<< HEAD
 import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
+=======
+import {
+  writeFileAtomic,
+  encodeOwnerIdentityLine,
+  lockOwnerLiveness,
+  SHORT_LOCK_MAX_HOLD_MS,
+} from "../core/atomic-write.js";
+>>>>>>> upstream-v0.105.0
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
+import type { FabricMessageSender } from "../protocol.js";
+import { processSender } from "../scope.js";
 
 export interface MeshIdentity {
   id: string;
@@ -32,6 +43,53 @@ export interface MeshEvent {
   text?: string;
   data?: unknown;
   createdAt: number;
+  /** Set on events appended through a scoped external grant (`pi-fabric mesh post`). */
+  origin?: "external";
+  untrusted?: true;
+  grantId?: string;
+  /** Set on events released from a pending schedule; the event id is the schedule id. */
+  scheduled?: { dueAt: number; key?: string };
+  /** Host-stamped authority of the publishing process; absent from older builds and grant posts. */
+  sender?: FabricMessageSender;
+}
+
+/** Host-internal append request used inside {@link MeshStore.transact}. */
+export interface MeshAppendInput {
+  id?: string;
+  topic: string;
+  kind?: string;
+  from: MeshIdentity;
+  to?: string;
+  text?: string;
+  data?: unknown;
+  origin?: "external";
+  untrusted?: true;
+  grantId?: string;
+  scheduled?: { dueAt: number; key?: string };
+  sender?: FabricMessageSender;
+  /** A tighter per-event byte ceiling than the store's own. */
+  maxEventBytes?: number;
+}
+
+/** A pending scheduled event; released into its topic log once due. */
+export interface MeshSchedule {
+  id: string;
+  key?: string;
+  topic: string;
+  kind: string;
+  from: MeshIdentity;
+  to?: string;
+  text?: string;
+  data?: unknown;
+  dueAt: number;
+  createdAt: number;
+  /** Stamped when scheduled; carried onto the released event. */
+  sender?: FabricMessageSender;
+}
+
+interface MeshScheduleFile {
+  format: 1;
+  schedules: MeshSchedule[];
 }
 
 export interface MeshTailResult {
@@ -90,6 +148,10 @@ export interface MeshStoreOptions {
 
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
+
+export const validateMeshTopic = (topic: string): void => {
+  if (!TOPIC_PATTERN.test(topic)) throw new Error(`Invalid Fabric mesh topic: ${topic}`);
+};
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 30_000;
 const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
@@ -114,10 +176,17 @@ const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
 const READ_HINT_LINES = 128;
 const CURSOR_OFFSET_BASE = 2 ** 32;
+<<<<<<< HEAD
 /** A tail cursor's live-log generation: it changes when the log is rewritten. */
 export const meshCursorGeneration = (cursor: number): number => Math.floor(cursor / CURSOR_OFFSET_BASE);
 /** The cursor at the start of a generation's log. */
 export const meshCursorAtStart = (generation: number): number => generation * CURSOR_OFFSET_BASE;
+=======
+export const MESH_MAX_PENDING_SCHEDULES = 1_000;
+export const MESH_MAX_SCHEDULE_AHEAD_MS = 366 * 24 * 60 * 60 * 1_000;
+const MAX_SCHEDULE_FILE_BYTES = 16 * 1024 * 1024;
+const SCHEDULE_KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
+>>>>>>> upstream-v0.105.0
 
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -231,6 +300,18 @@ const recoverConcatenatedState = (serialized: string): MeshStateFile | undefined
   }
 
   return start < 0 && documents > 1 ? snapshots.at(-1) : undefined;
+};
+
+const compareSchedules = (left: MeshSchedule, right: MeshSchedule): number =>
+  left.dueAt - right.dueAt || left.createdAt - right.createdAt || left.id.localeCompare(right.id);
+
+const isMeshSchedule = (value: unknown): value is MeshSchedule => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const entry = value as Partial<MeshSchedule>;
+  return typeof entry.id === "string" && typeof entry.topic === "string" &&
+    typeof entry.kind === "string" && typeof entry.from === "object" && entry.from !== null &&
+    Number.isSafeInteger(entry.dueAt) && Number.isSafeInteger(entry.createdAt) &&
+    (entry.key === undefined || typeof entry.key === "string");
 };
 
 const emptyState = (): MeshStateFile => ({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 });
@@ -544,7 +625,14 @@ export class MeshStore {
       generation: string | undefined;
     }
     | undefined;
+<<<<<<< HEAD
   #oldestLive: { identity: string; sequence: number | undefined } | undefined;
+=======
+  readonly #schedulesPath: string;
+  #scheduleCache:
+    | { inode: number; size: number; modifiedAt: number; file: MeshScheduleFile; error?: string }
+    | undefined;
+>>>>>>> upstream-v0.105.0
 
   constructor(
     readonly root: string,
@@ -561,7 +649,13 @@ export class MeshStore {
     this.#counterPath = path.join(root, "sequence");
     this.#generationPath = path.join(root, "generation");
     this.#lockPath = path.join(root, ".lock");
+<<<<<<< HEAD
     this.#signalPath = path.join(root, "state.read-signal.json");
+=======
+    // Pending schedules live beside state.json, outside the verified storage
+    // revision table: they are serialized by this lock, not by key CAS.
+    this.#schedulesPath = path.join(root, "schedules.json");
+>>>>>>> upstream-v0.105.0
     this.#maxEventLogBytes = Math.min(
       CURSOR_OFFSET_BASE - 1,
       Math.max(maxEventBytes + 2, Math.floor(options.maxEventLogBytes ?? DEFAULT_MAX_EVENT_LOG_BYTES)),
@@ -608,9 +702,12 @@ export class MeshStore {
     principal?: FabricPrincipal | undefined;
     /** A function receives the commit time, under the lock (smarty-dev#816). */
     data?: unknown;
+    /** Host-only: publish on behalf of another authority (an actor's scope). */
+    sender?: FabricMessageSender;
   }): Promise<MeshEvent> {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
+<<<<<<< HEAD
     const principal = copyFabricPrincipal(input.principal);
     const stamp = typeof input.data === "function" ? input.data as (createdAt: number) => unknown : undefined;
     const fixedData = stamp || input.data === undefined ? undefined : jsonClone(input.data);
@@ -660,7 +757,247 @@ export class MeshStore {
       if (pending) archive!.commit(pending);
       this.#compactEventLog();
       return event;
+=======
+    const eventData = input.data === undefined ? undefined : jsonClone(input.data);
+    const sender = input.sender ?? processSender();
+    return this.#withLock(() => {
+      // Any write that already holds the lock also releases due schedules first,
+      // so the log keeps due-time order relative to this event. Damaged
+      // schedule state must not block ordinary publishing.
+      try { this.#releaseDueLocked(Date.now()); } catch { /* schedule mutations report it */ }
+      return this.#appendLocked({ ...input, ...(eventData !== undefined ? { data: eventData } : {}), sender });
+>>>>>>> upstream-v0.105.0
     });
+  }
+
+  /**
+   * Host-internal: runs `operation` under the mesh lock with an append
+   * capability, for side stores (grants) that must commit with an event.
+   */
+  async transact<T>(operation: (append: (input: MeshAppendInput) => MeshEvent) => T): Promise<T> {
+    return this.#withLock(() => {
+      try { this.#releaseDueLocked(Date.now()); } catch { /* schedule mutations report it */ }
+      return operation((input) => {
+        this.#validateTopic(input.topic);
+        return this.#appendLocked(input);
+      });
+    });
+  }
+
+  #appendLocked(input: MeshAppendInput): MeshEvent {
+    this.#repairEventLog();
+    const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
+    const event: MeshEvent = {
+      id: input.id ?? randomUUID(),
+      sequence,
+      topic: input.topic,
+      kind: input.kind?.trim() || "message",
+      from: jsonClone(input.from),
+      ...(input.to ? { to: input.to } : {}),
+      ...(input.text !== undefined ? { text: input.text } : {}),
+      ...(input.data !== undefined ? { data: jsonClone(input.data) } : {}),
+      createdAt: Date.now(),
+      ...(input.origin ? { origin: input.origin } : {}),
+      ...(input.untrusted ? { untrusted: true as const } : {}),
+      ...(input.grantId ? { grantId: input.grantId } : {}),
+      ...(input.scheduled ? { scheduled: { ...input.scheduled } } : {}),
+      ...(input.sender ? { sender: jsonClone(input.sender) } : {}),
+    };
+    const line = JSON.stringify(event);
+    const limit = Math.min(this.maxEventBytes, input.maxEventBytes ?? this.maxEventBytes);
+    if (Buffer.byteLength(line, "utf8") > limit) {
+      throw new Error(`Mesh event exceeds ${limit} bytes`);
+    }
+    fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+    atomicWrite(this.#counterPath, sequence);
+    this.#compactEventLog();
+    return event;
+  }
+
+  /**
+   * Stores a pending event released into `topic` once `dueAt` passes. A `key`
+   * replaces any pending schedule with that key in the same locked write, so
+   * concurrent publishers never leave two schedules for one key.
+   */
+  async schedule(input: {
+    topic: string;
+    kind?: string;
+    from: MeshIdentity;
+    to?: string;
+    text?: string;
+    data?: unknown;
+    dueAt: number;
+    key?: string;
+  }, now = Date.now()): Promise<MeshSchedule> {
+    this.#validateTopic(input.topic);
+    if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
+    if (input.key !== undefined && !SCHEDULE_KEY_PATTERN.test(input.key)) {
+      throw new Error(`Invalid Fabric mesh schedule key: ${input.key}`);
+    }
+    if (!Number.isSafeInteger(input.dueAt) || input.dueAt < 0) {
+      throw new Error("Mesh schedule due time must be a nonnegative epoch millisecond integer");
+    }
+    if (input.dueAt > now + MESH_MAX_SCHEDULE_AHEAD_MS) {
+      throw new Error("Mesh schedules may be at most 366 days ahead");
+    }
+    const schedule: MeshSchedule = {
+      id: randomUUID(),
+      ...(input.key !== undefined ? { key: input.key } : {}),
+      topic: input.topic,
+      kind: input.kind?.trim() || "message",
+      from: jsonClone(input.from),
+      ...(input.to ? { to: input.to } : {}),
+      ...(input.text !== undefined ? { text: input.text } : {}),
+      ...(input.data !== undefined ? { data: jsonClone(input.data) } : {}),
+      dueAt: input.dueAt,
+      createdAt: now,
+      sender: processSender(),
+    };
+    // Reject at schedule time what release could never append.
+    const released: MeshEvent = {
+      id: schedule.id, sequence: Number.MAX_SAFE_INTEGER, topic: schedule.topic, kind: schedule.kind,
+      from: schedule.from, ...(schedule.to ? { to: schedule.to } : {}),
+      ...(schedule.text !== undefined ? { text: schedule.text } : {}),
+      ...(schedule.data !== undefined ? { data: schedule.data } : {}),
+      createdAt: Number.MAX_SAFE_INTEGER,
+      scheduled: { dueAt: schedule.dueAt, ...(schedule.key !== undefined ? { key: schedule.key } : {}) },
+      ...(schedule.sender ? { sender: schedule.sender } : {}),
+    };
+    if (Buffer.byteLength(JSON.stringify(released), "utf8") > this.maxEventBytes) {
+      throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
+    }
+    return this.#withLock(() => {
+      const file = this.#readSchedules(false);
+      const pending = file.schedules.filter((entry) => input.key === undefined || entry.key !== input.key);
+      if (pending.length >= MESH_MAX_PENDING_SCHEDULES) {
+        throw new Error(`At most ${MESH_MAX_PENDING_SCHEDULES} mesh schedules may be pending`);
+      }
+      pending.push(schedule);
+      this.#writeSchedules(pending);
+      this.#releaseDueLocked(now);
+      return jsonClone(schedule);
+    });
+  }
+
+  /** Removes the pending schedule with `key`, if any. */
+  async unschedule(key: string): Promise<{ removed: boolean }> {
+    if (!SCHEDULE_KEY_PATTERN.test(key)) throw new Error(`Invalid Fabric mesh schedule key: ${key}`);
+    return this.#withLock(() => {
+      const file = this.#readSchedules(false);
+      const pending = file.schedules.filter((entry) => entry.key !== key);
+      if (pending.length === file.schedules.length) return { removed: false };
+      this.#writeSchedules(pending);
+      return { removed: true };
+    });
+  }
+
+  /** Pending schedules by due time; a due one stays listed until a releaser appends it. */
+  scheduled(input: { topic?: string; limit?: number } = {}): MeshSchedule[] {
+    if (input.topic !== undefined) this.#validateTopic(input.topic);
+    const limit = Math.max(1, Math.min(Math.floor(input.limit ?? 100), MESH_MAX_PENDING_SCHEDULES));
+    return this.#readSchedules(true).schedules
+      .filter((entry) => input.topic === undefined || entry.topic === input.topic)
+      .sort(compareSchedules)
+      .slice(0, limit)
+      .map((entry) => jsonClone(entry));
+  }
+
+  /** Earliest pending due time, read without the lock (one stat when unchanged). */
+  nextScheduleDueAt(): number | undefined {
+    let next: number | undefined;
+    for (const entry of this.#readSchedules(true).schedules) {
+      if (next === undefined || entry.dueAt < next) next = entry.dueAt;
+    }
+    return next;
+  }
+
+  /**
+   * Appends every due schedule to its topic and removes it, under the mesh
+   * lock, so concurrent releasers (monitors, resident hosts, CLI posts) append
+   * each schedule once. The lock is taken only when something is due.
+   */
+  async releaseDueSchedules(now = Date.now()): Promise<MeshEvent[]> {
+    const next = this.nextScheduleDueAt();
+    if (next === undefined || next > now) return [];
+    return this.#withLock(() => this.#releaseDueLocked(now));
+  }
+
+  #releaseDueLocked(now: number): MeshEvent[] {
+    if (!fs.existsSync(this.#schedulesPath)) return [];
+    const file = this.#readSchedules(false);
+    const due = file.schedules.filter((entry) => entry.dueAt <= now).sort(compareSchedules);
+    if (due.length === 0) return [];
+    const released: MeshEvent[] = [];
+    const releasedIds = new Set<string>();
+    try {
+      // Events first, then the shrunken schedule file: a crash in between
+      // re-releases with the same event id (at-least-once, dedupe by id).
+      for (const entry of due) {
+        released.push(this.#appendLocked({
+          id: entry.id,
+          topic: entry.topic,
+          kind: entry.kind,
+          from: entry.from,
+          ...(entry.to ? { to: entry.to } : {}),
+          ...(entry.text !== undefined ? { text: entry.text } : {}),
+          ...(entry.data !== undefined ? { data: entry.data } : {}),
+          scheduled: { dueAt: entry.dueAt, ...(entry.key !== undefined ? { key: entry.key } : {}) },
+          // Older schedules stay unstamped: the releasing host never lends its own authority.
+          ...(entry.sender ? { sender: entry.sender } : {}),
+        }));
+        releasedIds.add(entry.id);
+      }
+    } finally {
+      if (releasedIds.size > 0) {
+        this.#writeSchedules(file.schedules.filter((entry) => !releasedIds.has(entry.id)));
+      }
+    }
+    return released;
+  }
+
+  #readSchedules(lenient: boolean): MeshScheduleFile {
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(this.#schedulesPath);
+    } catch (error) {
+      this.#scheduleCache = undefined;
+      if (errorCode(error) === "ENOENT") return { format: 1, schedules: [] };
+      throw error;
+    }
+    // Locked mutations always re-read; the stat-keyed cache serves only lockless reads.
+    const cached = lenient ? this.#scheduleCache : undefined;
+    if (cached && cached.inode === stat.ino && cached.size === stat.size && cached.modifiedAt === stat.mtimeMs) {
+      return cached.error === undefined ? cached.file : { format: 1, schedules: [] };
+    }
+    let file: MeshScheduleFile = { format: 1, schedules: [] };
+    let damage: string | undefined;
+    try {
+      if (stat.size > MAX_SCHEDULE_FILE_BYTES) throw new Error(`exceeds ${MAX_SCHEDULE_FILE_BYTES} bytes`);
+      const parsed = JSON.parse(fs.readFileSync(this.#schedulesPath, "utf8")) as Partial<MeshScheduleFile>;
+      if (parsed?.format !== 1 || !Array.isArray(parsed.schedules) || !parsed.schedules.every(isMeshSchedule)) {
+        throw new Error("invalid format");
+      }
+      file = { format: 1, schedules: parsed.schedules };
+    } catch (error) {
+      damage = error instanceof Error ? error.message : String(error);
+    }
+    this.#scheduleCache = {
+      inode: stat.ino, size: stat.size, modifiedAt: stat.mtimeMs, file, ...(damage !== undefined ? { error: damage } : {}),
+    };
+    if (damage === undefined) return file;
+    // Reads tolerate damage; mutations refuse to overwrite it silently.
+    if (lenient) return { format: 1, schedules: [] };
+    throw new Error(`Failed to read Fabric mesh schedules: ${damage}`);
+  }
+
+  #writeSchedules(schedules: MeshSchedule[]): void {
+    if (schedules.length === 0) {
+      fs.rmSync(this.#schedulesPath, { force: true });
+      this.#scheduleCache = undefined;
+      return;
+    }
+    atomicWrite(this.#schedulesPath, { format: 1, schedules }, MAX_SCHEDULE_FILE_BYTES);
+    this.#scheduleCache = undefined;
   }
 
   read(
@@ -1585,6 +1922,7 @@ export class MeshStore {
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     const releaseOwned = (): void => {
       try {
+<<<<<<< HEAD
         if (fs.readFileSync(ownerPath, "utf8") === ownerRecord) {
           // Detach the complete owned directory before unlinking anything inside it.
           // Interrupted/resumed recursive cleanup must never follow the canonical name.
@@ -1657,6 +1995,13 @@ export class MeshStore {
             fs.rmSync(staging, { recursive: true, force: true });
           }
         }
+=======
+        fs.mkdirSync(this.#lockPath, { mode: 0o700 });
+        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n${encodeOwnerIdentityLine()}\n`, {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+>>>>>>> upstream-v0.105.0
         break;
       } catch (error) {
         const code = errorCode(error);
@@ -1691,6 +2036,7 @@ export class MeshStore {
   // Torn/corrupt receipts and nonempty unrecorded directories remain protected.
   async #clearStaleLock(ownerPath: string): Promise<boolean> {
     try {
+<<<<<<< HEAD
       const stat = fs.lstatSync(this.#lockPath);
       if (!stat.isDirectory()) return false;
       const readOwner = (): string | undefined => {
@@ -1712,6 +2058,28 @@ export class MeshStore {
         fs.mkdirSync(fence, { recursive: true, mode: 0o700 });
         try { fs.writeFileSync(path.join(fence, ".recovery-fence"), "1\n", { flag: "wx", mode: 0o600 }); }
         catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
+=======
+      owner = fs.readFileSync(ownerPath, "utf8");
+    } catch {
+      try {
+        lockModifiedAt = fs.statSync(this.#lockPath).mtimeMs;
+      } catch {
+        return false;
+      }
+    }
+    if (owner !== undefined) {
+      const [, pidText, createdText, identityLine] = owner.trim().split("\n");
+      const createdAt = Number(createdText);
+      if (Number.isFinite(createdAt) && Date.now() - createdAt <= this.#staleLockMs) return false;
+      // Unknown (another PID namespace within the hold ceiling) is not death.
+      if (lockOwnerLiveness(Number(pidText), createdAt, identityLine, {
+        legacyAlive: processAlive,
+        maxHoldMs: Math.max(SHORT_LOCK_MAX_HOLD_MS, this.#staleLockMs),
+      }) !== "dead") return false;
+      try {
+        if (fs.readFileSync(ownerPath, "utf8") !== owner) return false;
+        fs.rmSync(this.#lockPath, { recursive: true, force: true });
+>>>>>>> upstream-v0.105.0
         return true;
       }
       const fields = owner.split("\n");
@@ -1866,7 +2234,7 @@ export class MeshStore {
   }
 
   #validateTopic(topic: string): void {
-    if (!TOPIC_PATTERN.test(topic)) throw new Error(`Invalid Fabric mesh topic: ${topic}`);
+    validateMeshTopic(topic);
   }
 
   #validateKey(key: string): void {

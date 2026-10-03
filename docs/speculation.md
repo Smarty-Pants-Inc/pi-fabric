@@ -74,7 +74,8 @@ ActionRegistry.invoke()          serve-or-reexecute at the real call site
    refs that are `risk: "read"` with `effect.kind: "none"`, never prompt for
    approval, and cost nothing when wasted (`pi.read`/`grep`/`find`/`ls`,
    `memory.recall`/`expand`/`sessions`, `state.get`/`history`/`complexity`,
-   `schema.status`, `compact.status`, `components.list`/`status`/`graph`).
+   `schema.status`, `compact.status`, `thinking.status`, `decisions.list`,
+   `programs.list`/`get`, `components.list`/`status`/`graph`).
    The gate re-runs against the resolved descriptor at launch, so a provider
    or config change that reclassifies a ref closes speculation off.
 2. **Freshness, not staleness.** A stored promise is served only when both

@@ -62,6 +62,8 @@ interface FabricAgentRequest {
   runner?: FabricAgentRunner;
   transport?: FabricTransport;
   model?: string;
+  /** Required and non-blank when explicitly selecting cliproxyapi/gpt-6-astra. */
+  modelReason?: string;
   persona?: string;
   thinking?: FabricThinking;
   tools?: string[];
@@ -302,6 +304,8 @@ interface FabricRemoteControlResult {
   acknowledged: true;
 }
 interface FabricAgentResult extends FabricAgentHandle {
+  /** Caller-supplied model justification, retained on the run record. */
+  modelReason?: string;
   /** Resolution marker (alias name or closest); does not replace the observed model. */
   via?: string;
   /** Canonical launch selection when via is present; may differ from observed model. */
@@ -699,6 +703,8 @@ interface FabricActorRequestBase {
   activationFilter?: FabricActorActivationFilter;
   runner?: FabricAgentRunner;
   model?: string;
+  /** Required and non-blank when explicitly selecting cliproxyapi/gpt-6-astra. */
+  modelReason?: string;
   thinking?: FabricThinking;
   tools?: string[];
   transport?: FabricTransport;

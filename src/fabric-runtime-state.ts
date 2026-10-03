@@ -84,6 +84,7 @@ import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
+import { rootParticipantName } from "./topology/participant-name.js";
 import type {
   FabricParticipantInfo,
   FabricParticipantListOptions,
@@ -722,6 +723,10 @@ export class FabricRuntimeState {
       projectRoot,
       hostId,
       identityId: identity.id,
+      ...(ownsPersistentActorRegistry ? { completionRecipient: () => ({
+        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.()), role: participantRole(),
+        startedAt: mainAgent.info(context).startedAt ?? Date.now(),
+      }) } : {}),
       spawnerSessionId: sessionId,
       retention: this.#config.retention,
       ...(this.#paths
@@ -768,12 +773,14 @@ export class FabricRuntimeState {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publishBackground(event);
       },
-      // Spool until consumption or handoff, independently of notification policy.
-      onSettled: (result) => {
+      // Retain terminal results until consumption, for both Main residency and actor children.
+      onSettled: (result, admittedRecipient) => {
+        this.#residency?.enqueueCompletion(result, admittedRecipient);
         if (actorChildStore && actorSpawner) actorChildStore.enqueue(result, actorSpawner, agentConfig.notifyOnComplete);
       },
-      onBackgroundComplete: (result) => {
-        completionInbox.enqueue(result,
+      onBackgroundComplete: (result, admittedRecipient) => {
+        if (this.#residency) this.#residency.enqueueCompletion(result, admittedRecipient);
+        else completionInbox.enqueue(result,
           actorChildStore ? () => actorChildStore.acknowledge(result.id) : undefined,
           actorChildStore ? () => actorChildStore.prepareLive(result.id) : undefined);
       },
@@ -789,6 +796,8 @@ export class FabricRuntimeState {
       },
       onResultConsumed: (id) => {
         completionInbox.acknowledge(id);
+        // The manager certifies logical settlement: fence even a temporarily failed journal save.
+        this.#residency?.acknowledgeCompletion(id, true);
         try { actorChildStore?.discard(id); } catch { /* Cleanup must not turn a returned outcome into a wait failure. */ }
         markStoppedDelivered(id);
       },
@@ -905,6 +914,8 @@ export class FabricRuntimeState {
             sessionId,
             cwd: context.cwd,
             projectRoot,
+            mainName: rootParticipantName(this.pi.getSessionName?.()),
+            mainStartedAt: mainAgent.info(context).startedAt ?? Date.now(),
             ...(participantRole() ? { role: participantRole()! } : {}),
             project: participantProject(context.cwd),
             meshRoot,
@@ -934,6 +945,7 @@ export class FabricRuntimeState {
           onBackgroundComplete: (result, delivered) => completionInbox.enqueue(result, delivered),
           onResultConsumed: (id) => completionInbox.acknowledge(id),
           piModelState,
+          mainName: () => rootParticipantName(this.pi.getSessionName?.()),
           ...(this.#paths ? { hostPath: this.#paths.residentHost } : {}),
         })
       : undefined;

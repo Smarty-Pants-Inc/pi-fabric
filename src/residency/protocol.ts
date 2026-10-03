@@ -332,6 +332,9 @@ export interface ResidentHostConfig {
   sessionId: string;
   cwd: string;
   projectRoot: string;
+  /** Current host-owned Main name; each admitted run snapshots it in its launch manifest. */
+  mainName?: string;
+  mainStartedAt?: number;
   /** The root's fleet role; only a project agent's hosts adopt a project's orphans (smarty-dev#878). */
   role?: string;
   /** The root's project (participantProject), which can differ from its cwd's (smarty-dev#977). */

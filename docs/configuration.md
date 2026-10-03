@@ -550,7 +550,9 @@ Sessions that share one `mesh.root` share one participant directory, so each see
 `mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing
 store. Protocol 1 keeps the B68 canonical-directory mkdir and three-line token/PID/time
-wire, but publishes its owner exclusively and verifies the canonical directory/record
+wire without an incarnation: if a dead holder's PID is reused by a live process, v1
+protects the receipt and can time out until trusted repair after fencing all writers/cleaners.
+It publishes its owner exclusively and verifies the canonical directory/record
 before entering the critical section. An initializer whose canonical directory has been
 replaced aborts with `FABRIC_MESH_LOCK_OWNERSHIP_LOST` rather than overwriting a successor.
 Protocol 2 uses fully initialized private-directory publication. Both require the complete
@@ -564,7 +566,11 @@ Fresh ownerless directories, empty/torn/corrupt owner files and nonempty unrecor
 directories fail closed; recorded live owners never expire. Unrecoverable unrecorded
 orphans need trusted repair after all possible writers/cleaners are fenced out. Immediate
 proven-dead-holder recovery, retained recovery receipts and bounded jitter/backoff remain.
-These safeguards do not repair old B68 binaries still running on the root. There is no environment fallback,
+These safeguards do not repair old B68 binaries still running on the root. Even on
+protocol 1, claiming this new-only safety boundary requires fencing every older capable
+writer/cleaner and preventing respawn or later resumption. Rollback needs the same
+boundary or isolated roots; changing the protocol default alone is not a migration.
+There is no environment fallback,
 runtime marker, transition guard or hot reload for this selector.
 
 Keep `1` for compatibility with B68 writers. Protocol 2 activation is deferred to the

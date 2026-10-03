@@ -90,6 +90,21 @@ describe("routing fixture process lifetime", () => {
 });
 
 describe("shadow model routing", () => {
+  it("keeps derived metadata on queued and host-stopped task receipts", async () => {
+    const dir = root();
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: true }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"),
+    }); managers.push(manager);
+    const blocker = await manager.spawn({ task: "HANG", transport: "process", protected: true });
+    const request = { task: "review security status-groom", transport: "process" as const, protected: false };
+    const queued = await manager.spawn(request);
+    expect(queued).toMatchObject({ status: "queued", routeClass: "task:pi:process", routeClassSource: "derived", protected: false });
+    request.protected = true; // The accepted receipt must retain its admission snapshot.
+    expect(await manager.stop(queued.id)).toMatchObject({ status: "stopped", routeClass: "task:pi:process", routeClassSource: "derived", protected: false });
+    expect(await manager.stop(blocker.id)).toMatchObject({ status: "stopped", routeClass: "task:pi:process", routeClassSource: "derived", protected: true });
+    expect(JSON.parse(fs.readFileSync(path.join(dir, "runs", blocker.id, "status.json"), "utf8")))
+      .toMatchObject({ routeClass: "task:pi:process", routeClassSource: "derived", protected: true });
+  });
   it.each([true, undefined, null, "review", "security", "audit", "needs-security-pass", "unknown", "false"])("excludes protected or unknown before Jev: %s", async protectedFlag => {
     const evaluate = vi.fn(async () => response());
     const result = await decideModelRoute({ ...input, protected: protectedFlag }, evaluate);
@@ -250,6 +265,9 @@ describe("durable route dispatch", () => {
     expect(launch).toHaveBeenCalledTimes(1);
     expect(result.status).toBe("failed");
     expect(result.error).toContain("MODEL_ROUTE_PIN_MISMATCH");
+    expect(result).toMatchObject({ routeClass: "bounded-lookup", routeClassSource: "explicit" });
+    expect(JSON.parse(fs.readFileSync(path.join(dir, "runs", result.id, "status.json"), "utf8")))
+      .toMatchObject({ routeClass: "bounded-lookup", routeClassSource: "explicit" });
     const rows = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null });
   }, 30000);
@@ -522,7 +540,7 @@ describe("durable route dispatch", () => {
   it("preserves explicit routing configuration and never creates a default role pin", () => {
     expect(normalizeFabricConfig({}).agents.modelRouting).toBeUndefined();
     expect(normalizeFabricConfig({ agents: { modelRouting: { pinModel: pin.model, pinThinking: pin.effort, shadowCandidates: [cheap] } } }).agents.modelRouting)
-      .toEqual({ pinModel: pin.model, pinThinking: pin.effort, shadowCandidates: [cheap] });
+      .toEqual({ live: false, pinModel: pin.model, pinThinking: pin.effort, shadowCandidates: [cheap] });
     expect(() => normalizeFabricConfig({ agents: { modelRouting: { shadowCandidates: [{ model: "bad", effort: "bogus" }] } } })).toThrow("Invalid agents.modelRouting");
   });
 });

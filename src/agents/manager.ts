@@ -2011,6 +2011,16 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
+    // On POSIX too, the worker can publish terminal status before exiting.
+    // Explicit cleanup must join that bounded obligation, not treat the result
+    // as exit proof or expose the incidental file/close ordering as a failure.
+    if (managed.transport.kind === "process") {
+      await this.#waitForTransportExit(managed);
+      await this.#noteUnconfirmedExit(managed);
+      if (managed.lostContact) {
+        throw new Error(`Cannot clean up agent ${id}: worker exit is unconfirmed (${managed.lostContact})`);
+      }
+    }
     const exitVeto = runTreeExitVeto(managed.runDirectory, 0, undefined, true);
     if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
     if (!this.#canCollect(managed)) {

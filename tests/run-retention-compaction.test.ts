@@ -46,6 +46,44 @@ describe("six-hour terminal run compaction", () => {
     expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), retentionMs: 7 * 24 * HOUR, now: 4 * HOUR + 7 * 24 * HOUR })).toEqual([run]);
   });
 
+  it.each([
+    [1024, 1000, 1],
+    [1024, 1024, 1],
+    [256 * 1024, 8190, 32],
+    [256 * 1024, 8192, 32],
+  ])("preserves a near-limit unmarked log byte-for-byte (cap=%i, eventBytes=%i, count=%i)", (cap, eventBytes, count) => {
+    const { run } = make();
+    const event = JSON.stringify({ text: "x".repeat(eventBytes - Buffer.byteLength('{"text":""}\n')) }) + "\n";
+    expect(Buffer.byteLength(event)).toBe(eventBytes);
+    const file = path.join(run, "events.jsonl"); fs.writeFileSync(file, event.repeat(count));
+    const before = snapshot(run); const directoryMtime = fs.statSync(run).mtimeMs;
+    const changes: unknown[] = [];
+    const options = { now, terminalRunEventsMaxBytes: cap, onCompact: (change: unknown) => changes.push(change) };
+    expect(compactTerminalRunEvents(run, { ...options, dryRun: true })).toBe(false);
+    expect(snapshot(run)).toEqual(before);
+    expect(compactTerminalRunEvents(run, options)).toBe(false);
+    expect(snapshot(run)).toEqual(before);
+    expect(fs.statSync(run).mtimeMs).toBe(directoryMtime);
+    expect(changes).toEqual([]);
+  });
+
+  it("compacts exactly 201 events even when bytes fit, then is idempotent", () => {
+    const { run } = make();
+    const file = path.join(run, "events.jsonl");
+    const events = Array.from({ length: 201 }, (_, sequence) => JSON.stringify({ sequence }) + "\n");
+    fs.writeFileSync(file, events.join(""));
+    const before = snapshot(run);
+    expect(compactTerminalRunEvents(run, { now, dryRun: true })).toBe(true);
+    expect(snapshot(run)).toEqual(before);
+    expect(compactTerminalRunEvents(run, { now })).toBe(true);
+    const lines = fs.readFileSync(file, "utf8").trim().split("\n");
+    expect(JSON.parse(lines[0]!)).toMatchObject({ fabricTruncated: true });
+    expect(lines.slice(1).join("\n") + "\n").toBe(events.slice(1).join(""));
+    const after = snapshot(run);
+    expect(compactTerminalRunEvents(run, { now })).toBe(false);
+    expect(snapshot(run)).toEqual(after);
+  });
+
   it("also compacts a closed managed one-shot root before its unchanged deletion age", () => {
     const { root, run } = make();
     const managed = path.join(root, FABRIC_RUN_ROOT_PREFIX + "closed");

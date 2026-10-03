@@ -437,8 +437,10 @@ export const compactTerminalRunEvents = (
       const opened = fs.fstatSync(fd);
       if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size ||
           opened.mtimeMs !== stat.mtimeMs) return false;
-      // One look-behind byte lets an exactly aligned final line survive the boundary.
-      const length = Math.min(stat.size, maxBytes - EVENT_TAIL_MARKER.length + 1);
+      // Establish whether the original satisfies both limits before reserving
+      // marker bytes. Reading at most the cap preserves near-limit unmarked logs
+      // and still includes the look-behind needed for the smaller marked tail.
+      const length = Math.min(stat.size, maxBytes);
       tail = Buffer.alloc(length);
       let read = 0;
       while (read < length) {
@@ -464,9 +466,17 @@ export const compactTerminalRunEvents = (
       }
     }
     // A full unmarked log of <=200 events, or our already bounded tail, is a no-op.
-    if (retained.length === stat.size ||
+    if (stat.size <= maxBytes && (retained.length === stat.size ||
         (tail.length === stat.size && stat.size === EVENT_TAIL_MARKER.length + retained.length &&
-         tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER))) return false;
+         tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)))) return false;
+    // Truncation is now known to be necessary. Reserve the marker's space and
+    // drop only complete prefix lines; look behind by one byte so an exactly
+    // aligned final event is kept. An oversized final event leaves only a marker.
+    const eventBytes = maxBytes - EVENT_TAIL_MARKER.length;
+    if (retained.length > eventBytes) {
+      const newline = retained.indexOf(0x0a, retained.length - eventBytes - 1);
+      retained = newline < 0 ? Buffer.alloc(0) : retained.subarray(newline + 1);
+    }
     const checked = ownedStat(file);
     if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
         checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||

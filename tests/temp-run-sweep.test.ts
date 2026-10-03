@@ -107,12 +107,14 @@ describe("configured detached temp sweep", () => {
   it("does not skip compaction younger than six hours when a shorter age is configured", async () => {
     const tempRoot = temp(); const finishedAt = Date.now() - 2 * HOUR;
     const { run } = seed(tempRoot, finishedAt);
+    // Compare the filesystem timestamp, not the input rounded through utimes.
+    const mtime = fs.statSync(run).mtimeMs;
     const request = { tempRoot, orphanedTempRunRetentionMs: 48 * HOUR, oneShotRunRetentionMs: 48 * HOUR,
       terminalRunEventsAgeMs: HOUR, terminalRunEventsMaxBytes: 1024 };
     const [runtime, ...args] = await scriptSpawnArgs(entry, [JSON.stringify(request)]);
     const result = childProcess.spawnSync(runtime!, args, { encoding: "utf8", timeout: 20_000 });
     expect(result.status, result.stderr).toBe(0);
     expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(1024);
-    expect(fs.statSync(run).mtimeMs).toBe(finishedAt);
+    expect(fs.statSync(run).mtimeMs).toBe(mtime);
   });
 });

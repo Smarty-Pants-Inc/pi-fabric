@@ -37,6 +37,23 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     const rows = route ? fs.readFileSync(path.join(root,"agent/fabric/model-routing.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
     return { result, rows, launch, events, pin };
   };
+  it("R3 cleanup joins a process that publishes its terminal result before exiting", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-exit-")); roots.push(root);
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/terminal-before-exit-worker.mjs"), runRoot: path.join(root, "runs"),
+    }); managers.push(manager);
+    const result = await manager.run({ task: "terminal-before-exit", transport: "process", extensions: false });
+    expect(result.status).toBe("completed");
+    const pid = Number(result.sessionId);
+    expect(Number.isSafeInteger(pid)).toBe(true);
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    const directory = manager.runDirectory(result.id)!;
+    expect(fs.existsSync(directory)).toBe(true);
+    await manager.cleanup(result.id);
+    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    expect(fs.existsSync(directory)).toBe(false);
+  });
+
   it("R3 real-Pi routed worktree uses native tool cwd and committed worktree contents, not parent edits", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-real-cwd-")); roots.push(root);
     const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe" });

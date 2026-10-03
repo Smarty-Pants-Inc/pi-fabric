@@ -65,10 +65,10 @@ describe("warm mesh bridge idle state cost (smarty-dev#2854)", () => {
       bridgeReads += count;
       if (tick % 20 !== 0) expect(count).toBe(0);
     }
-    // Only the two due presence passes read state: six canonical reads each, not eight
+    // Only the two due presence passes read state: three canonical reads each, not eight
     // full-state parses per tick (plus another eight when filtered pages move the cursor).
     expect(bridgeReads / 10).toBeLessThanOrEqual(1.2);
-    expect(presence).toHaveBeenCalledTimes(4); // observation + mirror preflight, every five seconds
+    expect(presence).toHaveBeenCalledTimes(2); // observation only; mirror preflight uses its locked snapshot
     expect(owned).not.toHaveBeenCalled();
     if (traffic) expect(commits).toBe(30);
   }, 20_000);

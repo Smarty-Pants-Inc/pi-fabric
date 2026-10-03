@@ -24,14 +24,14 @@ import { processStartTime, residentProcessAlive } from "../src/residency/process
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const fixture = () => {
+const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-host-review-"));
   const config: ResidentHostConfig = {
     format: RESIDENT_HOST_FORMAT, rootId: "session:review", sessionId: "review",
     cwd: process.cwd(), projectRoot: process.cwd(), meshRoot: path.join(root, "mesh"),
     actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
     fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh,
-    retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("dist/agents/worker.js"),
+    retention: { ...DEFAULT_FABRIC_CONFIG.retention, ...retention }, workerPath: path.resolve("dist/agents/worker.js"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
   fs.mkdirSync(config.residencyRoot);
@@ -314,10 +314,17 @@ describe("resident loaded-path census metadata", () => {
 });
 
 describe("resident retention config reload", () => {
-  it("applies a same-release client reload to an already-running host's next sweep without replacing its owner", async () => {
-    const { root, config, host } = fixture();
-    // Do not mutate the shared defaults, and leave the host's initial config immutable.
-    config.retention = { ...config.retention };
+  it.each([
+    { change: "age threshold", initial: { terminalRunEventsAgeMs: 12 * 60 * 60 * 1000, terminalRunEventsMaxBytes: 128 * 1024 },
+      reloaded: { terminalRunEventsAgeMs: 6 * 60 * 60 * 1000 } },
+    { change: "byte cap", initial: { terminalRunEventsMaxBytes: 512 * 1024 },
+      reloaded: { terminalRunEventsMaxBytes: 128 * 1024 } },
+  ])("applies a same-release client reload to an already-running host's next sweep without replacing its owner ($change)", async ({ initial, reloaded }) => {
+    // The streamed first sweep must genuinely retain this fixture: unlike the
+    // former startup sweep, it runs after the log is created. Set the initial
+    // policy before constructing the host, which takes its own shared copy.
+    const { root, config, host } = fixture(initial);
+    const initialRetention = { ...config.retention };
     let client: ResidencyClient | undefined;
     try {
       await host.start();
@@ -325,33 +332,42 @@ describe("resident retention config reload", () => {
       const owner = fs.readFileSync(ownerPath, "utf8");
       const run = path.join(config.residencyRoot, "runs", "reload-retention");
       fs.mkdirSync(run, { recursive: true });
-      const log = Buffer.from((JSON.stringify({ text: "x".repeat(100) }) + "\n").repeat(3000));
+      // Stay below the 200-line tail limit so the byte-cap case tests only bytes.
+      const log = Buffer.from((JSON.stringify({ text: "x".repeat(3000) }) + "\n").repeat(100));
       const status = JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647",
         finishedAt: Date.now() - 8 * 60 * 60 * 1000 });
       fs.writeFileSync(path.join(run, "status.json"), status);
       fs.writeFileSync(path.join(run, "events.jsonl"), log);
       fs.writeFileSync(path.join(run, "reply.json"), '{"text":"keep"}');
-      await delay(150);
+      // Observe a completed production scan, not merely elapsed wall time.
+      await vi.waitFor(() => expect(fs.existsSync(path.join(config.residencyRoot, "request-retention.json"))).toBe(true));
       expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(log);
       // The real reload creates a new client; ensureHost publishes desired config and reuses the owner.
-      const next = { ...config, retention: { ...config.retention,
-        terminalRunEventsAgeMs: 6 * 60 * 60 * 1000, terminalRunEventsMaxBytes: 128 * 1024 } };
+      // Each case changes only one threshold, making stale policy observable.
+      const next = { ...config, retention: { ...config.retention, ...reloaded } };
       client = new ResidencyClient({ config: next, mesh: host.mesh, participants: host.participants,
         mainAgent: { local: false } as FabricMainAgentTarget });
       expect((await client.ensureHost()).pid).toBe(process.pid);
       // Advance only the sample clock; keep the real host poll and its production 5-ms transaction.
       const due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
       const nativeSweep = ResidentRequestRetention.prototype.sweep;
+      const policies: Array<ResidentRequestRetention["retention"]> = [];
       const sweep = vi.spyOn(ResidentRequestRetention.prototype, "sweep").mockImplementation(function (this: ResidentRequestRetention, now, ...args) {
+        policies.push({ ...this.retention });
         return nativeSweep.call(this, now + 60_001, ...args);
       });
       const deadline = Date.now() + 2500;
       while (fs.statSync(path.join(run, "events.jsonl")).size > 128 * 1024 && Date.now() < deadline) await delay(10);
+      expect(sweep).toHaveBeenCalled();
+      expect(sweep.mock.calls.every(call => call[2] === 5)).toBe(true);
+      expect(policies).toContainEqual({ ...next.retention, retainRuns: config.agents.retainRuns });
       due.mockRestore(); sweep.mockRestore();
       expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(128 * 1024);
+      expect(config.retention).toEqual(initialRetention);
       expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(status);
       expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep"}');
       expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      expect(DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsAgeMs).toBe(6 * 60 * 60 * 1000);
       expect(DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsMaxBytes).toBe(256 * 1024);
     } finally {
       vi.restoreAllMocks(); await client?.close(); await host.close();

@@ -15,6 +15,24 @@ import { RESIDENT_REQUEST_RETENTION_MS } from "../src/residency/request-expiry.j
 import { readResidentRequestDecision, registerResidentCancellation, residentRoot, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { MeshStore } from "../src/mesh/store.js";
+
+// A native session Main owns the caller binding independently of the resident executor.
+const mainParticipants = (config: ResidentHostConfig) => {
+  const identity = { id: config.rootId, name: "live Main", kind: "main" as const, sessionId: config.sessionId };
+  const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+  const participants = new ParticipantDirectory(mesh, {
+    enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false,
+  });
+  participants.registerSource(() => [{
+    format: 1, id: identity.id, rootId: identity.id, kind: "root", name: identity.name, status: "idle",
+    ownerHostId: identity.id, ownerIdentityId: identity.id, sessionId: identity.sessionId,
+    runner: "pi", transport: "host", capabilities: ["fabric"], controlProtocol: "v1",
+    startedAt: Date.now(), updatedAt: Date.now(),
+  }]);
+  return participants;
+};
 
 const waitFor = async (predicate: () => boolean) => {
   const deadline = Date.now() + 5_000;
@@ -35,6 +53,7 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
   };
   const host = new ResidentHost(config);
+  const participants = mainParticipants(config);
   let client: ResidencyClient | undefined;
   let control: FabricControlPlane | undefined;
   let scanTime: number | undefined;
@@ -48,8 +67,9 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
   let due: ReturnType<typeof vi.spyOn> | undefined;
   const remove = vi.spyOn(fs, "rmSync");
   try {
+    await participants.start();
     await host.start();
-    client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+    client = new ResidencyClient({ config, mesh: host.mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
     control = new FabricControlPlane(host.mesh, { id: rootId, name: "main", kind: "main" },
       { enabled: true, hostId: rootId, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
     control.start(() => ({ accepted: false }));
@@ -114,7 +134,7 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     // Every run belongs to this isolated fixture. Join them even if setup failed
     // before the original writer ID was observed; actor close alone can await a detached run.
     for (const run of host.agents?.listForUi() ?? []) await host.agents.stop(run.id);
-    await control?.close(); await client?.close(); await host.close();
+    await control?.close(); await client?.close(); await host.close(); await participants.close();
     vi.restoreAllMocks();
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -143,6 +163,7 @@ it.skipIf(process.platform === "win32").each([
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
   };
   let host = new ResidentHost(config);
+  const participants = mainParticipants(config);
   let client: ResidencyClient | undefined;
   let control: FabricControlPlane | undefined;
   let scanTime: number | undefined;
@@ -155,8 +176,9 @@ it.skipIf(process.platform === "win32").each([
   let due: ReturnType<typeof vi.spyOn> | undefined;
   const remove = vi.spyOn(fs, "rmSync");
   try {
+    await participants.start();
     await host.start();
-    client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+    client = new ResidencyClient({ config, mesh: host.mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
     control = new FabricControlPlane(host.mesh, { id: rootId, name: "main", kind: "main" },
       { enabled: true, hostId: rootId, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
     control.start(() => ({ accepted: false }));
@@ -237,7 +259,7 @@ it.skipIf(process.platform === "win32").each([
       await host.start(); // Acquires a new owner fence; scans previous owner's runs.
       expect(fs.existsSync(runDirectory)).toBe(true); // Startup cannot erase ownership before maintenance.
       expect(fs.existsSync(child.statusFile)).toBe(true);
-      client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+      client = new ResidencyClient({ config, mesh: host.mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
       const before = scans;
       scanTime = (scanTime ?? 0) + 60_001;
       due.mockReturnValue(true);
@@ -284,7 +306,7 @@ it.skipIf(process.platform === "win32").each([
       const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { pid: number };
       await waitFor(() => !processAlive(child.pid));
     }
-    await control?.close(); await client?.close(); await host.close();
+    await control?.close(); await client?.close(); await host.close(); await participants.close();
     vi.restoreAllMocks();
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -309,10 +331,12 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
   git("init", "-q"); git("config", "user.name", "Pi Fabric tests"); git("config", "user.email", "pi-fabric-tests@example.invalid");
   fs.writeFileSync(path.join(root, "README.md"), "fixture repository\n"); git("add", "README.md"); git("commit", "-qm", "initial");
   let host = new ResidentHost(config);
+  const participants = mainParticipants(config);
   let client: ResidencyClient | undefined;
   try {
+    await participants.start();
     await host.start();
-    client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+    client = new ResidencyClient({ config, mesh: host.mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
     const handle = await client.spawnAgent({
       task: JSON.stringify({ primaryCrashPath: crash, nestedReleasePath: release, nestedObservationPath: observation, primaryTerminalFailure: true }),
       residency: "durable", transport: "process", recursive: true, worktree: true,
@@ -330,7 +354,7 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
     await client.close(); await host.close();
     for (const file of [run, child.statusFile, metadata, result]) expect(fs.existsSync(file), file).toBe(true);
     if (owner === "replacement") { host = new ResidentHost(config); await host.start(); }
-    client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+    client = new ResidencyClient({ config, mesh: host.mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
     const join = vi.spyOn(host.agents, "join");
     const committed = () => fs.readdirSync(path.join(config.residencyRoot, "decisions"))
       .map(name => JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "decisions", name), "utf8")))
@@ -366,7 +390,7 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
       const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { pid: number };
       await waitFor(() => !processAlive(child.pid));
     }
-    await client?.close(); await host.close(); vi.restoreAllMocks();
+    await client?.close(); await host.close(); await participants.close(); vi.restoreAllMocks();
     fs.rmSync(root, { recursive: true, force: true });
   }
 }, 30_000);
@@ -375,6 +399,9 @@ it("retention ownership uses checked orphan exit evidence, not terminal status, 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-orphan-writer-retention-"));
   const runs = path.join(root, "runs");
   const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, { runRoot: runs });
+  // These are ownership assertions, not elapsed-time assertions. A loaded host can
+  // exceed the conservative 5ms scan budget; exercise that veto explicitly below.
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0);
   const record = (id: string, actorId: string, sessionId: string, transport = "process") => {
     const run = path.join(runs, id);
     fs.mkdirSync(run, { recursive: true, mode: 0o700 });
@@ -404,9 +431,10 @@ it("retention ownership uses checked orphan exit evidence, not terminal status, 
     fs.mkdirSync(path.join(runs, "unknown"));
     expect(manager.retentionReferences().has("*")).toBe(true);
     fs.rmSync(path.join(runs, "unknown"), { recursive: true });
-    const clock = vi.spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(10);
-    try { expect(manager.retentionReferences().has("*")).toBe(true); } finally { clock.mockRestore(); }
+    clock.mockReturnValueOnce(0).mockReturnValue(10);
+    expect(manager.retentionReferences().has("*")).toBe(true);
   } finally {
+    clock.mockRestore();
     await manager.close();
     fs.rmSync(root, { recursive: true, force: true });
   }

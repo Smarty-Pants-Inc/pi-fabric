@@ -1,3 +1,4 @@
+import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
 import { randomUUID } from "node:crypto";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
@@ -32,6 +33,8 @@ import {
   acknowledgeResidentResponse,
   residentCommandForOwner,
   ResidentActorAuthorizationError,
+  assertResidentTaskCaller,
+  type ResidentTaskCaller,
   ResidentCommandUnsupportedError,
   assertResidentCommandSupported,
   prepareResidentCreationCommand,
@@ -155,6 +158,7 @@ export class ResidencyClient {
   readonly #responsesPath: string;
   readonly #agentsPath: string;
   readonly #inheritedToolAllowlist = readChildToolAllowlist();
+  readonly #spawnPolicy = snapshotTaskReturnAddress(undefined, undefined, undefined);
   readonly #deliveryPrefix: string;
   readonly #hostPath: string;
   #deliveryTimer: NodeJS.Timeout | undefined;
@@ -438,6 +442,19 @@ export class ResidencyClient {
   }
 
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
+    // Capture at the public call from the host-owned participant, never from request fields.
+    // Snapshot policy at runtime construction, before a task can change ambient state.
+    const self = this.options.participants.self();
+    const caller: ResidentTaskCaller = {
+      id: self.id, rootId: self.rootId, sessionId: self.sessionId ?? "",
+      ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind,
+      returnAddress: {
+        spawnerId: self.id, spawnerSessionId: self.sessionId ?? "",
+        ancestors: [...new Set([...this.#spawnPolicy.ancestors, this.options.config.rootId])],
+        escalationTargets: [...this.#spawnPolicy.escalationTargets],
+      },
+    };
+    assertResidentTaskCaller(caller, self, this.options.config.rootId);
     // Explicit keys are checked against the loaded owner before dispatch.
     const { idempotencyKey, ...spawnRequest } = request;
     const resolvedRequest = spawnRequest.cwd === undefined
@@ -451,11 +468,12 @@ export class ResidencyClient {
     const response = await this.#command(
       {
         format: RESIDENT_HOST_FORMAT,
-        operation: "spawn",
+        operation: "spawnBound",
         ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
         requestId: randomUUID(),
         rootId: this.options.config.rootId,
         request: { ...resolvedRequest, ...(tools ? { tools } : {}), residency: "durable" },
+        caller,
         createdAt: Date.now(),
       },
       signal,
@@ -463,8 +481,8 @@ export class ResidencyClient {
     if (!response.handle) throw new Error("Fabric resident host returned no agent handle");
     await this.#waitForParticipant(response.handle.id, "agent", signal).catch((error) => {
       throw new ResidentOutcomeUnknownError({
-        format: RESIDENT_HOST_FORMAT, operation: "spawn", requestId: response.requestId,
-        rootId: this.options.config.rootId, request, createdAt: Date.now(),
+        format: RESIDENT_HOST_FORMAT, operation: "spawnBound", requestId: response.requestId,
+        rootId: this.options.config.rootId, request, caller, createdAt: Date.now(),
       }, { requestId: response.requestId, state: "committed", id: response.handle!.id, ownerHostId: this.hostId }, error, signal);
     });
     return response.handle;
@@ -709,7 +727,7 @@ export class ResidencyClient {
             }
             throw new Error(response.error ?? "Fabric resident host rejected request");
           }
-          if ((command.operation === "spawn" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
+          if ((command.operation === "spawnBound" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
             throw new Error("Fabric resident host returned no created entity");
           }
           return response;

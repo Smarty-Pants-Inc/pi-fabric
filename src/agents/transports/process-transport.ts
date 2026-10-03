@@ -5,6 +5,7 @@ import type {
 } from "../types.js";
 import { spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
+import { applyTaskReturnAddress } from "../task-return-address.js";
 
 export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
@@ -20,9 +21,12 @@ export class ProcessTransport implements AgentTransportAdapter {
       request.cwd,
       request,
       // Worker arguments are flag/value pairs. A flag-shaped value is not an
-      // actor identity; explicit actors alone retain the parent's role env.
-      request.workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-name")
-        ? { ...process.env } : taskAgentEnvironment(),
+      // actor identity; explicit actor ids alone retain the parent's role env.
+      applyTaskReturnAddress(
+        request.workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id")
+          ? { ...process.env } : taskAgentEnvironment(),
+        request.workerArguments,
+      ),
     );
     return {
       kind: this.kind,

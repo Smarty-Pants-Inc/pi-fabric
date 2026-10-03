@@ -99,6 +99,7 @@ const routing = () => {
     validateDirectMessage: vi.fn<Ports[1]["validateDirectMessage"]>(),
     tell: vi.fn<Ports[1]["tell"]>(), ask: vi.fn<Ports[1]["ask"]>(), stop: vi.fn<Ports[1]["stop"]>(),
     steerRemote: vi.fn<Ports[1]["steerRemote"]>(), resolveBinding: vi.fn<Ports[1]["resolveBinding"]>(),
+    resolveActivationBinding: vi.fn<Ports[1]["resolveActivationBinding"]>(async () => ({})),
   };
   const main = {
     id: "main", local: true, matches: (id: string) => id === "main",

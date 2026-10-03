@@ -138,7 +138,7 @@ describe("shared run-tree exit veto", () => {
     const grandchild = path.join(child, "nested", "grandchild");
     const veto = () => runTreeExitVeto(run, 0, undefined, true);
     writeStatus(child, { status: "completed", transport: "process", sessionId: String(process.pid) });
-    expect(veto()).toMatch(/descendant worker may still be running/);
+    expect(veto()).toMatch(/exit is unconfirmed:.*descendant worker may still be running/);
     for (const sessionId of [undefined, "", "0", "-1", "not-a-pid", "9007199254740993"]) {
       writeStatus(child, { status: "completed", transport: "process", sessionId });
       expect(veto()).toMatch(/unknown descendant identity/);

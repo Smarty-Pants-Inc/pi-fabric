@@ -124,7 +124,7 @@ export const runTreeExitVeto = (
       const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
         ? Number(record.sessionId) : undefined;
       if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return "worker exit is unconfirmed: unknown descendant identity";
-      if (processAlive(pid)) return `its descendant worker may still be running (${directory})`;
+      if (processAlive(pid)) return `worker exit is unconfirmed: its descendant worker may still be running (${directory})`;
     }
     if (record?.transport === "process") {
       if (!record.status || !TERMINAL_STATUSES.has(record.status)) {

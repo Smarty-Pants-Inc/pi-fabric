@@ -91,7 +91,13 @@ describe("#2479 durable caller classes", () => {
 
   it.each(["commit", "abandon"])("persists the immutable resident %s fence before acknowledging it", (decision) => {
     const directory = root(), events = observe();
-    const command = { format: 1, requestId: "request", operation: "spawn", rootId: identity.id, createdAt: 1, request: { task: "audit" } } as ResidentCommand;
+    const command = {
+      format: 1, requestId: "request", operation: "spawnBound", rootId: identity.id, createdAt: 1, request: { task: "audit" },
+      caller: {
+        id: identity.id, rootId: identity.id, sessionId: "audit", ownerHostId: "host", ownerIdentityId: identity.id, kind: "root",
+        returnAddress: { spawnerId: identity.id, spawnerSessionId: "audit", ancestors: [identity.id], escalationTargets: [] },
+      },
+    } satisfies ResidentCommand;
     if (decision === "commit") commitResidentRequest(directory, command, "agent", "host");
     else abandonResidentRequest(path.join(directory, "requests"), path.join(directory, "responses"), command.requestId);
     expectPublished(events, path.join(directory, "decisions", "request.json"), "link");

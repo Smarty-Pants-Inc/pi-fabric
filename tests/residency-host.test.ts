@@ -160,11 +160,24 @@ describe("resident tracked result preservation", () => {
     config.agents = { ...config.agents, budgetUsd: 0 };
     config.piModels = { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" };
     const host = new ResidentHost(config, vi.fn());
+    // Public spawn needs a live session caller, not the hidden resident executor.
+    const callerIdentity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+    const callerMesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    const callerParticipants = new ParticipantDirectory(callerMesh, {
+      enabled: true, hostId: config.rootId, rootId: config.rootId, identity: callerIdentity,
+    });
+    callerParticipants.registerSource(() => [{
+      format: 1, id: config.rootId, rootId: config.rootId, kind: "root", name: "Main", status: "idle",
+      ownerHostId: config.rootId, ownerIdentityId: config.rootId, sessionId: config.sessionId,
+      runner: "pi", transport: "host", capabilities: ["fabric"], controlProtocol: "v1",
+      startedAt: Date.now(), updatedAt: Date.now(),
+    }]);
     let client: ResidencyClient | undefined;
     const write = vi.spyOn(atomic, "writeJsonAtomic");
     try {
+      await callerParticipants.start();
       await host.start();
-      client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+      client = new ResidencyClient({ config, mesh: callerMesh, participants: callerParticipants, mainAgent: { local: false } as FabricMainAgentTarget });
       await new ResidentActorClient(config.meshRoot, config.rootId).actors(AbortSignal.timeout(5_000));
       const handle = await client.spawnAgent({ task: "audit", transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
       await host.agents.wait(handle.id, { timeoutMs: 5_000 });
@@ -176,7 +189,7 @@ describe("resident tracked result preservation", () => {
       }
       const receipts = write.mock.calls.filter(([, value]) => typeof value === "object" && value !== null && "completionConsumedAt" in value);
       expect(receipts.length).toBeGreaterThan(0);
-    } finally { await client?.close(); await host.close(); write.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { await client?.close(); await host.close(); await callerParticipants.close(); write.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
   }, 15_000);
   it.each(["native", "win32-injected"] as const)("releases the host fence and closes delivery/participant work even if agent close fails (%s)", async (platformCase) => {
     const { root, config, host } = fixture();

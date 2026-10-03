@@ -601,6 +601,9 @@ export class ResidentHost {
     this.#requestRetention.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
     const actorsClosed = this.actors?.close();
+    // Admissions may themselves await model preparation or a stop joining a
+    // relaunch. Cancel preparation now; keep worker teardown in its order below.
+    this.agents?.beginClose();
     while (this.#pollingRequests || this.#admissions) await delay(10);
     await this.participants?.quiesce().catch(() => undefined);
     await this.lifecycle?.close().catch(() => undefined);

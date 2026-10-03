@@ -1186,6 +1186,86 @@ describe("AgentManager", () => {
     ).toBe("2");
   });
 
+  it.each(["stop", "caller abort"] as const)("D12 cancels hung relaunch preparation on %s without a late worker", async (operation) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const prepare = vi.fn(async (model: string | undefined) => {
+      if (prepare.mock.calls.length === 2) await gate;
+      return model;
+    });
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root, preparePiModel: prepare,
+    });
+    managers.push(manager);
+    const caller = new AbortController();
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    let stopping: Promise<AgentRunResult> | undefined;
+    try {
+      const handle = await manager.spawn({ task: "Recover startup", model: "test/retry", transport: "process" }, caller.signal);
+      await vi.waitFor(() => expect(prepare).toHaveBeenCalledTimes(2), { timeout: 10_000 });
+      if (operation === "caller abort") { caller.abort(); stopping = manager.wait(handle.id); }
+      else stopping = manager.stop(handle.id);
+      let settled = false;
+      void stopping.then(() => { settled = true; });
+      await vi.waitFor(() => expect(settled).toBe(true), { timeout: 1_000 });
+      await stopping;
+      expect(manager.runningCount()).toBe(0);
+      expect(launch).toHaveBeenCalledTimes(1);
+      // The cancelled preparation must neither poison same-model admission nor
+      // retain the only native permit, even while its underlying promise hangs.
+      const next = await manager.spawn({ task: "Reject startup", model: "test/retry", transport: "process" });
+      await manager.wait(next.id);
+      expect(prepare).toHaveBeenCalledTimes(3);
+      release();
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(launch).toHaveBeenCalledTimes(2);
+      expect(fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "startup-attempts"), "utf8")).toBe("1");
+    } finally { release(); await stopping; launch.mockRestore(); }
+  });
+
+  it("D12 still joins a replacement whose creation was already attempted", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    let releaseHandle!: () => void;
+    let releaseStop!: () => void;
+    const handleGate = new Promise<void>(resolve => { releaseHandle = resolve; });
+    const stopGate = new Promise<void>(resolve => { releaseStop = resolve; });
+    const launch = ProcessTransport.prototype.launch;
+    const replacementStop = vi.fn();
+    let attempts = 0;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const attempt = ++attempts;
+      const transport = await launch.call(this, request);
+      if (attempt === 2) {
+        replacementStop.mockImplementation(async () => { await stopGate; await transport.stop(); });
+        await handleGate;
+        return { ...transport, stop: replacementStop };
+      }
+      return transport;
+    });
+    let stopping: Promise<AgentRunResult> | undefined;
+    try {
+      const handle = await manager.spawn({ task: "Recover startup", transport: "process" });
+      await vi.waitFor(() => expect(attempts).toBe(2), { timeout: 10_000 });
+      let settled = false;
+      stopping = manager.stop(handle.id).then(result => { settled = true; return result; });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(settled, "an attempted worker still owes its handle join").toBe(false);
+      releaseHandle();
+      await vi.waitFor(() => expect(replacementStop).toHaveBeenCalledOnce());
+      expect(settled, "the replacement still owes its stop join").toBe(false);
+      releaseStop();
+      await stopping;
+      expect(attempts).toBe(2);
+      expect(manager.runningCount()).toBe(0);
+    } finally { releaseHandle(); releaseStop(); await stopping; spy.mockRestore(); }
+  });
   it.skipIf(process.platform === "win32")("3238 pins the first Pi artifact across a startup retry when its launcher symlink moves", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launch-pin-"));
     roots.push(root);

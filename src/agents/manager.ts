@@ -299,6 +299,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   settlement?: Promise<void>;
   /** A replacement worker may exist before its transport handle returns. */
   relaunching?: Promise<boolean>;
+  /** Cancel preparation only; an attempted replacement still owes its custody join. */
+  relaunchAbort: AbortController;
   transport: AgentTransportHandle;
   adapter: AgentTransportAdapter;
   launch: AgentTransportLaunch;
@@ -1427,6 +1429,7 @@ export class AgentManager {
           lastLivenessCheckAt: 0,
           resumeAttempts: 0,
           stopRequested: false,
+          relaunchAbort: new AbortController(),
           observedProgress: {
             turns: 0,
             toolCalls: 0,
@@ -1969,6 +1972,7 @@ export class AgentManager {
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
     managed.stopRequested = true;
+    managed.relaunchAbort.abort();
     if (managed.settled) {
       // A terminal result can be published just before native worker close.
       // Explicit process stop still owes its caller that exit join.
@@ -2243,9 +2247,14 @@ export class AgentManager {
     if (obligations()) throw new Error("Agent release quiescence changed while checking workers");
   }
 
-  close(): Promise<void> {
+  /** Fence/cancel launch preparation before a host waits for control admissions. */
+  beginClose(): void {
     this.#closing = true;
     this.#closeAbort.abort(new Error("Fabric agent manager is closing"));
+  }
+
+  close(): Promise<void> {
+    this.beginClose();
     return this.#closePromise ??= this.#close();
   }
 
@@ -2583,7 +2592,10 @@ export class AgentManager {
   ): Promise<boolean> {
     try {
       if (managed.runner === "pi") {
-        const model = await this.prepareModelForAdmission(managed.routePin?.model ?? managed.model, managed.runner, undefined, Boolean(managed.routePin));
+        const model = await this.prepareModelForAdmission(
+          managed.routePin?.model ?? managed.model, managed.runner, undefined, Boolean(managed.routePin),
+          AbortSignal.any([managed.relaunchAbort.signal, this.#closeAbort.signal]),
+        );
         if (managed.routePin) setWorkerArgument(managed.launch.workerArguments, "thinking", managed.routePin.effort);
         const modelIndex = managed.launch.workerArguments.indexOf("--model");
         if (model) {
@@ -2694,6 +2706,7 @@ export class AgentManager {
       this.#invalidateUiList();
       return true;
     } catch (error) {
+      if (managed.relaunchAbort.signal.aborted || this.#closing) return false;
       const retryError = error instanceof Error ? error.message : String(error);
       try {
         fs.appendFileSync(

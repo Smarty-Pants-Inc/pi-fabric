@@ -332,7 +332,7 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     expect(run(good).status).toBe(125); // legacy name-only grants are malformed
   });
 
-  it.each(["resolve", "reject"] as const)("S2: generated TMPDIR is retained until the operation's exit is confirmed (%s)", async outcome => {
+  it.each(["resolve", "reject"] as const)("S2: generated TMPDIR is retained without confirmed process-group custody (%s)", async outcome => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-s2-"));
     roots.push(root);
     vi.stubEnv("TMPDIR", "/tmp");
@@ -347,13 +347,39 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     confinement.close(); // shell store closed / job aborted; launch still unresolved
     expect(confinement.pendingOperations).toBe(1);
     expect(fs.existsSync(confinement.tmpdir)).toBe(true);
-    if (outcome === "resolve") {
-      settle({ exitCode: 0 }); await execution;
-      expect(fs.existsSync(confinement.tmpdir)).toBe(false);
-    } else {
-      fail(new Error("abort acknowledged, exit unknown")); await expect(execution).rejects.toThrow();
-      expect(fs.existsSync(confinement.tmpdir)).toBe(true);
-    }
+    // Foreign operations never report a process group: a resolved exit is not quiescence.
+    if (outcome === "resolve") { settle({ exitCode: 0 }); await execution; }
+    else { fail(new Error("abort acknowledged, exit unknown")); await expect(execution).rejects.toThrow(); }
+    expect(confinement.pendingOperations).toBe(0);
+    expect(fs.existsSync(confinement.tmpdir)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(`${confinement.tmpdir}.custody`, "utf8")).unconfirmed).toBe(true);
+  });
+
+  it("S2 r4: the next session's bounded sweep removes only confirmed-quiescent retained temps", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-sweep-"));
+    roots.push(root);
+    vi.stubEnv("TMPDIR", "/tmp");
+    vi.spyOn(os, "tmpdir").mockReturnValue(root);
+    const retained = (name: string, record: Record<string, unknown>) => {
+      const dir = path.join(root, `pi-fabric-landlock-${name}`);
+      fs.mkdirSync(dir, { mode: 0o700 }); fs.writeFileSync(path.join(dir, "data"), "x");
+      const stat = fs.statSync(dir, { bigint: true });
+      // An ended owner: no live process has this start time.
+      fs.writeFileSync(`${dir}.custody`, JSON.stringify({ host: process.pid, hostStart: -1, since: 0,
+        dev: String(stat.dev), ino: String(stat.ino), groups: [], unconfirmed: false, ...record }));
+      return dir;
+    };
+    const live = spawnSync("sh", ["-c", "sleep 30 >/dev/null 2>&1 & echo $!"], { encoding: "utf8" });
+    const livePid = Number(live.stdout.trim());
+    try {
+      const done = retained("done00", {});
+      const unknown = retained("unk000", { unconfirmed: true });
+      const owned = retained("own000", { hostStart: undefined }); // owner identity unknown
+      const busy = retained("busy00", { groups: [Number(fs.readFileSync(`/proc/${livePid}/stat`, "utf8").split(") ")[1]!.split(" ")[2])] });
+      new LandlockBashConfinement(root).close();
+      expect(fs.existsSync(done)).toBe(false); expect(fs.existsSync(`${done}.custody`)).toBe(false);
+      for (const kept of [unknown, owned, busy]) expect(fs.readFileSync(path.join(kept, "data"), "utf8")).toBe("x");
+    } finally { process.kill(livePid, "SIGKILL"); }
   });
 
   it("S1 r2: a grant absent at first enforced use is never admitted later (dangling cache alias)", async () => {
@@ -410,6 +436,41 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     expect(fs.existsSync(temp)).toBe(true); // descendant still sleeping
     await vi.waitFor(() => expect(fs.existsSync(temp)).toBe(false), { timeout: 8000 });
   }, 15_000);
+
+  it.each(["in-group", "setsid"] as const)("S2 r4: a sanitized-env worker holding only an absolute temp pathname keeps the generated TMPDIR (%s)", async variant => {
+    const h = harness();
+    vi.stubEnv("TMPDIR", "/tmp"); // not private: Fabric generates its own temp
+    vi.spyOn(os, "tmpdir").mockReturnValue(h.root);
+    // Review trigger: no TMPDIR in env, cwd outside, no fd under the temp; the input is only
+    // named in argv and opened after the shell returned and the provider closed.
+    const launch = variant === "setsid" ? "setsid -f env -i" : "env -i";
+    const result = await h.invoke({ command: `d="$TMPDIR"; printf input > "$d/input"; cd /; ${launch} /bin/sh -c 'sleep 1.5; cat "$1" > "$2"; sleep 1' worker "$d/input" "$d/result" </dev/null >/dev/null 2>&1 & printf "%s" "$d"` });
+    const temp = result.output.trim();
+    expect(path.dirname(temp)).toBe(h.root);
+    await h.registry.close();
+    expect(fs.readFileSync(path.join(temp, "input"), "utf8")).toBe("input");
+    await vi.waitFor(() => expect(fs.readFileSync(path.join(temp, "result"), "utf8")).toBe("input"), { timeout: 5000 });
+    expect(fs.existsSync(temp)).toBe(true); // worker still sleeping
+    await vi.waitFor(() => expect(fs.existsSync(temp)).toBe(false), { timeout: 8000 });
+  }, 15_000);
+
+  it("S2 r4: unreadable process state is unresolved, never absence", async () => {
+    const h = harness();
+    vi.stubEnv("TMPDIR", "/tmp");
+    vi.spyOn(os, "tmpdir").mockReturnValue(h.root);
+    const temp = (await h.invoke({ command: 'printf "%s" "$TMPDIR"' })).output.trim();
+    const read = fs.readFileSync;
+    const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (typeof file === "string" && /^\/proc\/\d+\/status$/.test(file)) {
+        throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      }
+      return (read as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.readFileSync);
+    await h.registry.close();
+    expect(fs.existsSync(temp)).toBe(true); // incomplete visibility: retained
+    spy.mockRestore();
+    await vi.waitFor(() => expect(fs.existsSync(temp)).toBe(false), { timeout: 5000 });
+  });
 
   it("F2: a host kill-switch flip reaches already-active lanes on their next call; project cannot override", async () => {
     const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-host-"));

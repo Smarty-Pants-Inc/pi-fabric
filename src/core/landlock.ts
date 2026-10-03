@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -54,31 +55,179 @@ const pinPath = (expanded: string): PinnedGrant | undefined => {
 };
 const sameGrant = (a: PinnedGrant, b: PinnedGrant): boolean =>
   a.real === b.real && a.dev === b.dev && a.ino === b.ino;
+const LEDGER = ".custody";
+const SWEEP_LIMIT = 16;
+interface Ledger {
+  host: number; hostStart: number | undefined; since: number;
+  dev: string; ino: string; groups: number[]; unconfirmed: boolean;
+}
+
+const code = (error: unknown): string | undefined => (error as NodeJS.ErrnoException).code;
+/** Process start in clock ticks since boot (field 22 of /proc/<pid>/stat). */
+const startTicks = (pid: number): number | undefined => {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]);
+  } catch { return undefined; }
+};
+/** Now, in the same unit, minus a one-second margin (USER_HZ is 100 on Linux). */
+const bootTicks = (): number =>
+  Math.floor(Number(fs.readFileSync("/proc/uptime", "utf8").split(" ")[0]) * 100) - 100;
+/** Only ESRCH confirms a process group is gone; EPERM or success means it may live. */
+const groupGone = (pgid: number): boolean => {
+  try { process.kill(-pgid, 0); return false; }
+  catch (error) { return code(error) === "ESRCH"; }
+};
+
 /**
- * S2: a resolved shell result proves only that the shell exited, not that its
- * background descendants stopped. True while any process of ours still inherits
- * the generated TMPDIR or has its cwd/root/an open descriptor under it.
- * Unreadable process state counts as held (never delete under a live child).
+ * S2: a resolved shell result proves only that the shell exited. The generated TMPDIR
+ * is releasable only with confirmed quiescence: every launched process group is gone
+ * (kill(-pgid, 0) == ESRCH) AND no process of ours can still be a confined descendant
+ * or a holder. The native helper sets no_new_privs, which every confined descendant
+ * inherits and cannot clear (also across setsid): any same-uid no_new_privs process
+ * started since the confinement began is a possible descendant that escaped its group,
+ * so it holds. Processes without that marker are provably not confined descendants;
+ * they still hold when they inherit the TMPDIR or have cwd/root/an fd under it.
+ * Inspection failures other than "exited" are unresolved, never absence.
  */
-const tmpHeld = (exported: string, real: string): boolean => {
+const quiescent = (exported: string, real: string, since: number, groups: Iterable<number>): boolean => {
+  for (const pgid of groups) if (!groupGone(pgid)) return false;
   let pids: string[];
   try { pids = fs.readdirSync("/proc").filter(name => /^\d+$/.test(name) && Number(name) !== process.pid); }
-  catch { return true; }
+  catch { return false; }
   const marker = Buffer.from(`\0TMPDIR=${exported}\0`);
+  const uid = process.getuid!();
   const under = (link: string): boolean => {
     try { const target = fs.readlinkSync(link); return within(target, real) || within(target, exported); }
-    catch { return false; }
+    catch (error) { if (code(error) === "ENOENT") return false; throw error; }
   };
   for (const pid of pids) {
     const base = `/proc/${pid}`;
     try {
-      if (fs.statSync(base).uid !== process.getuid!()) continue;
-      if (Buffer.concat([Buffer.from("\0"), fs.readFileSync(`${base}/environ`)]).includes(marker)) return true;
-      if (under(`${base}/cwd`) || under(`${base}/root`)) return true;
-      for (const fd of fs.readdirSync(`${base}/fd`)) if (under(`${base}/fd/${fd}`)) return true;
-    } catch { /* exited while scanning, or not inspectable: not ours to wait for */ }
+      if (fs.statSync(base).uid !== uid) continue; // a confined child cannot change uid (no_new_privs)
+      const status = fs.readFileSync(`${base}/status`, "utf8");
+      const nnp = /^NoNewPrivs:\s*(\d)/m.exec(status)?.[1];
+      if (nnp === undefined) return false;
+      if (nnp === "1") {
+        const started = startTicks(Number(pid));
+        if (started === undefined) { if (fs.existsSync(base)) return false; continue; }
+        if (started >= since) return false; // possible confined descendant, in or out of its group
+      }
+      try {
+        if (Buffer.concat([Buffer.from("\0"), fs.readFileSync(`${base}/environ`)]).includes(marker)) return false;
+        if (under(`${base}/cwd`) || under(`${base}/root`)) return false;
+        for (const fd of fs.readdirSync(`${base}/fd`)) if (under(`${base}/fd/${fd}`)) return false;
+      } catch (error) {
+        // Not a confined descendant (no marker above): an unreadable unrelated process
+        // (e.g. a non-dumpable agent) cannot hold a pathname-only future use for us.
+        if (nnp === "1" && code(error) !== "ENOENT" && code(error) !== "ESRCH") return false;
+      }
+    } catch (error) {
+      if (code(error) === "ENOENT" || code(error) === "ESRCH") continue; // exited while scanning
+      return false; // unreadable state is unresolved
+    }
   }
-  return false;
+  return true;
+};
+
+/**
+ * Next-session sweep: bounded, and it applies the same two checks to temps retained by an
+ * ended session. A live owner, an unconfirmed launch, or any doubt keeps the directory.
+ */
+const sweep = (parent: string, own: string): void => {
+  let names: string[];
+  try { names = fs.readdirSync(parent).filter(name => /^pi-fabric-landlock-[^/]+\.custody$/.test(name)); }
+  catch { return; }
+  for (const name of names.slice(0, SWEEP_LIMIT)) {
+    const ledger = path.join(parent, name);
+    const dir = ledger.slice(0, -LEDGER.length);
+    if (dir === own) continue;
+    try {
+      const fd = fs.openSync(ledger, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      let record: Ledger;
+      try {
+        if (fs.fstatSync(fd).uid !== process.getuid!()) continue;
+        record = JSON.parse(fs.readFileSync(fd, "utf8")) as Ledger;
+      } finally { fs.closeSync(fd); }
+      if (record.unconfirmed || !Array.isArray(record.groups) || typeof record.since !== "number") continue;
+      if (record.hostStart === undefined || startTicks(record.host) === record.hostStart) continue; // owner alive
+      let stat: fs.BigIntStats | undefined;
+      try { stat = fs.lstatSync(dir, { bigint: true }); }
+      catch (error) { if (code(error) === "ENOENT") { fs.rmSync(ledger, { force: true }); continue; } throw error; }
+      if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== BigInt(process.getuid!())
+        || String(stat.dev) !== record.dev || String(stat.ino) !== record.ino) continue;
+      if (!quiescent(dir, fs.realpathSync(dir), record.since, record.groups.map(Number))) continue;
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(ledger, { force: true });
+    } catch { /* unknown: keep */ }
+  }
+};
+
+type Launch = (command: string, cwd: string, options: Parameters<BashOperations["exec"]>[2],
+  onGroup: (pgid: number) => void) => Promise<{ exitCode: number | null }>;
+const launchers = new WeakMap<BashOperations, Launch>();
+const foreground = new Set<number>();
+let exitHook = false;
+
+/**
+ * Pi's local shell backend semantics (detached = setsid, so the shell leads a new process
+ * group whose id is its pid; timeout/abort kill the whole group; exit + idle stdio grace),
+ * but the host keeps the kernel-reported group id instead of trusting a pid file.
+ */
+export const groupOperations = (shell: string, args: string[]): BashOperations => {
+  const launch: Launch = async (command, cwd, { onData, signal, timeout, env }, onGroup) => {
+    if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) {
+      throw new Error("Invalid timeout: must be a finite number of seconds");
+    }
+    if (signal?.aborted) throw new Error("aborted");
+    try { await fs.promises.access(cwd); }
+    catch { throw new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`); }
+    if (!exitHook) {
+      exitHook = true; // as Pi does for its tracked detached children
+      process.once("exit", () => { for (const pgid of foreground) try { process.kill(-pgid, "SIGKILL"); } catch { /* gone */ } });
+    }
+    const child = spawn(shell, [...args, command], { cwd, detached: true, env, stdio: ["ignore", "pipe", "pipe"] });
+    const pgid = child.pid;
+    if (pgid) { onGroup(pgid); foreground.add(pgid); }
+    const kill = (): void => {
+      if (!pgid) return;
+      try { process.kill(-pgid, "SIGKILL"); } catch { try { process.kill(pgid, "SIGKILL"); } catch { /* gone */ } }
+    };
+    let timedOut = false;
+    const timer = timeout === undefined ? undefined : setTimeout(() => { timedOut = true; kill(); }, timeout * 1000);
+    if (signal) signal.addEventListener("abort", kill, { once: true });
+    try {
+      const exitCode = await new Promise<number | null>((resolve, reject) => {
+        let exited = false; let status: number | null = null; let open = 2; let settled = false;
+        let grace: NodeJS.Timeout | undefined;
+        const done = (): void => {
+          if (settled) return;
+          settled = true; clearTimeout(grace);
+          child.stdout.destroy(); child.stderr.destroy();
+          resolve(status);
+        };
+        const idle = (): void => { clearTimeout(grace); grace = setTimeout(done, 100); };
+        for (const stream of [child.stdout, child.stderr]) {
+          stream.on("data", (data: Buffer) => { onData(data); if (exited) idle(); });
+          stream.once("end", () => { if (--open === 0 && exited) done(); });
+        }
+        child.once("error", error => { if (!settled) { settled = true; clearTimeout(grace); reject(error); } });
+        child.once("exit", exitStatus => { exited = true; status = exitStatus; if (open === 0) done(); else idle(); });
+        child.once("close", exitStatus => { status ??= exitStatus; done(); });
+      });
+      if (signal?.aborted) throw new Error("aborted");
+      if (timedOut) throw new Error(`timeout:${timeout}`);
+      const signalCode = child.signalCode;
+      return { exitCode: exitCode ?? (signalCode ? 128 + (os.constants.signals[signalCode] ?? 0) : 1) };
+    } finally {
+      if (pgid) foreground.delete(pgid);
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", kill);
+    }
+  };
+  const operations: BashOperations = { exec: (command, cwd, options) => launch(command, cwd, options, () => {}) };
+  launchers.set(operations, launch);
+  return operations;
 };
 
 /** Loaded only for the first enforced local bash call, never at registration. */
@@ -95,7 +244,11 @@ export class LandlockBashConfinement {
   readonly #pins = new Map<string, PinnedGrant | undefined>();
   /** S2: confined/escaped operations whose exit is not confirmed by the operations API. */
   #pending = 0;
-  #unresolved = false;
+  /** Process groups of every launched command; release needs each one gone (ESRCH). */
+  readonly #groups = new Set<number>();
+  /** A launch whose process group is unknown (escape, foreign operations): never auto-delete. */
+  #unconfirmed = false;
+  readonly #since = bootTicks();
   #closed = false;
   #recheck: NodeJS.Timeout | undefined;
 
@@ -118,6 +271,10 @@ export class LandlockBashConfinement {
     this.#tmpdir = privateTmp ? supplied! : fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-landlock-"));
     if (this.#ownsTmp) fs.chmodSync(this.#tmpdir, 0o700);
     this.#tmpPin = pinPath(this.#tmpdir)!;
+    if (this.#ownsTmp) {
+      this.#ledger(fs.constants.O_EXCL);
+      sweep(path.dirname(this.#tmpdir), this.#tmpdir); // retained temps of earlier sessions
+    }
     // Pin every session-stable grant now, from trusted host state. Later calls
     // never re-credit a pathname a confined command may have replaced.
     for (const entry of this.#entries()) {
@@ -127,42 +284,72 @@ export class LandlockBashConfinement {
     }
   }
 
-  /** Release the generated temp only after every associated shell exit is confirmed. */
+  /** Release the generated temp only with confirmed quiescence; otherwise retain it. */
   close(): void {
     this.#closed = true;
     this.#release();
   }
 
   #release(): void {
-    if (!this.#closed || !this.#ownsTmp || this.#pending > 0 || this.#unresolved) return;
+    if (!this.#closed || !this.#ownsTmp || this.#pending > 0) return;
+    // Unknown process-group custody: never delete (the ledger also bars the sweep).
+    if (this.#unconfirmed) { clearInterval(this.#recheck); this.#recheck = undefined; return; }
     // Identity discipline for cleanup too: remove only the directory we created.
     let stat: fs.BigIntStats | undefined;
     try { stat = fs.lstatSync(this.#tmpdir, { bigint: true }); } catch { /* already gone */ }
     if (!stat || stat.isSymbolicLink() || stat.dev !== this.#tmpPin.dev || stat.ino !== this.#tmpPin.ino) {
       clearInterval(this.#recheck); this.#recheck = undefined; return;
     }
-    // A resolved shell is not quiescence: retain while a descendant still uses
-    // the temp and re-check; if this process exits first, the temp is retained.
-    if (tmpHeld(this.#tmpdir, this.#tmpPin.real)) {
+    // A resolved shell is not quiescence: retain until every process group is gone and
+    // no possible descendant/holder remains; re-check while Pi lives, else the next
+    // session's bounded sweep applies the same checks from the ledger.
+    if (!quiescent(this.#tmpdir, this.#tmpPin.real, this.#since, this.#groups)) {
       this.#recheck ??= setInterval(() => this.#release(), 1000).unref();
       return;
     }
     clearInterval(this.#recheck); this.#recheck = undefined;
     fs.rmSync(this.#tmpdir, { recursive: true, force: true });
+    fs.rmSync(`${this.#tmpdir}${LEDGER}`, { force: true });
   }
 
-  /** Only a resolved operations result confirms exit; a rejection retains the temp. */
+  /** Settlement ends launch custody; deletion still needs confirmed quiescence. */
   #custody<T>(operation: Promise<T>): Promise<T> {
     this.#pending++;
-    return operation.then(result => {
-      this.#pending--;
-      this.#release();
-      return result;
-    }, error => {
-      this.#pending--;
-      this.#unresolved = true; // exit unknown: never delete under a possibly live child
-      throw error;
+    const settle = (): void => { this.#pending--; this.#release(); };
+    return operation.then(result => { settle(); return result; }, error => { settle(); throw error; });
+  }
+
+  #launch(ops: BashOperations, command: string, cwd: string,
+    options: Parameters<BashOperations["exec"]>[2], escape: boolean): Promise<{ exitCode: number | null }> {
+    const launch = launchers.get(ops);
+    // An unconfined escape can leave its group without the no_new_privs marker, and
+    // foreign operations do not report their group: neither is confirmable.
+    if (!launch || escape) this.#unknown();
+    if (!launch) return ops.exec(command, cwd, options);
+    return launch(command, cwd, options, pgid => {
+      for (const known of this.#groups) if (groupGone(known)) this.#groups.delete(known); // bounded ledger
+      this.#groups.add(pgid);
+      this.#ledger();
     });
+  }
+
+  #unknown(): void {
+    if (this.#unconfirmed) return;
+    this.#unconfirmed = true;
+    this.#ledger();
+  }
+
+  /** Host-only custody record next to the temp, for the next session's sweep. */
+  #ledger(create = 0): void {
+    if (!this.#ownsTmp) return;
+    const record: Ledger = {
+      host: process.pid, hostStart: startTicks(process.pid), since: this.#since,
+      dev: String(this.#tmpPin.dev), ino: String(this.#tmpPin.ino),
+      groups: [...this.#groups], unconfirmed: this.#unconfirmed,
+    };
+    const fd = fs.openSync(`${this.#tmpdir}${LEDGER}`, fs.constants.O_WRONLY | fs.constants.O_CREAT
+      | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW | create, 0o600);
+    try { fs.writeFileSync(fd, JSON.stringify(record)); } finally { fs.closeSync(fd); }
   }
 
   /**
@@ -268,12 +455,12 @@ export class LandlockBashConfinement {
       delete env.PI_FABRIC_LANDLOCK_WRITES;
       if (escape) {
         options.onData(Buffer.from(`[Landlock escape: unconfined command; recorded in ${auditPath}]\n`));
-        return this.#custody(unconfined.exec(command, cwd, { ...options, env }));
+        return this.#custody(this.#launch(unconfined, command, cwd, { ...options, env }, true));
       }
       env.PI_FABRIC_LANDLOCK_SHELL = shell;
       // dev:ino:path — the helper binds each rule to this identity, not the name.
       env.PI_FABRIC_LANDLOCK_WRITES = lines.join("\n");
-      return this.#custody(confined.exec(command, cwd, { ...options, env }));
+      return this.#custody(this.#launch(confined, command, cwd, { ...options, env }, false));
     } };
   }
 }

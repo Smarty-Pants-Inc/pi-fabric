@@ -469,14 +469,16 @@ export class PiToolsProvider implements FabricProvider {
       const options = middleware?.options;
       let local = createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
       if (this.#landlockEnabled()) {
-        const { LandlockBashConfinement, landlockCommand } = await import("../core/landlock.js");
+        const { LandlockBashConfinement, groupOperations, landlockCommand } = await import("../core/landlock.js");
         this.#landlock ??= new LandlockBashConfinement(this.#cwd);
         const originalCommand = String(args.command ?? "");
         const { escape, command } = landlockCommand(originalCommand);
         args.command = command;
+        // S2: each command leads its own process group; the host keeps its kernel id.
+        const shell = getShellConfig(options?.shellPath);
         local = this.#landlock.operations(
-          createLocalBashOperations({ shellPath: this.#landlock.helperPath }), local,
-          getShellConfig(options?.shellPath).shell, path.dirname(job.pidPath), escape, originalCommand,
+          groupOperations(this.#landlock.helperPath, ["-c"]), groupOperations(shell.shell, shell.args),
+          shell.shell, path.dirname(job.pidPath), escape, originalCommand,
         );
         // S2: temp custody starts before middleware may delay the inner launch.
         holds.push(this.#landlock.hold());

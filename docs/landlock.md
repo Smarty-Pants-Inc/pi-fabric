@@ -73,12 +73,18 @@ list, never a wider fallback. Each entry has a one-line reason.
   the current uid with no group/other permissions. Shared `/tmp`, `/var/tmp`,
   `/` and the home directory are never granted as TMPDIR. Otherwise a private
   `0700` temporary directory is created at first enforced use and exported to
-  the child. Fabric-owned fallback temp is removed only after session close
-  **and** confirmed exit of every operation that used it; an abort with an
-  unknown exit retains it. A resolved shell does not prove its background
-  descendants stopped: removal also waits until no process of ours still
-  inherits that TMPDIR or has its cwd or an open descriptor under it
-  (re-checked each second); if Pi exits first, the directory is retained.
+  the child. Fabric-owned fallback temp is removed only with **confirmed
+  quiescence** after session close: every command runs in its own process group
+  (the host keeps the kernel-reported group id) and each group must be gone
+  (`kill(-pgid, 0)` = ESRCH), **and** a scan must find no holder: no process of
+  ours that inherits that TMPDIR or has its cwd/root/a descriptor under it, and no
+  same-uid `no_new_privs` process started since the confinement began (every
+  confined descendant carries that bit, also after `setsid`). Unreadable state
+  of a possible descendant counts as held. Otherwise the directory is retained
+  and re-checked each second; if Pi exits first, a host-only `<temp>.custody`
+  ledger lets the next session's bounded sweep apply the same checks. An escape
+  command or operations that do not report a process group make custody
+  unconfirmable: that temp is never deleted automatically.
 - **Grant identity.** Session-stable grants (`$CWD`, `$TMPDIR`, `$GIT_COMMON_DIR`,
   `$AGENT_RUN_DIR`, caches, devices) are resolved and pinned (`realpath`,
   device, inode) by the host at first enforced use, before any confined command

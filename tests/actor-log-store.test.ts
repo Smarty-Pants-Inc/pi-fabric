@@ -44,6 +44,22 @@ describe("ActorLogStore", () => {
     expect(store.retainedRunIds(actor)).toEqual([]);
   });
 
+  it("passes terminal event retention settings to its existing archive sweep without touching lastRunId", () => {
+    const { root, actor } = setup();
+    const retention = { actorRunArchiveMs: 10000, terminalRunEventsAgeMs: 100, terminalRunEventsMaxBytes: 1024 };
+    const store = new ActorLogStore({ maxEventBytes: 8192 }, { eventContextChars: 1000 }, retention);
+    const log = '{"text":"' + "x".repeat(100) + '"}\n';
+    for (const id of ["old", "latest"]) {
+      const run = path.join(root, "actor", "runs", id);
+      fs.mkdirSync(run, { recursive: true });
+      fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: 1 }));
+      fs.writeFileSync(path.join(run, "events.jsonl"), log.repeat(100));
+    }
+    store.pruneRuns(actor, 1000);
+    expect(fs.statSync(path.join(root, "actor", "runs", "old", "events.jsonl")).size).toBeLessThanOrEqual(1024);
+    expect(fs.readFileSync(path.join(root, "actor", "runs", "latest", "events.jsonl"), "utf8")).toBe(log.repeat(100));
+  });
+
   it("bounds caller messages identically to retained history and keeps the newest 100", () => {
     const { store } = setup();
     const history: FabricActorMessage[] = [];

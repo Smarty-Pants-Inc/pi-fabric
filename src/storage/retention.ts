@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
+import { processStartTime } from "../residency/process-identity.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -21,16 +22,17 @@ interface RunRecordSummary {
   updatedAt?: number;
   transport?: string;
   sessionId?: string;
+  processStartTime?: string;
 }
 export interface RetentionSweepResult {
   removedRoots: string[];
   removedRuns: string[];
 }
 const ownerPath = (root: string): string => path.join(root, RUN_ROOT_OWNER_FILE);
-const readJson = <T>(file: string): T | undefined => {
+const readJson = <T>(file: string, maxBytes = 1024 * 1024): T | undefined => {
   try {
     const stat = ownedStat(file);
-    if (!stat?.isFile() || stat.size > 1024 * 1024) return;
+    if (!stat?.isFile() || stat.size > maxBytes) return;
     return JSON.parse(fs.readFileSync(file, "utf8")) as T;
   } catch { return; }
 };
@@ -86,9 +88,10 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
   fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
   writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details });
 };
-/** A terminal external-pane record is not an exit receipt. Share this persistent,
+/** A terminal record is not a descendant exit receipt. Share this persistent,
  * tree-wide veto across tracked, recovered and offline cleanup before removing
- * worktrees or files; absence of an unresolved marker never proves pane exit.
+ * worktrees or files; absence of an unresolved marker never proves worker exit.
+ * Recordless pre-launch rollback remains distinct from an admitted process run.
  * Ownership retention additionally requires checked process exit for every
  * descendant, without coupling that proof to cleanup's artifact allowlist. */
 export const runTreeExitVeto = (
@@ -113,14 +116,42 @@ export const runTreeExitVeto = (
     if (record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
     }
-    // A surviving tracked root has its own transport exit evidence. Descendants
-    // have no surviving handles here: reuse the persisted process identities and
-    // processAlive check used by safeRunTree, not settlement or marker absence.
+    // Tracked ownership and collection compose conservatively: the descendant
+    // ownership check must pass as well as the terminal PID/birth proof below.
+    // A surviving tracked root has its own transport exit evidence; descendants
+    // have no surviving handles and must retain their persisted identities.
     if (requireDescendantExit && depth > 0) {
       const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
         ? Number(record.sessionId) : undefined;
       if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return "worker exit is unconfirmed: unknown descendant identity";
-      if (processAlive(pid)) return `its descendant worker may still be running (${directory})`;
+      if (processAlive(pid)) return `worker exit is unconfirmed: its descendant worker may still be running (${directory})`;
+    }
+    if (record?.transport === "process") {
+      if (!record.status || !TERMINAL_STATUSES.has(record.status)) {
+        return `worker exit is unconfirmed: nonterminal process record (${directory})`;
+      }
+      // A missing/invalid PID is unknown, not a never-launched record. ESRCH
+      // proves absence; a live PID is safe only if its checked start identity
+      // differs from the worker's saved identity (PID reuse). Query errors and
+      // unreadable birth identity never authorize removal.
+      const pid = typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
+        ? Number(record.sessionId) : NaN;
+      const validPid = Number.isSafeInteger(pid) && pid > 0;
+      let alive = false;
+      if (validPid) {
+        try { process.kill(pid, 0); alive = true; }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+            return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
+          }
+        }
+      }
+      const savedStart = typeof record.processStartTime === "string" && /^\d+$/.test(record.processStartTime)
+        ? record.processStartTime : undefined;
+      const currentStart = alive && savedStart ? processStartTime(pid) : undefined;
+      if (!validPid || (alive && (currentStart === undefined || currentStart === savedStart))) {
+        return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
+      }
     }
     const nested = path.join(directory, "nested");
     try { fs.lstatSync(nested); }
@@ -148,11 +179,15 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   if (runTreeExitVeto(root, 0, expired)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
+  // Automatic retention keeps its independent live-writer fence. A mismatched
+  // birth identity can clear explicit cleanup's exit veto, but never authorizes
+  // a sweep to remove a run with a live or unknown saved PID. Apply this at
+  // every level, including descendants, alongside the recursive exit proof.
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;
   if (pid !== undefined && processAlive(pid)) return false;
   if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
-    if (!childrenStopped && pid === undefined) return false;
+    if (!childrenStopped) return false;
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
   }
   try {
@@ -189,13 +224,10 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
     return true;
   } catch { return false; }
 };
-/** Explicit resident roots have no managed-temp owner. No birth identity is recorded for
- * their process workers (only status.json's transport/sessionId), so require terminal status,
- * and still veto live/unknown workers, nested survivors and unresolved markers. */
+/** Explicit resident roots have no managed-temp owner. Require terminal status
+ * plus checked process absence, and veto nested survivors and unresolved markers. */
 export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline): boolean => {
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-  if (record?.transport === "process" && record.sessionId !== undefined &&
-      (typeof record.sessionId !== "string" || !/^\d+$/.test(record.sessionId) || Number(record.sessionId) <= 0)) return false;
   return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired);
 };
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
@@ -328,10 +360,100 @@ export const sweepTempRunRoots = (options: {
   return result;
 };
 
+/** Full persisted latest-run references, shared by resident startup and streaming retention.
+ * An unreadable registry is a wildcard veto, never proof that a lastRunId is absent. */
+export const retainedActorRunIds = (actorRoots: readonly string[]): Set<string> => {
+  const refs = new Set<string>();
+  try {
+    for (const root of actorRoots) {
+      try { fs.lstatSync(root); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      if (!ownedStat(root)?.isDirectory()) throw new Error("Unsafe actor root");
+      const file = path.join(root, "actors.json");
+      try { fs.lstatSync(file); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      // ActorRegistryStore's writer/reader has no byte-size protocol limit: every
+      // actor includes instructions and up to 100 message bodies, so even one
+      // ordinary actor can exceed the 1-MiB summary-file guard. Match that existing
+      // JSON contract rather than inventing a fleet-size limit that disables all
+      // retention. Ownership, JSON/schema errors and unsafe references still veto.
+      const registry = readJson<{ actors?: Array<{ id?: unknown; lastRunId?: unknown }> }>(file, Number.MAX_SAFE_INTEGER);
+      if (!Array.isArray(registry?.actors)) throw new Error("Unreadable actor registry");
+      for (const actor of registry.actors) {
+        if (!actor || typeof actor.id !== "string" ||
+            (actor.lastRunId !== undefined && typeof actor.lastRunId !== "string")) throw new Error("Unknown actor run reference");
+        if (actor.lastRunId) refs.add(actor.lastRunId);
+      }
+    }
+  } catch { refs.add("*"); }
+  return refs;
+};
+
+export interface TerminalRunEventsRetention {
+  terminalRunEventsAgeMs?: number;
+  terminalRunEventsMaxBytes?: number;
+}
+
+const EVENT_TAIL_MARKER = Buffer.from('{"fabricTruncated":true,"reason":"terminal run event retention"}\n');
+
+/** Compact only an owned, safely terminal run. Read a bounded suffix, keep complete JSONL
+ * lines, and atomically replace only events.jsonl; status/reply/result remain byte-for-byte.
+ * The marker counts against the byte cap. A single oversized final event may leave only
+ * the marker rather than a corrupt JSON fragment. Already bounded logs are never rewritten.
+ * Callers retain their ownership/latest-run vetoes before entering this shared predicate. */
+export const compactTerminalRunEvents = (
+  directory: string,
+  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean } = {},
+): boolean => {
+  const now = options.now ?? Date.now();
+  const ageMs = options.terminalRunEventsAgeMs ?? 24 * 60 * 60 * 1_000;
+  const maxBytes = options.terminalRunEventsMaxBytes ?? 256 * 1024;
+  const expired = options.expired ?? noDeadline;
+  if (!Number.isSafeInteger(ageMs) || ageMs < 0 || !Number.isSafeInteger(maxBytes) ||
+      maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !ownedStat(directory)?.isDirectory()) return false;
+  const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
+  if (!record?.status || !TERMINAL_STATUSES.has(record.status) ||
+      now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
+  const file = path.join(directory, "events.jsonl");
+  const stat = ownedStat(file);
+  if (!stat?.isFile() || stat.size <= maxBytes || runTreeExitVeto(directory, 0, expired, true) ||
+      !canRemoveTerminalRun(directory, expired)) return false;
+  try {
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    let tail: Buffer;
+    try {
+      const opened = fs.fstatSync(fd);
+      if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size ||
+          opened.mtimeMs !== stat.mtimeMs) return false;
+      // One look-behind byte lets an exactly aligned final line survive the boundary.
+      const length = maxBytes - EVENT_TAIL_MARKER.length + 1;
+      tail = Buffer.alloc(length);
+      let read = 0;
+      while (read < length) {
+        if (expired()) return false;
+        const count = fs.readSync(fd, tail, read, length - read, stat.size - length + read);
+        if (count === 0) return false;
+        read += count;
+      }
+    } finally { fs.closeSync(fd); }
+    const newline = tail.indexOf(0x0a);
+    const retained = newline < 0 ? Buffer.alloc(0) : tail.subarray(newline + 1);
+    const checked = ownedStat(file);
+    if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
+        checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
+        runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
+        expired() || options.isRetained?.()) return false;
+    writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained]));
+    return true;
+  } catch { return false; }
+};
+
 export const pruneActorRunArchives = (options: {
   runsDirectory: string;
   latestRunId?: string;
   retentionMs: number;
+  terminalRunEventsAgeMs?: number;
+  terminalRunEventsMaxBytes?: number;
   now?: number;
 }): string[] => {
   const now = options.now ?? Date.now();
@@ -344,7 +466,10 @@ export const pruneActorRunArchives = (options: {
     const directory = path.join(options.runsDirectory, entry.name);
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
     if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false)) continue;
-    if (now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < options.retentionMs) continue;
+    if (now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < options.retentionMs) {
+      compactTerminalRunEvents(directory, { ...options, now });
+      continue;
+    }
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
   return removed;

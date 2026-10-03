@@ -2254,9 +2254,12 @@ describe("AgentsProvider runner support", () => {
       .resolves.toMatchObject({ id: "session:lead" });
     await expect(setup([], [mirrored]).provider.invoke("projectAgent", {}, context))
       .rejects.toThrow(`No live project agent for ${project}`);
-    // The resident-actor fallback uses the same resolver: with the actor's root gone, no mirror.
-    expect(deliveryRoot("session:gone", [lead, mirrored], project)).toBe("session:lead");
-    expect(deliveryRoot("session:gone", [mirrored], project)).toBe("session:gone");
+    // Resident delivery never elects a replacement. An exact launch binding still uses the
+    // same resolver, so an unrecorded mirror cannot inherit a dead root's messages.
+    expect(deliveryRoot("session:gone", [lead, mirrored], project)).toBe("session:gone");
+    const binding = { lineageAlive: () => false, boundIntegrator: () => ({ leadId: lead.id }) };
+    expect(deliveryRoot("session:gone", [lead, mirrored], project, binding)).toBe("session:lead");
+    expect(deliveryRoot("session:gone", [mirrored], project, binding)).toBe("session:gone");
   });
 
   it("lists current and peer roots as symmetric session agents", async () => {
@@ -2701,6 +2704,47 @@ describe("AgentsProvider runner support", () => {
     ).rejects.toThrow(/Invalid Fabric agent cwd/);
     expect(fs.existsSync(path.join(root, "runs"))).toBe(false);
   });
+
+  it.each([["run", false], ["run", true], ["spawn", false], ["spawn", true]] as const)(
+    "joins successful Windows %s -> public cleanup (worktree=%s)", async (method, worktree) => {
+      const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      const repository = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-public-win-close-"));
+      roots.push(repository);
+      if (worktree) {
+        const git = (...args: string[]) => execFileSync("git", args, { cwd: repository, stdio: "pipe" });
+        git("init", "-q");
+        git("config", "user.name", "Pi Fabric tests");
+        git("config", "user.email", "pi-fabric-tests@example.invalid");
+        fs.writeFileSync(path.join(repository, "README.md"), "public cleanup fixture\n");
+        git("add", ".");
+        git("commit", "-qm", "initial");
+      }
+      const { provider, agents } = setup([], [], undefined, { cwd: repository, agentsConfig: { retainRuns: false, budgetUsd: 0 } });
+      try {
+        // Force the real Windows settlement path even on a Linux test host.
+        Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+        const handle = await provider.invoke(method, {
+          task: "successful public cleanup", transport: "process", worktree,
+        }, context) as { id: string };
+        const result = (method === "spawn" ? await provider.invoke("wait", { id: handle.id }, context) : handle) as {
+          id: string; status: string; worktree?: string;
+        };
+        expect(result.status).toBe("completed");
+        const run = agents.runDirectory(handle.id)!;
+        expect(fs.existsSync(run)).toBe(true);
+        if (worktree) {
+          expect(result.worktree).toBeTypeOf("string");
+          expect(fs.existsSync(result.worktree!)).toBe(true);
+        }
+        await expect(provider.invoke("cleanup", { id: handle.id, deleteBranch: true }, context)).resolves.toEqual({ cleaned: true });
+        expect(fs.existsSync(run)).toBe(false);
+        if (worktree) expect(fs.existsSync(result.worktree!)).toBe(false);
+      } finally {
+        await agents.close();
+        Object.defineProperty(process, "platform", platform);
+      }
+    },
+  );
 
   it("shows the effective cwd in run and spawn launch activity", async () => {
     const { provider } = setup();

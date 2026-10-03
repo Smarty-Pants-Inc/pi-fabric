@@ -78,7 +78,8 @@ export class ActorLogStore {
   constructor(
     readonly mesh: Pick<MeshStore, "maxEventBytes">,
     readonly config: Pick<FabricMeshConfig, "eventContextChars">,
-    readonly retention: Pick<FabricRetentionConfig, "actorRunArchiveMs">,
+    readonly retention: Pick<FabricRetentionConfig, "actorRunArchiveMs"> &
+      Partial<Pick<FabricRetentionConfig, "terminalRunEventsAgeMs" | "terminalRunEventsMaxBytes">>,
   ) {}
 
   async retainRun(actor: ActorLogTarget, runId: string, runDirectory: string | undefined): Promise<void> {
@@ -105,6 +106,10 @@ export class ActorLogStore {
       runsDirectory: path.join(path.dirname(actor.sessionFile), "runs"),
       ...(actor.lastRunId ? { latestRunId: actor.lastRunId } : {}),
       retentionMs: this.retention.actorRunArchiveMs,
+      ...(this.retention.terminalRunEventsAgeMs !== undefined
+        ? { terminalRunEventsAgeMs: this.retention.terminalRunEventsAgeMs } : {}),
+      ...(this.retention.terminalRunEventsMaxBytes !== undefined
+        ? { terminalRunEventsMaxBytes: this.retention.terminalRunEventsMaxBytes } : {}),
       now,
     });
   }

@@ -235,13 +235,14 @@ describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/
 });
 
 describe("strict resident command parser", () => {
-  it.each(["futureSetter", "__proto__", "", null])("refuses unknown operation %s before actor lookup or removal", async operation => {
+  it.each(["spawn", "futureSetter", "__proto__", "", null])("refuses unknown operation %s before actor lookup or removal", async operation => {
     const { root, config } = fixture();
     const host = new ResidentHost(config);
     try {
       await host.start();
       const lookup = vi.spyOn(host.actors, "status");
       const remove = vi.spyOn(host.actors, "remove");
+      const spawn = vi.spyOn(host.agents, "spawn");
       const requestId = "unknown-operation";
       fs.writeFileSync(path.join(config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({ format: RESIDENT_HOST_FORMAT, rootId: config.rootId, requestId, operation, id: "actor-do-not-remove", createdAt: Date.now() }));
       const response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
@@ -249,6 +250,7 @@ describe("strict resident command parser", () => {
       while (!fs.existsSync(response)) { if (Date.now() > deadline) throw new Error("No unknown-command response"); await delay(20); }
       expect(JSON.parse(fs.readFileSync(response, "utf8"))).toMatchObject({ ok: false, errorCode: "RESIDENT_COMMAND_UNSUPPORTED", error: expect.stringContaining("Unsupported Fabric residency command") });
       expect(lookup).not.toHaveBeenCalled(); expect(remove).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 });

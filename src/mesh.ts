@@ -6,6 +6,7 @@ export type { FabricPrincipal, FabricPrincipalAuthorityCheck } from "./fabric-pr
 export type {
   MeshBatchOperation,
   MeshBatchResult,
+  MeshBatchView,
   MeshEvent,
   MeshIdentity,
   MeshStateEntry,

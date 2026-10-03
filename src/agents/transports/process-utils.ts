@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
+import { terminateWindowsTree } from "../../child-process-tree.js";
 
 export interface ExecFileResult {
   stdout: string;
@@ -278,12 +279,12 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
-  authority?: Pick<AgentTransportLaunch, "signal" | "authorize">,
+  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean> }> => {
+): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
   // The new tree-custody protocol is unsupported on Windows. Even an internal
@@ -299,7 +300,16 @@ export const spawnDetached = async (
   const pid = child.pid;
   // Exit is latched: after the worker/group empties its numeric id is not identity.
   let exited = false;
-  child.once("exit", () => { exited = true; });
+  let force: ReturnType<typeof setTimeout> | undefined;
+  child.once("exit", () => { exited = true; clearTimeout(force); });
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  let stopping: Promise<void> | undefined;
+  let lost: string | undefined;
+  const unconfirmed = (reason: string): void => {
+    if (lost !== undefined) return;
+    lost = reason;
+    try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
+  };
   child.unref();
   // Bun exposes an IPC channel without Node's unref method. The child's
   // native unref above is still valid; optional channel APIs are not custody.
@@ -324,7 +334,6 @@ export const spawnDetached = async (
   });
   let birth: LinuxGroupMember | undefined;
   try { birth = process.platform === "linux" ? linuxGroupMember(pid) : undefined; } catch { /* stop fails closed on unknown identity */ }
-  let stopping: Promise<void> | undefined;
   const owned = new Map<number, string>();
   if (birth) owned.set(pid, birth.started);
   const groups = new Set([pid]);
@@ -443,11 +452,53 @@ export const spawnDetached = async (
   };
   return {
     pid,
-    async stop() {
+    lostContact: () => lost,
+    async waitForClose() {
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([closed, new Promise<void>(resolve => {
+          deadline = setTimeout(() => {
+            unconfirmed("Owned process worker did not confirm native close within 7000ms");
+            resolve();
+          }, 7_000);
+        })]);
+      } finally { clearTimeout(deadline); }
+    },
+    stop() {
       if (stopping) return stopping;
-      const pending = stop();
+      const pending = (async () => {
+        if (process.platform !== "win32") {
+          // Preserve birth-checked POSIX execution-group drain and retryable debt.
+          await stop();
+        }
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            (async () => {
+              if (process.platform === "win32" && !exited) {
+                // Helper failure records immutable debt before parent-only fallback.
+                // Attempt close and captured native close are separate obligations.
+                await new Promise<void>(resolve => {
+                  void terminateWindowsTree(child, unconfirmed, resolve);
+                });
+              }
+              // Exit/probe absence alone is not captured native close.
+              await closed;
+            })(),
+            new Promise<void>(resolve => {
+              deadline = setTimeout(() => {
+                unconfirmed("Owned process worker did not confirm tree/native close within 7000ms");
+                resolve();
+              }, 7_000);
+            }),
+          ]);
+          stopped = true;
+        } finally { clearTimeout(deadline); }
+      })();
       stopping = pending;
-      try { await pending; stopped = true; } finally { stopping = undefined; }
+      // POSIX ownership/exit failures remain retryable on the exact same handle.
+      void pending.catch(() => { if (stopping === pending) stopping = undefined; });
+      return pending;
     },
     async isAlive() {
       // A dead custodian is not proof its retained execution groups stopped.

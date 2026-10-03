@@ -38,7 +38,7 @@ export class RuntimeStateBuiltins {
     cwd: string,
     config: FabricConfig,
     capturedTools: CapturedToolCatalog,
-    shell: { jobs: FabricShellJobStore; getHangMs: () => number },
+    shell: { jobs: FabricShellJobStore; getHangMs: () => number; getLandlockSettings?: () => FabricConfig["executor"]["landlock"] },
   ): Promise<void> {
     let mcpProvider: McpProvider | undefined;
     const enforceSchema = config.schema.mode === "enforce";
@@ -60,10 +60,11 @@ export class RuntimeStateBuiltins {
           capturedTools,
           capturedToolsProvider,
           this.managedHost
-            ? {requireCapturedOverrides: true, powerShellToolDefinitionFactory: undefined}
+            ? {requireCapturedOverrides: true, powerShellToolDefinitionFactory: undefined, getLandlockSettings: shell.getLandlockSettings}
             : {
                 powerShellToolDefinitionFactory,
                 shellJobs: shell.jobs, getShellHangMs: shell.getHangMs,
+                getLandlockSettings: shell.getLandlockSettings,
               },
         ),
       }));

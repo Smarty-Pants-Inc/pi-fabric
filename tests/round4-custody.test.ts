@@ -148,7 +148,7 @@ describe("round 4 execution custody", () => {
 
   it("F5 Windows process admission uses the legacy native-child path, not the tree-custody channel", async () => {
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-    const spawn = vi.spyOn(processUtils, "spawnDetached").mockResolvedValue({ pid: 123, stop: async () => {}, isAlive: async () => false });
+    const spawn = vi.spyOn(processUtils, "spawnDetached").mockResolvedValue({ pid: 123, stop: async () => {}, isAlive: async () => false, lostContact: () => undefined, waitForClose: async () => {} });
     await new ProcessTransport().launch({ id: "windows", name: "windows", cwd: process.cwd(), workerPath: "worker.js", workerArguments: [] });
     expect(spawn.mock.calls[0]?.[5]).toBe(7_000);
     expect(spawn.mock.calls[0]?.[6]).toBe(false);

@@ -488,7 +488,7 @@ export class FabricState {
     };
     const activation = (async () => {
       try {
-        await orphan?.shutdown().catch(() => undefined);
+        await orphan?.shutdown("reload").catch(() => undefined);
         assertCurrent();
         candidate = reusable ?? await this.#createRuntime();
         if (!reusable) {
@@ -533,7 +533,7 @@ export class FabricState {
           // Cleanup is best-effort; preserve the activation failure.
         }
         if (this.#activatingRuntime === candidate) this.#activatingRuntime = undefined;
-        if (candidate) await candidate.shutdown().catch(() => undefined);
+        if (candidate) await candidate.shutdown("reload").catch(() => undefined);
         if (this.#runtime === candidate) this.#runtime = undefined;
         throw error;
       }

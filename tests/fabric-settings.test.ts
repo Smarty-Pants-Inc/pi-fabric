@@ -405,6 +405,9 @@ describe("FabricSettingsComponent", () => {
     expect(lines).toContain("Actor run archives");
     expect(lines).toContain("7d");
     expect(lines).toContain("session.jsonl");
+    expect(lines).toContain("Terminal event log age");
+    expect(lines).toContain("Terminal event log tail");
+    expect(lines).toContain("256 KiB");
   });
 
   it("presents the Tool display row in the UI settings section", () => {
@@ -528,6 +531,9 @@ describe("FabricSettingsComponent", () => {
 
   it("parses every formatted numeric settings style", () => {
     expect(parseFormattedNumericValue("128 MB")).toBe(128 * 1024 * 1024);
+    expect(parseFormattedNumericValue("128 KiB")).toBe(128 * 1024);
+    expect(parseFormattedNumericValue("1.5 MiB")).toBe(1.5 * 1024 ** 2);
+    expect(parseFormattedNumericValue("2 GiB")).toBe(2 * 1024 ** 3);
     expect(parseFormattedNumericValue("250ms")).toBe(250);
     expect(parseFormattedNumericValue("2m")).toBe(120_000);
     expect(parseFormattedNumericValue("7d")).toBe(7 * 24 * 60 * 60 * 1_000);
@@ -861,6 +867,44 @@ describe("FabricSettingsComponent", () => {
       expect(loadFabricConfig({ cwd, agentDir, projectTrusted: true }).executor.kernel).toBe("python");
       expect(reloadResources).toHaveBeenCalledOnce();
       expect(applyFabricMode).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("persists terminal event byte cap and age through the real settings dialog and reload", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-retention-"));
+    const cwd = path.join(root, "project"); const agentDir = path.join(root, "agent");
+    fs.mkdirSync(cwd, { recursive: true });
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    try {
+      const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+      const location = { cwd, agentDir, projectTrusted: true };
+      const state = {
+        config, ensure: vi.fn().mockResolvedValue(undefined),
+        reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig(location))),
+        agents: { claudeModels: vi.fn().mockResolvedValue([]) },
+      } as unknown as FabricState;
+      const context = {
+        mode: "tui", cwd, isProjectTrusted: () => true,
+        modelRegistry: { getAvailable: () => fakeModelSource.models },
+        ui: { notify: vi.fn(), custom: vi.fn(async (factory) => {
+          const component = factory({}, theme, {}, () => {}) as FabricSettingsComponent;
+          const rootList = component.settingsList as any;
+          rootList.selectedIndex = rootList.items.findIndex((item: { id: string }) => item.id === "retention");
+          rootList.activateItem();
+          const list = rootList.submenuComponent.settingsList;
+          for (const [id, value] of [["terminalRunEventsMaxBytes", 128 * 1024], ["terminalRunEventsAgeMs", 6 * 3_600_000]]) {
+            list.selectedIndex = list.items.findIndex((item: { id: string }) => item.id === `retention.${id}`);
+            list.activateItem();
+            list.submenuComponent.selectList.onSelect({ value: String(value), label: String(value) });
+          }
+        }) },
+      } as unknown as ExtensionContext;
+      await openFabricSettings(context, { state, applyFabricMode: vi.fn(), capturedTools: { list: () => [] } as unknown as CapturedToolCatalog });
+      const saved = JSON.parse(fs.readFileSync(path.join(cwd, ".pi", "fabric.json"), "utf8"));
+      expect(saved.retention).toMatchObject({ terminalRunEventsMaxBytes: 131072, terminalRunEventsAgeMs: 21_600_000 });
+      expect(config.retention).toMatchObject(saved.retention);
+      expect(loadFabricConfig(location).retention).toMatchObject(saved.retention);
+      expect(state.reloadConfig).toHaveBeenCalledTimes(2);
     } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 

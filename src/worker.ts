@@ -14,6 +14,7 @@ import type {
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
 import { taskAgentEnvironment } from "./agents/task-environment.js";
+import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
 import { executionGroup } from "./worker/execution-group.js";
 
@@ -532,7 +533,9 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
-  const childEnvironment = options.actorName ? { ...process.env } : taskAgentEnvironment();
+  const childEnvironment = applyTaskReturnAddress(
+    options.actorId ? { ...process.env } : taskAgentEnvironment(), process.argv.slice(2),
+  );
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
   // A task child has its own identity and reply contract, not its actor parent's.
   for (const key of ["PI_FABRIC_ACTOR_ID", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_ACTOR_SESSION_FILE",
@@ -579,6 +582,8 @@ const main = async (): Promise<void> => {
       PI_FABRIC_ACTIVATION_NONCE: activationNonce ?? "",
       PI_FABRIC_ACTIVATION_HOOK: activationHookPath ?? "",
       PI_FABRIC_DELIVERY_DIR: deliveryDirectory,
+      // Own run only, never the shared parent/nested run root.
+      PI_FABRIC_AGENT_RUN_DIR: path.dirname(options.statusFile),
       PI_FABRIC_DEPTH: String(options.depth),
       PI_FABRIC_PARENT_RUN: options.id,
       PI_FABRIC_AGENT_NAME: options.name,

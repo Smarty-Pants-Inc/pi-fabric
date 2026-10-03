@@ -35,11 +35,18 @@ function release(root: string, name: string): string {
   fs.writeFileSync(path.join(dir, "dist/residency/pi-entry.js"), "// immutable fixture entry\n");
   // A no-inference probe has its own isolated status; business activations
   // still use the existing deterministic native fake-worker fixture.
-  fs.writeFileSync(path.join(dir, "dist/worker.js"), `import fs from 'node:fs';
+  fs.writeFileSync(path.join(dir, "dist/worker.js"), `import fs from 'node:fs';import path from 'node:path';
 const args=new Map();for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i].slice(2),process.argv[i+1]);
 if(args.get('resident-startup-probe')==='true'){
- const now=Date.now();fs.writeFileSync(args.get('status-file'),JSON.stringify({id:args.get('id'),name:args.get('name'),task:'probe',status:'completed',runner:'pi',transport:'process',cwd:args.get('cwd'),startedAt:now,updatedAt:now,finishedAt:now,text:'resident worker startup verified',turns:0,toolCalls:0,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:0}}));
-}else await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-worker.mjs")).href)});
+ // Startup success includes cleanup, so persist the probe's own checked identity.
+ const identity={sessionId:String(process.pid)};
+ if(process.platform==='linux'){const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8');identity.processStartTime=stat.slice(stat.lastIndexOf(')')+2).trim().split(/\\s+/)[19];}
+ const now=Date.now();fs.writeFileSync(args.get('status-file'),JSON.stringify({id:args.get('id'),name:args.get('name'),task:'probe',status:'completed',runner:'pi',transport:'process',...identity,cwd:args.get('cwd'),startedAt:now,updatedAt:now,finishedAt:now,text:'resident worker startup verified',turns:0,toolCalls:0,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:0}}));
+}else{
+ await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-worker.mjs")).href)});
+ // The retry counter is fixture bookkeeping, not a production run artifact.
+ fs.rmSync(path.join(path.dirname(args.get('status-file')),'resume-attempts'),{force:true});
+}
 `);
   return dir;
 }
@@ -55,7 +62,8 @@ async function fixture(protocolOnly = true) {
     format: 1, rootId: identity.id, sessionId: identity.sessionId, cwd: root, projectRoot: root,
     meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), sessionActorRoot: path.join(root, "session-actors"),
     residencyRoot: path.join(root, "resident"), fullCodeMode: true,
-    agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, notifyOnComplete: false, nice: 10 },
+    // Keep proof trees stable while custody inspection runs; collection is tested separately.
+    agents: { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, budgetUsd: 0, notifyOnComplete: false, nice: 10 },
     mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: path.join(a, "dist/worker.js"), fabricExtensionPath: path.join(a, "dist/index.js"),
     piBinary: process.execPath, claudeBinary: "fixture-missing-claude", vedaBinary: "fixture-missing-veda",

@@ -9,7 +9,7 @@ import { hostLeaseExpiry, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS,
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
-import { meshCursorGeneration, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
+import { meshCursorGeneration, type MeshBatchOperation, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
@@ -243,13 +243,17 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async presence(): Promise<BridgePresence> {
+    return this.#presence(this.store.listAll(HOST_PREFIX, { fresh: true }), this.#participantEntries());
+  }
+
+  #presence(hostEntries: MeshStateEntry[], participantEntries: MeshStateEntry[]): BridgePresence {
     const now = this.now();
     const leases = readHostLeases(this.store.root);
     const reserved = new Set<string>();
     const hosts: BridgeHost[] = [];
     // Every id not mirrored by this link is reserved: natives, live or not, and other links'
     // mirrors (security review F1/F2). Only natives are this side's presence.
-    for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
+    for (const entry of hostEntries) {
       const mark = remoteHostOf(entry.value);
       if (mark === this.peer) continue;
       const host = hostOf(entry.key, entry.value);
@@ -271,7 +275,7 @@ export class StoreBridgeSide implements BridgeSide {
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
-    for (const entry of this.#participantEntries()) {
+    for (const entry of participantEntries) {
       const mark = remoteHostOf(entry.value);
       if (mark === this.peer) continue;
       const participant = participantOf(entry.key, entry.value);
@@ -415,86 +419,91 @@ export class StoreBridgeSide implements BridgeSide {
   async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean): Promise<void> {
     const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
-    const own = new Set((await this.presence()).reserved);
-    const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
     const leases: Array<{ id: string; rootId: string; identityId: string; expiresAt: number }> = [];
-    const hosts = new Map<string, FabricHostRecord>();
-    for (const { record, expiresAt } of presence.hosts) {
-      if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
-      // Mirror a still-live observation for one source TTL from this side's sync,
-      // not until the source's absolute expiry. Even a final observation just before
-      // the source expires can therefore extend a stopped host by at most one TTL.
-      const ttl = Math.min(BRIDGE_LEASE_MS, expiresAt - record.updatedAt);
-      if (expiresAt <= now || !Number.isFinite(ttl) || ttl <= 0) continue;
-      const until = now + ttl;
-      hosts.set(record.id, record);
-      wanted.set(keyFor(HOST_PREFIX, record.id), {
-        value: { ...record, updatedAt: now, expiresAt: until, remoteHost: this.peer },
-        identity: record.identity,
-      });
-      leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, expiresAt: until });
-    }
-    for (const participant of presence.participants) {
-      const owner = hosts.get(participant.ownerHostId);
-      if (!owner || participant.kind !== "root" || own.has(participant.id)) continue;
-      if (owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) continue;
-      wanted.set(keyFor(PARTICIPANT_PREFIX, participant.id), {
-        value: { ...participant, remoteHost: this.peer },
-        identity: owner.identity,
-      });
-    }
-    const mirrored = new Map<string, { value: unknown; version: number }>();
-    for (const prefix of [HOST_PREFIX, PARTICIPANT_PREFIX]) {
-      for (const entry of this.store.listAll(prefix, { fresh: true })) {
-        mirrored.set(entry.key, { value: entry.value, version: entry.version });
-      }
-    }
-    for (const [key, { value, identity }] of wanted) {
-      const existing = mirrored.get(key);
-      // Never replace a native record, or another bridge's mirror (anti-spoofing); a native may be
-      // only in its own file (smarty-dev#2004).
-      if (existing && remoteHostOf(existing.value) !== this.peer) continue;
-      if (key.startsWith(PARTICIPANT_PREFIX) && participantFilePresent(this.store.root, key)) continue;
-      if (
-        existing && isObject(existing.value) && settled(existing.value) === settled(value) &&
-        (key.startsWith(HOST_PREFIX)
-          ? typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS
-          : existing.value.updatedAt === value.updatedAt)
-      ) continue;
-      if (halted()) return;
-      await this.#put(key, value, identity, existing?.version);
-    }
-    // A lease renews only a host record this link holds now, as written: never another owner's.
-    for (const lease of leases) {
-      if (halted()) return;
-      const entry = this.store.get(keyFor(HOST_PREFIX, lease.id), { fresh: true });
-      const held = entry && remoteHostOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
-      if (!held || held.identity.id !== lease.identityId || held.rootId !== lease.rootId) continue;
-      writeHostLease(this.store.root, { ...lease, updatedAt: now });
-    }
-    for (const [key, { value, version }] of mirrored) {
-      if (halted()) return;
-      if (wanted.has(key) || remoteHostOf(value) !== this.peer) continue;
-      if (key.startsWith(HOST_PREFIX) && isObject(value) && typeof value.id === "string") {
-        removeHostLease(this.store.root, value.id);
-      }
-      await this.store.delete({ key, ifVersion: version }).catch(ignoreConflict);
-    }
-  }
-
-  // Compare-and-swap only: a mirror never replaces a record written since it looked. A deleted
-  // key keeps its tombstone version, so creating it again swaps against that version, once the
-  // key is seen still absent.
-  async #put(key: string, value: unknown, identity: MeshIdentity, version: number | undefined): Promise<void> {
-    try {
-      await this.store.put({ key, value, identity, ifVersion: version ?? 0 });
-    } catch (error) {
-      const found = version === undefined && error instanceof Error
-        ? /compare-and-swap failed .* found (\d+)$/.exec(error.message)?.[1]
-        : undefined;
-      if (found === undefined || this.store.get(key, { fresh: true })) return ignoreConflict(error);
-      await this.store.put({ key, value, identity, ifVersion: Number(found) }).catch(ignoreConflict);
-    }
+    const removed: Array<{ key: string; id: string }> = [];
+    await this.store.writeBatch({
+      // Each put below supplies its checked owner identity; this default is unused for deletes.
+      identity: { id: `bridge:${this.peer}`, name: this.peer, kind: "main" },
+      ops: [],
+      // Admission, reservations and CAS all observe ONE authoritative snapshot under the
+      // write lock. No native takeover can fit between that observation and this commit
+      // (security review rounds 2/3, F1/F2), including recreation over retained tombstones.
+      prepare: (view) => {
+        if (halted()) return [];
+        const hostEntries = view.listAll(HOST_PREFIX);
+        const participantEntries = view.listAll(PARTICIPANT_PREFIX);
+        const own = new Set(this.#presence(hostEntries,
+          [...participantEntries, ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })]).reserved);
+        const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
+        const hosts = new Map<string, FabricHostRecord>();
+        for (const { record, expiresAt } of presence.hosts) {
+          if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
+          // Mirror a still-live observation for one source TTL from this side's sync,
+          // not until the source's absolute expiry. Even a final observation just before
+          // the source expires can therefore extend a stopped host by at most one TTL.
+          const ttl = Math.min(BRIDGE_LEASE_MS, expiresAt - record.updatedAt);
+          if (expiresAt <= now || !Number.isFinite(ttl) || ttl <= 0) continue;
+          const until = now + ttl;
+          hosts.set(record.id, record);
+          wanted.set(keyFor(HOST_PREFIX, record.id), {
+            value: { ...record, updatedAt: now, expiresAt: until, remoteHost: this.peer },
+            identity: record.identity,
+          });
+          leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, expiresAt: until });
+        }
+        for (const participant of presence.participants) {
+          const owner = hosts.get(participant.ownerHostId);
+          if (!owner || participant.kind !== "root" || own.has(participant.id)) continue;
+          if (owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) continue;
+          wanted.set(keyFor(PARTICIPANT_PREFIX, participant.id), {
+            value: { ...participant, remoteHost: this.peer },
+            identity: owner.identity,
+          });
+        }
+        const mirrored = new Map([...hostEntries, ...participantEntries].map((entry) => [entry.key, entry]));
+        const ops: MeshBatchOperation[] = [];
+        for (const [key, { value, identity }] of wanted) {
+          const existing = mirrored.get(key);
+          // Never replace a native record, or another bridge's mirror (anti-spoofing); a native may be
+          // only in its own file (smarty-dev#2004).
+          if (existing && remoteHostOf(existing.value) !== this.peer) continue;
+          if (key.startsWith(PARTICIPANT_PREFIX) && participantFilePresent(this.store.root, key)) continue;
+          if (
+            existing && isObject(existing.value) && settled(existing.value) === settled(value) &&
+            JSON.stringify(existing.updatedBy) === JSON.stringify(identity) &&
+            (key.startsWith(HOST_PREFIX)
+              ? typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS
+              : existing.value.updatedAt === value.updatedAt)
+          ) continue;
+          if (halted()) return [];
+          ops.push({ kind: "put", key, value, identity, ifVersion: view.version(key), onConflict: "skip" });
+        }
+        for (const [key, { value, version }] of mirrored) {
+          if (halted()) return [];
+          if (wanted.has(key) || remoteHostOf(value) !== this.peer) continue;
+          if (key.startsWith(HOST_PREFIX) && isObject(value) && typeof value.id === "string") {
+            removed.push({ key, id: value.id });
+          }
+          ops.push({ kind: "delete", key, ifVersion: version, onConflict: "skip" });
+        }
+        return ops;
+      },
+      afterCommit: (view) => {
+        // Lease-only renewal does not rewrite shared state. It still runs inside this ONE
+        // transaction and checks the committed owner, never a fresh per-record state read.
+        for (const lease of leases) {
+          if (halted()) return;
+          const entry = view.get(keyFor(HOST_PREFIX, lease.id));
+          const held = entry && remoteHostOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
+          if (!held || held.identity.id !== lease.identityId || held.rootId !== lease.rootId) continue;
+          writeHostLease(this.store.root, { ...lease, updatedAt: now });
+        }
+        for (const { key, id } of removed) {
+          if (halted()) return;
+          if (!view.get(key)) removeHostLease(this.store.root, id);
+        }
+      },
+    });
   }
 
   async bridgedIds(after: number): Promise<BridgedIds> {
@@ -519,12 +528,6 @@ export class StoreBridgeSide implements BridgeSide {
 
 /** An event refused at commit: its sender or target is no longer bound to this link. */
 export class BridgeOwnershipError extends Error {}
-
-const ignoreConflict = (error: unknown): void => {
-  // A concurrent writer changed the key: the next presence round decides again.
-  if (error instanceof Error && /compare-and-swap failed/.test(error.message)) return;
-  throw error;
-};
 
 /** The shape and allow-list check a side applies to every event it is asked to publish. */
 export const checkBridgePublish = (input: unknown): BridgePublish => {

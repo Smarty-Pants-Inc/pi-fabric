@@ -51,6 +51,7 @@ import type {
 import {
   DEFAULT_FABRIC_CONFIG,
   loadFabricConfig,
+  liveLandlockSettings,
   type FabricConfig,
   type FabricResultFormat,
   type FabricSchemaMode,
@@ -521,6 +522,9 @@ export class FabricRuntimeState {
     await builtins.tools(context.cwd, this.#config, this.capturedTools, {
       jobs: this.shellJobs,
       getHangMs: () => this.#config?.executor.shellHangMs ?? DEFAULT_SHELL_HANG_MS,
+      // F2: the host kill switch is re-read per call, never a cached value.
+      getLandlockSettings: () => liveLandlockSettings(
+        this.#config?.executor.landlock ?? { mode: "off", disabled: false }, resolveAgentDir()),
     });
     if (!this.#managedHost && (this.#config.fullCodeMode || enforceSchema)) {
       this.#shellInbox = new ShellEventInbox(this.pi, context, this.shellJobs);
@@ -583,13 +587,6 @@ export class FabricRuntimeState {
       (configuredMeshRoot
         ? path.resolve(projectRoot, configuredMeshRoot)
         : path.join(projectRoot, ".pi", "fabric", "mesh"));
-    // Held followUps are journalled per session under the mesh root until the session holds them.
-    mainAgent.attachFollowUpDrain(
-      context,
-      followUpDrainSupported() ? this.#config.mesh.followUpFlushMs : 0,
-      path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`),
-      this.#config.mesh.followUpStallSeconds,
-    );
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#mesh = new MeshStore(
       meshRoot,
@@ -601,8 +598,6 @@ export class FabricRuntimeState {
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
       ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.pi.getSessionName?.() ?? ""])
       : undefined;
-    // The idle wake reads this inbox on a timer: its start boundary is now, not its first read.
-    this.#rootInbox?.start();
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     this.#participants = new ParticipantDirectory(this.#mesh, {
       enabled: this.#config.mesh.enabled,
@@ -616,6 +611,17 @@ export class FabricRuntimeState {
         ? { selfOwnerIdentityId: process.env.PI_FABRIC_OWNER_IDENTITY_ID }
         : {}),
     });
+    // Resumption must invalidate an earlier terminal proof before actors/control
+    // can activate, not merely as part of the later participant publication batch.
+    await this.#participants.resumeLineage();
+    // No Main admission/drain starts while a prior-generation death proof survives.
+    mainAgent.attachFollowUpDrain(
+      context,
+      followUpDrainSupported() ? this.#config.mesh.followUpFlushMs : 0,
+      path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`),
+      this.#config.mesh.followUpStallSeconds,
+    );
+    this.#rootInbox?.start();
     this.#control = new FabricControlPlane(this.#mesh, identity, {
       enabled: this.#config.mesh.enabled,
       hostId,
@@ -716,6 +722,7 @@ export class FabricRuntimeState {
       projectRoot,
       hostId,
       identityId: identity.id,
+      spawnerSessionId: sessionId,
       retention: this.#config.retention,
       ...(this.#paths
         ? {
@@ -809,7 +816,7 @@ export class FabricRuntimeState {
       return participant ? participant.ownerHostId === hostId : undefined;
     };
     const lineageAlive = (rootId: string): boolean =>
-      this.#participants?.get(rootId) !== undefined;
+      this.#participants?.lineageAlive(rootId) ?? true;
     const actorRoots = {
       project: path.join(meshRoot, "actors"),
       session: path.join(meshRoot, "actors", fabricSessionId),
@@ -1594,7 +1601,8 @@ export class FabricRuntimeState {
     try {
       await this.#registry?.close();
     } finally {
-      await this.#participants?.close();
+      if (reason === "exit") await this.#participants?.closeLineage();
+      else await this.#participants?.close();
     }
     this.#registry = undefined;
     this.#config = undefined;
@@ -1680,6 +1688,11 @@ export class FabricRuntimeState {
   }
 
   async #closeInternal(): Promise<void> {
+    // /fabric reload and bootstrap replacement rebuild Fabric, not the creating
+    // Main's lineage. Preserve its mailbox/address even if replacement fails.
+    this.#mainAgent?.prepareReload();
+    this.#control?.pause();
+    await this.#participants?.quiesce("reload").catch(() => undefined);
     this.#completionInbox?.close();
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
@@ -1694,7 +1707,6 @@ export class FabricRuntimeState {
       await this.#outputArtifacts.close();
       return;
     }
-    await this.#participants?.quiesce().catch(() => undefined);
     this.#stopComponentWatch?.();
     this.#stopComponentWatch = undefined;
     await this.#componentControl?.close();

@@ -1,4 +1,11 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { MainAgentController } from "../src/main-agent.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { removeParticipantFileIf, writeParticipantFile } from "../src/topology/participant-files.js";
+import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
+import type { FabricParticipantRecord } from "../src/topology/types.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -15,9 +22,11 @@ const identity: MeshIdentity = { id: "session:owner", name: "Owner", kind: "main
 const roots: string[] = [];
 const managers: AgentManager[] = [];
 const planes: FabricControlPlane[] = [];
+const directories: ParticipantDirectory[] = [];
+const drains: Array<() => void> = [];
 type Ports = ConstructorParameters<typeof AgentMessageRouter>;
 
-const router = (manager: Ports[0], entries: FabricParticipantInfo[] = [], control?: Ports[4]) => {
+const router = (manager: Ports[0], entries: FabricParticipantInfo[] = [], control?: Ports[4], source?: Ports[3]) => {
   const actors = {
     identity, validateDirectMessage: vi.fn(),
     status: vi.fn((id: string) => {
@@ -30,7 +39,7 @@ const router = (manager: Ports[0], entries: FabricParticipantInfo[] = [], contro
   const main = { id: identity.id, local: true, matches: (id: string) => id === "main" || id === identity.id,
     deliverAgent: vi.fn(() => ({ queued: true, messageId: "main-queue", routed: "main" })) } as unknown as Ports[2];
   const participants = { get: (id: string) => entries.find(p => p.id === id), scheduleRefresh: vi.fn(), lastKnown: () => undefined };
-  return { value: new AgentMessageRouter(manager, actors, main, participants, control, b => b), actors, main };
+  return { value: new AgentMessageRouter(manager, actors, main, source ?? participants, control, b => b), actors, main };
 };
 const running = async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-followup-advisory-")); roots.push(root);
@@ -56,8 +65,108 @@ const unknown = { status: (id: string) => { throw new Error(`Unknown Fabric agen
 
 afterEach(async () => {
   await Promise.all(planes.splice(0).map(p => p.close()));
+  for (const close of drains.splice(0)) close();
+  await Promise.all(directories.splice(0).map(d => d.close()));
   await Promise.all(managers.splice(0).map(m => m.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+const mainLeaseFixture = async (files: boolean) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-main-lease-")); roots.push(root);
+  const meshRoot = path.join(root, "mesh");
+  const mesh = new MeshStore(meshRoot, 64 * 1024, 1000);
+  if (files) await mesh.put({ key: LIVENESS_POLICY_KEY, identity, value: { version: 1, participants: "files" } });
+  const directory = new ParticipantDirectory(mesh, {
+    enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 120_000,
+  });
+  directories.push(directory);
+  await directory.refresh();
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  const target: MeshIdentity = { id: `session:${sessionId}`, name: "Main", kind: "main", sessionId };
+  const key = (prefix: string) => prefix + createHash("sha256").update(target.id).digest("hex");
+  const presence: FabricParticipantRecord = {
+    format: 1, id: target.id, rootId: target.id, kind: "root", ownerHostId: target.id, ownerIdentityId: target.id,
+    name: "Main", status: "running", runner: "pi", transport: "host", cwd: root, sessionId,
+    capabilities: ["steer", "followUp", "fabric"], controlProtocol: "v1", startedAt: 1, updatedAt: Date.now(),
+  };
+  await mesh.put({ key: key("topology/hosts/"), identity: target, value: {
+    format: 1, id: target.id, rootId: target.id, identity: target, startedAt: 1,
+    updatedAt: Date.now(), expiresAt: Date.now() - 600_000,
+  } });
+  const participantKey = key("topology/participants/");
+  if (files) writeParticipantFile(meshRoot, { key: participantKey, value: presence, version: 1, updatedAt: Date.now(), updatedBy: target });
+  else await mesh.put({ key: participantKey, identity: target, value: presence });
+  const plane = (who: MeshIdentity) => {
+    const value = new FabricControlPlane(new MeshStore(meshRoot, 64 * 1024, 1000), who,
+      { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000 });
+    planes.push(value); return value;
+  };
+  return { root, meshRoot, mesh, directory, target, sessionId, participantKey, key, plane };
+};
+
+describe("Main target lineage delivery (#3686)", () => {
+  it.each([
+    [false, "steer", false], [false, "followUp", false], [true, "steer", false], [true, "followUp", false],
+    [false, "steer", true], [false, "followUp", true], [true, "steer", true], [true, "followUp", true],
+  ] as const)("queues %s file presence / %s / bare UUID=%s despite a ten-minute lease lapse", async (files, kind, bare) => {
+    const f = await mainLeaseFixture(files);
+    expect(f.directory.get(f.target.id, undefined, { fresh: true })).toBeUndefined();
+    expect(f.directory.lastKnown(f.target.id)?.lapsedMs).toBeGreaterThanOrEqual(600_000);
+    expect(f.directory.lineageAlive(f.target.id)).toBe(true);
+    const sender = f.plane(identity);
+    sender.start(() => ({ accepted: false }));
+    const send = router(unknown, [], sender, f.directory);
+    let error: unknown;
+    const pending = send.value.routeMessage(bare ? f.sessionId : f.target.id, "live Main reply", { proof: "unchanged" }, kind)
+      .catch(failure => { error = failure; return undefined; });
+    try {
+      await vi.waitFor(() => expect(error !== undefined || f.mesh.read({ topic: "fabric.control.command", limit: 10 }).length > 0).toBe(true));
+      expect(error).toBeUndefined();
+      // No target control plane is running yet. A fresh store sees the durable mailbox command.
+      const commands = new MeshStore(f.meshRoot, 64 * 1024, 1000).read({ topic: "fabric.control.command", limit: 10 });
+      expect(commands).toHaveLength(1);
+      expect(commands[0]!.data).toMatchObject({ targetId: f.target.id, operation: kind, message: "live Main reply", data: { proof: "unchanged" } });
+      const sendMessage = vi.fn();
+      const pi = { on: () => () => {}, sendMessage, getThinkingLevel: () => "off" } as unknown as ExtensionAPI;
+      const main = new MainAgentController(pi, f.target.id, true, f.root, f.sessionId);
+      const journal = path.join(f.root, "main-followups.json");
+      main.attachFollowUpDrain({ isIdle: () => false, hasPendingMessages: () => false,
+        sessionManager: { getEntries: () => [] } } as unknown as ExtensionContext, 60_000, journal);
+      drains.push(() => main.closeFollowUpDrain());
+      const owner = f.plane(f.target);
+      const receive = new AgentMessageRouter(unknown, send.actors, main, f.directory, owner, b => b);
+      owner.start((command, from, signal) => receive.acceptControl(command, from, signal));
+      await expect(pending).resolves.toMatchObject({ queued: true, acknowledged: true, routed: "mesh" });
+      if (kind === "followUp") {
+        expect(main.queueDepth().pendingFollowUps).toBe(1);
+        expect(JSON.parse(fs.readFileSync(journal, "utf8")).items).toEqual([
+          expect.objectContaining({ message: "live Main reply", data: { proof: "unchanged" } }),
+        ]);
+      } else expect(sendMessage).toHaveBeenCalledOnce();
+      expect(f.directory.get(f.target.id, undefined, { fresh: true })).toBeUndefined();
+    } finally {
+      await sender.close();
+      await pending;
+    }
+  });
+
+  it.each([false, true])("keeps dead roots and unknown ids unknown (files=%s)", async (files) => {
+    const f = await mainLeaseFixture(files);
+    if (files) await removeParticipantFileIf(f.mesh, f.participantKey, () => true);
+    else await f.mesh.delete({ key: f.participantKey });
+    await f.mesh.put({ key: f.key("topology/lineage-closures/"), identity: f.target, value: {
+      format: 1, rootId: f.target.id, ownerHostId: f.target.id, ownerIdentityId: f.target.id, closedAt: Date.now(),
+    } });
+    expect(f.directory.lineageAlive(f.target.id)).toBe(false);
+    expect(f.directory.lineageAlive("session:unknown")).toBe(true); // Unknown lineage alone is not an address.
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    for (const id of [f.target.id, "session:unknown"]) for (const kind of ["steer", "followUp"] as const) {
+      await expect(send.value.routeMessage(id, "not deliverable", undefined, kind)).rejects.toThrow(`Unknown Fabric participant: ${id}`);
+    }
+    expect(request).not.toHaveBeenCalled();
+    expect(f.mesh.read({ topic: "fabric.control.command", limit: 10 })).toEqual([]);
+  });
 });
 
 describe("running-task followUp advisory (#3005)", () => {

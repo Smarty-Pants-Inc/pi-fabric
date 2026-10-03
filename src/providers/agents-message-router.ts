@@ -45,11 +45,6 @@ const unsupported = (participant: { id: string; status?: string; interactive?: b
     ? new Error(`Fabric participant ${participant.id} is shutting down; its session will relaunch or end. Retry after it restarts.`)
     : new Error(`Fabric participant ${participant.id} does not support ${kind}`);
 
-// A root whose lease lapsed this recently may still be live: its heartbeat can be late
-// under mesh lock contention or a busy event loop (smarty-dev#447). A reply still goes to
-// its owner host, which acknowledges it when alive; a gone host leaves the outcome unknown.
-// ponytail: 5 min covers every lease flap seen in the fleet; a longer lapse reads as ended.
-const LAPSED_ROOT_REPLY_WINDOW_MS = 5 * 60_000;
 // A Pi session id (8-4-4-4-12). Actor and agent ids are 32 hex with no dashes, so they never match.
 const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Route messages using only the ownership, delivery, and binding ports needed here.
@@ -98,7 +93,7 @@ export class AgentMessageRouter {
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding"> & { owns?: (id: string) => boolean },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
-    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list">>,
+    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
@@ -111,24 +106,30 @@ export class AgentMessageRouter {
     return this.participants.get(id) ?? this.participants.get(id, undefined, { fresh: true });
   }
 
-  #recentlyLapsedRoot(id: string): FabricParticipantInfo | undefined {
+  #lapsedRoot(id: string): FabricParticipantInfo | undefined {
     // A write-stalled mesh explains the lapse, and delivery needs the mesh: report the stall.
     if (this.participants.writeStalled?.()) return undefined;
-    const known = this.participants.lastKnown?.(id);
-    if (!known || known.participant.kind !== "root" || known.lapsedMs > LAPSED_ROOT_REPLY_WINDOW_MS) return undefined;
+    // A busy Main can miss its heartbeat without losing its durable control mailbox (smarty-dev#3686).
+    // Read presence without filtering leases: get() and lastKnown() can both omit a root
+    // when its lease renews between those reads. Unknown lineage is not proof of death.
+    const root = this.participants.list
+      ? this.participants.list({ scope: "project", kinds: ["root"], includeStale: true, fresh: true })
+        .find((participant) => participant.id === id)
+      : this.participants.lastKnown?.(id)?.participant;
+    if (!root || root.kind !== "root") return undefined;
     // Reload leases are a hard bound, not an ordinary heartbeat flap; an exit is never routable.
-    if (["reloading", "stopping"].includes(known.participant.status)) return undefined;
+    if (["reloading", "stopping"].includes(root.status)) return undefined;
     // A mirrored lease lapses when the mesh bridge stops: nothing would carry the reply, so the
     // sender gets the lapse error at once instead of an acknowledgement timeout (smarty-dev#2004).
-    if (known.participant.remoteHost) return undefined;
-    return known.participant;
+    if (root.remoteHost || this.participants.lineageAlive?.(root.rootId) === false) return undefined;
+    return root;
   }
 
   #rootRouteSnapshot(id: string): FabricParticipantInfo | undefined {
     const cached = this.participants.get(id);
     // Keep a mirrored root's original bridge for the control plane's fresh admission check.
     if (cached?.kind === "root" && cached.remoteHost) return cached;
-    const fresh = this.participants.get(id, undefined, { fresh: true });
+    const fresh = this.participants.get(id, undefined, { fresh: true }) ?? this.#lapsedRoot(id);
     if (cached?.kind === "root") {
       // Refresh native lifecycle state only under the same authority. A replacement mirror
       // with the same id must never turn a private native delivery into bridge publication.
@@ -137,7 +138,7 @@ export class AgentMessageRouter {
         fresh.ownerIdentityId !== cached.ownerIdentityId) throw new FabricRouteAuthorityError(id);
       return fresh;
     }
-    return fresh ?? this.#recentlyLapsedRoot(id);
+    return fresh;
   }
 
   // A bare session UUID addresses its Main `session:<uuid>` when no participant has exactly
@@ -146,7 +147,7 @@ export class AgentMessageRouter {
     const bare = id.trim();
     if (!SESSION_UUID.test(bare) || this.#get(bare)) return id;
     const session = `session:${bare}`;
-    return this.mainAgent.matches(session) || this.#get(session) || this.#recentlyLapsedRoot(session)
+    return this.mainAgent.matches(session) || this.#get(session) || this.#lapsedRoot(session)
       ? session
       : id;
   }
@@ -156,7 +157,7 @@ export class AgentMessageRouter {
   // ownership and capabilities. Exact ids, UUID aliases and local `main` keep precedence.
   #messageTarget(id: string): string {
     const target = this.#sessionTarget(id);
-    if (this.mainAgent.matches(target) || this.#get(target) || this.#recentlyLapsedRoot(target)) return target;
+    if (this.mainAgent.matches(target) || this.#get(target) || this.#lapsedRoot(target)) return target;
     const matches = this.participants.list?.({ scope: "project", kinds: ["root"], fresh: true })
       .filter((participant) => participant.name === target) ?? [];
     if (matches.length > 1) {

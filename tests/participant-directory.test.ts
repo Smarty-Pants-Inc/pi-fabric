@@ -93,6 +93,23 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("#3662 ParticipantDirectory lineage liveness", () => {
+  it("does not treat lease expiry as lineage death, but observes withdrawal", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lineage-"));
+    roots.push(root);
+    const id = "session:lineage";
+    const directory = createDirectory(path.join(root, "mesh"), { id, name: "main", kind: "main" }, id,
+      () => [rootRecord(id, id, "lineage")]);
+    await directory.refresh();
+    const expiredAt = Date.now() + 120_000;
+    expect(directory.get(id, expiredAt)).toBeUndefined();
+    expect(directory.lastKnown(id, expiredAt)?.participant.stale).toBe(true);
+    expect(directory.lineageAlive(id, expiredAt)).toBe(true);
+    expect(directory.lineageAlive("session:unknown", expiredAt)).toBe(false);
+    await directory.close();
+    expect(directory.lineageAlive(id)).toBe(false);
+  });
+});
 describe("ParticipantDirectory.mirroredControlOwner", () => {
   const keyFor = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
   const setup = async () => {

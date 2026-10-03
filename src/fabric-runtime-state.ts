@@ -809,7 +809,7 @@ export class FabricRuntimeState {
       return participant ? participant.ownerHostId === hostId : undefined;
     };
     const lineageAlive = (rootId: string): boolean =>
-      this.#participants?.get(rootId) !== undefined;
+      this.#participants?.lineageAlive(rootId) ?? true;
     const actorRoots = {
       project: path.join(meshRoot, "actors"),
       session: path.join(meshRoot, "actors", fabricSessionId),

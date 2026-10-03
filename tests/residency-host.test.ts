@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { projectOf, repositoryOf } from "../src/topology/project-identity.js";
+import { residentDeliveryPrefix } from "../src/residency/protocol.js";
+import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { lockFile } from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
@@ -33,6 +37,74 @@ const fixture = () => {
   return { root, config, host, idle };
 };
 
+describe("#3662 resident actor delivery routing", () => {
+  it.each([
+    ["expired lease with live lineage", true, true, "root"],
+    ["dead root without bound integrator", false, false, "root"],
+    ["dead root with exact bound integrator", false, true, "integrator"],
+    ["dead root with actor repository different from host cwd", false, true, "integrator"],
+  ] as const)("routes %s through the host mailbox path", async (_case, rootPresent, bound, target) => {
+    const { root, config, host } = fixture();
+    const integratorId = "session:11111111-1111-4111-8111-111111111111";
+    config.cwd = root;
+    config.projectRoot = root;
+    let actorProject = root;
+    if (_case === "dead root with actor repository different from host cwd") {
+      actorProject = path.join(root, "actor-project");
+      fs.mkdirSync(actorProject);
+      for (const [cwd, origin] of [[root, "https://forge.test/team/host.git"], [actorProject, "https://forge.test/team/actors.git"]]) {
+        execFileSync("git", ["init", "-q"], { cwd, stdio: "ignore" });
+        execFileSync("git", ["config", "remote.origin.url", origin!], { cwd, stdio: "ignore" });
+      }
+    }
+    const project = projectOf(actorProject);
+    const repository = repositoryOf(project);
+    config.project = project;
+    vi.stubEnv("SMARTY_LEAD_SESSION", "");
+    if (bound) {
+      fs.mkdirSync(path.join(root, ".local"));
+      fs.writeFileSync(path.join(root, ".local", "lead"), integratorId);
+    }
+    try {
+      await host.start();
+      const publishRoot = async (id: string, startedAt: number, expiresAt: number) => {
+        const identity = { id, name: "main", kind: "main" as const };
+        const participant: FabricParticipantRecord = {
+          format: 1, id, rootId: id, kind: "root", ownerHostId: id, ownerIdentityId: id,
+          name: "main", status: "idle", runner: "pi", transport: "host", role: "project-agent",
+          project, ...(repository ? { repository } : {}), cwd: root, capabilities: ["steer", "followUp", "fabric"],
+          startedAt, updatedAt: Date.now(), controlProtocol: "v1",
+        };
+        const key = (prefix: string) => prefix + createHash("sha256").update(id).digest("hex");
+        await host.mesh.put({ key: key("topology/hosts/"), identity, value: {
+          format: 1, id, rootId: id, identity, startedAt, updatedAt: Date.now(), expiresAt,
+        } });
+        await host.mesh.put({ key: key("topology/participants/"), identity, value: participant });
+      };
+      if (rootPresent) await publishRoot(config.rootId, 1, Date.now() - 60_000);
+      if (bound) await publishRoot(integratorId, rootPresent ? 99 : 2, Date.now() + 120_000);
+      if (!rootPresent) await publishRoot("session:newer-project-agent", 99, Date.now() + 120_000);
+      const liveRoots = host.participants.list({ scope: "project", kinds: ["root"], fresh: true });
+      expect(liveRoots.some(candidate => candidate.id === config.rootId)).toBe(false);
+      if (rootPresent) expect(host.participants.lastKnown(config.rootId)?.participant.stale).toBe(true);
+      host.actors.onDeliver({
+        actor: { id: "actor:supervisor", name: "supervisor", project: config.project } as Parameters<typeof host.actors.onDeliver>[0]["actor"],
+        message: { id: "message", actorId: "actor:supervisor", actorName: "supervisor", direction: "out", source: "actor", createdAt: Date.now(), text: "directive" },
+        delivery: "steer", triggerTurn: true,
+      });
+      await vi.waitFor(() => expect(host.mesh.listAll("residency/deliveries/").length).toBe(1));
+      const expected = target === "integrator" ? integratorId : config.rootId;
+      const deliveries = host.mesh.listAll(residentDeliveryPrefix(expected));
+      expect(deliveries).toHaveLength(1);
+      expect(deliveries[0]?.value).toMatchObject({ rootId: expected, message: "directive", delivery: "steer" });
+      expect(host.mesh.listAll(residentDeliveryPrefix("session:newer-project-agent"))).toHaveLength(0);
+    } finally {
+      await host.close();
+      vi.unstubAllEnvs();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 describe("resident loaded-path census metadata", () => {
   it("publishes the startup generation rather than a later desired configuration", async () => {

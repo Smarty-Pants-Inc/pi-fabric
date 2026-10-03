@@ -810,6 +810,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
       .find((participant) => participant.id === target);
   }
 
+  /**
+   * Shared by orphan adoption and resident delivery: an expired lease only hides a root from
+   * live listings, not its lineage. A retained root record may return; only withdrawal or
+   * dead-host reaping removes that evidence. Read fresh so a closed root can be inherited.
+   */
+  lineageAlive(rootId: string, now = Date.now()): boolean {
+    return this.get(rootId, now, { fresh: true }) !== undefined || this.lastKnown(rootId, now) !== undefined;
+  }
+
   // A stalled mesh writer (for example a signal-stopped lock holder, smarty-dev#266)
   // stops every host lease from renewing, so peers soon look departed. This reports it;
   // the directory's own reads (get, list, sessions, peers) never throw, because timers,

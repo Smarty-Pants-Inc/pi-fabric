@@ -394,6 +394,23 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     await vi.waitFor(() => expect(fs.existsSync(temp)).toBe(false), { timeout: 3000 });
   });
 
+  it("S2 r3: a background descendant that outlives its shell keeps the generated TMPDIR until it exits", async () => {
+    const h = harness();
+    vi.stubEnv("TMPDIR", "/tmp"); // not private: Fabric generates its own temp
+    vi.spyOn(os, "tmpdir").mockReturnValue(h.root);
+    // Real local operations: the shell resolves while its setsid-less delayed child lives on.
+    const started = performance.now();
+    const result = await h.invoke({ command: 'printf input > "$TMPDIR/input"; (sleep 1.5; cat "$TMPDIR/input" > "$TMPDIR/result"; sleep 1) </dev/null >/dev/null 2>&1 & printf "%s" "$TMPDIR"' });
+    expect(performance.now() - started).toBeLessThan(1400);
+    const temp = result.output.trim();
+    expect(path.dirname(temp)).toBe(h.root);
+    await h.registry.close(); // provider/session close while the descendant is alive
+    expect(fs.readFileSync(path.join(temp, "input"), "utf8")).toBe("input");
+    await vi.waitFor(() => expect(fs.readFileSync(path.join(temp, "result"), "utf8")).toBe("input"), { timeout: 5000 });
+    expect(fs.existsSync(temp)).toBe(true); // descendant still sleeping
+    await vi.waitFor(() => expect(fs.existsSync(temp)).toBe(false), { timeout: 8000 });
+  }, 15_000);
+
   it("F2: a host kill-switch flip reaches already-active lanes on their next call; project cannot override", async () => {
     const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-host-"));
     roots.push(agentDir);

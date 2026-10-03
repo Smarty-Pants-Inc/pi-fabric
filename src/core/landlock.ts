@@ -54,6 +54,32 @@ const pinPath = (expanded: string): PinnedGrant | undefined => {
 };
 const sameGrant = (a: PinnedGrant, b: PinnedGrant): boolean =>
   a.real === b.real && a.dev === b.dev && a.ino === b.ino;
+/**
+ * S2: a resolved shell result proves only that the shell exited, not that its
+ * background descendants stopped. True while any process of ours still inherits
+ * the generated TMPDIR or has its cwd/root/an open descriptor under it.
+ * Unreadable process state counts as held (never delete under a live child).
+ */
+const tmpHeld = (exported: string, real: string): boolean => {
+  let pids: string[];
+  try { pids = fs.readdirSync("/proc").filter(name => /^\d+$/.test(name) && Number(name) !== process.pid); }
+  catch { return true; }
+  const marker = Buffer.from(`\0TMPDIR=${exported}\0`);
+  const under = (link: string): boolean => {
+    try { const target = fs.readlinkSync(link); return within(target, real) || within(target, exported); }
+    catch { return false; }
+  };
+  for (const pid of pids) {
+    const base = `/proc/${pid}`;
+    try {
+      if (fs.statSync(base).uid !== process.getuid!()) continue;
+      if (Buffer.concat([Buffer.from("\0"), fs.readFileSync(`${base}/environ`)]).includes(marker)) return true;
+      if (under(`${base}/cwd`) || under(`${base}/root`)) return true;
+      for (const fd of fs.readdirSync(`${base}/fd`)) if (under(`${base}/fd/${fd}`)) return true;
+    } catch { /* exited while scanning, or not inspectable: not ours to wait for */ }
+  }
+  return false;
+};
 
 /** Loaded only for the first enforced local bash call, never at registration. */
 export class LandlockBashConfinement {
@@ -71,6 +97,7 @@ export class LandlockBashConfinement {
   #pending = 0;
   #unresolved = false;
   #closed = false;
+  #recheck: NodeJS.Timeout | undefined;
 
   constructor(readonly cwd: string) {
     const root = loadedFabricRoot(import.meta.url);
@@ -109,9 +136,18 @@ export class LandlockBashConfinement {
   #release(): void {
     if (!this.#closed || !this.#ownsTmp || this.#pending > 0 || this.#unresolved) return;
     // Identity discipline for cleanup too: remove only the directory we created.
-    let stat: fs.BigIntStats;
-    try { stat = fs.lstatSync(this.#tmpdir, { bigint: true }); } catch { return; }
-    if (stat.isSymbolicLink() || stat.dev !== this.#tmpPin.dev || stat.ino !== this.#tmpPin.ino) return;
+    let stat: fs.BigIntStats | undefined;
+    try { stat = fs.lstatSync(this.#tmpdir, { bigint: true }); } catch { /* already gone */ }
+    if (!stat || stat.isSymbolicLink() || stat.dev !== this.#tmpPin.dev || stat.ino !== this.#tmpPin.ino) {
+      clearInterval(this.#recheck); this.#recheck = undefined; return;
+    }
+    // A resolved shell is not quiescence: retain while a descendant still uses
+    // the temp and re-check; if this process exits first, the temp is retained.
+    if (tmpHeld(this.#tmpdir, this.#tmpPin.real)) {
+      this.#recheck ??= setInterval(() => this.#release(), 1000).unref();
+      return;
+    }
+    clearInterval(this.#recheck); this.#recheck = undefined;
     fs.rmSync(this.#tmpdir, { recursive: true, force: true });
   }
 

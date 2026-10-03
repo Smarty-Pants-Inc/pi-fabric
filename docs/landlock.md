@@ -75,7 +75,10 @@ list, never a wider fallback. Each entry has a one-line reason.
   `0700` temporary directory is created at first enforced use and exported to
   the child. Fabric-owned fallback temp is removed only after session close
   **and** confirmed exit of every operation that used it; an abort with an
-  unknown exit retains it.
+  unknown exit retains it. A resolved shell does not prove its background
+  descendants stopped: removal also waits until no process of ours still
+  inherits that TMPDIR or has its cwd or an open descriptor under it
+  (re-checked each second); if Pi exits first, the directory is retained.
 - **Grant identity.** Session-stable grants (`$CWD`, `$TMPDIR`, `$GIT_COMMON_DIR`,
   `$AGENT_RUN_DIR`, caches, devices) are resolved and pinned (`realpath`,
   device, inode) by the host at first enforced use, before any confined command

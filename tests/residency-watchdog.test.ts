@@ -101,7 +101,9 @@ describe("resident watchdog", () => {
       expect(warn).toHaveBeenCalledOnce();
       read.mockReturnValue([]);
       await vi.advanceTimersByTimeAsync(400);
-      expect(read).toHaveBeenCalledTimes(4);
+      // Successor completion reconciliation also scans claims after a successful delivery pass.
+      // Count delivery polls, not that separate scan, to keep the backoff assertion unchanged.
+      expect(read.mock.calls.filter(([prefix]) => prefix?.startsWith("residency/deliveries/"))).toHaveLength(4);
       expect(warn).toHaveBeenCalledOnce();
       await client.close();
       expect(vi.getTimerCount()).toBe(0);

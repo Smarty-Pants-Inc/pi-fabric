@@ -45,8 +45,18 @@ let started = false;
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 input.on("line", (line) => {
   if (started || !line.trim()) return;
-  started = true;
   const command = JSON.parse(line);
+  // Actors inspect idle native state/history before dispatching their task.
+  // A control frame must never consume this fixture's one business prompt.
+  if (command.type === "get_state" || command.type === "get_messages") {
+    const data = command.type === "get_state"
+      ? { model: { provider: "fake", id: "fake-model", contextWindow: 128_000 }, isStreaming: false, isCompacting: false }
+      : { messages: [] };
+    send({ type: "response", id: command.id, command: command.type, success: true, data });
+    return;
+  }
+  if (command.type !== "prompt") return;
+  started = true;
   const task = typeof command.message === "string" ? command.message : "";
 
   send({ type: "response", command: "prompt", success: true });

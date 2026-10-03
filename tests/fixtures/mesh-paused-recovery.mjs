@@ -3,7 +3,7 @@ import path from "node:path";
 import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
 const { MeshStore } = await jiti.import("../../src/mesh/store.ts");
-const [root, role, phase] = process.argv.slice(2);
+const [root, role, phase, order] = process.argv.slice(2);
 const lock = path.join(root, ".lock");
 const ownerPath = path.join(lock, "owner");
 const write = fs.writeFileSync.bind(fs);
@@ -70,4 +70,10 @@ const result = await store.exclusive(() => {
     wait(path.join(root, "initializer.release"));
   }
 }).catch(error => error);
-console.log(JSON.stringify({ role, phase, boundary, ran, timeout: result?.code === "FABRIC_MESH_LOCK_TIMEOUT", code: result?.code }));
+const summary = { role, phase, boundary, ran, timeout: result?.code === "FABRIC_MESH_LOCK_TIMEOUT", code: result?.code };
+if (role === "initializer" && order === "recovery-first") {
+  // Keep the rejected holder genuinely alive while the parent checks immediate progress.
+  write(path.join(root, "initializer.finished"), JSON.stringify(summary));
+  wait(path.join(root, "initializer.release"));
+}
+console.log(JSON.stringify(summary));

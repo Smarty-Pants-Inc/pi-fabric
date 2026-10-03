@@ -464,7 +464,7 @@ describe("native activation window (offline; opted-in success needs exact native
 
   it.skipIf(!selectedNativeBinary).each(["google-generative-ai", "google-vertex"].flatMap(api =>
     ["stream", "streamSimple"].flatMap(method =>
-      ["success", "abort", "snapshot", "expand", "shrink", "non-json", "invalid-control"].map(mode => [api, method, mode])),
+      ["success", "abort", "snapshot", "late-write", "expand", "shrink", "non-json", "invalid-control"].map(mode => [api, method, mode])),
   ))("preserves native Google SDK payload and signal identity: %s %s %s", (api, method, mode) => {
     const dir = root();
     const resultFile = path.join(dir, "google-result.json");
@@ -490,12 +490,12 @@ describe("native activation window (offline; opted-in success needs exact native
       // fails admission. Its own serializer must never run, either.
       controller.signal.context = {cycle:controller.signal, big:1n};
       controller.signal.toJSON = () => {throw new Error('serialized SDK cancellation control')};
-      let observed, sdkCalls = 0, requests = 0, wire, disconnected = false, guardFired = false;
+      let observed, sdkCalls = 0, requests = 0, wire, disconnected = false, guardFired = false, lateWriteRan = false;
       // The SDK installs this public method as an instance arrow function. Wrap
       // that assignment to inspect the EXACT adapter input before SDK transforms.
       Object.defineProperty(Models.prototype, 'generateContentStream', {configurable:true, set(fn) {
         Object.defineProperty(this, 'generateContentStream', {value:async params => {
-          assert.equal(params, observed, 'replaced native SDK parameter object');
+          assert.notEqual(params, observed, 'dispatched the retained native SDK parameter object');
           assert.equal(params.config.abortSignal, controller.signal, 'lost native AbortSignal identity');
           sdkCalls++;
           fs.writeFileSync(${JSON.stringify(sdkCallFile)}, 'called');
@@ -542,6 +542,18 @@ describe("native activation window (offline; opted-in success needs exact native
             // An identically named value anywhere else is context, not a control.
             if (${JSON.stringify(mode)} === 'non-json') payload.config.extra = {abortSignal:controller.signal};
             if (${JSON.stringify(mode)} === 'invalid-control') payload.config.abortSignal = {aborted:false};
+            // smarty-dev#3337: schedule from the getter read DURING admission,
+            // so the retained root grows after the guard returns, before dispatch.
+            if (${JSON.stringify(mode)} === 'late-write') {
+              Object.defineProperty(payload, 'contents', {enumerable:true, configurable:true, get() {
+                queueMicrotask(() => {
+                  Object.defineProperty(payload, 'contents', {enumerable:true, configurable:true, writable:true,
+                    value:[{role:'user', parts:[{text:'x'.repeat(40_000)}]}]});
+                  lateWriteRan = true;
+                });
+                return [{role:'user', parts:[{text:'SMALL_GOOGLE_INPUT'}]}];
+              }});
+            }
             if (${JSON.stringify(mode)} === 'snapshot') {
               let reads = 0;
               Object.defineProperty(payload, 'contents', {enumerable:true, configurable:true, get() {
@@ -553,11 +565,15 @@ describe("native activation window (offline; opted-in success needs exact native
         assert.equal(sdkCalls, 1);
         assert.equal(requests, 1);
         assert.equal(JSON.stringify(wire).includes('abortSignal'), false);
-        assert.equal(JSON.stringify(wire).includes('SMALL_GOOGLE_INPUT'), true);
+        if (${JSON.stringify(mode)} === 'late-write') {
+          assert.equal(lateWriteRan, true, 'retained root write did not run');
+          assert.equal(observed.contents[0].parts[0].text, 'x'.repeat(40_000), 'retained root did not grow');
+        }
+        assert.deepEqual(wire.contents, [{role:'user', parts:[{text:'SMALL_GOOGLE_INPUT'}]}], 'dispatched data differs from admitted snapshot');
         if (${JSON.stringify(mode)} === 'abort') await connectionClosed;
         else assert.equal(result.content[0].text, 'GOOGLE_OK');
         assert.equal(guardFired, false, 'request/disconnect ended only because the hang guard fired');
-        fs.writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({sdkCalls, requests, samePayload:true, sameSignal:true,
+        fs.writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({sdkCalls, requests, detachedPayload:true, sameSignal:true,
           stopReason:result.stopReason, disconnected, wireKeys:Object.keys(wire)}));
       } finally {
         clearTimeout(timeout);
@@ -575,7 +591,7 @@ describe("native activation window (offline; opted-in success needs exact native
       expect(result.stderr).toContain(mode === "expand" ? "Context exceeds window" : "Fabric activation window failed");
       return;
     }
-    expect(JSON.parse(fs.readFileSync(resultFile, "utf8"))).toMatchObject({sdkCalls: 1, requests: 1, samePayload: true, sameSignal: true,
+    expect(JSON.parse(fs.readFileSync(resultFile, "utf8"))).toMatchObject({sdkCalls: 1, requests: 1, detachedPayload: true, sameSignal: true,
       stopReason: mode === "abort" ? "aborted" : "stop", ...(mode === "abort" ? {disconnected: true} : {})});
   }, TEST_GUARD_MS);
 

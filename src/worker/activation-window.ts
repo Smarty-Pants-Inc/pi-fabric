@@ -280,8 +280,9 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             // Ordinary wire payloads dispatch the admitted JSON snapshot, not
             // stateful getters/toJSON that could change at the next serialization.
             if (!google) return admitted;
-            // Stabilize Google's data on the ORIGINAL SDK parameter object. Do
-            // not JSON-clone, freeze or discard the live cancellation control.
+            // Dispatch a detached root: an extension may retain and mutate the
+            // original parameters after admission (smarty-dev#3337). Carry only
+            // the live cancellation control by identity, without serializing it.
             // Config remains mutable for the SDK's own schema normalization.
             if (abortSignal !== undefined) {
               const config = (admitted as Record<string, unknown>).config;
@@ -292,13 +293,7 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
                 value: abortSignal, enumerable: true, configurable: true, writable: true,
               });
             }
-            for (const key of Object.getOwnPropertyNames(final)) {
-              if (!Object.hasOwn(admitted, key) && !Reflect.deleteProperty(final, key)) {
-                throw new Error("Activation window cannot stabilize the Google payload");
-              }
-            }
-            Object.defineProperties(final, Object.getOwnPropertyDescriptors(admitted));
-            return final;
+            return admitted;
           } catch (error) {
             return failClosed(error);
           }

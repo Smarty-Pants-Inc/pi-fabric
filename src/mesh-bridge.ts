@@ -15,8 +15,8 @@ const MAX_EVENT_BYTES = 256 * 1024;
 const MAX_READ_EVENTS = 500;
 
 const USAGE = `usage:
-  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--call-timeout-ms MS] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
-  mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2]`;
+  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
+  mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES]`;
 
 const parseArgs = (argv: string[]): { mode: string; flags: Map<string, string>; command: string[] } => {
   const [mode = "", ...rest] = argv;
@@ -59,16 +59,24 @@ export const transportCommand = (flags: Map<string, string>, command: string[]):
   ];
 };
 
-const store = (root: string, flags: Map<string, string>): MeshStore => {
+export const openBridgeStore = (root: string, flags: Map<string, string>): MeshStore => {
   const selected = flags.get("lock-protocol") ?? "1";
   if (selected !== "1" && selected !== "2") throw new Error("--lock-protocol must be 1 or 2");
-  return new MeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS, { lockProtocol: selected === "1" ? 1 : 2 });
+  const capacity = flags.get("max-state-bytes");
+  const maxStateBytes = capacity === undefined ? undefined : Number(capacity);
+  if (maxStateBytes !== undefined && (!Number.isSafeInteger(maxStateBytes) || maxStateBytes < MAX_EVENT_BYTES * 2)) {
+    throw new Error(`--max-state-bytes must be a safe integer of at least ${MAX_EVENT_BYTES * 2}`);
+  }
+  return new MeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS, {
+    lockProtocol: selected === "1" ? 1 : 2,
+    ...(maxStateBytes === undefined ? {} : { maxStateBytes }),
+  });
 };
 const log = (message: string): void => void process.stderr.write(`mesh-bridge: ${message}\n`);
 
 const runAgent = async (flags: Map<string, string>): Promise<void> => {
   const peer = required(flags, "peer");
-  const side = new StoreBridgeSide(store(required(flags, "mesh"), flags), peer);
+  const side = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), peer);
   await serveBridgeAgent(side, process.stdin, process.stdout);
 };
 
@@ -95,7 +103,7 @@ export const runBridge = async (
   const callTimeoutMs = Number(flags.get("call-timeout-ms") ?? DEFAULT_CALL_TIMEOUT_MS);
   if (!Number.isSafeInteger(callTimeoutMs) || callTimeoutMs <= 0) throw new Error("--call-timeout-ms must be a positive integer");
   const cursorPath = required(flags, "cursor");
-  const local = new StoreBridgeSide(store(required(flags, "mesh"), flags), remoteName);
+  const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName);
   const argv = transportCommand(flags, command);
   if (signal.aborted) return 0;
 

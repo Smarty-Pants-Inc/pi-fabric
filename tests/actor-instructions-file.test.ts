@@ -103,7 +103,7 @@ const rejectionCases = (root: string, allowed: string) => {
   ] as const;
 };
 
-for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} verified actor instructions (#3819)`, () => {
+for (const durable of [false, true]) describe.skipIf(process.platform !== "linux")(`${durable ? "resident" : "Main"} verified actor instructions (#3819)`, () => {
   it("applies exact bytes for create and setter, reports digest, and never rereads a stored reference", async () => {
     const state = await fixture(durable);
     try {
@@ -153,6 +153,84 @@ for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} 
     } finally { await state.close(); }
   });
 
+  it("refuses an ancestor swap-and-restore before open without mutating the actor or registry", async () => {
+    const state = await fixture(durable);
+    const ancestor = path.join(state.allowed, "roles");
+    const saved = path.join(state.allowed, "roles-saved");
+    const outside = path.join(state.root, "outside-roles");
+    const file = path.join(ancestor, "role.md");
+    const outsideText = "Outside-root attacker instructions.\n";
+    let swapped = false;
+    const restore = () => {
+      if (!swapped) return;
+      fs.unlinkSync(ancestor); fs.renameSync(saved, ancestor); swapped = false;
+    };
+    let statSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let openSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      fs.mkdirSync(ancestor); fs.mkdirSync(outside);
+      fs.writeFileSync(file, text); fs.writeFileSync(path.join(outside, "role.md"), outsideText);
+      const actor = await state.create({ instructions: text });
+      const before = state.owner.status(actor.id);
+      const registryPath = path.join(durable ? state.config.actorRoot : path.join(state.root, "main-actors"), "actors.json");
+      const registry = fs.readFileSync(registryPath, "utf8");
+      const realStat = fs.statSync;
+      const realOpen = fs.openSync;
+      for (const operation of ["setter", "create"] as const) {
+        let injected = false;
+        let outsideOpened = false;
+        const outsideStat = realStat(path.join(outside, "role.md"));
+        const opened: number[] = [];
+        const realClose = fs.closeSync;
+        const closed: number[] = [];
+        const closeSpy = vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+          closed.push(fd); return realClose(fd);
+        });
+        // Inject after realpath/containment, before the expected stat and open.
+        // Both pathname operations in the old resolver see the outside inode.
+        statSpy = vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, options?: fs.StatOptions) => {
+          if (String(target) === file && !injected) {
+            fs.renameSync(ancestor, saved); fs.symlinkSync(outside, ancestor, "dir");
+            swapped = true; injected = true;
+          }
+          return realStat(target, options);
+        }) as typeof fs.statSync);
+        openSpy = vi.spyOn(fs, "openSync").mockImplementation((target, flags, mode) => {
+          const fd = realOpen(target, flags, mode);
+          opened.push(fd);
+          const openedStat = fs.fstatSync(fd);
+          if (openedStat.dev === outsideStat.dev && openedStat.ino === outsideStat.ino) {
+            outsideOpened = true;
+          }
+          if (String(target) === file) {
+            // Restore before the old resolver's second realpath observation.
+            restore();
+          }
+          return fd;
+        });
+        try {
+          const source = fileSource(file, outsideText);
+          const attempt = operation === "setter"
+            ? state.provider.invoke("setInstructions", { id: actor.id, replace: true, ...source }, state.context)
+            : state.create(source); // same-name replacement must not remove the predecessor
+          await expect(attempt, operation).rejects.toThrow();
+          expect(injected, operation).toBe(true);
+          expect(outsideOpened, operation).toBe(false);
+          expect(opened.length, operation).toBeGreaterThan(0);
+          expect(closed, operation).toEqual([...opened].reverse());
+          closeSpy.mockRestore();
+          expect(state.owner.status(actor.id), operation).toEqual(before);
+          expect(state.owner.instructions(actor.id), operation).toBe(text);
+          expect(state.owner.listOwned(), operation).toHaveLength(1);
+          expect(fs.readFileSync(registryPath, "utf8"), operation).toBe(registry);
+        } finally {
+          statSpy.mockRestore(); openSpy.mockRestore(); closeSpy.mockRestore(); restore();
+        }
+      }
+    } finally {
+      statSpy?.mockRestore(); openSpy?.mockRestore(); restore(); await state.close();
+    }
+  });
   it("keeps the shrink guard authoritative and accepts replace", async () => {
     const state = await fixture(durable);
     try {
@@ -166,7 +244,110 @@ for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} 
   });
 });
 
-it("uses the default factory/current realpath, allows an in-root symlink and the exact 512 KiB boundary", async () => {
+it.skipIf(process.platform !== "linux")("pins every directory handle for a deep canonical path and closes them after success or digest refusal", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-instructions-handles-"));
+  const dir = path.join(root, "a", "b"); fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "role.md"); fs.writeFileSync(file, text);
+  const realOpen = fs.openSync;
+  const realClose = fs.closeSync;
+  const opened: { fd: number; target: string; flags: number }[] = [];
+  const closed: number[] = [];
+  const open = vi.spyOn(fs, "openSync").mockImplementation((target, flags, mode) => {
+    const fd = realOpen(target, flags, mode);
+    opened.push({ fd, target: String(target), flags: Number(flags) }); return fd;
+  });
+  const close = vi.spyOn(fs, "closeSync").mockImplementation(fd => { closed.push(fd); realClose(fd); });
+  try {
+    for (const valid of [true, false]) {
+      opened.length = 0; closed.length = 0;
+      const source = { instructionsFile: file, sha256: valid ? digest(text) : "0".repeat(64) };
+      if (valid) expect(resolveActorInstructions(source, root)).toBe(text);
+      else expect(() => resolveActorInstructions(source, root)).toThrow(/digest mismatch/);
+      expect(opened).toHaveLength(4);
+      expect(opened[0]!.target).toBe(root);
+      for (let index = 0; index < opened.length; index++) {
+        const entry = opened[index]!;
+        expect(entry.flags & fs.constants.O_NOFOLLOW).toBe(fs.constants.O_NOFOLLOW);
+        if (index < 3) expect(entry.flags & fs.constants.O_DIRECTORY).toBe(fs.constants.O_DIRECTORY);
+        if (index > 0) expect(entry.target).toBe(`/proc/self/fd/${opened[index - 1]!.fd}/${["a", "b", "role.md"][index - 1]}`);
+      }
+      expect(closed).toEqual(opened.map(entry => entry.fd).reverse());
+    }
+  } finally { open.mockRestore(); close.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+it.skipIf(process.platform !== "linux").each(["root swap", "missing procfs"])("refuses %s before reading and closes the pinned root", failure => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-instructions-root-"));
+  const root = path.join(base, "factory"), saved = path.join(base, "saved"), outside = path.join(base, "outside");
+  fs.mkdirSync(root); fs.mkdirSync(outside);
+  const file = path.join(root, "role.md"); fs.writeFileSync(file, text); fs.writeFileSync(path.join(outside, "role.md"), text);
+  const realOpen = fs.openSync, realPath = fs.realpathSync;
+  let injected = false;
+  const opened: number[] = [];
+  const open = vi.spyOn(fs, "openSync").mockImplementation((target, flags, mode) => {
+    if (failure === "root swap" && String(target) === root && !injected) {
+      fs.renameSync(root, saved); fs.renameSync(outside, root); injected = true;
+    }
+    const fd = realOpen(target, flags, mode); opened.push(fd); return fd;
+  });
+  const realpath = vi.spyOn(fs, "realpathSync").mockImplementation(((target: fs.PathLike) => {
+    if (failure === "missing procfs" && String(target).startsWith("/proc/self/fd/")) {
+      injected = true; throw new Error("ENOENT: procfs unavailable");
+    }
+    return realPath(target);
+  }) as typeof fs.realpathSync);
+  const read = vi.spyOn(fs, "readSync");
+  const close = vi.spyOn(fs, "closeSync");
+  try {
+    expect(() => resolveActorInstructions(fileSource(file), root)).toThrow(/root changed|procfs unavailable/);
+    expect(injected).toBe(true);
+    expect(opened).toHaveLength(1);
+    expect(read).not.toHaveBeenCalled();
+    expect(close.mock.calls.map(([fd]) => fd)).toEqual(opened);
+  } finally {
+    open.mockRestore(); realpath.mockRestore(); read.mockRestore(); close.mockRestore();
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+it.each(["win32", "darwin", "freebsd"])("fails closed before filesystem access on %s, while inline instructions work", platform => {
+  const original = process.platform;
+  const realpath = vi.spyOn(fs, "realpathSync");
+  const open = vi.spyOn(fs, "openSync");
+  try {
+    Object.defineProperty(process, "platform", { value: platform });
+    expect(() => resolveActorInstructions(fileSource("untrusted/reparse/role.md"), "untrusted/root")).toThrow(/requires Linux/);
+    expect(resolveActorInstructions({ instructions: text })).toBe(text);
+    expect(realpath).not.toHaveBeenCalled();
+    expect(open).not.toHaveBeenCalled();
+  } finally {
+    Object.defineProperty(process, "platform", { value: original });
+    realpath.mockRestore(); open.mockRestore();
+  }
+});
+
+for (const durable of [false, true]) it.skipIf(process.platform === "linux")(`${durable ? "resident" : "Main"} refuses unsupported file sources without actor or registry mutation`, async () => {
+  const state = await fixture(durable);
+  try {
+    const actor = await state.create({ instructions: text });
+    const before = state.owner.status(actor.id);
+    const registryPath = path.join(durable ? state.config.actorRoot : path.join(state.root, "main-actors"), "actors.json");
+    const registry = fs.readFileSync(registryPath, "utf8");
+    const source = fileSource(path.join(state.allowed, "untrusted-reparse", "role.md"));
+    for (const operation of ["setter", "create"] as const) {
+      const attempt = operation === "setter"
+        ? state.provider.invoke("setInstructions", { id: actor.id, replace: true, ...source }, state.context)
+        : state.create(source);
+      await expect(attempt).rejects.toThrow(/requires Linux/);
+      expect(state.owner.status(actor.id)).toEqual(before);
+      expect(state.owner.instructions(actor.id)).toBe(text);
+      expect(state.owner.listOwned()).toHaveLength(1);
+      expect(fs.readFileSync(registryPath, "utf8")).toBe(registry);
+    }
+  } finally { await state.close(); }
+});
+
+it.skipIf(process.platform !== "linux")("uses the default factory/current realpath, allows an in-root symlink and the exact 512 KiB boundary", async () => {
   const state = await fixture();
   const home = vi.spyOn(os, "homedir").mockReturnValue(state.root);
   try {
@@ -181,7 +362,7 @@ it("uses the default factory/current realpath, allows an in-root symlink and the
   } finally { home.mockRestore(); await state.close(); }
 });
 
-it("resolves global template sources locally and reports the verified digest without persisting the reference", async () => {
+it.skipIf(process.platform !== "linux")("resolves global template sources locally and reports the verified digest without persisting the reference", async () => {
   const state = await fixture();
   try {
     const file = path.join(state.allowed, "template.md"); fs.writeFileSync(file, text);
@@ -199,7 +380,7 @@ it("resolves global template sources locally and reports the verified digest wit
     expect(state.globalActors.resolve(created.id)).not.toHaveProperty("instructionsFile");
   } finally { await state.close(); }
 });
-it("routes the file pair unchanged through the resident proxy client", async () => {
+it.skipIf(process.platform !== "linux")("routes the file pair unchanged through the resident proxy client", async () => {
   const state = await fixture(true);
   try {
     const file = path.join(state.factory, "proxy.md"); fs.writeFileSync(file, text);
@@ -213,7 +394,7 @@ it("routes the file pair unchanged through the resident proxy client", async () 
   } finally { await state.close(); }
 });
 
-it("exercises public guest createActor/create and setter schema admission end to end", async () => {
+it.skipIf(process.platform !== "linux")("exercises public guest createActor/create and setter schema admission end to end", async () => {
   const state = await fixture();
   try {
     const file = path.join(state.allowed, "guest.md"); fs.writeFileSync(file, text);

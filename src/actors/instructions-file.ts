@@ -38,6 +38,9 @@ const within = (root: string, file: string): boolean => {
 export const resolveActorInstructions = (source: FabricActorInstructionsSource, configuredRoot?: string): string => {
   const checked = actorInstructionsSource(source);
   if (checked.instructions !== undefined) return checked.instructions;
+  // Node has no portable openat / reparse-safe directory walk. Do not fall
+  // back to pathname-only checks on Windows or other non-Linux hosts.
+  if (process.platform !== "linux") throw new Error("instructionsFile requires Linux with /proc/self/fd; use inline instructions on this platform");
   // Inspect the caller spelling before homePath's path.join can erase '..'.
   if (checked.instructionsFile.split(/[\\/]/).includes("..")) throw new Error("instructionsFile must not contain '..' traversal");
   const file = homePath(checked.instructionsFile);
@@ -49,10 +52,32 @@ export const resolveActorInstructions = (source: FabricActorInstructionsSource, 
   const expected = fs.statSync(resolved);
   if (!expected.isFile()) throw new Error("instructionsFile must be a regular file");
   if (expected.size > MAX_ACTOR_INSTRUCTIONS_FILE_BYTES) throw new Error("instructionsFile exceeds 512 KB");
-  // Refuse a final-component swap and avoid blocking on a raced FIFO. fstat pins
-  // the checked inode; a second realpath check also catches parent-link swaps.
-  const fd = fs.openSync(resolved, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+  const expectedRoot = fs.statSync(root);
+  const handles: number[] = [];
   try {
+    // Pin the canonical trusted root once. /proc/self/fd provides Node's Linux
+    // equivalent of openat: the kernel follows our pinned descriptor, not a
+    // mutable pathname to its directory. Never follow caller components.
+    const rootFd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    handles.push(rootFd);
+    const rootStat = fs.fstatSync(rootFd);
+    if (!rootStat.isDirectory() || rootStat.dev !== expectedRoot.dev || rootStat.ino !== expectedRoot.ino ||
+      fs.realpathSync(`/proc/self/fd/${rootFd}`) !== root) {
+      throw new Error("instructionsFile allowed root changed");
+    }
+    const components = path.relative(root, resolved).split(path.sep);
+    let fd = rootFd;
+    for (let index = 0; index < components.length; index++) {
+      const final = index === components.length - 1;
+      fd = fs.openSync(`/proc/self/fd/${fd}/${components[index]}`,
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK |
+        (final ? 0 : fs.constants.O_DIRECTORY));
+      handles.push(fd);
+    }
+    // Regular-file/inode checks also refuse final swaps and raced FIFOs without
+    // blocking. The no-follow walk, not another pathname observation, contains
+    // the read even if an ancestor is swapped and restored between checks.
+    if (fs.realpathSync(`/proc/self/fd/${rootFd}`) !== root) throw new Error("instructionsFile allowed root changed");
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || stat.dev !== expected.dev || stat.ino !== expected.ino || fs.realpathSync(file) !== resolved) {
       throw new Error("instructionsFile changed or is not a regular file");
@@ -76,7 +101,9 @@ export const resolveActorInstructions = (source: FabricActorInstructionsSource, 
     // a digest different from the verified bytes (no BOM/newline normalization).
     if (!Buffer.from(text, "utf8").equals(bytes)) throw new Error("instructionsFile must contain valid UTF-8");
     return text;
-  } finally { fs.closeSync(fd); }
+  } finally {
+    for (const fd of handles.reverse()) fs.closeSync(fd);
+  }
 };
 
 export const assertActorInstructionReplacement = (current: string | undefined, instructions: string, replace?: boolean): void => {

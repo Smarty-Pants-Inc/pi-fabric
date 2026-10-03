@@ -252,6 +252,10 @@ export interface FabricRetentionConfig {
   orphanedTempRunMs: number;
   oneShotRunMs: number;
   actorRunArchiveMs: number;
+  /** Compact safe terminal run event logs after this age; latest actor runs are exempt. */
+  terminalRunEventsAgeMs: number;
+  /** Total retained events.jsonl bytes, including the truncation marker. */
+  terminalRunEventsMaxBytes: number;
 }
 
 export interface FabricActorsConfig {
@@ -513,6 +517,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     orphanedTempRunMs: 6 * 60 * 60 * 1_000,
     oneShotRunMs: 24 * 60 * 60 * 1_000,
     actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
+    terminalRunEventsAgeMs: 24 * 60 * 60 * 1_000,
+    terminalRunEventsMaxBytes: 256 * 1024,
   },
   actors: {
     maxSessionBytes: 20 * 1024 * 1024,
@@ -1191,6 +1197,18 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.retention.actorRunArchiveMs,
         60 * 60 * 1_000,
         365 * 24 * 60 * 60 * 1_000,
+      ),
+      terminalRunEventsAgeMs: boundedInteger(
+        retention.terminalRunEventsAgeMs,
+        DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsAgeMs,
+        60 * 60 * 1_000,
+        365 * 24 * 60 * 60 * 1_000,
+      ),
+      terminalRunEventsMaxBytes: boundedInteger(
+        retention.terminalRunEventsMaxBytes,
+        DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsMaxBytes,
+        1024,
+        16 * 1024 * 1024,
       ),
     },
     actors: {

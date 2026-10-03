@@ -30,6 +30,22 @@ describe("owned Windows taskkill close obligation", () => {
     expect(alarm).toHaveBeenCalledOnce();
     expect(alarm).toHaveBeenCalledWith(expect.stringContaining("retirement remains pending"), { code: "FABRIC_PROCESS_TREE_UNCONFIRMED" });
   });
+  it("failed attempt closure notifies its owner without discharging tree custody", async () => {
+    spyAlarm(); const child = fakeChild(); const killer = fakeChild(); spawn.mockReturnValue(killer);
+    const debt = vi.fn();
+    const closed = vi.fn();
+    let joined = false;
+    void terminateWindowsTree(child as unknown as ChildProcess, debt, closed).then(() => { joined = true; });
+    killer.emit("error", new Error("failed attempt"));
+    child.emit("close", null);
+    expect(closed).not.toHaveBeenCalled(); // Parent exit/error do not join the helper.
+    killer.emit("close", 1);
+    await Promise.resolve();
+    expect(closed).toHaveBeenCalledOnce();
+    expect(debt).toHaveBeenCalledOnce();
+    expect(debt.mock.invocationCallOrder[0]).toBeLessThan(closed.mock.invocationCallOrder[0]!);
+    expect(joined).toBe(false); // Closed failure is still not tree-exit authority.
+  });
   it("an error keeps retirement pending even after helper and parent close", async () => {
     const alarm = spyAlarm(); const child = fakeChild(); const killer = fakeChild(); spawn.mockReturnValue(killer);
     let joined = false;

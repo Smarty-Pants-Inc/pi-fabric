@@ -93,6 +93,54 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("#3662 ParticipantDirectory lineage liveness", () => {
+  it.each([null, {}, { format: 1, id: "session:lineage", kind: "invalid" }])(
+    "S1 retains invalid raw shared-state lineage %j until withdrawal", async (value) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lineage-raw-"));
+      roots.push(root);
+      const identity: MeshIdentity = { id: "observer", name: "main", kind: "main" };
+      const directory = createDirectory(path.join(root, "mesh"), identity, identity.id, () => []);
+      const id = "session:lineage";
+      const key = "topology/participants/" + createHash("sha256").update(id).digest("hex");
+      await directory.mesh.put({ key, identity, value });
+      expect(directory.get(id, Date.now(), { fresh: true })).toBeUndefined();
+      expect(directory.lastKnown(id)).toBeUndefined();
+      expect(directory.lineageAlive(id)).toBe(true);
+      await directory.mesh.delete({ key });
+      expect(directory.lineageAlive(id)).toBe(true); // Removal alone is not a close receipt.
+    },
+  );
+
+  it("S1 treats a failed raw lineage read as unknown, never dead", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lineage-read-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "observer", name: "main", kind: "main" };
+    const directory = createDirectory(path.join(root, "mesh"), identity, identity.id, () => []);
+    const read = vi.spyOn(directory.mesh, "get").mockImplementation(() => { throw new Error("unreadable state"); });
+    try {
+      expect(directory.lineageAlive("session:lineage")).toBe(true);
+    } finally {
+      read.mockRestore();
+    }
+    expect(directory.lineageAlive("session:lineage")).toBe(true);
+  });
+
+  it("does not treat lease expiry as lineage death, but observes withdrawal", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lineage-"));
+    roots.push(root);
+    const id = "session:lineage";
+    const directory = createDirectory(path.join(root, "mesh"), { id, name: "main", kind: "main" }, id,
+      () => [rootRecord(id, id, "lineage")]);
+    await directory.refresh();
+    const expiredAt = Date.now() + 120_000;
+    expect(directory.get(id, expiredAt)).toBeUndefined();
+    expect(directory.lastKnown(id, expiredAt)?.participant.stale).toBe(true);
+    expect(directory.lineageAlive(id, expiredAt)).toBe(true);
+    expect(directory.lineageAlive("session:unknown", expiredAt)).toBe(true);
+    await directory.closeLineage();
+    expect(directory.lineageAlive(id)).toBe(false);
+  });
+});
 describe("ParticipantDirectory.mirroredControlOwner", () => {
   const keyFor = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
   const setup = async () => {

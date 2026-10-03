@@ -27,6 +27,7 @@ import {
 import { peerLabelPrefix } from "./peer-settle.js";
 import { PARTICIPANT_NAME_PATTERN } from "./participant-name.js";
 import {
+  participantFilePresent,
   participantFilesOnly,
   readParticipantFile,
   readParticipantFiles,
@@ -38,6 +39,9 @@ const PARTICIPANT_PREFIX = "topology/participants/";
 /** Project-scoped monotonic counter backing Linear-style peer labels. Never shrinks. */
 const PEER_SEQ_KEY = "topology/peer-seq";
 const HOST_PREFIX = "topology/hosts/";
+// Root-owned clean-close receipts survive record cleanup. Absence alone (including a
+// lease-based reaper's cleanup) is not positive evidence that a lineage ended.
+const LINEAGE_CLOSURE_PREFIX = "topology/lineage-closures/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
@@ -810,6 +814,39 @@ export class ParticipantDirectory implements FabricParticipantSource {
       .find((participant) => participant.id === target);
   }
 
+  /**
+   * Shared by adoption and delivery. Live, stale and unknown all veto inheritance.
+   * Never combine lease-filtered get/lastKnown snapshots: a renewal between them
+   * can make both omit the same live root. Raw presence is lease-independent.
+   * Only a root-owned clean-close receipt, with no conflicting presence, proves death.
+   */
+  lineageAlive(rootId: string, _now = Date.now()): boolean {
+    if (!this.options.enabled) return true;
+    const target = rootId === "main" ? this.options.rootId : rootId;
+    const key = keyFor(PARTICIPANT_PREFIX, target);
+    try {
+      // true unless ENOENT: suppressed read/stat errors and invalid files veto inheritance.
+      if (participantFilePresent(this.mesh.root, key)) return true;
+      if (this.mesh.get(key, { fresh: true }) !== undefined) return true;
+      // Retained legacy sessions also count regardless of lease or parse validity.
+      if (target.startsWith("session:") && this.mesh.get(`${LEGACY_SESSION_PREFIX}${target.slice(8)}`, { fresh: true }) !== undefined) return true;
+      const entry = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, target), { fresh: true });
+      const receipt = entry?.value;
+      if (!(isObject(receipt) && receipt.format === 1 && receipt.rootId === target &&
+        receipt.ownerHostId === target && receipt.ownerIdentityId === target &&
+        entry?.updatedBy.id === target && entry.updatedBy.kind === "main" &&
+        typeof receipt.closedAt === "number" && Number.isFinite(receipt.closedAt))) return true;
+      // Recheck after reading the proof: a file-only publisher may have appeared
+      // since the first absence read. Cross-root commits additionally hold the
+      // mesh custody lock, which serializes this decision with resumeLineage().
+      if (participantFilePresent(this.mesh.root, key) || this.mesh.get(key, { fresh: true }) !== undefined) return true;
+      if (target.startsWith("session:") && this.mesh.get(`${LEGACY_SESSION_PREFIX}${target.slice(8)}`, { fresh: true }) !== undefined) return true;
+      return this.mesh.get(entry.key, { fresh: true })?.version !== entry.version;
+    } catch {
+      return true; // Unknown is not positive proof, even if a close receipt exists.
+    }
+  }
+
   // A stalled mesh writer (for example a signal-stopped lock holder, smarty-dev#266)
   // stops every host lease from renewing, so peers soon look departed. This reports it;
   // the directory's own reads (get, list, sessions, peers) never throw, because timers,
@@ -969,6 +1006,29 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#reloadPublished = this.#reloadUntil !== undefined;
   }
 
+  /** Invalidate death proof under the mesh custody lock BEFORE activation or file publication. */
+  async resumeLineage(): Promise<void> {
+    if (!this.options.enabled || this.options.hostId !== this.options.rootId ||
+      this.options.identity.id !== this.options.rootId || this.options.identity.kind !== "main") return;
+    const closure = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), { fresh: true });
+    if (closure) await this.mesh.delete({ key: closure.key, ifVersion: closure.version });
+  }
+
+  /** Explicit terminal session operation. Disposing/replacing a runtime is NOT lineage closure. */
+  async closeLineage(): Promise<void> {
+    await this.close();
+    if (!this.options.enabled || this.#reloadPublished) return;
+    // Only the creating Main may certify its terminal close, never a resident/child host.
+    if (this.options.hostId === this.options.rootId && this.options.identity.id === this.options.rootId &&
+      this.options.identity.kind === "main" && this.#localRecords.get(this.options.rootId)?.kind === "root") {
+      await this.mesh.put({
+        key: keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), identity: this.options.identity,
+        value: { format: 1, rootId: this.options.rootId, ownerHostId: this.options.hostId,
+          ownerIdentityId: this.options.identity.id, closedAt: Date.now() },
+      }).catch(() => undefined);
+    }
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
@@ -1030,6 +1090,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
         desired.set(record.id, record);
       }
     }
+    // No resumed root is activated locally or published to a file while an old
+    // death proof survives. Failure aborts this refresh before any root publication.
+    if (desired.get(this.options.rootId)?.kind === "root") await this.resumeLineage();
     // Mint before the local cache swap so self() exposes the label too.
     await this.#ensurePeerLabels(desired);
     this.#localRecords.clear();

@@ -8,7 +8,7 @@ import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { ResidentHost } from "../src/residency/host.js";
+import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
 import * as expiry from "../src/residency/request-expiry.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { acknowledgeResidentResponse, abandonResidentRequest, commitResidentRequest, readResidentRequestDecision, registerResidentCancellation, residentHostId, residentRoot, residentHostStateNote, residentCommandForOwner, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -32,6 +32,249 @@ const seed = (root: string, time: number, acknowledged = true) => {
 };
 const sweep = (root: string, now: number, live = new Set<string>()) => new ResidentRequestRetention(root).sweep(now, live, 10_000);
 const exists = (root: string, dir: string, id: string) => fs.existsSync(path.join(root, dir, `${id}.json`));
+
+describe("resident terminal event retention", () => {
+  const day = 24 * 60 * 60 * 1000;
+  const now = 4 * day;
+  const log = Buffer.from(Array.from({ length: 15000 }, (_, sequence) => JSON.stringify({ sequence, text: "🙂".repeat(10) }) + "\n").join(""));
+  const make = (dir: string, id: string, status: string, finishedAt = day) => {
+    const run = path.join(dir, "runs", id);
+    fs.mkdirSync(run, { recursive: true });
+    fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status, finishedAt }));
+    fs.writeFileSync(path.join(run, "events.jsonl"), log);
+    fs.writeFileSync(path.join(run, "reply.json"), '{"text":"keep reply"}');
+    return run;
+  };
+
+  it.each([
+    ["startup", false], ["startup", true], ["streaming", false], ["streaming wildcard", false],
+  ] as const)("%s retention (retainRuns=%s) requires checked descendant exit before touching an aged parent log", (phase, retainRuns) => {
+    const dir = root();
+    const unknown = [undefined, "malformed", String(process.pid)].map((sessionId, index) => {
+      const run = make(dir, `unknown-${index}`, "completed");
+      write(run, "nested/child", "status", { status: "completed", transport: "process", sessionId });
+      fs.writeFileSync(path.join(run, "nested/child/events.jsonl"), log);
+      const aged = new Date(day); fs.utimesSync(run, aged, aged);
+      return run;
+    });
+    const exited = make(dir, "checked-exited", "completed");
+    write(exited, "nested/child", "status", { status: "completed", transport: "process", sessionId: "2147483647" });
+    const snapshots = unknown.map(run => ["events.jsonl", "status.json", "reply.json", "nested/child/status.json", "nested/child/events.jsonl"]
+      .map(name => [name, fs.readFileSync(path.join(run, name))] as const));
+    if (phase === "startup") sweepResidentRuns(path.join(dir, "runs"), now, 10000, { retainRuns });
+    else {
+      const retention = new ResidentRequestRetention(dir);
+      try { retention.sweep(now, new Set(phase === "streaming wildcard" ? ["*"] : []), 10000); }
+      finally { retention.close(); }
+    }
+    // Native byte equality preserves the full snapshot guarantee without Vitest's
+    // per-byte deep comparison of multi-megabyte Buffers consuming the CI timeout.
+    for (const [index, run] of unknown.entries()) {
+      for (const [name, before] of snapshots[index]!) {
+        expect(fs.readFileSync(path.join(run, name)).equals(before), `${run}/${name} must remain byte-identical`).toBe(true);
+      }
+    }
+    expect(fs.statSync(path.join(exited, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+  });
+
+  it("uses the existing streaming sweep to bound terminal residency runs, preserving results, latest references and idempotency", () => {
+    const dir = root();
+    const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
+    const compacted = ["completed", "failed", "stopped", "timed_out"].map(status => make(dir, status, status));
+    const preserved = [make(dir, "live", "running"), make(dir, "queued", "queued"), make(dir, "unknown", "unknown"),
+      make(dir, "young", "completed", now - 1000), make(dir, "latest", "failed"), make(dir, "held", "completed")];
+    write(dir, "results", "completed", { text: "keep saved result" });
+    const result = fs.readFileSync(path.join(dir, "results", "completed.json"));
+    const statuses = compacted.map(run => fs.readFileSync(path.join(run, "status.json")));
+    const retention = new ResidentRequestRetention(dir, [actorRoot], { terminalRunEventsMaxBytes: 128 * 1024 });
+    // A wildcard from the budget-limited request-reference scan cannot starve the
+    // run phase: terminal/exit safety is independently checked for every candidate.
+    retention.sweep(now, new Set(["*", "held"]), 10000);
+    const bounded = compacted.map(run => fs.readFileSync(path.join(run, "events.jsonl")));
+    for (const [index, run] of compacted.entries()) {
+      const tail = bounded[index]!;
+      expect(tail.length).toBeLessThanOrEqual(128 * 1024);
+      expect(JSON.parse(tail.subarray(0, tail.indexOf(0x0a)).toString())).toMatchObject({ fabricTruncated: true });
+      const events = tail.subarray(tail.indexOf(0x0a) + 1);
+      expect(events.equals(log.subarray(log.length - events.length))).toBe(true);
+      expect(JSON.parse(events.toString().trim().split("\n").at(-1)!)).toMatchObject({ sequence: 14999 });
+      expect(fs.readFileSync(path.join(run, "status.json"))).toEqual(statuses[index]);
+      expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep reply"}');
+    }
+    for (const run of preserved) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+    expect(fs.readFileSync(path.join(dir, "results", "completed.json"))).toEqual(result);
+    const rename = vi.spyOn(fs, "renameSync");
+    retention.sweep(now + 60001, new Set(["held"]), 10000);
+    expect(rename.mock.calls.some(call => String(call[1]).endsWith("events.jsonl"))).toBe(false);
+    for (const [index, run] of compacted.entries()) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(bounded[index]!)).toBe(true);
+    retention.close();
+  });
+
+  it("also bounds explicitly retained runs at fenced startup and protects persisted lastRunId from cleanup", () => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
+    const old = make(dir, "old", "completed");
+    const latest = make(dir, "latest", "failed");
+    for (const run of [old, latest]) fs.utimesSync(run, day / 1000, day / 1000);
+    const runs = path.join(dir, "runs");
+    expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot], retainRuns: true })).toEqual([]);
+    expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+    expect(fs.existsSync(path.join(old, "status.json"))).toBe(true);
+    expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
+    fs.utimesSync(old, day / 1000, day / 1000);
+    expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot] })).toEqual([old]);
+    expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
+  });
+
+  it.each(["startup", "streaming"])("compacts with a valid registry above 1 MiB at %s, preserving its latest run", (phase) => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest", instructions: "normal actor",
+      messages: Array.from({ length: 100 }, () => ({ text: "x".repeat(12_000) })) }] });
+    const registry = fs.readFileSync(path.join(actorRoot, "actors.json"));
+    expect(registry.length).toBeGreaterThan(1024 * 1024);
+    const old = make(dir, "old", "completed"); const latest = make(dir, "latest", "failed");
+    if (phase === "startup") {
+      sweepResidentRuns(path.join(dir, "runs"), now, 10000, { actorRoots: [actorRoot], retainRuns: true });
+    } else {
+      const collector = new ResidentRequestRetention(dir, [actorRoot]);
+      try { collector.sweep(now, new Set(), 10000); } finally { collector.close(); }
+    }
+    expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+    expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
+    expect(fs.readFileSync(path.join(actorRoot, "actors.json")).equals(registry)).toBe(true);
+  });
+
+  it.each(["slow references", "slow safety walk"])("makes progress with the production 5-ms budget despite %s", (slow) => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
+    const old = make(dir, "old", "completed");
+    const latest = make(dir, "latest", "failed"); const live = make(dir, "live", "completed");
+    const worker = make(dir, "worker", "completed");
+    write(worker, ".", "status", { status: "completed", finishedAt: day, transport: "process", sessionId: String(process.pid) });
+    if (slow === "slow safety walk") {
+      for (let i = 0; i < 20; i++) {
+        const child = path.join(old, "nested", String(i));
+        write(child, ".", "status", { status: "completed", finishedAt: day, transport: "process", sessionId: "2147483647" });
+      }
+    }
+    let elapsed = 0; let registryReads = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      const file = String(args[0]);
+      if (file === path.join(actorRoot, "actors.json")) { registryReads++; if (slow === "slow references") elapsed += 6; }
+      if (slow === "slow safety walk" && file.startsWith(old) && file.endsWith("status.json")) elapsed += 1;
+      return read(...args);
+    });
+    const collector = new ResidentRequestRetention(dir, [actorRoot]);
+    try {
+      for (let slice = 0; slice < 100 && collector.due(now); slice++) collector.sweep(now, new Set(["live"]), 5);
+      expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+      for (const run of [latest, live, worker]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+      expect(registryReads).toBeGreaterThan(0);
+    } finally { collector.close(); }
+  });
+
+  it.each(["new latest", "live set", "live worker", "unreadable registry"])("refreshes the %s veto between over-budget reference preparation and compaction", (change) => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
+    const old = make(dir, "old", "completed"); const latest = make(dir, "latest", "failed");
+    let elapsed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      if (String(args[0]) === path.join(actorRoot, "actors.json")) elapsed += 6;
+      return read(...args);
+    });
+    const collector = new ResidentRequestRetention(dir, [actorRoot]);
+    try {
+      collector.sweep(now, new Set(), 5);
+      expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
+      if (change === "new latest") {
+        write(actorRoot, ".", "actors-next", { actors: [{ id: "actor", lastRunId: "old" }, { id: "other", lastRunId: "latest" }] });
+        fs.renameSync(path.join(actorRoot, "actors-next.json"), path.join(actorRoot, "actors.json"));
+      } else if (change === "unreadable registry") {
+        fs.writeFileSync(path.join(actorRoot, "actors.json"), "{");
+      } else if (change === "live worker") {
+        write(old, ".", "status", { status: "completed", finishedAt: day, transport: "process", sessionId: String(process.pid) });
+      }
+      for (let slice = 0; slice < 100 && collector.due(now); slice++) collector.sweep(now, new Set(change === "live set" ? ["old"] : []), 5);
+      for (const run of [old, latest]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+    } finally { collector.close(); }
+  });
+
+  it("vetoes a new latest-run reference published during a long compaction safety walk", () => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [] });
+    const old = make(dir, "old", "completed");
+    vi.spyOn(performance, "now").mockReturnValue(0);
+    const read = fs.readFileSync; let changed = false;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      if (!changed && String(args[0]) === path.join(old, "status.json")) {
+        changed = true;
+        write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "old" }] });
+      }
+      return read(...args);
+    });
+    const collector = new ResidentRequestRetention(dir, [actorRoot]);
+    try {
+      collector.sweep(now, new Set(), 5);
+      expect(changed).toBe(true);
+      expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
+    } finally { collector.close(); }
+  });
+
+  it("eventually compacts via ResidentHost's actual 5-ms polling path after an over-budget registry read", async () => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    const old = make(dir, "old", "completed"); const latest = make(dir, "latest", "failed");
+    const held = make(dir, "held", "completed"); const worker = make(dir, "worker", "completed");
+    write(worker, ".", "status", { status: "completed", finishedAt: day, transport: "process", sessionId: String(process.pid) });
+    // Protect fixtures from startup, so only the production poll can compact old.
+    write(actorRoot, ".", "actors", { actors: ["old", "latest", "held"].map(id => ({ id, lastRunId: id })) });
+    const config: ResidentHostConfig = {
+      format: 1, rootId: "session:retention", sessionId: "retention", cwd: dir, projectRoot: dir,
+      meshRoot: path.join(dir, "mesh"), actorRoot, residencyRoot: dir,
+      fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
+      mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorScope: "project" }, retention: DEFAULT_FABRIC_CONFIG.retention,
+      workerPath: "unused", fabricExtensionPath: "unused", piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
+    };
+    let elapsed = 0; let registryReads = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      if (String(args[0]) === path.join(actorRoot, "actors.json")) { elapsed += 6; registryReads++; }
+      return read(...args);
+    });
+    const slices = vi.spyOn(ResidentRequestRetention.prototype, "sweep");
+    const host = new ResidentHost(config);
+    try {
+      await host.start();
+      expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
+      vi.spyOn(host.agents, "retentionReferences").mockReturnValue(new Set(["held"]));
+      write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
+      const deadline = Date.now() + 2000;
+      while (fs.statSync(path.join(old, "events.jsonl")).size > 256 * 1024 && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+      for (const run of [latest, held, worker]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+      expect(registryReads).toBeGreaterThan(0);
+      expect(slices.mock.calls.length).toBeGreaterThan(1);
+      expect(slices.mock.calls.every(call => call[2] === 5)).toBe(true);
+    } finally { await host.close(); }
+  });
+
+  it("fails closed for unreadable actor lastRunId references, and honors custom age", () => {
+    const dir = root(); const actorRoot = path.join(dir, "actor-registry");
+    write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: 123 }] });
+    const run = make(dir, "old", "completed");
+    new ResidentRequestRetention(dir, [actorRoot]).sweep(now, new Set(), 10000);
+    expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+    new ResidentRequestRetention(dir, [], { terminalRunEventsAgeMs: 7 * day }).sweep(now, new Set(), 10000);
+    expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
+  });
+});
 
 describe("bounded resident request retention", () => {
   const now = Date.now();

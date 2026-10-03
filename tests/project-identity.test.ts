@@ -297,17 +297,55 @@ describe("project identity", () => {
     expect(() => resolveProjectAgent(all, P("/p/repo"))).toThrow(expect.objectContaining({ name: "FabricProjectAgentAmbiguousError" }));
   });
 
-  // smarty-dev#878: a durable actor's messages follow its project's agent once its root is gone.
-  it("delivers to the root while it is live, else to the project's live project agent, else still to the root", () => {
-    const next = root("session:new-dev-lead", { role: "project-agent", project: P("/p/smarty-dev"), cwd: P("/p/smarty-dev"), startedAt: 9 });
-    const worktree = root("session:worktree", { role: "worktree-agent", project: P("/p/smarty-dev"), cwd: P("/p/smarty-dev/worktrees/x") });
-    const other = root("session:knowledge", { role: "project-agent", project: P("/p/knowledge"), cwd: P("/p/knowledge") });
-    const old = root("session:dev-lead", { role: "project-agent", project: P("/p/smarty-dev"), cwd: P("/p/smarty-dev"), startedAt: 1 });
-    // While the root lives, even a newer project agent does not take its messages.
-    expect(deliveryRoot("session:dev-lead", [old, next, worktree], P("/p/smarty-dev"))).toBe("session:dev-lead");
-    expect(deliveryRoot("session:dev-lead", [next, worktree, other], P("/p/smarty-dev"))).toBe("session:new-dev-lead");
-    // Counterexamples: never a worktree agent of the project, nor another project's agent.
-    expect(deliveryRoot("session:dev-lead", [worktree, other], P("/p/smarty-dev"))).toBe("session:dev-lead");
+  describe("#3662 resident actor delivery", () => {
+    const project = P("/p/smarty-dev");
+    const rootId = "session:dev-lead";
+    const next = root("session:new-dev-lead", { role: "project-agent", project, startedAt: 99 });
+    const integrator = root("session:integrator", { role: "project-agent", project, startedAt: 1 });
+
+    it("keeps an expired-lease root with live lineage despite a newer project-agent", () => {
+      const boundIntegrator = vi.fn(() => ({ leadId: next.id }));
+      expect(deliveryRoot(rootId, [next], project, { lineageAlive: () => true, boundIntegrator })).toBe(rootId);
+      expect(boundIntegrator).not.toHaveBeenCalled();
+    });
+
+    it("keeps a dead root with no bound integrator, never electing a newer project-agent", () => {
+      expect(deliveryRoot(rootId, [next], project, { lineageAlive: () => false })).toBe(rootId);
+    });
+
+    it("delivers a dead root only to the bound integrator's exact session id", () => {
+      expect(deliveryRoot(rootId, [integrator, next], project, {
+        lineageAlive: () => false, boundIntegrator: () => ({ leadId: integrator.id }),
+      })).toBe(integrator.id);
+    });
+
+    it("keeps the root when lineage death is unknown or the bound integrator is unavailable", () => {
+      expect(deliveryRoot(rootId, [next], project)).toBe(rootId);
+      expect(deliveryRoot(rootId, [next], project, {
+        lineageAlive: () => false, boundIntegrator: () => ({ leadId: integrator.id }),
+      })).toBe(rootId);
+    });
+
+    it("keeps a listed root even if the lineage hook disagrees", () => {
+      expect(deliveryRoot(rootId, [root(rootId, { project }), next], project, {
+        lineageAlive: () => false, boundIntegrator: () => ({ leadId: next.id }),
+      })).toBe(rootId);
+    });
+
+    it("fails closed for invalid bindings and foreign or non-interactive integrators", () => {
+      const options = { lineageAlive: () => false, boundIntegrator: () => ({ leadId: integrator.id }) };
+      expect(deliveryRoot(rootId, [{ ...integrator, project: P("/p/other") }, next], project, options)).toBe(rootId);
+      expect(deliveryRoot(rootId, [{ ...integrator, interactive: false }, next], project, options)).toBe(rootId);
+      expect(deliveryRoot(rootId, [next], project, {
+        lineageAlive: () => false, boundIntegrator: () => { throw new Error("invalid marker"); },
+      })).toBe(rootId);
+      expect(deliveryRoot(rootId, [next], project, {
+        lineageAlive: () => { throw new Error("unknown liveness"); }, boundIntegrator: () => ({ leadId: next.id }),
+      })).toBe(rootId);
+      expect(deliveryRoot(rootId, [{ ...integrator, repository: "github.com/foreign/repo" }, next], project, {
+        lineageAlive: () => false, boundIntegrator: () => ({ leadId: integrator.id, repository: "github.com/our/repo" }),
+      })).toBe(rootId);
+    });
   });
 
   it("falls back to a root without a role whose cwd is the project checkout, and explains a miss", () => {

@@ -315,14 +315,15 @@ describe("terminal run event log retention", () => {
       expect(pruneActorRunArchives(options)).toEqual([]);
       const compacted = fs.readFileSync(path.join(dir, "events.jsonl"));
       expect(compacted.length).toBeLessThanOrEqual(256 * 1024);
-      expect(compacted.length).toBeGreaterThan(250 * 1024);
+      expect(compacted.toString().trim().split("\n")).toHaveLength(201);
       const newline = compacted.indexOf(0x0a);
       expect(JSON.parse(compacted.subarray(0, newline).toString())).toMatchObject({ fabricTruncated: true });
       const tail = compacted.subarray(newline + 1);
       expect(tail.equals(log.subarray(log.length - tail.length))).toBe(true);
       const lines = tail.toString().trim().split("\n").map(line => JSON.parse(line));
       expect(lines.at(-1).sequence).toBe(11999);
-      expect(lines[0].sequence).toBeGreaterThan(0);
+      expect(lines).toHaveLength(200);
+      expect(lines[0].sequence).toBe(11800);
       expect(fs.readFileSync(path.join(dir, "status.json"))).toEqual(statusBefore);
       expect(fs.readFileSync(path.join(dir, "reply.json"))).toEqual(replyBefore);
       expect(read.mock.calls.length).toBeGreaterThan(0);

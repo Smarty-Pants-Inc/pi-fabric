@@ -26,6 +26,7 @@ import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/mana
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore } from "./child-completions.js";
+import { pruneActorSessionBackups } from "../storage/retention.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
@@ -1070,7 +1071,7 @@ export class ActorManager {
     );
   }
 
-  // Moves session.jsonl to session.jsonl.<UTC stamp>.bak, keeps the 2 newest backups and logs it.
+  // Moves session.jsonl to session.jsonl.<UTC stamp>.bak, keeps the newest backup and logs it.
   #archiveSession(actor: ManagedActor, trigger: "requested" | "size"): void {
     const running = this.#runningActor(actor.id);
     if (this.#inFlight.has(actor.id) || running?.abortController || running?.inFlightRun) {
@@ -1102,13 +1103,7 @@ export class ActorManager {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       archived = null;
     }
-    const backups = listBackups()
-      .sort((left, right) => {
-        const [a, m] = order(left);
-        const [b, n] = order(right);
-        return a < b ? -1 : a > b ? 1 : m - n;
-      });
-    for (const name of backups.slice(0, -2)) fs.rmSync(path.join(dir, name), { force: true });
+    pruneActorSessionBackups(file);
     // Publish a complete header by temp + rename before a future writer can append.
     this.#ensurePiSession(actor);
     // A Claude-runner actor resumes by runner session id: drop it, too.

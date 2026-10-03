@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
-import { pruneActorRunArchives } from "../storage/retention.js";
+import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
 import type { FabricActorMessage } from "./types.js";
 
 export const ACTOR_MESSAGE_HISTORY_LIMIT = 100;
@@ -86,7 +86,7 @@ export class ActorLogStore {
     if (!runDirectory || !fs.existsSync(runDirectory)) return;
     const dest = path.join(path.dirname(actor.sessionFile), "runs", runId);
     fs.mkdirSync(dest, { recursive: true, mode: 0o700 });
-    for (const file of ["events.jsonl", "status.json", "task.txt", "relaunches.jsonl"]) {
+    for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
       const src = path.join(runDirectory, file);
       if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dest, file));
     }
@@ -102,6 +102,7 @@ export class ActorLogStore {
   }
 
   pruneRuns(actor: ActorLogTarget, now = Date.now()): void {
+    pruneActorSessionBackups(actor.sessionFile);
     pruneActorRunArchives({
       runsDirectory: path.join(path.dirname(actor.sessionFile), "runs"),
       ...(actor.lastRunId ? { latestRunId: actor.lastRunId } : {}),

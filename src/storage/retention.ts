@@ -23,6 +23,7 @@ interface RunRecordSummary {
   transport?: string;
   sessionId?: string;
   processStartTime?: string;
+  cleanupPending?: boolean;
 }
 export interface RetentionSweepResult {
   removedRoots: string[];
@@ -113,6 +114,7 @@ export const runTreeExitVeto = (
     const record = readJson<RunRecordSummary>(statusFile);
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (fs.existsSync(statusFile) && !record) return "worker exit is unconfirmed: unreadable run record";
+    if (record?.cleanupPending !== undefined && record.cleanupPending !== false) return "worker cleanup is not joined";
     if (record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
     }
@@ -252,7 +254,7 @@ const pruneClosedRunRoot = (
 ): string[] => {
   const removed: string[] = [];
   // Every run started after its root, so no run of a root younger than the shortest retention is due.
-  if (now - owner.startedAt < Math.min(orphanMs, oneShotMs)) return removed;
+  if (now - owner.startedAt < Math.min(orphanMs, oneShotMs, 6 * 60 * 60 * 1_000)) return removed;
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
@@ -264,7 +266,10 @@ const pruneClosedRunRoot = (
     const terminal = !!record?.status && TERMINAL_STATUSES.has(record.status);
     const reference = terminal ? recordAgeReference(record!, ownedStat(directory)?.mtimeMs ?? now) : owner.closedAt!;
     const retention = terminal && !record?.actorId ? oneShotMs : orphanMs;
-    if (now - reference < retention) continue;
+    if (now - reference < retention) {
+      compactTerminalRunEvents(directory, { now, expired });
+      continue;
+    }
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) continue;
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
@@ -394,29 +399,32 @@ export interface TerminalRunEventsRetention {
   terminalRunEventsMaxBytes?: number;
 }
 
+const TERMINAL_EVENT_TAIL_LINES = 200;
 const EVENT_TAIL_MARKER = Buffer.from('{"fabricTruncated":true,"reason":"terminal run event retention"}\n');
 
 /** Compact only an owned, safely terminal run. Read a bounded suffix, keep complete JSONL
- * lines, and atomically replace only events.jsonl; status/reply/result remain byte-for-byte.
+ * lines (at most the last 200), and atomically replace only events.jsonl; status/reply/result remain byte-for-byte.
  * The marker counts against the byte cap. A single oversized final event may leave only
  * the marker rather than a corrupt JSON fragment. Already bounded logs are never rewritten.
  * Callers retain their ownership/latest-run vetoes before entering this shared predicate. */
 export const compactTerminalRunEvents = (
   directory: string,
-  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean } = {},
+  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean; dryRun?: boolean;
+    onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
 ): boolean => {
   const now = options.now ?? Date.now();
-  const ageMs = options.terminalRunEventsAgeMs ?? 24 * 60 * 60 * 1_000;
+  const ageMs = options.terminalRunEventsAgeMs ?? 6 * 60 * 60 * 1_000;
   const maxBytes = options.terminalRunEventsMaxBytes ?? 256 * 1024;
   const expired = options.expired ?? noDeadline;
+  const directoryStat = ownedStat(directory);
   if (!Number.isSafeInteger(ageMs) || ageMs < 0 || !Number.isSafeInteger(maxBytes) ||
-      maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !ownedStat(directory)?.isDirectory()) return false;
+      maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !directoryStat?.isDirectory()) return false;
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
   if (!record?.status || !TERMINAL_STATUSES.has(record.status) ||
       now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
   const file = path.join(directory, "events.jsonl");
   const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size <= maxBytes || runTreeExitVeto(directory, 0, expired, true) ||
+  if (!stat?.isFile() || stat.size === 0 || runTreeExitVeto(directory, 0, expired, true) ||
       !canRemoveTerminalRun(directory, expired)) return false;
   try {
     const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
@@ -426,7 +434,7 @@ export const compactTerminalRunEvents = (
       if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size ||
           opened.mtimeMs !== stat.mtimeMs) return false;
       // One look-behind byte lets an exactly aligned final line survive the boundary.
-      const length = maxBytes - EVENT_TAIL_MARKER.length + 1;
+      const length = Math.min(stat.size, maxBytes - EVENT_TAIL_MARKER.length + 1);
       tail = Buffer.alloc(length);
       let read = 0;
       while (read < length) {
@@ -436,16 +444,74 @@ export const compactTerminalRunEvents = (
         read += count;
       }
     } finally { fs.closeSync(fd); }
-    const newline = tail.indexOf(0x0a);
-    const retained = newline < 0 ? Buffer.alloc(0) : tail.subarray(newline + 1);
+    // Skip a partial first line only when we did not read from the start.
+    let retained = tail;
+    if (tail.length < stat.size) {
+      const newline = tail.indexOf(0x0a);
+      retained = newline < 0 ? Buffer.alloc(0) : tail.subarray(newline + 1);
+    } else if (tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)) {
+      retained = tail.subarray(EVENT_TAIL_MARKER.length);
+    }
+    let lines = 0;
+    for (let index = retained.length - 1; index >= 0; index--) {
+      if (retained[index] === 0x0a && index !== retained.length - 1 && ++lines === TERMINAL_EVENT_TAIL_LINES) {
+        retained = retained.subarray(index + 1);
+        break;
+      }
+    }
+    // A full unmarked log of <=200 events, or our already bounded tail, is a no-op.
+    if (retained.length === stat.size ||
+        (tail.length === stat.size && stat.size === EVENT_TAIL_MARKER.length + retained.length &&
+         tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER))) return false;
     const checked = ownedStat(file);
     if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
         checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
         runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
         expired() || options.isRetained?.()) return false;
-    writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained]));
+    if (!options.dryRun) {
+      try { writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained])); }
+      finally {
+        // Residency expiry (and legacy timestamp fallback) uses directory mtime.
+        // Creating/renaming the atomic tail must not restart that retention clock.
+        const current = ownedStat(directory);
+        if (current?.dev === directoryStat.dev && current.ino === directoryStat.ino) {
+          try { fs.utimesSync(directory, directoryStat.atimeMs / 1000, directoryStat.mtimeMs / 1000); }
+          catch { /* A failed timestamp restore only delays collection; it cannot authorize it. */ }
+        }
+      }
+    }
+    options.onCompact?.({ path: file, beforeBytes: stat.size, afterBytes: EVENT_TAIL_MARKER.length + retained.length });
     return true;
   } catch { return false; }
+};
+
+/** Immutable, ordinary rotation history only. Malformed-session orphan backups are
+ * recovery evidence, not rotation history, and keep their existing exemption. */
+export const pruneActorSessionBackups = (sessionFile: string, options: {
+  dryRun?: boolean; onPrune?: (change: { path: string; bytes: number }) => void;
+} = {}): string[] => {
+  const directory = path.dirname(sessionFile);
+  if (!ownedStat(directory)?.isDirectory()) return [];
+  const prefix = `${path.basename(sessionFile)}.`;
+  try {
+    const backups = fs.readdirSync(directory).flatMap(name => {
+      if (!name.startsWith(prefix)) return [];
+      const match = /^(\d{8}T\d{9}Z)(?:-(\d+))?\.bak$/.exec(name.slice(prefix.length));
+      const stat = ownedStat(path.join(directory, name));
+      return match && stat?.isFile() ? [{ name, stamp: match[1]!, suffix: Number(match[2] ?? 0), stat }] : [];
+    }).sort((a, b) => a.stamp.localeCompare(b.stamp) || a.suffix - b.suffix);
+    const removed: string[] = [];
+    for (const backup of backups.slice(0, -1)) {
+      const file = path.join(directory, backup.name);
+      const checked = ownedStat(file);
+      if (!checked || checked.dev !== backup.stat.dev || checked.ino !== backup.stat.ino ||
+          checked.size !== backup.stat.size || checked.mtimeMs !== backup.stat.mtimeMs) continue;
+      if (!options.dryRun) fs.unlinkSync(file);
+      options.onPrune?.({ path: file, bytes: backup.stat.size });
+      removed.push(file);
+    }
+    return removed;
+  } catch { return []; }
 };
 
 export const pruneActorRunArchives = (options: {

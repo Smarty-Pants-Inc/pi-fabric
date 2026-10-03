@@ -336,7 +336,8 @@ export class FabricExecutionService {
         ref !== "agents.run" &&
         ref !== "agents.handoff" &&
         ref !== "agents.spawn" &&
-        ref !== "agents.create"
+        ref !== "agents.create" &&
+        ref !== "agents.createActor"
       ) return;
       agentCalls++;
       if (agentCalls > maxAgentCalls) {

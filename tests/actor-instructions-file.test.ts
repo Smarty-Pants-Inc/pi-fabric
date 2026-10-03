@@ -89,6 +89,8 @@ const rejectionCases = (root: string, allowed: string) => {
     ["outside", fileSource(outside), /outside/],
     ["prefix sibling", fileSource(path.join(sibling, "role.md")), /outside/],
     ["traversal", fileSource(`${allowed}/../${path.basename(allowed)}/role.md`), /traversal/],
+    ["tilde traversal", fileSource(`~/${path.relative(root, allowed)}/../${path.basename(allowed)}/role.md`), /traversal/],
+    ["tilde backslash traversal", fileSource(`~\\${path.relative(root, allowed)}/../${path.basename(allowed)}/role.md`), /traversal/],
     ["symlink escape", fileSource(link), /outside/],
     ["directory symlink escape", fileSource(path.join(directoryLink, "role.md")), /outside/],
     ["oversize", fileSource(large), /512 KB/],
@@ -131,13 +133,23 @@ for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} 
       const before = state.owner.status(actor.id);
       const registryPath = path.join(durable ? state.config.actorRoot : path.join(state.root, "main-actors"), "actors.json");
       const registry = fs.readFileSync(registryPath, "utf8");
-      for (const [label, source, error] of rejectionCases(state.root, state.allowed)) {
-        await expect(state.provider.invoke("setInstructions", { id: actor.id, replace: true, ...source }, state.context), label).rejects.toThrow(error);
-        await expect(state.create(source), label).rejects.toThrow(error);
-        expect(state.owner.status(actor.id), label).toEqual(before);
-        expect(state.owner.listOwned(), label).toHaveLength(1);
-        expect(fs.readFileSync(registryPath, "utf8"), label).toBe(registry);
-      }
+      // Make both tilde spellings expand to an existing, digest-matching in-root
+      // file. A normalizing expansion must not hide the original '..' segment.
+      const home = vi.spyOn(os, "homedir").mockReturnValue(state.root);
+      try {
+        const unchanged = (label: string) => {
+          expect(state.owner.status(actor.id), label).toEqual(before);
+          expect(state.owner.instructions(actor.id), label).toBe(text);
+          expect(state.owner.listOwned(), label).toHaveLength(1);
+          expect(fs.readFileSync(registryPath, "utf8"), label).toBe(registry);
+        };
+        for (const [label, source, error] of rejectionCases(state.root, state.allowed)) {
+          await expect(state.provider.invoke("setInstructions", { id: actor.id, replace: true, ...source }, state.context), label).rejects.toThrow(error);
+          unchanged(`${label}: setter`);
+          await expect(state.create(source), label).rejects.toThrow(error);
+          unchanged(`${label}: create`);
+        }
+      } finally { home.mockRestore(); }
     } finally { await state.close(); }
   });
 

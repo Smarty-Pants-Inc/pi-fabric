@@ -38,9 +38,9 @@ const within = (root: string, file: string): boolean => {
 export const resolveActorInstructions = (source: FabricActorInstructionsSource, configuredRoot?: string): string => {
   const checked = actorInstructionsSource(source);
   if (checked.instructions !== undefined) return checked.instructions;
+  // Inspect the caller spelling before homePath's path.join can erase '..'.
+  if (checked.instructionsFile.split(/[\\/]/).includes("..")) throw new Error("instructionsFile must not contain '..' traversal");
   const file = homePath(checked.instructionsFile);
-  // Do not silently normalize an explicitly traversing caller path.
-  if (file.split(/[\\/]/).includes("..")) throw new Error("instructionsFile must not contain '..' traversal");
   const defaultRoot = path.join(os.homedir(), ".local/share/smarty-dev/factory/current");
   const rootInput = configuredRoot ?? defaultRoot;
   const root = fs.realpathSync(homePath(rootInput));

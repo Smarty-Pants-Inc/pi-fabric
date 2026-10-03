@@ -136,6 +136,8 @@ import {
 import { participantProject, participantRole } from "./topology/project-identity.js";
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
+import { ActorChildCompletionStore } from "./actors/child-completions.js";
+import { resolveAgentSpawner } from "./agents/spawner.js";
 import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
@@ -700,7 +702,11 @@ export class FabricRuntimeState {
       }
       return { key: `${resolved.provider}/${resolved.id}`, model };
     };
-    const completionInbox = new AgentCompletionInbox(this.pi, context);
+    const actorSpawner = identity.kind === "actor" ? resolveAgentSpawner(identity.id, mainAgentId) : undefined;
+    const actorSessionFile = process.env.PI_FABRIC_ACTOR_SESSION_FILE?.trim() || context.sessionManager.getSessionFile?.();
+    const actorChildStore = actorSpawner && actorSessionFile ? new ActorChildCompletionStore(actorSessionFile) : undefined;
+    const completionInbox = new AgentCompletionInbox(this.pi, context,
+      actorChildStore ? (ids) => actorChildStore.consumeLiveBatch(ids) : undefined);
     this.#completionInbox = completionInbox;
     let markStoppedDelivered = (_id: string): void => {};
     recordMainRelease(sessionId, loadedFabricRoot(import.meta.url));
@@ -759,12 +765,35 @@ export class FabricRuntimeState {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publishBackground(event);
       },
-      onBackgroundComplete: (result) => completionInbox.enqueue(result),
+      // Spool until consumption or handoff, independently of notification policy.
+      onSettled: (result) => {
+        if (actorChildStore && actorSpawner) actorChildStore.enqueue(result, actorSpawner, agentConfig.notifyOnComplete);
+      },
+      onBackgroundComplete: (result) => {
+        completionInbox.enqueue(result,
+          actorChildStore ? () => actorChildStore.acknowledge(result.id) : undefined,
+          actorChildStore ? () => actorChildStore.prepareLive(result.id) : undefined);
+      },
+      onBeforeResultReturned: (id) => {
+        // ponytail: commit BEFORE returning to the actor program, not in the
+        // deferred post-delivery callback. Retry a transient receipt failure once;
+        // persistent failure rejects the observation, making returned-but-unrecorded impossible.
+        if (actorChildStore) {
+          try { actorChildStore.consume(id, { handoff: true }); } catch {
+            actorChildStore.consume(id, { handoff: true });
+          }
+        }
+      },
       onResultConsumed: (id) => {
         completionInbox.acknowledge(id);
+        try { actorChildStore?.discard(id); } catch { /* Cleanup must not turn a returned outcome into a wait failure. */ }
         markStoppedDelivered(id);
       },
       onStoppedAtClose: (results) => {
+        if (actorChildStore && actorSpawner) {
+          for (const result of results) actorChildStore.enqueue(result, actorSpawner, agentConfig.notifyOnComplete);
+          return;
+        }
         rememberStoppedAtClose(sessionId, results);
         this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, { stopped: results });
       },

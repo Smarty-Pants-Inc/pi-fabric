@@ -135,11 +135,12 @@ describe("agents provider message routing service boundaries", () => {
     expect(ports.control.request).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ["ensure", "dead"], ["route", "dead"], ["ensure", "ownerless"], ["route", "ownerless"],
-    ["ensure", "ownerless-submillisecond"], ["route", "ownerless-submillisecond"],
-    ["ensure", "ownerless-submillisecond-past"], ["route", "ownerless-submillisecond-past"],
-  ] as const)("F7 waits through the mesh stale window on %s failure (%s holder)", async (stage, holder) => {
+  it.each(
+    (["ensure", "route"] as const).flatMap((stage) =>
+      (["actor", "spawner"] as const).flatMap((target) =>
+        (["dead", "ownerless", "ownerless-submillisecond", "ownerless-submillisecond-past"] as const)
+          .map((holder) => [stage, target, holder] as const))),
+  )("F7 waits through the mesh stale window on %s failure for %s (%s holder)", async (stage, target, holder) => {
     const ports = routing();
     ports.actors.status.mockReturnValue({ id: "actor", residency: "durable", rootId: "main" } as ReturnType<Ports[1]["status"]>);
     const live: FabricParticipantInfo = { ...participant(), id: "actor", kind: "actor" as const, residency: "durable" as const,
@@ -149,7 +150,8 @@ describe("agents provider message routing service boundaries", () => {
     const ensureActor = vi.fn(async () => {});
     const residency = { hostId: "resident", ensureActor, options: { config: { rootId: "main", meshRoot: root } } };
     const router = new AgentMessageRouter(ports.agents, { ...ports.actors, owns: () => false },
-      ports.main, ports.participants, ports.control, (binding) => binding, residency);
+      ports.main, ports.participants, ports.control, (binding) => binding, residency,
+      { id: "actor", kind: "actor", runId: "a".repeat(32) });
     const failure = Object.assign(new Error("dead mesh holder"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
     // Whole-second epoch avoids floating-point loss in the seconds-based utimes API.
     vi.useFakeTimers({ now: new Date("2026-01-01T00:00:00.000Z") });
@@ -173,7 +175,7 @@ describe("agents provider message routing service boundaries", () => {
     else ports.control.request.mockRejectedValueOnce(failure);
     ports.control.request.mockResolvedValue({ queued: true, messageId: "recovered" } as Awaited<ReturnType<NonNullable<Ports[4]>["request"]>>);
     try {
-      const result = router.routeMessage("actor", "immediate", undefined, "followUp")
+      const result = router.routeMessage(target, "immediate", undefined, "followUp")
         .then((value) => ({ value }), (error: unknown) => ({ error }));
       // MeshStore protects an ownerless directory while age <= 30_000, including
       // the exact boundary. Use the real filesystem timestamp, not the requested utime.
@@ -184,6 +186,11 @@ describe("agents provider message routing service boundaries", () => {
       expect(stage === "ensure" ? ensureActor : ports.control.request).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(holder === "dead" ? 2 : 1);
       expect(await result).toMatchObject({ value: { queued: true } });
+      expect(ensureActor).toHaveBeenCalledWith("actor");
+      expect(ports.control.request).toHaveBeenLastCalledWith("resident", "actor", "followUp",
+        { message: "immediate", data: undefined, bindingProvenance: { kind: "owner-defaults", rootId: "main" } },
+        live.ownerIdentityId, { routedRemoteHost: null });
+      expect(ports.main.deliverAgent).not.toHaveBeenCalled();
       expect(Date.now() - started).toBeLessThanOrEqual(40_000);
       // The router waits/retries only; MeshStore alone owns reclamation and fencing.
       expect(fs.existsSync(lockPath)).toBe(true);

@@ -247,6 +247,71 @@ describe("AgentManager fleet model admission (#2490)", () => {
 });
 
 describe("AgentManager", () => {
+  it.each(["pending", "empty", "outcome", "live", "link", "unknown"] as const)("R-1 active-manager expiry applies the terminal-tree gate (%s)", async (contents) => {
+    let sweep: (() => void) | undefined;
+    const interval = globalThis.setInterval;
+    const timer = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+      if (ms === 15 * 60 * 1_000) sweep = callback;
+      return interval(callback, ms, ...args);
+    }) as typeof setInterval);
+    const detachedSweep = vi.spyOn(retentionStorage, "claimTempRunSweep").mockReturnValue(false);
+    const inheritedRunRoot = process.env.PI_FABRIC_RUN_ROOT;
+    delete process.env.PI_FABRIC_RUN_ROOT;
+    let manager: AgentManager;
+    try {
+      manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, budgetUsd: 0 }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        retention: { ...DEFAULT_FABRIC_CONFIG.retention, oneShotRunMs: 1_000 },
+      });
+    } finally {
+      if (inheritedRunRoot !== undefined) process.env.PI_FABRIC_RUN_ROOT = inheritedRunRoot;
+    }
+    managers.push(manager);
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const result = await manager.run({ task: "expiry content gate", transport: "process" });
+      const run = manager.runDirectory(result.id)!;
+      roots.push(path.dirname(run));
+      const status = fs.readFileSync(path.join(run, "status.json"), "utf8");
+      const deliveries = path.join(run, "deliveries");
+      fs.mkdirSync(deliveries);
+      if (contents === "pending") fs.writeFileSync(path.join(deliveries, "ingress.json"), JSON.stringify({ message: "not consumed" }));
+      if (contents === "outcome") fs.writeFileSync(path.join(run, "pending-route-outcome.json"), "{}");
+      if (contents === "live") {
+        const child = path.join(run, "nested", "live-child");
+        fs.mkdirSync(child, { recursive: true });
+        fs.writeFileSync(path.join(child, "task.txt"), "live descendant");
+        fs.writeFileSync(path.join(child, "status.json"), JSON.stringify({ status: "running", transport: "process", sessionId: String(process.pid) }));
+      }
+      if (contents === "link") fs.linkSync(path.join(run, "task.txt"), path.join(run, "reply.json"));
+      if (contents === "unknown") fs.writeFileSync(path.join(run, "diagnostic.txt"), "preserve unknown content");
+      // A later empty run proves that the entire requested sweep has run, including vetoes.
+      const control = await manager.run({ task: "empty expiry control", transport: "process" });
+      const controlRun = manager.runDirectory(control.id)!;
+      fs.mkdirSync(path.join(controlRun, "deliveries"));
+      expect(sweep).toBeTypeOf("function");
+      clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
+      sweep!();
+      await vi.waitFor(() => expect(fs.existsSync(controlRun)).toBe(false), { timeout: 2_000 });
+      expect(fs.existsSync(run), contents).toBe(contents !== "empty");
+      if (contents !== "empty") {
+        expect(manager.runDirectory(result.id)).toBe(run);
+        expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(status);
+      }
+      if (contents === "pending") {
+        expect(fs.readFileSync(path.join(deliveries, "ingress.json"), "utf8")).toContain("not consumed");
+        fs.unlinkSync(path.join(deliveries, "ingress.json"));
+        sweep!();
+        await vi.waitFor(() => expect(fs.existsSync(run)).toBe(false), { timeout: 2_000 });
+      }
+    } finally {
+      clock?.mockRestore();
+      await manager.close();
+      timer.mockRestore();
+      detachedSweep.mockRestore();
+    }
+  }, 15_000);
+
   it("F1 tracked retention retries the full failed save before collection, without pinning session or actor runs", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-save-fault-"));
     roots.push(root);
@@ -295,6 +360,7 @@ describe("AgentManager", () => {
       sweep!();
       await vi.waitFor(() => expect(fs.existsSync(ordinaryRun)).toBe(false), { timeout: 2_000 });
       expect(fs.existsSync(run), "unsaved completion stays tracked").toBe(true);
+      expect(manager.retentionReferences().has(result.id), "pending saved-result publication keeps its acknowledgement fence").toBe(true);
       expect(save.mock.calls.length).toBeGreaterThan(attempts);
       expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(worker);
       await expect(manager.cleanup(result.id)).rejects.toThrow(/Cannot clean up agent.*Terminal result save failed/);
@@ -2124,7 +2190,7 @@ describe("AgentManager", () => {
     });
   });
 
-  it("marks ordinary process children as task agents without replacing actor identity (smarty-dev#2088)", async () => {
+  it("marks ordinary children as task agents while preserving explicitly launched actor identity (#2088, #2643)", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
@@ -2164,12 +2230,12 @@ describe("AgentManager", () => {
       expect(await report("security-review")).toEqual({
         role: null, actorName: "security-review", fabricRole: null,
       });
-      // Actor write attribution stays inherited, but a spawner-only role
-      // override must not hide the ordinary task's role in participant discovery.
+      // A task must not impersonate its spawning actor (#2643) or retain its
+      // spawner-only role override (#2998). Explicit actors retain their own identity.
       vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
       vi.stubEnv("PI_FABRIC_ROLE", "project-agent");
       expect(await report()).toEqual({
-        role: "task-agent", actorName: "parent-actor", fabricRole: null,
+        role: "task-agent", actorName: null, fabricRole: null,
       });
     } finally {
       vi.unstubAllEnvs();

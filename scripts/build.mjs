@@ -37,8 +37,8 @@ const primaryEntryPoints = [
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
   "src/judge/agent.ts",
-  "src/core/literal-bash-guard.ts",
   "src/core/landlock.ts",
+  "src/core/pattern-kill.ts",
   "src/lifecycle/reload-target-profile.ts",
   "src/lifecycle/reload-slots.ts",
   "src/coordination/unverified-ids.ts",

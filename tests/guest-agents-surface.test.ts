@@ -23,6 +23,38 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("types model selection provenance without conflating effective models (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const code = `const run = await agents.run({ task: "work", model: "sol" });
+      const actor = await agents.setModel({ id: "actor", model: "sol", scope: "project" });
+      const imported = await agents.import({ id: "template" });
+      const markers: Array<string | undefined> = [run.via, actor.via, imported.via];
+      const selections: Array<string | undefined> = [run.selectedModel, actor.selectedModel, imported.selectedModel];
+      return { markers, selections, effective: actor.model, observed: run.model };`;
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    expect(typeCheckFabricCode(`${code}\nconst invalid: boolean = run.selectedModel;`, declarations, true).errors.map(error => error.message))
+      .toEqual([expect.stringContaining("not assignable to type 'boolean'")]);
+  });
+
+  it.each([false, true])("#3307 types preparation states and diagnostics (fullCodeMode=%s)", fullCodeMode => {
+    const result = typeCheckFabricCode(
+      `const actor = await agents.actorStatus({ id: "actor" });
+       const preparing: FabricActorInfo["status"] = "preparing";
+       const waiting: FabricActorInfo["status"] = "waiting";
+       if (actor.status === preparing || actor.status === waiting) {
+         const phase: string | undefined = actor.preparing?.phase;
+         const startedAt: number | undefined = actor.preparing?.startedAt;
+         const ageS: number | undefined = actor.preparing?.ageS;
+         const attempts: number | undefined = actor.preparing?.attempts;
+         const runId: string | undefined = actor.preparing?.runId;
+         const queuePosition: number | undefined = actor.preparing?.queuePosition;
+         return { phase, startedAt, ageS, attempts, runId, queuePosition };
+       }
+       return (await agents.actors())[0]?.preparing?.phase;`,
+      guestTypeDeclarations(fullCodeMode), true,
+    );
+    expect(result.errors).toEqual([]);
+  });
   it.each([false, true])("types retry keys on public durable create/spawn (fullCodeMode=%s)", fullCodeMode => {
     const result = typeCheckFabricCode(
       `await agents.create({ name: "actor", instructions: "work", residency: "durable", idempotencyKey: "actor-retry" });

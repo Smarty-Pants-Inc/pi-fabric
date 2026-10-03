@@ -93,6 +93,63 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("ParticipantDirectory routing freshness (#2386)", () => {
+  const fixture = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-routing-view-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:observer", name: "Observer", kind: "main" };
+    return createDirectory(path.join(root, "mesh"), identity, identity.id, () => [], { heartbeatMs: 60_000, leaseMs: 120_000 });
+  };
+
+  it("distinguishes missing, fresh and overdue views, and does not upgrade read evidence to lease admission", async () => {
+    const directory = fixture();
+    expect(directory.routingUnavailable()).toContain("no confirmed view");
+    expect(directory.canConsumeMesh()).toBe(false);
+    const read = vi.spyOn(directory.mesh, "exclusive");
+    await directory.refreshRoutingView();
+    expect(read).toHaveBeenCalledWith(expect.any(Function), 250);
+    expect(directory.routingUnavailable()).toBeUndefined();
+    expect(directory.canConsumeMesh()).toBe(false);
+    await directory.refresh();
+    expect(directory.routingUnavailable()).toBeUndefined();
+    expect(directory.routingUnavailable(directory.confirmedAt() + 120_000)).toContain("overdue");
+    const confirmed = directory.confirmedAt();
+    await directory.refreshRoutingView();
+    expect(directory.confirmedAt()).toBe(confirmed);
+  });
+
+  it("invalidates prior routing confirmation after any failed refresh and recovers with one canonical read", async () => {
+    const directory = fixture();
+    await directory.refresh();
+    await directory.refreshRoutingView();
+    const failure = new Error("directory refresh read failed");
+    const heartbeat = vi.spyOn(directory.mesh, "confirmWritable").mockRejectedValueOnce(failure);
+    await expect(directory.refresh()).rejects.toBe(failure);
+    heartbeat.mockRestore();
+    expect(directory.routingUnavailable()).toBe(failure.message);
+    const confirmed = directory.confirmedAt();
+    await directory.refreshRoutingView();
+    expect(directory.routingUnavailable()).toBeUndefined();
+    expect(directory.confirmedAt()).toBe(confirmed);
+    expect(directory.canConsumeMesh()).toBe(false);
+    // A canonical read failure cannot leave behind successful routing evidence.
+    const read = vi.spyOn(directory.mesh, "stateToken").mockImplementation(() => { throw new Error("unreadable canonical view"); });
+    await expect(directory.refreshRoutingView()).rejects.toThrow("unreadable canonical view");
+    expect(directory.routingUnavailable()).toBeDefined();
+    read.mockRestore();
+    await directory.refreshRoutingView();
+    expect(directory.routingUnavailable()).toBeUndefined();
+  });
+
+  it("does not refresh a closed directory", async () => {
+    const directory = fixture();
+    await directory.refresh();
+    await directory.close();
+    expect(directory.routingUnavailable()).toContain("closed");
+    await expect(directory.refreshRoutingView()).rejects.toThrow("closed");
+  });
+});
+
 describe("#3662 ParticipantDirectory lineage liveness", () => {
   it.each([null, {}, { format: 1, id: "session:lineage", kind: "invalid" }])(
     "S1 retains invalid raw shared-state lineage %j until withdrawal", async (value) => {

@@ -1162,7 +1162,7 @@ export class AgentsProvider implements FabricProvider {
         // Agent/task stop keeps its existing control route; actor lifecycle uses
         // the same root identity and resident request fence as native setters.
         let actorTarget = false;
-        try { this.#resolveActorTarget(id); actorTarget = true; } catch (error) {
+        try { if (!id.trim().startsWith("session:")) { this.#resolveActorTarget(id); actorTarget = true; } } catch (error) {
           if (!(error instanceof Error) || !/Unknown Fabric actor/.test(error.message)) throw error;
         }
         if (actorTarget) {

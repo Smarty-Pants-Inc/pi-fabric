@@ -112,6 +112,106 @@ const mainLeaseFixture = async (files: boolean) => {
   return { root, meshRoot, mesh, directory, target, sessionId, participantKey, key, plane, presence, publishPresence };
 };
 
+describe("directory availability for live Mains (#2386)", () => {
+  it.each([[false, false], [false, true], [true, false], [true, true]] as const)("reports a retryable lock outage then delivers after recovery (files=%s, fresh lease=%s)", async (files, freshLease) => {
+    const f = await mainLeaseFixture(files);
+    if (freshLease) {
+      const host = f.mesh.get(f.key("topology/hosts/"))!.value as Record<string, unknown>;
+      await f.mesh.put({ key: f.key("topology/hosts/"), identity: f.target, value: { ...host, expiresAt: Date.now() + 120_000 } });
+      expect(f.directory.get(f.target.id)?.kind).toBe("root");
+    }
+    const timeout = Object.assign(new Error("Timed out waiting for the Fabric mesh lock (injected)"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    const heartbeat = vi.spyOn(f.mesh, "confirmWritable").mockRejectedValueOnce(timeout);
+    await expect(f.directory.refresh()).rejects.toBe(timeout);
+    heartbeat.mockRestore();
+    expect(f.directory.routingUnavailable()).toContain(timeout.message);
+    const request = vi.fn().mockResolvedValue({ queued: true, messageId: "recovered", routed: "mesh", acknowledged: true });
+    const send = router(unknown, [], { request }, f.directory);
+    const probe = vi.spyOn(f.directory, "refreshRoutingView");
+    const lock = path.join(f.meshRoot, ".lock");
+    fs.mkdirSync(lock, { mode: 0o700 });
+    fs.writeFileSync(path.join(lock, "owner"), `contended\n${process.pid}\n${Date.now()}\n`);
+    try {
+      const failure = await send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp").catch(error => error);
+      expect(failure).toMatchObject({ name: "FabricDirectoryUnavailableError", code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+      expect(failure.message).toMatch(/^Fabric directory unavailable \(retry\):/);
+      expect(failure.message).toContain("Timed out waiting for the Fabric mesh lock");
+      expect(failure.message).not.toContain("Unknown Fabric actor");
+      expect(probe).toHaveBeenCalledOnce();
+      expect(request).not.toHaveBeenCalled();
+      expect(send.actors.status).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(lock, { recursive: true, force: true });
+    }
+    // No heartbeat success is needed for the canonical routing read to recover.
+    await expect(send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp"))
+      .resolves.toMatchObject({ queued: true, messageId: "recovered", acknowledged: true });
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledOnce();
+    expect(request.mock.calls[0]?.slice(0, 4)).toEqual([f.target.id, f.target.id, "followUp", expect.objectContaining({ message: "live Main reply", data: { proof: "unchanged" } })]);
+    expect(f.directory.canConsumeMesh()).toBe(false); // Routing did not weaken lease admission.
+  });
+
+  it.each(["no confirmed view", "view overdue", "last refresh failed"])("probes once when the %s, for both delivery modes", async (reason) => {
+    let unavailable: string | undefined = reason;
+    const target = remote("session:live", "running", "root");
+    const get = vi.fn(() => unavailable ? undefined : target);
+    const refreshRoutingView = vi.fn(async () => { unavailable = undefined; });
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const send = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn(), routingUnavailable: () => unavailable, refreshRoutingView });
+    for (const kind of ["followUp", "steer"] as const) {
+      unavailable = reason;
+      await expect(send.value.routeMessage(target.id, "recovered", undefined, kind)).resolves.toMatchObject({ queued: true });
+    }
+    expect(refreshRoutingView).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(send.actors.status).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("bounds recovery of a read failure after a healthy preflight (probe fails=%s)", async (fails) => {
+    let failed = true;
+    const target = remote("session:live", "running", "root");
+    const get = vi.fn(() => { if (failed) throw new Error("directory read failed"); return target; });
+    const refreshRoutingView = vi.fn(async () => {
+      if (fails) throw new Error("Timed out waiting for the Fabric mesh lock");
+      failed = false;
+    });
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const send = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn(), routingUnavailable: () => undefined, refreshRoutingView });
+    const delivery = send.value.routeMessage(target.id, "retry resolution", undefined, "followUp");
+    if (fails) {
+      await expect(delivery).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+      expect(request).not.toHaveBeenCalled();
+    } else {
+      await expect(delivery).resolves.toMatchObject({ queued: true });
+      expect(request).toHaveBeenCalledOnce();
+    }
+    expect(refreshRoutingView).toHaveBeenCalledOnce();
+  });
+
+  it("only a fresh view proves an actor id absent, and healthy actor routes are unchanged", async () => {
+    const f = await mainLeaseFixture(false);
+    const send = router(unknown, [], undefined, f.directory);
+    await expect(send.value.resolveActorMessageTarget("actor:missing")).rejects.toThrow("Unknown Fabric actor: actor:missing");
+    for (const kind of ["followUp", "steer"] as const) {
+      await expect(send.value.routeMessage("actor:running", "existing route", undefined, kind))
+        .resolves.toMatchObject({ queued: true, routed: "local", messageId: "mailbox" });
+    }
+    expect(send.actors.tell).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["followUp", "steer"] as const)("never tries an actor for an absent session: address (%s)", async (kind) => {
+    const send = router(unknown);
+    const failure = await send.value.routeMessage("session:missing", "no actor fallback", undefined, kind).catch(error => error);
+    expect(failure.message).toContain("Unknown Fabric participant: session:missing");
+    expect(failure.message).not.toContain("Unknown Fabric actor");
+    await expect(send.value.resolveActorMessageTarget("session:missing")).rejects.toThrow("Unknown Fabric Main participant");
+    expect(() => send.value.resolveActorTarget("session:missing")).toThrow("is not an actor");
+    expect(send.actors.status).not.toHaveBeenCalled();
+    expect(send.actors.validateDirectMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe("Main target lineage delivery (#3686)", () => {
   it.each([
     [false, "steer", false], [false, "followUp", false], [true, "steer", false], [true, "followUp", false],
@@ -236,7 +336,10 @@ describe.each([false, true])("stale Main name safeguards (files=%s)", (files) =>
     const f = await mainLeaseFixture(files);
     const stalled = new Error("Fabric mesh write stalled");
     if (state === "dead-lineage") vi.spyOn(f.directory, "lineageAlive").mockReturnValue(false);
-    else vi.spyOn(f.directory, "writeStalled").mockReturnValue(stalled);
+    else {
+      vi.spyOn(f.directory, "routingUnavailable").mockReturnValue(stalled.message);
+      vi.spyOn(f.directory, "refreshRoutingView").mockRejectedValue(stalled);
+    }
     const request = vi.fn();
     const send = router(unknown, [], { request }, f.directory);
     for (const kind of ["followUp", "steer"] as const) {

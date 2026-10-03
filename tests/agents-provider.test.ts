@@ -2213,6 +2213,15 @@ describe("AgentsProvider runner support", () => {
     expect((await provider.describe("peers", context))?.risk).toBe("read");
   });
 
+  it("keeps session: stop targets out of actor classification (#2386)", async () => {
+    const { provider, actors } = setup();
+    const status = vi.spyOn(actors, "status");
+    const stop = vi.spyOn(provider, "stopParticipant").mockResolvedValue({ status: "stopped" });
+    await expect(provider.invoke("stop", { id: "session:peer" }, context)).resolves.toEqual({ status: "stopped" });
+    expect(stop).toHaveBeenCalledWith("session:peer");
+    expect(status).not.toHaveBeenCalled();
+  });
+
   it.each(["followUp", "steer", "tell"])("%s refreshes an exact-id negative lookup using the same peers directory", async (action) => {
     const id = "session:remote-root";
     const peer = { id, host: "forge" } as FabricPeerInfo;
@@ -2237,6 +2246,7 @@ describe("AgentsProvider runner support", () => {
   });
 
   it.each([
+    ["directory-unavailable", "FabricDirectoryUnavailableError", "FABRIC_DIRECTORY_UNAVAILABLE"],
     ["not-yet-mirrored", "FabricParticipantNotYetMirroredError", "FABRIC_PARTICIPANT_NOT_YET_MIRRORED"],
     ["non-interactive", "FabricParticipantNonInteractiveError", "FABRIC_PARTICIPANT_NON_INTERACTIVE"],
     ["ambiguous", "FabricProjectAgentAmbiguousError", "FABRIC_PROJECT_AGENT_AMBIGUOUS"],
@@ -2252,7 +2262,11 @@ describe("AgentsProvider runner support", () => {
     const members = scenario === "non-interactive" ? [{ ...base, interactive: false }]
       : scenario === "ambiguous" ? [base, { ...base, id: "session:22222222-2222-4222-8222-222222222222" }] : [];
     const peers = scenario === "not-yet-mirrored" ? [{ id, host: "forge" } as FabricPeerInfo] : [];
-    const { provider } = setup(peers, members, undefined, { cwd: lane });
+    const { provider, participants } = setup(peers, members, undefined, { cwd: lane });
+    if (scenario === "directory-unavailable") {
+      participants.routingUnavailable = () => "Timed out waiting for the Fabric mesh lock";
+      participants.refreshRoutingView = vi.fn().mockRejectedValue(new Error("Timed out waiting for the Fabric mesh lock"));
+    }
     const registry = new ActionRegistry();
     registry.register(provider);
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
@@ -2271,7 +2285,7 @@ describe("AgentsProvider runner support", () => {
       });
       expect(result.success, result.error).toBe(true);
       expect(result.value).toEqual({ isError: true, name, code,
-        ...(scenario === "not-yet-mirrored" ? { retryable: true } : {}) });
+        ...(["not-yet-mirrored", "directory-unavailable"].includes(scenario) ? { retryable: true } : {}) });
     } finally {
       await registry.close();
     }

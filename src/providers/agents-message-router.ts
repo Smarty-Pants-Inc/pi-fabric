@@ -29,6 +29,15 @@ export class FabricParticipantNotYetMirroredError extends Error {
   }
 }
 
+export class FabricDirectoryUnavailableError extends Error {
+  override readonly name = "FabricDirectoryUnavailableError";
+  readonly code = "FABRIC_DIRECTORY_UNAVAILABLE";
+  readonly retryable = true;
+  constructor(reason: string) {
+    super(`Fabric directory unavailable (retry): ${reason}`);
+  }
+}
+
 export class FabricParticipantNonInteractiveError extends Error {
   override readonly name = "FabricParticipantNonInteractiveError";
   readonly code = "FABRIC_PARTICIPANT_NON_INTERACTIVE";
@@ -94,7 +103,7 @@ export class AgentMessageRouter {
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
-    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive">>,
+    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
@@ -104,12 +113,51 @@ export class AgentMessageRouter {
     // Discovery and admission share this directory/root. A cached negative may predate the
     // bridge's first presence refresh: re-read its files + state before declaring it unknown.
     // lastKnown also reads fresh, but deliberately discards newly live records (smarty-dev#2377).
-    return this.participants.get(id) ?? this.participants.get(id, undefined, { fresh: true });
+    let participant: FabricParticipantInfo | undefined;
+    try {
+      participant = this.participants.get(id) ?? this.participants.get(id, undefined, { fresh: true });
+    } catch (error) {
+      throw new FabricDirectoryUnavailableError(error instanceof Error ? error.message : String(error));
+    }
+    const reason = !participant ? this.#directoryUnavailable() : undefined;
+    if (reason) throw new FabricDirectoryUnavailableError(reason);
+    return participant;
+  }
+
+  #directoryUnavailable(): string | undefined {
+    return this.participants.routingUnavailable
+      ? this.participants.routingUnavailable()
+      : this.participants.writeStalled?.()?.message;
+  }
+
+  async #withDirectory<T>(operation: () => Promise<T>): Promise<T> {
+    const reason = this.#directoryUnavailable();
+    if (reason) await this.#refreshDirectory(reason);
+    try {
+      return await operation();
+    } catch (error) {
+      // A read can fail after the preflight. Retry resolution once, never delivery after
+      // an ACK/control error: only pre-publication directory failures have this class.
+      if (!(error instanceof FabricDirectoryUnavailableError) || reason || !this.participants.refreshRoutingView) throw error;
+      await this.#refreshDirectory(error.message);
+      return operation();
+    }
+  }
+
+  async #refreshDirectory(reason: string): Promise<void> {
+    if (!this.participants.refreshRoutingView) throw new FabricDirectoryUnavailableError(reason);
+    try {
+      await this.participants.refreshRoutingView();
+      const unavailable = this.#directoryUnavailable();
+      if (unavailable) throw new Error(unavailable);
+    } catch (error) {
+      throw new FabricDirectoryUnavailableError(error instanceof Error ? error.message : String(error));
+    }
   }
 
   #lapsedRoot(id: string): FabricParticipantInfo | undefined {
     // A write-stalled mesh explains the lapse, and delivery needs the mesh: report the stall.
-    if (this.participants.writeStalled?.()) return undefined;
+    if (this.#directoryUnavailable()) return undefined;
     // A busy Main can miss its heartbeat without losing its durable control mailbox (smarty-dev#3686).
     // Read presence without filtering leases: get() and lastKnown() can both omit a root
     // when its lease renews between those reads. Unknown lineage is not proof of death.
@@ -123,7 +171,7 @@ export class AgentMessageRouter {
   #eligibleRetainedRoot(root: FabricParticipantInfo): boolean {
     // Names and exact ids share the same lease-independent native eligibility. A stalled
     // writer, reload/exit, dead lineage or lapsed bridge must never gain a new route by name.
-    if (this.participants.writeStalled?.() || root.kind !== "root") return false;
+    if (this.#directoryUnavailable() || root.kind !== "root") return false;
     // Reload leases are a hard bound, not an ordinary heartbeat flap; an exit is never routable.
     if (["reloading", "stopping"].includes(root.status)) return false;
     // A mirrored lease lapses when the mesh bridge stops: nothing would carry the reply, so the
@@ -163,7 +211,7 @@ export class AgentMessageRouter {
   // ownership and capabilities. Exact ids, UUID aliases and local `main` keep precedence.
   #messageTarget(id: string): string {
     const target = this.#sessionTarget(id);
-    if (this.mainAgent.matches(target) || this.#get(target) || this.#lapsedRoot(target)) return target;
+    if (this.mainAgent.matches(target) || this.#get(target) || this.#lapsedRoot(target) || target.trim().startsWith("session:")) return target;
     // A published name survives an ordinary lease lapse just like its exact session id.
     // Use fresh raw presence, but add only eligible retained native roots to the live set.
     const matches = this.participants.list?.({ scope: "project", kinds: ["root"], includeStale: true, fresh: true })
@@ -217,7 +265,8 @@ export class AgentMessageRouter {
     // Capture before routing yields; a queued incoming turn cannot change this send.
     if (context) context = snapshotFabricInvocation(context);
     options = { ...options, principal: context ? invocationFabricPrincipal(context) : undefined };
-    const result = await this.#withDurableRecovery(id, () => this.#route(id, message, data, kind, context, options));
+    const result = await this.#withDirectory(() =>
+      this.#withDurableRecovery(id, () => this.#route(id, message, data, kind, context, options)));
     // smarty-dev#1826: an ack alone hid a Main whose held followUps no boundary would release.
     // Older owners never report `stalled`, so their results pass unchanged.
     if (kind === "followUp" && result?.stalled) {
@@ -376,6 +425,11 @@ export class AgentMessageRouter {
       );
     }
 
+    // Explicit Main addresses never reach task/actor resolution, even when absent.
+    if (id.trim().startsWith("session:")) {
+      throw unknownParticipant(this.participants, id);
+    }
+
     // Local one-shot agent: forward between its turns via the worker's
     // steer.jsonl channel, preserving the child's accumulated context.
     try {
@@ -415,7 +469,7 @@ export class AgentMessageRouter {
     this.actorManager.validateDirectMessage(message, data);
     let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
     try {
-      target = await this.resolveActorMessageTarget(id);
+      target = await this.#resolveActorMessageTarget(id);
     } catch (error) {
       if (error instanceof Error && /Unknown Fabric actor/.test(error.message)) {
         throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, id);
@@ -615,6 +669,11 @@ export class AgentMessageRouter {
   /** A lease can still look fresh after SIGKILL. For this root's non-owned durable
    * actors, check the real owner before delivery, not just participant freshness. */
   async resolveActorMessageTarget(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+    return this.#withDirectory(() => this.#resolveActorMessageTarget(id));
+  }
+
+  async #resolveActorMessageTarget(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+    if (id.trim().startsWith("session:")) throw unknownParticipant(this.participants, id, "Fabric Main participant");
     const target = this.resolveActorTarget(id);
     const { actor, participant } = target;
     if (this.residency && (actor?.residency ?? participant?.residency) === "durable" &&
@@ -634,6 +693,7 @@ export class AgentMessageRouter {
     actor?: FabricActorInfo;
     participant?: FabricParticipantInfo;
   } {
+    if (id.trim().startsWith("session:")) throw new Error(`Fabric Main participant ${id} is not an actor`);
     let actor: FabricActorInfo | undefined;
     try {
       actor = this.actorManager.status(id);

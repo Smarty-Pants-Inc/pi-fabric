@@ -1335,9 +1335,10 @@ export class MeshStore {
    * writable now, for a heartbeat that renewed only its file lease. Discards this store's cached
    * snapshot so the next state read must read the canonical file, even if metadata is unchanged.
    */
-  async confirmWritable(): Promise<void> {
+  async confirmWritable(onAcquired?: (at: number) => void): Promise<void> {
     await this.#withLock(() => {
       this.#stateCache = undefined;
+      onAcquired?.(Date.now());
     });
   }
 

@@ -556,7 +556,7 @@ describe("bounded resident request retention", () => {
     const host = new ResidentHost(config);
     try {
       await host.start();
-      expect(exists(dir, "decisions", command.requestId)).toBe(false);
+      await vi.waitFor(() => expect(exists(dir, "decisions", command.requestId)).toBe(false));
       const remove = vi.spyOn(host.actors, "remove");
       write(dir, "requests", command.requestId, { ...command, createdAt: Date.now() });
       const deadline = Date.now() + 2_000;

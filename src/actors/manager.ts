@@ -396,7 +396,7 @@ export class ActorManager {
   // both move the same dead lineage: only the first fenced write succeeds.
   readonly #persistedRoots = new Map<string, string>();
   // In-flight fenced adoption attempts, one per actor.
-  readonly #adoptionPending = new Set<string>();
+  readonly #adoptionPending = new Map<string, Promise<void>>();
   readonly #adoptionGraceMs: number;
   readonly #listeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
@@ -422,6 +422,7 @@ export class ActorManager {
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
   #closing = false;
+  #closePromise: Promise<void> | undefined;
   #releasePaused = false;
   readonly #closeGraceMs: number;
   // Stop-the-world gate armed by haltAll() (ESC): while true, host-event and
@@ -2090,15 +2091,24 @@ export class ActorManager {
     this.#meshMonitor.checkpointForRelease();
   }
 
-  async close(): Promise<void> {
-    if (this.#closing) return;
-    this.#closing = true;
+  close(): Promise<void> {
+    if (!this.#closePromise) {
+      this.#closing = true;
+      this.#closePromise = this.#close();
+    }
+    return this.#closePromise;
+  }
+
+  async #close(): Promise<void> {
     this.#meshMonitor.close();
     for (const timer of this.#drainRetries.values()) clearTimeout(timer);
     this.#drainRetries.clear();
     this.#drainRearms.clear();
     if (this.#presenceTimer) clearTimeout(this.#presenceTimer);
     this.#presenceTimer = undefined;
+    // Cancellation is monotonic: pending claims must settle before the enclosing
+    // runtime releases host custody or certifies terminal lineage closure.
+    await Promise.allSettled([...this.#adoptionPending.values()]);
     // Let presence writes already in flight finish before the runtime goes.
     await Promise.allSettled([...this.#presenceChains.values()]);
     await this.#notifications.close();
@@ -4092,17 +4102,22 @@ export class ActorManager {
     if (actor.adoptedAt !== undefined && Date.now() - actor.adoptedAt < this.#adoptionGraceMs) {
       return;
     }
-    void this.#confirmAdoption(actor).catch(() => undefined);
+    // Register before any custody callback runs, so close joins every attempt
+    // and synchronous ownership refreshes cannot launch a duplicate claim.
+    const pending = Promise.resolve().then(() => this.#confirmAdoption(actor)).catch(() => undefined);
+    this.#adoptionPending.set(actor.id, pending);
   }
 
   async #confirmAdoption(actor: ManagedActor): Promise<void> {
-    if (this.#adoptionPending.has(actor.id)) return;
-    this.#adoptionPending.add(actor.id);
     try {
+      if (this.#closing) return;
       const expectedRootId = actor.rootId;
       // Lock order: registry, then mesh. Resume invalidates death proof under
       // the mesh lock; retain both fences from the fresh recheck through commit.
       const adopted = await this.#registry.withLock(() => this.mesh.exclusive(() => {
+        // Both custody waits may outlive this owner. No mutation is authorized
+        // once close begins, even when the previous lineage is provably dead.
+        if (this.#closing) return false;
         const records = this.#registry.records();
         const current = records.find((record) => record.id === actor.id);
         // A racing adopter rewrote the lineage since we loaded it; they win.
@@ -4118,6 +4133,8 @@ export class ActorManager {
         ) {
           return false;
         }
+        // Directory hooks above are synchronous but may re-enter shutdown.
+        if (this.#closing) return false;
         for (const record of records) {
           if (typeof record.rootId === "string") this.#persistedRoots.set(record.id, record.rootId);
         }
@@ -4136,6 +4153,9 @@ export class ActorManager {
         this.#registryFingerprint = this.#registry.fingerprint();
         return true;
       }));
+      // Close can also begin after the synchronous claim, before lock release
+      // resumes us. Do not take over queues or resync/notify a disposed owner.
+      if (this.#closing) return;
       if (adopted) {
         this.#persistedRoots.set(actor.id, this.#rootId);
         this.#takeOverPredecessors(this.#actors.get(actor.id) ?? actor);
@@ -4156,6 +4176,7 @@ export class ActorManager {
     } finally {
       this.#adoptionPending.delete(actor.id);
     }
+    if (this.#closing) return;
     this.#refreshOwnership();
     this.#emitChange();
   }

@@ -45,6 +45,7 @@ const lazyEntryPoints = [
   "src/core/provider-operations.ts",
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
+  "src/agents/model-route-prepare.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
@@ -54,6 +55,7 @@ const lazyEntryPoints = [
   "src/providers/jev-provider.ts",
   "src/records/service.ts",
   "src/jev/client.ts",
+  "src/jev/routes.ts",
   "src/jev/observation.ts",
   "src/runtime/core-override-guest-types.ts",
   "src/runtime/dynamic-guest-types.ts",
@@ -84,6 +86,7 @@ const lazyEntryPoints = [
   "src/worker/principal-delivery.ts",
   "src/worker/session-id.ts",
   "src/worker/model-control.ts",
+  "src/worker/context-admission.ts",
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",
   "src/worker/retry-profile.ts",
@@ -132,7 +135,7 @@ const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozec
 // ponytail: typebox (agent-result schema checks) is their only host import
 // today; scripts/smoke-package-install.mjs fails if one gains another.
 const standalone = await build({
-  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts"],
+  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts", "src/storage/retention-cli.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",

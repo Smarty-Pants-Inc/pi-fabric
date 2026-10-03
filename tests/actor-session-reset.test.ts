@@ -316,6 +316,26 @@ describe("actor session reset (smarty-dev#1439)", () => {
     expect(runs[2]!.prior).toEqual([]);
   });
 
+  it("terminal stop cancels a pending reset without rotating or resuming the actor", async () => {
+    const { actors, runs, hold } = setup();
+    const actor = await actors.create({ name: "cancel repair", instructions: "Work." });
+    await actors.ask(actor.id, "first");
+    const header = sessionHeader(actor.sessionFile!);
+    const release = hold();
+    const active = actors.ask(actor.id, "held activation").catch(error => error);
+    await waitFor(() => runs.length === 2);
+    const reset = actors.resetSession(actor.id).catch(error => error);
+    try {
+      await actors.stop(actor.id);
+      expect(await reset).toMatchObject({ name: "ActorSessionResetCancelledError", code: "ACTOR_SESSION_RESET_CANCELLED", id: actor.id });
+      expect(backups(actor.sessionFile!)).toEqual([]);
+      expect(sessionHeader(actor.sessionFile!)).toEqual(header);
+    } finally { release(); await active; }
+    expect(resets(actors, actor.id)).toEqual([]);
+    expect(actors.status(actor.id).status).toBe("stopped");
+    expect(() => actors.ask(actor.id, "still stopped")).toThrow(/stopped/);
+  });
+
   it("waits for a run in flight: it finishes on the old session, queued work runs on the new one", async () => {
     const { actors, runs, hold } = setup();
     const actor = await actors.create({ name: "busy", instructions: "Work." });
@@ -375,7 +395,7 @@ describe("actor session reset (smarty-dev#1439)", () => {
     expect(backups(actor.sessionFile!)).toEqual([]);
   });
 
-  it("keeps only the 2 newest backups", async () => {
+  it("keeps only the newest backup", async () => {
     const { actors } = setup();
     const actor = await actors.create({ name: "churn", instructions: "Churn." });
     const archived: string[] = [];
@@ -387,12 +407,12 @@ describe("actor session reset (smarty-dev#1439)", () => {
       archived.push(path.basename(data.sessionReset.archived));
     }
     expect(new Set(archived).size).toBe(4);
-    expect(backups(actor.sessionFile!)).toEqual(archived.slice(-2).sort());
+    expect(backups(actor.sessionFile!)).toEqual(archived.slice(-1).sort());
     // A reset without a session file archives nothing, but creates its header atomically.
     fs.rmSync(actor.sessionFile!);
     await actors.resetSession(actor.id);
     expect(resets(actors, actor.id).at(-1)!.data).toMatchObject({ sessionReset: { archived: null, bytes: 0 } });
-    expect(backups(actor.sessionFile!)).toEqual(archived.slice(-2).sort());
+    expect(backups(actor.sessionFile!)).toEqual(archived.slice(-1).sort());
   });
 
   it("orders same-millisecond backups by their suffix when it prunes", async () => {
@@ -403,14 +423,16 @@ describe("actor session reset (smarty-dev#1439)", () => {
     const stamp = "20260927T150000000Z";
     for (const name of [`session.jsonl.${stamp}.bak`, `session.jsonl.${stamp}-1.bak`]) fs.writeFileSync(path.join(dir, name), "{}\n");
     fs.writeFileSync(actor.sessionFile!, JSON.stringify({ type: "session", version: 3, id: "valid", timestamp: new Date().toISOString(), cwd: process.cwd() }) + "\n");
-    await actors.resetSession(actor.id);
-    expect(backups(actor.sessionFile!)).toHaveLength(2);
-    expect(backups(actor.sessionFile!)).toContain(`session.jsonl.${stamp}-1.bak`);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-27T15:00:00.000Z"));
+    try { await actors.resetSession(actor.id); } finally { vi.useRealTimers(); }
+    expect(backups(actor.sessionFile!)).toEqual([`session.jsonl.${stamp}-2.bak`]);
+    expect(backups(actor.sessionFile!)).not.toContain(`session.jsonl.${stamp}-1.bak`);
     expect(backups(actor.sessionFile!)).not.toContain(`session.jsonl.${stamp}.bak`);
   });
 
   // review/astra F1 on #101: a pruned name was reused, sorted oldest and deleted at once.
-  it("keeps the 2 newest backups when every reset lands in the same millisecond", async () => {
+  it("keeps the newest backup when every reset lands in the same millisecond", async () => {
     const { actors } = setup();
     const actor = await actors.create({ name: "frozen", instructions: "Churn." });
     const archived: string[] = [];
@@ -430,11 +452,11 @@ describe("actor session reset (smarty-dev#1439)", () => {
     }
     expect(new Set(archived).size).toBe(4);
     const kept = backups(actor.sessionFile!);
-    expect(kept).toHaveLength(2);
-    expect(kept.sort()).toEqual(archived.slice(-2).sort());
+    expect(kept).toHaveLength(1);
+    expect(kept.sort()).toEqual(archived.slice(-1).sort());
     const dir = path.dirname(actor.sessionFile!);
     const contents = kept.map((name) => fs.readFileSync(path.join(dir, name), "utf8")).join("\n");
-    expect(contents).toContain("charlie");
+    expect(contents).not.toContain("charlie");
     expect(contents).toContain("delta");
     expect(contents).not.toContain("bravo");
   });

@@ -68,6 +68,19 @@ describe("activation native tool compaction", () => {
     expect(plan!.messages.find(message => message.role === "toolResult" && message.toolCallId === "small")).toMatchObject({content: [{type: "text", text: "small result"}]});
   });
 
+  it("compacts an overflowing latest batch without dropping user directions or tool pairs", () => {
+    const f = fixture(); const event = f.batch(["latest-only"], "x".repeat(80_000));
+    const before = f.session.getBranch();
+    const plan = compactActivationTools(event, { includeLatest: true })!;
+    expect(plan.entries.filter(entry => entry.type === "context_edit")).toHaveLength(1);
+    expect(plan.messages.find(message => message.role === "user")).toMatchObject({ content: "EXACT_ACTIVATION_DIRECTIONS" });
+    expect(plan.messages.find(message => message.role === "assistant")).toEqual(event.message);
+    expect(plan.messages.find(message => message.role === "toolResult")).toMatchObject({ toolCallId: "latest-only", content: [{ type: "text", text: expect.stringContaining("Compacted tool output") }] });
+    const window = new ActivationWindow([]);
+    window.project(event.context.contextMessages.filter(message => message.role !== "system"));
+    window.authorizeCompaction(plan.summary, plan.messages); expect(window.project(f.apply(plan))).toBeDefined();
+    expect(f.session.getBranch().slice(0, before.length)).toEqual(before);
+  });
   it.each(["summary", "retained", "unapproved"])("rejects an altered native compaction: %s", mode => {
     const f = fixture();
     f.batch(["old"]);

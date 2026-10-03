@@ -2,6 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { FabricActivityStore } from "../src/activity/store.js";
 
 describe("FabricActivityStore", () => {
+  it.each(["agents.create", "agents.createActor"])("classifies %s as actor creation", ref => {
+    const store = new FabricActivityStore(); store.start("actor-alias");
+    store.beginCall("actor-alias", { callId: "create", ref, args: { name: "reviewer", instructionsFile: "/factory/role.md", sha256: "a".repeat(64) } });
+    expect(store.get("actor-alias")?.calls[0]?.kind).toBe("actor");
+  });
   it("tracks dynamic phases, calls, entities, metrics, and custom items", () => {
     const store = new FabricActivityStore();
     const listener = vi.fn();

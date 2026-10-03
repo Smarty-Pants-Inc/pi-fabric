@@ -468,6 +468,70 @@ describe("ParticipantDirectory host leases", () => {
     expect(result).toBeUndefined();                                 // still waiting for the running peer
   });
 
+  // #411 R1: a lock acquisition can outlast the pre-confirmation renewal decision.
+  it.each([
+    { crossing: "host threshold", leaseMs: 4_000, delayMs: 2_001, policy: false },
+    { crossing: "host expiry", leaseMs: 4_000, delayMs: 4_001, policy: false },
+    { crossing: "legacy threshold", leaseMs: 60_000, delayMs: 7_501, policy: false },
+    { crossing: "legacy expiry", leaseMs: 60_000, delayMs: 15_001, policy: false },
+    { crossing: "policy threshold", leaseMs: 60_000, delayMs: STATE_LEASE_RENEW_MS, policy: true },
+  ])("renews after delayed confirmation crosses $crossing", async ({ leaseMs, delayMs, policy }) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-delayed-confirm-"));
+    roots.push(root);
+    const identity = identityOf("delayed");
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 5_000 });
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity,
+      heartbeatMs: 1_000, leaseMs, reapDeadHosts: false,
+    });
+    directories.push(directory);
+    directory.registerSource(() => [rootRecord(identity.id, identity.id, "delayed")]);
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const lockPath = path.join(mesh.root, ".lock");
+    try {
+      if (policy) await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity });
+      await directory.refresh(); // no heartbeat timer: only this awaited refresh can renew
+      const hostBefore = mesh.listAll("topology/hosts/")[0]!;
+      const legacyBefore = mesh.get("sessions/delayed")!;
+      const participantBefore = mesh.listAll("topology/participants/")[0]!;
+      const writes = vi.spyOn(mesh, "writeBatch");
+      const confirm = mesh.confirmWritable.bind(mesh);
+      let entered!: () => void;
+      const confirming = new Promise<void>((resolve) => { entered = resolve; });
+      const confirmations = vi.spyOn(mesh, "confirmWritable").mockImplementation(async () => {
+        const pending = confirm(); // the real acquisition waits behind a live lock
+        entered();
+        await pending;
+      });
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+      fs.writeFileSync(path.join(lockPath, "owner"), `delayed\n${process.pid}\n${now}\n`);
+      let settled = false;
+      const refresh = directory.refresh().then(() => { settled = true; });
+      await confirming;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(settled).toBe(false);
+      now += delayMs; // deterministic elapsed time during the actual lock wait
+      fs.rmSync(lockPath, { recursive: true, force: true });
+      await refresh;
+      expect(confirmations).toHaveBeenCalledOnce();
+      expect.soft(writes).toHaveBeenCalledOnce(); // host + legacy in one locked commit
+      const hostAfter = mesh.listAll("topology/hosts/", { fresh: true })[0]!;
+      expect.soft(hostAfter.version).toBeGreaterThan(hostBefore.version);
+      expect.soft(hostAfter.value).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
+      const legacyAfter = mesh.get("sessions/delayed", { fresh: true })!;
+      expect.soft(legacyAfter.version).toBeGreaterThan(legacyBefore.version);
+      expect.soft(legacyAfter.updatedAt).toBe(now);
+      expect.soft(legacyAfter.value).toMatchObject({ updatedAt: now });
+      expect(mesh.listAll("topology/participants/", { fresh: true })[0]).toEqual(participantBefore);
+      expect(directory.confirmedAt()).toBe(now);
+    } finally {
+      fs.rmSync(lockPath, { recursive: true, force: true });
+      clock.mockRestore();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("under the policy, still renew the shared record every STATE_LEASE_RENEW_MS", async () => {
     const { hostEntry } = await setup(true);
     const shared = hostEntry()!;
@@ -1155,7 +1219,7 @@ describe("ParticipantDirectory", () => {
         // Drive the real heartbeat callback without incidental ticks during backoff.
         const heartbeat = intervals.mock.calls[0]![0] as () => void;
         const runs = vi.spyOn(MeshBackgroundRetry.prototype, "run");
-        const writes = vi.spyOn(mesh, "writeBatch");
+        const confirmations = vi.spyOn(mesh, "confirmWritable");
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
         const tick = async () => {
           heartbeat();
@@ -1181,7 +1245,7 @@ describe("ParticipantDirectory", () => {
         await Promise.resolve(); // run the queued change-only refresh
         expect(await runs.mock.results.at(-1)!.value).toBe("done");
         expect(source.mock.calls.length).toBeGreaterThan(readsBefore);
-        expect(writes).toHaveBeenCalledOnce(); // unchanged snapshot took no mesh lock
+        expect(confirmations).toHaveBeenCalledOnce(); // unchanged snapshot took no mesh lock
         expect(recovered).not.toHaveBeenCalled();
         expect(directory.writeStalled()).toBeDefined();
         expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(holder);
@@ -1191,11 +1255,11 @@ describe("ParticipantDirectory", () => {
         expect(retry.waitMs).toBeGreaterThan(0); // second timeout retained the doubled delay
         heartbeat();
         expect(await runs.mock.results.at(-1)!.value).toBe("skipped");
-        expect(writes).toHaveBeenCalledTimes(2);
+        expect(confirmations).toHaveBeenCalledTimes(2);
 
         fs.rmSync(lockPath, { recursive: true, force: true });
         await vi.advanceTimersByTimeAsync(retry.waitMs);
-        expect(await tick()).toBe("done"); // a real locked write confirms recovery
+        expect(await tick()).toBe("done"); // a real lock acquisition confirms recovery
         expect(directory.writeStalled()).toBeUndefined();
         expect(recovered).toHaveBeenCalledOnce();
         expect(retry.waitMs).toBe(0);
@@ -1226,10 +1290,14 @@ describe("ParticipantDirectory", () => {
       expect(writes.mock.calls.length).toBeLessThanOrEqual(2);
     });
 
-    it("still renews the lease on a heartbeat with unchanged records", async () => {
+    it("still renews the file lease on a heartbeat with unchanged records", async () => {
       const { directory, writes } = await changing();
+      const confirmed = vi.spyOn(directory.mesh, "confirmWritable");
       await directory.refresh();
-      expect(writes).toHaveBeenCalledTimes(1);
+      expect(writes).not.toHaveBeenCalled();
+      expect(confirmed).toHaveBeenCalledOnce();
+      expect(readHostLeases(directory.mesh.root).get(directory.options.hostId)?.expiresAt).toBeGreaterThan(Date.now());
+      confirmed.mockRestore();
     });
   });
 
@@ -1363,7 +1431,7 @@ describe("ParticipantDirectory", () => {
     await directory.refresh();
     const steady = again.mock.calls.filter(([, target]) => String(target).endsWith("state.json")).length;
     again.mockRestore();
-    expect(steady).toBe(1);
+    expect(steady).toBe(0); // the fresh host lease needs no shared-state rewrite
   });
 
   // smarty-dev#266: a stopped mesh lock holder expired every lease; sessions() said [].

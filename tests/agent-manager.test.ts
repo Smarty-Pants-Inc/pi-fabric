@@ -1504,7 +1504,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const runRoot = path.join(root, "runs");
     const untracked = path.join(runRoot, "previous-host-worker");
-    fs.mkdirSync(untracked, { recursive: true });
+    fs.mkdirSync(untracked, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(untracked, "evidence"), "still in use");
     const child = spawn("sleep", ["60"], { stdio: "ignore" });
     const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
@@ -1746,7 +1746,6 @@ describe("AgentManager", () => {
     (["clean", "uncertain", "failed-result"] as const).map(outcome => ({ platform, outcome })),
   ))("keeps stop settlement separate from joined process custody ($outcome, $platform)", async ({ outcome, platform }) => {
     const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
-    if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
@@ -1788,6 +1787,10 @@ describe("AgentManager", () => {
     let stopping: Promise<AgentRunResult> | undefined;
     try {
       const handle = await manager.spawn({ task: "joined stop", transport: "process" });
+      // Emulate Windows teardown, not a Windows filesystem on a POSIX host.
+      // The actual host still validates the private run namespace at launch;
+      // every settlement, stop, helper and cleanup assertion below stays intact.
+      if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
       statusFile = path.join(manager.runDirectory(handle.id)!, "status.json");
       writeJsonAtomic(statusFile, {
         id: handle.id, name: "joined stop", task: "joined stop", status: "running", runner: "pi", transport: "process", sessionId,

@@ -1958,7 +1958,16 @@ export class AgentManager {
         throw new Error(`Cannot clean up agent ${id}: Fabric lost track of its worker; check ${runDirectory} before removing its files`);
       }
       if (!this.#saveQueuedRouteOutcome(queued)) throw new Error(`Cannot clean up agent ${id}: ${queued.routeSaveFailure}`);
-      const exitVeto = runTreeExitVeto(runDirectory, 0, undefined, true);
+      // A terminal queued receipt may fail in model preparation before a run
+      // directory ever existed. Unknown launches were fenced above; absence
+      // here is not evidence about an admitted process or its descendants.
+      let exitVeto: string | undefined;
+      try {
+        fs.lstatSync(runDirectory);
+        exitVeto = runTreeExitVeto(runDirectory, 0, undefined, true);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       this.#onResultConsumed?.(id);
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);

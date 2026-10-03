@@ -122,8 +122,6 @@ export const runTreeExitVeto = (
         if (reason) return reason;
       }
     }
-    const scratchVeto = runScratchExitVeto(directory, expired);
-    if (scratchVeto) return scratchVeto;
     if (fs.existsSync(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     const statusFile = path.join(directory, "status.json");
@@ -141,7 +139,11 @@ export const runTreeExitVeto = (
       const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
         ? Number(record.sessionId) : undefined;
       if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) {
-        if (!hasNeverStartedReceipt(directory)) return "worker exit is unconfirmed: unknown descendant identity";
+        if (!hasNeverStartedReceipt(directory)) {
+          const reason = "worker exit is unconfirmed: unknown descendant identity";
+          const scratchVeto = runScratchExitVeto(directory, expired);
+          return scratchVeto ? `${reason}; ${scratchVeto}` : reason;
+        }
       }
       if (pid !== undefined && processAlive(pid)) return `worker exit is unconfirmed: its descendant worker may still be running (${directory})`;
     }
@@ -172,6 +174,10 @@ export const runTreeExitVeto = (
         return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
       }
     }
+    // Report a known worker/descendant obligation before the independent
+    // scratch fence. Both still have to pass; native exit never bypasses it.
+    const scratchVeto = runScratchExitVeto(directory, expired);
+    if (scratchVeto) return scratchVeto;
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
 };
 const recordAgeReference = (record: RunRecordSummary, fallback: number): number =>

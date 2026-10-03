@@ -269,11 +269,24 @@ const allocateRunTmpDirectoryLocked = (runDirectory: string): { directory: strin
       // A pending/ambiguous retry has no such receipt and stays fenced.
       let unlock: (() => void) | undefined;
       try {
-        if (scope || !Number.isSafeInteger(pid) || pid <= 0) return;
+        if (!Number.isSafeInteger(pid) || pid <= 0) return;
         unlock = lockScratchCustody(runDirectory);
         const current = readFence(runDirectory);
-        if (!current || !validUnscopedFence(current) || current.launchNonce !== launchNonce ||
+        if (!current || current.launchNonce !== launchNonce ||
             !same(runDirectory, root) || !same(directory, scratch)) return;
+        if (scope) {
+          // A captured native close also joins a gate stopped before its JS
+          // attachment receipt. No process from this launch can attach later;
+          // descendants already attached still require the kernel's atomic
+          // empty/removal proof in disposeRunTmpDirectory. Never infer emptiness
+          // from close, nor arm a different/pending retry generation.
+          const checked = checkedProcessScratchScope(current.scope);
+          if (current.version !== 2 || !checked || checked.directory !== scope.directory ||
+              checked.dev !== scope.dev || checked.ino !== scope.ino || checked.bootId !== scope.bootId) return;
+          writeJsonAtomic(joinedFile, { ...scope, launchNonce }, { durable: true });
+          return;
+        }
+        if (!validUnscopedFence(current)) return;
         if (current.closedPid === pid && typeof current.closedAt === "number" && current.closedAt >= current.lastLaunchAt!) return;
         writeJsonAtomic(fence, { ...current, closedPid: pid, closedAt: Date.now() }, { durable: true });
       } catch { /* unproved native completion remains fenced */ }

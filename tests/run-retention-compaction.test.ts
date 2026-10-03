@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { compactTerminalRunEvents, pruneActorRunArchives, markRunRootActive, markRunRootClosed, sweepTempRunRoots, FABRIC_RUN_ROOT_PREFIX, runTreeExitVeto } from "../src/storage/retention.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
+import { allocateRunTmpDirectory } from "../src/storage/run-scratch.js";
+import * as scratchScopes from "../src/storage/process-scratch-scope.js";
 
 const roots: string[] = [];
 const HOUR = 3600000;
@@ -11,7 +13,7 @@ const now = 10 * HOUR;
 const log = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
 const make = (record: Record<string, unknown> = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-tail-")); roots.push(root);
-  const run = path.join(root, "runs", "old"); fs.mkdirSync(run, { recursive: true });
+  const run = path.join(root, "runs", "old"); fs.mkdirSync(run, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: 4 * HOUR, transport: "process", sessionId: "2147483647", ...record }));
   fs.writeFileSync(path.join(run, "events.jsonl"), log);
   fs.writeFileSync(path.join(run, "reply.json"), '{"text":"retained result"}');
@@ -21,7 +23,7 @@ const snapshot = (run: string) => fs.readdirSync(run).sort().map(name => {
   const file = path.join(run, name); const stat = fs.statSync(file);
   return [name, fs.readFileSync(file, "utf8"), stat.ino, stat.mtimeMs, stat.ctimeMs];
 });
-afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 describe("six-hour terminal run compaction", () => {
   it("atomically keeps the final 200 events at six hours even below the byte cap, with status/result and TTL unchanged", () => {
@@ -56,6 +58,7 @@ describe("six-hour terminal run compaction", () => {
     const event = JSON.stringify({ text: "x".repeat(eventBytes - Buffer.byteLength('{"text":""}\n')) }) + "\n";
     expect(Buffer.byteLength(event)).toBe(eventBytes);
     const file = path.join(run, "events.jsonl"); fs.writeFileSync(file, event.repeat(count));
+    fs.utimesSync(run, 4 * HOUR / 1000, 4 * HOUR / 1000);
     const before = snapshot(run); const directoryMtime = fs.statSync(run).mtimeMs;
     const changes: unknown[] = [];
     const options = { now, terminalRunEventsMaxBytes: cap, onCompact: (change: unknown) => changes.push(change) };
@@ -65,6 +68,32 @@ describe("six-hour terminal run compaction", () => {
     expect(snapshot(run)).toEqual(before);
     expect(fs.statSync(run).mtimeMs).toBe(directoryMtime);
     expect(changes).toEqual([]);
+  });
+
+  it.skipIf(process.platform === "win32").each([true, false])("does not dispose otherwise collectable scratch during compaction (dryRun=%s)", dryRun => {
+    const { run } = make();
+    // Build a genuinely collectable unscoped generation, not a legacy fence
+    // that would make a mutating guard fail anyway.
+    fs.unlinkSync(path.join(run, "status.json"));
+    vi.spyOn(scratchScopes, "createProcessScratchScope").mockReturnValue(undefined);
+    const allocation = allocateRunTmpDirectory(run);
+    fs.writeFileSync(path.join(allocation.directory, "writer-output"), "preserve in an observation");
+    fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647", finishedAt: 4 * HOUR }));
+    allocation.workerClosed(2147483647);
+    fs.utimesSync(run, 4 * HOUR / 1000, 4 * HOUR / 1000);
+    const before = fs.statSync(run);
+    const files = fs.readdirSync(run).sort();
+    const fence = fs.readFileSync(path.join(run, "unresolved-scratch.json"), "utf8");
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    expect(compactTerminalRunEvents(run, { now, dryRun })).toBe(false);
+    expect(mkdir).not.toHaveBeenCalled();
+    const after = fs.statSync(run);
+    expect([after.ino, after.mtimeMs, after.ctimeMs]).toEqual([before.ino, before.mtimeMs, before.ctimeMs]);
+    expect(fs.readdirSync(run).sort()).toEqual(files);
+    expect(fs.readFileSync(path.join(run, "unresolved-scratch.json"), "utf8")).toBe(fence);
+    expect(fs.readFileSync(path.join(allocation.directory, "writer-output"), "utf8")).toBe("preserve in an observation");
+    expect(runTreeExitVeto(run, 0, undefined, true)).toBeUndefined(); // actual collection can still dispose it
+    expect(fs.existsSync(allocation.directory)).toBe(false);
   });
 
   it("compacts exactly 201 events even when bytes fit, then is idempotent", () => {

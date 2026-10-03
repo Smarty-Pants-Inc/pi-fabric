@@ -10,6 +10,8 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
+import * as runScratch from "../src/storage/run-scratch.js";
+import { scratchEvidence } from "./scratch-evidence.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 const waitFor = async (predicate: () => boolean, ms = 5_000) => {
@@ -142,6 +144,7 @@ describe("round-four launch-preparation recovery (#3167)", () => {
   const scenarios = [false, true].flatMap((queued) => [false, true].flatMap((recreate) =>
     (["text", "directive"] as const).map((responseMode) => ({ queued, recreate, responseMode }))));
   it.each(scenarios)("durably retries confirmed-unlaunched auth (queued=$queued, recreate=$recreate, mode=$responseMode) exactly once", async ({ queued, recreate, responseMode }) => {
+    const allocations = vi.spyOn(runScratch, "allocateRunTmpDirectory");
     const gate = deferred<void>();
     const authStarted = deferred<void>();
     const recovered = deferred<void>();
@@ -231,7 +234,29 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     expect(actors.status(actor.id).preparing).toBeUndefined();
     expect(fs.readdirSync(directory).filter((file) => file.startsWith("queue-"))).toEqual([]);
     expect(agents.list().filter((run) => run.actorId === actor.id && run.status === "running")).toEqual([]);
-    expect(fs.readdirSync(path.join(root, recreate ? "recreated-runs" : "runs"))).toHaveLength(recreate ? 0 : queued ? 2 : 1);
+    const runsDirectory = path.join(root, recreate ? "recreated-runs" : "runs");
+    const runId = actors.status(actor.id).lastRunId!;
+    expect(runId).toBeTruthy();
+    const runDirectory = path.join(runsDirectory, runId);
+    const allocationIndex = allocations.mock.calls.findIndex(([directory]) => directory === runDirectory);
+    expect(allocationIndex).toBeGreaterThanOrEqual(0);
+    const allocation = allocations.mock.results[allocationIndex]!;
+    expect(allocation.type).toBe("return");
+    expect(allocation.value.directory).toBe(path.join(runDirectory, "tmp"));
+    const otherRuns = recreate ? 0 : queued ? 2 : 1;
+    if (allocation.value.scope) {
+      // A joined native scope proves complete descendant exit immediately.
+      expect(fs.existsSync(runDirectory)).toBe(false);
+      expect(fs.readdirSync(runsDirectory)).toHaveLength(otherRuns);
+      scratchEvidence(`actor-auth-${queued}-${recreate}-${responseMode}`, { containment: "native scoped",
+        scope: allocation.value.scope, runId, runRemovedImmediately: true });
+    } else {
+      // Unscoped hosts retain main's immediate terminal collection contract.
+      expect(fs.existsSync(runDirectory)).toBe(false);
+      expect(fs.readdirSync(runsDirectory)).toHaveLength(otherRuns);
+      scratchEvidence(`actor-auth-${queued}-${recreate}-${responseMode}`, { containment: "unscoped compatibility",
+        runId, runRemovedImmediately: true, descendantExitProved: false });
+    }
   });
 
   it.each([false, true])("exhausts the preparation retry budget in one terminal failure and one alarm (queued: %s)", async (queued) => {
@@ -588,7 +613,11 @@ describe("actor preparation (#3167)", () => {
     for (const actor of all) actors.tell(actor.id, "HANG");
     await waitFor(() => all.slice(14).every((actor) => actors.status(actor.id).inFlightRun !== undefined));
     expect(all.slice(14).every((actor) => retryEvent(actors, actor.id, "presence") === undefined)).toBe(true);
-    await waitFor(() => all.every((actor) => actors.status(actor.id).inFlightRun !== undefined));
+    // Keep the first four healthy actors under the existing starvation guard.
+    // Joining all 18 durable native launches at nice 19 can take longer than
+    // one five-second observation; retain all retry/state/count assertions and
+    // the existing 20-second case ceiling.
+    await waitFor(() => all.every((actor) => actors.status(actor.id).inFlightRun !== undefined), 15_000);
     expect(agents.list().filter((run) => run.status === "running")).toHaveLength(18);
     expect(all.slice(0, 14).every((actor) => retryEvent(actors, actor.id, "presence") !== undefined)).toBe(true);
     expect(all.every((actor) => actors.status(actor.id).status === "running" && actors.status(actor.id).preparing === undefined)).toBe(true);
@@ -607,7 +636,9 @@ describe("actor preparation (#3167)", () => {
     await pause(200); // A legitimate permit wait is longer than the 80ms setup deadline.
     expect(all.every((actor) => actors.status(actor.id).status === "waiting")).toBe(true);
     await agents.stop(blockers[0]!.id);
-    await waitFor(() => all.every((actor) => actors.status(actor.id).lastRunId !== undefined) && actors.inFlightCount() === 0);
+    // Seven serial durable native launches are not a five-second performance
+    // budget at nice 19. Keep prompt waiter/position checks above unchanged.
+    await waitFor(() => all.every((actor) => actors.status(actor.id).lastRunId !== undefined) && actors.inFlightCount() === 0, 10_000);
     expect(all.every((actor) => actors.status(actor.id).queued === 0 && actors.status(actor.id).inFlightRun === undefined)).toBe(true);
   });
 });

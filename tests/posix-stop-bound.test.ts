@@ -163,6 +163,10 @@ fs.writeFileSync("native-ready", String(process.pid));`);
       expect(same(native!), "native child must exit, not merely its worker").toBe(false);
       expect(child!.signalCode, "worker must finish the child-close sequence cooperatively").toBeNull();
       expect(hasUnresolvedWorker(run)).toBe(false);
+      // The shell gate now contains runtime preloads on scoped hosts. With
+      // native teardown joined, both scoped custody and main-compatible
+      // unscoped collection permit checkpoint/cleanup immediately.
+      expect(fs.existsSync(path.join(run, "unresolved-scratch.json"))).toBe(false);
       if (action !== "close") await expect(manager.checkpointForRelease()).resolves.toBeUndefined();
       await manager.close();
       expect(fs.existsSync(run)).toBe(false);

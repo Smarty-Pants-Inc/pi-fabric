@@ -38,6 +38,9 @@ const waitFor = async (test: () => boolean) => {
 const harness = (small = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "completion-successor-")); roots.push(root);
   const meshRoot = path.join(root, "mesh");
+  // Private ancestry is part of the real worker launch contract. Recursive
+  // leaf creation alone would otherwise leave mesh/residency world-writable.
+  fs.mkdirSync(path.join(meshRoot, "residency"), { recursive: true, mode: 0o700 });
   const mesh = new MeshStore(meshRoot, small ? 1024 : DEFAULT_FABRIC_CONFIG.mesh.maxEventBytes, 100, small ? { maxStateBytes: 4096, maxStateTombstones: 2 } : {});
   let live: FabricParticipantInfo[] = [];
   const participant = (session: string, startedAt: number, extra = {}): FabricParticipantInfo => ({
@@ -287,7 +290,7 @@ describe("round 4 completion fences", () => {
       piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
     });
     const cfg = a.client.options.config;
-    fs.mkdirSync(cfg.residencyRoot, { recursive: true });
+    fs.mkdirSync(cfg.residencyRoot, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(cfg.residencyRoot, "config.json"), JSON.stringify(cfg));
     const host = new ResidentHost(cfg);
     // Public durable spawns belong to Main, never the hidden resident executor.
@@ -800,7 +803,9 @@ describe("round 2 completion security", () => {
     h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
     await new Promise(resolve => setTimeout(resolve, 60)); expect(b.completed).not.toHaveBeenCalled();
     expect(fs.statSync(path.join(h.meshRoot, "state.json")).size).toBeLessThan(4096);
-  });
+    // Thirty durable fsync/claim/retirement cycles at nice 19 can exceed the
+    // generic 15-second case ceiling. Keep every capacity/receipt/replay check.
+  }, 60_000);
 
   it("F3: retirement CAS cannot erase a replacement claim version", async () => {
     const h = harness(); h.setLive([h.participant("A", 100)]);

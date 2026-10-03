@@ -217,6 +217,37 @@ describe("shared run-tree exit veto", () => {
   });
 
 
+  it("allows only a live admission's recordless unlaunched root, never a missing descendant identity", () => {
+    const run = temporaryDirectory();
+    const options = { allowUnlaunchedRoot: true };
+    fs.writeFileSync(path.join(run, "task.txt"), "known pre-dispatch refusal");
+    expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/unknown root identity/);
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toBeUndefined();
+    expect(canRemoveTerminalRun(run)).toBe(false); // offline retention has no live admission authority
+    const child = path.join(run, "nested", "child");
+    fs.mkdirSync(child, { recursive: true });
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toMatch(/unknown descendant identity/);
+    writeStatus(child, { status: "completed", transport: "process", sessionId: String(process.pid) });
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toMatch(/descendant worker may still be running/);
+    writeStatus(child, { status: "completed", transport: "process", sessionId: "2147483647" });
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toBeUndefined();
+    writeStatus(run, { status: "stopped", transport: "process", sessionId: undefined });
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toMatch(/unknown root identity/);
+    fs.unlinkSync(path.join(run, "status.json"));
+    markUnresolvedWorker(run, "dispatched request lost its reply");
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toMatch(/unresolved worker marker/);
+  });
+
+  it("never treats an unreadable root record as a known unlaunched root", () => {
+    const run = temporaryDirectory(), status = path.join(run, "status.json");
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation((...args: Parameters<typeof lstat>) => {
+      if (String(args[0]) === status) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      return lstat(...args);
+    });
+    expect(runTreeExitVeto(run, 0, undefined, true, { allowUnlaunchedRoot: true })).toMatch(/inspection failed/);
+  });
+
   it("refuses malformed records and failed nested inspection rather than inferring exit", () => {
     const run = temporaryDirectory();
     const status = path.join(run, "status.json"); fs.writeFileSync(status, "{broken");
@@ -304,6 +335,31 @@ describe("safe run roots", () => {
     expect(fs.existsSync(path.join(root, "done"))).toBe(false);
     for (const name of ["pending", "live", "unresolved"]) expect(fs.existsSync(path.join(root, name))).toBe(true);
   });
+  it.each(["closed", "orphan"])("retains uncontained scratch in expired %s runs, even when worker/nested records say exited", kind => {
+    const tempRoot = temporaryDirectory();
+    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + kind);
+    for (const name of ["done", "live", "unsettled", "nested-live", "unknown", "nested-unknown", "unsafe"]) {
+      const directory = path.join(root, name);
+      writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: name === "live" ? String(process.pid) : "2147483647" });
+      const tmp = path.join(directory, "tmp");
+      fs.mkdirSync(path.join(tmp, "compound-suffix"), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(tmp, "compound-suffix", "anything.tmp"), "leftover");
+      if (name === "unsettled") markUnresolvedWorker(directory, "exit unsettled");
+      if (name === "nested-live") writeStatus(path.join(directory, "nested", "child"), {
+        status: "completed", transport: "process", sessionId: String(process.pid), finishedAt: 1,
+      });
+      if (name === "unknown") writeStatus(directory, { status: "completed", transport: "process", finishedAt: 1 });
+      if (name === "nested-unknown") writeStatus(path.join(directory, "nested", "child"), { status: "completed", transport: "process", finishedAt: 1 });
+      if (name === "unsafe") fs.symlinkSync(temporaryDirectory(), path.join(tmp, "linked"), "junction");
+    }
+    fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1,
+      ...(kind === "closed" ? { closedAt: 1, childrenStopped: true } : { orphanedAt: 1 }) }));
+    sweep(tempRoot);
+    for (const name of ["done", "live", "unsettled", "nested-live", "unknown", "nested-unknown", "unsafe"]) {
+      expect(fs.existsSync(path.join(root, name, "tmp", "compound-suffix", "anything.tmp"))).toBe(true);
+    }
+  });
+
   it.each([
     ["closed", "root"], ["closed", "descendant"],
     ["orphan", "root"], ["orphan", "descendant"],
@@ -702,6 +758,9 @@ describe("temporal retention", () => {
       for (let depth = 0; depth < 20; depth++) {
         deepest = path.join(deepest, "nested", `child-${depth}`);
         completedRun(deepest);
+        // A stopped host alone cannot prove descendant exit; supply the
+        // fixture identity so this test reaches its intended deadline.
+        writeStatus(deepest, { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: 1 });
       }
       fs.writeFileSync(path.join(closed, ".fabric-owner.json"), JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
       let deepVisits = 0;

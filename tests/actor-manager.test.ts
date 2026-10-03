@@ -2678,6 +2678,29 @@ describe("ActorManager", () => {
     expect(listener).toHaveBeenCalledTimes(beforeUnsubscribedUpdate);
   });
 
+  it("allocates distinct private scratch per actor activation and collects terminal scratch", async () => {
+    const { actors, agents, root } = setup(false, undefined, undefined, undefined, {}, { retainRuns: true });
+    const actor = await actors.create({ name: "scratch-reviewer", instructions: "REPORT_RUN_TMPDIR", responseMode: "text", transport: "process" });
+    const reports: Array<{ tmpdir: string; scratch: string }> = [];
+    for (const message of ["first review", "second review"]) {
+      const reply = await actors.ask(actor.id, `REPORT_RUN_TMPDIR ${message}`);
+      const report = JSON.parse(reply.text!);
+      expect(report.tmpdir).toBe(path.join(root, "runs", reply.runId!, "tmp"));
+      if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
+      else expect(report.mode).toBe(0o700);
+      expect(path.dirname(report.scratch)).toBe(report.tmpdir);
+      expect(fs.existsSync(report.tmpdir)).toBe(false);
+      expect(fs.existsSync(path.join(path.dirname(report.tmpdir), "unresolved-scratch.json"))).toBe(false);
+      reports.push(report);
+      await waitFor(() => actors.status(actor.id).status === "idle");
+    }
+    expect(reports[0]!.tmpdir).not.toBe(reports[1]!.tmpdir);
+    // Actor lifecycle copies logs and collects terminal originals even when
+    // the AgentManager alone would retain them.
+    expect(actors.readLog(actor.id, { type: "all" }).retainedRuns).toHaveLength(2);
+    expect(agents.list()).toEqual([]);
+  });
+
   it("keeps a persistent actor identity and processes direct mailbox messages", async () => {
     const { actors, agents } = setup();
     const actor = await actors.create({
@@ -2933,7 +2956,6 @@ describe("ActorManager", () => {
       error: expect.stringContaining("Structured agent output was invalid"),
     });
 
-    // Removing the actor releases the retained run.
     await actors.remove(actor.id);
     expect(agents.list()).toEqual([]);
   });
@@ -3386,8 +3408,7 @@ describe("ActorManager", () => {
     expect(eventTypes).toContain("message_end");
     expect(log.run!.status?.status).toBe("completed");
     expect(log.retainedRuns).toHaveLength(1);
-    // Completed runs are released from the in-memory registry, but the log
-    // copy in the actor directory survives.
+    // Log copies survive collection of the terminal original run.
     expect(agents.list()).toEqual([]);
   });
 

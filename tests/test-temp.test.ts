@@ -6,7 +6,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 // Match the native Node config probes in test-fleet-isolation.test.ts. Only the
-// platform selector is simulated; config evaluation, ownership and exit are real.
+// platform selector and native VHD provisioning are simulated; config evaluation,
+// ownership and exit are real. Native ACL/VHD proof lives in the Windows suite.
 const windowsConfigProbe = String.raw`
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -15,6 +16,11 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { registerHooks } from "node:module";
 registerHooks({ resolve(specifier, context, nextResolve) {
+  // This Linux/Windows ownership probe cannot mount an NTFS VHD. Stub only
+  // the native provisioning seam; the real config/temp/fleet lifecycles run.
+  if (specifier === "./scripts/windows-test-temp.js" && context.parentURL?.endsWith("/vitest.config.ts")) {
+    return { url: "data:text/javascript," + encodeURIComponent("export const privateWindowsTestTemp=()=>({directory:process.env.RUNNER_TEMP,close(){}});"), shortCircuit: true };
+  }
   if (specifier.endsWith(".js") && specifier.startsWith(".") && context.parentURL?.startsWith("file:")) {
     const source = new URL(specifier.slice(0, -3) + ".ts", context.parentURL);
     if (fs.existsSync(fileURLToPath(source))) return nextResolve(source.href, context);

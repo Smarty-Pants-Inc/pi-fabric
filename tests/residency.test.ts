@@ -135,6 +135,8 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
     heartbeatMs: 50,
     leaseMs: 300,
   });
+  // One Main runtime identity, not a different birth stamp on each heartbeat.
+  const runtimeStartedAt = Date.now();
   participants.registerSource(() => [{
     format: 1,
     id: identity.id,
@@ -150,7 +152,7 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
     capabilities: ["steer", "followUp", "fabric"],
     cwd: repo,
     sessionId: name,
-    startedAt: Date.now(),
+    startedAt: runtimeStartedAt,
     updatedAt: Date.now(),
     controlProtocol: "v1",
   }]);
@@ -458,7 +460,7 @@ describe.skipIf(process.platform !== "linux" || !hasResidentHost)("S4 originatin
 describe("resident setter Main authorization", () => {
   it.each(["self", "sibling"] as const)("refuses read-only Fabric child setTools escalation to %s and preserves next activation tools", { timeout: 20_000 }, async (target) => {
     const state = await rootHarness(`setter-child-${target}`);
-    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true, mode: 0o700 });
     const configPath = path.join(state.config.residencyRoot, "config.json");
     fs.writeFileSync(configPath, JSON.stringify(state.config));
     const controller = new AbortController();
@@ -504,7 +506,7 @@ describe("resident setter Main authorization", () => {
 
   it("host rejects missing, child, laundered and foreign control identities and above-ceiling tools independently of provider", { timeout: 20_000 }, async () => {
     const state = await rootHarness("setter-host-auth");
-    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true, mode: 0o700 });
     const configPath = path.join(state.config.residencyRoot, "config.json");
     fs.writeFileSync(configPath, JSON.stringify(state.config));
     const controller = new AbortController();
@@ -544,7 +546,7 @@ describe("saturated durable spawn receipt consistency (#181 F2)", () => {
   it("revokes accepted queued work before reporting failure through the provider", { timeout: 15_000 }, async () => {
     const state = await rootHarness("resident-saturated");
     state.config.agents = { ...state.config.agents, maxConcurrent: 1 };
-    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true, mode: 0o700 });
     const configPath = path.join(state.config.residencyRoot, "config.json");
     fs.writeFileSync(configPath, JSON.stringify(state.config));
     const controller = new AbortController();
@@ -575,6 +577,9 @@ describe("saturated durable spawn receipt consistency (#181 F2)", () => {
       expect(client.hasAgent(queued.id)).toBe(false);
       expect(client.listAgents().map((run) => run.id)).toEqual([blocker.id]);
       await hostManager.stop(blocker.id);
+      // Native teardown can outlast this fixture's accelerated 300ms lease.
+      // Publish the still-live Main before its next authority-bound request.
+      await state.participants.refresh();
       const successor = await client.spawnAgent({ task: "accepted after pool release", residency: "durable", transport: "process" });
       await expect(client.waitAgent(successor.id)).resolves.toMatchObject({ status: "completed" });
       expect(hostManager.runDirectory(queued.id)).toBeUndefined();
@@ -592,7 +597,7 @@ describe("saturated durable spawn receipt consistency (#181 F2)", () => {
 describe("#169 round 2 public cleanup outcome", () => {
   it.each(["main", "nested"] as const)("carries failed cleanup and exact-id retry through the real %s client and provider", { timeout: 15_000 }, async (caller) => {
     const state = await rootHarness(`public-cleanup-${caller}`);
-    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true, mode: 0o700 });
     const configPath = path.join(state.config.residencyRoot, "config.json");
     fs.writeFileSync(configPath, JSON.stringify(state.config));
     const controller = new AbortController();
@@ -648,7 +653,7 @@ describe("#169 round 1 resident cleanup routing", () => {
   it.each(["project", "session"] as const)("retries and reports an exact cleanup-only %s id through the resident removeActor request", { timeout: 15_000 }, async (scope) => {
     const state = await rootHarness(`cleanup-host-${scope}`);
     const configPath = path.join(state.config.residencyRoot, "config.json");
-    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true, mode: 0o700 });
     fs.writeFileSync(configPath, JSON.stringify(state.config));
     const controller = new AbortController();
     const running = runResidentHostFromConfigPath(configPath, controller.signal);
@@ -1832,7 +1837,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     const state = await rootHarness("resident-reused-pid");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh,
       participants: state.participants, mainAgent: state.mainAgent, hostPath });
-    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true, mode: 0o700 });
     const stale = { format: RESIDENT_HOST_FORMAT, hostId: client.hostId, pid: process.pid,
       processStartTime: "0", token: "stale", startedAt: 0, readyAt: 0 };
     for (const file of ["owner.json", "host.lock"]) fs.writeFileSync(path.join(state.config.residencyRoot, file), JSON.stringify(stale));

@@ -14,6 +14,19 @@ vi.mock("node:child_process", async importOriginal => {
   return { ...actual, spawn: vi.fn() };
 });
 
+// These are native-event mocks, not native Windows filesystem/privacy probes.
+// Do not create real unresolved scratch for a worker that never actually exists;
+// real private TMPDIR/DACL custody is covered by the native scratch suites.
+vi.mock("../src/storage/run-scratch.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/storage/run-scratch.js")>();
+  return { ...actual,
+    prepareRunRoot: (root: string) => { fs.mkdirSync(root, { recursive: true, mode: 0o700 }); return root; },
+    allocateRunTmpDirectory: (root: string): ReturnType<typeof actual.allocateRunTmpDirectory> => ({
+      directory: path.join(root, "tmp"), neverStarted: () => {}, workerClosed: () => {},
+    }),
+  };
+});
+
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 afterEach(() => {
   Object.defineProperty(process, "platform", platform);

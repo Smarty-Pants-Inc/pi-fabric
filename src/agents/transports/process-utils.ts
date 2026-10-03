@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
+import { SCRATCH_GATE_LOADER_HOOKS, scopedWorkerArguments, type ScopedScratchLaunch } from "../../storage/process-scratch-scope.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 
 export interface ExecFileResult {
@@ -254,16 +255,50 @@ export const workerCommand = async (
 ): Promise<string> =>
   (await scriptSpawnArgs(workerPath, workerArguments)).map(shellQuote).join(" ");
 
+/** Proof that no worker-creation side effect was attempted. */
+export class WorkerNotStartedError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "WorkerNotStartedError";
+  }
+}
+
 export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
+  scope?: ScopedScratchLaunch,
 ): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
-  const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
-  assertTransportLaunchAllowed(authority);
-  const child = spawn(runtime, [workerPath, ...workerArguments], {
+  let runtime: string;
+  try {
+    runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
+    assertTransportLaunchAllowed(authority);
+    // The fixed shell gate must itself have no dynamic-loader execution hook,
+    // including on retries or when an explicit child environment was supplied.
+    if (scope && SCRATCH_GATE_LOADER_HOOKS.some(key => (environment ?? process.env)[key]?.trim())) {
+      throw new Error("Unproved scratch attachment: launch gate has a loader hook");
+    }
+  } catch (error) {
+    // This boundary has not invoked spawn. Errors at/after spawn are not
+    // never-started receipts, even when no PID or handle was returned.
+    throw new WorkerNotStartedError(error);
+  }
+  // Attach BEFORE exec of any runtime: Bun's bunfig preloads execute before
+  // --eval, so the JavaScript receipt gate alone cannot contain their forks.
+  // /bin/sh -p -c is fixed and noninteractive; -p disables inherited shell
+  // functions/startup hooks without changing uid. Only shell builtins run
+  // before attachment. Positional arguments
+  // preserve paths/argv without evaluating worker-controlled shell text.
+  const arguments_ = scope ? ["-p", "-c", `
+printf '%s' "$$" > "$1/cgroup.procs" || exit 125
+IFS= read -r membership < /proc/self/cgroup || exit 125
+[ "$membership" = "0::\${1#/sys/fs/cgroup}" ] || exit 125
+shift
+exec "$@"
+`, "pi-fabric-scratch-gate", scope.directory, runtime, ...scopedWorkerArguments(scope, workerPath, workerArguments, cwd)] : [workerPath, ...workerArguments];
+  const child = spawn(scope ? "/bin/sh" : runtime, arguments_, {
     cwd,
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",

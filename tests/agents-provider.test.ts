@@ -52,6 +52,8 @@ import { parseWorkerOptions } from "../src/worker/options.js";
 import { createRunningRecord, writeRunRecord } from "../src/worker/run-record.js";
 import { resolvePiModel } from "../src/core/model-refresh.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as windowsTempRoot from "../src/storage/windows-temp-root.js";
+import { posixDataRoot } from "../src/storage/temp-root.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import type { AgentHandleInfo } from "../src/agents/types.js";
@@ -2826,6 +2828,11 @@ describe("AgentsProvider runner support", () => {
       }
       const { provider, agents } = setup([], [], undefined, { cwd: repository, agentsConfig: { retainRuns: false, budgetUsd: 0 } });
       try {
+        // The lifecycle platform override must not turn actual POSIX fixture
+        // paths into fake Windows drive/DACL custody. Keep native namespace
+        // validation; native Windows runs still use the real Windows policy.
+        if (platform.value !== "win32") vi.spyOn(windowsTempRoot, "windowsDataRoot")
+          .mockImplementation(directory => posixDataRoot(directory, { create: true }));
         // Force the real Windows settlement path even on a Linux test host.
         Object.defineProperty(process, "platform", { ...platform, value: "win32" });
         const handle = await provider.invoke(method, {

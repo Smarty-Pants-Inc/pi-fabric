@@ -154,6 +154,7 @@ test.each(["vitest.config.ts", "tests/fleet-isolation-setup.ts"])(
         PI_FABRIC_ACTIVATION_TEST_PI_BINARY: "./exact artifact/native.exe",
         PI_FABRIC_ACTIVATION_TEST_WORKER: "./exact artifact/worker.js",
         PI_FABRIC_TEST_PG_BIN: "./exact artifact/pg bin", PI_FABRIC_TEST_PID_DELAY_MS: "600",
+        PI_FABRIC_SCRATCH_EVIDENCE_DIR: "./exact artifact/scratch evidence",
       };
       const env: NodeJS.ProcessEnv = { ...process.env, ...testControls, FLEET_ISOLATION_SENTINEL: sentinel,
         FLEET_ISOLATION_ENTRY: path.join(repo, entry), FLEET_ISOLATION_TEST_CONTROLS: JSON.stringify(testControls) };
@@ -167,7 +168,7 @@ test.each(["vitest.config.ts", "tests/fleet-isolation-setup.ts"])(
         "PI_FABRIC_CAPABILITY_DIGEST", "PI_FABRIC_GRANTED_RISKS", "PI_FABRIC_TOOL_ALLOWLIST",
         "PI_FABRIC_FUTURE_SELECTOR", "PI_FABRIC_PI_BINARY", "PI_FABRIC_NODE_BINARY",
         "PI_FABRIC_PROFILE", "PI_FABRIC_JEV_LIVE_EXTRA", "PI_FABRIC_ACTIVATION_TEST_WORKER_EXTRA",
-        "PI_FABRIC_TEST_FUTURE", "PI_FABRIC_TEST_PG_BIN_EXTRA", "pi_fabric_future_case_selector",
+        "PI_FABRIC_TEST_FUTURE", "PI_FABRIC_TEST_PG_BIN_EXTRA", "PI_FABRIC_SCRATCH_EVIDENCE_DIR_EXTRA", "pi_fabric_future_case_selector",
         "SMARTY_ROLE", "HERDR_WORKSPACE_ID"])
         env[key] = "production-main-sentinel";
       env.HERDR_ENV = "1";

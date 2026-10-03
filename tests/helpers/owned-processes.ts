@@ -37,7 +37,16 @@ if (log) {
     try { started = execFileSync("ps", ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8" }).trim(); } catch {}
   }
   if (started) {
-    try { fs.appendFileSync(log, JSON.stringify({ pid: process.pid, started, at: Date.now(), argv: process.argv.slice(1) }) + "\\n"); } catch {}
+    // F4 runs the scoped worker through a fixed --eval gate. NODE_OPTIONS
+    // preloads execute after shell attachment but before that gate rewrites
+    // process.argv. Decode only its JSON literal assignment for classification;
+    // process ownership still comes solely from this native PID/birth receipt.
+    let argv = process.argv.slice(1);
+    const evalIndex = process.execArgv.indexOf("--eval");
+    const source = evalIndex < 0 ? "" : process.execArgv[evalIndex + 1] ?? "";
+    const assignment = source.match(/process\\.argv = \\[process\\.execPath, (.+), \\.\\.\\.(\\[[^\\n]*\\])\\];/);
+    if (assignment) { try { const worker = JSON.parse(assignment[1]), args = JSON.parse(assignment[2]); if (typeof worker === "string" && Array.isArray(args) && args.every(value => typeof value === "string")) argv = [worker, ...args]; } catch {} }
+    try { fs.appendFileSync(log, JSON.stringify({ pid: process.pid, started, at: Date.now(), argv, nativeArgv: process.argv.slice(1) }) + "\\n"); } catch {}
   }
 }
 `;

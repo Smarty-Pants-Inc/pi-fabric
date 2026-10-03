@@ -69,7 +69,7 @@ public static class FabricTempRootDevice {
 `;
 
 /** Existing, local Windows directories only; no repair or writes on uncertain ACLs. */
-export const windowsDataRoot = (root: string): string => {
+export const windowsDataRoot = (root: string, options: { private?: boolean } = {}): string => {
   const fail = (directory: string, reason: string): never => {
     throw new Error(`PI_FABRIC_TMPDIR is unsafe: ${directory} ${reason}`);
   };
@@ -118,7 +118,13 @@ export const windowsDataRoot = (root: string): string => {
       const rule = ace as { type: number; sid: string; mask: number };
       // Include inherited/inherit-only grants: later scratch children must be private
       // too. Rejecting a deny+allow pair is deliberate conservative fail-closed policy.
-      if (rule.type === 0 && !trusted(rule.sid) && (rule.mask & ~READ_ONLY_RIGHTS) !== 0) fail(current, "is writable or replaceable by an untrusted principal");
+      if (rule.type === 0 && !trusted(rule.sid)) {
+        if ((rule.mask & ~READ_ONLY_RIGHTS) !== 0) fail(current, "is writable or replaceable by an untrusted principal");
+        // Read/list/traverse grants are harmless for ancestor custody, but not
+        // for a namespace exported as private TMPDIR/TMP/TEMP. Include
+        // inherit-only grants so newly allocated files cannot leak either.
+        if (options.private && index === chain.length - 1 && rule.mask !== 0) fail(current, "is not private (untrusted principal has access)");
+      }
     }
   }
   return directory;

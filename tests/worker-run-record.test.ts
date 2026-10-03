@@ -24,6 +24,19 @@ const baseRecord = (): AgentRunRecord => ({
   logFile: "/tmp/log",
 });
 
+describe("worker process exit identity", () => {
+  it.each(["process", "tmux"] as const)("persists its own worker PID only for process scratch (%s)", transport => {
+    const options: AgentWorkerOptions = {
+      id: "worker", name: "worker", runner: "pi", transport, cwd: process.cwd(),
+      taskFile: "task.txt", statusFile: "status.json", lifecycleFile: "lifecycle.jsonl", logFile: "events.jsonl",
+      piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda", vedaBackend: "pi", vedaPersona: "worker",
+      timeoutMs: 1000, depth: 0, fullCodeMode: false, extensions: false, tools: [], grantedRisks: [],
+    };
+    const record = createRunningRecord(options, "task", undefined, 1);
+    expect(record.sessionId).toBe(transport === "process" ? String(process.pid) : undefined);
+  });
+});
+
 describe("record-only run classes", () => {
   const argv = (flags: Record<string, string> = {}) => ["node", "worker.js", ...Object.entries({
     id: "run", name: "supervisor", runner: "pi", transport: "process", "task-file": "task.txt",

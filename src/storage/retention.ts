@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
+import { runScratchExitVeto } from "./run-scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 
@@ -98,8 +99,16 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
  * the admitted root and every descendant, independently of the artifact allowlist.
  * External transports currently have no durable native exit-receipt contract: skip
  * them even when a surviving host once observed a terminal result. */
+export interface RunTreeExitOptions {
+  /** Compaction/dry-run inspect custody without collecting scratch or creating locks. */
+  disposeScratch?: boolean;
+  /** Live admission knows this root never launched; never inherited by descendants.
+   * Applies only to a recordless root, not to saved or ambiguous worker identities. */
+  allowUnlaunchedRoot?: boolean;
+}
 export const runTreeExitVeto = (
   directory: string, depth = 0, expired: Deadline = noDeadline, requirePersistedExit = false,
+  options: RunTreeExitOptions = {},
 ): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
@@ -116,7 +125,10 @@ export const runTreeExitVeto = (
     const statusFile = path.join(directory, "status.json");
     const record = readJson<RunRecordSummary>(statusFile);
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
-    if (fs.existsSync(statusFile) && !record) return "worker exit is unconfirmed: unreadable run record";
+    let statusExists = false;
+    try { fs.lstatSync(statusFile); statusExists = true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (statusExists && !record) return "worker exit is unconfirmed: unreadable run record";
     if (record?.cleanupPending !== undefined && record.cleanupPending !== false) return "worker cleanup is not joined";
     if (record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
@@ -126,7 +138,7 @@ export const runTreeExitVeto = (
     // or absent unresolved marker does not prove the root writer has exited.
     // Recordless pre-launch rollback uses the non-retention mode explicitly;
     // missing persisted status is never evidence for an admitted worker.
-    if (requirePersistedExit) {
+    if (requirePersistedExit && !(depth === 0 && options.allowUnlaunchedRoot && !statusExists)) {
       const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
         ? Number(record.sessionId) : undefined;
       const worker = depth > 0 ? "descendant" : "root";
@@ -160,14 +172,24 @@ export const runTreeExitVeto = (
         return `worker exit is unconfirmed: saved process identity is live or unknown (${directory})`;
       }
     }
+    // A parent's populated=0 scope may still contain empty nested cgroups.
+    // Retire only checked nested run scopes bottom-up, before parent rmdir.
+    // Unknown children/receipts/identities veto the entire parent collection.
     const nested = path.join(directory, "nested");
-    try { fs.lstatSync(nested); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-    if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
-    for (const name of fs.readdirSync(nested)) {
-      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit);
-      if (reason) return reason;
+    let hasNested = false;
+    try { fs.lstatSync(nested); hasNested = true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (hasNested) {
+      if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
+      for (const name of fs.readdirSync(nested)) {
+        const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, { disposeScratch: options.disposeScratch !== false });
+        if (reason) return reason;
+      }
     }
+    // Report a known worker/descendant obligation before the independent
+    // scratch fence. Both still have to pass; native exit never bypasses it.
+    const scratchVeto = runScratchExitVeto(directory, expired, options.disposeScratch);
+    if (scratchVeto) return scratchVeto;
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
 };
 const recordAgeReference = (record: RunRecordSummary, fallback: number): number =>
@@ -208,12 +230,12 @@ const safeFollowUps = (directory: string, expired: Deadline): boolean => {
   return true;
 };
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
-const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline): boolean => {
+const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, options: Pick<RunTreeExitOptions, "disposeScratch"> = {}): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   // Offline collection cannot establish never-launched custody from filenames
   // or a host-wide childrenStopped marker. Only the live admission caller can
   // authorize recordless pre-launch rollback through the non-retention mode.
-  if (runTreeExitVeto(root, 0, expired, true)) return false;
+  if (runTreeExitVeto(root, 0, expired, true, options)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   // Automatic retention keeps its independent live-writer fence. A mismatched
   // birth identity can clear explicit cleanup's exit veto, but never authorizes
@@ -259,7 +281,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired)) return false;
+        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, options)) return false;
         continue;
       }
       return false;
@@ -269,9 +291,9 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
 };
 /** Explicit resident roots have no managed-temp owner. Require terminal status
  * plus checked process absence, and veto nested survivors and unresolved markers. */
-export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline): boolean => {
+export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline, options: Pick<RunTreeExitOptions, "disposeScratch"> = {}): boolean => {
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired);
+  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, options);
 };
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
   try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }
@@ -454,6 +476,10 @@ export const compactTerminalRunEvents = (
   const ageMs = options.terminalRunEventsAgeMs ?? 6 * 60 * 60 * 1_000;
   const maxBytes = options.terminalRunEventsMaxBytes ?? 256 * 1024;
   const expired = options.expired ?? noDeadline;
+  // Compaction is observation until atomic replacement, including dry-run and
+  // already-bounded no-ops. Scratch disposal belongs to collection, never to
+  // these guards: even a failed disposal can alter the directory's TTL clock.
+  const inspection = { disposeScratch: false };
   const directoryStat = ownedStat(directory);
   if (!Number.isSafeInteger(ageMs) || ageMs < 0 || !Number.isSafeInteger(maxBytes) ||
       maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !directoryStat?.isDirectory()) return false;
@@ -462,8 +488,8 @@ export const compactTerminalRunEvents = (
       now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
   const file = path.join(directory, "events.jsonl");
   const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size === 0 || runTreeExitVeto(directory, 0, expired, true) ||
-      !canRemoveTerminalRun(directory, expired)) return false;
+  if (!stat?.isFile() || stat.size === 0 || runTreeExitVeto(directory, 0, expired, true, inspection) ||
+      !canRemoveTerminalRun(directory, expired, inspection)) return false;
   try {
     const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
     let tail: Buffer;
@@ -514,7 +540,7 @@ export const compactTerminalRunEvents = (
     const checked = ownedStat(file);
     if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
         checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
-        runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
+        runTreeExitVeto(directory, 0, expired, true, inspection) || !canRemoveTerminalRun(directory, expired, inspection) ||
         expired() || options.isRetained?.()) return false;
     if (!options.dryRun) {
       try { writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained])); }

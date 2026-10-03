@@ -215,7 +215,7 @@ describe.skipIf(process.platform === "win32")("durable public spawn return addre
       piBinary: f.fakePi, claudeBinary: "claude", vedaBinary: "veda",
       piModels: { available: [{ provider: "fixture", id: "model" }], aliases: {}, defaultModel: "fixture/model" },
     };
-    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    fs.mkdirSync(config.residencyRoot, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
     const host = new ResidentHost(config);
     closers.push(() => host.close());

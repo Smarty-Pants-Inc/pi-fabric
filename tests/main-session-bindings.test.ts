@@ -191,6 +191,79 @@ describe("live Main binding setters (smarty-dev#3626)", () => {
     expect(f.pi.setModel).not.toHaveBeenCalled(); expect(f.entries).toHaveLength(0);
   });
 
+  it.each(["abort", "timeout"] as const)("delivers remote caller %s to the model-refresh commit fence before resolution resumes", async cause => {
+    const mesh = root(), callerId = session(); vi.stubEnv("PI_FABRIC_MAIN_CONTROLLERS", JSON.stringify([callerId]));
+    const target = fixture(mesh), caller = fixture(mesh, callerId);
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const refresh = vi.fn(() => barrier);
+    Object.assign(target.context.modelRegistry, { refresh });
+    vi.spyOn(target.context.modelRegistry, "getAvailable").mockImplementationOnce(() => []);
+    let receiverSignal: AbortSignal | undefined;
+    const accept = target.provider.acceptControl.bind(target.provider);
+    vi.spyOn(target.provider, "acceptControl").mockImplementation((command, from, signal, verification) => {
+      if (command.operation === "setModel") receiverSignal = signal;
+      return accept(command, from, signal, verification);
+    });
+    const abort = new AbortController();
+    const signal = cause === "timeout" ? AbortSignal.timeout(500) : abort.signal;
+    const pending = caller.provider.invoke("setModel", { id: target.main.id, model: "probe/b" }, { ...caller.invocation, signal }).catch(error => error);
+    let cancelledBeforeRelease = false;
+    try {
+      await vi.waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+      if (cause === "abort") abort.abort();
+      expect(await pending).toMatchObject({ message: expect.stringMatching(/cancelled/) });
+      // The wire deadline is still live (5 s); only consuming sender cancellation can pass.
+      await vi.waitFor(() => { cancelledBeforeRelease = receiverSignal?.aborted === true; expect(cancelledBeforeRelease).toBe(true); }, { timeout: 700, interval: 10 }).catch(() => {});
+    } finally { release(); }
+    const acks = () => caller.control.mesh.read({ topic: "fabric.control.ack" }).filter(event => event.to === callerId);
+    await vi.waitFor(() => expect(acks()).toHaveLength(1));
+    expect(target.pi.setModel).not.toHaveBeenCalled();
+    expect(target.entries).toHaveLength(0);
+    expect(cancelledBeforeRelease).toBe(true);
+    expect(acks()[0]!.data).toMatchObject({ accepted: false, error: expect.stringMatching(/expired or cancelled/) });
+    expect(target.main.info(target.context).model).toBe("probe/a");
+  });
+
+  it("cancels a queued remote thinking change while an already committed model change completes exactly once", async () => {
+    const mesh = root(), callerId = session(); vi.stubEnv("PI_FABRIC_MAIN_CONTROLLERS", JSON.stringify([callerId]));
+    const target = fixture(mesh), caller = fixture(mesh, callerId);
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const native = vi.mocked(target.pi.setModel).getMockImplementation()!;
+    vi.mocked(target.pi.setModel).mockImplementation(async model => {
+      await native(model); // Point of no return: committed native state, await its completion.
+      await barrier; return true;
+    });
+    let thinkingSignal: AbortSignal | undefined;
+    const accept = target.provider.acceptControl.bind(target.provider);
+    vi.spyOn(target.provider, "acceptControl").mockImplementation((command, from, signal, verification) => {
+      if (command.operation === "setThinking") thinkingSignal = signal;
+      return accept(command, from, signal, verification);
+    });
+    const model = caller.provider.invoke("setModel", { id: target.main.id, model: "probe/b" }, caller.invocation);
+    void model.catch(() => {});
+    const abort = new AbortController();
+    let thinking: Promise<unknown> | undefined;
+    try {
+      await vi.waitFor(() => expect(target.pi.setModel).toHaveBeenCalledOnce());
+      thinking = caller.provider.invoke("setThinking", { id: target.main.id, thinking: "high" }, { ...caller.invocation, signal: abort.signal }).catch(error => error);
+      await vi.waitFor(() => expect(thinkingSignal).toBeDefined());
+      abort.abort();
+      expect(await thinking).toMatchObject({ message: expect.stringMatching(/cancelled/) });
+      await vi.waitFor(() => expect(thinkingSignal!.aborted).toBe(true));
+    } finally { abort.abort(); release(); await thinking; }
+    expect(await model).toMatchObject({ model: "probe/b", caller: callerId });
+    const acks = () => caller.control.mesh.read({ topic: "fabric.control.ack" }).filter(event => event.to === callerId);
+    await vi.waitFor(() => expect(acks()).toHaveLength(2));
+    expect(target.pi.setThinkingLevel).not.toHaveBeenCalled(); expect(target.entries).toHaveLength(1);
+    const command = caller.control.mesh.read({ topic: "fabric.control.command" }).find(event => event.kind === "setModel")!;
+    await caller.control.mesh.publish({ topic: command.topic, kind: command.kind, from: command.from, to: target.main.id, data: command.data });
+    await vi.waitFor(() => expect(acks()).toHaveLength(3));
+    expect(acks().filter(event => (event.data as { accepted: boolean }).accepted)).toHaveLength(2);
+    expect(target.pi.setModel).toHaveBeenCalledOnce(); expect(target.entries).toHaveLength(1);
+  });
+
   it("refuses another-host Main when its advertised bridge has no control path, without publishing", async () => {
     const mesh = root(), target = fixture(mesh), caller = fixture(mesh);
     target.self.remoteHost = "unreachable";

@@ -40,6 +40,11 @@ export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
 
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel" | "setModel" | "setThinking";
 
+// Keep the reader free to deliver cancellation while asynchronous work waits at its
+// commit fence. These commands own their handler and outcome/ACK retries after the cursor.
+const detachedControlOperation = (operation: FabricControlOperation): boolean =>
+  operation === "ask" || operation === "setModel" || operation === "setThinking";
+
 export interface FabricControlCommand {
   /** Hydrated from the admitted MeshEvent envelope, never event.data. */
   principal?: FabricPrincipal | undefined;
@@ -971,7 +976,7 @@ export class FabricControlPlane {
       event.sequence,
       event.verification,
     );
-    if (command.operation === "ask") {
+    if (detachedControlOperation(command.operation)) {
       this.#activeHandlers.add(execution);
       void execution.finally(() => this.#activeHandlers.delete(execution)).catch(() => undefined);
       return;
@@ -1054,8 +1059,8 @@ export class FabricControlPlane {
           return undefined;
         }, error);
       }
-      if (command.operation === "ask") {
-        // Detached asks have already left the poll cursor. Retain just their outcome, never
+      if (detachedControlOperation(command.operation)) {
+        // Detached commands have already left the poll cursor. Retain just their outcome, never
         // execute the handler again, and retry the ACK on the owned notification tick.
         await this.#backgroundNotifications.enqueue(() => {
           if (Date.now() <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) {

@@ -969,6 +969,55 @@ describe("FabricControlPlane", () => {
     }, 15_000);
   });
 
+  describe("detached Main binding ownership", () => {
+    it.each(["setModel", "setThinking"] as const)("joins %s through its receipt at the paused release gate", async operation => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-binding-release-")); roots.push(root);
+      const receiver = plane(path.join(root, "mesh"), "host:receiver");
+      let release!: () => void;
+      const barrier = new Promise<void>(resolve => { release = resolve; });
+      const receive = vi.fn(async () => { await barrier; return { accepted: true, result: { committed: true } }; });
+      receiver.start(receive);
+      await receiver.mesh.publish({ topic: "fabric.control.command", kind: operation, from: identity("host:sender"), to: "host:receiver",
+        data: { version: 1, commandId: "binding:release", targetId: "session:target", operation, replyTo: "host:sender", requestedAt: Date.now(), deadlineAt: Date.now() + 5_000 } });
+      let checkpoint: Promise<void> | undefined;
+      let joined = false;
+      try {
+        await vi.waitFor(() => expect(receive).toHaveBeenCalledOnce());
+        receiver.pause();
+        checkpoint = receiver.checkpointForRelease().then(() => { joined = true; });
+        await new Promise(resolve => setTimeout(resolve, 50));
+        expect(joined).toBe(false);
+      } finally { release(); await checkpoint; }
+      expect(joined).toBe(true);
+      expect(receiver.mesh.read({ topic: "fabric.control.ack" })[0]!.data).toMatchObject({ accepted: true, result: { committed: true } });
+      expect(receive).toHaveBeenCalledOnce();
+    });
+
+    it.each(["setModel", "setThinking"] as const)("aborts and joins an active %s handler on close", async operation => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-binding-close-")); roots.push(root);
+      const receiver = plane(path.join(root, "mesh"), "host:receiver");
+      let release!: () => void;
+      const barrier = new Promise<void>(resolve => { release = resolve; });
+      let signal: AbortSignal | undefined;
+      receiver.start(async (_command, _from, current) => {
+        signal = current; await barrier;
+        return { accepted: false, error: current!.aborted ? "cancelled before commit" : "unexpected live handler" };
+      });
+      await receiver.mesh.publish({ topic: "fabric.control.command", kind: operation, from: identity("host:sender"), to: "host:receiver",
+        data: { version: 1, commandId: "binding:close", targetId: "session:target", operation, replyTo: "host:sender", requestedAt: Date.now(), deadlineAt: Date.now() + 5_000 } });
+      let close: Promise<void> | undefined;
+      let joined = false;
+      try {
+        await vi.waitFor(() => expect(signal).toBeDefined());
+        close = receiver.close().then(() => { joined = true; });
+        await vi.waitFor(() => expect(signal!.aborted).toBe(true));
+        expect(joined).toBe(false);
+      } finally { release(); await close; }
+      expect(joined).toBe(true);
+      expect(receiver.mesh.read({ topic: "fabric.control.ack" })[0]!.data).toMatchObject({ accepted: false, error: "cancelled before commit" });
+    });
+  });
+
   // smarty-dev#424: a lock timeout while the owner claimed, recorded or acknowledged a command
   // dropped it without an acknowledgement or a retry (dev-lead: 30 of 61 commands in 6 h).
   describe("after a lock timeout", () => {
@@ -1028,14 +1077,14 @@ describe("FabricControlPlane", () => {
       expect(receive).toHaveBeenCalledTimes(1);
     });
 
-    // A detached ask has passed the cursor: the bounded owned queue retries only its ACK,
+    // Detached asynchronous commands pass the cursor: the owned queue retries only the ACK,
     // not the handler. A later replay still consults the durable claim/outcome.
-    it("of a detached ask, the bounded notification queue retries its outcome without re-execution", async () => {
+    it.each(["ask", "setModel", "setThinking"] as const)("of a detached %s, the bounded notification queue retries its outcome without re-execution", async operation => {
       const { meshRoot, receive } = await run();
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
       const ask = {
-        topic: "fabric.control.command", kind: "ask", from: identity("host:sender"), to: "host:receiver",
-        data: { version: 1, commandId: "command:ask", targetId: "agent:target", operation: "ask", replyTo: "host:sender",
+        topic: "fabric.control.command", kind: operation, from: identity("host:sender"), to: "host:receiver",
+        data: { version: 1, commandId: "command:ask", targetId: "agent:target", operation, replyTo: "host:sender",
           message: "inspect", requestedAt: Date.now(), deadlineAt: Date.now() + 60_000 },
       };
       const acks = () => store.read({ topic: "fabric.control.ack", limit: 100 })

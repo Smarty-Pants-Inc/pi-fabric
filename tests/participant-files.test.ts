@@ -665,7 +665,7 @@ describe("participant files", () => {
     };
     const exited = () => new Promise<number>((resolve) => {
       const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
-      child.once("exit", () => resolve(child.pid!));
+      child.once("close", () => resolve(child.pid!));
     });
 
     it("serializes a paused leftover sweep with recovery rather than restoring an ownerless canonical lock", async () => {
@@ -722,7 +722,39 @@ describe("participant files", () => {
       ].sort());
     });
 
-    it.skipIf(!["linux", "darwin", "win32"].includes(process.platform) || (process.platform === "linux" && !fs.existsSync(`/proc/${process.pid}/stat`)))("native participant publication records incarnation and recovers a proven reused PID", async () => {
+    it.each(["EACCES", "EIO", undefined].flatMap(code =>
+      (["write", "remove"] as const).map(operation => ({ code, operation })),
+    ))("non-ESRCH key probe failure $code preserves $operation exclusion and the exact receipt", async ({ code, operation }) => {
+      vi.useFakeTimers({ now: Date.now() });
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const key = keyOf("session:a");
+      writeParticipantFile(root, { key, value: record("a"), version: 1, updatedAt: 1, updatedBy: identityOf("a") });
+      const lock = holdLock(root, "session:a", process.pid);
+      const owner = fs.readFileSync(path.join(lock, "owner"), "utf8");
+      const directory = fs.lstatSync(lock);
+      const file = path.join(root, "participants", `${key.slice(PREFIX.length)}.json`);
+      const contents = fs.readFileSync(file, "utf8");
+      const recovery = vi.spyOn(mesh, "exclusive");
+      vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("unknown probe failure"), { code }); });
+      try {
+        const decide = vi.fn(() => ({ key, value: record("replacement"), version: 2, updatedAt: 2, updatedBy: identityOf("replacement") }));
+        const remove = vi.fn(() => true);
+        const pending = (operation === "write"
+          ? participantFiles.writeParticipantFileIf(mesh, key, decide)
+          : participantFiles.removeParticipantFileIf(mesh, key, remove)).catch((error: unknown) => error);
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(await pending).toMatchObject({ message: expect.stringMatching(/Timed out waiting/) });
+        expect(decide).not.toHaveBeenCalled();
+        expect(remove).not.toHaveBeenCalled();
+        expect(recovery).not.toHaveBeenCalled();
+        expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+        expect([fs.lstatSync(lock).dev, fs.lstatSync(lock).ino]).toEqual([directory.dev, directory.ino]);
+        expect(fs.readFileSync(file, "utf8")).toBe(contents);
+      } finally { vi.useRealTimers(); }
+    });
+
+    it.skipIf(!["linux", "darwin", "win32"].includes(process.platform) || (process.platform === "linux" && !fs.existsSync(`/proc/${process.pid}/stat`))).each([false, true])("native participant publication records incarnation and recovers a proven reused PID (unknown probe=%s)", async (unknownProbe) => {
       const root = meshRoot();
       const mesh = new MeshStore(root, 64 * 1024, 1_000);
       const key = keyOf("session:a");
@@ -736,12 +768,13 @@ describe("participant files", () => {
       const different = process.platform === "linux" ? String(BigInt(start!) + 1n)
         : process.platform === "win32" ? `win32:${BigInt(start!.slice(6)) + 1n}` : "darwin:Fri Jan  1 00:00:00 1999";
       fs.writeFileSync(path.join(lock, "owner"), `${process.pid}\n${different}\nreused\n`);
+      if (unknownProbe) vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("unknown probe failure"), { code: "EIO" }); });
       await expect(participantFiles.writeParticipantFileIf(mesh, key, () => ({
         key, value: record("a"), version: 1, updatedAt: 1, updatedBy: identityOf("a"),
       }))).resolves.toBe(true);
     });
 
-    it.skipIf(process.platform !== "linux" || !fs.existsSync(`/proc/${process.pid}/stat`))("keeps unreadable, torn and permission-denied live Linux key holders", async () => {
+    it.skipIf(process.platform !== "linux" || !fs.existsSync(`/proc/${process.pid}/stat`))("keeps unreadable, torn, foreign and probe-denied live Linux key holders", async () => {
       vi.useFakeTimers({ now: Date.now() });
       const root = meshRoot();
       const mesh = new MeshStore(root, 64 * 1024, 1_000);
@@ -749,23 +782,27 @@ describe("participant files", () => {
       const start = (await processIncarnation(process.pid))!;
       const read = fs.readFileSync.bind(fs);
       try {
-        for (const scenario of ["unreadable", "torn", "permission"] as const) {
-          fs.writeFileSync(path.join(lock, "owner"), scenario === "torn"
+        for (const scenario of ["unreadable", "torn", "permission", "unknown-probe", "unknown-unreadable", "unknown-torn", "unknown-foreign"] as const) {
+          const unreadable = scenario.includes("unreadable");
+          fs.writeFileSync(path.join(lock, "owner"), scenario.includes("torn")
             ? `${process.pid}\n${start.slice(0, -1) || "0"}`
-            : `${process.pid}\n${scenario === "unreadable" ? BigInt(start) + 1n : start}\nheld\n`);
-          if (scenario === "unreadable") {
+            : `${process.pid}\n${unreadable ? BigInt(start) + 1n : scenario === "unknown-foreign" ? "win32:639264528000000000" : start}\nheld\n`);
+          if (unreadable) {
             vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
               if (String(file) === `/proc/${process.pid}/stat`) throw Object.assign(new Error("unreadable"), { code: "EACCES" });
               return (read as (...args: unknown[]) => unknown)(file, ...args);
             }) as typeof fs.readFileSync);
           }
           if (scenario === "permission") vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("denied"), { code: "EPERM" }); });
+          if (scenario.startsWith("unknown-")) vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("unknown probe failure"), { code: "EIO" }); });
+          const owner = fs.readFileSync(path.join(lock, "owner"), "utf8");
           const decide = vi.fn(() => undefined);
           const pending = participantFiles.writeParticipantFileIf(mesh, keyOf("session:a"), decide).catch((error: unknown) => error);
           await vi.advanceTimersByTimeAsync(5_000);
           expect(await pending).toMatchObject({ message: expect.stringMatching(/Timed out waiting/) });
           expect(decide).not.toHaveBeenCalled();
           expect(fs.existsSync(lock)).toBe(true);
+          expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
           vi.restoreAllMocks();
         }
       } finally {

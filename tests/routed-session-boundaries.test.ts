@@ -10,7 +10,8 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { findExecutable } from "../src/agents/transports/process-utils.js";
 import { decideModelRoute } from "../src/agents/model-route.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, sweepTempRunRoots } from "../src/storage/retention.js";
+import { processStartTime } from "../src/residency/process-identity.js";
+import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
 
 const decision = (model = "test/sol") => decideModelRoute({ routeClass: "bounded-lookup", protected: true,
   pin: { model, effort: "high" }, candidates: [], parentSessionId: "parent" }, async () => { throw new Error("excluded"); });
@@ -58,6 +59,18 @@ describe("R3 routed session boundaries", () => {
       const handle = await manager.spawn({ task: mode === "startup-retry" ? "Recover startup" : mode === "resume" ? "RESUME_AFTER_STOP" : "lookup", worktree: true, routeDecision: await decision(), transport: "process" }); child = handle.id;
       if (blocker) { expect(handle.status).toBe("queued"); await manager.stop(blocker.id); }
       const result = await manager.wait(handle.id); expect(result.status).toBe("completed");
+      if (mode === "startup-retry") {
+        const saved = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "status.json"), "utf8"));
+        expect(saved.sessionId).toMatch(/^\d+$/);
+        if (process.platform === "linux") expect(saved.processStartTime).toMatch(/^\d+$/);
+        await expect.poll(() => {
+          try { process.kill(Number(saved.sessionId), 0); return false; }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+            throw error;
+          }
+        }, { interval: 10, timeout: 5_000 }).toBe(true);
+      }
       const launches = launch.mock.calls.map(([request]) => request).filter(request => request.id === handle.id);
       expect(launches).toHaveLength(mode === "startup-retry" || mode === "resume" ? 2 : 1);
       for (const request of launches) {
@@ -135,10 +148,31 @@ describe("R3 routed session boundaries", () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-retention-"));
     const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + state);
     try {
+      // A reaped worker supplies a real saved PID/birth identity, not an invented dead PID.
+      const exited = spawnSync(process.execPath, ["-e", `
+        const fs = require("node:fs");
+        const identity = { sessionId: String(process.pid) };
+        if (process.platform === "linux") {
+          const stat = fs.readFileSync("/proc/" + process.pid + "/stat", "utf8");
+          identity.processStartTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\\s+/)[19];
+        }
+        process.stdout.write(JSON.stringify(identity));
+      `], { encoding: "utf8" });
+      expect(exited.status, exited.stderr).toBe(0);
+      const absentIdentity = JSON.parse(exited.stdout);
+      expect(absentIdentity.sessionId).toMatch(/^\d+$/);
+      if (process.platform === "linux") expect(absentIdentity.processStartTime).toMatch(/^\d+$/);
+      expect(() => process.kill(Number(absentIdentity.sessionId), 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
       markRunRootActive(runRoot, 1);
       for (const kind of ["successful", "pending", "live", "link", "unknown", "unresolved"]) {
         const run = path.join(runRoot, kind); fs.mkdirSync(run);
-        fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: 1, transport: "process", ...(kind === "live" ? { sessionId: String(process.pid) } : {}) }));
+        const identity = kind === "live"
+          ? { sessionId: String(process.pid), processStartTime: processStartTime(process.pid) }
+          : absentIdentity;
+        fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: 1, transport: "process", ...identity }));
+        // Prove the non-live controls reach their artifact boundary rather than the exit veto.
+        if (kind === "live") expect(runTreeExitVeto(run)).toMatch(/saved process identity is live or unknown/);
+        else expect(runTreeExitVeto(run)).toBeUndefined();
         if (kind === "link") fs.symlinkSync(path.join(run, "status.json"), path.join(run, "route-session.jsonl"));
         else fs.writeFileSync(path.join(run, "route-session.jsonl"), "private native session");
         if (kind === "pending") fs.writeFileSync(path.join(run, "pending-route-outcome.json"), "{}");

@@ -1,5 +1,6 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
+import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
 import type { RouteEvaluate } from "../agents/model-route.js";
 import type { JevRequest, JevResponse } from "../jev/types.js";
@@ -17,6 +18,7 @@ import type {
   FabricActorReadInfo,
   FabricActorMessage,
   FabricActorRequest,
+  FabricActorCreateRequest,
   FabricActorRunBinding,
 } from "../actors/types.js";
 import type {
@@ -252,7 +254,7 @@ const actorRequest = (
   manager: AgentManager,
   inheritModel = true,
   inheritedThinking?: string,
-): FabricActorRequest => {
+): FabricActorCreateRequest => {
   const events = Array.isArray(args.events)
     ? args.events.filter(
         (event): event is FabricActorHostEvent => isFabricActorHostEvent(event),
@@ -317,7 +319,7 @@ const actorRequest = (
   return {
     ...(args.scope === "session" || args.scope === "project" ? { scope: args.scope } : {}),
     name: String(args.name),
-    instructions: String(args.instructions),
+    ...actorInstructionsSource(args),
     runner,
     ...(kernel !== undefined ? { kernel } : {}),
     ...(events ? { events } : {}),
@@ -548,7 +550,7 @@ export class AgentsProvider implements FabricProvider {
     ) as unknown as AgentRunRequest & { via?: string };
   }
 
-  async #admitActorRequest(request: FabricActorRequest, context: FabricInvocationContext, closest = true): Promise<FabricActorRequest & { via?: string }> {
+  async #admitActorRequest(request: FabricActorCreateRequest, context: FabricInvocationContext, closest = true): Promise<FabricActorCreateRequest & { via?: string }> {
     if (request.routeClass !== undefined) {
       if (!request.model || !isFabricThinking(request.thinking)) throw new ModelRoutePinError(request.model ?? "");
       const exact = await resolvePiRoutePin({ selector: request.model, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases });
@@ -771,7 +773,7 @@ export class AgentsProvider implements FabricProvider {
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
     // Guard only explicit public launch selections, never inherited/default models.
-    if ((actionName === "run" || actionName === "spawn" || actionName === "create") &&
+    if ((actionName === "run" || actionName === "spawn" || actionName === "create" || actionName === "createActor") &&
       typeof args.model === "string" && args.model.trim() === "cliproxyapi/gpt-6-astra" &&
       !(typeof args.modelReason === "string" && args.modelReason.trim())) {
       throw new Error("named passes use cliproxyapi/gpt-6.1-sol thinking max; otherwise omit model (role default)");
@@ -1179,13 +1181,17 @@ export class AgentsProvider implements FabricProvider {
           ? this.residency!.cleanupAgent(id, args.deleteBranch === true, context.signal)
           : this.manager.cleanup(id, args.deleteBranch === true);
       }
+      case "createActor":
       case "create": {
         const request = await this.#admitActorRequest(
           actorRequest(args, context, this.manager, args.scope !== "global", this.callerThinking()), context, false,
         );
         if (args.scope === "global") {
           checkCommit();
-          return this.globalActors.create(request);
+          const { instructionsFile: _file, sha256: _digest, ...base } = request;
+          const instructions = resolveActorInstructions(request, this.manager.config.instructionsRoot);
+          checkCommit();
+          return { ...this.globalActors.create({ ...base, instructions }), instructionsDigest: createHash("sha256").update(instructions).digest("hex") };
         }
         const actor = await this.#createActor(request, context);
         this.participants.scheduleRefresh();
@@ -1510,18 +1516,19 @@ export class AgentsProvider implements FabricProvider {
       }
       case "setInstructions": {
         const id = String(args.id);
-        const instructions = String(args.instructions);
+        const source = actorInstructionsSource(args);
         const global = args.scope === "global";
-        // smarty-dev#2340: refuse a >80% shrink unless the caller opts into replace: true.
+        const resident = global ? undefined : this.#residentActorOwner(id);
+        // Forward the reference unchanged: only the resident owner can read it.
+        if (resident) return this.#setResidentActor(resident, { operation: "setInstructions", id: resident.id, ...source, ...(args.replace === true ? { replace: true } : {}) }, context);
+        if (!global && !this.actorManager.owns(this.actorManager.status(id).id)) throw new Error("Fabric actor is owned by another host; only its owning root can set instructions");
+        const instructions = resolveActorInstructions(source, this.manager.config.instructionsRoot);
         const current = global ? this.globalActors.resolve(id)?.instructions : this.actorManager.instructions(id);
-        if (args.replace !== true && current !== undefined && instructions.length * 5 < current.length) {
-          throw new Error(
-            `Refusing setInstructions: new instructions (${instructions.length} chars) are more than 80% shorter than the current ${current.length} chars; pass replace: true to replace them`,
-          );
+        assertActorInstructionReplacement(current, instructions, args.replace === true);
+        if (global) {
+          checkCommit();
+          return { ...this.globalActors.update(id, { instructions }), instructionsDigest: createHash("sha256").update(instructions).digest("hex") };
         }
-        if (global) return this.globalActors.update(id, { instructions });
-        const resident = this.#residentActorOwner(id);
-        if (resident) return this.#setResidentActor(resident, { operation: "setInstructions", id: resident.id, instructions }, context);
         return this.actorManager.setInstructions(id, instructions, checkCommit);
       }
       case "import": {
@@ -1649,7 +1656,7 @@ export class AgentsProvider implements FabricProvider {
     return this.#router.resolveActorTarget(id);
   }
 
-  async #createActor(request: FabricActorRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
+  async #createActor(request: FabricActorCreateRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
     const { signal } = context;
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
@@ -1676,7 +1683,9 @@ export class AgentsProvider implements FabricProvider {
         if (!hostId?.trim()) throw new Error("Local actor creation requires a runtime owner host ID");
         return hostId;
       };
-      return this.actorManager.create(request, {
+      const { instructionsFile: _file, sha256: _digest, ...base } = request;
+      const resolvedRequest: FabricActorRequest = { ...base, instructions: resolveActorInstructions(request, this.manager.config.instructionsRoot) };
+      return this.actorManager.create(resolvedRequest, {
         // Validate ownership before predecessor removal as well as insertion.
         beforeCommit: () => { checkCommit(); creationOwnerHostId(); }, checkActive: checkCommit,
         onCommit: (id) => {

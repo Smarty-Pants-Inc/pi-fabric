@@ -732,63 +732,92 @@ describe("MeshStore lock recovery", () => {
     expect(fs.existsSync(lock)).toBe(false);
   }, 30_000);
 
-  it("a rejected default-v1 initializer cleans its own receipt in a recovery-first empty successor while still alive", async () => {
+  it("a rejected default-v1 initializer cleans its own receipt in a recovery-first empty successor while still alive", { timeout: 30_000 }, async ({ signal }) => {
     const store = createStore({ lockTimeoutMs: 150 });
     const lock = path.join(store.root, ".lock");
     const ownerPath = path.join(lock, "owner");
     const finished = path.join(store.root, "initializer.finished");
-    const signal = (name: string) => fs.writeFileSync(path.join(store.root, name), "");
-    const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-paused-recovery.mjs"), store.root, "initializer", "write", "recovery-first"], {
-      cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "", stderr = "";
-    child.stdout.on("data", chunk => { stdout += chunk; });
-    child.stderr.on("data", chunk => { stderr += chunk; });
-    const closed = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
-    closed.catch(() => undefined);
+    const send = (name: string) => fs.writeFileSync(path.join(store.root, name), "");
+    const children: Array<{ child: ReturnType<typeof spawn>; closed: Promise<number | null>; output: () => { stdout: string; stderr: string } }> = [];
+    let originalDirectory: fs.Dir | undefined;
+    function start(role: "initializer" | "successor") {
+      const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-paused-recovery.mjs"), store.root, role, "write", "recovery-first"], {
+        cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", chunk => { stdout += chunk; });
+      child.stderr.on("data", chunk => { stderr += chunk; });
+      const closed = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+      closed.catch(() => undefined);
+      const owned = { child, closed, output: () => ({ stdout, stderr }) };
+      children.push(owned);
+      return owned;
+    }
+    const abort = () => { for (const { child } of children) child.kill("SIGKILL"); };
+    signal.addEventListener("abort", abort, { once: true });
+    const initializer = start("initializer");
+    const ready = async (name: string) => {
+      // Let the test timeout own cancellation. No synchronous wait on the test
+      // event loop, and no independent fixture clock racing the parent's clock.
+      const watcher = fs.watch(store.root);
+      const closed = new Promise<void>(resolve => watcher.once("close", resolve));
+      let cancel!: () => void;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const check = () => {
+            if (fs.existsSync(path.join(store.root, name))) resolve();
+            else if (name === "initializer.finished" && fs.existsSync(path.join(store.root, "initializer.entered"))) {
+              reject(new Error(`Initializer entered a replacement instead of rejecting it: ${fs.readFileSync(path.join(store.root, "initializer.entered"), "utf8")}`));
+            }
+          };
+          cancel = () => reject(signal.reason);
+          watcher.on("change", check);
+          watcher.once("error", reject);
+          signal.addEventListener("abort", cancel, { once: true });
+          void initializer.closed.then(() => { check(); reject(new Error(initializer.output().stderr || "Initializer exited before handshake")); }, reject);
+          check();
+          if (signal.aborted) cancel();
+        });
+      } finally { signal.removeEventListener("abort", cancel); watcher.close(); await closed; }
+    };
     try {
-      await vi.waitFor(() => expect(fs.existsSync(path.join(store.root, "initializer.ready"))).toBe(true), { timeout: 10_000, interval: 20 });
+      await ready("initializer.ready");
+      // Keep the removed directory's identity allocated until both publications
+      // finish. Otherwise the filesystem may reuse its inode for the successor,
+      // accidentally exercising identity ABA instead of the intended rejection.
+      originalDirectory = fs.opendirSync(lock);
       const original = fs.lstatSync(lock);
       expect(fs.existsSync(ownerPath)).toBe(false);
       const past = new Date(Date.now() - 60_000);
       fs.utimesSync(lock, past, past);
-      const write = fs.writeFileSync.bind(fs);
-      let armed = true;
-      let replacement: fs.Stats | undefined;
-      vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
-        if (armed && String(file) === ownerPath) {
-          // Real recovery has removed the empty original and acquired a new directory.
-          // Stop the successor's actual owner create and let the original publish first.
-          armed = false;
-          replacement = fs.lstatSync(lock);
-          signal("initializer.go");
-          const deadline = Date.now() + 10_000;
-          while (!fs.existsSync(finished) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-          if (!fs.existsSync(finished)) throw new Error("Timed out awaiting rejected initializer");
-        }
-        return write(file, data, options);
-      });
-      const operation = vi.fn();
-      await expect(store.exclusive(operation)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
-      expect(operation).not.toHaveBeenCalled();
-      expect(replacement).toBeDefined();
-      expect([replacement!.dev, replacement!.ino]).not.toEqual([original.dev, original.ino]);
+      const successor = start("successor");
+      await ready("initializer.finished");
+      expect(await successor.closed, successor.output().stderr).toBe(0);
+      const recovered = JSON.parse(successor.output().stdout.trim());
+      expect(recovered).toMatchObject({ ran: false, code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
+      expect([recovered.replacement.dev, recovered.replacement.ino]).not.toEqual([original.dev, original.ino]);
       expect(JSON.parse(fs.readFileSync(finished, "utf8"))).toMatchObject({ ran: false, code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
-      expect(fs.existsSync(lock)).toBe(false); // no live rejected receipt can strand this root
-      expect(child.exitCode).toBeNull();
-      expect(process.kill(child.pid!, 0)).toBe(true);
+      expect(fs.existsSync(lock)).toBe(false);
+      expect(initializer.child.exitCode).toBeNull();
+      expect(process.kill(initializer.child.pid!, 0)).toBe(true);
       const healthy = vi.fn(() => "progress");
       await expect(store.exclusive(healthy)).resolves.toBe("progress");
       expect(healthy).toHaveBeenCalledOnce();
       expect(fs.existsSync(lock)).toBe(false);
       expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.released."))).toEqual([]);
     } finally {
-      signal("initializer.go");
-      signal("initializer.release");
-      expect(await closed, stderr).toBe(0); // joined close while root remains owned by this test
+      try {
+        send("initializer.go");
+        send("initializer.release");
+        const exits = await Promise.all(children.map(async owned => ({ code: await owned.closed, ...owned.output() })));
+        for (const exit of exits) expect(exit.code, exit.stderr).toBe(0);
+      } finally {
+        signal.removeEventListener("abort", abort);
+        originalDirectory?.closeSync();
+      }
     }
-    expect(JSON.parse(stdout.trim())).toMatchObject({ ran: false, code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
-  }, 30_000);
+    expect(JSON.parse(initializer.output().stdout.trim())).toMatchObject({ ran: false, code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
+  });
 
   it("pre-entry cleanup preserves a changed full receipt even when its token still matches", async () => {
     const store = createStore();

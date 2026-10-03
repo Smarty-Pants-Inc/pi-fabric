@@ -367,6 +367,10 @@ export interface AgentTransportHandle {
   lostContact?(): string | undefined;
   /** Optional checked session observation; absence alone is NOT a worker exit receipt. */
   observe?(options?: AgentTransportObservationOptions): Promise<AgentTransportObservation>;
+  /** Immutable debt from this captured native stop/close deadline, not a generic
+   * liveness failure. Logical stop may finish while this exact debt retains files
+   * and admission; cancelled launches still require confirmed execution exit. */
+  stopDebt?(): string | undefined;
   /** Bounded join of the captured process worker's native close (not PID absence). */
   waitForClose?(): Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;

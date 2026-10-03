@@ -284,7 +284,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
   // The new tree-custody protocol is unsupported on Windows. Even an internal
@@ -333,7 +333,8 @@ export const spawnDetached = async (
     } else if (message.type === "fabric-execution-settled") executionPending = false;
   });
   let birth: LinuxGroupMember | undefined;
-  try { birth = process.platform === "linux" ? linuxGroupMember(pid) : undefined; } catch { /* stop fails closed on unknown identity */ }
+  let birthUnknown = false;
+  try { birth = process.platform === "linux" ? linuxGroupMember(pid) : undefined; } catch { birthUnknown = true; }
   const owned = new Map<number, string>();
   if (birth) owned.set(pid, birth.started);
   const groups = new Set([pid]);
@@ -365,6 +366,7 @@ export const spawnDetached = async (
     return snapshot.filter(member => groups.has(member.group));
   };
   let stopped = false;
+  let stopFailed = false;
   const members = (): LinuxGroupMember[] => {
     const snapshot = linuxProcesses().filter((member) => !exited || member.pid !== pid);
     // Retain detached execution groups BEFORE their custodian can die/reparent
@@ -436,9 +438,12 @@ export const spawnDetached = async (
       }
     };
     const wait = async (ms: number): Promise<boolean> => {
-      const deadline = Date.now() + ms;
-      do { if (await settled()) return true; await stopDelay(); } while (Date.now() < deadline);
-      return settled();
+      let expired = false;
+      const timer = setTimeout(() => { expired = true; }, ms);
+      try {
+        do { if (await settled()) return true; await stopDelay(); } while (!expired);
+        return settled();
+      } finally { clearTimeout(timer); }
     };
     // POSIX custodians drain cooperatively on TERM. Windows uses only its
     // legacy native worker stop; no tree receipt or custody IPC is supported.
@@ -447,12 +452,23 @@ export const spawnDetached = async (
     if (process.platform !== "linux" && (executionPending || portableUncertain || groups.size > 1)) {
       throw new Error(`Fabric worker ${pid} execution exit unconfirmed; retaining custodian without birth-safe escalation`);
     }
+    // A forcibly killed custodian cannot attest that all separately grouped
+    // native execution was drained. Birth-checked escalation still joins every
+    // observed group, but must not erase this immutable receipt debt.
+    if (tracksExecution && !exited) unconfirmed(`POSIX worker tree termination is unconfirmed after ${termGraceMs}ms grace`);
     signal("SIGKILL");
-    if (!(await wait(STOP_KILL_MS))) throw new Error(`Fabric worker ${pid} did not exit after bounded SIGTERM/SIGKILL cleanup`);
+    if (!(await wait(STOP_KILL_MS))) {
+      if (tracksExecution) {
+        unconfirmed(`Fabric worker ${pid} did not confirm execution exit after bounded SIGTERM/SIGKILL cleanup`);
+        return;
+      }
+      throw new Error(`Fabric worker ${pid} did not exit after bounded SIGTERM/SIGKILL cleanup`);
+    }
   };
   return {
     pid,
     lostContact: () => lost,
+    stopDebt: () => stopFailed ? undefined : lost,
     async waitForClose() {
       let deadline: ReturnType<typeof setTimeout> | undefined;
       try {
@@ -466,10 +482,33 @@ export const spawnDetached = async (
     },
     stop() {
       if (stopping) return stopping;
+      stopFailed = false;
       const pending = (async () => {
         if (process.platform !== "win32") {
-          // Preserve birth-checked POSIX execution-group drain and retryable debt.
-          await stop();
+          if (process.platform === "linux" && !birth) {
+            // A captured native handle can lag /proc absence. Bound its close
+            // without adopting a new birth or an unowned surviving group. In
+            // particular, an unreadable birth is NOT this absent-worker case.
+            const signalAbsent = (value: NodeJS.Signals): void => {
+              if (birthUnknown || linuxGroupMember(pid) || members().length) {
+                throw new Error(`Cannot confirm ownership/exit of Fabric process group ${pid}`);
+              }
+              try { process.kill(-pid, value); }
+              catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+            };
+            if (!exited) {
+              unconfirmed("Owned process worker birth/tree exit is unconfirmed");
+              signalAbsent("SIGTERM");
+              force = setTimeout(() => {
+                if (exited) return;
+                try { signalAbsent("SIGKILL"); } catch { stopFailed = true; /* never signal unknown identity */ }
+              }, 6_000);
+            }
+          } else {
+            // Preserve birth-checked POSIX execution-group drain and retryable
+            // identity failures. Never turn a failed ownership check into exit.
+            await stop();
+          }
         }
         let deadline: ReturnType<typeof setTimeout> | undefined;
         try {
@@ -493,11 +532,11 @@ export const spawnDetached = async (
             }),
           ]);
           stopped = true;
-        } finally { clearTimeout(deadline); }
+        } finally { clearTimeout(force); clearTimeout(deadline); }
       })();
       stopping = pending;
       // POSIX ownership/exit failures remain retryable on the exact same handle.
-      void pending.catch(() => { if (stopping === pending) stopping = undefined; });
+      void pending.catch(() => { stopFailed = true; if (stopping === pending) stopping = undefined; });
       return pending;
     },
     async isAlive() {

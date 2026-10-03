@@ -320,6 +320,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   relaunchFailure?: AgentRunRecord;
   /** Terminal results do not discharge execution custody or admission permits. */
   executionExited?: boolean;
+  launchCancelled?: boolean;
+  joinedStopDebt?: string;
   executionRelease?: () => void;
   executionDrain?: Promise<void>;
   /** Set when the run failed because its transport lost contact: its worker may still run. */
@@ -1381,6 +1383,7 @@ export class AgentManager {
           lastLivenessCheckAt: 0,
           resumeAttempts: 0,
           stopRequested: launchCancelled,
+          launchCancelled,
           observedProgress: {
             turns: 0,
             toolCalls: 0,
@@ -1949,12 +1952,9 @@ export class AgentManager {
     managed.stopRequested = true;
     const existing = readRecord(managed.statusFile);
     // Even a settled/terminal run may still own a detached execution group.
-    // Windows retains the bounded helper/native-close contract instead.
-    if (managed.transport.kind === "process" && process.platform === "win32") {
-      await this.#stopManagedTransport(managed);
-    } else {
-      await this.#drainExecution(managed);
-    }
+    // Only an exact native deadline receipt permits logical completion with
+    // retained debt. Platform or process kind alone is never such a receipt.
+    await this.#drainExecution(managed);
     if (managed.settled) return consumeSettled ? this.wait(id) : this.#settledResult(managed);
     managed.background = false;
     const terminal = readRecord(managed.statusFile);
@@ -2271,12 +2271,11 @@ export class AgentManager {
     }
     if (this.#budgetOwned) clearOwnedBudgetEnv();
     if (this.#managedTempRoot) await this.#startTempRunSweep();
-    // Windows process teardown reports logical completion with immutable tree
-    // debt retained above; strict execution-tree receipts are POSIX-only.
-    const requiresExecutionExit = (transport: AgentTransportHandle): boolean =>
-      transport.kind !== "process" || process.platform !== "win32";
-    if (transports.some((transport, index) => requiresExecutionExit(transport) && alive[index]) ||
-        all.some((managed) => requiresExecutionExit(managed.transport) && !managed.executionExited) ||
+    // A deadline receipt finishes native shutdown without claiming exit. Every
+    // other handle (including custom process handles on Windows) stays strict.
+    if (transports.some((transport, index) => alive[index] &&
+          !all.some(managed => managed.transport === transport && this.#hasNativeStopDebt(managed))) ||
+        all.some((managed) => !managed.executionExited && !this.#hasNativeStopDebt(managed)) ||
         [...this.#queued.values()].some(queued => queued.cleanupPending)) {
       throw new Error("Agent manager close incomplete: execution exit unconfirmed; custody and files retained");
     }
@@ -2390,6 +2389,16 @@ export class AgentManager {
     void (async () => {
       try {
         await managed.transport.stop();
+        // Legacy Windows adapters can join their helper and captured primary
+        // without implementing stopDebt. Checked primary absence after that
+        // successful join permits ONLY logical stop, never tree exit/release.
+        const lost = managed.transport.lostContact?.();
+        const session = managed.transport.sessionId;
+        if (process.platform === "win32" && !managed.actorId && lost !== undefined &&
+            session && /^\d+$/.test(session) && Number.isSafeInteger(Number(session)) && Number(session) > 0) {
+          try { process.kill(Number(session), 0); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") managed.joinedStopDebt = lost; }
+        }
         await this.#noteUnconfirmedExit(managed);
         managed.processStopPending = false;
         resolve();
@@ -2421,17 +2430,35 @@ export class AgentManager {
     this.#markLost(managed, lost ?? "the worker did not confirm its exit after it was stopped");
   }
 
+  #hasNativeStopDebt(managed: ManagedAgent): boolean {
+    const debt = managed.transport.stopDebt?.() ?? managed.joinedStopDebt;
+    return managed.transport.kind === "process" && debt !== undefined &&
+      debt === managed.transport.lostContact?.() && !managed.launchCancelled &&
+      (!managed.actorId || process.platform === "win32");
+  }
+
   async #drainExecution(managed: ManagedAgent): Promise<void> {
     if (managed.executionExited) return;
     if (managed.executionDrain) return managed.executionDrain;
     const pending = (async () => {
       // The same bounded stop/probe contract covers launches promoted solely
       // for custody. A hung liveness RPC must not make public stop hang forever.
+      // Native transports own a finite close/tree deadline. Do not race that
+      // join against the generic RPC grace: its escalation can start at the
+      // grace boundary, and the captured child must still be reaped afterwards.
+      if (managed.transport.stopDebt && managed.transport.waitForClose &&
+          managed.transport.lostContact?.() === undefined) {
+        try { await this.#stopManagedTransport(managed); }
+        catch {
+          throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${managed.lostContact}`);
+        }
+      }
       const transport = managed.transport.kind === "process"
         ? { ...managed.transport, stop: () => this.#stopManagedTransport(managed) }
         : managed.transport;
       if (transport.lostContact?.() !== undefined || !await this.#stopUnregisteredTransport(transport)) {
         this.#markLost(managed, managed.transport.lostContact?.() ?? "worker execution exit unconfirmed; custody retained");
+        if (this.#hasNativeStopDebt(managed)) return;
         throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${managed.lostContact}`);
       }
       managed.executionExited = true;
@@ -2739,12 +2766,13 @@ export class AgentManager {
         // Terminal publication may precede a worker's final native-session flush.
         // Give normal process exit a bounded observation window before stop():
         // on Windows SIGTERM is destructive, not a cooperative flush request.
-        if (managed.transport.kind === "process" && process.platform !== "win32") {
+        const nativeWindowsClose = managed.transport.kind === "process" && process.platform === "win32" &&
+          managed.transport.waitForClose && !managed.launchCancelled &&
+          !managed.transport.lostContact?.() && !managed.lostContact;
+        if (managed.transport.kind === "process" && !nativeWindowsClose) {
           await this.#waitForTransportExit(managed, Date.now() + TRANSPORT_EXIT_GRACE_MS);
         }
-        if (managed.transport.kind !== "process" || process.platform !== "win32") {
-          await this.#drainExecution(managed);
-        }
+        if (!nativeWindowsClose) await this.#drainExecution(managed);
         this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
         return;
       }
@@ -2847,7 +2875,9 @@ export class AgentManager {
     // An actor result resumes its same-session activation drain. Holding only
     // a parent concurrency permit would not fence that writer when capacity >1.
     if (managed.actorId && !managed.executionExited &&
-        !(managed.transport.kind === "process" && process.platform === "win32")) return;
+        !(managed.transport.kind === "process" && process.platform === "win32" &&
+          managed.transport.waitForClose && !managed.launchCancelled &&
+          (!managed.transport.lostContact?.() || this.#hasNativeStopDebt(managed)))) return;
     this.#drainLifecycle(managed);
     const lost = managed.transport.lostContact?.();
     if (lost) this.#markLost(managed, lost);
@@ -2867,7 +2897,10 @@ export class AgentManager {
           // Stop may have begun after settlement, while native close was pending.
           await managed.processStop;
           await this.#noteUnconfirmedExit(managed);
-          if (!managed.lostContact) release();
+          if (!managed.lostContact) {
+            fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
+            release();
+          }
         }).catch(error => {
           this.#markLost(managed, error instanceof Error ? error.message : String(error));
         }).finally(() => { delete managed.nativeReleasePending; });
@@ -2877,7 +2910,10 @@ export class AgentManager {
     // Images are transport inputs, not retained run artifacts. Startup retries
     // have finished by settlement, so remove the owner-only handoff file for
     // every terminal outcome even when retainRuns keeps the rest of the run.
-    if (managed.executionExited) fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
+    if (managed.executionExited || (process.platform === "win32" && managed.transport.waitForClose &&
+        !managed.launchCancelled && !managed.transport.lostContact?.() && !managed.lostContact)) {
+      fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
+    }
     this.#emitLifecycle(managed, `run.${result.status}`, result.finishedAt ?? Date.now(), {
       status: result.status,
       data: {

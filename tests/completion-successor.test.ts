@@ -19,6 +19,7 @@ import { ResidentHost } from "../src/residency/host.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { residentDeliveryPrefix, residentHostId, residentResultPath, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
+import { isUnscopedRun, proveUnscopedCollection } from "./unscoped-collection-contract.js";
 
 const roots: string[] = [];
 const clients: ResidencyClient[] = [];
@@ -38,6 +39,9 @@ const waitFor = async (test: () => boolean) => {
 const harness = (small = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "completion-successor-")); roots.push(root);
   const meshRoot = path.join(root, "mesh");
+  // Private ancestry is part of the real worker launch contract. Recursive
+  // leaf creation alone would otherwise leave mesh/residency world-writable.
+  fs.mkdirSync(path.join(meshRoot, "residency"), { recursive: true, mode: 0o700 });
   const mesh = new MeshStore(meshRoot, small ? 1024 : DEFAULT_FABRIC_CONFIG.mesh.maxEventBytes, 100, small ? { maxStateBytes: 4096, maxStateTombstones: 2 } : {});
   let live: FabricParticipantInfo[] = [];
   const participant = (session: string, startedAt: number, extra = {}): FabricParticipantInfo => ({
@@ -287,7 +291,7 @@ describe("round 4 completion fences", () => {
       piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
     });
     const cfg = a.client.options.config;
-    fs.mkdirSync(cfg.residencyRoot, { recursive: true });
+    fs.mkdirSync(cfg.residencyRoot, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(cfg.residencyRoot, "config.json"), JSON.stringify(cfg));
     const host = new ResidentHost(cfg);
     // Public durable spawns belong to Main, never the hidden resident executor.
@@ -464,6 +468,11 @@ describe("round 4 completion fences", () => {
     const result = await manager.run({ task: "LARGE_RESULT", transport: "process" });
     const run = manager.runDirectory(result.id)!; const worker = fs.readFileSync(path.join(run, "status.json"), "utf8");
     expect(target).toBeDefined(); expect(result.warnings?.join(" ")).toMatch(/save failed.*retained/i);
+    if (isUnscopedRun(run)) {
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
+      expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(worker);
+      await proveUnscopedCollection(run);
+    }
     for (const required of ["directory", "file", "directory"] as const) {
       barrier = required;
       await expect(manager.cleanup(result.id)).rejects.toThrow(/Terminal result save failed.*post-rename/);
@@ -767,6 +776,21 @@ describe("round 2 completion security", () => {
     expect(result).toMatchObject({ status: "completed" });
     expect(a.client.hasAgent(handle.id)).toBe(true);
     expect(await provider.invoke("log", { id: handle.id }, invocation)).toMatchObject({ id: handle.id, events: expect.any(Array) });
+    const runDirectory = manager.runDirectory(handle.id)!;
+    if (isUnscopedRun(runDirectory)) {
+      await expect(provider.invoke("cleanup", { id: handle.id }, invocation)).rejects.toThrow(/scratch writer exit is unconfirmed/);
+      // wait may already have receipted the journal envelope. The ordinary
+      // manager, not that envelope, must retain its local cleanup authority.
+      expect(a.client.hasAgent(handle.id)).toBe(true);
+      // A journal result is not durable operational ownership: the provider
+      // must continue routing cleanup to the ordinary manager after rejection.
+      expect(a.client.ownsAgent(handle.id)).toBe(false);
+      expect(manager.status(handle.id)).toMatchObject({ id: handle.id, status: "completed" });
+      expect(manager.runDirectory(handle.id)).toBe(runDirectory);
+      expect(await provider.invoke("log", { id: handle.id }, invocation)).toMatchObject({ id: handle.id, events: expect.any(Array) });
+      expect(fs.existsSync(runDirectory)).toBe(true);
+      await proveUnscopedCollection(runDirectory);
+    }
     expect(await provider.invoke("cleanup", { id: handle.id }, invocation)).toMatchObject({ cleaned: true });
     expect(a.client.ownsAgent(handle.id)).toBe(false);
     expect(fs.existsSync(path.join(h.root, "runs", handle.id))).toBe(false);
@@ -800,7 +824,9 @@ describe("round 2 completion security", () => {
     h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
     await new Promise(resolve => setTimeout(resolve, 60)); expect(b.completed).not.toHaveBeenCalled();
     expect(fs.statSync(path.join(h.meshRoot, "state.json")).size).toBeLessThan(4096);
-  });
+    // Thirty durable fsync/claim/retirement cycles at nice 19 can exceed the
+    // generic 15-second case ceiling. Keep every capacity/receipt/replay check.
+  }, 60_000);
 
   it("F3: retirement CAS cannot erase a replacement claim version", async () => {
     const h = harness(); h.setLive([h.participant("A", 100)]);

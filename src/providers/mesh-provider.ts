@@ -82,6 +82,7 @@ const descriptors: FabricActionDescriptor[] = [
           type: "array",
           items: { type: "string", enum: ["root", "agent", "actor"] },
         },
+        name: { type: "string" },
         includeStale: { type: "boolean" },
         limit: { type: "number", minimum: 1 },
       },
@@ -251,6 +252,7 @@ export class MeshProvider implements FabricProvider {
         // once the fleet passed 100 participants (smarty-dev#1241). The list is already in memory.
         const members = this.participants.list({
           scope,
+          ...(typeof args.name === "string" ? { name: args.name } : {}),
           ...(kinds ? { kinds } : {}),
           ...(args.includeStale === true ? { includeStale: true } : {}),
         });

@@ -57,7 +57,7 @@ describe("stale directory bookkeeping", () => {
     const recover = async () => {
       // A different store and inbox force a reload of the persisted checkpoint, not memory.
       const reloaded = new MeshStore(mesh.root, 64 * 1024, 100);
-      const inbox = new RootInbox(reloaded, recipient, () => [recipient.id], { now: () => now, steerGraceMs: 0 });
+      const inbox = new RootInbox(reloaded, recipient, { now: () => now, steerGraceMs: 0 });
       expect((await inbox.next({ holdsBatch: () => false, holdsSteer: () => false })).events).toEqual([work]);
     };
     return { mesh, now, recipient, clock, session, hostRecord, lease, recover };

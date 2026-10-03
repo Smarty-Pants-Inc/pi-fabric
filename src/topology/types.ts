@@ -92,6 +92,8 @@ export interface FabricHostRecord {
 }
 
 export interface FabricParticipantListOptions {
+  /** Exact published name; retains every matching id so duplicates are never hidden. */
+  name?: string;
   scope?: FabricParticipantScope;
   kinds?: FabricParticipantKind[];
   includeStale?: boolean;

@@ -950,6 +950,7 @@ export class AgentsProvider implements FabricProvider {
         if (stalled) throw stalled;
         return this.participants.list({
           scope,
+          ...(typeof args.name === "string" ? { name: args.name } : {}),
           ...(kinds ? { kinds } : {}),
           ...(args.includeStale === true ? { includeStale: true } : {}),
         });

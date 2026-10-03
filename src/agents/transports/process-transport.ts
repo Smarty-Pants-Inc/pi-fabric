@@ -15,18 +15,18 @@ export class ProcessTransport implements AgentTransportAdapter {
   }
 
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
+    // Worker arguments are flag/value pairs. A flag-shaped value is not an
+    // actor identity; explicit actor ids alone retain the parent's role env.
+    const childEnvironment = request.workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id")
+      ? { ...process.env } : taskAgentEnvironment();
+    // Actors also own their names; the root launch name is never inherited.
+    delete childEnvironment.SMARTY_AGENT_NAME;
     const processHandle = await spawnDetached(
       request.workerPath,
       request.workerArguments,
       request.cwd,
       request,
-      // Worker arguments are flag/value pairs. A flag-shaped value is not an
-      // actor identity; explicit actor ids alone retain the parent's role env.
-      applyTaskReturnAddress(
-        request.workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id")
-          ? { ...process.env } : taskAgentEnvironment(),
-        request.workerArguments,
-      ),
+      applyTaskReturnAddress(childEnvironment, request.workerArguments),
     );
     return {
       kind: this.kind,

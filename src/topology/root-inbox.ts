@@ -20,9 +20,9 @@ import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 export const ROOT_INBOX_PREFIX = "topology/inbox/";
 export const WORK_TOPIC_PREFIX = "fleet.";
 /**
- * The canonical id namespace of root sessions. A root accepts a name in it only when the name is
- * its own id, never a session name that looks like one: the mesh bridge routes ids in this
- * namespace to other hosts, so native name delivery must stay disjoint from it (smarty-dev#2004).
+ * The canonical id namespace of root sessions. Live name routing must stay disjoint from it:
+ * the mesh bridge routes these ids to other hosts (smarty-dev#2004). Inbox recovery accepts
+ * only its own exact id, never a published name or a name that looks like another root's id.
  */
 export const ROOT_ID_PREFIX = "session:";
 export const ROOT_INBOX_CUSTOM_TYPE = "pi-fabric-inbox";
@@ -131,8 +131,6 @@ export class RootInbox {
   constructor(
     readonly mesh: MeshStore,
     readonly identity: MeshIdentity,
-    /** The ids and names a sender may address this root by (its id first). */
-    readonly names: () => readonly string[],
     readonly options: { now?: () => number; steerGraceMs?: number; pageSize?: number; wakeCooldownMs?: number; horizonMs?: number } = {},
   ) {}
 
@@ -162,6 +160,8 @@ export class RootInbox {
           !this.#delivered.has(eventReceipt(id)) && !session.delivered?.has(eventReceipt(id)));
         // A native delivery can arrive after the pending save. Recheck it on recovery too.
         const events = pending.filter((event) => {
+          // Legacy pending batches may contain names; only this exact root id is authority.
+          if (!this.#addressed(event)) return false;
           if (this.#stale(event)) { skippedStale++; return false; }
           if (!this.#steered(event, session)) return true;
           this.#remember(eventReceipts(event));
@@ -235,13 +235,11 @@ export class RootInbox {
     const pending = state.pending && !session.holdsBatch(state.pending.ids) ? state.pending : undefined;
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
     return [...(pending ? this.#reread(state.after, pending).filter((event) =>
-      !this.#stale(event) && !this.#steered(event, session)) : []), ...this.#scan(after, session, false).events];
+      this.#addressed(event) && !this.#stale(event) && !this.#steered(event, session)) : []), ...this.#scan(after, session, false).events];
   }
 
   #scan(after: number, session: RootInboxSession, bounded = true, onDelivered?: (event: MeshEvent) => void): RootInboxBatch {
     const now = this.#now();
-    const names = new Set(this.names().filter((name) =>
-      name.trim() && (name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX))));
     const cutoff = now - (this.options.steerGraceMs ?? STEER_GRACE_MS);
     const pageSize = this.options.pageSize ?? 500;
     const events: MeshEvent[] = [];
@@ -254,7 +252,7 @@ export class RootInbox {
       const page = this.mesh.read({ after: through, limit: pageSize });
       for (const event of page) {
         if (event.createdAt > cutoff) return result();
-        if (event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to)) {
+        if (this.#addressed(event)) {
           if (this.#stale(event)) skippedStale++;
           else if (this.#steered(event, session)) onDelivered?.(event);
           else if (!eventReceipts(event).some((id) => seen.has(id))) {
@@ -271,6 +269,12 @@ export class RootInbox {
       }
       if (page.length < pageSize) return result();
     }
+  }
+
+  #addressed(event: MeshEvent): boolean {
+    // Display names (including caller-relative `main`) are live routing selectors, not
+    // durable mailbox addresses. Recovery never bypasses that router's ambiguity rules.
+    return event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to === this.identity.id;
   }
 
   // Positive delivery evidence only, qualified by sender and this recipient's state key.

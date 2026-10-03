@@ -10,6 +10,8 @@ export const taskAgentEnvironment = (environment: NodeJS.ProcessEnv = process.en
   // child's task role. A parent's critical-read class is role-specific too.
   delete child.PI_FABRIC_ROLE;
   delete child.SMARTY_READ_CLASS;
+  // Launcher metadata belongs only to the root Main, never to its task children.
+  delete child.SMARTY_AGENT_NAME;
   // An actor's task child is a task, not another activation of the parent's actor.
   delete child.PI_FABRIC_ACTOR_ID;
   delete child.PI_FABRIC_TASK_PROCESS_CHILD;

@@ -503,6 +503,8 @@ const main = async (): Promise<void> => {
   const childEnvironment = applyTaskReturnAddress(
     options.actorId ? { ...process.env } : taskAgentEnvironment(), process.argv.slice(2),
   );
+  // Explicit actor launches retain role provenance, but not the root Main's name.
+  delete childEnvironment.SMARTY_AGENT_NAME;
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
   // A task child has its own identity and reply contract, not its actor parent's.
   for (const key of ["PI_FABRIC_ACTOR_ID", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_ACTOR_SESSION_FILE",

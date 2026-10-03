@@ -920,7 +920,7 @@ interface FabricAgentsApi {
   join(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   status(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricAgentHandle | FabricMainAgentInfo | FabricActorInfo | FabricParticipantInfo>;
   list(args?: { scope?: FabricParticipantScope }): Promise<Array<FabricAgentResult | FabricAgentHandle | FabricParticipantInfo>>;
-  members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;
+  members(args?: { name?: string; scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;
   self(): Promise<FabricParticipantInfo>;
   main(): Promise<FabricMainAgentInfo>;
   /** Immediate spawning participant; main is the root, not an actor spawner. Address it with id: "spawner". */
@@ -1082,7 +1082,7 @@ interface FabricMeshApi {
   /** An unverified-ids notice is advisory; it is also appended to the durable event text. */
   publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; message?: string; body?: string }): Promise<FabricMeshEvent & { notice?: string }>;
   read(args?: { after?: number; topic?: string; to?: string; limit?: number; max?: number }): Promise<FabricMeshEvent[]>;
-  members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean; limit?: number; max?: number; include_stale?: boolean }): Promise<FabricParticipantInfo[]>;
+  members(args?: { name?: string; scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean; limit?: number; max?: number; include_stale?: boolean }): Promise<FabricParticipantInfo[]>;
   get<T = unknown>(args: { key: string }): Promise<FabricMeshStateEntry<T> | null>;
   list<T = unknown>(args?: { prefix?: string; limit?: number; max?: number }): Promise<Array<FabricMeshStateEntry<T>>>;
   put<T = unknown>(args: { key: string; value: T; ifVersion?: number; if_version?: number; version?: number }): Promise<FabricMeshStateEntry<T>>;

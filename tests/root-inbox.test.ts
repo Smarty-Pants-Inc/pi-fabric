@@ -55,6 +55,42 @@ describe("RootInbox", () => {
     expect((await box.next(held)).events).toEqual([]);
   });
 
+  it("revalidates name admission for pending retries and idle wakes, including a restart", async () => {
+    const { mesh, clock, work, texts } = setup();
+    let names = [me.id, "fabric-v2"];
+    const inbox = () => new RootInbox(mesh, me, () => names, { now: clock.now, steerGraceMs: 0 });
+    const first = inbox();
+    first.start();
+    await work("name pending", "fabric-v2");
+    await work("exact pending");
+    clock.advance(1);
+    expect(texts((await first.next(notHeld)).events)).toEqual(["name pending", "exact pending"]);
+    // The runtime withdraws an alias when another live root publishes it. Persisted pending
+    // admission is not authority to retry an address which no longer resolves uniquely.
+    names = [me.id];
+    const restarted = inbox();
+    expect(texts((await restarted.wake(notHeld, () => true))!.events)).toEqual(["exact pending"]);
+    expect(texts((await restarted.next(notHeld)).events)).toEqual(["exact pending"]);
+    expect((await restarted.next(held)).events).toEqual([]);
+    names = [me.id, "fabric-v2"];
+    expect((await inbox().next(notHeld)).events).toEqual([]);
+    await restarted.close();
+  });
+
+  it("does not wake for a pending batch whose name admission was withdrawn", async () => {
+    const { mesh, clock, work } = setup();
+    let names = [me.id, "fabric-v2"];
+    const box = new RootInbox(mesh, me, () => names, { now: clock.now, steerGraceMs: 0 });
+    box.start();
+    await work("only ambiguous pending", "fabric-v2");
+    clock.advance(1);
+    expect((await box.next(notHeld)).events).toHaveLength(1);
+    names = [me.id];
+    expect(await box.wake(notHeld, () => true)).toBeUndefined();
+    expect((await box.next(notHeld)).events).toEqual([]);
+    await box.close();
+  });
+
   it("leaves a young event for a later reconcile, and never moves past it", async () => {
     const { clock, inbox, work, texts } = setup();
     const box = inbox(60_000);

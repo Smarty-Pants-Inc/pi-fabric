@@ -131,7 +131,7 @@ export class RootInbox {
   constructor(
     readonly mesh: MeshStore,
     readonly identity: MeshIdentity,
-    /** The ids and names a sender may address this root by (its id first). */
+    /** Currently admitted ids/names (id first); callers must withdraw ambiguous name aliases. */
     readonly names: () => readonly string[],
     readonly options: { now?: () => number; steerGraceMs?: number; pageSize?: number; wakeCooldownMs?: number; horizonMs?: number } = {},
   ) {}
@@ -161,7 +161,10 @@ export class RootInbox {
         const missing = state.pending.ids.filter((id) => !found.has(id) &&
           !this.#delivered.has(eventReceipt(id)) && !session.delivered?.has(eventReceipt(id)));
         // A native delivery can arrive after the pending save. Recheck it on recovery too.
+        const names = this.#deliveryNames();
         const events = pending.filter((event) => {
+          // A saved pending batch is not authority for a name which has since become ambiguous.
+          if (!this.#addressed(event, names)) return false;
           if (this.#stale(event)) { skippedStale++; return false; }
           if (!this.#steered(event, session)) return true;
           this.#remember(eventReceipts(event));
@@ -234,14 +237,14 @@ export class RootInbox {
     const state = this.#load();
     const pending = state.pending && !session.holdsBatch(state.pending.ids) ? state.pending : undefined;
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
+    const names = this.#deliveryNames();
     return [...(pending ? this.#reread(state.after, pending).filter((event) =>
-      !this.#stale(event) && !this.#steered(event, session)) : []), ...this.#scan(after, session, false).events];
+      this.#addressed(event, names) && !this.#stale(event) && !this.#steered(event, session)) : []), ...this.#scan(after, session, false).events];
   }
 
   #scan(after: number, session: RootInboxSession, bounded = true, onDelivered?: (event: MeshEvent) => void): RootInboxBatch {
     const now = this.#now();
-    const names = new Set(this.names().filter((name) =>
-      name.trim() && (name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX))));
+    const names = this.#deliveryNames();
     const cutoff = now - (this.options.steerGraceMs ?? STEER_GRACE_MS);
     const pageSize = this.options.pageSize ?? 500;
     const events: MeshEvent[] = [];
@@ -254,7 +257,7 @@ export class RootInbox {
       const page = this.mesh.read({ after: through, limit: pageSize });
       for (const event of page) {
         if (event.createdAt > cutoff) return result();
-        if (event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to)) {
+        if (this.#addressed(event, names)) {
           if (this.#stale(event)) skippedStale++;
           else if (this.#steered(event, session)) onDelivered?.(event);
           else if (!eventReceipts(event).some((id) => seen.has(id))) {
@@ -271,6 +274,15 @@ export class RootInbox {
       }
       if (page.length < pageSize) return result();
     }
+  }
+
+  #deliveryNames(): ReadonlySet<string> {
+    return new Set(this.names().filter((name) =>
+      name.trim() && (name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX))));
+  }
+
+  #addressed(event: MeshEvent, names: ReadonlySet<string>): boolean {
+    return event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to);
   }
 
   // Positive delivery evidence only, qualified by sender and this recipient's state key.

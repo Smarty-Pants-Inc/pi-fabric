@@ -157,15 +157,16 @@ it("lists the Pi-named Main through agents.peers/members and reaches its current
     expect(await reviewer.invoke("agents.self")).toMatchObject({ name: "main", kind: "root" });
     const label = owner.runtime.participantInfos().find(p => p.id === ownerId)?.label;
     const deliverByName = async (name: string) => {
-      await reviewer.runtime.mesh.publish({ topic: "fleet.work.root-name", kind: "ask", to: name,
-        from: { id: "review-actor", name: "review-actor", kind: "actor" }, text: `hello ${name}` });
-      // Only bypass the inbox's existing 60-second steer grace, not publication or routing.
-      const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+      // Age the shadow, not the directory's live presence leases: recovery now validates
+      // the same unambiguous current project roster as routing.
+      const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() - 61_000);
       try {
-        expect((await owner.runtime.nextRootInbox(held))?.events).toEqual(expect.arrayContaining([
-          expect.objectContaining({ to: name, text: `hello ${name}` }),
-        ]));
+        await reviewer.runtime.mesh.publish({ topic: "fleet.work.root-name", kind: "ask", to: name,
+          from: { id: "review-actor", name: "review-actor", kind: "actor" }, text: `hello ${name}` });
       } finally { clock.mockRestore(); }
+      expect((await owner.runtime.nextRootInbox(held))?.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ to: name, text: `hello ${name}` }),
+      ]));
     };
     await deliverByName("lucky-ios-lead");
     owner.rename("renamed-lead");

@@ -65,9 +65,31 @@ const claimKey = (id: string): string => `${claimPrefix}${key(id)}`;
 const read = <T>(file: string): T | undefined => {
   try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; } catch { return undefined; }
 };
+const isJournalFile = (file: string): boolean => /^[a-f0-9]{64}\.json$/.test(file);
 const files = (dir: string): string[] => {
-  try { return fs.readdirSync(dir).filter(file => /^[a-f0-9]{64}\.json$/.test(file)); } catch { return []; }
+  try { return fs.readdirSync(dir).filter(isJournalFile); } catch { return []; }
 };
+// Idle scans must yield on inspected entries, not just successful cleanup/delivery.
+// Four entries leave headroom for multiple plain fence/body reads per envelope
+// and adjacent immediate callbacks before the next timer/IO phase.
+async function* scanSlices<T>(entries: Iterable<T>): AsyncGenerator<T> {
+  let scanned = 0;
+  for (const entry of entries) {
+    yield entry;
+    if (++scanned % 4 === 0) await new Promise<void>(resolve => setImmediate(resolve));
+  }
+}
+async function* scanTargets(dirs: readonly string[]): AsyncGenerator<string> {
+  for (const dir of dirs) {
+    let entries: string[];
+    // Keep directory snapshots synchronous, like the public query: small native
+    // prompt/idle reconciles must complete even before the next IO phase.
+    try { entries = fs.readdirSync(dir); } catch { continue; }
+    for await (const file of scanSlices(entries.filter(isJournalFile))) {
+      yield path.join(dir, file);
+    }
+  }
+}
 interface CompletionReceipt { id: string; sessionId: string; consumedAt: number }
 interface CompletionClaim { rootId: string; sessionId: string; recipient?: CompletionRecipient }
 const fingerprint = (stat: fs.Stats): string => JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
@@ -223,24 +245,28 @@ export const saveWorkerCompletion = (statusFile: string, result: AgentRunRecord)
     result.warnings = [...(result.warnings ?? []), `Completion remains in the worker status: journal save failed: ${String(error).slice(0, 500)}`];
   }
 };
+const promoteOrphan = (meshRoot: string, projectRoot: string, project: string, target: string,
+  accepts: (recipient: CompletionRecipient) => boolean): void => {
+  const file = path.basename(target);
+  const address = readRecipient(target);
+  if (!address || canonical(address.projectRoot) !== project || !accepts(address)) return;
+  const fence = path.join(directory(meshRoot), "receipts", file);
+  if (readReceipt(fence)) return; // Consumed attempts join drain's bounded async cleanup.
+  const candidate = read<CompletionCandidate>(target);
+  if (candidate?.format !== 1 || !candidate.result || !candidate.recipient || !candidate.supervisor ||
+    !Number.isSafeInteger(candidate.supervisor.pid) || candidate.supervisor.pid <= 0 ||
+    typeof candidate.result.id !== "string" || file !== `${key(candidate.result.id)}.json` ||
+    typeof candidate.recipient.projectRoot !== "string" || canonical(candidate.recipient.projectRoot) !== canonical(projectRoot)) return;
+  if (!completionConsumed(meshRoot, candidate.result.id) &&
+    !residentProcessAlive(candidate.supervisor.pid, candidate.supervisor.processStartedAt)) {
+    saveCompletion(meshRoot, candidate.recipient, candidate.result);
+  }
+};
 const promoteOrphans = (meshRoot: string, projectRoot: string,
   accepts: (recipient: CompletionRecipient) => boolean = () => true): void => {
   const project = canonical(projectRoot);
   for (const file of files(path.join(directory(meshRoot), "attempts"))) {
-    const target = path.join(directory(meshRoot), "attempts", file);
-    const address = readRecipient(target);
-    if (!address || canonical(address.projectRoot) !== project || !accepts(address)) continue;
-    const fence = path.join(directory(meshRoot), "receipts", file);
-    if (readReceipt(fence)) continue; // Consumed attempts join drain's bounded async cleanup.
-    const candidate = read<CompletionCandidate>(target);
-    if (candidate?.format !== 1 || !candidate.result || !candidate.recipient || !candidate.supervisor ||
-      !Number.isSafeInteger(candidate.supervisor.pid) || candidate.supervisor.pid <= 0 ||
-      typeof candidate.result.id !== "string" || file !== `${key(candidate.result.id)}.json` ||
-      typeof candidate.recipient.projectRoot !== "string" || canonical(candidate.recipient.projectRoot) !== canonical(projectRoot)) continue;
-    if (!completionConsumed(meshRoot, candidate.result.id) &&
-      !residentProcessAlive(candidate.supervisor.pid, candidate.supervisor.processStartedAt)) {
-      saveCompletion(meshRoot, candidate.recipient, candidate.result);
-    }
+    promoteOrphan(meshRoot, projectRoot, project, path.join(directory(meshRoot), "attempts", file), accepts);
   }
 };
 const savedCompletion = (meshRoot: string, projectRoot: string, id: string): CompletionEnvelope | undefined => {
@@ -265,29 +291,44 @@ export const legacyCompletionConsumed = (meshRoot: string, rootId: string, id: s
   }
   return metadata.completionConsumedAt !== undefined;
 };
+const pendingCompletion = (meshRoot: string, projectRoot: string, project: string, target: string,
+  accepts: (recipient: CompletionRecipient) => boolean): CompletionEnvelope[] => {
+  // The immutable address precedes the potentially huge body. Foreign lanes never touch fences.
+  const file = path.basename(target);
+  const recipient = readRecipient(target);
+  if (!recipient || canonical(recipient.projectRoot) !== project || !accepts(recipient)) return [];
+  if (readReceipt(path.join(directory(meshRoot), "receipts", file))) return [];
+  const value = read<CompletionEnvelope>(target);
+  if (value?.format !== 1 || !value.recipient || !value.result ||
+    typeof value.recipient.rootId !== "string" || typeof value.recipient.sessionId !== "string" ||
+    typeof value.recipient.projectRoot !== "string" || typeof value.recipient.cwd !== "string" ||
+    typeof value.recipient.name !== "string" || typeof value.recipient.startedAt !== "number" ||
+    (value.recipient.role !== undefined && typeof value.recipient.role !== "string") ||
+    typeof value.result.id !== "string" || !/^[a-f0-9]{32}$/.test(value.result.id) ||
+    typeof value.result.name !== "string" || typeof value.result.text !== "string" || typeof value.result.startedAt !== "number" ||
+    file !== `${key(value.result.id)}.json` ||
+    !["completed", "failed", "stopped", "timed_out"].includes(value.result.status) ||
+    canonical(value.recipient.projectRoot) !== canonical(projectRoot) || completionConsumed(meshRoot, value.result.id)) return [];
+  return legacyCompletionConsumed(meshRoot, value.recipient.rootId, value.result.id) ? [] : [value];
+};
 export const pendingCompletions = (meshRoot: string, projectRoot: string,
   accepts: (recipient: CompletionRecipient) => boolean = () => true): CompletionEnvelope[] => {
   promoteOrphans(meshRoot, projectRoot, accepts);
   const project = canonical(projectRoot);
-  return files(directory(meshRoot)).flatMap(file => {
-    // The immutable address precedes the potentially huge body. Foreign lanes never touch fences.
-    const target = path.join(directory(meshRoot), file);
-    const recipient = readRecipient(target);
-    if (!recipient || canonical(recipient.projectRoot) !== project || !accepts(recipient)) return [];
-    if (readReceipt(path.join(directory(meshRoot), "receipts", file))) return [];
-    const value = read<CompletionEnvelope>(target);
-    if (value?.format !== 1 || !value.recipient || !value.result ||
-      typeof value.recipient.rootId !== "string" || typeof value.recipient.sessionId !== "string" ||
-      typeof value.recipient.projectRoot !== "string" || typeof value.recipient.cwd !== "string" ||
-      typeof value.recipient.name !== "string" || typeof value.recipient.startedAt !== "number" ||
-      (value.recipient.role !== undefined && typeof value.recipient.role !== "string") ||
-      typeof value.result.id !== "string" || !/^[a-f0-9]{32}$/.test(value.result.id) ||
-      typeof value.result.name !== "string" || typeof value.result.text !== "string" || typeof value.result.startedAt !== "number" ||
-      file !== `${key(value.result.id)}.json` ||
-      !["completed", "failed", "stopped", "timed_out"].includes(value.result.status) ||
-      canonical(value.recipient.projectRoot) !== project || completionConsumed(meshRoot, value.result.id)) return [];
-    return legacyCompletionConsumed(meshRoot, value.recipient.rootId, value.result.id) ? [] : [value];
-  });
+  return files(directory(meshRoot)).flatMap(file => pendingCompletion(meshRoot, projectRoot, project, path.join(directory(meshRoot), file), accepts));
+};
+const scanPendingCompletions = async (meshRoot: string, projectRoot: string,
+  accepts: (recipient: CompletionRecipient) => boolean): Promise<CompletionEnvelope[]> => {
+  const promotionProject = canonical(projectRoot);
+  for await (const target of scanTargets([path.join(directory(meshRoot), "attempts")])) {
+    promoteOrphan(meshRoot, projectRoot, promotionProject, target, accepts);
+  }
+  const project = canonical(projectRoot);
+  const pending: CompletionEnvelope[] = [];
+  for await (const target of scanTargets([directory(meshRoot)])) {
+    pending.push(...pendingCompletion(meshRoot, projectRoot, project, target, accepts));
+  }
+  return pending;
 };
 export const pendingCompletionResult = (envelope: CompletionEnvelope): AgentRunResult => ({
   ...envelope.result,
@@ -363,7 +404,7 @@ export class CompletionJournal {
     // Gate before reading a fence, even without a body. The authenticated claim retains
     // its owner's lane so a dead Main's same-lane successor can reclaim bounded state.
     let retired = 0;
-    for (const claim of this.mesh.listAll(claimPrefix)) {
+    for await (const claim of scanSlices(this.mesh.listAll(claimPrefix))) {
       if (!this.#canRetireClaim(claim)) continue;
       const receipt = readReceipt(path.join(directory(this.meshRoot), "receipts", `${claim.key.slice(claimPrefix.length)}.json`));
       if (typeof receipt?.id === "string" && claim.key === claimKey(receipt.id)) {
@@ -377,8 +418,7 @@ export class CompletionJournal {
     // Bound crash-left cleanup; receipt barriers use the async filesystem, never the UI thread.
     let pruned = 0;
     const project = canonical(recipient.projectRoot);
-    for (const target of [directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts")]
-      .flatMap(dir => files(dir).map(file => path.join(dir, file)))) {
+    for await (const target of scanTargets([directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts")])) {
       const file = path.basename(target);
       const address = readRecipient(target);
       if (!address || canonical(address.projectRoot) !== project || !accepts(address)) continue;
@@ -388,12 +428,11 @@ export class CompletionJournal {
       await confirmReceipt(fence, receipt);
       fs.rmSync(target, { force: true });
       if (++pruned === 128) break;
-      if (pruned % 16 === 0) await new Promise<void>(resolve => setImmediate(resolve));
     }
-    const pending = pendingCompletions(this.meshRoot, recipient.projectRoot, accepts);
+    const pending = await scanPendingCompletions(this.meshRoot, recipient.projectRoot, accepts);
     if (!pending.length) return;
     const roots = this.participants.list({ scope: "project", kinds: ["root"], fresh: true });
-    for (const envelope of pending) {
+    for await (const envelope of scanSlices(pending)) {
       if (this.#enqueued.has(envelope.result.id) || !this.#canDeliver(envelope, roots)) continue;
       const ck = claimKey(envelope.result.id);
       const claim = this.mesh.get(ck, { fresh: true });

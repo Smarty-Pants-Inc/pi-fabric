@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { performance } from "node:perf_hooks";
+import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, saveCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
 import type { AgentRunResult } from "../src/agents/types.js";
@@ -34,6 +34,23 @@ const setup = () => {
   return { root, meshRoot, recipient, result, file, receipt, journal, seed };
 };
 
+// Observe the maximum event-loop slice, not the wall time of an async scan/pass.
+const measureIdleSlices = async (operation: () => Promise<void>) => {
+  const delay = monitorEventLoopDelay({ resolution: 1 });
+  delay.enable();
+  try {
+    await new Promise(resolve => setTimeout(resolve, 10)); // Arm before the first synchronous slice.
+    delay.reset();
+    const start = performance.now();
+    const pending = operation();
+    const initialMs = performance.now() - start; // A scan that never yields can finish before the monitor fires.
+    await pending;
+    const passMs = performance.now() - start;
+    await new Promise(resolve => setTimeout(resolve, 10)); // Record the final slice too.
+    return { maxMs: Math.max(initialMs, delay.max / 1e6), samples: delay.count, passMs };
+  } finally { delay.disable(); }
+};
+
 describe("completion journal idle scans", () => {
   it("drains 100 consumed large envelopes and two pending ones without synchronous fsync or a 16ms blocking scan", async () => {
     const h = setup();
@@ -46,13 +63,10 @@ describe("completion journal idle scans", () => {
     const journal = h.journal(enqueue);
     const sync = vi.spyOn(fs, "fsyncSync");
     const asyncOpen = vi.spyOn(fs.promises, "open");
-    const beforeScan = performance.now();
     expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(2);
-    const scanMs = performance.now() - beforeScan;
-    const beforeDrain = performance.now(); const drain = journal.drain();
-    const syncMs = performance.now() - beforeDrain;
-    await drain; await journal.drain();
-    expect(scanMs).toBeLessThan(16); expect(syncMs).toBeLessThan(16);
+    const slices = await measureIdleSlices(async () => { await journal.drain(); await journal.drain(); });
+    expect(slices.samples).toBeGreaterThan(0);
+    expect(slices.maxMs).toBeLessThan(16);
     expect(sync).not.toHaveBeenCalled(); expect(asyncOpen).toHaveBeenCalled();
     expect(enqueue.mock.calls.map(([result]) => result.id)).toEqual(expect.arrayContaining([a.id, b.id]));
     expect(enqueue).toHaveBeenCalledTimes(2);
@@ -63,6 +77,42 @@ describe("completion journal idle scans", () => {
     callbacks.get(a.id)!(); callbacks.get(b.id)!();
     await journal.drain(); expect(enqueue).toHaveBeenCalledTimes(2);
     expect(fs.existsSync(h.file(a.id))).toBe(false); expect(fs.existsSync(h.file(b.id))).toBe(false);
+  });
+
+  it.each(["consumed leftovers", "pending", "attempts"] as const)("bounds every idle slice with slow plain reads: %s", async state => {
+    const h = setup();
+    const count = state === "consumed leftovers" ? 260 : 100;
+    for (let index = 1; index <= count; index++) {
+      const result = h.seed(index);
+      if (state === "consumed leftovers") consumeCompletion(h.meshRoot, result.id, h.recipient.sessionId);
+      if (state === "attempts") {
+        const target = path.join(path.dirname(h.file(result.id)), "attempts", path.basename(h.file(result.id)));
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.renameSync(h.file(result.id), target); // Addressed but uncommitted: no supervisor can authorize promotion.
+      }
+    }
+    const expected = pendingCompletions(h.meshRoot, h.root).map(envelope => envelope.result.id);
+    const enqueue = vi.fn(); const journal = h.journal(enqueue);
+    const read = fs.readFileSync;
+    const slowRead = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: any[]) => {
+      const start = performance.now();
+      while (performance.now() - start < 0.3) { /* Emulate a slower local filesystem. */ }
+      return (read as any)(target, ...args);
+    }) as typeof fs.readFileSync);
+    const sync = vi.spyOn(fs, "fsyncSync");
+    const slices = await measureIdleSlices(() => journal.drain());
+    expect(slowRead.mock.calls.length).toBeGreaterThanOrEqual(100);
+    expect(slices.passMs).toBeGreaterThan(30); // A whole-pass timer would incorrectly reject this scan.
+    expect(slices.samples).toBeGreaterThan(0);
+    expect(slices.maxMs).toBeLessThan(16);
+    expect(sync).not.toHaveBeenCalled();
+    expect(enqueue.mock.calls.map(([result]) => result.id)).toEqual(expected); // Preserve directory order.
+    slowRead.mockRestore();
+    if (state === "consumed leftovers") {
+      const envelopes = fs.readdirSync(path.dirname(h.file(h.result(1).id))).filter(file => file.endsWith(".json"));
+      expect(envelopes).toHaveLength(132); // Still cap destructive pruning at 128 per pass.
+      for (let index = 1; index <= count; index++) expect(completionConsumed(h.meshRoot, h.result(index).id)).toBe(true);
+    }
   });
 
   it("recovers a crash after the receipt barrier but before envelope unlink without redelivery", async () => {

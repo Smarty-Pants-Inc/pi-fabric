@@ -33,6 +33,10 @@ const runProperties = {
   },
   routeClass: { type: "string", pattern: "^[a-z][a-z0-9-]{0,63}$", description: "Explicit run-history class. Record-only unless spawn also requests model: auto; auto permits bounded-lookup or status-groom only." },
   protected: { type: "boolean", description: "Trusted issue/PR protection snapshot, never task text: true for review/security/audit/named passes/needs-security-pass; false only for known-clear state. Omitted stays unknown and excluded from routing." },
+  modelReason: {
+    type: "string",
+    description: "Reason for an explicit model selection, recorded on the run. Required and non-blank for cliproxyapi/gpt-6-astra; named passes use cliproxyapi/gpt-6.1-sol thinking max, otherwise omit model (role default).",
+  },
   persona: {
     type: "string",
     description: "Veda persona name for this run, such as frontend, reviewer, worker, or a custom persona.",
@@ -432,6 +436,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         runner: runProperties.runner,
         kernel: runProperties.kernel,
         model: strictModelProperty,
+        modelReason: runProperties.modelReason,
         thinking: runProperties.thinking,
         tools: runProperties.tools,
         transport: runProperties.transport,

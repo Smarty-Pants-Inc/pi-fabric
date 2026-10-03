@@ -1,4 +1,11 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { MainAgentController } from "../src/main-agent.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { removeParticipantFileIf, writeParticipantFile } from "../src/topology/participant-files.js";
+import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
+import type { FabricParticipantRecord } from "../src/topology/types.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -15,9 +22,11 @@ const identity: MeshIdentity = { id: "session:owner", name: "Owner", kind: "main
 const roots: string[] = [];
 const managers: AgentManager[] = [];
 const planes: FabricControlPlane[] = [];
+const directories: ParticipantDirectory[] = [];
+const drains: Array<() => void> = [];
 type Ports = ConstructorParameters<typeof AgentMessageRouter>;
 
-const router = (manager: Ports[0], entries: FabricParticipantInfo[] = [], control?: Ports[4]) => {
+const router = (manager: Ports[0], entries: FabricParticipantInfo[] = [], control?: Ports[4], source?: Ports[3]) => {
   const actors = {
     identity, validateDirectMessage: vi.fn(),
     status: vi.fn((id: string) => {
@@ -26,11 +35,12 @@ const router = (manager: Ports[0], entries: FabricParticipantInfo[] = [], contro
     }),
     owns: () => true, tell: vi.fn(() => ({ messageId: "mailbox" })),
     ask: vi.fn(), stop: vi.fn(), steerRemote: vi.fn(), resolveBinding: vi.fn(),
+    resolveActivationBinding: vi.fn(async () => ({})),
   } as unknown as Ports[1];
   const main = { id: identity.id, local: true, matches: (id: string) => id === "main" || id === identity.id,
     deliverAgent: vi.fn(() => ({ queued: true, messageId: "main-queue", routed: "main" })) } as unknown as Ports[2];
   const participants = { get: (id: string) => entries.find(p => p.id === id), scheduleRefresh: vi.fn(), lastKnown: () => undefined };
-  return { value: new AgentMessageRouter(manager, actors, main, participants, control, b => b), actors, main };
+  return { value: new AgentMessageRouter(manager, actors, main, source ?? participants, control, b => b), actors, main };
 };
 const running = async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-followup-advisory-")); roots.push(root);
@@ -56,8 +66,196 @@ const unknown = { status: (id: string) => { throw new Error(`Unknown Fabric agen
 
 afterEach(async () => {
   await Promise.all(planes.splice(0).map(p => p.close()));
+  for (const close of drains.splice(0)) close();
+  await Promise.all(directories.splice(0).map(d => d.close()));
   await Promise.all(managers.splice(0).map(m => m.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+const mainLeaseFixture = async (files: boolean) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-main-lease-")); roots.push(root);
+  const meshRoot = path.join(root, "mesh");
+  const mesh = new MeshStore(meshRoot, 64 * 1024, 1000);
+  if (files) await mesh.put({ key: LIVENESS_POLICY_KEY, identity, value: { version: 1, participants: "files" } });
+  const directory = new ParticipantDirectory(mesh, {
+    enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 120_000,
+  });
+  directories.push(directory);
+  await directory.refresh();
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  const target: MeshIdentity = { id: `session:${sessionId}`, name: "Main", kind: "main", sessionId };
+  const key = (prefix: string) => prefix + createHash("sha256").update(target.id).digest("hex");
+  const presence: FabricParticipantRecord = {
+    format: 1, id: target.id, rootId: target.id, kind: "root", ownerHostId: target.id, ownerIdentityId: target.id,
+    name: "lead-example", status: "running", runner: "pi", transport: "host", cwd: root, sessionId,
+    capabilities: ["steer", "followUp", "fabric"], controlProtocol: "v1", startedAt: 1, updatedAt: Date.now(),
+  };
+  await mesh.put({ key: key("topology/hosts/"), identity: target, value: {
+    format: 1, id: target.id, rootId: target.id, identity: target, startedAt: 1,
+    updatedAt: Date.now(), expiresAt: Date.now() - 600_000,
+  } });
+  const participantKey = key("topology/participants/");
+  if (files) writeParticipantFile(meshRoot, { key: participantKey, value: presence, version: 1, updatedAt: Date.now(), updatedBy: target });
+  else await mesh.put({ key: participantKey, identity: target, value: presence });
+  const plane = (who: MeshIdentity) => {
+    const value = new FabricControlPlane(new MeshStore(meshRoot, 64 * 1024, 1000), who,
+      { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000 });
+    planes.push(value); return value;
+  };
+  const publishPresence = async (value: FabricParticipantRecord) => {
+    if (files) writeParticipantFile(meshRoot, { key: participantKey, value, version: 2, updatedAt: Date.now(), updatedBy: target });
+    else await mesh.put({ key: participantKey, identity: target, value });
+  };
+  return { root, meshRoot, mesh, directory, target, sessionId, participantKey, key, plane, presence, publishPresence };
+};
+
+describe("Main target lineage delivery (#3686)", () => {
+  it.each([
+    [false, "steer", false], [false, "followUp", false], [true, "steer", false], [true, "followUp", false],
+    [false, "steer", true], [false, "followUp", true], [true, "steer", true], [true, "followUp", true],
+    [false, "steer", "name"], [false, "followUp", "name"], [true, "steer", "name"], [true, "followUp", "name"],
+  ] as const)("queues %s file presence / %s / selector=%s despite a ten-minute lease lapse", async (files, kind, selector) => {
+    const f = await mainLeaseFixture(files);
+    expect(f.directory.get(f.target.id, undefined, { fresh: true })).toBeUndefined();
+    expect(f.directory.lastKnown(f.target.id)?.lapsedMs).toBeGreaterThanOrEqual(600_000);
+    expect(f.directory.lineageAlive(f.target.id)).toBe(true);
+    const sender = f.plane(identity);
+    sender.start(() => ({ accepted: false }));
+    const send = router(unknown, [], sender, f.directory);
+    let error: unknown;
+    const pending = send.value.routeMessage(selector === "name" ? "lead-example" : selector ? f.sessionId : f.target.id, "live Main reply", { proof: "unchanged" }, kind)
+      .catch(failure => { error = failure; return undefined; });
+    try {
+      await vi.waitFor(() => expect(error !== undefined || f.mesh.read({ topic: "fabric.control.command", limit: 10 }).length > 0).toBe(true));
+      expect(error).toBeUndefined();
+      // No target control plane is running yet. A fresh store sees the durable mailbox command.
+      const commands = new MeshStore(f.meshRoot, 64 * 1024, 1000).read({ topic: "fabric.control.command", limit: 10 });
+      expect(commands).toHaveLength(1);
+      expect(commands[0]!.data).toMatchObject({ targetId: f.target.id, operation: kind, message: "live Main reply", data: { proof: "unchanged" } });
+      const sendMessage = vi.fn();
+      const pi = { on: () => () => {}, sendMessage, getThinkingLevel: () => "off" } as unknown as ExtensionAPI;
+      const main = new MainAgentController(pi, f.target.id, true, f.root, f.sessionId);
+      const journal = path.join(f.root, "main-followups.json");
+      main.attachFollowUpDrain({ isIdle: () => false, hasPendingMessages: () => false,
+        sessionManager: { getEntries: () => [] } } as unknown as ExtensionContext, 60_000, journal);
+      drains.push(() => main.closeFollowUpDrain());
+      const owner = f.plane(f.target);
+      const receive = new AgentMessageRouter(unknown, send.actors, main, f.directory, owner, b => b);
+      owner.start((command, from, signal) => receive.acceptControl(command, from, signal));
+      await expect(pending).resolves.toMatchObject({ queued: true, acknowledged: true, routed: "mesh" });
+      if (kind === "followUp") {
+        expect(main.queueDepth().pendingFollowUps).toBe(1);
+        expect(JSON.parse(fs.readFileSync(journal, "utf8")).items).toEqual([
+          expect.objectContaining({ message: "live Main reply", data: { proof: "unchanged" } }),
+        ]);
+      } else expect(sendMessage).toHaveBeenCalledOnce();
+      expect(f.directory.get(f.target.id, undefined, { fresh: true })).toBeUndefined();
+    } finally {
+      await sender.close();
+      await pending;
+    }
+  });
+
+  it.each([false, true])("keeps dead roots and unknown ids unknown (files=%s)", async (files) => {
+    const f = await mainLeaseFixture(files);
+    if (files) await removeParticipantFileIf(f.mesh, f.participantKey, () => true);
+    else await f.mesh.delete({ key: f.participantKey });
+    await f.mesh.put({ key: f.key("topology/lineage-closures/"), identity: f.target, value: {
+      format: 1, rootId: f.target.id, ownerHostId: f.target.id, ownerIdentityId: f.target.id, closedAt: Date.now(),
+    } });
+    expect(f.directory.lineageAlive(f.target.id)).toBe(false);
+    expect(f.directory.lineageAlive("session:unknown")).toBe(true); // Unknown lineage alone is not an address.
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    for (const id of [f.target.id, "lead-example", "session:unknown"]) for (const kind of ["steer", "followUp"] as const) {
+      await expect(send.value.routeMessage(id, "not deliverable", undefined, kind)).rejects.toThrow(`Unknown Fabric participant: ${id}`);
+    }
+    expect(request).not.toHaveBeenCalled();
+    expect(f.mesh.read({ topic: "fabric.control.command", limit: 10 })).toEqual([]);
+  });
+});
+
+describe.each([false, true])("stale Main name safeguards (files=%s)", (files) => {
+  it.each(["reloading", "stopping", "mirrored"] as const)("does not admit a %s root by stale name", async (state) => {
+    const f = await mainLeaseFixture(files);
+    await f.publishPresence({ ...f.presence, ...(state === "mirrored" ? { remoteHost: "peer-host" } : { status: state }) });
+    if (state === "mirrored") {
+      const host = f.mesh.get(f.key("topology/hosts/"))!.value as Record<string, unknown>;
+      await f.mesh.put({ key: f.key("topology/hosts/"), identity: f.target, value: { ...host, remoteHost: "peer-host" } });
+    }
+    expect(f.directory.list({ scope: "project", includeStale: true, fresh: true }))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ id: f.target.id, stale: true })]));
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    for (const kind of ["followUp", "steer"] as const) {
+      await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, kind))
+        .rejects.toThrow("Unknown Fabric participant: lead-example");
+    }
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each(["non-interactive", "missing-capability"] as const)("retains %s admission guards for a stale named root", async (state) => {
+    const f = await mainLeaseFixture(files);
+    await f.publishPresence({ ...f.presence, ...(state === "non-interactive" ? { interactive: false } : { capabilities: ["fabric"] }) });
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    for (const kind of ["followUp", "steer"] as const) {
+      await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, kind))
+        .rejects.toThrow(state === "non-interactive" ? "is non-interactive" : `does not support ${kind}`);
+    }
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("retains duplicate-name and actor-name ambiguity before publication", async () => {
+    const f = await mainLeaseFixture(files);
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    const status = vi.spyOn(send.actors, "status").mockReturnValue({ id: "actor:named", name: "lead-example", runner: "pi" } as ReturnType<Ports[1]["status"]>);
+    await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, "followUp"))
+      .rejects.toThrow(`Ambiguous Fabric participant: lead-example (actor actor:named, root ${f.target.id})`);
+    status.mockRestore();
+    const duplicate = { ...f.presence, id: "session:duplicate", rootId: "session:duplicate", ownerHostId: "session:duplicate", ownerIdentityId: "session:duplicate" };
+    const duplicateKey = "topology/participants/" + createHash("sha256").update(duplicate.id).digest("hex");
+    const duplicateIdentity: MeshIdentity = { id: duplicate.id, name: "Main", kind: "main" };
+    if (files) writeParticipantFile(f.meshRoot, { key: duplicateKey, value: duplicate, version: 1, updatedAt: Date.now(), updatedBy: duplicateIdentity });
+    else await f.mesh.put({ key: duplicateKey, identity: duplicateIdentity, value: duplicate });
+    for (const kind of ["followUp", "steer"] as const) {
+      const failure = await send.value.routeMessage("lead-example", "never guess", undefined, kind).catch(error => error);
+      expect(failure.message).toContain("Ambiguous Fabric participant: lead-example");
+      expect(failure.message).toContain(f.target.id);
+      expect(failure.message).toContain(duplicate.id);
+    }
+    expect(request).not.toHaveBeenCalled();
+    expect(f.mesh.read({ topic: "fabric.control.command", limit: 10 })).toEqual([]);
+  });
+
+  it.each(["dead-lineage", "write-stalled"] as const)("does not admit a %s root by stale name", async (state) => {
+    const f = await mainLeaseFixture(files);
+    const stalled = new Error("Fabric mesh write stalled");
+    if (state === "dead-lineage") vi.spyOn(f.directory, "lineageAlive").mockReturnValue(false);
+    else vi.spyOn(f.directory, "writeStalled").mockReturnValue(stalled);
+    const request = vi.fn();
+    const send = router(unknown, [], { request }, f.directory);
+    for (const kind of ["followUp", "steer"] as const) {
+      await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, kind))
+        .rejects.toThrow(state === "write-stalled" ? stalled.message : "Unknown Fabric participant: lead-example");
+    }
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("reads the current stale name rather than a cached previous name", async () => {
+    const f = await mainLeaseFixture(files);
+    f.directory.list({ scope: "project", kinds: ["root"], includeStale: true });
+    await f.publishPresence({ ...f.presence, name: "renamed-lead" });
+    const request = vi.fn().mockResolvedValue({ queued: true, acknowledged: true, routed: "mesh" });
+    const send = router(unknown, [], { request }, f.directory);
+    await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, "followUp"))
+      .rejects.toThrow("Unknown Fabric participant: lead-example");
+    await expect(send.value.routeMessage("renamed-lead", "current name", undefined, "followUp"))
+      .resolves.toMatchObject({ queued: true, acknowledged: true });
+    expect(request).toHaveBeenCalledOnce();
+    expect(request.mock.calls[0]?.slice(0, 3)).toEqual([f.target.id, f.target.id, "followUp"]);
+  });
 });
 
 describe("running-task followUp advisory (#3005)", () => {

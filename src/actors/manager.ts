@@ -137,6 +137,7 @@ interface ManagedActor {
   pythonRuntime?: FabricPythonRuntime;
   runnerSessionId?: string;
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
   routeClass?: "status-groom";
   protected?: boolean;
@@ -720,6 +721,7 @@ export class ActorManager {
       ...(kernel ? { kernel } : {}),
       ...(pythonRuntime ? { pythonRuntime } : {}),
       ...(model ? { model } : {}),
+      ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
       ...(request.thinking ? { thinking: request.thinking } : {}),
       ...(request.routeClass ? { routeClass: request.routeClass } : {}),
       ...(typeof request.protected === "boolean" ? { protected: request.protected } : {}),
@@ -1394,6 +1396,7 @@ export class ActorManager {
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       ...(actor.model ? { model: actor.model } : {}),
+      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
       ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
       ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
@@ -2901,6 +2904,7 @@ export class ActorManager {
         : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(binding.model ? { model: binding.model } : {}),
+      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
       ...(binding.thinking ? { thinking: binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -3405,6 +3409,7 @@ export class ActorManager {
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(actor.model ? { model: actor.model } : {}),
+      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
       ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
       ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
@@ -3608,6 +3613,7 @@ export class ActorManager {
           ? { runnerSessionId: record.runnerSessionId }
           : {}),
         ...(typeof record.model === "string" ? { model: record.model } : {}),
+        ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
         ...(isFabricThinking(record.thinking) ? { thinking: record.thinking } : {}),
         ...(typeof record.routeClass === "string" ? { routeClass: record.routeClass as "status-groom" } : {}),
         ...(typeof record.protected === "boolean" ? { protected: record.protected } : {}),

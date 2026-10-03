@@ -346,6 +346,7 @@ const actorRequest = (
       : inheritedModel
         ? { model: inheritedModel }
         : {}),
+    ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}),
     ...(isFabricThinking(args.thinking) ? { thinking: args.thinking }
       : inheritedModel && isFabricThinking(inheritedThinking) ? { thinking: inheritedThinking } : {}),
     ...(tools ? { tools } : {}),
@@ -769,6 +770,12 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
+    // Guard only explicit public launch selections, never inherited/default models.
+    if ((actionName === "run" || actionName === "spawn" || actionName === "create") &&
+      typeof args.model === "string" && args.model.trim() === "cliproxyapi/gpt-6-astra" &&
+      !(typeof args.modelReason === "string" && args.modelReason.trim())) {
+      throw new Error("named passes use cliproxyapi/gpt-6.1-sol thinking max; otherwise omit model (role default)");
+    }
     switch (actionName) {
       case "run": {
         const main = isInteractiveMain(context.extensionContext);

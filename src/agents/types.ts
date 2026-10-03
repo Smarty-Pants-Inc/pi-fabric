@@ -81,6 +81,8 @@ export interface AgentRunRequest {
   pythonRuntime?: FabricPythonRuntime;
   transport?: FabricAgentTransport;
   model?: string;
+  /** Caller-supplied justification for an explicit model selection. */
+  modelReason?: string;
   /** Veda persona name; only used when runner is "veda". */
   persona?: string;
   thinking?: FabricThinking;
@@ -170,6 +172,7 @@ export interface AgentRunRecord {
   transport: FabricAgentTransport;
   cwd: string;
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
   actorId?: string;
   actorName?: string;
@@ -251,6 +254,7 @@ export interface AgentHandleInfo {
   transport: FabricAgentTransport;
   cwd: string;
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
   actorId?: string;
   actorName?: string;
@@ -308,6 +312,7 @@ export interface AgentWorkerOptions {
   /** Host-only bounded judge: no ambient resources, compaction or retry. */
   judgment?: boolean;
   model?: string;
+  modelReason?: string;
   thinking?: string;
   systemPrompt?: string;
   sessionFile?: string;

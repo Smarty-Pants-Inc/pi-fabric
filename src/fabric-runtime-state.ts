@@ -682,9 +682,9 @@ export class FabricRuntimeState {
       };
     };
     // Task agents and actors share one single-flight refresh per registry (smarty-dev#1830).
-    const resolveParticipantPiModel = async (selector?: string, requiredPin = false) => {
+    const resolveParticipantPiModel = async (selector?: string, options: { requiredPin?: boolean; closest?: boolean } = {}) => {
       const defaultModel = context.model ? `${context.model.provider}/${context.model.id}` : undefined;
-      const resolved = requiredPin
+      const resolved = options.requiredPin
         ? await resolvePiRoutePin({ selector: selector!, registry: context.modelRegistry, aliases: {} })
         : await resolvePiModel({
             selector,
@@ -692,6 +692,7 @@ export class FabricRuntimeState {
             aliases: modelsConfig.aliases,
             defaultModel,
             policy: agentConfig,
+            closest: options.closest ?? true,
           });
       const model = visiblePiModels().find(
         (candidate) =>
@@ -765,7 +766,7 @@ export class FabricRuntimeState {
         };
       },
       preparePiModel: async (modelKey, requiredPin) => {
-        const resolved = await resolveParticipantPiModel(modelKey, requiredPin);
+        const resolved = await resolveParticipantPiModel(modelKey, { requiredPin: requiredPin ?? false });
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
@@ -874,7 +875,7 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, requiredPin)).key,
+            resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
             prepareModelRoute: prepareActorModelRoute,
             acquireCapabilityView: acquireActorCapabilityView,
             // A /reload or restart of this session resumes its actors' mesh stream where the
@@ -894,7 +895,7 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, requiredPin)).key,
+            resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
             prepareModelRoute: prepareActorModelRoute,
             acquireCapabilityView: acquireActorCapabilityView,
           },

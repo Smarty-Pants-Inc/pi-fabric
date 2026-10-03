@@ -326,8 +326,8 @@ export class ResidentHost {
       ...(modelRegistry?.refresh ? { refresh: () => modelRegistry.refresh!() } : {}),
     };
     const residentRouteRegistry = (): PiModelRegistryView => routeRegistry;
-    const resolveResidentPiModel = async (selector?: string, requiredPin = false): Promise<string> => {
-      if (requiredPin) {
+    const resolveResidentPiModel = async (selector?: string, options: { requiredPin?: boolean; closest?: boolean } = {}): Promise<string> => {
+      if (options.requiredPin) {
         const exact = await resolvePiRoutePin({ selector: selector ?? "", registry: residentRouteRegistry(),
           aliases: normalizeModelAliases((currentConfig().piModels ?? config.piModels)?.aliases) });
         return `${exact.provider}/${exact.id}`;
@@ -351,6 +351,7 @@ export class ResidentHost {
         defaultModel: state?.defaultModel,
         snapshot,
         policy: config.agents,
+        closest: options.closest ?? true,
       });
       return `${resolved.provider}/${resolved.id}`;
     };
@@ -374,7 +375,7 @@ export class ResidentHost {
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: this.#retention,
-      preparePiModel: async (model, requiredPin) => resolveResidentPiModel(model, requiredPin),
+      preparePiModel: async (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false }),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;
         return resolveFabricModelGuidance(currentModelGuidance(), {
@@ -472,7 +473,7 @@ export class ResidentHost {
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: this.#retention,
         ...(typeof config.actors?.maxSessionBytes === "number" ? { maxSessionBytes: config.actors.maxSessionBytes } : {}),
-        resolvePiModel: resolveResidentPiModel,
+        resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
         prepareModelRoute: async (input, signal) => {
           const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
           return prepareModelRoute({ ...input, signal, config: config.agents.modelRouting,

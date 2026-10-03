@@ -1381,6 +1381,50 @@ describe("AgentManager", () => {
     }
   }, 30_000);
 
+  // dev-lead review D1 on #26: lost contact is not an exit. The run fails as lost, once, and
+  // neither cleanup nor shutdown deletes files that the still-running worker may use.
+  it("preserves modelReason in the persisted terminal record and settlement callback for a lost worker", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const modelReason = "Astra is required for this lost-worker audit regression";
+    const settled = vi.fn();
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    const handles: Array<Awaited<ReturnType<typeof launch>>> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      launches++;
+      handles.push(handle);
+      // As a Herdr handle past its bound: the worker keeps running, contact is lost.
+      return { ...handle, relaunchable: false, isAlive: async () => false, lostContact: () => "the Herdr server has been unreachable for 300 s" };
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+        onSettled: settled,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "HANG until stopped", transport: "process", model: "cliproxyapi/gpt-6-astra", modelReason });
+      const persisted = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "status.json"), "utf8"));
+      expect.soft(persisted).toMatchObject({ status: "failed", modelReason });
+      expect.soft(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: result.id, status: "failed", modelReason }));
+      expect(launches).toBe(1);
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/^Lost track of the worker: the Herdr server has been unreachable/);
+      expect(result.error).not.toContain("exited without a result");
+      const runDirectory = manager.runDirectory(result.id)!;
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
+      expect(fs.existsSync(runDirectory)).toBe(true);
+      expect(await handles[0]!.isAlive()).toBe(true);           // the real worker still runs
+      await manager.close();
+      expect(fs.existsSync(runDirectory)).toBe(true);           // shutdown kept its files
+    } finally {
+      spy.mockRestore();
+      for (const handle of handles) await handle.stop();
+    }
+  }, 30_000);
+
   // review/astra on 3257dba, D1: every settlement path keeps a possibly live worker's evidence.
   const lostOnStop = (launched: Array<{ stop(): Promise<void> }>) => {
     const launch = ProcessTransport.prototype.launch;
@@ -1421,6 +1465,42 @@ describe("AgentManager", () => {
         .toMatch(/Herdr server has been unreachable/);
       await expect(manager.cleanup(handle.id)).rejects.toThrow(path_ === "stop" ? /running agent/ : /lost track of its worker/);
       await expectUnconfirmedClose(manager);
+      expect(fs.existsSync(runDirectory)).toBe(true);
+    } finally {
+      spy.mockRestore();
+      for (const handle of launched) await handle.stop();
+    }
+  }, 30_000);
+
+  it.each(["stop", "deadline"] as const)("preserves modelReason in the persisted terminal record and settlement callback on the %s path", async (path_) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const modelReason = "Astra is required for this stop/timeout audit regression";
+    const settled = vi.fn();
+    const launched: Array<{ stop(): Promise<void> }> = [];
+    const spy = lostOnStop(launched);
+    try {
+      // A request can only extend the configured timeout, so the deadline case configures it.
+      const manager = new AgentManager(process.cwd(), {
+        ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, ...(path_ === "deadline" ? { timeoutMs: 1_500 } : {}),
+      }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+        onSettled: settled,
+      });
+      managers.push(manager);
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process", model: "cliproxyapi/gpt-6-astra", modelReason });
+      const result = path_ === "stop" ? await manager.stop(handle.id) : await manager.wait(handle.id);
+      const status = path_ === "stop" ? "stopped" : "timed_out";
+      expect(result.status).toBe(status);
+      const runDirectory = manager.runDirectory(handle.id)!;
+      const persisted = JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8"));
+      expect.soft(persisted).toMatchObject({ status, modelReason });
+      expect.soft(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: handle.id, status, modelReason }));
+      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8")).reason)
+        .toMatch(/Herdr server has been unreachable/);
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
+      await manager.close();
       expect(fs.existsSync(runDirectory)).toBe(true);
     } finally {
       spy.mockRestore();

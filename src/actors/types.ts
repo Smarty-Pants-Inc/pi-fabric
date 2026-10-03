@@ -229,6 +229,8 @@ export interface FabricActorRequest {
   /** Host-only backend snapshot for persistent/resident sessions; not a provider argument. */
   pythonRuntime?: FabricPythonRuntime;
   model?: string;
+  /** Creation-time model justification retained on actor activation runs. */
+  modelReason?: string;
   thinking?: FabricThinking;
   tools?: string[];
   transport?: FabricAgentTransport;

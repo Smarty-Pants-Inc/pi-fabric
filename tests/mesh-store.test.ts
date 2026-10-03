@@ -732,6 +732,87 @@ describe("MeshStore lock recovery", () => {
     expect(fs.existsSync(lock)).toBe(false);
   }, 30_000);
 
+  it("a rejected default-v1 initializer cleans its own receipt in a recovery-first empty successor while still alive", async () => {
+    const store = createStore({ lockTimeoutMs: 150 });
+    const lock = path.join(store.root, ".lock");
+    const ownerPath = path.join(lock, "owner");
+    const finished = path.join(store.root, "initializer.finished");
+    const signal = (name: string) => fs.writeFileSync(path.join(store.root, name), "");
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-paused-recovery.mjs"), store.root, "initializer", "write", "recovery-first"], {
+      cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", chunk => { stdout += chunk; });
+    child.stderr.on("data", chunk => { stderr += chunk; });
+    const closed = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    closed.catch(() => undefined);
+    try {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(store.root, "initializer.ready"))).toBe(true), { timeout: 10_000, interval: 20 });
+      const original = fs.lstatSync(lock);
+      expect(fs.existsSync(ownerPath)).toBe(false);
+      const past = new Date(Date.now() - 60_000);
+      fs.utimesSync(lock, past, past);
+      const write = fs.writeFileSync.bind(fs);
+      let armed = true;
+      let replacement: fs.Stats | undefined;
+      vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+        if (armed && String(file) === ownerPath) {
+          // Real recovery has removed the empty original and acquired a new directory.
+          // Stop the successor's actual owner create and let the original publish first.
+          armed = false;
+          replacement = fs.lstatSync(lock);
+          signal("initializer.go");
+          const deadline = Date.now() + 10_000;
+          while (!fs.existsSync(finished) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          if (!fs.existsSync(finished)) throw new Error("Timed out awaiting rejected initializer");
+        }
+        return write(file, data, options);
+      });
+      const operation = vi.fn();
+      await expect(store.exclusive(operation)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
+      expect(operation).not.toHaveBeenCalled();
+      expect(replacement).toBeDefined();
+      expect([replacement!.dev, replacement!.ino]).not.toEqual([original.dev, original.ino]);
+      expect(JSON.parse(fs.readFileSync(finished, "utf8"))).toMatchObject({ ran: false, code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
+      expect(fs.existsSync(lock)).toBe(false); // no live rejected receipt can strand this root
+      expect(child.exitCode).toBeNull();
+      expect(process.kill(child.pid!, 0)).toBe(true);
+      const healthy = vi.fn(() => "progress");
+      await expect(store.exclusive(healthy)).resolves.toBe("progress");
+      expect(healthy).toHaveBeenCalledOnce();
+      expect(fs.existsSync(lock)).toBe(false);
+      expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.released."))).toEqual([]);
+    } finally {
+      signal("initializer.go");
+      signal("initializer.release");
+      expect(await closed, stderr).toBe(0); // joined close while root remains owned by this test
+    }
+    expect(JSON.parse(stdout.trim())).toMatchObject({ ran: false, code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
+  }, 30_000);
+
+  it("pre-entry cleanup preserves a changed full receipt even when its token still matches", async () => {
+    const store = createStore();
+    const lock = path.join(store.root, ".lock");
+    const ownerPath = path.join(lock, "owner");
+    const write = fs.writeFileSync.bind(fs);
+    let receipt: string | undefined;
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+      if (String(file) === ownerPath) {
+        const fields = String(data).split("\n");
+        fields[2] = String(Number(fields[2]) + 1); // same token and live PID, different full receipt
+        receipt = fields.join("\n");
+        return write(file, receipt, options);
+      }
+      return write(file, data, options);
+    });
+    const operation = vi.fn();
+    await expect(store.exclusive(operation)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST" });
+    expect(operation).not.toHaveBeenCalled();
+    expect(receipt).toBeDefined();
+    expect(fs.readFileSync(ownerPath, "utf8")).toBe(receipt);
+    expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.released."))).toEqual([]);
+  });
+
   it.each([["write", 1], ["opened", 1], ["write", 2], ["rename", 2]] as const)("a paused native %s publication (protocol %s) preserves exclusion against live owners or successors", async (phase, lockProtocol) => {
     const store = createStore({ lockTimeoutMs: 1_000, ...(lockProtocol === 2 ? { lockProtocol } : {}) });
     const lock = path.join(store.root, ".lock");

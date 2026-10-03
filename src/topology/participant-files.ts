@@ -118,7 +118,8 @@ const holderAlive = async (owner: string): Promise<boolean> => {
   try {
     process.kill(pid, 0);
   } catch (error) {
-    if ((error as { code?: unknown }).code !== "EPERM") return false;
+    // Only ESRCH proves absence. Other probe failures still need native reuse evidence.
+    if ((error as { code?: unknown }).code === "ESRCH") return false;
   }
   // Read once: an unreadable or foreign/torn identity proves nothing about PID reuse.
   if (!owner.endsWith("\n") || !token || !validProcessIncarnation(startTime)) return true;

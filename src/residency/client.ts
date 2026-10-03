@@ -21,6 +21,7 @@ import {
   mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
 } from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
+import { assertResidentWatchdogAdmission } from "./watchdog-admission.js";
 import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
@@ -251,6 +252,7 @@ export class ResidencyClient {
 
   async #startHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
+    assertResidentWatchdogAdmission(this.options.config.residencyRoot);
     this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
     const existing = this.#liveOwner();
@@ -265,6 +267,7 @@ export class ResidencyClient {
       }
       await delay(STATUS_POLL_MS);
     }
+    assertResidentWatchdogAdmission(this.options.config.residencyRoot);
     const followed = this.#liveOwner();
     if (followed) return followed;
     fs.rmSync(this.#errorPath, { force: true });

@@ -16,6 +16,7 @@ interface ResidentHostLaunchContext {
   attempt?: { id: string; kind: "target" | "fallback" };
 }
 import { lockFile, FileLockBusy } from "./file-lock.js";
+import { assertResidentWatchdogAdmission } from "./watchdog-admission.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -460,9 +461,14 @@ export class ResidentHost {
 
   async start(): Promise<void> {
     if (this.#started) return;
+    assertResidentWatchdogAdmission(this.config.residencyRoot);
     await this.#acquireLock();
     this.#started = true;
     try {
+      // The alarm may have latched while the asynchronous fence was acquired.
+      // A free fence is not an attempt-exit receipt: refuse before restoring
+      // actors, starting control or publishing/renewing the host lease.
+      assertResidentWatchdogAdmission(this.config.residencyRoot);
       // Archived runs are read on demand, never walked before the host lease is up.
       // The streaming request collector handles terminal retention after readiness.
       this.#initialize();

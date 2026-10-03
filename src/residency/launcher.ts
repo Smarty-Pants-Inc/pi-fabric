@@ -9,6 +9,7 @@ import crossSpawn from "cross-spawn";
 import { observeResidentOwner } from "./launcher-owner.js";
 import { readHostLease } from "../topology/host-leases.js";
 import { ResidentLauncherWatchdog } from "./launcher-watchdog.js";
+import { assertResidentWatchdogAdmission, latchResidentWatchdogAlarm, RESIDENT_WATCHDOG_BLOCKED } from "./watchdog-admission.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
@@ -148,6 +149,7 @@ async function supervise(configPath: string): Promise<void> {
     if (current) void stopAttempt(current).catch((error) => writeFailure(root, error));
   });
   const start = (spec?: ResidentLaunchSpec, plan?: ResidentHandoverPlan, kind?: "target" | "fallback"): Attempt => {
+    assertResidentWatchdogAdmission(root);
     const launchConfig = spec?.config ?? config;
     const launchEntry = spec?.entry ?? entry;
     const snapshot = spec ? writeLaunchSnapshot(root, spec) : configPath;
@@ -224,7 +226,6 @@ async function supervise(configPath: string): Promise<void> {
       let plan: ResidentHandoverPlan | undefined;
       let custodyFd: number | undefined;
       let inode: fs.Stats | undefined;
-      let watchdogRestart = false;
       while (!attempt.native.exited && !stopping) {
         observe(attempt);
         const state = readHandoverJson<ResidentHandoverState>(handoverPath(root));
@@ -246,9 +247,20 @@ async function supervise(configPath: string): Promise<void> {
             const reason = attempt.watchdog.observe(readyAt, ownLease, zombies);
             if (reason) {
               trace("watchdog-alarm", { pid: childPid, token: own?.token, reason });
-              await stopAttempt(attempt);
-              watchdogRestart = true;
-              break;
+              // Native child exit / sampled ancestry are not whole-attempt
+              // exit proof (#360/#313). Retain the alarm as admission debt BEFORE
+              // releasing this child: neither this launcher nor a reconnecting
+              // client may re-take the lease while escaped helpers may survive.
+              trace("watchdog-restart-blocked", { pid: childPid, reason: "complete attempt exit is unproven" });
+              try {
+                latchResidentWatchdogAlarm(root, { pid: childPid, processStartTime: own?.processStartTime,
+                  launcherPid: process.pid, launcherBirth: launcher.processStartTime, reason });
+              } finally {
+                // Alarm persistence failure is not permission to restart, and
+                // must not bypass the existing owned-child shutdown deadline.
+                await stopAttempt(attempt);
+              }
+              throw new Error(RESIDENT_WATCHDOG_BLOCKED);
             }
           }
         }
@@ -299,11 +311,6 @@ async function supervise(configPath: string): Promise<void> {
       }
       const exit = await attempt.native.exit;
       if (stopping) { if (custodyFd !== undefined) fs.closeSync(custodyFd); return; }
-      if (watchdogRestart && !plan) {
-        trace("watchdog-restart", { previousPid: attempt.child.pid });
-        attempt = start(attempt.spec);
-        continue;
-      }
       if (!plan || !inode) {
         if (!attempt.seenOwner) writeFailure(root, attempt.stderr.trim() || `Pi resident host exited (${exit.signal ?? exit.code ?? "unknown"})`);
         process.exitCode = exit.code ?? 1;

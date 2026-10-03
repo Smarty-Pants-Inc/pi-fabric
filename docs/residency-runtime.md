@@ -53,6 +53,29 @@ and reconnection.
 The host exits after its normal idle grace once it owns no live durable actor or
 running durable agent.
 
+### Watchdog alarm: no automatic successor without complete exit proof
+
+The launcher alarms after three stale lease-renewal intervals or a persistently
+unreaped direct child. It retains owned-child TERM/KILL and native-exit joining,
+but **does not restart**: sampled ancestry, process-group cleanup, native parent
+exit and a free host fence cannot prove the exit of every attempt-owned helper.
+This follows worker stop's existing rule that uncertain descendant exit retains
+admission debt; no new process tracker or containment claim is introduced.
+
+Before stopping the alarmed child, the launcher durably latches
+`watchdog-alarm.json` in the residency root. The launcher, reconnecting residency
+client and direct host startup all refuse admission while that marker exists.
+The host checks again after acquiring its fence, before restoring actors or
+publishing its lease. Corrupt/unreadable markers also fail closed. Nothing in
+cold-start retry, native shutdown or lease expiry clears the alarm. Ordinary
+unalarmed cold start and the existing shutdown deadlines are unchanged.
+
+Recovery requires the existing explicit installer drain and complete descendant
+exit proof before an operator removes the alarm marker. Removing it merely
+because the parent exited or the lease expired is unsafe. Automatic watchdog
+recovery remains unavailable until attempt-owned containment and checked exit
+receipts cover detached/reparented descendants.
+
 ## Validation
 
 Run:

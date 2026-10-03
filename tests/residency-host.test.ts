@@ -21,6 +21,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
+import { residentWatchdogAlarmPath, latchResidentWatchdogAlarm, RESIDENT_WATCHDOG_BLOCKED } from "../src/residency/watchdog-admission.js";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -41,6 +42,52 @@ const fixture = () => {
   const host = new ResidentHost(config, idle);
   return { root, config, host, idle };
 };
+
+describe("resident watchdog fail-closed admission (F1)", () => {
+  it.skipIf(process.platform !== "linux")("rechecks an alarm latched during asynchronous fence acquisition before restoring actors", async () => {
+    const { root, config, host } = fixture();
+    // lockFile yields before its native flock helper settles; latch during that
+    // yield to exercise the final admission check, not only the entry precheck.
+    const starting = host.start();
+    latchResidentWatchdogAlarm(config.residencyRoot, { reason: "stale-lease" });
+    try {
+      await expect(starting).rejects.toThrow(RESIDENT_WATCHDOG_BLOCKED);
+      expect(host.actors).toBeUndefined();
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      expect(fs.existsSync(path.join(config.meshRoot, "host-leases"))).toBe(false);
+      expect(fs.existsSync(residentWatchdogAlarmPath(config.residencyRoot))).toBe(true);
+      // The rejection releases the fence rather than leaving a live lock helper.
+      const fd = await lockFile(path.join(config.residencyRoot, "host.lock"), 0, true);
+      fs.closeSync(fd);
+    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["latched", "torn", "directory"] as const)("blocks client and host startup with a %s alarm, without renewing the lease", async mode => {
+    const { root, config, host } = fixture();
+    const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: "caller", rootId: config.rootId, identity: { id: "caller", name: "caller", kind: "main" } });
+    const client = new ResidencyClient({ config, mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
+    const alarmPath = residentWatchdogAlarmPath(config.residencyRoot);
+    if (mode === "latched") latchResidentWatchdogAlarm(config.residencyRoot, { reason: "stale-lease" });
+    else if (mode === "torn") fs.writeFileSync(alarmPath, "{");
+    else fs.mkdirSync(alarmPath);
+    const errorPath = path.join(config.residencyRoot, "error.json");
+    fs.writeFileSync(errorPath, '{"error":"prior alarm must survive"}');
+    const alarmBefore = mode === "directory" ? undefined : fs.readFileSync(alarmPath, "utf8");
+    try {
+      await expect(client.ensureHost()).rejects.toThrow(RESIDENT_WATCHDOG_BLOCKED);
+      await expect(client.ensureHost()).rejects.toThrow(RESIDENT_WATCHDOG_BLOCKED); // client retry cannot clear debt
+      await expect(host.start()).rejects.toThrow(RESIDENT_WATCHDOG_BLOCKED); // direct host cannot bypass launcher
+      expect(host.actors).toBeUndefined(); // persisted actor work was not restored
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+      expect(fs.existsSync(path.join(config.residencyRoot, "launcher.log"))).toBe(false);
+      expect(fs.existsSync(path.join(config.residencyRoot, "host.lock"))).toBe(false);
+      expect(fs.existsSync(path.join(config.meshRoot, "host-leases"))).toBe(false);
+      expect(fs.readFileSync(errorPath, "utf8")).toBe('{"error":"prior alarm must survive"}');
+      if (alarmBefore !== undefined) expect(fs.readFileSync(alarmPath, "utf8")).toBe(alarmBefore);
+    } finally { await client.close(); await host.close(); await participants.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
 
 describe("#3662 resident actor delivery routing", () => {
   it.each(["read-denied", "stat-denied", "invalid-json", "invalid-envelope", "invalid-participant"] as const)(

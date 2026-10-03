@@ -1,3 +1,4 @@
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,10 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
+import * as runScratch from "../src/storage/run-scratch.js";
+import { pruneActorRunArchives } from "../src/storage/retention.js";
+import { UNSCOPED_SCRATCH_RETENTION_MS } from "../src/storage/scratch-process-census.js";
+import { scratchEvidence } from "./scratch-evidence.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 const waitFor = async (predicate: () => boolean, ms = 5_000) => {
@@ -142,6 +147,7 @@ describe("round-four launch-preparation recovery (#3167)", () => {
   const scenarios = [false, true].flatMap((queued) => [false, true].flatMap((recreate) =>
     (["text", "directive"] as const).map((responseMode) => ({ queued, recreate, responseMode }))));
   it.each(scenarios)("durably retries confirmed-unlaunched auth (queued=$queued, recreate=$recreate, mode=$responseMode) exactly once", async ({ queued, recreate, responseMode }) => {
+    const allocations = vi.spyOn(runScratch, "allocateRunTmpDirectory");
     const gate = deferred<void>();
     let calls = 0;
     let resolved = false;
@@ -213,7 +219,92 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     expect(actors.status(actor.id).preparing).toBeUndefined();
     expect(fs.readdirSync(directory).filter((file) => file.startsWith("queue-"))).toEqual([]);
     expect(agents.list().filter((run) => run.actorId === actor.id && run.status === "running")).toEqual([]);
-    expect(fs.readdirSync(path.join(root, recreate ? "recreated-runs" : "runs"))).toHaveLength(recreate ? 0 : queued ? 2 : 1);
+    const runsDirectory = path.join(root, recreate ? "recreated-runs" : "runs");
+    const runId = actors.status(actor.id).lastRunId!;
+    expect(runId).toBeTruthy();
+    const runDirectory = path.join(runsDirectory, runId);
+    const allocationIndex = allocations.mock.calls.findIndex(([directory]) => directory === runDirectory);
+    expect(allocationIndex).toBeGreaterThanOrEqual(0);
+    const allocation = allocations.mock.results[allocationIndex]!;
+    expect(allocation.type).toBe("return");
+    expect(allocation.value.directory).toBe(path.join(runDirectory, "tmp"));
+    const otherRuns = recreate ? 0 : queued ? 2 : 1;
+    if (allocation.value.scope) {
+      // A joined native scope proves complete descendant exit immediately.
+      expect(fs.existsSync(runDirectory)).toBe(false);
+      expect(fs.readdirSync(runsDirectory)).toHaveLength(otherRuns);
+      scratchEvidence(`actor-auth-${queued}-${recreate}-${responseMode}`, { containment: "native scoped",
+        scope: allocation.value.scope, runId, runRemovedImmediately: true });
+    } else {
+      // D4: native worker close is a generation receipt, not descendant proof.
+      expect(fs.readdirSync(runsDirectory)).toHaveLength(otherRuns + 1);
+      expect(fs.existsSync(path.join(runDirectory, "tmp"))).toBe(true);
+      const fenceFile = path.join(runDirectory, runScratch.UNRESOLVED_SCRATCH_FILE);
+      const fence = JSON.parse(fs.readFileSync(fenceFile, "utf8"));
+      const status = JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8"));
+      expect(agents.status(runId)).toMatchObject({ actorId: actor.id, status: "completed" });
+      expect(status).toMatchObject({ id: runId, status: "completed", transport: "process" });
+      expect(fence).toMatchObject({ version: 3, runDirectory, closedPid: Number(status.sessionId),
+        root: { dev: fs.statSync(runDirectory).dev, ino: fs.statSync(runDirectory).ino },
+        scratch: { dev: fs.statSync(path.join(runDirectory, "tmp")).dev, ino: fs.statSync(path.join(runDirectory, "tmp")).ino } });
+      expect(fence.scope).toBeUndefined();
+      expect(fence.launchNonce).toEqual(expect.any(String));
+      expect(fence.launchNonce.length).toBeGreaterThan(0);
+      expect(fence.lastLaunchAt).toBeGreaterThanOrEqual(fence.allocatedAt);
+      expect(fence.closedAt).toBeGreaterThanOrEqual(fence.lastLaunchAt);
+      expect(fence.hostEpoch.platform).toBe(process.platform);
+      expect(() => process.kill(fence.closedPid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+
+      // Isolate the complete parsed census from unrelated fleet processes. Do
+      // not mock worker liveness, boot identity, or the collector's proof gate.
+      const nativeExec = childProcess.execFileSync;
+      let holder = false;
+      let censusCalls = 0;
+      const census = vi.spyOn(childProcess, "execFileSync").mockImplementation((file, args, options) => {
+        if (file !== "/bin/ps" && !(options as childProcess.ExecFileSyncOptions)?.env?.PI_FABRIC_CENSUS_PID) {
+          return nativeExec(file, args, options as childProcess.ExecFileSyncOptions);
+        }
+        censusCalls++;
+        if (process.platform === "win32") return JSON.stringify([
+          { pid: process.pid, ppid: process.ppid, birth: fence.allocatedAt - 60_000, zombie: false, query: false },
+          ...(holder ? [{ pid: fence.closedPid, ppid: process.pid, birth: fence.allocatedAt, zombie: false, query: false }] : []),
+        ]) as never;
+        const birth = (at: number) => new Date(at).toUTCString()
+          .replace(/^(\w+), (\d+) (\w+) (\d+) (.*) GMT$/, "$1 $3 $2 $5 $4");
+        return `${process.pid} ${process.ppid} ${process.getuid!()} S ${birth(fence.allocatedAt - 60_000)} node\n` +
+          (holder ? `${fence.closedPid} ${process.pid} ${process.getuid!()} S ${birth(fence.allocatedAt)} node\n` : "") as never;
+      });
+      const clock = vi.spyOn(Date, "now");
+      const collect = () => pruneActorRunArchives({ runsDirectory, retentionMs: 1 });
+      const retained = () => {
+        expect(collect()).not.toContain(runDirectory);
+        expect(fs.existsSync(path.join(runDirectory, "tmp"))).toBe(true);
+        expect(JSON.parse(fs.readFileSync(fenceFile, "utf8"))).toEqual(fence);
+      };
+      try {
+        retained(); // Even an empty holder population cannot bypass the age gate.
+        expect(censusCalls).toBe(0);
+        const ageGate = Math.max(fence.lastLaunchAt, fence.closedAt, status.finishedAt) + UNSCOPED_SCRATCH_RETENTION_MS;
+        clock.mockReturnValue(ageGate - 1);
+        retained();
+        // Older healthy/blocker siblings may already be due for collection.
+        censusCalls = 0;
+        clock.mockReturnValue(ageGate + 1);
+        holder = true;
+        retained(); // Age alone cannot bypass a potential surviving descendant.
+        expect(censusCalls).toBeGreaterThan(0);
+        holder = false;
+        censusCalls = 0;
+        expect(collect()).toContain(runDirectory);
+        expect(censusCalls).toBeGreaterThanOrEqual(2);
+        expect(fs.existsSync(runDirectory)).toBe(false);
+        scratchEvidence(`actor-auth-${queued}-${recreate}-${responseMode}`, { containment: "unscoped", runId, fence,
+          runRetainedImmediately: true, retainedBelowAgeGate: true, retainedWithPotentialHolder: true,
+          workerPidConfirmedAbsent: true, runRemovedAfterAgeAndEmptyCensus: true, finalCensusCalls: censusCalls,
+          retentionClock: "injected Date.now past 24-hour gate, not actual 24-hour elapsed time",
+          census: "isolated complete parsed census fixture; native worker liveness and boot identity unchanged" });
+      } finally { clock.mockRestore(); census.mockRestore(); }
+    }
   });
 
   it.each([false, true])("exhausts the preparation retry budget in one terminal failure and one alarm (queued: %s)", async (queued) => {

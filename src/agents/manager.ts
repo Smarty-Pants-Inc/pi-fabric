@@ -1609,11 +1609,17 @@ export class AgentManager {
       consumed();
       return result;
     }
+    const result = this.#settledResult(managed);
+    consumed();
+    return result;
+  }
+
+  /** Observe a settled outcome, independently of foreground consumption receipts. */
+  #settledResult(managed: ManagedAgent): AgentRunResult {
     const record = readRecord(managed.statusFile) ?? managed.latestRecord;
     if (!record || !terminalStatuses.has(record.status)) {
-      throw new Error(`Agent ${id} settled without a result`);
+      throw new Error(`Agent ${managed.id} settled without a result`);
     }
-    consumed();
     return this.#withTransportMetadata(record, managed) as AgentRunResult;
   }
 
@@ -1891,6 +1897,11 @@ export class AgentManager {
   }
 
   async stop(id: string): Promise<AgentRunResult> {
+    return this.#stop(id, true);
+  }
+
+  /** Internal close joins execution custody without acknowledging an actor result. */
+  async #stop(id: string, consumeSettled: boolean): Promise<AgentRunResult> {
     const queued = this.#queued.get(id);
     if (queued) {
       queued.background = false;
@@ -1898,7 +1909,7 @@ export class AgentManager {
       await queued.pending;
       // Admission may have promoted this queued receipt while stop was joining
       // launch. Join its installed execution fence, not a terminal queue fallback.
-      if (this.#runs.has(id)) return this.stop(id);
+      if (this.#runs.has(id)) return this.#stop(id, consumeSettled);
       if (queued.cleanupPending) throw new Error(`Agent ${id} execution exit unconfirmed; custody retained: ${queued.cleanupPending}`);
       return queued.result;
     }
@@ -1911,7 +1922,7 @@ export class AgentManager {
     const existing = readRecord(managed.statusFile);
     // Even a settled/terminal run may still own a detached execution group.
     await this.#drainExecution(managed);
-    if (managed.settled) return this.wait(id);
+    if (managed.settled) return consumeSettled ? this.wait(id) : this.#settledResult(managed);
     managed.background = false;
     const terminal = readRecord(managed.statusFile);
     // A force-killed worker (notably on Windows) may leave only running status.
@@ -2157,11 +2168,11 @@ export class AgentManager {
     const running = tracked.filter((managed) => !managed.settled);
     const lastEventAt = new Map(running.map((managed) => [managed.id, lastEventTime(managed)]));
     const stopped = await Promise.allSettled([
-      ...tracked.map((managed) => this.stop(managed.id)),
+      ...tracked.map((managed) => this.#stop(managed.id, false)),
       ...[...this.#unregisteredTransports].map(async (transport) => {
         if (!await this.#stopUnregisteredTransport(transport)) throw new Error("Unregistered execution exit unconfirmed");
       }),
-      ...queuedAtClose.map((queued) => this.stop(queued.info.id)),
+      ...queuedAtClose.map((queued) => this.#stop(queued.info.id, false)),
     ]);
     // A reload or shutdown ends these runs; tell the spawner's session (smarty-dev#1602).
     const results = stopped.flatMap((outcome) =>

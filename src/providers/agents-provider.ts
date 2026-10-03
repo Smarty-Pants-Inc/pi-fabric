@@ -1282,6 +1282,8 @@ export class AgentsProvider implements FabricProvider {
           "steer",
           context,
         );
+      case "cancelFollowUp":
+        return this.manager.cancelFollowUp(String(args.id), String(args.messageId));
       case "followUp":
         return this.routeMessage(
           String(args.id),
@@ -1289,6 +1291,7 @@ export class AgentsProvider implements FabricProvider {
           args.data,
           "followUp",
           context,
+          { ...(typeof args.deadlineMs === "number" ? { deadlineMs: args.deadlineMs } : {}) },
         );
       case "setSteeringMode":
         return this.manager.setSteeringMode(String(args.id), this.#steeringMode(args.mode));
@@ -1609,6 +1612,7 @@ export class AgentsProvider implements FabricProvider {
       from?: MeshIdentity;
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
+      deadlineMs?: number;
     } = {},
   ): Promise<FabricAgentMessageResult> {
     // Host-authored lifecycle routing has no sender invocation/history. Check

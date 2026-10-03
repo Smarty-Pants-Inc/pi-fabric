@@ -95,6 +95,54 @@ afterEach(async () => {
 });
 
 describe("LifecycleBroker", () => {
+  it("3864 retains an awaited delivery receipt without advancing a cursor after lease loss", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-lifecycle-lease-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    let leased = true;
+    const deliver = vi.fn(async () => { await Promise.resolve(); leased = false; });
+    const broker = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
+      { enabled: true, pollMs: 20, maxReadEvents: 100, canConsumeMesh: () => leased }, deliver);
+    brokers.push(broker);
+    const sub = await broker.subscribe({ from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false });
+    broker.start();
+    await mesh.publish({ topic: FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, kind: "pi.agent_settled", from: sourceIdentity,
+      data: { version: 1, event: "pi.agent_settled", source, occurredAt: 42 } });
+    await waitFor(() => deliver.mock.calls.length === 1);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(broker.list()[0]?.afterSequence).toBe(sub.afterSequence);
+    leased = true;
+    await waitFor(() => broker.list()[0]?.afterSequence === mesh.latestSequence());
+    expect(deliver).toHaveBeenCalledOnce();
+  });
+  it.each([false, true])("3864 fences the cursor/once receipt under the commit lock after lease loss (once=%s)", async once => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-lifecycle-commit-lease-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    let leased = true;
+    const deliver = vi.fn();
+    const broker = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
+      { enabled: true, pollMs: 20, maxReadEvents: 100, canConsumeMesh: () => leased }, deliver);
+    brokers.push(broker);
+    const sub = await broker.subscribe({ from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false, once });
+    const write = mesh.writeBatch.bind(mesh);
+    const waiting = vi.spyOn(mesh, "writeBatch").mockImplementation(async input => {
+      // Renewal fails while cursor persistence is waiting for its mesh lock.
+      leased = false;
+      return write(input);
+    });
+    broker.start();
+    await mesh.publish({ topic: FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, kind: "pi.agent_settled", from: sourceIdentity,
+      data: { version: 1, event: "pi.agent_settled", source, occurredAt: 42 } });
+    await waitFor(() => deliver.mock.calls.length === 1);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(broker.list()).toHaveLength(1);
+    expect(broker.list()[0]?.afterSequence).toBe(sub.afterSequence);
+    waiting.mockRestore(); leased = true;
+    await waitFor(() => once ? broker.list().length === 0 : broker.list()[0]?.afterSequence === mesh.latestSequence());
+    expect(deliver).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])("blocks release on an unconfirmed delivered cursor/once deletion without replay (once=%s)", async (once) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-")); roots.push(root);
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);

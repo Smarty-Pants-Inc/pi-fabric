@@ -4,6 +4,7 @@ import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
+import { copyFabricProvenance } from "../fabric-provenance.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -199,6 +200,32 @@ const runFiles = new Set([
   "session.jsonl",
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
+const followUpName = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
+/** Only paired, owned admission/final-receipt artifacts authorize collection.
+ * A passed alarm deadline is not expiry of the payload: the sender may wait.
+ * Queued, crashed claims, malformed state, links and unknown contents veto. */
+const safeFollowUps = (directory: string, expired: Deadline): boolean => {
+  const names = fs.readdirSync(directory);
+  for (const name of names) {
+    if (expired()) return false;
+    const admissionName = name.endsWith(".settled") ? name.slice(0, -8) : name;
+    if (!followUpName.test(admissionName)) return false;
+    const file = path.join(directory, admissionName);
+    const admission = readJson<{ messageId?: unknown; deadlineAt?: unknown }>(file, 4096);
+    if (!admission || admission.messageId !== admissionName.slice(0, -5) ||
+        !Number.isSafeInteger(admission.deadlineAt) || (admission.deadlineAt as number) < 0 ||
+        Object.keys(admission).some(key => key !== "messageId" && key !== "deadlineAt")) return false;
+    const settled = file + ".settled";
+    if (!ownedStat(settled)?.isDirectory()) return false;
+    const contents = fs.readdirSync(settled);
+    if (contents.length !== 1 || contents[0] !== "state") return false;
+    const stateFile = path.join(settled, "state"), stat = ownedStat(stateFile);
+    if (!stat?.isFile() || stat.size > 9) return false;
+    const state = fs.readFileSync(stateFile, "utf8");
+    if (state !== "delivered" && state !== "cancelled") return false;
+  }
+  return true;
+};
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
@@ -230,16 +257,23 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
         continue;
       }
+      if (stat.isDirectory() && name === "follow-ups") {
+        if (!safeFollowUps(file, expired)) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "deliveries") {
-        // The worker always creates this ingress directory; the native Pi hook
-        // unlinks consumed items. Any remaining item is pending or unknown,
-        // even when it has a known filename or valid JSON: keep the whole run.
-        if (fs.readdirSync(file).length !== 0) return false;
-        // Only the worker's UUID-addressed private delivery envelopes are ours.
-        // Empty directories are normal; unknown content, links and non-files veto.
-        for (const child of fs.readdirSync(file)) {
-          if (expired() || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/.test(child) ||
-              !ownedStat(path.join(file, child))?.isFile()) return false;
+        // Empty ingress is normal. A final tracked receipt also authorizes
+        // its owned envelope: a crash can fall between receipt write and unlink.
+        // Anonymous, pending, uncertain, malformed or linked content still vetoes.
+        const children = fs.readdirSync(file);
+        const followUps = path.join(root, "follow-ups");
+        if (children.length && (!ownedStat(followUps)?.isDirectory() || !safeFollowUps(followUps, expired))) return false;
+        for (const child of children) {
+          if (expired() || !followUpName.test(child) || !ownedStat(path.join(followUps, child))?.isFile()) return false;
+          const item = readJson<{ message?: unknown; delivery?: unknown; followUpId?: unknown; provenance?: unknown }>(path.join(file, child));
+          if (!item || item.delivery !== "followUp" || item.followUpId !== child.slice(0, -5) ||
+              typeof item.message !== "string" || !copyFabricProvenance(item.provenance) ||
+              Object.keys(item).some(key => !["message", "delivery", "followUpId", "provenance"].includes(key))) return false;
         }
         continue;
       }

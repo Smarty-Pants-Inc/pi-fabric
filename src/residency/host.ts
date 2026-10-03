@@ -41,6 +41,7 @@ import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mes
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
+import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
@@ -229,6 +230,7 @@ export class ResidentHost {
   readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
+  #ready = false;
   #idleSince = Date.now();
   #admissions = 0;
   readonly #requestRetention: ResidentRequestRetention;
@@ -239,7 +241,7 @@ export class ResidentHost {
   #reloadEvent: Promise<unknown> | undefined;
   readonly #publications = new Set<Promise<unknown>>();
   #effectiveConfig: (() => ResidentHostConfig) | undefined;
-  readonly #retention: ResidentHostConfig["retention"];
+  readonly #retention: ResidentHostConfig["retention"] & { retainRuns: boolean };
 
   constructor(
     readonly config: ResidentHostConfig,
@@ -261,9 +263,10 @@ export class ResidentHost {
     this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
     // All resident collectors share one mutable policy, not the constructor's
     // config snapshot (nor the process-wide default object).
-    this.#retention = { ...config.retention };
+    this.#retention = { ...config.retention, retainRuns: config.agents.retainRuns };
     this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
-      [...new Set(Object.values(residentActorRoots(config)))], this.#retention);
+      [...new Set(Object.values(residentActorRoots(config)))], this.#retention,
+      (directory) => { this.agents.recoverPendingArchives(directory); });
   }
 
   #initialize(): void {
@@ -282,6 +285,7 @@ export class ResidentHost {
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
       bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
+      canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
@@ -467,7 +471,9 @@ export class ResidentHost {
         ));
       },
       {
-        releasePaused: this.#staged,
+        // Restoration must not launch queued work until owner and readiness publication commit.
+        releasePaused: true,
+        canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
         persistent: true,
         canManageActor,
         lineageAlive,
@@ -498,6 +504,7 @@ export class ResidentHost {
         enabled: true,
         pollMs: config.mesh.actorPollMs,
         maxReadEvents: config.mesh.maxReadEvents,
+        canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
       },
       (subscription, event) => this.#deliverLifecycle(subscription, event),
     );
@@ -508,15 +515,10 @@ export class ResidentHost {
     await this.#acquireLock();
     this.#started = true;
     try {
+      // Archived runs are read on demand, never walked before the host lease is up.
+      // The streaming request collector replays pending full archives before
+      // terminal retention after readiness. Failed sinks retain their sources.
       this.#initialize();
-      // Replay the original full archive under the new host fence before any
-      // orphan collection. Failed sinks keep their marker and source intact.
-      this.agents.recoverPendingArchives();
-      sweepResidentRuns(path.join(this.config.residencyRoot, "runs"), Date.now(), 100, {
-        ...this.config.retention,
-        actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
-        retainRuns: this.config.agents.retainRuns,
-      });
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
@@ -550,6 +552,12 @@ export class ResidentHost {
         this.#acceptControl(command, from, signal, verification));
       if (this.#staged) this.control.pause();
       await this.participants.start().catch(() => undefined);
+      // A publication failure is not readiness. Keep this same start pending,
+      // with requests/events untouched, until a real locked renewal confirms it.
+      while (!this.participants.canConsumeMesh()) {
+        if (this.#closed) throw new Error(HOST_CLOSING_RETRY);
+        await delay(20);
+      }
       this.lifecycle.start();
       if (this.#staged) {
         this.lifecycle.pause();
@@ -572,6 +580,7 @@ export class ResidentHost {
         token: this.#token,
         startedAt: now,
         readyAt: now,
+        maintenanceReady: 1, // client requires the same-token startup receipt before business admission
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
         callerBoundSpawn: 1,
@@ -583,15 +592,23 @@ export class ResidentHost {
       };
       atomicWrite(this.#ownerPath, owner);
       fs.rmSync(this.#errorPath, { force: true });
+      // The originating client may cancel this owned attempt until it sees the
+      // required receipt. Commit it BEFORE opening any business gate or resuming
+      // restored queues: publication failure/timeout must remain a non-serving
+      // start, not shutdown of work that may already have escaped the attempt.
+      atomicWrite(path.join(this.config.residencyRoot, "maintenance-ready.json"), { token: this.#token, readyAt: now });
+      // No fallible/awaited startup work remains. Accepted backlog is untouched
+      // on failure; maintenance/collection stays on normal post-readiness ticks.
+      this.#ready = true;
       // Removals a previous host accepted: their runs ended with it.
       if (!this.#staged) {
-      void this.#backgroundDeliveries.enqueue(async () => {
-        await this.actors.finishPendingRemovals();
-        this.#writeRemovals();
-      });
-      void this.#retryDeliveries();
+        this.actors.resumeAfterRelease();
+        void this.#backgroundDeliveries.enqueue(async () => {
+          await this.actors.finishPendingRemovals();
+          this.#writeRemovals();
+        });
+        void this.#retryDeliveries();
       }
-      await this.#pollRequests();
     } catch (error) {
       await this.close();
       throw error;
@@ -638,6 +655,7 @@ export class ResidentHost {
     if (this.#closed || this.#staged || this.#handover) {
       return { accepted: false, error: HOST_CLOSING_RETRY };
     }
+    assertMeshConsumption(() => this.participants.canConsumeMesh());
     this.#admissions++;
     try { return await this.#handleControl(command, from, signal, verification); }
     finally { this.#admissions--; }
@@ -726,9 +744,11 @@ export class ResidentHost {
       // Validate now without turning the resolved owner defaults into per-call overrides.
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
+      assertMeshConsumption(() => this.participants.canConsumeMesh());
       const result = this.actors.tell(command.targetId, message, command.data, { provenance, ...options });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
+      if (error instanceof MeshConsumptionPausedError) throw error;
       return { accepted: false, error: errorMessage(error) };
     }
   }
@@ -738,6 +758,7 @@ export class ResidentHost {
     event: FabricLifecycleEvent,
   ): Promise<void> {
     if (this.#closed || this.#staged || this.#handover) throw new Error(HOST_CLOSING_RETRY);
+    assertMeshConsumption(() => this.participants.canConsumeMesh());
     this.#admissions++;
     try { await this.#handleLifecycle(subscription, event); }
     finally { this.#admissions--; }
@@ -862,7 +883,7 @@ export class ResidentHost {
   }
 
   async #pollRequests(): Promise<void> {
-    if (this.#pollingRequests || this.#closed) return;
+    if (!this.#ready || this.#pollingRequests || this.#closed) return;
     if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
@@ -909,7 +930,7 @@ export class ResidentHost {
 
   #maintainRequests(): void {
     const now = Date.now();
-    if (this.#closed || !this.#requestRetention.due(now)) return;
+    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh() || !this.#requestRetention.due(now)) return;
     // ensureHost/syncPiModels already publishes reloads to config.json. Apply
     // only the same-release/root/session overlay at the next existing sweep;
     // actor archives and agent collectors hold this same policy object.

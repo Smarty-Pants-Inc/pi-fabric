@@ -38,6 +38,19 @@ function setup(cursor?: string) {
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 
 describe("ActorMeshMonitor", () => {
+  it("3864 holds the event boundary when the lease is lost during dispatch", async () => {
+    const s = setup('{"format":1,"cursor":3}');
+    let leased = true;
+    Object.assign(s.monitor.callbacks, { canConsumeMesh: () => leased });
+    s.onEvent.mockImplementation(() => { leased = false; });
+    s.monitor.start(); await flush();
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(3);
+    leased = true;
+    s.onEvent.mockImplementation(() => true);
+    s.monitor.schedule(); await flush();
+    expect(s.onEvent).toHaveBeenCalledTimes(2); // owner deduplication handles replay
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(20);
+  });
   it("does not persist a cursor when disabled or never started", () => {
     const disabled = setup();
     disabled.monitor.config.enabled = false;

@@ -833,7 +833,7 @@ export class FabricRuntimeState {
     // resumed root either wins this fence, or loads only prune's committed registry.
     // Keep it for the runtime's lifetime: lease expiry is never proof of process death.
     const releaseMainStartup = ownsPersistentActorRegistry
-      ? await acquireNativeMainStartupFence(meshRoot, mainAgentId)
+      ? await acquireNativeMainStartupFence(meshRoot, mainAgentId, [actorRoots.project, actorRoots.session])
       : undefined;
     try {
       if (mainAgent.local) {

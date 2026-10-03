@@ -2,9 +2,23 @@
 // shutdown: the parent stops heartbeats with SIGSTOP, then checks native SIGKILL exit.
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { FabricRuntimeState } from "../../src/fabric-runtime-state.js";
-import { CapturedToolCatalog } from "../../src/capture/catalog.js";
-import { normalizeFabricConfig } from "../../src/config.js";
+import { pathToFileURL } from "node:url";
+// A local git-archive of the actual merge-base runtime exercises mixed-version admission.
+const legacy = process.argv[4] === "legacy";
+const source = legacy ? process.env.PI_FABRIC_PRUNE_LEGACY_SOURCE : undefined;
+if (legacy && !source) {
+  // Previous native admission had neither a lifetime fence nor root-bound identity.
+  // Keep a fully initialized real Main; omit only that new admission protocol.
+  const builtin: string = "bun:test";
+  const { mock } = await import(builtin) as { mock: { module: (file: string, factory: () => object) => void } };
+  mock.module(path.resolve("src/residency/main-startup-fence.ts"), () => ({
+    acquireNativeMainStartupFence: async () => () => {},
+  }));
+}
+const load = (file: string) => import(source ? pathToFileURL(path.join(source, "src", file)).href : `../../src/${file}`);
+const { FabricRuntimeState } = await load("fabric-runtime-state.js") as typeof import("../../src/fabric-runtime-state.js");
+const { CapturedToolCatalog } = await load("capture/catalog.js") as typeof import("../../src/capture/catalog.js");
+const { normalizeFabricConfig } = await load("config.js") as typeof import("../../src/config.js");
 
 const [root, meshRoot] = process.argv.slice(2) as [string, string];
 process.env.PI_CODING_AGENT_DIR = path.join(root, "agent");

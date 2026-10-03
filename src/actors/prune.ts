@@ -7,7 +7,7 @@ import { residentRoot } from "../residency/protocol.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { assertPruneOwnershipDead } from "../topology/prune-ownership.js";
 import { FileLockBusy, kernelFenceAvailable, lockFile } from "../residency/file-lock.js";
-import { nativeMainStartupLock } from "../residency/main-startup-fence.js";
+import { nativeMainProcessRecord, nativeMainStartupLock } from "../residency/main-startup-fence.js";
 import { ActorRegistryStore } from "./registry-store.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -47,6 +47,50 @@ const residentFence = async <T>(mesh: MeshStore, root: string, dryRun: boolean,
   let fd: number | undefined;
   let mainFd: number | undefined;
   const mainLocked = nativeMainStartupLock(mesh.root, root);
+  const checkMainProcess = () => {
+    const file = nativeMainProcessRecord(mesh.root, root);
+    let owner: Record<string, unknown> | undefined;
+    try {
+      if (!fs.lstatSync(file).isFile()) unknown("invalid native Main process identity");
+      owner = record(read(file));
+    } catch { unknown("missing or unreadable native Main process identity"); }
+    if (owner?.format !== 1 || owner.meshRoot !== mesh.root || owner.rootId !== root ||
+        !Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0 || Number(owner.pid) > 2_147_483_647 ||
+        typeof owner.processStartTime !== "string" || !/^\d+$/.test(owner.processStartTime) ||
+        typeof owner.bootId !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(owner.bootId)) {
+      unknown("invalid native Main process identity custody");
+    }
+    if (owner!.legacyOwnershipUnknown !== undefined && owner!.legacyOwnershipUnknown !== false) {
+      unknown("native Main process identity has unknown legacy ownership");
+    }
+    if (process.platform !== "linux") unknown("native Main process identity unavailable on this platform");
+    let bootId: string;
+    try { bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(); }
+    catch { return unknown("unreadable native Main boot identity"); }
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(bootId)) unknown("invalid native Main boot identity");
+    // A previous boot or a positively read different incarnation proves the recorded process gone.
+    if (bootId !== owner!.bootId) return;
+    const pid = Number(owner!.pid);
+    let stat: string;
+    try { stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") unknown(`unreadable native Main process ${pid}`);
+      // ENOENT alone can hide a live process (hidepid). Demand ESRCH as well.
+      try { process.kill(pid, 0); }
+      catch (probe) {
+        if ((probe as NodeJS.ErrnoException).code === "ESRCH") return;
+        return unknown(`unreadable native Main process ${pid}`);
+      }
+      return unknown(`unreadable native Main process ${pid}`);
+    }
+    const started = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+    if (!stat.startsWith(`${pid} (`) || stat.lastIndexOf(")") < 0 || !started || !/^\d+$/.test(started)) {
+      unknown(`invalid native Main process ${pid}`);
+    }
+    if (started === owner!.processStartTime) {
+      throw new Error(`Cannot prune live lineage ${root}: native Main process is live`);
+    }
+  };
   const checkOwner = () => {
     if (mainFd !== undefined) {
       const held = fs.fstatSync(mainFd);
@@ -84,9 +128,10 @@ const residentFence = async <T>(mesh: MeshStore, root: string, dryRun: boolean,
       if (process.platform !== "linux" || owner!.processStartTime === undefined ||
           started === undefined || started === owner!.processStartTime) refuse();
     }
+    checkMainProcess();
   };
-  checkOwner();
   if (!dryRun && !kernelFenceAvailable()) unknown("resident startup fence unavailable; destructive prune requires Linux flock/setpriv");
+  checkOwner();
   try {
     // Native Main keeps main-start.lock for its lifetime, independently of host.lock.
     // Probe an existing resident inode without creating anything first. Do not create

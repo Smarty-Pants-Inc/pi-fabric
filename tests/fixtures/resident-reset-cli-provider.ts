@@ -39,6 +39,41 @@ const after = await agents.actorStatus({ id: actor.id });
 return { actor, before, reset, after, retainedMessages, messages };
 `;
 
+const cancelCode = `
+const actor = await agents.create({ name: "cancel-reset-proof", instructions: "KEEP_PERSONA: hold the admitted activation until cancelled.",
+  residency: "durable", transport: "process", model: "resident-reset-proof/offline", thinking: "off", tools: [], extensions: true,
+  events: [], topics: [], delivery: "mailbox", triggerTurn: false, responseMode: "text", inferenceContext: "full-history" });
+const other = await agents.create({ name: "unrelated-reset-proof", instructions: "Keep responding", residency: "durable", model: "resident-reset-proof/offline",
+  tools: [], events: [], topics: [], delivery: "mailbox", triggerTurn: false });
+await agents.tell({ id: actor.id, message: "HELD_EVENT" });
+let active;
+for (let attempt = 0; attempt < 200; attempt++) {
+  active = await agents.actorStatus({ id: actor.id });
+  if (active.status === "running") break;
+  await pi.bash({ cmd: "sleep 0.05" });
+}
+if (active.status !== "running") throw new Error("Resident never admitted its activation");
+await agents.tell({ id: actor.id, message: "QUEUED_EVENT" });
+let resetSettled = false;
+const reset = agents.resetSession({ id: actor.id }).then(value => { resetSettled = true; return { value }; }, error => {
+  resetSettled = true; return { error: { name: error.name, message: error.message } };
+});
+// Native provider holds for 25 seconds; this only lets the request reach its fence.
+await pi.bash({ cmd: "sleep 1" });
+if (resetSettled) throw new Error("Reset did not wait for the activation fence");
+const pendingSince = Date.now();
+const status = await agents.actorStatus({ id: actor.id });
+const updated = await agents.setInstructions({ id: other.id, instructions: "Updated while repair waits" });
+const stop = await agents.stop({ id: actor.id });
+const elapsedMs = Date.now() - pendingSince;
+if (elapsedMs > 5000) throw new Error("Lifecycle dispatcher was not promptly serviceable: " + elapsedMs);
+const resetOutcome = await reset;
+const after = await agents.actorStatus({ id: actor.id });
+const messages = await agents.messages({ id: actor.id, limit: 50 });
+const discovery = await tools.describe({ ref: "agents.resetSession" });
+return { actor, other, active, status, updated, stop, resetOutcome, after, messages, discovery, elapsedMs };
+`;
+
 export default function (pi: ExtensionAPI) {
   const model: Model<Api> = {
     provider: "resident-reset-proof", id: "offline", name: "Keyless resident reset proof", api: "resident-reset-proof-api", baseUrl: "http://invalid.local",
@@ -54,7 +89,7 @@ export default function (pi: ExtensionAPI) {
     const marker = ["NEW_EVENT", "QUEUED_EVENT", "HELD_EVENT"].find(value => prompt.includes(value)) ?? "MAIN_COMPLETE";
     const message: AssistantMessage = {
       role: "assistant", provider: selected.provider, model: selected.id, api: selected.api, timestamp: Date.now(),
-      content: tool ? [{ type: "toolCall", id: `reset-proof-${Date.now()}`, name: "fabric_exec", arguments: { code: mainCode, resultFormat: "json" } }]
+      content: tool ? [{ type: "toolCall", id: `reset-proof-${Date.now()}`, name: "fabric_exec", arguments: { code: process.env.RESIDENT_RESET_CANCEL_PROOF === "1" ? cancelCode : mainCode, resultFormat: "json" } }]
         : [{ type: "text", text: "HANDLED_" + marker }], stopReason: tool ? "toolUse" : "stop",
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
     };

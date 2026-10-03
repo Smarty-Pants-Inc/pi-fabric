@@ -2,6 +2,7 @@ import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
 import { randomUUID } from "node:crypto";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
+import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -718,6 +719,9 @@ export class ResidencyClient {
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           if (acknowledgeResidentResponse(this.options.config.residencyRoot, response, Date.now(), command.format)) fs.rmSync(responsePath, { force: true });
           if (!response.ok) {
+            if (command.operation === "resetSession" && response.errorCode === "ACTOR_SESSION_RESET_CANCELLED") {
+              throw new ActorSessionResetCancelledError(command.id, response.error, command.requestId);
+            }
             if (response.errorCode === "RESIDENT_REQUEST_EXPIRED") throw new ResidentRequestExpiredError(command.requestId);
             if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
             if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
@@ -740,6 +744,8 @@ export class ResidencyClient {
       throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}` +
         ` (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
+      // This acknowledged terminal response is known, unlike a lost post-commit reply.
+      if (error instanceof ActorSessionResetCancelledError) throw error;
       if (error instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.options.config.residencyRoot, command, signal);
       let decision;
       try {

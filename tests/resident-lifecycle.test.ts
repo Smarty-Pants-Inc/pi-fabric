@@ -16,6 +16,27 @@ import { ResidentHost } from "../src/residency/host.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { residentRoot, RESIDENT_COMMANDS, type ResidentHostConfig } from "../src/residency/protocol.js";
 
+const waitFor = async (predicate: () => boolean) => {
+  const deadline = Date.now() + 5_000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for resident lifecycle probe");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+};
+const promptly = async <T>(promise: Promise<T>): Promise<T> => {
+  let timer!: ReturnType<typeof setTimeout>;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Resident dispatcher blocked behind activation settlement")), 2_000);
+    })]);
+  } finally { clearTimeout(timer); }
+};
+const decisions = (root: string): Array<{ requestId: string; state: string; operation: string; id: string }> => {
+  try { return fs.readdirSync(path.join(root, "decisions")).filter(name => name.endsWith(".json"))
+    .map(name => JSON.parse(fs.readFileSync(path.join(root, "decisions", name), "utf8"))); }
+  catch { return []; }
+};
+
 const fixture = async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-lifecycle-"));
   const identity = { id: "session:lifecycle", name: "Main", kind: "main" as const, sessionId: "lifecycle" };
@@ -41,6 +62,156 @@ const fixture = async () => {
   return { root, config, host, client, passive, provider, actor, context, identity,
     close: async () => { await passive.close(); await host.close(); await client.close(); await participants.close(); fs.rmSync(root, { recursive: true, force: true }); } };
 };
+
+it.each(["Main", "proxy"] as const)("public reset leaves status, other actors and terminal stop serviceable during a hanging activation (%s)", async kind => {
+  const f = await fixture();
+  const pending: Promise<unknown>[] = [];
+  const observe = <T>(promise: Promise<T>) => {
+    const outcome = promise.then(value => ({ value }), error => ({ error }));
+    pending.push(outcome); return outcome;
+  };
+  try {
+    const other = await f.host.actors.create({ name: "unrelated", instructions: "Other persona", residency: "durable", model: "fixture/visible", tools: [] });
+    await f.client.options.participants.refresh();
+    const run = observe(f.host.actors.ask(f.actor.id, "HANG_WITH_PROGRESS"));
+    await waitFor(() => {
+      const id = f.host.actors.status(f.actor.id).inFlightRun?.id;
+      if (!id) return false;
+      const run = f.host.agents.status(id);
+      return "turns" in run && run.turns === 3;
+    });
+    const header = fs.readFileSync(f.actor.sessionFile!, "utf8").split("\n")[0];
+    const queued = observe(f.host.actors.ask(f.actor.id, "queued work cancelled only by explicit stop"));
+    const proxy = new ResidentActorClient(f.config.meshRoot, f.config.rootId, 5_000);
+    const reset = observe(kind === "Main"
+      ? f.provider.invoke("resetSession", { id: f.actor.name }, f.context)
+      : proxy.setActor({ operation: "resetSession", id: f.actor.id }, undefined, { identity: f.identity, hostId: f.identity.id }));
+    await waitFor(() => decisions(f.config.residencyRoot).some(entry => entry.operation === "resetSession" && entry.state === "committed"));
+    const resetDecision = decisions(f.config.residencyRoot).find(entry => entry.operation === "resetSession")!;
+    // All use the public provider, which routes to this resident's command dispatcher.
+    const status = observe(f.provider.invoke("actorStatus", { id: f.actor.id }, f.context));
+    const unrelated = observe(f.provider.invoke("setInstructions", { id: other.id, instructions: "Still serviceable" }, f.context));
+    const stop = observe(f.provider.invoke("stop", { id: f.actor.id }, f.context));
+    const results = await promptly(Promise.all([status, unrelated, stop]));
+    expect(results[0]).toMatchObject({ value: { id: f.actor.id } });
+    expect(results[1]).toMatchObject({ value: { id: other.id } });
+    expect(results[2]).toMatchObject({ value: { id: f.actor.id, status: "stopped" } });
+    // No external release: only the owner's public stop can terminate this real child.
+    await promptly(run);
+    expect(await promptly(reset)).toMatchObject({ error: { name: "ActorSessionResetCancelledError", code: "ACTOR_SESSION_RESET_CANCELLED", id: f.actor.id, requestId: resetDecision.requestId } });
+    expect(await queued).toMatchObject({ error: { message: expect.stringContaining("stopped while messages were queued") } });
+    expect(fs.readFileSync(f.actor.sessionFile!, "utf8").split("\n")[0]).toBe(header);
+    expect(fs.readdirSync(path.dirname(f.actor.sessionFile!)).filter(name => name.endsWith(".bak"))).toEqual([]);
+    expect(f.host.actors.messages(f.actor.id, 50).some(message => (message.data as { sessionReset?: unknown })?.sessionReset)).toBe(false);
+    expect(f.host.actors.status(f.actor.id).status).toBe("stopped");
+    expect(f.host.actors.status(f.actor.id)).not.toHaveProperty("inFlightRun");
+    expect(() => f.host.actors.ask(f.actor.id, "not resumed")).toThrow(/stopped/);
+    for (const entry of decisions(f.config.residencyRoot).filter(entry => ["resetSession", "stop"].includes(entry.operation))) {
+      expect(entry).toMatchObject({ state: "committed", id: f.actor.id });
+      expect(fs.existsSync(path.join(f.config.residencyRoot, "acknowledgements", `${entry.requestId}.json`))).toBe(true);
+    }
+    expect(fs.readdirSync(path.join(f.config.residencyRoot, "processing"))).toEqual([]);
+    expect(fs.readdirSync(path.join(f.config.residencyRoot, "responses"))).toEqual([]);
+  } finally {
+    // Failed assertions on the old dispatcher must not leave the real hanging child alive.
+    const actor = f.host.actors.status(f.actor.id);
+    const runId = actor.inFlightRun?.id ?? actor.lastRunId;
+    if (runId) await f.host.agents.stop(runId);
+    await f.host.actors.stop(f.actor.id, undefined, true);
+    await Promise.all(pending);
+    await f.close();
+  }
+}, 15_000);
+
+it("public stop joins its activation without blocking resident status or another actor's command", async () => {
+  const f = await fixture();
+  let entered!: () => void; let aborted!: () => void; let release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const cancelled = new Promise<void>(resolve => { aborted = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const spy = vi.spyOn(f.host.agents, "run").mockImplementation(async (_request, signal) => {
+    entered(); signal!.addEventListener("abort", aborted, { once: true });
+    await gate; throw new Error("Activation cancelled by stop");
+  });
+  const pending: Promise<unknown>[] = [];
+  const observe = <T>(promise: Promise<T>) => {
+    const outcome = promise.then(value => ({ value }), error => ({ error }));
+    pending.push(outcome); return outcome;
+  };
+  try {
+    const other = await f.host.actors.create({ name: "other during join", instructions: "Other", residency: "durable", model: "fixture/visible", tools: [] });
+    await f.client.options.participants.refresh();
+    observe(f.host.actors.ask(f.actor.id, "held until stop join")); await started;
+    let stopped = false;
+    const stop = observe(f.provider.invoke("stop", { id: f.actor.id }, f.context).then(value => { stopped = true; return value; }));
+    await cancelled;
+    expect(stopped).toBe(false);
+    const status = observe(f.provider.invoke("actorStatus", { id: f.actor.id }, f.context));
+    const unrelated = observe(f.provider.invoke("setInstructions", { id: other.id, instructions: "Updated while stop joins" }, f.context));
+    expect(await promptly(Promise.all([status, unrelated]))).toMatchObject([
+      { value: { id: f.actor.id, status: "stopped" } }, { value: { id: other.id } },
+    ]);
+    expect(stopped).toBe(false);
+    release();
+    expect(await promptly(stop)).toMatchObject({ value: { status: "stopped" } });
+  } finally {
+    release(); await f.host.actors.stop(f.actor.id, undefined, true);
+    await Promise.all(pending); spy.mockRestore(); await f.close();
+  }
+}, 15_000);
+
+it.each(["Main", "proxy"] as const)("%s bounded reset wait preserves a committed receipt and a late terminal cancellation", async kind => {
+  const f = await fixture();
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const spy = vi.spyOn(f.host.agents, "run").mockImplementation(async (_request, signal) => {
+    entered();
+    await new Promise<void>(resolve => signal!.addEventListener("abort", () => resolve(), { once: true }));
+    throw new Error("Activation cancelled by stop");
+  });
+  const abort = new AbortController();
+  const run = f.host.actors.ask(f.actor.id, "pending activation").catch(error => error);
+  try {
+    await started;
+    f.client.options.commandTimeoutMs = kind === "Main" ? 5_000 : 200;
+    const proxy = new ResidentActorClient(f.config.meshRoot, f.config.rootId, 200);
+    const reset = (kind === "Main"
+      ? f.provider.invoke("resetSession", { id: f.actor.id }, { ...f.context, signal: abort.signal })
+      : proxy.setActor({ operation: "resetSession", id: f.actor.id }, undefined, { identity: f.identity, hostId: f.identity.id }))
+      .catch(error => error);
+    await waitFor(() => decisions(f.config.residencyRoot).some(entry => entry.operation === "resetSession" && entry.state === "committed"));
+    const decision = decisions(f.config.residencyRoot).find(entry => entry.operation === "resetSession")!;
+    expect(await promptly(f.provider.invoke("actorStatus", { id: f.actor.id }, f.context))).toMatchObject({ id: f.actor.id });
+    if (kind === "Main") abort.abort();
+    expect(await promptly(reset)).toMatchObject({ name: "ResidentOutcomeUnknownError", id: f.actor.id, requestId: decision.requestId,
+      residentOutcome: { state: "committed", operation: "resetSession", id: f.actor.id } });
+    f.client.options.commandTimeoutMs = 5_000;
+    expect(await promptly(f.provider.invoke("stop", { id: f.actor.id }, f.context))).toMatchObject({ status: "stopped" });
+    await run;
+    await waitFor(() => fs.readdirSync(path.join(f.config.residencyRoot, "processing")).length === 0);
+    // The original bounded caller left after commit: retain its eventual definitive reply.
+    expect(JSON.parse(fs.readFileSync(path.join(f.config.residencyRoot, "responses", `${decision.requestId}.json`), "utf8")))
+      .toMatchObject({ requestId: decision.requestId, ok: false, errorCode: "ACTOR_SESSION_RESET_CANCELLED" });
+    expect(decisions(f.config.residencyRoot).find(entry => entry.requestId === decision.requestId)).toEqual(decision);
+    expect(fs.readdirSync(path.dirname(f.actor.sessionFile!)).filter(name => name.endsWith(".bak"))).toEqual([]);
+  } finally {
+    abort.abort(); await f.host.actors.stop(f.actor.id, undefined, true); await run;
+    spy.mockRestore(); await f.close();
+  }
+}, 15_000);
+
+it("public discovery advertises direct repair rather than a stop prerequisite", async () => {
+  const f = await fixture();
+  try {
+    const descriptor = await f.provider.describe("resetSession", f.context);
+    const listed = (await f.provider.list({ query: "resetSession" }, f.context)).find(action => action.name === "resetSession");
+    expect(listed).toEqual(descriptor);
+    expect(descriptor!.description).not.toMatch(/stop[ -]first|idle run boundary/);
+    expect(descriptor!.description).toMatch(/owning Main.*directly/);
+    expect(descriptor!.description).toMatch(/activation.*settles.*fenced boundary/);
+    expect(descriptor!.description).toMatch(/stop.*cancels work/);
+  } finally { await f.close(); }
+});
 
 it("advertises resident lifecycle commands", () => {
   expect(RESIDENT_COMMANDS).toContain("resetSession"); expect(RESIDENT_COMMANDS).toContain("stop");

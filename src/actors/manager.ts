@@ -4,6 +4,7 @@ import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
+import { ActorSessionResetCancelledError } from "./session-reset-error.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
@@ -1661,6 +1662,9 @@ export class ActorManager {
     const running = this.#runningActor(id);
     if (!running) return;
     this.#stopRun(running);
+    // A caller abort detaches a worker that made progress. Public terminal stop
+    // must explicitly end that owned worker before joining its activation.
+    if (running.inFlightRun) await this.agents.stop(running.inFlightRun.id);
     await running.drain?.catch(() => undefined);
   }
 
@@ -1669,6 +1673,10 @@ export class ActorManager {
     const running = this.#runningActor(actor.id)!;
     const stopped = actor.status === "stopped";
     beforeCommit?.(actor.id);
+    // Terminal stop cancels an unperformed repair, never rotates its journal.
+    const resets = this.#pendingResets.get(actor.id);
+    this.#pendingResets.delete(actor.id);
+    resets?.forEach(waiter => waiter.reject(new ActorSessionResetCancelledError(actor.id)));
     this.#stopRun(running);
     if (running !== actor) this.#stopRun(actor);
     if (stopped && running === actor) {

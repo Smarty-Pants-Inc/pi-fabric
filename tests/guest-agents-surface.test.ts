@@ -23,6 +23,14 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("generated reset guidance never requires destructive stop (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const guidance = declarations.slice(declarations.lastIndexOf("/**", declarations.indexOf("resetSession(args:")), declarations.indexOf("resetSession(args:"));
+    expect(guidance).not.toMatch(/stop[ -]first|idle boundary/);
+    expect(guidance).toMatch(/owning Main.*directly/);
+    expect(guidance).toMatch(/activation.*settles.*fenced boundary/);
+    expect(guidance).toMatch(/stop.*cancels work/);
+  });
   it.each([false, true])("types model selection provenance without conflating effective models (fullCodeMode=%s)", fullCodeMode => {
     const declarations = guestTypeDeclarations(fullCodeMode);
     const code = `const run = await agents.run({ task: "work", model: "sol" });

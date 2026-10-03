@@ -277,7 +277,7 @@ export const residentHostStateNote = (residencyRoot: string, now = Date.now()): 
       const age = now - fs.statSync(file).mtimeMs;
       if (age < 2_000) continue;
       notes.push(`the host has been processing ${String(command.operation)}` +
-        `${typeof command.id === "string" ? ` of ${command.id}` : ""} for ${formatAge(age)}; this request waits behind it`);
+        `${typeof command.id === "string" ? ` of ${command.id}` : ""} for ${formatAge(age)}; its response may still be settling`);
     }
   } catch { /* nothing in process */ }
   try {
@@ -613,7 +613,7 @@ export interface ResidentCommandResponse {
   pending?: string;
   cleaned?: boolean;
   error?: string;
-  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED";
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED";
   /** Allowlisted policy-refusal payload, never arbitrary host Error properties. */
   modelDenied?: { model: string; replacement?: string };
   completedAt: number;

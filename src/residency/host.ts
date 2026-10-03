@@ -23,7 +23,8 @@ import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
-import { resolvePiModel, type PiModelRegistryView } from "../core/model-refresh.js";
+import { resolvePiModel, resolvePiRoutePin, type PiModelRegistryView } from "../core/model-refresh.js";
+import { ShadowRouteOwner } from "../agents/model-route-owner.js";
 import {
   parseFabricOwnedModelGuidance,
   resolveFabricModelGuidance,
@@ -220,6 +221,7 @@ export class ResidentHost {
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
   readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
+  #routeOwner?: ShadowRouteOwner;
   readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
@@ -310,7 +312,26 @@ export class ResidentHost {
     // The session's visible models (synced at each ensureHost) plus, after a miss, this host's
     // own refreshed Pi registry: the one shared resolver, so an already-running host resolves a
     // model added to models.json after it started (pi-fabric#138).
-    const resolveResidentPiModel = async (selector?: string, options: { closest?: boolean } = {}): Promise<string> => {
+    // A bare resident registry does not load Main's provider extensions. Workers do:
+    // retain the trusted, auth-filtered catalog synced by Main for exact route pins
+    // and candidates, just as ordinary resident model selection does below.
+    // Keep one view so concurrent exact misses share the bounded registry refresh.
+    const routeRegistry: PiModelRegistryView = {
+      getAvailable: () => {
+        const live = modelRegistry?.getAvailable() ?? [];
+        const snapshot = (currentConfig().piModels ?? config.piModels)?.available ?? [];
+        return [...live, ...snapshot.filter(candidate => !live.some(model =>
+          model.provider === candidate.provider && model.id === candidate.id))];
+      },
+      ...(modelRegistry?.refresh ? { refresh: () => modelRegistry.refresh!() } : {}),
+    };
+    const residentRouteRegistry = (): PiModelRegistryView => routeRegistry;
+    const resolveResidentPiModel = async (selector?: string, options: { requiredPin?: boolean; closest?: boolean } = {}): Promise<string> => {
+      if (options.requiredPin) {
+        const exact = await resolvePiRoutePin({ selector: selector ?? "", registry: residentRouteRegistry(),
+          aliases: normalizeModelAliases((currentConfig().piModels ?? config.piModels)?.aliases) });
+        return `${exact.provider}/${exact.id}`;
+      }
       const state = currentConfig().piModels ?? config.piModels;
       const snapshot: FabricModelCandidate[] = Array.isArray(state?.available)
         ? state.available.flatMap((candidate) =>
@@ -354,7 +375,7 @@ export class ResidentHost {
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: this.#retention,
-      preparePiModel: async (model) => resolveResidentPiModel(model),
+      preparePiModel: async (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false }),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;
         return resolveFabricModelGuidance(currentModelGuidance(), {
@@ -401,6 +422,7 @@ export class ResidentHost {
     const lineageAlive = (rootId: string): boolean =>
       this.participants.lineageAlive(rootId);
     const actorRoots = residentActorRoots(config);
+    this.#routeOwner = new ShadowRouteOwner(() => currentConfig().shadowRouting ?? config.shadowRouting);
     this.actors = new ActorDirectory([
       config.sessionId,
       this.identity,
@@ -451,7 +473,14 @@ export class ResidentHost {
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: this.#retention,
         ...(typeof config.actors?.maxSessionBytes === "number" ? { maxSessionBytes: config.actors.maxSessionBytes } : {}),
-        resolvePiModel: (model) => resolveResidentPiModel(model, { closest: false }),
+        resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
+        prepareModelRoute: async (input, signal) => {
+          const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
+          return prepareModelRoute({ ...input, signal, config: config.agents.modelRouting,
+            registry: residentRouteRegistry(), aliases: normalizeModelAliases((currentConfig().piModels ?? config.piModels)?.aliases),
+            assertModelAllowed: model => this.agents.assertModelAllowed(model, "pi"),
+            evaluate: (request, routeSignal) => this.#routeOwner!.evaluate(request, routeSignal) });
+        },
       },
     ], actorRoots, config.mesh.actorScope);
     this.lifecycle = new LifecycleBroker(
@@ -562,6 +591,7 @@ export class ResidentHost {
   async close(): Promise<void> {
     if (this.#closed || !this.#started) return;
     this.#closed = true;
+    const routeClosed = this.#routeOwner?.close();
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
     this.#requestRetention.close();
@@ -576,6 +606,7 @@ export class ResidentHost {
       try {
         try {
           await this.agents?.close();
+          await routeClosed;
         } finally {
           // Fenced actor deliveries may still be acquiring custody. Join them
           // before releasing the host; closed hosts retain their durable outbox.

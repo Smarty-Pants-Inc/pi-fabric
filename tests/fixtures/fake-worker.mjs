@@ -21,6 +21,12 @@ const task = fs.readFileSync(taskFile, "utf8");
 // over the status file, so pollers never observe a truncated or half-written record.
 let statusWrites = 0;
 function writeStatus(text) {
+  // Mirror the production worker's host-supplied, record-only metadata on every write.
+  if (args.has("route-class")) {
+    text = JSON.stringify({ ...JSON.parse(text), routeClass: args.get("route-class"),
+      routeClassSource: args.get("route-class-source"),
+      ...(args.has("protected") ? { protected: args.get("protected") === "true" } : {}) });
+  }
   const temporary = `${statusFile}.${process.pid}.${++statusWrites}.tmp`;
   fs.writeFileSync(temporary, text);
   for (let attempt = 0; ; attempt++) {

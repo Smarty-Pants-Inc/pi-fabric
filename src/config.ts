@@ -169,6 +169,8 @@ export interface FabricAgentConfig {
   /** Host-only fleet policy; workspace configuration cannot override these keys. */
   deniedModels: string[];
   deniedModelReplacement?: string;
+  /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
+  instructionsRoot?: string;
   claude: FabricClaudeRunnerConfig;
   veda: FabricVedaRunnerConfig;
   thinking: FabricThinking;
@@ -1135,6 +1137,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           ? agents.sessionExportDir
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
+      ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
     },
     jev: normalizeJevConfig(input.jev),
     records: normalizeRecordsConfig(input.records),
@@ -1576,6 +1579,7 @@ const resolveFabricConfig = (
       const agents = { ...objectValue(document.agents) };
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;
+      delete agents.instructionsRoot;
       document.agents = agents;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

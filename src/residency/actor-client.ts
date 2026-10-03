@@ -6,7 +6,7 @@ import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorCreateRequest } from "../actors/types.js";
 import {
   abandonResidentRequest,
   acknowledgeResidentResponse,
@@ -110,7 +110,7 @@ export class ResidentActorClient {
     return response.actors;
   }
 
-  async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+  async createActor(request: FabricActorCreateRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,

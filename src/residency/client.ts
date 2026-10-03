@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorCreateRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
@@ -379,7 +379,7 @@ export class ResidencyClient {
     await this.#waitForParticipant(id, "actor");
   }
 
-  async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+  async createActor(request: FabricActorCreateRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
     await this.ensureHost();
     const response = await this.#command({

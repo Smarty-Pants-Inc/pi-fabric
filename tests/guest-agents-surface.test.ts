@@ -23,6 +23,21 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("#3819 types inline XOR verified file instructions (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    for (const name of ["create", "createActor", "setInstructions"]) {
+      const target = name === "setInstructions" ? 'id: "actor"' : 'name: "actor"';
+      expect(typeCheckFabricCode(`await agents.${name}({ ${target}, instructionsFile: "/factory/role.md", sha256: "${"a".repeat(64)}" });`, declarations, true).errors).toEqual([]);
+      expect(typeCheckFabricCode(`await agents.${name}({ ${target}, instructions: "inline" });`, declarations, true).errors).toEqual([]);
+      for (const fields of ['instructionsFile: "/factory/role.md"', 'sha256: "digest"', 'instructions: "inline", instructionsFile: "/factory/role.md", sha256: "digest"']) {
+        expect(typeCheckFabricCode(`await agents.${name}({ ${target}, ${fields} });`, declarations, true).errors.length).toBeGreaterThan(0);
+      }
+      const schema = AGENTS_ACTION_DESCRIPTORS.find(action => action.name === name)!.inputSchema as { properties: Record<string, unknown> };
+      expect(schema.properties.instructionsFile).toMatchObject({ type: "string" });
+      expect(schema.properties.sha256).toMatchObject({ type: "string", pattern: "^[a-f0-9]{64}$" });
+    }
+  });
+
   it.each([false, true])("types model selection provenance without conflating effective models (fullCodeMode=%s)", fullCodeMode => {
     const declarations = guestTypeDeclarations(fullCodeMode);
     const code = `const run = await agents.run({ task: "work", model: "sol" });

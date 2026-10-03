@@ -313,7 +313,7 @@ export class ResidentHost {
     // The session's visible models (synced at each ensureHost) plus, after a miss, this host's
     // own refreshed Pi registry: the one shared resolver, so an already-running host resolves a
     // model added to models.json after it started (pi-fabric#138).
-    const resolveResidentPiModel = async (selector?: string): Promise<string> => {
+    const resolveResidentPiModel = async (selector?: string, options: { closest?: boolean } = {}): Promise<string> => {
       const state = currentConfig().piModels ?? config.piModels;
       const snapshot: FabricModelCandidate[] = Array.isArray(state?.available)
         ? state.available.flatMap((candidate) =>
@@ -333,6 +333,7 @@ export class ResidentHost {
         defaultModel: state?.defaultModel,
         snapshot,
         policy: config.agents,
+        closest: options.closest ?? true,
       });
       return `${resolved.provider}/${resolved.id}`;
     };
@@ -453,7 +454,7 @@ export class ResidentHost {
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: this.#retention,
         ...(typeof config.actors?.maxSessionBytes === "number" ? { maxSessionBytes: config.actors.maxSessionBytes } : {}),
-        resolvePiModel: resolveResidentPiModel,
+        resolvePiModel: (model) => resolveResidentPiModel(model, { closest: false }),
       },
     ], actorRoots, config.mesh.actorScope);
     this.lifecycle = new LifecycleBroker(

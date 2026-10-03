@@ -31,6 +31,10 @@ const runProperties = {
     description:
       "Pi provider/id copied from agents.models({ runner: \"pi\" }), a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties). Reuse returned keys; never infer version numbers from agent names. Exact keys win; near-miss IDs resolve to the closest visible model on the same provider. Handles report the canonical model. Without host model policy, Claude runtime values and Veda backend models/aliases are forwarded verbatim. Under active policy, Claude aliases must resolve through its native CLI catalog; Veda requires backend pi and an exact visible provider/model (unresolved aliases/defaults are refused).",
   },
+  modelReason: {
+    type: "string",
+    description: "Reason for an explicit model selection, recorded on the run. Required and non-blank for cliproxyapi/gpt-6-astra; named passes use cliproxyapi/gpt-6.1-sol thinking max, otherwise omit model (role default).",
+  },
   persona: {
     type: "string",
     description: "Veda persona name for this run, such as frontend, reviewer, worker, or a custom persona.",
@@ -428,6 +432,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         runner: runProperties.runner,
         kernel: runProperties.kernel,
         model: strictModelProperty,
+        modelReason: runProperties.modelReason,
         thinking: runProperties.thinking,
         tools: runProperties.tools,
         transport: runProperties.transport,

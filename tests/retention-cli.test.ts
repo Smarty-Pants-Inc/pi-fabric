@@ -49,6 +49,56 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect(fs.readdirSync(actor).filter(name => name.endsWith(".bak"))).toEqual(["session.jsonl.20260928T150000000Z.bak"]);
   });
 
+  it("enumerates an owned actor registry larger than 1 MiB in dry-run and apply without losing latest-run vetoes", async () => {
+    const { root, actor, host } = make();
+    const file = path.join(root, "actors", "project", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    const messages = Array.from({ length: 100 }, (_, index) => ({ id: String(index), text: "x".repeat(1400) }));
+    const first = registry.actors[0];
+    registry.actors = Array.from({ length: 10 }, (_, index) => {
+      const id = index ? `other-${index}` : "actor";
+      const sessionFile = path.join(path.dirname(file), id, "session.jsonl");
+      if (index) write(sessionFile, "live session");
+      return { ...first, id, sessionFile, ...(index ? { lastRunId: undefined } : {}), messages };
+    });
+    write(file, JSON.stringify(registry));
+    expect(fs.statSync(file).size).toBeGreaterThan(1024 * 1024);
+    const before = snapshot(root);
+    const plan = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true });
+    expect(snapshot(root)).toEqual(before);
+    expect(plan.skipped).toEqual([]);
+    expect(plan.changes.map(change => change.path).sort()).toEqual([
+      path.join(host, "runs", "terminal", "events.jsonl"),
+      path.join(actor, "runs", "archive", "events.jsonl"),
+      path.join(actor, "session.jsonl.20260927T150000000Z.bak"),
+    ].sort());
+    const latest = snapshot(path.join(actor, "runs", "latest"));
+    const applied = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: false });
+    expect(applied.skipped).toEqual([]);
+    expect(applied.changes).toEqual(plan.changes);
+    expect(snapshot(path.join(actor, "runs", "latest"))).toEqual(latest);
+    expect(fs.readFileSync(path.join(actor, "runs", "archive", "events.jsonl"), "utf8").trim().split("\n")).toHaveLength(201);
+    expect(fs.readdirSync(actor).filter(name => name.endsWith(".bak"))).toEqual(["session.jsonl.20260928T150000000Z.bak"]);
+    fs.mkdirSync(`${file}.lock`);
+    const locked = snapshot(root);
+    expect((await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: false })).skipped).toEqual([
+      expect.objectContaining({ path: path.dirname(file), reason: expect.stringMatching(/lock/) }),
+    ]);
+    expect(snapshot(root)).toEqual(locked);
+  });
+
+  it.each([undefined, "unknown", "herdr", "localterm", "tmux", "screen"])("never reports or changes a root with %s transport and no persisted native exit receipt", async transport => {
+    const { root, host, actor } = make();
+    const unsafe = [path.join(host, "runs", "terminal"), path.join(actor, "runs", "archive")];
+    for (const run of unsafe) write(path.join(run, "status.json"), JSON.stringify({ status: "completed", transport, finishedAt: 1, sessionId: "2147483647", exitCode: 0 }));
+    const before = unsafe.map(run => ({ directoryMtime: fs.statSync(run).mtimeMs, tree: snapshot(run) }));
+    for (const dryRun of [true, false]) {
+      const result = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun });
+      expect(result.changes.filter(change => unsafe.some(run => change.path.startsWith(run + path.sep)))).toEqual([]);
+      expect(unsafe.map(run => ({ directoryMtime: fs.statSync(run).mtimeMs, tree: snapshot(run) }))).toEqual(before);
+    }
+  });
+
   it("does not displace a kernel-fenced holder even with stale dead-PID diagnostics", async () => {
     const { root, host } = make(); const fd = await lockFile(path.join(host, "host.lock"), 0, true);
     try {

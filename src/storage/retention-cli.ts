@@ -6,9 +6,9 @@ import { lockFile } from "../residency/file-lock.js";
 import { compactTerminalRunEvents, pruneActorSessionBackups, retainedActorRunIds } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
 
-const read = (file: string): Record<string, unknown> => {
+const read = (file: string, maxBytes = 1024 * 1024): Record<string, unknown> => {
   const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size > 1024 * 1024) throw new Error(`Unsafe or unreadable custody record: ${file}`);
+  if (!stat?.isFile() || stat.size > maxBytes) throw new Error(`Unsafe or unreadable custody record: ${file}`);
   return JSON.parse(fs.readFileSync(file, "utf8"));
 };
 const absent = (file: string): boolean => {
@@ -83,7 +83,10 @@ export const sweepMeshRetention = async (meshRoot: string, options: { dryRun?: b
     for (const root of residents.values()) compactRuns(path.join(root, "runs"));
     for (const registryRoot of residents.size ? registries : []) {
       const prune = () => {
-        const registry = read(path.join(registryRoot, "actors.json"));
+        // Match ActorRegistryStore/retainedActorRunIds: owned registries contain
+        // instructions and message history and have no byte-size protocol limit.
+        // Diagnostic records keep the bounded reader above.
+        const registry = read(path.join(registryRoot, "actors.json"), Number.MAX_SAFE_INTEGER);
         if (!Array.isArray(registry.actors)) throw new Error("unreadable actor registry");
         for (const actor of registry.actors) {
           if (!actor || typeof actor.rootId !== "string" || !residents.has(actor.rootId) || actor.removal !== undefined ||

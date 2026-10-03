@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { compactTerminalRunEvents, pruneActorRunArchives, markRunRootActive, markRunRootClosed, sweepTempRunRoots, FABRIC_RUN_ROOT_PREFIX } from "../src/storage/retention.js";
+import { compactTerminalRunEvents, pruneActorRunArchives, markRunRootActive, markRunRootClosed, sweepTempRunRoots, FABRIC_RUN_ROOT_PREFIX, runTreeExitVeto } from "../src/storage/retention.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 
 const roots: string[] = [];
@@ -62,6 +62,49 @@ describe("six-hour terminal run compaction", () => {
     const { run } = make(record); const before = snapshot(run);
     expect(compactTerminalRunEvents(run, { now })).toBe(false);
     expect(snapshot(run)).toEqual(before);
+  });
+
+  it.each([undefined, "unknown", "herdr", "localterm"])("requires persisted root exit evidence for %s custody in compaction and collection", transport => {
+    const { root, run } = make({ transport });
+    const before = snapshot(run); const mtime = fs.statSync(run).mtimeMs;
+    expect(compactTerminalRunEvents(run, { now, dryRun: true })).toBe(false);
+    expect(compactTerminalRunEvents(run, { now })).toBe(false);
+    expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), retentionMs: 7 * 24 * HOUR, now: 8 * 24 * HOUR })).toEqual([]);
+    expect(snapshot(run)).toEqual(before); expect(fs.statSync(run).mtimeMs).toBe(mtime);
+    const managed = path.join(root, FABRIC_RUN_ROOT_PREFIX + "unknown"); fs.mkdirSync(managed);
+    const moved = path.join(managed, "old"); fs.renameSync(run, moved);
+    markRunRootActive(managed, 4 * HOUR); markRunRootClosed(managed, 4 * HOUR, true);
+    const movedMtime = fs.statSync(moved).mtimeMs;
+    const sweep = (at: number) => sweepTempRunRoots({ tempRoot: root, now: at, orphanedTempRunRetentionMs: 24 * HOUR, oneShotRunRetentionMs: 24 * HOUR });
+    expect(sweep(now)).toEqual({ removedRuns: [], removedRoots: [] });
+    expect(snapshot(moved)).toEqual(before); expect(fs.statSync(moved).mtimeMs).toBe(movedMtime);
+    expect(sweep(28 * HOUR)).toEqual({ removedRuns: [], removedRoots: [] });
+    expect(snapshot(moved)).toEqual(before); expect(fs.statSync(moved).mtimeMs).toBe(movedMtime);
+  });
+
+  it("never treats an admitted tree with a missing saved root record as recordless pre-launch rollback", () => {
+    const { root, run } = make(); fs.unlinkSync(path.join(run, "status.json"));
+    const before = snapshot(run); const mtime = fs.statSync(run).mtimeMs;
+    expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/unknown root identity/);
+    expect(compactTerminalRunEvents(run, { now })).toBe(false);
+    expect(snapshot(run)).toEqual(before); expect(fs.statSync(run).mtimeMs).toBe(mtime);
+    const managed = path.join(root, FABRIC_RUN_ROOT_PREFIX + "missing-record"); fs.mkdirSync(managed);
+    const moved = path.join(managed, "old"); fs.renameSync(run, moved);
+    fs.writeFileSync(path.join(moved, "task.txt"), "admitted worker input");
+    markRunRootActive(managed, 4 * HOUR); markRunRootClosed(managed, 4 * HOUR, true);
+    const movedBefore = snapshot(moved); const movedMtime = fs.statSync(moved).mtimeMs;
+    expect(sweepTempRunRoots({ tempRoot: root, now: 100 * HOUR, orphanedTempRunRetentionMs: 24 * HOUR, oneShotRunRetentionMs: 24 * HOUR })).toEqual({ removedRuns: [], removedRoots: [] });
+    expect(snapshot(moved)).toEqual(movedBefore); expect(fs.statSync(moved).mtimeMs).toBe(movedMtime);
+  });
+
+  it("does not infer pre-launch rollback from an input-only legacy tree under a closed owner", () => {
+    const { root } = make(); const managed = path.join(root, FABRIC_RUN_ROOT_PREFIX + "input-only");
+    const run = path.join(managed, "unknown"); fs.mkdirSync(run, { recursive: true });
+    fs.writeFileSync(path.join(run, "task.txt"), "no durable admission or worker exit record");
+    markRunRootActive(managed, 1); markRunRootClosed(managed, 1, true);
+    const before = snapshot(run); const mtime = fs.statSync(run).mtimeMs;
+    expect(sweepTempRunRoots({ tempRoot: root, now: 100 * HOUR, orphanedTempRunRetentionMs: 24 * HOUR, oneShotRunRetentionMs: 24 * HOUR })).toEqual({ removedRuns: [], removedRoots: [] });
+    expect(snapshot(run)).toEqual(before); expect(fs.statSync(run).mtimeMs).toBe(mtime);
   });
 
   it("dry-run reports eligibility without changing bytes, inode or timestamps", () => {

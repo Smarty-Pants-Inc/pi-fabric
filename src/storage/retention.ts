@@ -89,21 +89,23 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
   fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
   writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details });
 };
-/** A terminal record is not a descendant exit receipt. Share this persistent,
+/** A terminal record is not a worker exit receipt. Share this persistent,
  * tree-wide veto across tracked, recovered and offline cleanup before removing
  * worktrees or files; absence of an unresolved marker never proves worker exit.
  * Recordless pre-launch rollback remains distinct from an admitted process run.
- * Ownership retention additionally requires checked process exit for every
- * descendant, without coupling that proof to cleanup's artifact allowlist. */
+ * Ownership retention additionally requires persisted, checked process exit for
+ * the admitted root and every descendant, independently of the artifact allowlist.
+ * External transports currently have no durable native exit-receipt contract: skip
+ * them even when a surviving host once observed a terminal result. */
 export const runTreeExitVeto = (
-  directory: string, depth = 0, expired: Deadline = noDeadline, requireDescendantExit = false,
+  directory: string, depth = 0, expired: Deadline = noDeadline, requirePersistedExit = false,
 ): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
   // initial absence is safe; errors or changes during inspection veto cleanup.
   try { fs.lstatSync(directory); }
   catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" && !requireDescendantExit
+    return (error as NodeJS.ErrnoException).code === "ENOENT" && !requirePersistedExit
       ? undefined : "worker exit is unconfirmed: run-tree inspection failed";
   }
   try {
@@ -118,15 +120,17 @@ export const runTreeExitVeto = (
     if (record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
     }
-    // Tracked ownership and collection compose conservatively: the descendant
-    // ownership check must pass as well as the terminal PID/birth proof below.
-    // A surviving tracked root has its own transport exit evidence; descendants
-    // have no surviving handles and must retain their persisted identities.
-    if (requireDescendantExit && depth > 0) {
+    // Offline compaction/collection has no surviving transport handle. Require
+    // the saved root identity too; a free host flock, terminal status, exitCode,
+    // or absent unresolved marker does not prove the root writer has exited.
+    // Recordless pre-launch rollback uses the non-retention mode explicitly;
+    // missing persisted status is never evidence for an admitted worker.
+    if (requirePersistedExit) {
       const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
         ? Number(record.sessionId) : undefined;
-      if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return "worker exit is unconfirmed: unknown descendant identity";
-      if (processAlive(pid)) return `worker exit is unconfirmed: its descendant worker may still be running (${directory})`;
+      const worker = depth > 0 ? "descendant" : "root";
+      if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return `worker exit is unconfirmed: unknown ${worker} identity`;
+      if (processAlive(pid)) return `worker exit is unconfirmed: its ${worker} worker may still be running (${directory})`;
     }
     if (record?.transport === "process") {
       if (!record.status || !TERMINAL_STATUSES.has(record.status)) {
@@ -160,7 +164,7 @@ export const runTreeExitVeto = (
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
     if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
     for (const name of fs.readdirSync(nested)) {
-      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requireDescendantExit);
+      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit);
       if (reason) return reason;
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
@@ -179,7 +183,10 @@ const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-eve
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
-  if (runTreeExitVeto(root, 0, expired)) return false;
+  // Offline collection cannot establish never-launched custody from filenames
+  // or a host-wide childrenStopped marker. Only the live admission caller can
+  // authorize recordless pre-launch rollback through the non-retention mode.
+  if (runTreeExitVeto(root, 0, expired, true)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   // Automatic retention keeps its independent live-writer fence. A mismatched
   // birth identity can clear explicit cleanup's exit veto, but never authorizes
@@ -251,10 +258,11 @@ export const removeEmptyRunRoot = (root: string): boolean => {
 };
 const pruneClosedRunRoot = (
   root: string, owner: RunRootOwner, orphanMs: number, oneShotMs: number, now: number, expired: () => boolean,
+  eventsRetention: TerminalRunEventsRetention,
 ): string[] => {
   const removed: string[] = [];
   // Every run started after its root, so no run of a root younger than the shortest retention is due.
-  if (now - owner.startedAt < Math.min(orphanMs, oneShotMs, 6 * 60 * 60 * 1_000)) return removed;
+  if (now - owner.startedAt < Math.min(orphanMs, oneShotMs, eventsRetention.terminalRunEventsAgeMs ?? 6 * 60 * 60 * 1_000)) return removed;
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
@@ -267,7 +275,7 @@ const pruneClosedRunRoot = (
     const reference = terminal ? recordAgeReference(record!, ownedStat(directory)?.mtimeMs ?? now) : owner.closedAt!;
     const retention = terminal && !record?.actorId ? oneShotMs : orphanMs;
     if (now - reference < retention) {
-      compactTerminalRunEvents(directory, { now, expired });
+      compactTerminalRunEvents(directory, { ...eventsRetention, now, expired });
       continue;
     }
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) continue;
@@ -289,17 +297,13 @@ export const claimTempRunSweep = (tempRoot: string, minIntervalMs: number, now =
   try { writeJsonAtomic(marker, { sweptAt: now }); } catch {}
   return true;
 };
-export interface TempRunSweepRequest {
+export interface TempRunSweepRequest extends TerminalRunEventsRetention {
   tempRoot: string;
   currentRoot?: string;
   orphanedTempRunRetentionMs: number;
   oneShotRunRetentionMs: number;
 }
-export const sweepTempRunRoots = (options: {
-  tempRoot: string;
-  currentRoot?: string;
-  orphanedTempRunRetentionMs: number;
-  oneShotRunRetentionMs: number;
+export const sweepTempRunRoots = (options: TempRunSweepRequest & {
   now?: number;
   /**
    * Skip when any process of this user swept the temp root within this interval. The sweep walks
@@ -337,7 +341,7 @@ export const sweepTempRunRoots = (options: {
     if (!validOwner(owner)) continue;
     if (owner.closedAt !== undefined) {
       result.removedRuns.push(...pruneClosedRunRoot(
-        root, owner, options.orphanedTempRunRetentionMs, options.oneShotRunRetentionMs, now, expired,
+        root, owner, options.orphanedTempRunRetentionMs, options.oneShotRunRetentionMs, now, expired, options,
       ));
       if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
       continue;

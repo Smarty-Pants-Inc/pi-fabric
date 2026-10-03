@@ -43,7 +43,7 @@ afterEach(() => {
 describe("shared run-tree exit veto", () => {
   it.each(["running", "queued", "unknown", undefined])("vetoes a nested nonterminal process record (%s) even with a dead saved PID", status => {
     const run = temporaryDirectory();
-    writeStatus(run, { status: "completed" });
+    writeStatus(run, { status: "completed", transport: "process", sessionId: "2147483646" });
     writeStatus(path.join(run, "nested", "child"), { status, transport: "process", sessionId: "2147483647" });
     const probe = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
     try {
@@ -73,7 +73,7 @@ describe("shared run-tree exit veto", () => {
 
   it.each(["completed", "failed", "stopped", "timed_out"])("permits a nested %s process record only after a usable saved PID is confirmed absent", status => {
     const run = temporaryDirectory();
-    writeStatus(run, { status: "completed" });
+    writeStatus(run, { status: "completed", transport: "process", sessionId: "2147483646" });
     writeStatus(path.join(run, "nested", "child"), { status, transport: "process", sessionId: "2147483647" });
     const probe = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
     try {
@@ -112,6 +112,7 @@ describe("shared run-tree exit veto", () => {
     const run = temporaryDirectory();
     fs.writeFileSync(path.join(run, "task.txt"), "not launched");
     expect(runTreeExitVeto(run)).toBeUndefined();
+    expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/unknown root identity/);
     expect(canRemoveTerminalRun(run)).toBe(false);
     expect(runTreeExitVeto(path.join(run, "already-removed"))).toBeUndefined();
   });
@@ -135,6 +136,7 @@ describe("shared run-tree exit veto", () => {
 
   it("ownership retention requires checked exit identities for every descendant, including terminal live writers", () => {
     const run = temporaryDirectory();
+    writeStatus(run, { status: "completed", transport: "process", sessionId: "2147483646" });
     const child = path.join(run, "nested", "child");
     const grandchild = path.join(child, "nested", "grandchild");
     const veto = () => runTreeExitVeto(run, 0, undefined, true);
@@ -162,9 +164,12 @@ describe("shared run-tree exit veto", () => {
 
   it("retains tracked descendant ownership even when PID reuse passes the cleanup birth proof", () => {
     const run = temporaryDirectory();
-    writeStatus(run, { status: "completed" });
+    writeStatus(run, { status: "completed", transport: "process", sessionId: "2147483646" });
     writeStatus(path.join(run, "nested", "child"), { status: "completed", transport: "process", sessionId: "2147483647", processStartTime: "123" });
-    const probe = vi.spyOn(process, "kill").mockReturnValue(true);
+    const probe = vi.spyOn(process, "kill").mockImplementation(pid => {
+      if (pid === 2147483646) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      return true;
+    });
     const birth = vi.spyOn(processIdentity, "processStartTime").mockReturnValue("456");
     try {
       expect(runTreeExitVeto(run)).toBeUndefined();
@@ -262,7 +267,7 @@ describe("safe run roots", () => {
     expect(fs.existsSync(run)).toBe(true);
   });
 
-  it("expires shutdown-confirmed incomplete runs, but never a live descendant", () => {
+  it("retains recordless incomplete custody until persisted process exit, and never expires a live worker", () => {
     const tempRoot = temporaryDirectory();
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed-incomplete");
     markRunRootActive(root, 1);
@@ -274,6 +279,10 @@ describe("safe run roots", () => {
     fs.writeFileSync(path.join(active, "task.txt"), "still live");
     markRunRootClosed(root, 1, true);
     expect(sweep(tempRoot, 5 * HOUR).removedRuns).toEqual([]);
+    expect(sweep(tempRoot, 6 * HOUR + 1).removedRuns).toEqual([]);
+    expect(fs.readFileSync(path.join(incomplete, "task.txt"), "utf8")).toBe("incomplete launch");
+    // A host-wide shutdown marker is not a persisted receipt for this worker.
+    writeStatus(incomplete, { status: "failed", actorId: "actor-1", transport: "process", sessionId: "2147483647", finishedAt: 1 });
     expect(sweep(tempRoot, 6 * HOUR + 1).removedRuns).toEqual([incomplete]);
     expect(fs.existsSync(active)).toBe(true);
   });
@@ -297,7 +306,8 @@ describe("terminal run event log retention", () => {
     JSON.stringify({ sequence, text: "🙂".repeat(24) }) + "\n").join(""));
   const make = (runs: string, id: string, record: Record<string, unknown>) => {
     const dir = path.join(runs, id);
-    writeStatus(dir, record);
+    // Positive compaction fixtures represent a persisted, confirmed-dead process.
+    writeStatus(dir, { transport: "process", sessionId: "2147483647", ...record });
     fs.writeFileSync(path.join(dir, "events.jsonl"), log);
     fs.writeFileSync(path.join(dir, "reply.json"), '{"text":"keep this result"}');
     return dir;
@@ -368,7 +378,7 @@ describe("terminal run event log retention", () => {
   });
 
   it("rechecks descendant exit immediately before atomic replacement, not just before reading the tail", () => {
-    const dir = make(temporaryDirectory(), "old", { status: "completed", finishedAt: DAY });
+    const dir = make(temporaryDirectory(), "old", { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: DAY });
     const child = path.join(dir, "nested", "child");
     writeStatus(child, { status: "completed", transport: "process", sessionId: "2147483647" });
     const read = fs.readSync;
@@ -385,7 +395,7 @@ describe("terminal run event log retention", () => {
   });
 
   it("honors custom age/cap and a zero budget, and drops an oversized final line without corrupt JSON", () => {
-    const dir = make(temporaryDirectory(), "old", { status: "completed", finishedAt: DAY });
+    const dir = make(temporaryDirectory(), "old", { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: DAY });
     expect(compactTerminalRunEvents(dir, { now: 3 * DAY, terminalRunEventsAgeMs: 3 * DAY })).toBe(false);
     expect(compactTerminalRunEvents(dir, { now: 3 * DAY, expired: () => true })).toBe(false);
     expect(fs.readFileSync(path.join(dir, "events.jsonl")).equals(log)).toBe(true);
@@ -399,7 +409,7 @@ describe("terminal run event log retention", () => {
   });
 
   it("leaves the original log intact and removes its temporary file when atomic rename fails", () => {
-    const dir = make(temporaryDirectory(), "old", { status: "completed", finishedAt: DAY });
+    const dir = make(temporaryDirectory(), "old", { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: DAY });
     const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => { throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); });
     try {
       expect(compactTerminalRunEvents(dir, { now: 3 * DAY })).toBe(false);
@@ -428,8 +438,13 @@ describe("temporal retention", () => {
     expect(result).toEqual({ removedRoots: [], removedRuns: [] });
     expect(fs.existsSync(path.join(orphaned, "lost"))).toBe(true);
     expect(fs.existsSync(path.join(closed, "lost"))).toBe(true);
-    // Without the marker the same runs are swept.
+    // Marker absence is not an external worker exit receipt. Preserve those trees.
     for (const runRoot of [orphaned, closed]) fs.rmSync(path.join(runRoot, "lost", "unresolved-worker.json"));
+    expect(sweep(tempRoot)).toEqual({ removedRoots: [], removedRuns: [] });
+    for (const runRoot of [orphaned, closed]) {
+      expect(fs.existsSync(path.join(runRoot, "lost"))).toBe(true);
+      writeStatus(path.join(runRoot, "lost"), { status: "failed", transport: "process", sessionId: "2147483647", finishedAt: 1, updatedAt: 1 });
+    }
     const unmarked = sweep(tempRoot);
     expect(unmarked.removedRoots).toContain(orphaned);         // the closed root goes too once empty
     expect(unmarked.removedRuns).toEqual([path.join(closed, "lost")]);
@@ -515,12 +530,12 @@ describe("temporal retention", () => {
     const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "actor");
     markRunRootActive(runRoot, 1);
     const actorRun = path.join(runRoot, "actor-run");
-    writeStatus(actorRun, { status: "completed", actorId: "actor-1", finishedAt: DAY });
+    writeStatus(actorRun, { status: "completed", transport: "process", sessionId: "2147483647", actorId: "actor-1", finishedAt: DAY });
     for (const name of ["task.txt", "events.jsonl", "reply.json", "relaunches.jsonl", "oversized-event-prefix.txt", "oversized-event-prefix-2.txt"]) {
       fs.writeFileSync(path.join(actorRun, name), "x");
     }
     const unknown = path.join(runRoot, "unknown");
-    writeStatus(unknown, { status: "completed", actorId: "actor-1", finishedAt: DAY });
+    writeStatus(unknown, { status: "completed", transport: "process", sessionId: "2147483647", actorId: "actor-1", finishedAt: DAY });
     fs.writeFileSync(path.join(unknown, "reply.json.bak"), "not ours");
     markRunRootClosed(runRoot, DAY + 1);
     const result = sweepTempRunRoots({
@@ -535,7 +550,7 @@ describe("temporal retention", () => {
     const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "young");
     markRunRootActive(runRoot, DAY);
     const run = path.join(runRoot, "run");
-    writeStatus(run, { status: "completed", finishedAt: DAY });
+    writeStatus(run, { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: DAY });
     markRunRootClosed(runRoot, DAY + 1);
     const read = vi.spyOn(fs, "readdirSync");
     const sweepAt = (now: number, budgetMs?: number) => sweepTempRunRoots({
@@ -558,7 +573,7 @@ describe("temporal retention", () => {
       ...(budgetMs !== undefined ? { budgetMs } : {}),
     });
     const completedRun = (directory: string): void => {
-      writeStatus(directory, { status: "completed", finishedAt: 1 });
+      writeStatus(directory, { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: 1 });
       fs.writeFileSync(path.join(directory, "task.txt"), "work");
     };
 
@@ -633,9 +648,9 @@ describe("temporal retention", () => {
     const expired = path.join(runRoot, "expired");
     const fresh = path.join(runRoot, "fresh");
     const actorTemp = path.join(runRoot, "actor-temp");
-    writeStatus(expired, { status: "completed", finishedAt: DAY });
-    writeStatus(fresh, { status: "completed", finishedAt: 2 * DAY });
-    writeStatus(actorTemp, { status: "failed", actorId: "actor-1", finishedAt: DAY });
+    writeStatus(expired, { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: DAY });
+    writeStatus(fresh, { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: 2 * DAY });
+    writeStatus(actorTemp, { status: "failed", transport: "process", sessionId: "2147483647", actorId: "actor-1", finishedAt: DAY });
     markRunRootClosed(runRoot, 2 * DAY);
 
     const result = sweepTempRunRoots({
@@ -657,9 +672,9 @@ describe("temporal retention", () => {
     const expired = path.join(runsDirectory, "expired");
     const latest = path.join(runsDirectory, "latest");
     const fresh = path.join(runsDirectory, "fresh");
-    writeStatus(expired, { status: "completed", finishedAt: DAY });
-    writeStatus(latest, { status: "completed", finishedAt: DAY });
-    writeStatus(fresh, { status: "completed", finishedAt: 8 * DAY });
+    writeStatus(expired, { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: DAY });
+    writeStatus(latest, { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: DAY });
+    writeStatus(fresh, { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: 8 * DAY });
 
     const removed = pruneActorRunArchives({
       runsDirectory,

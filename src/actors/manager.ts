@@ -2385,8 +2385,13 @@ export class ActorManager {
         existing.bindingVersion = 2;
         const persisted = this.#persistQueue(actor.id);
         if (this.#persistent && !existing.resolve && !existing.reject && !persisted) {
+          // Assignment alone retains optional fields introduced by the rejected
+          // replacement (notably provenance on legacy/UNKNOWN input). Restore
+          // both values and property absence as one input/identity snapshot.
+          for (const key of Object.keys(existing)) {
+            if (!Object.hasOwn(previous, key)) Reflect.deleteProperty(existing, key);
+          }
           Object.assign(existing, previous);
-          if (!previous.images) delete existing.images;
           actor.latestActivationSequence = previousSequence;
           throw new ActorQueueDurabilityError(actor.id);
         }

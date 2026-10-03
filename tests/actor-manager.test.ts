@@ -572,6 +572,80 @@ describe("ActorManager across a session reload", () => {
     expect(runs.filter(run => run.task.includes("retry after reboot"))).toHaveLength(1);
   }, 30_000);
 
+  it.each([
+    [false, "live"], [false, "replacement"], [true, "live"], [true, "replacement"],
+  ] as const)("S8 failed coalescing restores input and principal (known: %s, boundary: %s)", async (known, boundary) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-principal-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs") }); agentManagers.push(agents);
+    const before = reloadable(root, mesh, agents), from = { id: "peer", name: "peer", kind: "actor" as const };
+    const oldPrincipal = known ? { id: "old-human", binding: "voice-call" as const } : undefined;
+    const rejectedPrincipal = { id: "replacement-human", binding: "voice-call" as const };
+    const actor = await before.create({ name: "snapshot identity", instructions: "Work", topics: ["team.pulls"], responseMode: "text", coalesce: false, coalesceKey: "payload.number" });
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const run = agents.run.bind(agents);
+    let precedingFinished = false;
+    const running = vi.spyOn(agents, "run").mockImplementation(async (...args) => {
+      const result = await run(...args);
+      if (args[0].task.includes("preceding activation")) { precedingFinished = true; await held; }
+      return result;
+    });
+    const openedFiles = new Map<number, string>(), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), tail = mesh.tail.bind(mesh);
+    let unavailable = false, holdReplay = false, failures = 0;
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); openedFiles.set(fd, String(file)); return fd; });
+    const syncing = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = openedFiles.get(fd) ?? "";
+      if (unavailable && file.includes(`${path.sep}queue-`) && file.endsWith(".tmp")) { failures++; holdReplay = true; throw new Error("coalescing queue barrier unavailable"); }
+      sync(fd);
+    });
+    // Prevent the rejected monitor event from replaying before ordinary completion.
+    const reading = vi.spyOn(mesh, "tail").mockImplementation((...args) => { if (holdReplay) throw new Error("rejected replacement replay held"); return tail(...args); });
+    let launched = vi.spyOn(agents, "spawn");
+    try {
+      await mesh.publish({ topic: "team.pulls", from, text: "preceding activation", principal: oldPrincipal });
+      await waitFor(() => precedingFinished, 10_000);
+      const oldEvent = await mesh.publish({ topic: "team.pulls", from, text: "older retained input", principal: oldPrincipal, data: { payload: { number: 1 }, ...(!known ? { bridge: {} } : {}) } });
+      await waitFor(() => before.status(actor.id).queued === 1, 10_000);
+      const previous = queueFiles(root, actor.id).flatMap(({ text }) => JSON.parse(text).items).find(item => item.payload?.id === oldEvent.id);
+      expect(previous).toBeDefined();
+      if (known) expect(previous.provenance.principal).toEqual(oldPrincipal);
+      else expect(previous).not.toHaveProperty("provenance");
+      unavailable = true;
+      await mesh.publish({ topic: "team.pulls", from, text: "rejected new input", principal: rejectedPrincipal, data: { payload: { number: 1 } } });
+      await waitFor(() => failures > 0, 10_000);
+      if (boundary === "replacement") before.pauseForRelease();
+      unavailable = false; release();
+      await waitFor(() => before.messages(actor.id).some(message => message.direction === "out" && !message.error), 10_000);
+      let owner = before;
+      if (boundary === "replacement") {
+        await waitFor(() => before.inFlightCount() === 0, 10_000);
+        const saved = queueFiles(root, actor.id).flatMap(({ text }) => JSON.parse(text).items).find(item => item.id === previous.id);
+        expect(saved).toMatchObject({ payload: previous.payload, activation: previous.activation, binding: previous.binding, bindingMode: previous.bindingMode, bindingVersion: previous.bindingVersion, createdAt: previous.createdAt });
+        expect(saved.images).toEqual(previous.images);
+        expect(saved.provenance).toEqual(previous.provenance);
+        if (!known) expect(saved).not.toHaveProperty("provenance");
+        await before.close();
+        const restarted = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "restarted-runs") }); agentManagers.push(restarted);
+        launched = vi.spyOn(restarted, "spawn");
+        owner = reloadable(root, mesh, restarted);
+      }
+      await waitFor(() => owner.messages(actor.id).filter(message => message.direction === "out" && !message.error).length === 2, 15_000);
+      const requests = launched.mock.calls.map(([request]) => request).filter(request => request.task.includes("older retained input"));
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!.provenance?.principal).toEqual(oldPrincipal);
+      if (!known) expect(requests[0]).not.toHaveProperty("provenance");
+      expect(owner.messages(actor.id).filter(message => message.direction === "out" && !message.error).at(-1)?.principal).toEqual(oldPrincipal);
+      expect(mesh.read({ topic: "fabric.actor.output", limit: 100 }).filter(event => event.from.id === actor.id).at(-1)?.principal).toEqual(oldPrincipal);
+      expect(launched.mock.calls.some(([request]) => request.task.includes("rejected new input"))).toBe(false);
+      await owner.close();
+    } finally {
+      unavailable = false; release();
+      await before.close();
+      reading.mockRestore(); syncing.mockRestore(); opened.mockRestore(); running.mockRestore(); launched.mockRestore();
+    }
+  }, 30_000);
+
   it.each(["owner-defaults", "resolved"] as const)("keeps originating principal and %s binding mode through an actor queue reload and task launch", async (bindingMode) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-principal-actor-")); roots.push(root);
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);

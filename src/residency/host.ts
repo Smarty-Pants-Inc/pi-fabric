@@ -211,6 +211,8 @@ export class ResidentHost {
   readonly #unconfirmedPickups = new Set<string>();
   /** Executed requests owe storage only; never route these through mutation pickup again. */
   readonly #pendingResponses = new Map<string, ResidentCommandResponse>();
+  /** Replacement custody: read/reconfirm receipts only, never replay processing. */
+  readonly #interruptedRequests = new Set<string>();
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
   readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
@@ -766,10 +768,11 @@ export class ResidentHost {
     if (this.#staged) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
+      for (const file of [...this.#interruptedRequests].slice(0, 32)) this.#recoverInterruptedResponse(file);
       for (const [file, response] of [...this.#pendingResponses].slice(0, 32)) this.#publishResponse(file, response);
       if (this.#handover) return;
       // Retry only pickups this running host renamed but never executed. Startup
-      // recovery handles older processing entries conservatively as indeterminate.
+      // recovery settles older processing entries without executing their mutations.
       for (const entry of [...this.#unconfirmedPickups].slice(0, 32)) {
         // These pickups owe execution, not just storage settlement. The prior
         // request may have closed admission while awaited; retain custody.
@@ -1282,23 +1285,42 @@ export class ResidentHost {
     } catch {
       return;
     }
-    for (const entry of entries) {
-      const requestId = path.basename(entry, ".json");
-      if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
-        fs.rmSync(path.join(this.#processingPath, entry), { force: true });
-        fs.rmSync(path.join(this.#responsesPath, entry), { force: true });
-        continue;
-      }
-      const response: ResidentCommandResponse = {
+    for (const entry of entries) this.#interruptedRequests.add(path.join(this.#processingPath, entry));
+  }
+
+  #recoverInterruptedResponse(filePath: string): void {
+    const requestId = path.basename(filePath, ".json");
+    const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
+    if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+      fs.rmSync(filePath, { force: true });
+      fs.rmSync(responsePath, { force: true });
+      this.#interruptedRequests.delete(filePath);
+      return;
+    }
+    let saved: ResidentCommandResponse | undefined;
+    try {
+      saved = JSON.parse(fs.readFileSync(responsePath, "utf8")) as ResidentCommandResponse;
+    } catch (error) {
+      // Unreadable is not absent: retain the read obligation instead of overwriting
+      // a potentially recoverable receipt when storage is temporarily unavailable.
+      if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const response: ResidentCommandResponse = saved?.format === RESIDENT_HOST_FORMAT &&
+      saved.requestId === requestId && typeof saved.ok === "boolean" &&
+      Number.isSafeInteger(saved.completedAt) && saved.completedAt >= 0 &&
+      (saved.pending === undefined || typeof saved.pending === "string")
+      ? saved : {
         format: RESIDENT_HOST_FORMAT,
         requestId,
         ok: false,
         error: "Fabric residency outcome is indeterminate after resident host restart",
         completedAt: Date.now(),
       };
-      atomicWrite(path.join(this.#responsesPath, entry), response);
-      fs.rmSync(path.join(this.#processingPath, entry), { force: true });
-    }
+    // Transfer custody BEFORE any throwing publication/retirement. The shared
+    // poll reconfirms this exact response durably, then retires processing; failure
+    // remains a storage-only retry on this host and on its next replacement.
+    this.#pendingResponses.set(filePath, response);
+    this.#interruptedRequests.delete(filePath);
   }
 
   async #acquireLock(): Promise<void> {

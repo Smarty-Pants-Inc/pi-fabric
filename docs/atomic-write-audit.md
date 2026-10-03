@@ -129,6 +129,25 @@ requests and three-directory configuration retargeting. Claude uses the actual
 source worker and fake native CLI; recovered launches must omit `--resume`.
 These are A's reset/config/resident-command receipts, not PR B's task terminals.
 
+## Security round 3 response and coalescing recovery
+
+- **S7/F28:** replacement startup retains processing custody and validates any
+  existing command-response envelope. The owned request poll durably republishes
+  the exact saved response before processing retirement. Read or confirmation
+  failures retain storage-only debt; no interrupted mutation is replayed. Only
+  absent or invalid responses receive an indeterminate outcome.
+- **S8:** failed callerless coalescing restores the entire previous item snapshot,
+  including absence of optional provenance and images. Older UNKNOWN input cannot
+  acquire the principal of a rejected replacement.
+
+`residency-host.test.ts` and `resident-response-retirement-crash.mjs` exercise a
+real producer exit after durable success and failed retirement, with the original
+caller held until replacement settlement. Unavailable reconfirmation and receipt
+reads remain retryable; missing/invalid envelopes and saved refusals are controls.
+`actor-manager.test.ts` covers UNKNOWN and known-principal rollback, ordinary
+completion before rejected-event replay, persisted replacement, launch attribution
+and output attribution. These remain A command/queue receipts, not B task terminals.
+
 ## Limits and before-merge holds
 
 Filesystems/devices must honor fsync. Windows skips unsupported directory barriers

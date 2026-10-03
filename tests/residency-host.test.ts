@@ -88,6 +88,118 @@ describe("resident tracked result preservation", () => {
     } finally { unavailable = false; synced.mockRestore(); opened.mockRestore(); create.mockRestore(); close.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   }, 15000);
 
+  it.each(["missing", "malformed", "wrong-format", "wrong-id", "wrong-ok", "wrong-time", "wrong-pending", "saved-error"] as const)("S7/F28 validates replacement receipt: %s", async (receipt) => {
+    const { root, config, host } = fixture();
+    const requestId = "recovery-receipt", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    fs.mkdirSync(path.dirname(processing)); fs.mkdirSync(path.dirname(response));
+    fs.writeFileSync(processing, JSON.stringify({ format: 1, requestId, rootId: config.rootId, operation: "createActor", createdAt: Date.now(), request: { name: "never replay", instructions: "Work" } }));
+    const saved = { format: 1, requestId, ok: false, error: "original refusal", completedAt: Date.now() - 100 };
+    if (receipt !== "missing") fs.writeFileSync(response, receipt === "malformed" ? "{" : JSON.stringify({ ...saved,
+      ...(receipt === "wrong-format" ? { format: 2 } : {}), ...(receipt === "wrong-id" ? { requestId: "other" } : {}),
+      ...(receipt === "wrong-ok" ? { ok: "false" } : {}), ...(receipt === "wrong-time" ? { completedAt: -1 } : {}),
+      ...(receipt === "wrong-pending" ? { pending: {} } : {}),
+    }));
+    const create = vi.spyOn(ActorManager.prototype, "create");
+    try {
+      await host.start();
+      const recovered = JSON.parse(fs.readFileSync(response, "utf8"));
+      if (receipt === "saved-error") expect(recovered).toEqual(saved);
+      else expect(recovered).toMatchObject({ format: 1, requestId, ok: false, error: "Fabric residency outcome is indeterminate after resident host restart" });
+      expect(fs.existsSync(processing)).toBe(false); expect(create).not.toHaveBeenCalled();
+    } finally { create.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("S7/F28 unreadable replacement receipt stays retryable without synthesizing indeterminate", async () => {
+    const { root, config, host } = fixture();
+    const requestId = "unreadable-receipt", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    fs.mkdirSync(path.dirname(processing)); fs.mkdirSync(path.dirname(response));
+    fs.writeFileSync(processing, JSON.stringify({ format: 1, requestId, rootId: config.rootId, operation: "createActor", createdAt: Date.now(), request: { name: "never replay", instructions: "Work" } }));
+    const saved = { format: 1, requestId, ok: false, error: "original refusal", completedAt: Date.now() - 100 };
+    fs.writeFileSync(response, JSON.stringify(saved));
+    const read = fs.readFileSync.bind(fs), create = vi.spyOn(ActorManager.prototype, "create");
+    let unavailable = true, failures = 0;
+    const reading = vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+      if (unavailable && String(args[0]) === response) { failures++; throw Object.assign(new Error("receipt read unavailable"), { code: "EIO" }); }
+      return read(...args);
+    });
+    try {
+      await expect(host.start()).resolves.toBeUndefined();
+      await delay(150);
+      expect(failures).toBeGreaterThan(1); expect(fs.existsSync(processing)).toBe(true);
+      expect(JSON.parse(read(response, "utf8"))).toEqual(saved); expect(create).not.toHaveBeenCalled();
+      unavailable = false;
+      for (let n = 0; fs.existsSync(processing) && n < 500; n++) await delay(10);
+      expect(fs.existsSync(processing)).toBe(false);
+      expect(JSON.parse(read(response, "utf8"))).toEqual(saved); expect(create).not.toHaveBeenCalled();
+    } finally { unavailable = false; reading.mockRestore(); create.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 15_000);
+
+  it.each([false, true])("S7/F28 process replacement preserves published success (reconfirmation unavailable: %s)", async (failConfirmation) => {
+    const { root, config } = fixture();
+    config.residencyRoot = residentRoot(config.meshRoot, config.rootId);
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    const configPath = path.join(config.residencyRoot, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify(config));
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/resident-response-retirement-crash.mjs"), configPath, root], { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = ""; child.stderr.on("data", chunk => { stderr += String(chunk); });
+    const exited = new Promise<{ code: number | null; signal: string | null }>((resolve, reject) => { child.once("error", reject); child.once("close", (code, signal) => resolve({ code, signal })); });
+    const replacement = new ResidentHost(config);
+    const create = vi.spyOn(ActorManager.prototype, "create");
+    const read = fs.readFileSync.bind(fs), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    const files = new Map<number, string>();
+    let holdCaller = true, unavailable = failConfirmation, failures = 0;
+    // Keep the original live caller from consuming before the replacement boundary.
+    // Only its response reads are gated; recovery reads the actual saved receipt.
+    const reading = vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+      if (holdCaller && String(args[0]).includes(`${path.sep}responses${path.sep}`) && new Error().stack?.includes("actor-client")) throw new Error("caller consumption held");
+      return read(...args);
+    });
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); files.set(fd, String(file)); return fd; });
+    const syncing = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = files.get(fd) ?? "";
+      if (unavailable && file.includes(`${path.sep}responses${path.sep}`) && file.endsWith(".tmp")) { failures++; throw new Error("replacement response confirmation unavailable"); }
+      sync(fd);
+    });
+    let result: Promise<unknown> | undefined;
+    try {
+      for (let n = 0; !fs.existsSync(path.join(root, "ready")) && n < 1000; n++) {
+        if (child.exitCode !== null) throw new Error(`producer exited: ${stderr}`);
+        await delay(10);
+      }
+      expect(fs.existsSync(path.join(root, "ready")), stderr).toBe(true);
+      result = new ResidentActorClient(config.meshRoot, config.rootId, 15_000).createActor({ name: "replacement receipt", instructions: "Work", residency: "durable" }).catch(error => error);
+      expect(await exited, stderr).toEqual({ code: 0, signal: null });
+      const original = JSON.parse(read(path.join(root, "original.json"), "utf8"));
+      expect(original).toMatchObject({ ok: true, actor: { name: "replacement receipt" } });
+      const processing = path.join(config.residencyRoot, "processing", `${original.requestId}.json`);
+      const response = path.join(config.residencyRoot, "responses", `${original.requestId}.json`);
+      expect(fs.existsSync(processing)).toBe(true);
+      await expect(replacement.start()).resolves.toBeUndefined();
+      if (failConfirmation) {
+        expect(failures).toBeGreaterThan(0);
+        await delay(150);
+        expect(fs.existsSync(processing)).toBe(true);
+        expect(JSON.parse(read(response, "utf8"))).toEqual(original);
+        unavailable = false;
+      }
+      for (let n = 0; fs.existsSync(processing) && n < 500; n++) await delay(10);
+      expect(fs.existsSync(processing)).toBe(false);
+      expect(JSON.parse(read(response, "utf8"))).toEqual(original);
+      holdCaller = false;
+      expect(await result).toEqual(original.actor);
+      expect(read(path.join(root, "mutations.txt"), "utf8").trim().split("\n")).toEqual(["createActor"]);
+      expect(create).not.toHaveBeenCalled();
+      expect(replacement.actors.listOwned().map(actor => actor.id)).toEqual([original.actor.id]);
+    } finally {
+      holdCaller = false; unavailable = false;
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      await exited; await replacement.close();
+      await result;
+      syncing.mockRestore(); opened.mockRestore(); reading.mockRestore(); create.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it.each(process.platform === "win32" ? ["file", "retirement"] as const : ["file", "namespace", "retirement"] as const)("S5 retries completed response %s storage without repeating the mutation", async fault => {
     const { root, config, host } = fixture();
     const requestId = "response-retry", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);

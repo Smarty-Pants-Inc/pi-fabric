@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { build } from "esbuild";
-import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { buildLandlock } from "./build-landlock.mjs";
 
@@ -14,6 +14,7 @@ const primaryEntryPoints = [
   "src/releases-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
+  "src/agents/worker-protocol.ts",
   "src/jev.ts",
   "src/protocol.ts",
   "src/residency/host.ts",
@@ -121,6 +122,10 @@ const result = await build({
   metafile: true,
   logLevel: "info",
 });
+
+// Advertise the exact manager/worker contract without importing candidate code at spawn.
+const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
+writeFileSync("dist/worker-protocol.json", `${JSON.stringify({ version: WORKER_PROTOCOL_VERSION })}\n`);
 
 // Pi supplies these packages to extensions through its module aliases, so
 // they are peers and must never be bundled into code that Pi loads.

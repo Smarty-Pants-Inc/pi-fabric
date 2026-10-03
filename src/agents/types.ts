@@ -136,6 +136,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Canonical Fabric package root selected for the process worker at spawn time. */
+  fabricRelease?: string;
   /** Immediate caller, distinct from the lineage Main. */
   spawner?: AgentSpawner;
   /** Requested launch model; model below follows verified state/assistant attribution. */
@@ -217,6 +219,8 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  /** Canonical Fabric package root selected for the process worker at spawn time. */
+  fabricRelease?: string;
   spawner?: AgentSpawner;
   /** Present on terminal status snapshots when the full log was retained. */
   compactionSkipped?: string;
@@ -246,6 +250,8 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  /** Spawn-selected Fabric package root, retained in the durable run record. */
+  fabricRelease?: string;
   residentStartupProbe?: boolean;
   id: string;
   runner: FabricAgentRunner;
@@ -350,6 +356,8 @@ export type AgentTransportObservation =
   | { state: "unknown"; reason: string };
 
 export interface AgentTransportHandle {
+  /** Actual worker release, not the parent manager's loaded generation. */
+  fabricRelease?: string;
   kind: FabricAgentTransport;
   sessionId?: string;
   attachCommand?: string;

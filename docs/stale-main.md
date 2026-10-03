@@ -1,15 +1,23 @@
 # Release census
 
-PR #190 (smarty-dev#2665) ships release observability only. Release launch enforcement
-and durable recovery are deferred to **smarty-dev#3285**. This census does not change
+PR #190 shipped release observability. Process-transport spawns now resolve the profile's
+active Fabric selection at launch time (smarty-dev#2665 option (a)). Durable recovery and
+resident handover remain deferred to **smarty-dev#3285**. The census itself does not change
 launch admission, agent routing, actor queue behavior, or resident retirement authority.
 
 ## Loaded generation versus active selection
 
 Activation changes the profile's `settings.json` `packages` selector. It does not replace
-code in an existing Main, worker, or resident host. An ordinary task worker uses its
-launching runtime's loaded Fabric package; a durable task routed to an existing resident
-uses that resident's running generation. The report distinguishes those loaded paths from
+code in an existing Main, worker, or resident host. A new process-transport worker uses
+the active package's `dist/worker.js` and, when Fabric is enabled, `dist/index.js`, provided
+its `dist/worker-protocol.json` version matches the parent manager's
+`WORKER_PROTOCOL_VERSION`. An incompatible, unversioned, or incomplete active release
+falls back to the parent with one warning naming both releases. A missing selector
+falls back silently. Explicit source/custom worker paths remain caller-selected.
+Spawn handles, results, and new workers' status records expose the selected canonical
+root as `fabricRelease`. Existing resident hosts themselves retain their loaded
+generation; selecting a compatible worker does not migrate resident ownership or
+perform a resident handover. The report distinguishes those loaded paths from
 the profile's current active selection; an active selector is not evidence that a running
 process has changed generation.
 

@@ -46,6 +46,7 @@ export const createRunningRecord = (
   ...(options.fabricSessionId ? { fabricSessionId: options.fabricSessionId } : {}),
   ...(options.kernel ? { kernel: options.kernel } : {}),
   transport: options.transport,
+  ...(options.fabricRelease ? { fabricRelease: options.fabricRelease } : {}),
   // The publisher must save its own identity before any terminal publication;
   // the manager's enriched in-memory result is not a persistent exit receipt.
   ...(options.transport === "process" ? workerProcessIdentity() : {}),

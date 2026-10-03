@@ -487,6 +487,10 @@ export class ResidencyClient {
     const tools = allowedTools === undefined ? undefined
       : (request.tools ?? this.options.config.agents.defaultTools).filter((tool) => allowedTools.has(tool));
     await this.ensureHost();
+    // Durable settlement can synchronously occupy the caller's event loop past
+    // its last heartbeat. Publish a fresh trusted owner lease before dispatch;
+    // the host still checks the captured binding and rejects absent/stale peers.
+    await this.options.participants.refresh?.();
     const response = await this.#command(
       {
         format: RESIDENT_HOST_FORMAT,

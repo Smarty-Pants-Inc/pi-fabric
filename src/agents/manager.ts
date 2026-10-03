@@ -90,6 +90,7 @@ import {
   canRemoveTerminalRun,
   hasUnresolvedWorker,
   runTreeExitVeto,
+  runTreeResourceVeto,
   markUnresolvedWorker,
   heartbeatRunRoot,
   markRunRootActive,
@@ -632,7 +633,7 @@ const hostStoppedResult = (result: AgentRunResult, lastEventAt: number | undefin
 const runRootHasExitVeto = (root: string): boolean => {
   try {
     return fs.readdirSync(root, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && !!runTreeExitVeto(path.join(root, entry.name), 0, undefined, true));
+      .some((entry) => entry.isDirectory() && !!runTreeResourceVeto(path.join(root, entry.name), 0, undefined, true));
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
@@ -1475,7 +1476,7 @@ export class AgentManager {
           throw error;
         }
         try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
-        if (worktree && !runTreeExitVeto(runDirectory, 0, undefined, true)) await this.#worktrees.cleanup(id, true).catch(() => false);
+        if (worktree && !runTreeResourceVeto(runDirectory, 0, undefined, true)) await this.#worktrees.cleanup(id, true).catch(() => false);
         throw error;
       }
     };
@@ -2088,6 +2089,12 @@ export class AgentManager {
     // Join its existing bounded obligation instead of exposing that incidental
     // ordering as a cleanup failure. Expiry records uncertainty, not exit proof.
     if (managed.nativeReleasePending) await managed.nativeReleasePending;
+    // A bounded stop/native-close observation already recorded uncertainty.
+    // Do not start a second seven-second join after its deadline; neither a
+    // retry nor a late parent close can discharge the persisted tree fence.
+    if (managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) {
+      throw new Error(`Cannot clean up agent ${id}: Fabric lost track of its worker (${managed.lostContact ?? "see its run directory"})`);
+    }
     if (managed.transport.kind === "process") {
       // Captured native close avoids a full liveness-poll interval per short run.
       if (managed.transport.waitForClose) await managed.transport.waitForClose();
@@ -2307,7 +2314,6 @@ export class AgentManager {
     // A reload or shutdown ends these runs; tell the spawner's session (smarty-dev#1602).
     const results = stopped.flatMap((outcome) =>
       outcome.status === "fulfilled" ? [hostStoppedResult(outcome.value, lastEventAt.get(outcome.value.id))] : []);
-    let shutdownSaveFailed = false;
     if (results.length > 0) {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -2318,9 +2324,9 @@ export class AgentManager {
             this.#commitArchive(directory, result, "shutdown");
             if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure && !fs.existsSync(path.join(directory, "status.json"))) fs.rmSync(directory, { recursive: true, force: true });
           }
-          shutdownSaveFailed = false; break;
+          break;
         }
-        catch { shutdownSaveFailed = true; } // A failed archive never grants source deletion.
+        catch { /* The staged archive retains each failed shutdown result. */ } // A failed archive never grants source deletion.
       }
     }
     await Promise.allSettled([...this.#spawns]);
@@ -2340,8 +2346,10 @@ export class AgentManager {
     // Primary transport exit cannot release a surviving descendant's files or
     // shared budget. Keep the persistent run tree (and its owning actor ID) for
     // the next fenced owner whenever tree-wide exit evidence is incomplete.
-    const unresolved = shutdownSaveFailed || all.some((managed) => managed.processStopPending || managed.nativeReleasePending || managed.lostContact || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) ||
-      [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasExitVeto(this.#runRoot);
+    // An archive failure protects that run's full source, not another exited
+    // worker's files. Native uncertainty still fences the entire shared tree.
+    const unresolved = all.some((managed) => managed.processStopPending || managed.nativeReleasePending || managed.lostContact || runTreeResourceVeto(managed.runDirectory, 0, undefined, true)) ||
+      [...this.#queued.values()].some((queued) => queued.cleanupPending) || runRootHasExitVeto(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {
       this.#unregisteredTransports.clear();
@@ -2352,7 +2360,8 @@ export class AgentManager {
           // All tracked transports are confirmed exited above; untracked runs stay put.
           await Promise.all([
             ...all.filter((managed) => this.#canCollect(managed)).map((managed) => managed.runDirectory),
-            ...[...this.#queued.values()].filter((queued) => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending)
+            ...[...this.#queued.values()].filter((queued) => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
+                !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
               .map((queued) => path.join(this.#runRoot, queued.info.id)),
           ].map((directory) => removeTree(directory).catch(() => undefined)));
           try {
@@ -2477,8 +2486,19 @@ export class AgentManager {
     managed.processStop = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
     // Install the promise before stop can synchronously emit native events.
     void (async () => {
+      const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7;
       try {
         await managed.transport.stop();
+        // A wrapped/reconnected stop acknowledgment need not have joined the
+        // captured process close. Use the SAME stop deadline, never a new grace
+        // period after the native transport already exhausted its bound.
+        const remaining = deadline - Date.now();
+        if (managed.transport.closed && remaining > 0) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([managed.transport.closed, new Promise<void>(done => { timer = setTimeout(done, remaining); })]);
+          } finally { if (timer) clearTimeout(timer); }
+        }
         await this.#noteUnconfirmedExit(managed);
         managed.processStopPending = false;
         resolve();
@@ -2993,6 +3013,7 @@ export class AgentManager {
     const visit = (directory: string, depth: number): void => {
       if (depth > 32 || !ownedStat(directory)?.isDirectory()) return;
       const file = path.join(directory, ARCHIVE_PENDING_FILE);
+      const ageReference = ownedStat(directory);
       if (ownedStat(file)?.isFile()) {
         try {
           for (const archive of readPendingRunArchives(directory)) {
@@ -3003,6 +3024,13 @@ export class AgentManager {
             else if (archive.kind === "settlement" && this.#onSettled) this.#onSettled(archive.result, archive.recipient);
             else continue;
             commitRunArchive(directory, archive.kind);
+            // Replaying an old result is not new worker activity. Removing its
+            // custody marker must not reset the source's retention age and make
+            // an already expired, durably archived run uncollectible at startup.
+            const current = ownedStat(directory);
+            if (ageReference && current?.dev === ageReference.dev && current.ino === ageReference.ino) {
+              fs.utimesSync(directory, ageReference.atime, ageReference.mtime);
+            }
             recovered++;
           }
         } catch { /* The persisted veto remains for the next recovery attempt. */ }

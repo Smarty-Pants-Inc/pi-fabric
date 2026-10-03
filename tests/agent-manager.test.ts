@@ -525,6 +525,33 @@ describe("AgentManager", () => {
     } finally { await manager.close(); sweep.mockRestore(); }
   });
 
+  it("isolates shutdown archive failures without collecting an uncommitted queued source", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-shutdown-"));
+    roots.push(root);
+    const save = vi.fn(() => { throw new Error("shutdown archive unavailable"); });
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: false, budgetUsd: 0 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onStoppedAtClose: save,
+    });
+    managers.push(manager);
+    await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "queued shutdown outcome", transport: "process" });
+    expect(queued.status).toBe("queued");
+    await manager.close();
+    expect(save).toHaveBeenCalledTimes(3);
+    const source = path.join(root, queued.id, "archive-pending.json");
+    expect(JSON.parse(fs.readFileSync(source, "utf8")).pending.shutdown.result).toMatchObject({
+      id: queued.id, task: "queued shutdown outcome", status: "stopped",
+    });
+    const recovered = vi.fn();
+    const replacement = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, budgetUsd: 0 }, {
+      runRoot: root, onStoppedAtClose: recovered,
+    });
+    managers.push(replacement);
+    expect(replacement.recoverPendingArchives()).toBe(2);
+    expect(recovered.mock.calls.flatMap(([results]) => results)).toContainEqual(expect.objectContaining({ id: queued.id, status: "stopped" }));
+    expect(fs.existsSync(source)).toBe(false);
+  });
+
   it("retains a managed temporary run root when shutdown archival remains uncommitted", async () => {
     const detachedSweep = vi.spyOn(retentionStorage, "claimTempRunSweep").mockReturnValue(false);
     const inheritedRunRoot = process.env.PI_FABRIC_RUN_ROOT;

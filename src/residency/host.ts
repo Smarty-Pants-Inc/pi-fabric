@@ -395,11 +395,14 @@ export class ResidentHost {
         fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
         try {
           writeJsonAtomic(file, result, { durable: true });
-          // Rejected queued durable spawns have no admitted worker/source.
-          if (!this.agents.runDirectory(result.id)) return;
+          const trackedRun = this.agents.runDirectory(result.id);
+          const runDirectory = trackedRun ?? path.join(config.residencyRoot, "runs", result.id);
+          // Rejected queued spawns have no worker source; recovered admitted
+          // runs do, even though this manager no longer has their transport.
+          if (!trackedRun && !fs.existsSync(path.join(runDirectory, "status.json"))) return;
           // Retain/retry full sources on faults; logical settlement is recoverable
           // even when inbox notifications are disabled.
-          const recipient = completionRecipientFromRun(config.meshRoot, this.agents.runDirectory(result.id)!);
+          const recipient = completionRecipientFromRun(config.meshRoot, runDirectory);
           if (!recipient) throw new Error(`Missing admitted completion recipient for ${result.id}`);
           saveCompletion(config.meshRoot, recipient, result);
         } catch (error) { this.#publicationFailed = true; throw error; }
@@ -504,12 +507,15 @@ export class ResidentHost {
     await this.#acquireLock();
     this.#started = true;
     try {
+      this.#initialize();
+      // Replay the original full archive under the new host fence before any
+      // orphan collection. Failed sinks keep their marker and source intact.
+      this.agents.recoverPendingArchives();
       sweepResidentRuns(path.join(this.config.residencyRoot, "runs"), Date.now(), 100, {
         ...this.config.retention,
         actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
         retainRuns: this.config.agents.retainRuns,
       });
-      this.#initialize();
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });

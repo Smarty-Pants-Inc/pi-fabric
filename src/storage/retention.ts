@@ -98,6 +98,15 @@ export const markUnresolvedWorker = (runDirectory: string, reason: string, detai
  * descendant, without coupling that proof to cleanup's artifact allowlist. */
 export const runTreeExitVeto = (
   directory: string, depth = 0, expired: Deadline = noDeadline, requireDescendantExit = false,
+): string | undefined => runTreeVeto(directory, depth, expired, requireDescendantExit, true);
+/** Native resource safety is independent of full-result archival. This only
+ * authorizes pre-launch worktree rollback or isolation of shutdown obligations;
+ * run-file collection must still use runTreeExitVeto with its archive fence. */
+export const runTreeResourceVeto = (
+  directory: string, depth = 0, expired: Deadline = noDeadline, requireDescendantExit = false,
+): string | undefined => runTreeVeto(directory, depth, expired, requireDescendantExit, false);
+const runTreeVeto = (
+  directory: string, depth: number, expired: Deadline, requireDescendantExit: boolean, preserveArchives: boolean,
 ): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
@@ -109,7 +118,7 @@ export const runTreeExitVeto = (
   }
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
-    if (fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
+    if (preserveArchives && fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (fs.existsSync(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
@@ -162,7 +171,7 @@ export const runTreeExitVeto = (
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
     if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
     for (const name of fs.readdirSync(nested)) {
-      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requireDescendantExit);
+      const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requireDescendantExit, preserveArchives);
       if (reason) return reason;
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }

@@ -3221,12 +3221,12 @@ export class ActorManager {
   // Returns false when an owned receiver's queue was full; the monitor then offers the event
   // again while it catches up, and actors that already took it are skipped.
   #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
-    // One ownership refresh per event. Each decision reads the participant directory, and
-    // re-deciding for every actor per actor (and before the topic filter) cost 182 directory
-    // reads per event on a host with 13 actors and saturated its event loop (smarty-dev#784).
-    // The snapshot holds for this synchronous delivery (enqueue, drain start, message record);
-    // work that resumes later decides again.
-    this.#refreshOwnership();
+    // beforePoll already refreshed all owners for this synchronous page. No
+    // await separates that snapshot from dispatch, including archive catch-up.
+    // Re-refreshing per event or full-queue retry repeats directory reads without
+    // adding an authority boundary. Async activation continuations recheck their
+    // own target after every wait.
+
     this.#ownershipSnapshot = true;
     try {
       return this.#deliverMeshEvent(event);
@@ -4319,10 +4319,14 @@ export class ActorManager {
     this.#emitChange();
   }
 
-  #refreshOwnership(): void {
+  #refreshOwnership(id?: string): void {
     if (!this.#canManageActor || this.#reloadingOwnership) return;
     let acquired = false;
-    for (const actor of this.#actors.values()) {
+    // Async activation boundaries recheck their target, not every actor for
+    // every target. Polls and mesh delivery still refresh the complete snapshot.
+    const target = id === undefined ? undefined : this.#actors.get(id);
+    const actors = id === undefined ? this.#actors.values() : target ? [target] : [];
+    for (const actor of actors) {
       const previous = this.#ownership.get(actor.id) ?? false;
       const next = this.#ownershipDecision(actor.id);
       this.#ownership.set(actor.id, next);
@@ -4566,7 +4570,7 @@ export class ActorManager {
   }
 
   #canManage(id: string): boolean {
-    if (!this.#ownershipSnapshot) this.#refreshOwnership();
+    if (!this.#ownershipSnapshot) this.#refreshOwnership(id);
     return this.#canManageCached(id);
   }
 

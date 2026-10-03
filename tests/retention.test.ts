@@ -14,6 +14,7 @@ import {
   markRunRootClosed,
   hasUnresolvedWorker,
   runTreeExitVeto,
+  runTreeResourceVeto,
   markUnresolvedWorker,
   pruneActorRunArchives,
   compactTerminalRunEvents,
@@ -44,6 +45,25 @@ afterEach(() => {
 });
 
 describe("persistent archive custody", () => {
+  it("separates pending archives from native resource debt without authorizing source deletion", () => {
+    const parent = temporaryDirectory();
+    writeStatus(parent, { status: "completed" });
+    const child = path.join(parent, "nested", "child");
+    writeStatus(child, { status: "completed", transport: "process", sessionId: "2147483647" });
+    fs.writeFileSync(path.join(child, "archive-pending.json"), JSON.stringify({ format: 1, awaitingResult: true }));
+    const probe = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
+    try {
+      expect(runTreeResourceVeto(parent, 0, undefined, true)).toBeUndefined();
+      expect(runTreeExitVeto(parent, 0, undefined, true)).toMatch(/archive is pending/);
+      expect(canRemoveTerminalRun(parent)).toBe(false);
+      markUnresolvedWorker(child, "tree exit unknown");
+      expect(runTreeResourceVeto(parent, 0, undefined, true)).toMatch(/unresolved worker/);
+      fs.rmSync(path.join(child, "unresolved-worker.json"));
+      writeStatus(child, { status: "running", transport: "process", sessionId: "2147483647" });
+      expect(runTreeResourceVeto(parent, 0, undefined, true)).toMatch(/nonterminal process/);
+      expect(runTreeResourceVeto(parent, 0, () => true, true)).toMatch(/inspection was incomplete/);
+    } finally { probe.mockRestore(); }
+  });
   it("vetoes ancestor/orphan deletion until offline recovery commits the full actor outcome", () => {
     const temp = temporaryDirectory();
     const root = path.join(temp, "pi-fabric-runs-recovery");

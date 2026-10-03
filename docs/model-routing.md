@@ -1,11 +1,12 @@
-# Opt-in task model routing (shadow only)
+# Opt-in task and actor model routing (shadow only)
 
 `agents.spawn` accepts `model: "auto"` for **new session-owned process/Pi tasks only**.
 It makes one typed Jev Choice and records it. It **never changes the model or effort
 launched**: PR1 always runs the role's explicit pin, even when Jev recommends a
 cheaper candidate at high confidence. This is evidence collection, not live routing
-or measured savings. Mains, actors, durable agents, handoffs, explicit-model calls
-and the fleet's direct task CLI are not routed.
+or measured savings. Opted-in `status-groom` process/Pi **actor activations** also
+collect shadow decisions (below). Mains, durable task agents, handoffs, ordinary
+explicit-model calls and the fleet's direct task CLI are not routed.
 
 ```ts
 const child = await agents.spawn({
@@ -22,11 +23,29 @@ const child = await agents.spawn({
 ```
 
 Bounded lookup means a checkable one-file lookup, extraction or formatting task;
-not code changes, design judgment, review evidence, secrets or client data. Callers
+not code changes, design judgment, review evidence, secrets or client data.
+`status-groom` means routine checks and grooming whose output is a status line or
+a no-op; the same exclusions apply. Callers
 must set `protected: true` for review, security, audit, named passes and all
 `needs-security-pass` work. An omitted/unknown flag or unknown class is excluded
 before Jev. Protection is a caller-supplied trusted-state snapshot, **not an
 authenticated label oracle**. No prompt-based override or cheaper live route exists.
+
+## Classes on every run record
+
+Every new task, actor activation and handoff records `routeClass` and
+`routeClassSource: "explicit" | "derived"`, independently of shadow routing. An
+explicit caller/actor class wins. Otherwise host facts yield `actor:review` for
+`*-review-astra`, `actor:security` for `*-security-astra`, `actor:status-groom` for
+`supervisor`/`*-supervisor`, `actor:other` for other actors,
+`task:<runner>:<resolved transport>` for tasks, or `handoff` for handoffs. Queued
+task receipts use the requested transport until launch resolves it; portable
+hosted tasks use `task:pi:hosted`. Task text
+is never classification input. The existing `protected` true/false snapshot is
+retained; omitted protection stays unknown. These are history fields, not routing
+permission: derived classes, handoffs, review/security and protected work never
+opt into routing, and all existing shadow-only gates/pins remain unchanged.
+Legacy records are not backfilled.
 
 ## Pins and finite candidates
 
@@ -47,6 +66,7 @@ records no verified admission. Ordinary explicit-model clamping is unchanged.
 {
   "agents": {
     "modelRouting": {
+      "live": false,
       "pinModel": "my-provider/gpt-6.1-sol",
       "pinThinking": "high",
       "shadowCandidates": [
@@ -64,7 +84,10 @@ registered, authenticated keys visible to Main; at most 16 additional candidates
 are evaluated. Unavailable candidates select the pin with `invalid-candidates`.
 Configuring a shadow candidate grants **no permission to run it**. Paul's rule
 still applies: no Sol role at medium or below without measured parity and his
-approval. This PR has no switch to enable live routing.
+approval (Paul's floor rule, smarty-dev#2236). `agents.modelRouting.live` is a
+reserved, default-OFF flag: only `false` is accepted; `true` is refused, not an
+execution permission. LIVE implementation belongs to PR2 and requires measured
+parity plus Paul's floor approval.
 
 Jev receives only class, clear protection status and finite model/effort choices:
 no task text, prompts, history or free-text explanation. One request, no retry,
@@ -90,6 +113,63 @@ reasonCode, decisionId, ... }`. `model/effort` describes the accepted **would-be
 choice (or pin on fallback); `shadowChoice` preserves Jev's raw finite choice even
 below threshold. `handle.model/thinking` and the worker's admission still use the pin.
 
+## Per-activation actor shadow routing
+
+```ts
+const supervisor = await agents.create({
+  name: "factory-status",
+  instructions: "Check status and routine grooming; return a status line or no-op.",
+  residency: "durable",
+  runner: "pi",
+  transport: "process",
+  model: "my-provider/gpt-6.1-sol",
+  thinking: "high",
+  routeClass: "status-groom",
+  protected: false, // trusted issue/role state; never derived from instructions
+});
+```
+
+`routeClass` is fixed in the actor spec and retained by actor registry reload,
+portable definition export, global templates and import. Actor routing accepts
+only `status-groom`, requires explicit actor model **and** effort pins, and does
+not use parent/global/default-medium settings as pins. Every dispatched activation
+prepares the effective caller/project binding with the **same** exact pin and
+candidate validation, `decideModelRoute` Choice, threshold and deadline as auto
+spawn. Session/call binding overrides may set explicit pins; a missing/invalid
+pin refuses activation before inference or launch. Decision rows identify actor,
+mailbox activation and run; a new dispatch attempt has a new decision/run joined
+by the activation ID. A Choice itself is never retried.
+
+The activation always launches its effective **pinned** model/effort, regardless
+of the would-be choice. It retains its original persistent Pi session (no new
+child header/session is seeded), while the existing per-request route header
+identifies the shadow decision. Unopted actors are unchanged. Protected actors
+(`protected: true`: review/security/audit/named passes/`needs-security-pass`) record
+`excluded-protected` without evaluating Jev; omitted/unknown flags record
+`excluded-unknown`. Protection is the same caller-supplied trusted snapshot as
+spawn, not a new authenticated label oracle. Opting in never overrides protection.
+
+Both session and resident owners prepare decisions. Resident owners reuse the
+standard Jev client lazily at first eligible activation; there is no startup or
+idle inference. Their host-only policy snapshot requires Jev enabled, explicit
+network allow and non-enforced Schema. Older snapshots, disabled/unavailable Jev,
+network ask/auto/deny or unavailable Schema programs select the pin with
+`jev-error`. No credentials are sent in an actor request or taken from its text;
+resident evaluation uses the existing Jev configuration/environment, not a new
+credential store. Owner close revokes calls and joins pending evaluation and
+credential work. Lack of a resident backend is evidence of fallback, not a live
+route or a reason to relax gates.
+
+The existing dispatch/outcome recorder and terminal-save retry/retention fence
+write a decision before launch and an outcome after settlement, joined by
+`decisionId` plus `actorId`/`activationId`/`runId`. Outcomes include completed,
+failed or stopped status, admitted pin when known and observed input/output/cache
+and cost counters (null when unknown). Failed activations retain the same evidence
+as task failures. There is no invented quality score: a later parity report must
+join outcomes to class and would-be choice, and cannot claim cheaper execution or
+savings from shadow decisions alone. Existing ledger write-failure behavior applies
+(`record-failed`, pinned launch, retained pending terminal receipt).
+
 ## Durable join and child header
 
 Before the transport dispatches, Fabric writes a `decision` row to
@@ -99,7 +179,8 @@ ephemeral agent run directory. The host profile (`PI_CODING_AGENT_DIR`, otherwis
 cannot redirect it. Append-open uses `O_NOFOLLOW` and `O_NONBLOCK`, rejects links,
 non-regular/hard-linked endpoints and unsafe ownership/permissions, and bounds
 records to 64 KiB and the ledger to 64 MiB. Writes use append and `fsync`. This records the decision ID,
-Main/child native session IDs, class, role pin, candidates, shadow choice,
+Main/child native session IDs for new tasks (actor rows instead carry `actorId`,
+`activationId` and `runId`, with `childSessionId: null`), class, role pin, candidates, shadow choice,
 confidence, probability, fixed reason, latency and time. A seeded native child
 session binds the recorded child ID to Pi, not just to the process transport.
 For worktree tasks, its header is seeded only after the final worktree cwd is

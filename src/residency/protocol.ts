@@ -277,7 +277,7 @@ export const residentHostStateNote = (residencyRoot: string, now = Date.now()): 
       const age = now - fs.statSync(file).mtimeMs;
       if (age < 2_000) continue;
       notes.push(`the host has been processing ${String(command.operation)}` +
-        `${typeof command.id === "string" ? ` of ${command.id}` : ""} for ${formatAge(age)}; this request waits behind it`);
+        `${typeof command.id === "string" ? ` of ${command.id}` : ""} for ${formatAge(age)}; its response may still be settling`);
     }
   } catch { /* nothing in process */ }
   try {
@@ -351,6 +351,8 @@ export interface ResidentHostConfig {
   retention: FabricRetentionConfig;
   /** Absent in a config an older release wrote: the defaults apply. */
   actors?: FabricActorsConfig;
+  /** Host-only shadow gates; old snapshots refuse optional inference. */
+  shadowRouting?: import("../agents/model-route-owner.js").ShadowRoutePolicy;
   workerPath: string;
   fabricExtensionPath: string;
   piBinary: string;
@@ -507,6 +509,8 @@ export const assertResidentActorToolCeiling = (tools: string[], ceiling: readonl
 
 /** Root-owned registry operations; these never start a resident host. */
 export type ResidentActorMutation =
+  | { operation: "resetSession"; id: string }
+  | { operation: "stop"; id: string }
   | { operation: "setInstructions"; id: string; instructions: string }
   | { operation: "setTools"; id: string; tools: string[] }
   | { operation: "setModel"; id: string; model?: string; scope: FabricActorBindingScope }
@@ -554,7 +558,7 @@ export const residentCommandForOwner = (command: ResidentCommand, owner: Residen
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "setInstructions", "setModel",
-  "setThinking", "setTools", "setActivationFilter", "releaseChange",
+  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>
@@ -614,7 +618,7 @@ export interface ResidentCommandResponse {
   pending?: string;
   cleaned?: boolean;
   error?: string;
-  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED";
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED";
   /** Allowlisted policy-refusal payload, never arbitrary host Error properties. */
   modelDenied?: { model: string; replacement?: string };
   completedAt: number;

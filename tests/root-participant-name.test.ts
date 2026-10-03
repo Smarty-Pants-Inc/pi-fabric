@@ -20,6 +20,39 @@ const directory = (meshRoot: string, self = identity): ParticipantDirectory => n
 );
 
 describe("root participant session names", () => {
+  describe.each([false, true])("launch-name roster (mesh enabled=%s)", (enabled) => {
+    it.each([
+      [undefined, undefined, "main"],
+      [undefined, "  explicit-lead  ", "explicit-lead"],
+      ["  fabric-v2  ", undefined, "fabric-v2"],
+      ["fabric-v2", "explicit-lead", "fabric-v2"],
+      ["bad/name", "  explicit-lead  ", "explicit-lead"],
+      ["fabric-v2@x", "bad/name", "main"],
+    ] as const)("filters agent=%j Pi name=%j as %j, preserving role metadata", async (agentName, sessionName, expected) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-launch-roster-"));
+      vi.stubEnv("SMARTY_AGENT_NAME", agentName);
+      vi.stubEnv("SMARTY_ROLE", "project-agent@x");
+      vi.stubEnv("PI_FABRIC_ROLE", undefined);
+      const owner = new ParticipantDirectory(new MeshStore(root, 64 * 1024, 1000), {
+        enabled, hostId: identity.id, rootId: identity.id, identity,
+      });
+      const record = owner.root(info, true, sessionName);
+      owner.registerSource(() => [record]);
+      try {
+        await owner.start();
+        expect(record).toMatchObject({ name: expected, role: "project-agent", id: identity.id,
+          rootId: identity.id, ownerIdentityId: identity.id });
+        expect(owner.list({ name: expected, kinds: ["root"] }))
+          .toEqual([expect.objectContaining({ name: expected, id: identity.id })]);
+        expect(owner.list({ name: "project-agent", kinds: ["root"] })).toEqual([]);
+        expect(owner.list({ name: expected.toUpperCase(), kinds: ["root"] })).toEqual([]);
+      } finally {
+        await owner.close(); vi.unstubAllEnvs();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
   it.each([
     [undefined, "main"], ["", "main"], ["  \t ", "main"],
     ["  lucky-ios-lead  ", "lucky-ios-lead"], ["Lead 1_test.ok", "Lead 1_test.ok"],
@@ -196,11 +229,12 @@ const received = (target: ReturnType<typeof main>, senderId: string, text: strin
 };
 
 describe.each([false, true])("cross-root participant name routing (filesOnly=%s)", (filesOnly) => {
-  it("discovers role names, reports duplicates and resolves the new session after relaunch (#3860)", async () => {
+  it("discovers Pi names with role-only launch metadata, reports duplicates and resolves the new session after relaunch (#3860)", async () => {
     await acrossRoots(filesOnly, async ({ owner, reviewer, duplicate, ownerId, duplicateId, reviewerId }) => {
       reviewer.rename("reviewer");
-      vi.stubEnv("SMARTY_ROLE", "fabric-v2@abcdef123456");
-      owner.rename(undefined);
+      vi.stubEnv("SMARTY_ROLE", "project-agent@abcdef123456");
+      vi.stubEnv("SMARTY_AGENT_NAME", undefined);
+      owner.rename("fabric-v2");
       const members = () => reviewer.invoke("agents.members", { kinds: ["root"], name: "fabric-v2" });
       await vi.waitFor(async () => expect(await members()).toEqual([
         expect.objectContaining({ id: ownerId, name: "fabric-v2", sessionId: ownerId.slice(8) }),
@@ -213,7 +247,7 @@ describe.each([false, true])("cross-root participant name routing (filesOnly=%s)
       await expect(reviewer.invoke("agents.followUp", { id: "fabric-v2", message: "role reply" }))
         .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
       received(owner, reviewerId, "role reply", "followUp");
-      duplicate.rename(undefined);
+      duplicate.rename("fabric-v2");
       await vi.waitFor(async () => expect(await members()).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: ownerId }), expect.objectContaining({ id: duplicateId }),
       ])), { timeout: 8000, interval: 100 });
@@ -226,7 +260,7 @@ describe.each([false, true])("cross-root participant name routing (filesOnly=%s)
       await duplicate.runtime.shutdown();
       const config = owner.runtime.config;
       await owner.runtime.shutdown();
-      const next = main(owner.context.cwd, "dddddddd-0000-4000-8000-000000000004");
+      const next = main(owner.context.cwd, "dddddddd-0000-4000-8000-000000000004", "fabric-v2");
       try {
         await next.runtime.initialize(next.context, config);
         const nextId = "session:dddddddd-0000-4000-8000-000000000004";

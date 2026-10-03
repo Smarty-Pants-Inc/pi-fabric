@@ -59,7 +59,7 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
     if (key.toUpperCase().startsWith("PI_FABRIC_") && !testControls.has(key)) delete process.env[key];
   }
   for (const key of [
-    "PI_CODING_AGENT_DIR", "SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH",
+    "PI_CODING_AGENT_DIR", "SMARTY_ROLE", "SMARTY_AGENT_NAME", "HERDR_ENV", "HERDR_SOCKET_PATH",
     "HERDR_WORKSPACE_ID", "MCPORTER_CONFIG",
   ]) delete process.env[key];
 

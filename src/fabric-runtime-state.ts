@@ -596,7 +596,7 @@ export class FabricRuntimeState {
       { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: this.#config.mesh.lockProtocol },
     );
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
-    // Reevaluate the validated roster name on every scan, including renames and role fallback.
+    // Reevaluate the validated roster name on every scan, including launch names and Pi renames.
     // Names are delivery aliases only; the canonical id still owns the inbox and its receipts.
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
       ? new RootInbox(this.#mesh, identity, () => [mainAgentId, rootParticipantName(this.pi.getSessionName?.())])

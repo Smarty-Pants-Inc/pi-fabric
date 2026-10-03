@@ -63,14 +63,19 @@ const main = async (cwd: string, sessionId: string, initialName?: string) => {
 
 describe("public fabric_exec published-name missed-delivery recovery (#3860)", () => {
   it.each([
-    [undefined, undefined, "main"],
-    ["fabric-v2@abcdef123456", undefined, "fabric-v2"],
-    ["fabric-v2@abcdef123456", "  explicit-lead  ", "explicit-lead"],
-    ["fabric-v2@abcdef123456", "bad/name", "fabric-v2"],
-  ] as const)("recovers SMARTY_ROLE=%j Pi name=%j as %j", async (role, piName, publishedName) => {
+    [undefined, undefined, undefined, "main"],
+    [undefined, "project-agent@x", undefined, "main"],
+    [undefined, "project-agent@x", "  explicit-lead  ", "explicit-lead"],
+    ["fabric-v2", "project-agent@x", undefined, "fabric-v2"],
+    ["fabric-v2", "project-agent@x", "  explicit-lead  ", "fabric-v2"],
+    ["fabric-v2", "project-agent@x", "bad/name", "fabric-v2"],
+    ["bad/name", "project-agent@x", "  explicit-lead  ", "explicit-lead"],
+    ["fabric-v2@x", "project-agent@x", undefined, "main"],
+  ] as const)("recovers SMARTY_AGENT_NAME=%j SMARTY_ROLE=%j Pi name=%j as %j", async (agentName, role, piName, publishedName) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-inbox-published-name-"));
     for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
     vi.stubEnv("SMARTY_ROLE", role);
+    vi.stubEnv("SMARTY_AGENT_NAME", agentName);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
     fs.mkdirSync(path.join(root, "agent"));
     fs.writeFileSync(path.join(root, "agent", "fabric.json"), JSON.stringify({
@@ -113,16 +118,26 @@ describe("public fabric_exec published-name missed-delivery recovery (#3860)", (
         try { await owner.prompt(); } finally { clock.mockRestore(); }
         expect(owner.sendMessage).toHaveBeenCalledTimes(1);
       }
-      for (const [next, expected] of [["renamed-lead", "renamed-lead"], [undefined, role ? "fabric-v2" : "main"]] as const) {
+      // The role stamp is metadata only; an invalid/unpublished launch name is not an alias either.
+      for (const alias of [role?.split("@")[0], agentName]) {
+        if (!alias || alias === publishedName) continue;
+        await publish(alias, "unpublished launch alias must not arrive");
+        const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+        try { await owner.prompt(); } finally { clock.mockRestore(); }
+        expect(owner.sendMessage).toHaveBeenCalledTimes(1);
+      }
+      for (const [next, expected] of [["renamed-lead", agentName === "fabric-v2" ? "fabric-v2" : "renamed-lead"],
+        [undefined, agentName === "fabric-v2" ? "fabric-v2" : "main"]] as const) {
         const previous = (await owner.exec(`return await agents.self(); // previous ${next}`)).name;
         owner.rename(next);
         // Presence is republished by the existing heartbeat, not synchronously by getSessionName.
         let probe = 0;
         await vi.waitFor(async () => expect(await owner.exec(`return await agents.self(); // rename probe ${++probe}`))
           .toMatchObject({ id: self.id, name: expected }), { timeout: 8000, interval: 500 });
-        await publish(previous, "old alias must not arrive " + previous);
-        const current = await publish(expected, "current name " + expected);
-        const exact = await publish(self.id, "exact id " + expected);
+        if (previous !== expected) await publish(previous, "old alias must not arrive " + previous);
+        // A valid launch name stays fixed across Pi renames; use distinct work keys per probe.
+        const current = await publish(expected, `current name ${expected} after ${next ?? "clear"}`);
+        const exact = await publish(self.id, `exact id ${expected} after ${next ?? "clear"}`);
         await recover([current.id, exact.id]);
       }
     } finally {

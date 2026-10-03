@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
+import { terminateWindowsTree } from "../../child-process-tree.js";
 
 export interface ExecFileResult {
   stdout: string;
@@ -257,9 +258,9 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
-  authority?: Pick<AgentTransportLaunch, "signal" | "authorize">,
+  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
-): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean> }> => {
+): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
   const child = spawn(runtime, [workerPath, ...workerArguments], {
@@ -275,15 +276,80 @@ export const spawnDetached = async (
   // ponytail: descendants an exited worker left in its group are not signalled; liveness
   // (and so relaunch) is about the worker itself.
   let exited = false;
-  child.once("exit", () => { exited = true; });
+  let force: ReturnType<typeof setTimeout> | undefined;
+  child.once("exit", () => { exited = true; clearTimeout(force); });
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  let stopping: Promise<void> | undefined;
+  let lost: string | undefined;
+  const unconfirmed = (reason: string): void => {
+    if (lost !== undefined) return;
+    lost = reason;
+    try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
+  };
   child.unref();
   return {
     pid,
-    async stop() {
-      if (exited) return;
+    lostContact: () => lost,
+    async waitForClose() {
+      let deadline: ReturnType<typeof setTimeout> | undefined;
       try {
-        process.kill(process.platform === "win32" ? pid : -pid, "SIGTERM");
-      } catch { /* process group already exited */ }
+        await Promise.race([closed, new Promise<void>(resolve => {
+          deadline = setTimeout(() => {
+            unconfirmed("Owned process worker did not confirm native close within 7000ms");
+            resolve();
+          }, 7_000);
+        })]);
+      } finally { clearTimeout(deadline); }
+    },
+    stop() {
+      return stopping ??= (async () => {
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            (async () => {
+              if (!exited) {
+                // A Windows parent-only kill cannot join its native descendants.
+                // Publish helper uncertainty before its fallback can emit exit.
+                if (process.platform === "win32") await new Promise<void>(resolve => {
+                  // Join the actual helper attempt, even when it failed. Failure
+                  // publishes immutable lost-contact debt BEFORE this join ends;
+                  // the owner retains files and native admission indefinitely.
+                  // Waiting out the whole seven-second bound after helper close
+                  // only delays logical stop, without adding any exit evidence.
+                  void terminateWindowsTree(child, unconfirmed, resolve);
+                });
+                else {
+                  try { process.kill(-pid, "SIGTERM"); }
+                  catch { /* still require captured native close */ }
+                  // The worker gives its separately grouped native child 5000ms.
+                  // Leave another second for TERM delivery, child KILL/close,
+                  // and worker exit before escalating the still-live worker.
+                  force = setTimeout(() => {
+                    if (exited) return; // Never signal an exited/reused numeric identity.
+                    // Native Pi can own a separate group. Forced worker exit
+                    // cannot prove that its graceful descendant teardown ran.
+                    unconfirmed("POSIX worker tree termination is unconfirmed after 6000ms grace");
+                    try { process.kill(-pid, "SIGKILL"); }
+                    catch { /* deadline records an unconfirmed exit */ }
+                  }, 6_000);
+                }
+              }
+              // Exit/probe absence alone is not native close. However, a stuck
+              // worker (or unknown Windows tree) must not hang timeout/shutdown.
+              await closed;
+            })(),
+            new Promise<void>(resolve => {
+              deadline = setTimeout(() => {
+                unconfirmed("Owned process worker did not confirm tree/native close within 7000ms");
+                resolve();
+              }, 7_000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(force);
+          clearTimeout(deadline);
+        }
+      })();
     },
     async isAlive() {
       if (exited) return false;

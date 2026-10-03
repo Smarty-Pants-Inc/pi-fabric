@@ -496,14 +496,19 @@ describe("round 3 completion fences", () => {
     // A separate Main manager forces the real residency-first status path for durable runs.
     const provider = providerFor(h, a.client, scope === "durable" ? managerFor(h) : manager);
     let launches = 0; let statusFile = ""; let final: AgentRunResult | undefined;
+    const stoppedAttempts: number[] = [];
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
-      launches++;
+      const attempt = ++launches;
+      let exited = false;
       const args = new Map<string, string>();
       for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
       statusFile = args.get("--status-file")!;
       final = { ...h.result, id: request.id, startedAt: Date.now(), updatedAt: Date.now(), text: "FINAL_SUCCESS_R3" };
       fs.writeFileSync(statusFile, JSON.stringify({ ...final, status: "running", finishedAt: undefined }));
-      return { kind: "process", isAlive: async () => launches > 1, stop: async () => {} };
+      // Each fake worker keeps its own lifetime. Relaunch must not make the
+      // exited predecessor alive again; terminal publication is not exit proof.
+      return { kind: "process", isAlive: async () => !exited && attempt > 1,
+        stop: async () => { stoppedAttempts.push(attempt); exited = true; } };
     });
     const handle = await manager.spawn({ task: "retry me", transport: "process", residency: scope, nice: 19 });
     let metadataFile: string | undefined;
@@ -526,6 +531,7 @@ describe("round 3 completion fences", () => {
     await waitFor(() => launches === 2);
     fs.writeFileSync(statusFile, JSON.stringify(final)); saveWorkerCompletion(statusFile, final!);
     await manager.join(handle.id);
+    expect(stoppedAttempts).toEqual([1, 2]);
     expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
     h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
     await waitFor(() => b.completed.mock.calls.length === 1); b.turn();
@@ -717,8 +723,9 @@ describe("round 2 completion security", () => {
   it.each(["credential startup", "recoverable stop"] as const)("F2/manager: %s retries with journal enabled; successor receives final success only", async mode => {
     const h = harness(); const owner = h.client("A", 100); const manager = managerFor(h, owner);
     let launches = 0; let statusFile = ""; let final: AgentRunResult | undefined;
+    const stoppedAttempts: number[] = [];
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
-      launches++; const args = new Map<string, string>();
+      const attempt = ++launches; let exited = false; const args = new Map<string, string>();
       for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
       statusFile = args.get("--status-file")!;
       const now = Date.now();
@@ -731,7 +738,10 @@ describe("round 2 completion security", () => {
       } else {
         final = result; fs.writeFileSync(statusFile, JSON.stringify({ ...result, status: "running", finishedAt: undefined }));
       }
-      return { kind: "process", isAlive: async () => launches > 1 && final !== undefined, stop: async () => {} };
+      // Each fake worker keeps its own lifetime. Relaunch must not make the
+      // exited predecessor alive again; terminal publication is not exit proof.
+      return { kind: "process", isAlive: async () => !exited && attempt > 1,
+        stop: async () => { stoppedAttempts.push(attempt); exited = true; } };
     });
     h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
     const handle = await manager.spawn({ task: "retry me", transport: "process", nice: 19 });
@@ -747,6 +757,7 @@ describe("round 2 completion security", () => {
     expect(manifest.supervisor).toMatchObject({ pid: process.pid });
     fs.writeFileSync(statusFile, JSON.stringify(final)); saveWorkerCompletion(statusFile, final!);
     const settled = await manager.wait(handle.id); expect(settled).toMatchObject({ status: "completed", text: "FINAL_RECOVERED_SUCCESS" });
+    expect(stoppedAttempts).toEqual([1, 2]);
     await waitFor(() => b.completed.mock.calls.length === 1);
     b.turn();
     expect(await b.client.waitAgent(handle.id)).toMatchObject({ status: "completed", text: "FINAL_RECOVERED_SUCCESS" });

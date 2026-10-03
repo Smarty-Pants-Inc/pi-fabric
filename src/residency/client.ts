@@ -1009,7 +1009,9 @@ export class ResidencyClient {
   }
 
   #recipient(config: ResidentHostConfig): CompletionRecipient {
-    const original = this.options.participants.lastKnown?.(config.rootId)?.participant;
+    // A startup-only client can precede the resident directory's initialization.
+    // Its persisted config still supplies the original, fixed lane address.
+    const original = this.options.participants?.lastKnown?.(config.rootId)?.participant;
     return { rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd, projectRoot: config.projectRoot,
       name: (config === this.options.config ? this.options.mainName?.() : undefined) ?? config.mainName ?? original?.name ?? "main", role: config.role,
       startedAt: config.mainStartedAt ?? original?.startedAt ??

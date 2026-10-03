@@ -320,6 +320,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   lastRetriedTransportFailure?: AgentRunResult;
   /** Set when a relaunch failed; the run settles with it, not the attempt it replaced. */
   relaunchFailure?: AgentRunRecord;
+  /** A retry launch owns custody until its exact replacement handle is installed. */
+  relaunchPending?: Promise<boolean>;
   /** Terminal results do not discharge execution custody or admission permits. */
   executionExited?: boolean;
   launchCancelled?: boolean;
@@ -1979,6 +1981,9 @@ export class AgentManager {
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
     managed.stopRequested = true;
+    // A retry may already be launching its replacement. The previous attempt's
+    // exit cannot settle/release this run while that new execution is in flight.
+    await managed.relaunchPending;
     const existing = readRecord(managed.statusFile);
     // Even a settled/terminal run may still own a detached execution group.
     // Only an exact native deadline receipt permits logical completion with
@@ -2627,6 +2632,18 @@ export class AgentManager {
     record: AgentRunRecord,
     resume?: { task: string; carryOver: AgentRunCarryOver },
   ): Promise<boolean> {
+    // Publish the join before preparation or stop can re-enter public stop().
+    const pending = Promise.resolve().then(() => this.#relaunchAttempt(managed, record, resume));
+    managed.relaunchPending = pending;
+    try { return await pending; }
+    finally { delete managed.relaunchPending; }
+  }
+
+  async #relaunchAttempt(
+    managed: ManagedAgent,
+    record: AgentRunRecord,
+    resume?: { task: string; carryOver: AgentRunCarryOver },
+  ): Promise<boolean> {
     try {
       if (managed.runner === "pi") {
         const model = await this.prepareModelForAdmission(managed.routePin?.model ?? managed.model, managed.runner, undefined, Boolean(managed.routePin));
@@ -2660,7 +2677,7 @@ export class AgentManager {
       // case it exists for. A process worker that really exited is not signalled: its
       // transport saw the exit and never signals a numeric id that may be reused.
       const previousSession = managed.transport.sessionId;
-      await managed.transport.stop().catch(() => undefined);
+      await this.#stopManagedTransport(managed).catch(() => undefined);
       await this.#waitForTransportExit(managed);
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
       // Relaunch only when the previous worker is gone for certain. A worker that did
@@ -2708,16 +2725,22 @@ export class AgentManager {
 
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
+      const transport = await this.#launchTransport(managed.adapter, managed.launch);
+      // Stop receipts belong to one transport attempt, not the run id. Install
+      // the replacement and its fresh custody together, after launch resolves.
+      managed.transport = transport;
       managed.executionExited = false;
-      managed.transport = await this.#launchTransport(managed.adapter, managed.launch);
-      this.#unregisteredTransports.delete(managed.transport);
+      delete managed.processStop;
+      delete managed.processStopPending;
+      delete managed.joinedStopDebt;
+      this.#unregisteredTransports.delete(transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
       delete managed.relaunchFailure;
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) {
         // A stop (or an abandonment, #2184 8b) landed while the relaunch was in flight.
         // Release the child we just started so it cannot outlive the monitor and the
         // stop path can publish its terminal record.
-        await managed.transport.stop().catch(() => undefined);
+        await this.#drainExecution(managed);
         return false;
       }
       delete managed.latestRecord;

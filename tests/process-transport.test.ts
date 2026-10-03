@@ -108,8 +108,9 @@ describe("process transport spawn-time Fabric release selection", () => {
     expect(JSON.parse(result.text).worker).toBe(pathToFileURL(custom).href);
   });
 
-  it("preserves an explicit non-Fabric hook while selecting the installed worker", async () => {
+  it("preserves an explicit non-Fabric hook inside a pi-fabric checkout while selecting the installed worker", async () => {
     const f = fixture();
+    fs.copyFileSync(path.resolve("package.json"), path.join(f.root, "package.json"));
     const hook = path.join(f.root, "custom-hook.mjs");
     fs.writeFileSync(hook, "export default function () {}\n");
     const current = f.release("custom-hook-current");

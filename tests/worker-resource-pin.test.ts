@@ -12,6 +12,10 @@ afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup();
 it.each([false, true])("filters before native trust bootstrap and every reload, retaining other authorized resources (trust: %s)", async trusted => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-resource-pin-"));
   cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
+  // Source checkout ancestry, using the real Fabric manifest rather than an
+  // unrelated sibling package: project/caller hooks are not release entrypoints.
+  fs.copyFileSync(path.resolve("package.json"), path.join(root, "package.json"));
+  fs.mkdirSync(path.join(root, "dist"));
   const profile = path.join(root, "profile"); fs.mkdirSync(profile);
   const marks = path.join(root, "executed.jsonl");
   const factory = (label: string) => `import fs from 'node:fs'; export default function() { fs.appendFileSync(${JSON.stringify(marks)}, JSON.stringify(${JSON.stringify(label)})+'\\n'); }`;
@@ -28,12 +32,21 @@ it.each([false, true])("filters before native trust bootstrap and every reload, 
   fs.writeFileSync(path.join(other, "prompt.md"), "---\ndescription: Other authorized prompt\n---\nOther prompt\n");
   fs.mkdirSync(path.join(profile, "extensions")); fs.writeFileSync(path.join(profile, "extensions/profile.ts"), factory("profile-extension"));
   fs.mkdirSync(path.join(root, ".pi/extensions"), { recursive: true }); fs.writeFileSync(path.join(root, ".pi/extensions/project.ts"), factory("project-extension"));
+  const callerHook = path.join(root, "caller-hook.mjs");
+  fs.writeFileSync(callerHook, factory("explicit-caller-hook"));
+  fs.writeFileSync(path.join(root, "dist/index.js"), factory("rejected-checkout-fabric"));
+  fs.mkdirSync(path.join(root, ".pi/skills/project"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".pi/skills/project/SKILL.md"), "---\nname: project-skill\ndescription: Authorized checkout skill\n---\nProject skill\n");
+  fs.mkdirSync(path.join(root, ".pi/prompts"));
+  fs.writeFileSync(path.join(root, ".pi/prompts/project.md"), "---\ndescription: Authorized checkout prompt\n---\nProject prompt\n");
+  fs.mkdirSync(path.join(root, ".pi/themes"));
+  fs.copyFileSync(path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/dark.json"), path.join(root, ".pi/themes/project.json"));
   const settingsFile = path.join(profile, "settings.json");
   const select = (release: string) => fs.writeFileSync(settingsFile, JSON.stringify({ packages: [release, other] }));
   select(b);
   const settings = SettingsManager.create(root, profile, { projectTrusted: false });
   cleanups.push(installFabricResourcePin(DefaultPackageManager, path.join(a, "index.mjs")));
-  const loader = new DefaultResourceLoader({ cwd: root, agentDir: profile, settingsManager: settings, additionalExtensionPaths: [path.join(a, "index.mjs")] });
+  const loader = new DefaultResourceLoader({ cwd: root, agentDir: profile, settingsManager: settings, additionalExtensionPaths: [path.join(a, "index.mjs"), callerHook, path.join(root, "dist/index.js")] });
   const before = fs.readFileSync(settingsFile, "utf8");
   await loader.reload({ resolveProjectTrust: async ({ extensionsResult }) => {
     expect(extensionsResult.errors).toEqual([]);
@@ -44,10 +57,13 @@ it.each([false, true])("filters before native trust bootstrap and every reload, 
   const assertLoaded = () => {
     expect(loader.getExtensions().errors).toEqual([]);
     const executed = new Set(fs.readFileSync(marks, "utf8").trim().split("\n").map(line => JSON.parse(line)));
-    expect(executed).toEqual(new Set(["A", "other-package", "profile-extension", ...(trusted ? ["project-extension"] : [])]));
+    expect(executed).toEqual(new Set(["A", "other-package", "profile-extension", "explicit-caller-hook", ...(trusted ? ["project-extension"] : [])]));
     expect(loader.getExtensions().extensions.some(extension => extension.resolvedPath === path.join(a, "index.mjs") || extension.path === path.join(a, "index.mjs"))).toBe(true);
     expect(loader.getSkills().skills.map(skill => skill.name)).toContain("other-skill");
     expect(loader.getPrompts().prompts.map(prompt => prompt.name)).toContain("prompt");
+    expect(loader.getSkills().skills.map(skill => skill.name).includes("project-skill")).toBe(trusted);
+    expect(loader.getPrompts().prompts.map(prompt => prompt.name).includes("project")).toBe(trusted);
+    expect(loader.getThemes().themes.some(theme => theme.sourcePath === path.join(root, ".pi/themes/project.json"))).toBe(trusted);
   };
   assertLoaded();
   select(b); const saved = fs.readFileSync(settingsFile, "utf8");

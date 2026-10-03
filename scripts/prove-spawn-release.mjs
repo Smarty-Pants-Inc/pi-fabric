@@ -35,9 +35,20 @@ const release = name => {
 const parent = release("old-main-A"); const selected = release("activated-compatible-B"); const incompatible = release("activated-incompatible-C");
 const protocol = JSON.parse(fs.readFileSync(path.join(incompatible, "dist/worker-protocol.json"), "utf8"));
 fs.writeFileSync(path.join(incompatible, "dist/worker-protocol.json"), JSON.stringify({ version: protocol.version + 1 }));
+// Exercise actual source-checkout ancestry, not just sibling release fixtures.
+const checkout = path.join(root, "source-checkout"); fs.mkdirSync(checkout);
+execFileSync("tar", ["-x", "-C", checkout], { input: execFileSync("git", ["archive", "HEAD"], { cwd: repo, maxBuffer: 64 * 1024 * 1024 }) });
+const cwd = path.join(checkout, "workspace"); fs.mkdirSync(cwd);
+const projectHook = path.join(cwd, ".pi/extensions/caller-hook.js");
+const callerHook = path.join(checkout, "explicit-caller-hook.mjs");
+const rejectedCheckout = path.join(checkout, "dist/index.js");
+fs.mkdirSync(path.dirname(projectHook), { recursive: true }); fs.mkdirSync(path.dirname(rejectedCheckout), { recursive: true });
+for (const [file, type] of [[projectHook, "project_resource"], [callerHook, "caller_resource"], [rejectedCheckout, "rejected_checkout_fabric"]]) {
+  fs.writeFileSync(file, `import fs from 'node:fs'; export default function() { const row = { type: ${JSON.stringify(type)}, module: import.meta.url, pid: process.pid, runDir: process.env.PI_FABRIC_AGENT_RUN_DIR ?? null }; fs.appendFileSync(${JSON.stringify(markerFile)}, JSON.stringify(row)+'\\n'); console.log(JSON.stringify(row)); }`);
+}
 const otherHook = path.join(root, "other-extension.mjs");
 fs.writeFileSync(otherHook, `import fs from 'node:fs'; export default function() { const row = { type: 'other_resource', pid: process.pid, runDir: process.env.PI_FABRIC_AGENT_RUN_DIR ?? null }; fs.appendFileSync(${JSON.stringify(markerFile)}, JSON.stringify(row)+'\\n'); console.log(JSON.stringify(row)); }`);
-const select = dir => fs.writeFileSync(settingsFile, JSON.stringify({ packages: [dir], extensions: [otherHook], enableInstallTelemetry: false, compaction: { enabled: false }, retry: { enabled: false } }));
+const select = dir => fs.writeFileSync(settingsFile, JSON.stringify({ packages: [dir], extensions: [otherHook, callerHook, ...(dir === parent ? [] : [rejectedCheckout])], defaultProjectTrust: "always", enableInstallTelemetry: false, compaction: { enabled: false }, retry: { enabled: false } }));
 select(parent);
 fs.writeFileSync(path.join(profile, "fabric.json"), JSON.stringify({ autoReload: false, mcp: { enabled: false }, mesh: { enabled: false }, agents: { nice: 19, retainRuns: true, sessionExport: false, notifyOnComplete: false, timeoutMs: 45000 }, executor: { kernel: "typescript" } }));
 let pendingCall;
@@ -66,8 +77,8 @@ try {
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const model = id => ({ id, name: id, reasoning: false, input: ["text"], contextWindow: 64000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
   fs.writeFileSync(path.join(profile, "models.json"), JSON.stringify({ providers: { "release-proof": { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "offline-only", api: "openai-completions", models: [model("main"), model("child")] } } }));
-  emit({ type: "command", command: `PI_FABRIC_PROOF_PI=${JSON.stringify(sdk)} nice -n 19 node scripts/prove-spawn-release.mjs`, head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim(), sdk, parent, selected, incompatible, instrumentation: "Exact built dist copies, appended origin-print markers only; Main autoReload disabled" });
-  main = spawn(process.execPath, [sdk, "--mode", "rpc", "--no-session", "--model", "release-proof/main", "-e", path.join(parent, "dist/index.js")], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: profile, PI_OFFLINE: "1", PI_FABRIC_PI_BINARY: sdk, PI_FABRIC_RUN_ROOT: path.join(root, "runs") }, stdio: ["pipe", "pipe", "pipe"] });
+  emit({ type: "command", command: `PI_FABRIC_PROOF_PI=${JSON.stringify(sdk)} nice -n 19 node scripts/prove-spawn-release.mjs`, head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim(), sdk, parent, selected, incompatible, checkout, cwd, checkoutSource: "git archive HEAD", instrumentation: "Exact built dist copies, appended origin-print markers only; Main autoReload disabled" });
+  main = spawn(process.execPath, [sdk, "--mode", "rpc", "--no-session", "--model", "release-proof/main", "-e", path.join(parent, "dist/index.js"), "-e", callerHook], { cwd, env: { ...process.env, PI_CODING_AGENT_DIR: profile, PI_OFFLINE: "1", PI_FABRIC_PI_BINARY: sdk, PI_FABRIC_RUN_ROOT: path.join(root, "runs") }, stdio: ["pipe", "pipe", "pipe"] });
   mainClosed = new Promise(resolve => main.on("close", (code, signal) => { emit({ type: "main_closed", code, signal }); resolve(); }));
   let buffer = "";
   main.stdout.on("data", data => { buffer += data; while (buffer.includes("\n")) { const pos = buffer.indexOf("\n"); const line = buffer.slice(0, pos); buffer = buffer.slice(pos + 1); let row; try { row = JSON.parse(line); } catch { emit({ type: "main_stdout", line }); continue; } emit({ type: "native_main_event", event: row }); records.push(row); for (const waiter of [...waiters]) if (waiter.predicate(row)) { waiters.splice(waiters.indexOf(waiter), 1); waiter.resolve(row); } } });
@@ -94,9 +105,13 @@ try {
     const status = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8")); assert.equal(status.fabricRelease, expected);
     const origins = fs.readFileSync(markerFile, "utf8").trim().split("\n").map(JSON.parse);
     const worker = origins.find(row => row.kind === "worker" && row.pid === Number(value.result.sessionId));
-    assert(worker, "No child-worker-origin evidence"); assert.equal(fileURLToPath(worker.module), path.join(expected, "dist/worker.js"));
+    assert(worker, "No child-worker-origin evidence");
+    assert.equal(fileURLToPath(worker.module), path.join(expected, "dist/worker.js"));
+    assert.equal(worker.argv[1], path.join(expected, "dist/worker.js"));
+    assert.equal(worker.marker, path.basename(expected));
+    assert.equal(worker.argv[worker.argv.indexOf("--fabric-release") + 1], expected);
     const loaded = origins.filter(row => row.kind === "extension" && row.runDir === run);
-    if (extensions) { assert(loaded.length > 0); assert(loaded.every(row => fileURLToPath(row.module) === path.join(expected, "dist/index.js"))); assert(origins.some(row => row.type === "other_resource" && row.runDir === run)); }
+    if (extensions) { assert(loaded.length > 0); assert(loaded.every(row => fileURLToPath(row.module) === path.join(expected, "dist/index.js"))); assert(origins.some(row => row.type === "other_resource" && row.runDir === run)); assert(origins.some(row => row.type === "project_resource" && row.runDir === run), "Authorized project hook in real checkout ancestry must load"); assert(origins.some(row => row.type === "caller_resource" && row.runDir === run), "Authorized caller hook in real checkout ancestry must load"); }
     else assert.equal(loaded.length, 0);
     fs.cpSync(run, path.join(out, "native-" + phase + "-run"), { recursive: true });
     // Native RPC redirects extension stdout to stderr before it owns stdout.
@@ -105,11 +120,12 @@ try {
       if (row.type !== "worker_stderr") return [];
       return row.text.trim().split("\n").flatMap(line => { try { const mark = JSON.parse(line); return mark.type === "release_origin" ? [mark] : []; } catch { return []; } });
     });
-    if (extensions) assert(printed.some(row => row.marker === path.basename(expected)), "Child must print its selected extension marker");
+    if (extensions) assert(printed.some(row => row.kind === "extension" && row.marker === path.basename(expected) && fileURLToPath(row.module) === path.join(expected, "dist/index.js") && row.argv.includes(path.join(expected, "dist/index.js"))), "Child must print its actual selected extension path, argv and marker");
     assert.equal(warnings.length - warnsBefore, phase === "incompatible" ? 1 : 0);
     if (phase === "incompatible") { assert(warnings[warnsBefore].includes(activated)); assert(warnings[warnsBefore].includes(expected)); assert(warnings[warnsBefore].includes("worker protocol")); }
     assert(!origins.some(row => row.kind === "extension" && row.marker === "activated-incompatible-C"));
-    emit({ type: "phase_pass", phase, oldMainPid: main.pid, activated, expected, handle: value.handle, result: value.result, onDisk: status, workerOrigin: worker, loadedExtensions: loaded, childPrintedMarkers: printed, warnings: warnings.slice(warnsBefore) });
+    assert(!origins.some(row => row.type === "rejected_checkout_fabric"), "Rejected Fabric checkout entrypoint must never execute");
+    emit({ type: "phase_pass", phase, oldMainPid: main.pid, activated, expected, handle: value.handle, result: value.result, onDisk: status, workerOrigin: worker, loadedExtensions: loaded, authorizedCheckoutHooks: origins.filter(row => ["project_resource", "caller_resource"].includes(row.type) && row.runDir === run), childPrintedMarkers: printed, warnings: warnings.slice(warnsBefore) });
     const deadline = Date.now() + 10000;
     while (Date.now() < deadline) { try { process.kill(Number(value.result.sessionId), 0); } catch { break; } await new Promise(resolve => setTimeout(resolve, 50)); }
     assert.throws(() => process.kill(Number(value.result.sessionId), 0), "Worker must be joined before handing evidence back");

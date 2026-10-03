@@ -23,6 +23,7 @@ it.each([
   { entry: "sdk", change: false }, { entry: "sdk", change: true },
 ])("native Pi excludes incompatible Fabric before factories run ($entry; selector changes: $change)", async ({ entry, change }) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-release-loader-")); roots.push(root);
+  fs.copyFileSync(path.resolve("package.json"), path.join(root, "package.json"));
   const profile = path.join(root, "profile"); fs.mkdirSync(profile);
   const marks = path.join(root, "loaded.jsonl");
   const settings = path.join(profile, "settings.json");
@@ -38,9 +39,16 @@ it.each([
   const parent = release("parent"); const incompatible = release("incompatible", WORKER_PROTOCOL_VERSION + 1); const changed = release("changed");
   const other = path.join(root, "other.mjs");
   fs.writeFileSync(other, `import fs from 'node:fs'; export default function() { fs.appendFileSync(${JSON.stringify(marks)}, JSON.stringify({ name: 'other' }) + '\\n'); }`);
-  const select = (dir: string) => fs.writeFileSync(settings, JSON.stringify({ packages: [dir], extensions: [other], enableInstallTelemetry: false, compaction: { enabled: false }, ...(entry === "cli" ? { retry: { enabled: false } } : {}) }));
+  const caller = path.join(root, "caller-hook.mjs");
+  const project = path.join(root, ".pi/extensions/caller-hook.js");
+  const rejected = path.join(root, "dist/index.js");
+  fs.mkdirSync(path.dirname(project), { recursive: true }); fs.mkdirSync(path.dirname(rejected));
+  for (const [file, name] of [[caller, "caller-hook"], [project, "project-hook"], [rejected, "rejected-checkout-fabric"]]) {
+    fs.writeFileSync(file!, `import fs from 'node:fs'; export default function() { fs.appendFileSync(${JSON.stringify(marks)}, JSON.stringify({ name: ${JSON.stringify(name)} }) + '\\n'); }`);
+  }
+  const select = (dir: string) => fs.writeFileSync(settings, JSON.stringify({ packages: [dir], extensions: [other, caller, rejected], defaultProjectTrust: "always", enableInstallTelemetry: false, compaction: { enabled: false }, ...(entry === "cli" ? { retry: { enabled: false } } : {}) }));
   select(incompatible);
-  if (change) fs.appendFileSync(path.join(parent, "dist/index.js"), `\nfs.writeFileSync(${JSON.stringify(settings)}, ${JSON.stringify(JSON.stringify({ packages: [changed], extensions: [other], enableInstallTelemetry: false, compaction: { enabled: false }, ...(entry === "cli" ? { retry: { enabled: false } } : {}) }))});\n`);
+  if (change) fs.appendFileSync(path.join(parent, "dist/index.js"), `\nfs.writeFileSync(${JSON.stringify(settings)}, ${JSON.stringify(JSON.stringify({ packages: [changed], extensions: [other, caller, rejected], defaultProjectTrust: "always", enableInstallTelemetry: false, compaction: { enabled: false }, ...(entry === "cli" ? { retry: { enabled: false } } : {}) }))});\n`);
   const server = http.createServer((request, response) => {
     request.resume(); request.on("end", () => {
       response.writeHead(200, { "Content-Type": "text/event-stream" });
@@ -57,7 +65,7 @@ it.each([
   expect(result.fabricRelease).toBe(parent);
   expect(warn).toHaveBeenCalledTimes(1);
   const loaded = fs.readFileSync(marks, "utf8").trim().split("\n").map(line => JSON.parse(line));
-  expect(new Set(loaded.map(row => row.name))).toEqual(new Set(["parent", "other"]));
+  expect(new Set(loaded.map(row => row.name))).toEqual(new Set(["parent", "other", "caller-hook", "project-hook"]));
   const parentLoads = loaded.filter(row => row.name === "parent");
   expect(parentLoads.every(row => row.path === pathToFileURL(path.join(parent, "dist/index.js")).href)).toBe(true);
   expect(parentLoads.every(row => row.argv[1].endsWith(entry === "sdk" ? path.join("worker", "task-entry.js") : "cli.js"))).toBe(true);

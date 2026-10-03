@@ -1,7 +1,5 @@
-import fs from "node:fs";
-import { pathToFileURL } from "node:url";
 import type { DefaultPackageManager, ResolvedPaths } from "@earendil-works/pi-coding-agent";
-import { loadedFabricRoot } from "../core/agent-dir.js";
+import { fabricResourceRoot } from "../core/fabric-resource.js";
 
 /** Install before native Pi resolves resources, including its project-trust bootstrap.
  * Dedicated child process only: decorate public discovery methods on the supplied
@@ -11,19 +9,15 @@ import { loadedFabricRoot } from "../core/agent-dir.js";
  * Filtering a post-load extensionsOverride would be too late: factories already ran.
  */
 export const installFabricResourcePin = (PackageManager: typeof DefaultPackageManager, extensionPath: string): (() => void) => {
-  const rootOf = (file: string) => {
-    try { return loadedFabricRoot(pathToFileURL(fs.realpathSync(file)).href); }
-    catch { return loadedFabricRoot(pathToFileURL(file).href); }
-  };
-  const pinnedRoot = rootOf(extensionPath);
+  const pinnedRoot = fabricResourceRoot(extensionPath, "extensions");
   if (!pinnedRoot) throw new Error(`Pinned extension is not a Fabric release: ${extensionPath}`);
   const filter = (paths: ResolvedPaths): ResolvedPaths => {
-    const keep = (resource: { path: string }) => {
-      const root = rootOf(resource.path);
+    const keep = (type: "extensions" | "skills" | "prompts" | "themes") => (resource: { path: string }) => {
+      const root = fabricResourceRoot(resource.path, type);
       return !root || root === pinnedRoot;
     };
-    return { extensions: paths.extensions.filter(keep), skills: paths.skills.filter(keep),
-      prompts: paths.prompts.filter(keep), themes: paths.themes.filter(keep) };
+    return { extensions: paths.extensions.filter(keep("extensions")), skills: paths.skills.filter(keep("skills")),
+      prompts: paths.prompts.filter(keep("prompts")), themes: paths.themes.filter(keep("themes")) };
   };
   const prototype = PackageManager.prototype;
   const resolve = prototype.resolve;

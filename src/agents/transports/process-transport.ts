@@ -7,6 +7,7 @@ import type {
   AgentTransportLaunch,
 } from "../types.js";
 import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/agent-dir.js";
+import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
 import { spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
@@ -61,7 +62,7 @@ export class ProcessTransport implements AgentTransportAdapter {
           const explicitExtension = workerArguments[index + 1]!;
           // Only replace a Fabric generation. Explicit caller hooks are not
           // release selectors (e.g. resident probes testing a broken factory).
-          if (loadedFabricRoot(pathToFileURL(path.resolve(explicitExtension)).href)) {
+          if (fabricResourceRoot(explicitExtension, "extensions")) {
             workerArguments[index + 1] = selected.extensionPath;
           }
           pinned = true;

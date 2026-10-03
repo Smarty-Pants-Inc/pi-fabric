@@ -538,6 +538,7 @@ globalThis.agents = Object.freeze({
   tell: (target, message) => __call("agents.tell", __messageArgs(target, message)),
   steer: (target, message) => __call("agents.steer", __messageArgs(target, message)),
   followUp: (target, message) => __call("agents.followUp", __messageArgs(target, message)),
+  cancelFollowUp: (args) => __call("agents.cancelFollowUp", args),
   setSteeringMode: (args) => __call("agents.setSteeringMode", args),
   setFollowUpMode: (args) => __call("agents.setFollowUpMode", args),
   compact: (args) => __call("agents.compact", args),

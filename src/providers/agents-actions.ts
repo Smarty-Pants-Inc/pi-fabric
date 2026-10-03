@@ -528,11 +528,22 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "followUp",
     description:
-      "Queue a follow-up for Main or a running one-shot agent, or enqueue a persistent actor mailbox message. The stable id alias main targets the root user-facing Pi session. Non-local targets route over the project mesh.",
+      "Queue a follow-up for Main, a task or an actor. Local Pi tasks have a 10 minute delivery deadline (override with deadlineMs), one sender alarm if late, and remain queued until a boundary or cancelFollowUp. Explicit deadlines require a local Pi task.",
     inputSchema: {
       type: "object",
-      properties: { id: { type: "string" }, message: { type: "string" }, data: {} },
+      properties: { id: { type: "string" }, message: { type: "string" }, data: {}, deadlineMs: { type: "integer", minimum: 1 } },
       required: ["id", "message"],
+      additionalProperties: false,
+    },
+    risk: "agent",
+  },
+  {
+    name: "cancelFollowUp",
+    description: "Cancel one deadline-tracked follow-up to a local Pi task by its receipt messageId. Does not stop the receiver. Returns delivered if delivery already won the race.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" }, messageId: { type: "string" } },
+      required: ["id", "messageId"],
       additionalProperties: false,
     },
     risk: "agent",

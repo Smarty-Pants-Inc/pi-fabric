@@ -769,6 +769,11 @@ export class FabricRuntimeState {
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
       },
+      onFollowUpAlarm: (alarm) => {
+        this.pi.sendMessage({ customType: "pi-fabric-follow-up-alarm", content: alarm.message, display: true, details: alarm },
+          { deliverAs: "steer", triggerTurn: false });
+        this.pi.events.emit("fabric.followUp.deadline", alarm);
+      },
       onLifecycle: (event) => {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publishBackground(event);

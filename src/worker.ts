@@ -1277,6 +1277,7 @@ const main = async (): Promise<void> => {
       record.toolCalls++;
       if (typeof event.toolName === "string") {
         record.currentTool = event.toolName;
+        record.currentToolStartedAt = Date.now();
         process.stdout.write(`→ ${event.toolName}\n`);
       }
       update();
@@ -1290,6 +1291,7 @@ const main = async (): Promise<void> => {
         });
       }
       delete record.currentTool;
+      delete record.currentToolStartedAt;
       update();
       return;
     }
@@ -1479,7 +1481,7 @@ const main = async (): Promise<void> => {
         const line = raw.trim();
         if (!line) continue;
         processedCommands += 1;
-        let command: { type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown };
+        let command: { type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown; followUpId?: string };
         try {
           command = JSON.parse(line);
         } catch {
@@ -1516,7 +1518,13 @@ const main = async (): Promise<void> => {
           } else if (command.type === "steer" && typeof command.message === "string") {
             sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "steer");
           } else if (command.type === "follow_up" && typeof command.message === "string") {
-            sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "followUp");
+            if (command.followUpId && /^[0-9a-f-]{36}$/.test(command.followUpId)) {
+              const id = command.followUpId;
+              fs.writeFileSync(path.join(deliveryDirectory, id + ".json"), JSON.stringify({
+                message: command.message, provenance: command.provenance, delivery: "followUp", followUpId: id,
+              }), { mode: 0o600 });
+              child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+            } else sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "followUp");
           } else if (command.type === "set_steering_mode" && typeof command.mode === "string") {
             child.stdin?.write(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
           } else if (command.type === "set_follow_up_mode" && typeof command.mode === "string") {

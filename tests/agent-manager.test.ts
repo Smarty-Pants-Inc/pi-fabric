@@ -21,6 +21,7 @@ import {
 } from "../src/agents/budget-ledger.js";
 import type { AgentRunRecord, AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { isUnscopedRun, proveUnscopedCollection } from "./unscoped-collection-contract.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -290,6 +291,8 @@ describe("AgentManager", () => {
       const controlRun = manager.runDirectory(control.id)!;
       fs.mkdirSync(path.join(controlRun, "deliveries"));
       expect(sweep).toBeTypeOf("function");
+      await proveUnscopedCollection(run);
+      await proveUnscopedCollection(controlRun);
       clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
       sweep!();
       await vi.waitFor(() => expect(fs.existsSync(controlRun)).toBe(false), { timeout: 2_000 });
@@ -354,7 +357,12 @@ describe("AgentManager", () => {
       const actor = await manager.run({ task: "actor activation", residency: "durable", actorId: "actor:fixture", transport: "process" });
       const actorRun = manager.runDirectory(actor.id)!;
       expect(sweep).toBeTypeOf("function");
-      // Advance only the manager's clock after real subprocess completion; do not fabricate status.
+      // Scratch proof is independent of persistence and actor ownership. Do not
+      // fabricate status or make a failed save inherit descendant exit authority.
+      await proveUnscopedCollection(run);
+      await proveUnscopedCollection(ordinaryRun);
+      await proveUnscopedCollection(actorRun);
+      // Advance only the manager's expiry clock after real subprocess completion.
       clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
       const attempts = save.mock.calls.length;
       sweep!();
@@ -409,6 +417,11 @@ describe("AgentManager", () => {
     expect(result.error).toBe(worker.error);
     expect(result.warnings).toEqual(expect.arrayContaining([expect.stringContaining(savedPath)]));
     expect(fs.existsSync(savedPath)).toBe(false);
+    if (isUnscopedRun(run)) {
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
+      expect(fs.existsSync(savedPath)).toBe(false);
+      await proveUnscopedCollection(run);
+    }
     if (collection === "cleanup") {
       await expect(manager.cleanup(result.id)).rejects.toThrow(/EIO writing/);
       expect(fs.existsSync(run), "throwing callback must veto explicit cleanup").toBe(true);
@@ -420,11 +433,13 @@ describe("AgentManager", () => {
     managers.push(ordinary);
     const session = await ordinary.run({ task: "ordinary session", transport: "process" });
     const sessionRun = ordinary.runDirectory(session.id)!;
+    await proveUnscopedCollection(sessionRun);
     await ordinary.cleanup(session.id);
     expect(fs.existsSync(sessionRun)).toBe(false);
     // Actor callback returns normally; it must not inherit the unrelated public task's pin.
     const actor = await manager.run({ task: "actor activation", actorId: "actor:fixture", residency: "durable", transport: "process" });
     const actorRun = manager.runDirectory(actor.id)!;
+    await proveUnscopedCollection(actorRun);
     await manager.cleanup(actor.id);
     expect(fs.existsSync(actorRun)).toBe(false);
     blocked = false;
@@ -454,6 +469,12 @@ describe("AgentManager", () => {
 
     unsubscribe();
     const beforeCleanup = listener.mock.calls.length;
+    const runDirectory = manager.runDirectory(result.id)!;
+    if (isUnscopedRun(runDirectory)) {
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
+      expect(listener).toHaveBeenCalledTimes(beforeCleanup);
+      await proveUnscopedCollection(runDirectory);
+    }
     await manager.cleanup(result.id);
     expect(listener).toHaveBeenCalledTimes(beforeCleanup);
   });
@@ -1517,6 +1538,12 @@ describe("AgentManager", () => {
       const result = await manager.run({ task: "complete quickly", transport: "process" });
       expect(result.status).toBe("completed");
       const tracked = manager.runDirectory(result.id)!;
+      if (isUnscopedRun(tracked)) {
+        await expect(manager.cleanup(result.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
+        expect(child.exitCode).toBeNull();
+        expect(fs.readFileSync(path.join(untracked, "evidence"), "utf8")).toBe("still in use");
+        await proveUnscopedCollection(tracked);
+      }
       await manager.close();
       expect(child.exitCode).toBeNull();
       expect(fs.existsSync(tracked)).toBe(false);

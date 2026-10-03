@@ -144,28 +144,22 @@ export class ActorRegistryStore {
     return JSON.parse(fs.readFileSync(this.#registryPath, "utf8"));
   }
 
-  /** Call within withLock for read-modify-write operations. Pending decisions are always durable. */
+  /** Call within withLock. Definitions, lineage claims and pending decisions are durable. */
   write(actors: readonly Record<string, unknown>[], options?: { durable?: boolean }): void {
     // A barrier belongs to an inode, not its contents. Every replacement carrying an
     // accepted removal must establish its own barriers, including foreign/preserved rows.
     if (!options?.durable && !hasRemovalDecision(actors)) {
-      writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2 });
+      writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2, durable: true });
       return;
     }
     const previous = fs.readFileSync(this.#registryPath, "utf8");
-    let rollbackDurable = false;
-    try {
-      const parsed = JSON.parse(previous) as { actors?: unknown } | null;
-      rollbackDurable = Array.isArray(parsed?.actors) && hasRemovalDecision(parsed.actors);
-    } catch {
-      // A malformed previous registry cannot contain an accepted, recoverable decision.
-    }
+    const rollbackDurable = true; // The restored definitions/lineage are authoritative too.
     try {
       writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2, durable: true });
     } catch (error) {
       // A directory barrier can fail after rename installed the new registry. Restore the
-      // live decision under the lock. If it carries an earlier accepted pending decision,
-      // this replacement needs barriers too; otherwise the cleanup marker covers rollback.
+      // live decision under the lock. The replacement restores authoritative definitions
+      // and lineage as well as removal decisions, so it needs barriers too.
       // Never report the failed commit as accepted.
       writeFileAtomic(this.#registryPath, previous, { durable: rollbackDurable });
       throw error;

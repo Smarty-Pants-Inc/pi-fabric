@@ -956,6 +956,9 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       // 900 ms with a 250 ms client wait. Resident actorStatus now uses that same
       // serial exchange, so reconcile only after the held request finishes.
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      // The original 250 ms uncertainty deadline is unchanged. Fresh status and
+      // main's now-resident joined stop use an ordinary reconciliation budget.
+      state.client.options.commandTimeoutMs = 5_000;
       // Simulate the resumed wall clock for new reconciliation generations, not
       // the original execution deadline. The expiry watermark never rolls back.
       const realNow = Date.now.bind(Date);
@@ -1053,6 +1056,8 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
       const realNow = Date.now.bind(Date);
       const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000);
+      state.client.options.commandTimeoutMs = 5_000;
+      await state.participants.refresh();
       const status = await state.client.actorStatus(decisions[0]!.id);
       expect(status).toMatchObject({ id: decisions[0]!.id });
       clock.mockRestore();
@@ -1250,6 +1255,9 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
       expect(mapped).toEqual([expect.objectContaining({ ok: true, handle: expect.objectContaining({ id: expect.any(String) }) }),
         expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") }),
         expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") })]);
+      // Initial handled-uncertainty calls keep their asserted 700 ms deadline;
+      // only the new status/joined-stop invocations use ordinary admission waits.
+      state.client.options.commandTimeoutMs = 5_000;
       const successful = decisions.find(decision => decision.id === mapped[0].handle.id)!;
       const uncertain = decisions.filter(decision => decision !== successful);
       const reconciled = [];
@@ -1985,7 +1993,9 @@ describe("round 1 public cancellation contract", () => {
   });
 
   it("durable create never enters activation compensation when committed removal would be unknown", async () => {
-    const state = await harness(false, undefined, 200); const main = mainProvider(state);
+    // This success-path request must cover core admission's durable registry/queue barriers.
+    // Timeout/abandonment cases above retain their intentionally short deadlines.
+    const state = await harness(false, undefined, 1_000); const main = mainProvider(state);
     const activationFailure = new Error("injected activation failure");
     const ensure = vi.spyOn(state.client, "ensureActor").mockImplementation(async (id) => {
       await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));

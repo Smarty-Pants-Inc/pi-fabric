@@ -6,7 +6,7 @@ import {
   CURRENT_FABRIC_CONFIG_VERSION,
   migrateFabricConfigDocument,
 } from "../src/config-migrations.js";
-import { loadFabricConfig, saveFabricConfig } from "../src/config.js";
+import { loadFabricConfig, saveFabricConfig, writeJsonAtomic } from "../src/config.js";
 
 const roots: string[] = [];
 
@@ -31,6 +31,18 @@ afterEach(() => {
 });
 
 describe("Fabric configuration migrations", () => {
+  it.skipIf(process.platform === "win32")("#2479 syncs new config ancestors after publishing the file", () => {
+    const paths = fixture(), target = path.join(paths.agentDir, "nested", "deeper", "fabric.json");
+    const events: string[] = [], descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { events.push(descriptors.get(fd)!); sync(fd); });
+    writeJsonAtomic(target, { agents: { maxConcurrent: 7 } }, null);
+    expect(events).toContain(path.dirname(target));
+    expect(events).toContain(path.dirname(path.dirname(target)));
+    expect(events).toContain(paths.agentDir);
+    expect(events).toContain(path.dirname(paths.agentDir));
+  });
   it("migrates the legacy agent section without mutating its input", () => {
     const input = { subagents: { runner: "claude", defaultTools: ["read"] }, ui: { enabled: false } };
     const result = migrateFabricConfigDocument(input);
@@ -163,6 +175,28 @@ describe("Fabric configuration migrations", () => {
     },
   );
 
+  it.skipIf(process.platform === "win32")("#2479 R3 F27 rejects a configuration symlink retargeted after publication", () => {
+    const paths = fixture(), root = path.dirname(paths.agentDir);
+    const oldDir = path.join(root, "old-target"), newDir = path.join(root, "new-target");
+    fs.mkdirSync(oldDir); fs.mkdirSync(newDir);
+    const oldTarget = path.join(oldDir, "fabric.json"), newTarget = path.join(newDir, "fabric.json");
+    const source = JSON.stringify({ subagents: { maxConcurrent: 5 } });
+    fs.writeFileSync(oldTarget, source); fs.writeFileSync(newTarget, source); fs.symlinkSync(oldTarget, paths.globalPath);
+    const rename = fs.renameSync.bind(fs), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    const descriptors = new Map<number, string>(), barriers: string[] = [];
+    let published = false;
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { if (published) barriers.push(descriptors.get(fd)!); sync(fd); });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (to === oldTarget) { published = true; fs.unlinkSync(paths.globalPath); fs.symlinkSync(newTarget, paths.globalPath); }
+    });
+    expect(() => loadFabricConfig({ cwd: paths.cwd, agentDir: paths.agentDir, projectTrusted: false })).toThrow(/inode changed|configuration changed/);
+    expect(published).toBe(true); expect(barriers).toContain(oldDir);
+    expect(JSON.parse(fs.readFileSync(oldTarget, "utf8"))).toMatchObject({ configVersion: 4, agents: { maxConcurrent: 5 } });
+    expect(fs.readFileSync(newTarget, "utf8")).toBe(source); expect(fs.realpathSync(paths.globalPath)).toBe(newTarget);
+  });
+
   it("does not replace a config concurrently created during its first save", () => {
     const paths = fixture();
     const fsyncSync = fs.fsyncSync.bind(fs);
@@ -195,7 +229,7 @@ describe("Fabric configuration migrations", () => {
     expect(fs.statSync(paths.globalPath).mode & 0o777).toBe(mode);
   });
 
-  it("tolerates unsupported directory fsync operations", () => {
+  it("#2479 skips unsupported Windows directory barriers but fails closed on POSIX", () => {
     const paths = fixture();
     const fsyncSync = fs.fsyncSync.bind(fs);
     vi.spyOn(fs, "fsyncSync").mockImplementation((descriptor) => {
@@ -205,14 +239,12 @@ describe("Fabric configuration migrations", () => {
       fsyncSync(descriptor);
     });
 
-    saveFabricConfig(
+    const save = () => saveFabricConfig(
       { cwd: paths.cwd, agentDir: paths.agentDir, projectTrusted: true },
       { agents: { maxConcurrent: 7 } },
     );
-
-    expect(JSON.parse(fs.readFileSync(paths.projectPath, "utf8"))).toMatchObject({
-      agents: { maxConcurrent: 7 },
-    });
+    if (process.platform === "win32") expect(save).not.toThrow();
+    else expect(save).toThrow("operation not permitted");
   });
 
   it("rejects obsolete or caller-controlled migration metadata on save", () => {

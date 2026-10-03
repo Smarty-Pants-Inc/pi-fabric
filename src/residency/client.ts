@@ -90,7 +90,7 @@ const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 const atomicWrite = (filePath: string, value: unknown): void => {
-  writeJsonAtomic(filePath, value, { space: 2 });
+  writeJsonAtomic(filePath, value, { space: 2, durable: true });
 };
 
 const readJson = <T>(filePath: string): T | undefined => {
@@ -195,7 +195,7 @@ export class ResidencyClient {
     this.#completions = new CompletionJournal(options.config.meshRoot,
       options.mainName ? () => this.#recipient(options.config) : this.#recipient(options.config),
       options.participants, options.mesh, (result, delivered) => {
-        const acknowledge = () => { delivered(); this.acknowledgeCompletion(result.id); };
+        const acknowledge = () => { this.acknowledgeCompletion(result.id); delivered(); };
         if (options.onBackgroundComplete) options.onBackgroundComplete(result, acknowledge);
         else {
           options.mainAgent.deliverAgent({ from: { id: result.id, name: result.name, kind: "agent" },
@@ -595,10 +595,12 @@ export class ResidencyClient {
     const metadata = this.#metadata(id);
     // The local-manager fallback is for its ordinary runs, never a resident worker attempt.
     if ((metadata || !localRunSettled) && !this.completionSettled(id)) return;
-    const journalConsumed = this.#completions.acknowledge(id, localRunSettled);
-    if (metadata && !metadata.completionConsumedAt) {
-      atomicWrite(this.#metadataPath(id), { ...metadata, completionConsumedAt: Date.now() });
+    if (metadata) {
+      // Visible bytes can be left by a rejected post-rename barrier, including
+      // across process replacement. Repay that receipt before consuming the journal.
+      atomicWrite(this.#metadataPath(id), { ...metadata, completionConsumedAt: metadata.completionConsumedAt ?? Date.now() });
     }
+    const journalConsumed = this.#completions.acknowledge(id, localRunSettled);
     // Journal-only ordinary outcomes have no durable metadata, but their wait still
     // retracts an already admitted completion from this session's inbox.
     if (metadata || journalConsumed) this.options.onResultConsumed?.(id);
@@ -1094,7 +1096,11 @@ export class ResidencyClient {
       terminal(data.status) && typeof data.startedAt === "number" ? data.id : undefined);
     if (value.from.kind === "agent" && typeof completionId === "string" && completionId === value.from.id) {
       const metadata = this.#metadata(completionId);
-      if (metadata?.completionConsumedAt) this.#completions.acknowledge(completionId);
+      if (metadata?.completionConsumedAt) {
+        // A visible consumption timestamp alone must not retire either source.
+        atomicWrite(this.#metadataPath(completionId), metadata);
+        this.#completions.acknowledge(completionId);
+      }
       if (metadata?.completionConsumedAt || completionConsumed(this.options.config.meshRoot, completionId)) {
         await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
         return;

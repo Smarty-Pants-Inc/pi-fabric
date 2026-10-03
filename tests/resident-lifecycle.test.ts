@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -63,8 +64,14 @@ const fixture = async () => {
     close: async () => { await passive.close(); await host.close(); await client.close(); await participants.close(); fs.rmSync(root, { recursive: true, force: true }); } };
 };
 
-it.each(["Main", "proxy"] as const)("public reset leaves status, other actors and terminal stop serviceable during a hanging activation (%s)", async kind => {
+it.each([
+  { kind: "Main", retryPickup: false }, { kind: "proxy", retryPickup: false },
+  { kind: "Main", retryPickup: true }, { kind: "proxy", retryPickup: true },
+] as const)("public reset leaves status, other actors and terminal stop serviceable during a hanging activation ($kind, retried pickup: $retryPickup)", async ({ kind, retryPickup }) => {
   const f = await fixture();
+  let pickupFailures = 0;
+  let pickupAttempts = 0;
+  let pickupBarrier: ReturnType<typeof vi.spyOn> | undefined;
   const pending: Promise<unknown>[] = [];
   const observe = <T>(promise: Promise<T>) => {
     const outcome = promise.then(value => ({ value }), error => ({ error }));
@@ -83,11 +90,31 @@ it.each(["Main", "proxy"] as const)("public reset leaves status, other actors an
     const header = fs.readFileSync(f.actor.sessionFile!, "utf8").split("\n")[0];
     const queued = observe(f.host.actors.ask(f.actor.id, "queued work cancelled only by explicit stop"));
     const proxy = new ResidentActorClient(f.config.meshRoot, f.config.rootId, 5_000);
+    if (retryPickup) {
+      const actualNamespace = atomic.syncPathNamespace;
+      // Windows skips directory fsync, but still confirms the pickup namespace.
+      // Fail that portable boundary after rename, before lifecycle admission.
+      // The next attempt must retain custody and confirm it before committing.
+      pickupBarrier = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+        if (path.dirname(file) === path.join(f.config.residencyRoot, "processing")) {
+          pickupAttempts++;
+          expect(fs.existsSync(file)).toBe(true);
+          expect(decisions(f.config.residencyRoot).some(entry => entry.operation === "resetSession")).toBe(false);
+          if (pickupFailures === 0) {
+            pickupFailures++; throw new Error("reset pickup namespace unavailable");
+          }
+        }
+        actualNamespace(file, inode);
+      });
+    }
     const reset = observe(kind === "Main"
       ? f.provider.invoke("resetSession", { id: f.actor.name }, f.context)
       : proxy.setActor({ operation: "resetSession", id: f.actor.id }, undefined, { identity: f.identity, hostId: f.identity.id }));
     await waitFor(() => decisions(f.config.residencyRoot).some(entry => entry.operation === "resetSession" && entry.state === "committed"));
     const resetDecision = decisions(f.config.residencyRoot).find(entry => entry.operation === "resetSession")!;
+    expect(pickupFailures).toBe(retryPickup ? 1 : 0);
+    expect(pickupAttempts).toBe(retryPickup ? 2 : 0);
+    pickupBarrier?.mockRestore();
     // All use the public provider, which routes to this resident's command dispatcher.
     const status = observe(f.provider.invoke("actorStatus", { id: f.actor.id }, f.context));
     const unrelated = observe(f.provider.invoke("setInstructions", { id: other.id, instructions: "Still serviceable" }, f.context));
@@ -114,6 +141,7 @@ it.each(["Main", "proxy"] as const)("public reset leaves status, other actors an
     expect(fs.readdirSync(path.join(f.config.residencyRoot, "responses"))).toEqual([]);
   } finally {
     // Failed assertions on the old dispatcher must not leave the real hanging child alive.
+    pickupBarrier?.mockRestore();
     const actor = f.host.actors.status(f.actor.id);
     const runId = actor.inFlightRun?.id ?? actor.lastRunId;
     if (runId) await f.host.agents.stop(runId);
@@ -173,7 +201,9 @@ it.each(["Main", "proxy"] as const)("%s bounded reset wait preserves a committed
   const run = f.host.actors.ask(f.actor.id, "pending activation").catch(error => error);
   try {
     await started;
-    f.client.options.commandTimeoutMs = kind === "Main" ? 5_000 : 200;
+    // Only the proxy reset below uses the intentionally short 200 ms budget.
+    // Ordinary public status/stop still use the Main's normal exchange budget.
+    f.client.options.commandTimeoutMs = 5_000;
     const proxy = new ResidentActorClient(f.config.meshRoot, f.config.rootId, 200);
     const reset = (kind === "Main"
       ? f.provider.invoke("resetSession", { id: f.actor.id }, { ...f.context, signal: abort.signal })

@@ -777,7 +777,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "resetSession",
     description:
-      "Start a persistent actor's next run on a fresh Pi session. An in-flight run finishes first; the old session is archived beside it (2 kept). Instructions, topics, bindings, the queue and messages are kept.",
+      "Start a persistent actor's next run on a fresh Pi session. Locally an in-flight run finishes first; a resident-owned actor requires its owning Main and an idle run boundary (stop first). The old session is archived beside it (2 kept). Instructions, topics, bindings, the queue and messages are kept.",
     inputSchema: idSchema,
     risk: "agent",
   },

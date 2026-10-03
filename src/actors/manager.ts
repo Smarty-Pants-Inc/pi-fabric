@@ -1015,18 +1015,21 @@ export class ActorManager {
    * finishes on the old session first; it is not interrupted. The session file is archived
    * beside it; instructions, topics, bindings, the queue and the message log are kept.
    */
-  async resetSession(id: string): Promise<FabricActorInfo> {
+  async resetSession(id: string, options: { refuseActive?: boolean; beforeCommit?: (id: string) => void } = {}): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#draining.get(actor.id);
     // A drain owns admission before it installs its abort controller, including
     // while a boundary presence write or launch preparation is awaiting.
     if (actor.draining || running || this.#inFlight.has(actor.id) || actor.abortController) {
+      if (options.refuseActive) throw new Error(`Cannot reset actor ${actor.name} while a run is active; stop first`);
+      options.beforeCommit?.(actor.id);
       return new Promise((resolve, reject) => {
         const waiters = this.#pendingResets.get(actor.id) ?? [];
         waiters.push({ resolve, reject });
         this.#pendingResets.set(actor.id, waiters);
       });
     }
+    options.beforeCommit?.(actor.id);
     this.#archiveSession(actor, "requested");
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -1662,13 +1665,17 @@ export class ActorManager {
     await running.drain?.catch(() => undefined);
   }
 
-  async stop(id: string): Promise<FabricActorInfo> {
+  async stop(id: string, beforeCommit?: (id: string) => void, wait = false): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#runningActor(actor.id)!;
     const stopped = actor.status === "stopped";
+    beforeCommit?.(actor.id);
     this.#stopRun(running);
     if (running !== actor) this.#stopRun(actor);
-    if (stopped && running === actor) return this.#publicInfo(actor);
+    if (stopped && running === actor) {
+      if (wait) await this.#joinStoppedRun(actor.id);
+      return this.#publicInfo(actor);
+    }
     this.#drop(actor, [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
     await this.#publishPresence(actor);
@@ -1679,6 +1686,7 @@ export class ActorManager {
         data: this.#publicInfo(actor),
       })
       .catch(() => undefined);
+    if (wait) await this.#joinStoppedRun(actor.id);
     return this.#publicInfo(actor);
   }
 

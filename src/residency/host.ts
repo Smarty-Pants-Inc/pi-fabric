@@ -608,6 +608,9 @@ export class ResidentHost {
         if (!this.actors.owns(command.targetId)) {
           return { accepted: false, error: `Resident host does not own ${command.targetId}` };
         }
+        // Legacy control traffic must not bypass resident lifecycle authority.
+        const caller = this.participants.get(from.id, Date.now(), { fresh: true });
+        this.#authorizeResidentSetter({ identity: from, hostId: caller?.ownerHostId ?? "" });
         await this.actors.stop(command.targetId);
         this.participants.scheduleRefresh();
         return { accepted: true, messageId: command.commandId };
@@ -1217,7 +1220,8 @@ export class ResidentHost {
         };
       } else if (command.operation !== "removeActor") {
         if (command.operation === "setInstructions" || command.operation === "setModel" ||
-          command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools") {
+          command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools" ||
+          command.operation === "resetSession" || command.operation === "stop") {
           this.#authorizeResidentSetter(command.caller);
           if (command.operation === "setTools") assertResidentActorToolCeiling(command.tools, command.caller?.toolCeiling);
         }
@@ -1228,6 +1232,8 @@ export class ResidentHost {
         let updated: FabricActorInfo;
         switch (command.operation) {
           case "actorStatus": updated = actor; break;
+          case "resetSession": updated = await this.actors.resetSession(actor.id, { refuseActive: true, beforeCommit: commit }); break;
+          case "stop": updated = await this.actors.stop(actor.id, commit, true); break;
           case "setInstructions": updated = await this.actors.setInstructions(actor.id, command.instructions, commit); break;
           case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit); break;
           case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope, commit); break;

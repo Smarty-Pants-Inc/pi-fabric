@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getCurrentSystemMessage, getCurrentSystemPrompt } from "@earendil-works/pi-ai";
-import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
+import { estimateContextTokens, estimateTextTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { SessionManager, buildSessionContext, convertToLlm, sessionEntryToContextMessages, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ActivationWindow } from "../src/worker/activation-window.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -394,6 +394,31 @@ describe("native activation window (offline; opted-in success needs exact native
     managers.push(manager);
     return { dir, manager, requests, get requestCount() { return requestCount; }, settingsFile, settings };
   };
+
+  it.skipIf(!selectedNativeBinary)("full-history actor compacts overflow before dispatch, keeping the raw session journal", async () => {
+    const s = await setup();
+    fs.writeFileSync(s.settingsFile, JSON.stringify({ enableInstallTelemetry: false, compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1000 } }));
+    const journal = path.join(s.dir, "full-history-actor.jsonl");
+    const session = SessionManager.open(journal);
+    for (let index = 0; index < 10; index++) {
+      session.appendMessage(user(`OLD_OBJECTIVE_${index} ` + "x".repeat(8000)));
+      session.appendMessage(assistant(`old decision ${index}`));
+    }
+    const before = readJournal(journal);
+    const result = await s.manager.run({ task: "CURRENT_FULL_HISTORY_EVENT", model: "window-test/offline", actorId: "full-history-actor",
+      sessionFile: journal, tools: [], extensions: false, transport: "process" });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    const log = fs.readFileSync(result.logFile!, "utf8");
+    expect(log).toContain('"type":"fabric_context_compaction"');
+    const dispatch = s.requests.find(payload => JSON.stringify(payload.messages).includes("CURRENT_FULL_HISTORY_EVENT"));
+    expect(dispatch).toBeDefined();
+    expect(estimateTextTokens(JSON.stringify(dispatch))).toBeLessThan(8000);
+    expectJournalAppended(journal, before, true);
+    const entries = SessionManager.open(journal).getBranch();
+    expect(entries.some(entry => entry.type === "compaction")).toBe(true);
+    expect(fs.readFileSync(journal, "utf8")).toContain("OLD_OBJECTIVE_0");
+    expect(log).not.toContain('"type":"auto_retry_start"');
+  }, TEST_GUARD_MS);
 
   it.skipIf(!selectedNativeBinary).each(["google-generative-ai", "google-vertex"].flatMap(api =>
     ["stream", "streamSimple"].flatMap(method =>
@@ -805,7 +830,7 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
   }, TEST_GUARD_MS);
 
-  it.skipIf(!selectedNativeBinary).each([false, true])("3238 compacts mid-run growth in a real activation (unfittable latest batch: %s)", async unfittable => {
+  it.skipIf(!selectedNativeBinary).each([false, true])("compacts mid-run growth and overflowing latest batch before dispatch (oversized: %s)", async unfittable => {
     const s = await setup(5, unfittable ? 4 : 0);
     const alarms: Array<{message: {text?: string}}> = [];
     const mesh = new MeshStore(path.join(s.dir, "mesh"), 2 * 1024 * 1024, 100);
@@ -817,13 +842,12 @@ describe("native activation window (offline; opted-in success needs exact native
       model: "window-test/offline", tools: ["read"], extensions: false, transport: "process", delivery: "mailbox"});
     const run = vi.spyOn(s.manager, "run");
     const outcome = actors.ask(actor.id, "CURRENT_GROWING_ACTIVATION");
-    if (unfittable) await expect(outcome).rejects.toThrow(/Context exceeds window/);
-    else await expect(outcome).resolves.toMatchObject({text: "useful current result"});
+    await expect(outcome).resolves.toMatchObject({text: "useful current result"});
     await actors.close();
     expect(run).toHaveBeenCalledTimes(1);
-    expect(alarms).toHaveLength(unfittable ? 1 : 0);
-    expect(mesh.read({topic: "ops.owner"}).filter(event => event.kind === "actor.alarm")).toHaveLength(unfittable ? 1 : 0);
-    expect(s.requests).toHaveLength(unfittable ? 4 : 6);
+    expect(alarms).toHaveLength(0);
+    expect(mesh.read({topic: "ops.owner"}).filter(event => event.kind === "actor.alarm")).toHaveLength(0);
+    expect(s.requests).toHaveLength(6);
     const journal = readJournal(path.join(s.dir, "actors", actor.id, "session.jsonl"));
     const rawMessages = SessionManager.open(path.join(s.dir, "actors", actor.id, "session.jsonl")).getBranch()
       .flatMap(entry => entry.type === "message" ? sessionEntryToContextMessages(entry) : []);
@@ -835,14 +859,15 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(journal.entries.some(entry => entry.type === "compaction" || entry.type === "context_edit")).toBe(false);
     const raw = journal.bytes.toString("utf8");
     expect(raw).toContain("CURRENT_GROWING_ACTIVATION");
-    for (let round = 1; round <= (unfittable ? 4 : 5); round++) {
+    for (let round = 1; round <= 5; round++) {
       const full = fs.readFileSync(path.join(s.dir, `task-${round}.txt`), "utf8");
       expect(raw).toContain(full); // Full original output survives every inference compaction.
       const next = s.requests[round];
       if (!next) continue; // Latest oversized result was never dispatched.
       const tool = next.messages.find((message: any) => message.role === "tool" && message.tool_call_id === `read-${round}`);
       const text = typeof tool.content === "string" ? tool.content : tool.content.map((part: any) => part.text ?? "").join("");
-      expect(text).toBe(full); // Current batch is not compacted, even at the threshold.
+      if (unfittable && round === 4) expect(text).toContain("Compacted tool output");
+      else expect(text).toBe(full); // Latest batch stays exact unless it alone overflows.
       const call = next.messages.find((message: any) => message.tool_calls?.some((call: any) => call.id === `read-${round}`));
       expect(call.tool_calls.some((call: any) => call.id === tool.tool_call_id)).toBe(true);
     }

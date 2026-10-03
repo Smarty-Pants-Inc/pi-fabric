@@ -504,6 +504,8 @@ export const assertResidentActorToolCeiling = (tools: string[], ceiling: readonl
 
 /** Root-owned registry operations; these never start a resident host. */
 export type ResidentActorMutation =
+  | { operation: "resetSession"; id: string }
+  | { operation: "stop"; id: string }
   | { operation: "setInstructions"; id: string; instructions: string }
   | { operation: "setTools"; id: string; tools: string[] }
   | { operation: "setModel"; id: string; model?: string; scope: FabricActorBindingScope }
@@ -551,7 +553,7 @@ export const residentCommandForOwner = (command: ResidentCommand, owner: Residen
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "setInstructions", "setModel",
-  "setThinking", "setTools", "setActivationFilter", "releaseChange",
+  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>

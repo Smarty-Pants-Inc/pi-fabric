@@ -265,7 +265,8 @@ export class ResidentHost {
     // config snapshot (nor the process-wide default object).
     this.#retention = { ...config.retention, retainRuns: config.agents.retainRuns };
     this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
-      [...new Set(Object.values(residentActorRoots(config)))], this.#retention);
+      [...new Set(Object.values(residentActorRoots(config)))], this.#retention,
+      (directory) => { this.agents.recoverPendingArchives(directory); });
   }
 
   #initialize(): void {
@@ -399,11 +400,14 @@ export class ResidentHost {
         fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
         try {
           writeJsonAtomic(file, result, { durable: true });
-          // Rejected queued durable spawns have no admitted worker/source.
-          if (!this.agents.runDirectory(result.id)) return;
+          const trackedRun = this.agents.runDirectory(result.id);
+          const runDirectory = trackedRun ?? path.join(config.residencyRoot, "runs", result.id);
+          // Rejected queued spawns have no worker source; recovered admitted
+          // runs do, even though this manager no longer has their transport.
+          if (!trackedRun && !fs.existsSync(path.join(runDirectory, "status.json"))) return;
           // Retain/retry full sources on faults; logical settlement is recoverable
           // even when inbox notifications are disabled.
-          const recipient = completionRecipientFromRun(config.meshRoot, this.agents.runDirectory(result.id)!);
+          const recipient = completionRecipientFromRun(config.meshRoot, runDirectory);
           if (!recipient) throw new Error(`Missing admitted completion recipient for ${result.id}`);
           saveCompletion(config.meshRoot, recipient, result);
         } catch (error) { this.#publicationFailed = true; throw error; }
@@ -512,7 +516,8 @@ export class ResidentHost {
     this.#started = true;
     try {
       // Archived runs are read on demand, never walked before the host lease is up.
-      // The streaming request collector handles terminal retention after readiness.
+      // The streaming request collector replays pending full archives before
+      // terminal retention after readiness. Failed sinks retain their sources.
       this.#initialize();
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });

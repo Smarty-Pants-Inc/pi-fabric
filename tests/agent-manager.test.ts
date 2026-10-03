@@ -458,6 +458,143 @@ describe("AgentManager", () => {
     expect(listener).toHaveBeenCalledTimes(beforeCleanup);
   });
 
+  it("retries each queued settlement archive and retains its source on persistent failure", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-save-"));
+    roots.push(root);
+    let blocked = true;
+    const attempts = new Map<string, number>();
+    const save = vi.fn((result: AgentRunResult) => {
+      attempts.set(result.id, (attempts.get(result.id) ?? 0) + 1);
+      if (result.task === "queued archive" && blocked) throw new Error("queued archive unavailable");
+      writeJsonAtomic(path.join(root, `${result.id}.json`), result, { durable: true });
+    });
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"), onSettled: save,
+    });
+    managers.push(manager);
+    const blocker = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "queued archive", transport: "process" });
+    expect(queued.status).toBe("queued");
+    const result = await manager.stop(queued.id);
+    expect(result.status).toBe("stopped");
+    expect(attempts.get(queued.id)).toBe(3);
+    const source = path.join(root, "runs", queued.id, "queued-result.json");
+    expect(JSON.parse(fs.readFileSync(source, "utf8"))).toMatchObject({ id: queued.id, status: "stopped", task: "queued archive" });
+    await expect(manager.cleanup(queued.id)).rejects.toThrow(/queued archive unavailable/);
+    expect(fs.existsSync(source)).toBe(true);
+    blocked = false;
+    await manager.cleanup(queued.id);
+    expect(JSON.parse(fs.readFileSync(path.join(root, `${queued.id}.json`), "utf8"))).toMatchObject({ id: queued.id, status: "stopped", task: "queued archive" });
+    expect(fs.existsSync(source)).toBe(false);
+    await manager.stop(blocker.id);
+  });
+
+  it.each([false, true])("collects only committed queued outcomes in a default managed root (archive fails=%s)", async archiveFails => {
+    const sweep = vi.spyOn(retentionStorage, "claimTempRunSweep").mockReturnValue(false);
+    const inheritedRunRoot = process.env.PI_FABRIC_RUN_ROOT;
+    delete process.env.PI_FABRIC_RUN_ROOT;
+    let manager: AgentManager;
+    try {
+      manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: false, budgetUsd: 0 }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), onSettled: (result) => {
+          if (archiveFails && result.task === "queued committed outcome") throw new Error("queued archive unavailable");
+        },
+      });
+    } finally {
+      if (inheritedRunRoot !== undefined) process.env.PI_FABRIC_RUN_ROOT = inheritedRunRoot;
+    }
+    managers.push(manager);
+    try {
+      const blocker = await manager.spawn({ task: "HANG", transport: "process" });
+      const runRoot = path.dirname(manager.runDirectory(blocker.id)!);
+      roots.push(runRoot);
+      const queued = await manager.spawn({ task: "queued committed outcome", transport: "process" });
+      expect(queued.status).toBe("queued");
+      const directory = path.join(runRoot, queued.id);
+      const remove = fs.rmSync;
+      const deletionFault = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+        if (!archiveFails && String(target) === directory) throw Object.assign(new Error("source temporarily busy"), { code: "EPERM" });
+        return remove(target, options);
+      });
+      await manager.stop(queued.id);
+      expect(fs.existsSync(directory)).toBe(true);
+      expect(retentionStorage.canRemoveTerminalRun(directory)).toBe(!archiveFails);
+      deletionFault.mockRestore();
+      await manager.close();
+      expect(fs.existsSync(runRoot)).toBe(archiveFails);
+    } finally { await manager.close(); sweep.mockRestore(); }
+  });
+
+  it("isolates shutdown archive failures without collecting an uncommitted queued source", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-shutdown-"));
+    roots.push(root);
+    const save = vi.fn(() => { throw new Error("shutdown archive unavailable"); });
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: false, budgetUsd: 0 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onStoppedAtClose: save,
+    });
+    managers.push(manager);
+    await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "queued shutdown outcome", transport: "process" });
+    expect(queued.status).toBe("queued");
+    await manager.close();
+    expect(save).toHaveBeenCalledTimes(3);
+    const source = path.join(root, queued.id, "archive-pending.json");
+    expect(JSON.parse(fs.readFileSync(source, "utf8")).pending.shutdown.result).toMatchObject({
+      id: queued.id, task: "queued shutdown outcome", status: "stopped",
+    });
+    const recovered = vi.fn();
+    const replacement = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, budgetUsd: 0 }, {
+      runRoot: root, onStoppedAtClose: recovered,
+    });
+    managers.push(replacement);
+    expect(replacement.recoverPendingArchives()).toBe(2);
+    expect(recovered.mock.calls.flatMap(([results]) => results)).toContainEqual(expect.objectContaining({ id: queued.id, status: "stopped" }));
+    expect(fs.existsSync(source)).toBe(false);
+  });
+
+  it("retains a managed temporary run root when shutdown archival remains uncommitted", async () => {
+    const detachedSweep = vi.spyOn(retentionStorage, "claimTempRunSweep").mockReturnValue(false);
+    const inheritedRunRoot = process.env.PI_FABRIC_RUN_ROOT;
+    delete process.env.PI_FABRIC_RUN_ROOT;
+    const save = vi.fn(() => { throw new Error("shutdown archive unavailable"); });
+    let manager: AgentManager;
+    try {
+      manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, budgetUsd: 0 }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), onStoppedAtClose: save,
+      });
+    } finally {
+      if (inheritedRunRoot !== undefined) process.env.PI_FABRIC_RUN_ROOT = inheritedRunRoot;
+    }
+    managers.push(manager);
+    try {
+      const child = await manager.spawn({ task: "HANG_WITH_PROGRESS", transport: "process" });
+      await vi.waitFor(() => expect(manager.status(child.id)).toMatchObject({ turns: 3 }), { timeout: 5000 });
+      const run = manager.runDirectory(child.id)!;
+      roots.push(path.dirname(run));
+      await manager.close();
+      expect(save).toHaveBeenCalledTimes(3);
+      expect(fs.existsSync(run)).toBe(true);
+      expect(fs.existsSync(path.join(run, "archive-pending.json"))).toBe(true);
+      const root = path.dirname(run);
+      writeJsonAtomic(path.join(root, ".fabric-owner.json"), { pid: 2147483647, startedAt: 0, heartbeatAt: 0, orphanedAt: 0 });
+      retentionStorage.sweepTempRunRoots({ tempRoot: path.dirname(root), orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
+      expect(fs.existsSync(run)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toMatchObject({ id: child.id, status: "stopped", turns: 3 });
+      expect(fs.existsSync(path.join(path.dirname(run), ".fabric-owner.json"))).toBe(true);
+      // A new custodian retries the exact saved outcome after the failed manager exits.
+      const recovered = vi.fn();
+      const replacement = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, budgetUsd: 0 }, {
+        runRoot: root, onStoppedAtClose: recovered,
+      });
+      managers.push(replacement);
+      expect(replacement.recoverPendingArchives()).toBe(1);
+      expect(recovered).toHaveBeenCalledWith([expect.objectContaining({ id: child.id, status: "stopped", turns: 3 })]);
+      expect(fs.existsSync(path.join(run, "archive-pending.json"))).toBe(false);
+      retentionStorage.sweepTempRunRoots({ tempRoot: path.dirname(root), orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
+      expect(fs.existsSync(root)).toBe(false);
+    } finally { await manager.close(); detachedSweep.mockRestore(); }
+  });
+
   it("owns a returned queued handle independently of the caller's abort signal", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -796,31 +933,50 @@ describe("AgentManager", () => {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
     });
     managers.push(manager);
-    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    // Release admission through a real worker's natural completion. An unrelated
+    // Windows tree-helper failure must retain its permit, not strand this fixture.
+    const firstRelease = path.join(root, "release-first-worker");
+    const first = await manager.spawn({
+      task: `LIVE_WITH_PROGRESS ${JSON.stringify({ fakeWorkerReleasePath: firstRelease })}`, transport: "process",
+    });
     let release!: () => void;
     let ready!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const creating = new Promise<void>((resolve) => { ready = resolve; });
-    let stoppedAt: number | undefined;
+    let workerExited = false;
+    const stop = vi.fn(async () => {});
     const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementationOnce(async () => {
       ready(); await gate;
-      return { kind: "process", stop: async () => { stoppedAt = Date.now(); }, isAlive: async () => stoppedAt === undefined || Date.now() - stoppedAt < 150 };
+      return { kind: "process", stop, isAlive: async () => !workerExited };
     });
+    let stopped: Promise<AgentRunResult> | undefined;
     try {
       const queued = await manager.spawn({ task: "exit after termination", transport: "process" });
-      await manager.stop(first.id);
+      expect(queued.status).toBe("queued");
+      fs.writeFileSync(firstRelease, "complete");
+      expect(await manager.wait(first.id)).toMatchObject({ status: "completed" });
       await creating;
       let settled = false;
-      const stopped = manager.stop(queued.id).then((result) => { settled = true; return result; });
+      stopped = manager.stop(queued.id).then((result) => { settled = true; return result; });
       release();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(1));
+      // Successful stop acknowledgment is not exit proof. Hold the exit gate
+      // explicitly so scheduler delays cannot turn a 50ms check into 150ms.
       expect(settled).toBe(false);
       expect(fs.existsSync(path.join(root, queued.id, "task.txt"))).toBe(true);
+      await expect(manager.cleanup(queued.id)).rejects.toThrow("Cannot clean up a queued agent");
+      workerExited = true;
       expect(await stopped).toMatchObject({ status: "stopped", error: "Agent launch aborted" });
       expect(fs.existsSync(path.join(root, queued.id, "unresolved-worker.json"))).toBe(false);
       expect(await manager.cleanup(queued.id)).toEqual({ cleaned: true });
       expect(fs.existsSync(path.join(root, queued.id))).toBe(false);
-    } finally { release(); launch.mockRestore(); }
+    } finally {
+      workerExited = true;
+      release();
+      fs.writeFileSync(firstRelease, "complete");
+      await stopped;
+      launch.mockRestore();
+    }
   });
 
   it("reattaches completion notification when a queued wait reaches its bound after admission", async () => {

@@ -69,12 +69,11 @@ const files = (dir: string): string[] => {
   try { return fs.readdirSync(dir).filter(file => /^[a-f0-9]{64}\.json$/.test(file)); } catch { return []; }
 };
 interface CompletionReceipt { id: string; sessionId: string; consumedAt: number }
-const durableReceipts = new Map<string, string>();
-const syncedDirectories = new Map<string, string>();
+interface CompletionClaim { rootId: string; sessionId: string; recipient?: CompletionRecipient }
 const fingerprint = (stat: fs.Stats): string => JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
-const receiptDurable = (file: string): boolean => durableReceipts.get(file) === fingerprint(fs.statSync(file));
+// Plain scans only read receipts. Every destructive cleanup confirms the full namespace
+// afresh: an unchanged endpoint inode is not evidence that its parent entries are durable.
 const confirmReceipt = async (file: string, value: CompletionReceipt): Promise<void> => {
-  if (receiptDurable(file)) return;
   const handle = await fs.promises.open(file, process.platform === "win32" ? "r+" : "r");
   try {
     const stat = await handle.stat();
@@ -82,9 +81,8 @@ const confirmReceipt = async (file: string, value: CompletionReceipt): Promise<v
       throw new Error(`Completion file changed before durability confirmation at ${file}`);
     }
     await handle.sync();
-    await syncPathNamespaceAsync(file, stat, syncedDirectories);
+    await syncPathNamespaceAsync(file, stat);
     if (fingerprint(await handle.stat()) !== fingerprint(stat)) throw new Error(`Completion file changed during confirmation at ${file}`);
-    durableReceipts.set(file, fingerprint(stat));
   } finally { await handle.close(); }
 };
 // Journal writers put the address before the result. Read only that bounded prefix,
@@ -159,15 +157,8 @@ export const completionConsumed = (meshRoot: string, id: string): boolean =>
 export const consumeCompletion = (meshRoot: string, id: string, sessionId: string): void => {
   const file = receiptPath(meshRoot, id);
   const receipt = readReceipt(file, id);
-  if (receipt) {
-    if (!receiptDurable(file)) {
-      syncCompletionFile(file, receipt);
-      durableReceipts.set(file, fingerprint(fs.statSync(file)));
-    }
-  } else {
-    writeJsonAtomic(file, { id, sessionId, consumedAt: Date.now() }, { durable: true });
-    durableReceipts.set(file, fingerprint(fs.statSync(file)));
-  }
+  if (receipt) syncCompletionFile(file, receipt);
+  else writeJsonAtomic(file, { id, sessionId, consumedAt: Date.now() }, { durable: true });
 };
 /** Stable run id fences committed outcomes. Settlement supersedes an uncommitted attempt. */
 export const saveCompletion = (meshRoot: string, recipient: CompletionRecipient, result: AgentRunResult): void => {
@@ -369,12 +360,16 @@ export class CompletionJournal {
     return true;
   }
   async drain(deliver = true): Promise<void> {
-    // Receipts are the durable replay fence. Retire crash-left claims even with no pending body.
+    // Gate before reading a fence, even without a body. The authenticated claim retains
+    // its owner's lane so a dead Main's same-lane successor can reclaim bounded state.
+    let retired = 0;
     for (const claim of this.mesh.listAll(claimPrefix)) {
-      const owner = claim.value as { rootId?: string; sessionId?: string };
-      if (owner?.rootId !== this.recipient.rootId || owner.sessionId !== this.recipient.sessionId) continue;
+      if (!this.#canRetireClaim(claim)) continue;
       const receipt = readReceipt(path.join(directory(this.meshRoot), "receipts", `${claim.key.slice(claimPrefix.length)}.json`));
-      if (typeof receipt?.id === "string" && claim.key === claimKey(receipt.id)) await this.#retireClaim(receipt.id, claim);
+      if (typeof receipt?.id === "string" && claim.key === claimKey(receipt.id)) {
+        await this.#retireClaim(receipt.id, claim);
+        if (++retired === 128) break;
+      }
     }
     const recipient = this.recipient;
     const accepts = (address: CompletionRecipient) =>
@@ -408,7 +403,7 @@ export class CompletionJournal {
         try {
           await this.mesh.put({ key: ck, ifVersion: claim?.version ?? 0,
             identity: { id: this.recipient.rootId, name: "main", kind: "main" },
-            value: { rootId: this.recipient.rootId, sessionId: this.recipient.sessionId } });
+            value: { rootId: this.recipient.rootId, sessionId: this.recipient.sessionId, recipient: this.recipient } satisfies CompletionClaim });
         } catch { continue; } // Another live successor owns admission; leave the source pending.
       }
       if (completionConsumed(this.meshRoot, envelope.result.id)) { await this.#retireClaim(envelope.result.id); continue; }
@@ -432,15 +427,38 @@ export class CompletionJournal {
       } catch { this.#enqueued.delete(envelope.result.id); } // Source stays pending if admission failed.
     }
   }
+  #canRetireClaim(snapshot: NonNullable<ReturnType<MeshStore["get"]>>): boolean {
+    const owner = snapshot.value as Partial<CompletionClaim> | undefined;
+    if (typeof owner?.rootId !== "string" || typeof owner.sessionId !== "string" || snapshot.updatedBy.id !== owner.rootId) return false;
+    const recipient = this.recipient;
+    if (owner.rootId === recipient.rootId && owner.sessionId === recipient.sessionId) return true;
+    // Older claims can use the bounded envelope address; new claims retain this
+    // address themselves, including after unlink. Never infer a lane from a session id.
+    const address = owner.recipient ?? readRecipient(path.join(directory(this.meshRoot), `${snapshot.key.slice(claimPrefix.length)}.json`));
+    if (!address || address.rootId !== owner.rootId || address.sessionId !== owner.sessionId ||
+      typeof address.cwd !== "string" || typeof address.projectRoot !== "string" || typeof address.name !== "string" ||
+      typeof address.startedAt !== "number" || !Number.isFinite(address.startedAt) ||
+      (address.role !== undefined && typeof address.role !== "string") || !sameRecipientLane(address, recipient)) return false;
+    const successor = completionSuccessor(address, this.participants.list({ scope: "project", kinds: ["root"], fresh: true }));
+    return successor?.id === recipient.rootId && successor.sessionId === recipient.sessionId && sameLane(recipient, successor);
+  }
   async #retireClaim(id: string, snapshot = this.mesh.get(claimKey(id), { fresh: true })): Promise<void> {
-    if (!snapshot || !completionConsumed(this.meshRoot, id)) return;
-    const owner = snapshot.value as { rootId?: string; sessionId?: string };
-    // Only journal-owned claims; CAS cannot erase a replacement owner/version.
-    if (typeof owner?.rootId !== "string" || typeof owner.sessionId !== "string" || snapshot.updatedBy.id !== owner.rootId) return;
+    if (!snapshot || !this.#canRetireClaim(snapshot)) return;
+    // The versioned delete cannot erase a replacement owner/version.
     const file = receiptPath(this.meshRoot, id);
     const receipt = readReceipt(file, id);
     if (!receipt) return;
+    // One fresh confirmation authorizes this consumed outcome's cleanup batch.
+    // Do not retire its claim and then owe a second barrier before body unlink:
+    // that barrier could fail after the claim was already lost.
+    const recipient = this.recipient;
+    const targets = [envelopePath(this.meshRoot, id), candidatePath(this.meshRoot, id)].filter(target => {
+      const address = readRecipient(target);
+      return address && canonical(address.projectRoot) === canonical(recipient.projectRoot) &&
+        ((address.rootId === recipient.rootId && address.sessionId === recipient.sessionId) || sameRecipientLane(address, recipient));
+    });
     await confirmReceipt(file, receipt);
+    for (const target of targets) fs.rmSync(target, { force: true });
     try { await this.mesh.delete({ key: snapshot.key, ifVersion: snapshot.version }); } catch { /* next drain reconciles */ }
   }
   #canRead(envelope: CompletionEnvelope): boolean {

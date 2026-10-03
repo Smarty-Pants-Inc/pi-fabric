@@ -53,7 +53,7 @@ describe("completion journal idle scans", () => {
     const syncMs = performance.now() - beforeDrain;
     await drain; await journal.drain();
     expect(scanMs).toBeLessThan(16); expect(syncMs).toBeLessThan(16);
-    expect(sync).not.toHaveBeenCalled(); expect(asyncOpen).not.toHaveBeenCalled();
+    expect(sync).not.toHaveBeenCalled(); expect(asyncOpen).toHaveBeenCalled();
     expect(enqueue.mock.calls.map(([result]) => result.id)).toEqual(expect.arrayContaining([a.id, b.id]));
     expect(enqueue).toHaveBeenCalledTimes(2);
     for (let index = 1; index <= 100; index++) {
@@ -111,7 +111,7 @@ describe("completion journal idle scans", () => {
     expect(fs.existsSync(h.file(foreignProject.id))).toBe(true); expect(fs.existsSync(h.file(foreignLane.id))).toBe(true);
   });
 
-  it.skipIf(process.platform === "win32")("confirms imported receipt inodes once asynchronously and resyncs changed receipt entries, not stable ancestors", async () => {
+  it.skipIf(process.platform === "win32")("reconfirms the entire namespace asynchronously before every destructive prune", async () => {
     const h = setup(); const a = h.seed(1), b = h.seed(2);
     const receipts = path.dirname(h.receipt(a.id)); fs.mkdirSync(receipts, { recursive: true });
     const receipt = (id: string) => JSON.stringify({ id, sessionId: h.recipient.sessionId, consumedAt: 1 });
@@ -126,13 +126,13 @@ describe("completion journal idle scans", () => {
     });
     const sync = vi.spyOn(fs, "fsyncSync"); const journal = h.journal(); await journal.drain();
     expect(counts.get(h.receipt(a.id))).toBe(1); expect(counts.get(h.receipt(b.id))).toBe(1);
-    expect(counts.get(receipts)).toBe(1);
-    h.seed(1); await journal.drain(); expect(counts.get(h.receipt(a.id))).toBe(1);
+    expect(counts.get(receipts)).toBe(2);
+    h.seed(1); await journal.drain(); expect(counts.get(h.receipt(a.id))).toBe(2);
     h.seed(1); const replacement = `${h.receipt(a.id)}.replacement`; fs.writeFileSync(replacement, receipt(a.id));
     fs.renameSync(replacement, h.receipt(a.id));
     await journal.drain();
-    expect(counts.get(h.receipt(a.id))).toBe(2); expect(counts.get(receipts)).toBe(2);
-    expect(counts.get(path.dirname(receipts))).toBe(1); expect(sync).not.toHaveBeenCalled();
+    expect(counts.get(h.receipt(a.id))).toBe(3); expect(counts.get(receipts)).toBe(4);
+    expect(counts.get(path.dirname(receipts))).toBe(4); expect(sync).not.toHaveBeenCalled();
     expect(fs.existsSync(h.file(a.id))).toBe(false);
   });
   it.each(["torn", "invalid", "dangling"])("keeps unknown %s receipts fail-closed even on plain scans", async fault => {

@@ -263,29 +263,23 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
 };
 
 /** Same namespace fence as the synchronous writer, with barriers off the event loop.
- * Cache ancestors by incarnation; endpoint/symlink parents also bind their entry changes. */
-export const syncPathNamespaceAsync = async (target: string, receipt: Inode,
-  synced: Map<string, string>): Promise<void> => {
+ * Always confirm all parent entries: an unchanged ancestor inode does not prove
+ * that a newly created or replaced child directory is durably linked. */
+export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Promise<void> => {
   const before = namespaceSnapshot(target, receipt);
-  const confirmed = new Map<string, string>();
   if (process.platform !== "win32") {
     for (const [directory, expected] of [...before.directories].reverse()) {
-      const stamp = JSON.stringify([expected.dev, expected.ino, expected.birthtimeMs,
-        ...(before.parents.includes(directory) ? [expected.mtimeMs, expected.ctimeMs] : [])]);
-      if (synced.get(directory) === stamp) continue;
       const handle = await fs.promises.open(directory, fs.constants.O_RDONLY);
       try {
         const opened = await handle.stat();
         if (!opened.isDirectory() || !sameInode(opened, expected)) throw new Error("Namespace directory changed before barrier");
         await handle.sync();
-        confirmed.set(directory, stamp);
       } finally { await handle.close(); }
     }
   }
   if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
     throw new Error("Namespace changed during durability barriers");
   }
-  for (const [directory, stamp] of confirmed) synced.set(directory, stamp);
 };
 /** Existence is not a receipt; retry every required directory barrier without a cache. */
 export const syncDirectoryChain = (directory: string): void => {

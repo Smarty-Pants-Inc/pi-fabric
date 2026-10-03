@@ -96,7 +96,7 @@ export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
-    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding"> & { owns?: (id: string) => boolean },
+    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
@@ -572,12 +572,11 @@ export class AgentMessageRouter {
       if (ownership && !ownership.local) {
         return { accepted: false, error: `Participant ${actor.id} is owned by ${ownership.ownerHostId}` };
       }
-      const result = this.actorManager.tell(
-        actor.id,
-        message,
-        command.data,
-        { provenance, ...controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId) },
-      );
+      const options = controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId);
+      // Refuse inexact owner-side model selections before acknowledging a synchronous tell.
+      // Validate without promoting the owner's current defaults into fixed per-call overrides.
+      await this.actorManager.resolveActivationBinding(actor.id, options);
+      const result = this.actorManager.tell(actor.id, message, command.data, { provenance, ...options });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) {

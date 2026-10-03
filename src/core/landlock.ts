@@ -129,6 +129,22 @@ export class LandlockBashConfinement {
     });
   }
 
+  /**
+   * S2: launch custody taken before awaited middleware/spawn preparation. The caller
+   * releases it only when the tool call settled; an inner operation that started keeps
+   * its own custody, and an unknown exit retains the temp.
+   */
+  hold(): () => void {
+    this.#pending++;
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false;
+      this.#pending--;
+      this.#release();
+    };
+  }
+
   get pendingOperations(): number { return this.#pending; }
   get tmpdir(): string { return this.#tmpdir; }
 
@@ -163,15 +179,10 @@ export class LandlockBashConfinement {
       if (expanded === undefined) continue;
       const pinned = this.#pins.get(entry);
       const current = pinPath(expanded);
-      if (!pinned) {
-        // Absent at session start: credit only if not reachable via a writable grant.
-        if (current && !grants.some(grant => within(path.resolve(expanded), grant.real)
-          || within(current.real, grant.real))) {
-          this.#pins.set(entry, current);
-          grants.push(current);
-        }
-        continue;
-      }
+      // Absent when the trusted host pinned grants: omitted for this confinement's
+      // lifetime. A later-created root (or a dangling alias whose target a confined
+      // command created) is never admitted; provision it and start a new session.
+      if (!pinned) continue;
       if (!current) continue; // Removed: grant nothing (fail closed).
       if (!sameGrant(pinned, current)) {
         throw new Error(`Landlock write grant ${entry} changed identity since it was approved (${pinned.real}); refusing. Restore it or start a new session.`);
@@ -187,6 +198,8 @@ export class LandlockBashConfinement {
     const grants = this.#grants(runDir);
     const lines = grants.map(({ dev, ino, real }) => `${dev}:${ino}:${real}`);
     return { exec: async (command, cwd, options) => {
+      // Fence: no launch after close, even from delayed middleware.
+      if (this.#closed) throw new Error("Landlock confinement is closed; refusing a late launch");
       // Escape logging is mandatory and happens before spawn. Do not log command
       // text (it may contain secrets); record a digest and nested tool correlation.
       const auditDir = path.join(this.cwd, ".pi");

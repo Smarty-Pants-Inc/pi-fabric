@@ -20,7 +20,7 @@ const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 const helper = path.resolve("dist/native/fabric-landlock");
 
 const harness = (settings: LandlockSettings = { mode: "enforce", disabled: false },
-  opt: { opaque?: boolean; managed?: boolean; blocked?: boolean } = {}) => {
+  opt: { opaque?: boolean; managed?: boolean; blocked?: boolean; gate?: { entered: () => void; open: Promise<void> } } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-test-"));
   roots.push(root);
   const cwd = path.join(root, "lane");
@@ -41,9 +41,13 @@ const harness = (settings: LandlockSettings = { mode: "enforce", disabled: false
         return { ...rest, env: filtered };
       },
     },
-    wrapOperations: inner => ({ exec: (command, directory, options) => inner.exec(command, directory, {
-      ...options, onData: data => options.onData(Buffer.from(data.toString().replaceAll("filter-me", "[filtered]"))),
-    }) }),
+    wrapOperations: inner => ({ exec: async (command, directory, options) => {
+      // Optional delayed preparation before delegating to the supplied operations.
+      if (opt.gate) { opt.gate.entered(); await opt.gate.open; }
+      return inner.exec(command, directory, {
+        ...options, onData: data => options.onData(Buffer.from(data.toString().replaceAll("filter-me", "[filtered]"))),
+      });
+    } }),
   };
   const fallback = vi.fn(async () => ({ content: [{ type: "text" as const, text: "opaque" }], details: undefined }));
   const definition = { ...createBashToolDefinition(cwd), execute: fallback };
@@ -350,6 +354,44 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
       fail(new Error("abort acknowledged, exit unknown")); await expect(execution).rejects.toThrow();
       expect(fs.existsSync(confinement.tmpdir)).toBe(true);
     }
+  });
+
+  it("S1 r2: a grant absent at first enforced use is never admitted later (dangling cache alias)", async () => {
+    const h = harness();
+    const home = path.join(h.root, "home");
+    const cache = path.join(home, ".cache");
+    fs.mkdirSync(cache, { recursive: true, mode: 0o700 });
+    // Host-configured ~/.npm alias to a not-yet-created directory beneath the allowed cache.
+    fs.symlinkSync(path.join(cache, "npm"), path.join(home, ".npm"));
+    vi.stubEnv("HOME", home);
+    const first = await h.invoke({ command: `ln -s ${quote(h.sibling)} ${quote(path.join(cache, "npm"))} && printf staged` });
+    expect(first.output).toBe("staged");
+    const second = await h.invoke({ command: `printf redirected > ${quote(path.join(home, ".npm", "victim"))}`, settle: true });
+    expect(second.ok).toBe(false);
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+    const writes = h.audit().filter(entry => entry.event === "enforce").map(entry => entry.writes as string[]);
+    expect(writes).toHaveLength(2);
+    for (const grant of writes.flat()) expect(grant.startsWith(fs.realpathSync(h.sibling))).toBe(false);
+  });
+
+  it("S2 r2: temp custody covers a background launch whose middleware is still preparing at close", async () => {
+    let entered!: () => void; let open!: () => void;
+    const reached = new Promise<void>(resolve => { entered = resolve; });
+    const gate = { entered: () => entered(), open: new Promise<void>(resolve => { open = resolve; }) };
+    const h = harness(undefined, { gate });
+    vi.stubEnv("TMPDIR", "/tmp"); // not private: Fabric generates its own temp
+    vi.spyOn(os, "tmpdir").mockReturnValue(h.root);
+    const launched = await h.invoke({ command: "printf late", background: true });
+    expect(launched.details?.running).toBe(true);
+    await reached; // middleware is awaiting preparation; inner confined exec not entered
+    const [generated] = fs.readdirSync(h.root).filter(name => name.startsWith("pi-fabric-landlock-"));
+    expect(generated).toBeDefined();
+    const temp = path.join(h.root, generated!);
+    fs.writeFileSync(path.join(temp, "sentinel"), "keep");
+    await h.registry.close(); // session/provider close inside the delayed-launch window
+    expect(fs.readFileSync(path.join(temp, "sentinel"), "utf8")).toBe("keep");
+    open(); // the late delegation is fenced after close; settlement releases custody
+    await vi.waitFor(() => expect(fs.existsSync(temp)).toBe(false), { timeout: 3000 });
   });
 
   it("F2: a host kill-switch flip reaches already-active lanes on their next call; project cannot override", async () => {

@@ -462,6 +462,7 @@ export class PiToolsProvider implements FabricProvider {
     args: Record<string, unknown>,
     job: ReturnType<FabricShellJobStore["begin"]>,
     middleware: FabricBashMiddlewareV1 | undefined,
+    holds: Array<() => void>,
   ): Promise<ToolDefinition<any, any, any>> {
     const cwd = typeof args[PI_BASH_CWD_KEY] === "string" ? args[PI_BASH_CWD_KEY] : this.#cwd;
     if (name === "bash") {
@@ -477,6 +478,8 @@ export class PiToolsProvider implements FabricProvider {
           createLocalBashOperations({ shellPath: this.#landlock.helperPath }), local,
           getShellConfig(options?.shellPath).shell, path.dirname(job.pidPath), escape, originalCommand,
         );
+        // S2: temp custody starts before middleware may delay the inner launch.
+        holds.push(this.#landlock.hold());
       }
       const operations = middleware ? middleware.wrapOperations(local) : local;
       if (!operations || typeof operations.exec !== "function") {
@@ -540,9 +543,12 @@ export class PiToolsProvider implements FabricProvider {
       ...(monitor ? { monitor } : {}),
     });
     let tool: ToolDefinition<any, any, any>;
+    const holds: Array<() => void> = [];
+    const releaseHolds = (): void => { for (const release of holds.splice(0)) release(); };
     try {
-      tool = await this.#trackedShellDefinition(name, executeArgs, job, middleware);
+      tool = await this.#trackedShellDefinition(name, executeArgs, job, middleware, holds);
     } catch (error) {
+      releaseHolds(); // nothing was launched
       await job.finish(null);
       throw error;
     }
@@ -554,7 +560,8 @@ export class PiToolsProvider implements FabricProvider {
       parentSignal: context.signal,
       job,
       execute: (signal) =>
-        tool.execute(
+        // Settlement of the tool call ends launch custody (also after a spill/handoff).
+        Promise.resolve().then(() => tool.execute(
           context.nestedToolCallId,
           executeArgs,
           signal,
@@ -563,7 +570,7 @@ export class PiToolsProvider implements FabricProvider {
             onUpdate(partialResult as PiToolResult);
           },
           this.#executionContextFor(name, args, context.extensionContext),
-        ),
+        )).finally(releaseHolds),
     });
     if (outcome.status === "done") {
       await job.finish((outcome.value as PiToolResult & { isError?: boolean }).isError ? null : 0);

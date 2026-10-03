@@ -94,7 +94,10 @@ list, never a wider fallback. Each entry has a one-line reason.
   only cache data. Review this breadth before rollout.
 
 Absent optional paths are omitted, **not** created and not widened to their
-parent. Hosts must provision needed cache directories before an enforced run.
+parent. A grant absent (or dangling) at the first enforced call stays omitted for
+the session: a later-created path is never admitted. Hosts must provision needed
+cache directories before an enforced run. Temp custody starts before middleware
+preparation; after close, a late launch is refused.
 Paths containing newline, carriage return or NUL are rejected (the native
 adapter's trusted launch format is newline-delimited). `/` is never a grant.
 Policy changes are host/package policy, not an agent authorization mechanism;

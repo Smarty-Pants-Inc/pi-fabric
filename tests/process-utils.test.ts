@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { processIsAlive, spawnDetached } from "../src/agents/transports/process-utils.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { taskReturnAddressArguments } from "../src/agents/task-return-address.js";
 
 // Preserve native spawn, but capture its exact ChildProcess before it can close.
 vi.mock("node:child_process", async (importOriginal) => {
@@ -104,6 +105,30 @@ setInterval(() => {}, 1000);`;
       expect(process.env.PI_FABRIC_ROLE).toBe("worktree-agent");
       expect(process.env.SMARTY_READ_CLASS).toBe("critical");
     }, ["--name", "--actor-name"]); // A flag-shaped value is not an explicit actor.
+  });
+
+  it("injects the bound spawner and native session before the worker itself executes", async () => {
+    const args = taskReturnAddressArguments("session:bound-parent", "parent-native-session", "session:bound-parent", {});
+    await withOwnedWorker(`import fs from "node:fs";
+fs.writeFileSync("binding.json", JSON.stringify({
+  spawner: process.env.PI_FABRIC_SPAWNER_ID,
+  session: process.env.PI_FABRIC_SPAWNER_SESSION_ID,
+  chain: JSON.parse(process.env.PI_FABRIC_SPAWNER_CHAIN),
+  targets: JSON.parse(process.env.PI_FABRIC_TASK_ESCALATION_TARGETS),
+  processChild: process.env.PI_FABRIC_TASK_PROCESS_CHILD,
+}));
+setInterval(() => {}, 1000);`, async (handle, root) => {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(root, "binding.json"))).toBe(true));
+      expect(JSON.parse(fs.readFileSync(path.join(root, "binding.json"), "utf8"))).toEqual({
+        spawner: "session:bound-parent", session: "parent-native-session",
+        chain: ["session:bound-parent"], targets: [], processChild: "1",
+      });
+      if (process.platform === "linux") {
+        const entries = fs.readFileSync(`/proc/${handle.pid}/environ`, "utf8").split("\0");
+        expect(entries).toContain("PI_FABRIC_SPAWNER_ID=session:bound-parent");
+        expect(entries).toContain("PI_FABRIC_SPAWNER_SESSION_ID=parent-native-session");
+      }
+    }, args);
   });
 
   it("does not relabel generic detached launches such as a resident host", async () => {

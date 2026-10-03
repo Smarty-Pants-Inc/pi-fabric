@@ -154,18 +154,23 @@ describe("AgentManager close storage", () => {
     // Persist the real transport identity, as production workers do; UNKNOWN is
     // an ordinary readable record with no identity and no unresolved marker.
     const record = JSON.parse(fs.readFileSync(childStatus, "utf8"));
-    fs.writeFileSync(childStatus, JSON.stringify({ ...record, ...(state === "unknown" ? {} : { sessionId: String(pid) }) }));
+    const { sessionId: _savedPid, ...withoutIdentity } = record;
+    fs.writeFileSync(childStatus, JSON.stringify(state === "unknown" ? withoutIdentity : { ...record, sessionId: String(pid) }));
 
     // Exercise actual registration, settlement, and #pruneRetainedUiRecords:
     // only pressure-run execution is substituted, never #runs or its handle cap.
+    // Both the handle and persisted record need an absent identity: settlement
+    // alone cannot release the budget after these handles have been evicted.
+    const absentPid = "2147483647";
+    expect(processAlive(Number(absentPid))).toBe(false);
     const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async (request) => {
       const arg = (flag: string) => request.workerArguments[request.workerArguments.indexOf(flag) + 1]!;
       fs.writeFileSync(arg("--status-file"), JSON.stringify({
-        id: request.id, name: request.name, task: "eviction pressure", status: "completed", runner: "pi", transport: "process",
+        id: request.id, name: request.name, task: "eviction pressure", status: "completed", runner: "pi", transport: "process", sessionId: absentPid,
         cwd: request.cwd, startedAt: Date.now(), updatedAt: Date.now(), finishedAt: Date.now(), text: "done", turns: 1, toolCalls: 0,
         exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
       }));
-      return { kind: "process", isAlive: async () => false, stop: async () => {} };
+      return { kind: "process", sessionId: absentPid, isAlive: async () => false, stop: async () => {} };
     });
     try {
       for (let index = 0; index < 1_000; index++) {

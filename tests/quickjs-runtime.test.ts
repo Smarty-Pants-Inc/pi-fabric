@@ -220,6 +220,7 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
   it.each([
     ["FABRIC_PARTICIPANT_NOT_YET_MIRRORED", "FabricParticipantNotYetMirroredError"],
     ["FABRIC_PARTICIPANT_NON_INTERACTIVE", "FabricParticipantNonInteractiveError"],
+    ["FABRIC_TASK_ESCALATION_TARGET_DENIED", "TaskEscalationTargetError"],
     ["FABRIC_PROJECT_AGENT_UNRESOLVED", "FabricProjectAgentUnresolvedError"],
     ["FABRIC_PROJECT_AGENT_AMBIGUOUS", "FabricProjectAgentAmbiguousError"],
     ["FABRIC_PROJECT_LEAD_INVALID", "FabricProjectLeadInvalidError"],

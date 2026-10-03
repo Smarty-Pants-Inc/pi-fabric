@@ -54,6 +54,12 @@ const logFile = args.get("log-file");
 const task = fs.readFileSync(args.get("task-file"), "utf8");
 await new Promise((resolve) => setTimeout(resolve, 25));
 const now = Date.now();
+// Publish the worker's own identity, not just the transport's in-memory PID.
+const identity = args.get("transport") === "process" ? { sessionId: String(process.pid) } : {};
+if (args.get("transport") === "process" && process.platform === "linux") {
+  const stat = fs.readFileSync("/proc/" + process.pid + "/stat", "utf8");
+  identity.processStartTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\\s+/)[19];
+}
 const record = {
   id: args.get("id"),
   name: args.get("name"),
@@ -61,6 +67,7 @@ const record = {
   status: "completed",
   runner: args.get("runner") || "pi",
   transport: args.get("transport"),
+  ...identity,
   cwd: process.cwd(),
   projectRoot: args.get("project-root"),
   meshRoot: args.get("mesh-root"),
@@ -99,6 +106,22 @@ const createManager = (
   });
   managers.push(manager);
   return manager;
+};
+
+const waitForWorkerExit = async (manager: AgentManager, id: string): Promise<void> => {
+  const record = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(id)!, "status.json"), "utf8"));
+  expect(record.sessionId).toMatch(/^\d+$/);
+  const pid = Number(record.sessionId);
+  expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+  if (process.platform === "linux") expect(record.processStartTime).toMatch(/^\d+$/);
+  // Settlement can precede process exit. Only ESRCH is a checked absence receipt.
+  await expect.poll(() => {
+    try { process.kill(pid, 0); return false; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+      throw error;
+    }
+  }, { interval: 10, timeout: 5_000 }).toBe(true);
 };
 
 afterEach(async () => {
@@ -284,7 +307,11 @@ describe("one-shot agent cwd", () => {
       expect(git(parent, "worktree", "list", "--porcelain")).toBe(parentWorktreesBefore);
       expect(worktreeBranches(target)).toContain(result.branch!);
     } finally {
-      if (result) await manager.cleanup(result.id, true);
+      if (result) {
+        await waitForWorkerExit(manager, result.id);
+        expect(await manager.cleanup(result.id, true)).toEqual({ cleaned: true });
+        expect(fs.existsSync(result.worktree!)).toBe(false);
+      }
     }
   });
 
@@ -304,7 +331,11 @@ describe("one-shot agent cwd", () => {
       expect(result.worktree).toBeDefined();
       expect(result.cwd).toBe(fs.realpathSync(result.worktree!));
     } finally {
-      if (result) await manager.cleanup(result.id, true);
+      if (result) {
+        await waitForWorkerExit(manager, result.id);
+        expect(await manager.cleanup(result.id, true)).toEqual({ cleaned: true });
+        expect(fs.existsSync(result.worktree!)).toBe(false);
+      }
     }
   });
 

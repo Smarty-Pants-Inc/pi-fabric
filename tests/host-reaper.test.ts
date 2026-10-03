@@ -8,6 +8,7 @@ import { deadHostRecords, reapDeadHostRecords } from "../src/topology/host-reape
 import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { RootInbox } from "../src/topology/root-inbox.js";
 
 const roots: string[] = [];
 const directories: ParticipantDirectory[] = [];
@@ -35,6 +36,107 @@ const participantKey = (id: string) => "topology/participants/" + createHash("sh
 const inboxKey = (id: string) => "topology/inbox/" + createHash("sha256").update(id).digest("hex").slice(0, 32);
 
 describe("stale directory bookkeeping", () => {
+  // F1 (#410): a cursor can be unchanged for days while its owner is still addressable.
+  // Losing that checkpoint makes #load start at latestSequence and skip seconds-old work.
+  const recoveryFixture = async () => {
+    const mesh = store();
+    const now = Date.now();
+    const recipient: MeshIdentity = { id: "session:legacy", name: "main", kind: "main", sessionId: "legacy" };
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now - 25 * HOUR);
+    await mesh.put({ key: inboxKey(recipient.id), value: { after: mesh.latestSequence() }, identity: recipient });
+    clock.mockReturnValue(now);
+    const work = await mesh.publish({ topic: "fleet.work.pi-fabric.410", to: recipient.id, kind: "ack", from: writer,
+      text: "recent undelivered work", data: { key: "recovery-410" } });
+    const session = (status = "idle") => mesh.put({ key: "sessions/legacy", identity: recipient,
+      value: { id: recipient.id, sessionId: "legacy", cwd: "/legacy", startedAt: now - 26 * HOUR, status } });
+    const hostRecord = (expiresAt: number) => mesh.put({ key: hostKey("legacy-host"), identity: recipient,
+      value: { format: 1, id: "legacy-host", rootId: recipient.id, identity: recipient,
+        startedAt: now - 26 * HOUR, updatedAt: now, expiresAt } });
+    const lease = () => writeHostLease(mesh.root, { id: "legacy-host", rootId: recipient.id,
+      identityId: recipient.id, updatedAt: now, expiresAt: now + 15_000 });
+    const recover = async () => {
+      // A different store and inbox force a reload of the persisted checkpoint, not memory.
+      const reloaded = new MeshStore(mesh.root, 64 * 1024, 100);
+      const inbox = new RootInbox(reloaded, recipient, () => [recipient.id], { now: () => now, steerGraceMs: 0 });
+      expect((await inbox.next({ holdsBatch: () => false, holdsSteer: () => false })).events).toEqual([work]);
+    };
+    return { mesh, now, recipient, clock, session, hostRecord, lease, recover };
+  };
+
+  it.each(["idle", "running"])("keeps a session-only live %s root's old checkpoint and recovers fresh work", async (status) => {
+    const { mesh, now, recipient, session, recover } = await recoveryFixture();
+    await session(status);
+    const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: "own", rootId: writer.id, identity: writer });
+    directories.push(directory);
+    expect(directory.list({ fresh: true }).find((entry) => entry.id === recipient.id)?.stale).toBe(false);
+    expect(mesh.get(participantKey(recipient.id))).toBeUndefined();
+    const removed = await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now });
+    await recover();
+    expect(removed).toBe(0);
+  });
+
+  it.each(["state", "file", "file-only"])("keeps a root's old checkpoint under a live %s host lease without a participant", async (kind) => {
+    const { mesh, now, hostRecord, lease, recover } = await recoveryFixture();
+    if (kind !== "file-only") await hostRecord(kind === "state" ? now + 15_000 : now - 7 * HOUR);
+    if (kind !== "state") lease();
+    const removed = await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now });
+    await recover();
+    expect(removed).toBe(0);
+  });
+
+  it.each(["session-renewed", "session-appeared", "host-renewed", "file-renewed"])(
+    "rechecks %s liveness under the commit lock and recovers fresh work after reload", async (kind) => {
+      const { mesh, now, clock, session, hostRecord, lease, recover } = await recoveryFixture();
+      if (kind === "session-renewed") {
+        clock.mockReturnValue(now - 16_000);
+        await session();
+        clock.mockReturnValue(now);
+      }
+      if (kind === "host-renewed" || kind === "file-renewed") await hostRecord(now - 7 * HOUR);
+      const original = mesh.writeBatch.bind(mesh);
+      const batches = vi.spyOn(mesh, "writeBatch").mockImplementationOnce(async (input) => {
+        // Selection is complete. A different writer renews before the batch acquires its lock,
+        // without touching the cursor or adding any participant record/file.
+        if (kind.startsWith("session-")) await session();
+        if (kind === "host-renewed") await hostRecord(now + 15_000);
+        if (kind === "file-renewed") lease();
+        return original(input);
+      });
+      const removed = await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now });
+      expect(batches).toHaveBeenCalledOnce();
+      await recover();
+      expect(removed).toBe(0);
+    },
+  );
+
+  it("keeps the exact legacy lease boundary and recovers fresh work", async () => {
+    const { mesh, now, clock, session, recover } = await recoveryFixture();
+    clock.mockReturnValue(now - 15_000);
+    await session();
+    clock.mockReturnValue(now);
+    const removed = await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now });
+    await recover();
+    expect(removed).toBe(0);
+  });
+
+  it.each(["expired", "terminal", "wrong-key", "wrong-writer", "malformed-writer"])(
+    "does not let a %s session protect an orphan cursor", async (kind) => {
+      const { mesh, now, recipient, clock, session } = await recoveryFixture();
+      if (kind === "expired") clock.mockReturnValue(now - 15_001);
+      const entry = await session(kind === "terminal" ? "completed" : "idle");
+      clock.mockReturnValue(now);
+      if (["wrong-key", "wrong-writer", "malformed-writer"].includes(kind)) {
+        const statePath = path.join(mesh.root, "state.json");
+        const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+        if (kind === "wrong-key") state.entries[entry.key].value.sessionId = "other";
+        else state.entries[entry.key].updatedBy = kind === "wrong-writer" ? writer : null;
+        fs.writeFileSync(statePath, JSON.stringify(state));
+      }
+      expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(1);
+      expect(mesh.get(inboxKey(recipient.id), { fresh: true })).toBeUndefined();
+      expect(mesh.get(entry.key, { fresh: true })).toBeDefined(); // fresh terminal/nonterminal record is not swept
+    },
+  );
   it("prunes old orphan cursors and terminal sessions together with dead hosts in one commit", async () => {
     const mesh = store();
     const now = Date.now();

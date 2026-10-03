@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import type { MeshBatchOperation, MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
+import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { type FabricHostLease, readHostLeases, removeHostLease } from "./host-leases.js";
 import { participantFilePresent, readParticipantFiles, removeParticipantFileIf, sweepParticipantLockLeftovers } from "./participant-files.js";
+import { isLiveLegacyRootEntry } from "./legacy-root-liveness.js";
 
 /** A host's records are removed when its lease expired this long ago (smarty-dev#367). */
 export const DEAD_HOST_RECORDS_MS = 6 * 60 * 60 * 1000;
@@ -73,6 +74,38 @@ export const deadHostRecords = (
   return dead.slice(0, MAX_REAP_BATCH);
 };
 
+// Participant absence is not proof of departure: legacy roots can advertise only a session,
+// and an active host/lease can bridge a gap in participant publication. Retain conservatively
+// on positive host liveness; malformed participant presence already fails closed below.
+const liveRootCursorKeys = (
+  view: Pick<MeshBatchView, "listAll">, mesh: { root?: string }, now: number,
+): Set<string> => {
+  const keys = new Set<string>();
+  const keep = (id: unknown): void => {
+    if (typeof id === "string") keys.add(INBOX_PREFIX + createHash("sha256").update(id).digest("hex").slice(0, 32));
+  };
+  for (const entry of view.listAll(SESSION_PREFIX)) {
+    if (isLiveLegacyRootEntry(entry, now)) keep(entry.value.id);
+  }
+  const leases = fileLeases(mesh);
+  for (const entry of view.listAll(HOST_PREFIX)) {
+    const host = record(entry.value);
+    if (typeof host?.id !== "string" || entry.key !== hostKey(host.id)) continue;
+    if (typeof host.expiresAt === "number" && host.expiresAt >= now) {
+      keep(host.rootId);
+      keep(record(host.identity)?.id);
+    }
+  }
+  // A file-only host lease can outlive a shared-state publication gap too.
+  for (const lease of leases.values()) {
+    if (lease.expiresAt >= now) {
+      keep(lease.rootId);
+      keep(lease.identityId);
+    }
+  }
+  return keys;
+};
+
 // Inbox keys hash the writer's participant id to 32 hex chars (RootInbox.key). Raw state/file
 // presence counts even if malformed or unreadable: absence, not failed parsing, permits cleanup.
 const staleDirectoryDeletes = (
@@ -80,6 +113,7 @@ const staleDirectoryDeletes = (
 ): MeshBatchOperation[] => {
   const cutoff = now - DIRECTORY_RETENTION_MS;
   const participants = new Set(mesh.listAll(PARTICIPANT_PREFIX, { fresh: true }).map((entry) => entry.key));
+  const live = liveRootCursorKeys({ listAll: (prefix) => mesh.listAll(prefix, { fresh: true }) }, mesh, now);
   const filePresent = (key: string): boolean => typeof mesh.root === "string" && participantFilePresent(mesh.root, key);
   const ops: MeshBatchOperation[] = [];
   for (const entry of mesh.listAll(INBOX_PREFIX, { fresh: true })) {
@@ -88,7 +122,7 @@ const staleDirectoryDeletes = (
     const hash = createHash("sha256").update(id).digest("hex");
     const participantKey = PARTICIPANT_PREFIX + hash;
     if (id === identity.id || entry.key !== INBOX_PREFIX + hash.slice(0, 32) ||
-      participants.has(participantKey) || filePresent(participantKey)) continue;
+      participants.has(participantKey) || filePresent(participantKey) || live.has(entry.key)) continue;
     ops.push({
       kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip",
       // A resumed participant or a cursor updated after selection must survive this pass.
@@ -144,7 +178,15 @@ export const reapDeadHostRecords = async (
         const host = current(hostKey(hostId));
         return host === undefined || leaseGone(host, cutoff, fileLeases(mesh));
       },
-    })), ...bookkeeping],
+    }))],
+    // Session keys are not derivable from participant ids, and a returning root can create
+    // a new one after selection. Scan the authoritative batch view, not a cached listAll,
+    // under the commit lock. File leases are reread here too. Presence is checked by each
+    // cursor condition; its version fence still protects a rewritten checkpoint.
+    prepare: (view) => {
+      const live = liveRootCursorKeys(view, mesh, options.now ?? Date.now());
+      return bookkeeping.filter((op) => !live.has(op.key));
+    },
   });
   let removed = results.filter((result) => result.applied).length;
   if (typeof mesh.root === "string") {

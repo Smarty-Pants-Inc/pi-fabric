@@ -14,6 +14,7 @@ import type {
 } from "./types.js";
 
 import { reapDeadHostRecords } from "./host-reaper.js";
+import { isLiveLegacyRootEntry, LEGACY_ROOT_LEASE_MS as PARTICIPANT_LEASE_MS } from "./legacy-root-liveness.js";
 import {
   fileLeasesOnly,
   hostLeaseExpiry,
@@ -45,7 +46,6 @@ const LINEAGE_CLOSURE_PREFIX = "topology/lineage-closures/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
-const PARTICIPANT_LEASE_MS = 15_000;
 /** Addressable across a live reload, but a failed reload stops accepting after this lease. */
 export const MAIN_RELOAD_LEASE_MS = 30_000;
 /**
@@ -285,20 +285,8 @@ const legacyRootFromEntry = (
   localRootId: string,
   now: number,
 ): FabricParticipantInfo | undefined => {
-  if (now - entry.updatedAt > PARTICIPANT_LEASE_MS || !isObject(entry.value)) return undefined;
+  if (!isLiveLegacyRootEntry(entry, now) || entry.value.id === localRootId) return undefined;
   const value = entry.value;
-  if (
-    typeof value.id !== "string" ||
-    value.id === localRootId ||
-    typeof value.sessionId !== "string" ||
-    entry.key !== `${LEGACY_SESSION_PREFIX}${value.sessionId}` ||
-    entry.updatedBy.id !== value.id ||
-    typeof value.cwd !== "string" ||
-    typeof value.startedAt !== "number" ||
-    (value.status !== "idle" && value.status !== "running")
-  ) {
-    return undefined;
-  }
   return {
     format: 1,
     id: value.id,

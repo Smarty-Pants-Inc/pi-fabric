@@ -48,6 +48,7 @@ import {
   RESIDENT_COMMANDS,
   isResidentCommandOperation,
   assertResidentActorMain,
+  assertResidentTaskCaller,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
   commitResidentRequest,
@@ -494,6 +495,7 @@ export class ResidentHost {
         readyAt: now,
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
+        callerBoundSpawn: 1,
         requestExpiry: 1,
         creationIdempotency: 1,
         ...(this.launch ? { releaseRoot: this.launch.spec.releaseRoot, configDigest: this.launch.spec.digest,
@@ -1025,11 +1027,17 @@ export class ResidentHost {
   }
 
   async #executeOnce(command: ResidentCommand): Promise<ResidentCommandResponse> {
-    if ((command.operation !== "spawn" && command.operation !== "createActor") || command.idempotencyKey === undefined) {
+    if ((command.operation !== "spawnBound" && command.operation !== "createActor") || command.idempotencyKey === undefined) {
       return this.#executeRequest(command);
     }
     if (typeof command.idempotencyKey !== "string" || !command.idempotencyKey.length || command.idempotencyKey.length > 256) {
       throw new Error("Resident idempotencyKey must be a string of 1 to 256 characters");
+    }
+    // Retry receipts must not bypass the trusted live-caller fence, even on cache hits.
+    if (command.operation === "spawnBound") {
+      const caller = command.caller;
+      assertResidentTaskCaller(caller,
+        caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
     }
     this.#pruneCreations();
     // Operation-scoped; this host already validates its one root before dispatch.
@@ -1072,7 +1080,7 @@ export class ResidentHost {
       if (command.operation === "releaseChange") {
         this.#prepareRelease(command);
         response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, completedAt: Date.now() };
-      } else if (command.operation === "spawn") {
+      } else if (command.operation === "spawnBound") {
         if (
           command.request.residentStartupProbe ||
           command.request.sessionSeed ||
@@ -1085,7 +1093,11 @@ export class ResidentHost {
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
         }
-        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit);
+        // No executor fallback: revalidate the captured caller before the mutation fence.
+        const caller = command.caller;
+        const returnAddress = assertResidentTaskCaller(caller,
+          caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
+        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, undefined, undefined, returnAddress);
         const runDirectory = this.agents.runDirectory(handle.id);
         if (!runDirectory) {
           // Durable metadata currently requires an admitted run directory. Never

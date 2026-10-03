@@ -9,6 +9,24 @@ import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { RESIDENT_REQUEST_RETENTION_MS, residentRequestGeneration } from "../src/residency/request-expiry.js";
 import { readResidentRequestDecision, residentRoot, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { MeshStore } from "../src/mesh/store.js";
+
+// A native session Main owns the caller binding independently of the resident executor.
+const mainParticipants = (config: ResidentHostConfig) => {
+  const identity = { id: config.rootId, name: "live Main", kind: "main" as const, sessionId: config.sessionId };
+  const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+  const participants = new ParticipantDirectory(mesh, {
+    enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false,
+  });
+  participants.registerSource(() => [{
+    format: 1, id: identity.id, rootId: identity.id, kind: "root", name: identity.name, status: "idle",
+    ownerHostId: identity.id, ownerIdentityId: identity.id, sessionId: identity.sessionId,
+    runner: "pi", transport: "host", capabilities: ["fabric"], controlProtocol: "v1",
+    startedAt: Date.now(), updatedAt: Date.now(),
+  }]);
+  return participants;
+};
 
 const waitFor = async (predicate: () => boolean) => {
   const deadline = Date.now() + 5_000;
@@ -36,11 +54,13 @@ const setup = async () => {
     if (now !== undefined) scans++;
   });
   let due: ReturnType<typeof vi.spyOn> | undefined;
+  const participants = mainParticipants(config);
+  await participants.start();
   await host.start();
-  const client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+  const client = new ResidencyClient({ config, mesh: host.mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
   return {
     config, host, client,
-    creationIds: (operation: "spawn" | "createActor") => fs.readdirSync(path.join(config.residencyRoot, "decisions")).map(name => name.slice(0, -5))
+    creationIds: (operation: "spawnBound" | "createActor") => fs.readdirSync(path.join(config.residencyRoot, "decisions")).map(name => name.slice(0, -5))
       .filter(id => readResidentRequestDecision(config.residencyRoot, id)?.operation === operation),
     ack: (id: string) => JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "acknowledgements", `${id}.json`), "utf8")),
     retained: (id: string) => fs.existsSync(path.join(config.residencyRoot, "decisions", `${id}.json`)),
@@ -51,7 +71,7 @@ const setup = async () => {
     },
     close: async () => {
       due?.mockRestore(); sweep.mockRestore();
-      await client.close(); await host.close(); vi.restoreAllMocks();
+      await client.close(); await host.close(); await participants.close(); vi.restoreAllMocks();
       fs.rmSync(root, { recursive: true, force: true });
     },
   };
@@ -69,7 +89,7 @@ it("completed-but-not-cleaned durable agents release acknowledged capacity debt 
       const metadata = JSON.parse(fs.readFileSync(path.join(fixture.config.residencyRoot, "agents", `${handle.id}.json`), "utf8"));
       expect(metadata.handle.status).toBe("running");
     }
-    const ids = fixture.creationIds("spawn");
+    const ids = fixture.creationIds("spawnBound");
     expect(ids).toHaveLength(3);
     const now = Math.max(...ids.map(id => fixture.ack(id).acknowledgedAt)) + RESIDENT_REQUEST_RETENTION_MS + 1;
     await fixture.scan(now);
@@ -103,7 +123,7 @@ it.each(["missing", "stub", "running", "wrong id", "wrong transport", "unreadabl
       const child = path.join(run, "nested", "unknown"); fs.mkdirSync(child, { recursive: true });
       fs.writeFileSync(path.join(child, "status.json"), JSON.stringify({ status: "completed", transport: "process" }));
     }
-    const id = fixture.creationIds("spawn")[0]!;
+    const id = fixture.creationIds("spawnBound")[0]!;
     const now = fixture.ack(id).acknowledgedAt + RESIDENT_REQUEST_RETENTION_MS + 1;
     await fixture.scan(now);
     expect(fixture.retained(id)).toBe(true);
@@ -117,12 +137,12 @@ it.each(["missing", "stub", "running", "wrong id", "wrong transport", "unreadabl
   } finally { await fixture.close(); }
 }, 15_000);
 
-it.each(["spawn", "createActor"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", async operation => {
+it.each(["spawnBound", "createActor"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", async operation => {
   const fixture = await setup();
   try {
-    const create = operation === "spawn" ? vi.spyOn(fixture.host.agents, "spawn") : vi.spyOn(fixture.host.actors, "create");
+    const create = operation === "spawnBound" ? vi.spyOn(fixture.host.agents, "spawn") : vi.spyOn(fixture.host.actors, "create");
     const request = { transport: "process" as const, idempotencyKey: "later-retry" };
-    const invoke = () => operation === "spawn"
+    const invoke = () => operation === "spawnBound"
       ? fixture.client.spawnAgent({ ...request, task: "completed cached task", extensions: false }, AbortSignal.timeout(5_000))
       : fixture.client.createActor({ ...request, name: "cached actor", instructions: "Reply.", residency: "durable", scope: "project" }, AbortSignal.timeout(5_000));
     const first = await invoke();
@@ -143,7 +163,7 @@ it.each(["spawn", "createActor"] as const)("later cached %s retries acknowledge 
       expect(ack.acknowledgedAt).toBeGreaterThanOrEqual(ack.completedAt);
       expect(readResidentRequestDecision(fixture.config.residencyRoot, id)?.id).toBe(first.id);
     }
-    if (operation === "spawn") {
+    if (operation === "spawnBound") {
       await waitFor(() => fs.existsSync(residentResultPath(fixture.config.residencyRoot, first.id)));
       await fixture.client.cleanupAgent(first.id);
     } else await fixture.client.removeActor(first.id);

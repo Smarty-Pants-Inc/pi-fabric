@@ -74,12 +74,12 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
   const residencyRoot = residentRoot(meshRoot, rootId);
   const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 };
   const mesh = new MeshStore(meshRoot, meshConfig.maxEventBytes, meshConfig.maxReadEvents);
-  const identity = { id: rootId, name: "main", kind: "main" as const };
+  const identity = { id: rootId, name: "main", kind: "main" as const, sessionId: "fence" };
   const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: rootId, rootId, identity });
   participants.registerSource(() => [{
     format: 1, id: rootId, kind: "root", rootId, ownerHostId: rootId, ownerIdentityId: rootId,
     name: "main", status: "idle", residency: "session", runner: "pi", transport: "host",
-    capabilities: ["fabric"], cwd: root, startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    capabilities: ["fabric"], cwd: root, sessionId: identity.sessionId, startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
   }]);
   await participants.start();
   const config: ResidentHostConfig = {
@@ -293,7 +293,7 @@ describe("loaded resident creation capability", () => {
         expect(first.id).not.toBe(second.id);
         expect(envelopes).toHaveLength(2);
         for (const envelope of envelopes) {
-          expect(envelope.operation).toBe(kind === "main spawn" ? "spawn" : "createActor");
+          expect(envelope.operation).toBe(kind === "main spawn" ? "spawnBound" : "createActor");
           expect(envelope.idempotencyKey).toBeUndefined();
           expect(envelope.request.idempotencyKey).toBeUndefined();
         }
@@ -472,7 +472,7 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
         state.release.resolve();
         await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
         expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", requestId, id: knownId,
-          operation: kind === "main spawn" ? "spawn" : "createActor", ownerHostId: residentHostId(state.config.rootId) });
+          operation: kind === "main spawn" ? "spawnBound" : "createActor", ownerHostId: residentHostId(state.config.rootId) });
         expect((error as Error).message).toContain(knownId);
         expect((error as Error).message).toMatch(/Do not retry or reassign.*status|actorStatus/);
         expect((error as Error).message).toContain("agents.stop");
@@ -554,10 +554,10 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
       for (const status of ["abandoned", "committed"]) {
         const requestId = `restart-${status}`;
         fs.writeFileSync(path.join(config.residencyRoot, "decisions", `${requestId}.json`), JSON.stringify({
-          requestId, state: status, ...(status === "committed" ? { id: "known", operation: "spawn", ownerHostId: residentHostId(config.rootId) } : {}),
+          requestId, state: status, ...(status === "committed" ? { id: "known", operation: "spawnBound", ownerHostId: residentHostId(config.rootId) } : {}),
         }));
         fs.writeFileSync(path.join(config.residencyRoot, "processing", `${requestId}.json`), JSON.stringify({
-          format: 1, requestId, rootId: config.rootId, operation: "spawn", request: { task: "never replay" }, createdAt: 1,
+          format: 1, requestId, rootId: config.rootId, operation: "spawnBound", request: { task: "never replay" }, createdAt: 1,
         }));
       }
     });
@@ -1522,7 +1522,7 @@ describe("durable systemPrompt public contract (#2985)", { timeout: 25_000 }, ()
       // The real host launches the fixture worker through ProcessTransport.
       // Its status echoes the actual --system-prompt argument it received.
       expect(completed).toMatchObject({ status: "completed", systemPrompt });
-      expect(decisionsFor(state)).toEqual([expect.objectContaining({ state: "committed", operation: "spawn", id: handle.id })]);
+      expect(decisionsFor(state)).toEqual([expect.objectContaining({ state: "committed", operation: "spawnBound", id: handle.id })]);
     } finally { await main.close(); await state.close(); }
   });
 });
@@ -1570,7 +1570,7 @@ describe("invocation-local spawn receipts (#2947)", { timeout: 25_000 }, () => {
           expect.objectContaining({ status: "fulfilled", value: expect.objectContaining({ messageId: "unused" }) }),
           expect.objectContaining({ status: "fulfilled", value: expect.objectContaining({ sequence: expect.any(Number) }) }),
         ]);
-        expect(decisionsFor(state).filter(decision => decision.operation === "spawn")).toHaveLength(3);
+        expect(decisionsFor(state).filter(decision => decision.operation === "spawnBound")).toHaveLength(3);
         expect(controller.signal.aborted).toBe(false);
       } finally { controller.abort(); await main.close(); await state.close(); }
     });
@@ -2292,7 +2292,7 @@ describe("outcome-unknown cross-process receipt isolation (#3172)", { timeout: 4
       await session.prompt("Run the outcome-unknown regression and reconcile only through a separate query.");
       const results = session.messages.flatMap(message => message.role === "toolResult" && message.toolName === "fabric_exec" ? [message] : []);
       const texts = results.map(textOf);
-      const decisions = decisionsFor(state).filter(decision => decision.operation === "spawn");
+      const decisions = decisionsFor(state).filter(decision => decision.operation === "spawnBound");
       const persisted = SessionManager.open(manager.getSessionFile()!).getBranch()
         .flatMap(entry => entry.type === "message" && entry.message.role === "toolResult" ? [entry.message] : []);
       const ownAgentId = latestAgent();

@@ -484,6 +484,9 @@ export class AgentMessageRouter {
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
+    if (command.operation === "setModel" || command.operation === "setThinking") {
+      return { accepted: false, error: "remote Main model changes are not supported yet; see smarty-dev#4153" };
+    }
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
     }

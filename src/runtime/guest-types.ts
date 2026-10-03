@@ -136,6 +136,13 @@ interface FabricMainAgentInfo {
   pendingMessages: boolean;
   local: boolean;
 }
+interface FabricMainAgentBindingResult extends FabricMainAgentInfo {
+  caller: string;
+  previous: { model?: string; thinking?: string };
+}
+type FabricBindingTargetResult<Id extends string> = string extends Id
+  ? FabricActorInfo | FabricMainAgentBindingResult
+  : Id extends \`session:\${string}\` ? FabricMainAgentBindingResult : FabricActorInfo;
 interface FabricPeerInfo {
   id: string;
   /** The root's fleet role, for example "project-agent". */
@@ -177,6 +184,8 @@ interface FabricParticipantInfo {
   repository?: string;
   /** False for print/JSON roots, which cannot receive messages or become project leads. */
   interactive?: boolean;
+  /** Reserved remote Main setter advertisement; currently false/absent. */
+  mainBindings?: boolean;
   kind: FabricParticipantKind;
   rootId: string;
   ownerHostId: string;
@@ -970,9 +979,13 @@ interface FabricAgentsApi {
   create(args: FabricActorRequest): Promise<FabricActorInfo>;
   /** Alias of create; file paths are resolved by the owning host. */
   createActor(args: FabricActorRequest): Promise<FabricActorInfo>;
-  setModel(args: { id: string; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<FabricActorInfo>;
+  /** Main setModel (own or remote) is refused; deferred to smarty-dev#4153. Actor bindings are unchanged. */
+  setModel(args: { id: \`session:\${string}\`; model?: string; scope?: "session" }): Promise<never>;
+  setModel<Id extends string>(args: { id: Id; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
-  setThinking(args: { id: string; thinking?: FabricThinking; scope?: FabricActorBindingScope | "global" }): Promise<FabricActorInfo>;
+  /** Only this session's own Main is supported; remote Main targets are refused. */
+  setThinking(args: { id: \`session:\${string}\`; thinking: FabricThinking; scope?: "session" }): Promise<FabricMainAgentBindingResult>;
+  setThinking<Id extends string>(args: { id: Id; thinking?: FabricThinking; scope?: FabricActorBindingScope | "global" }): Promise<FabricBindingTargetResult<Id>>;
   setTools(args: { id: string; tools: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setNice(args: { id: string; nice: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;

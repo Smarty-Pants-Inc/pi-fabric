@@ -39,6 +39,9 @@ export interface FabricParticipantRecord {
   repository?: string;
   /** False for print/JSON roots: discoverable observers, never message or lead targets. */
   interactive?: boolean;
+  /** Reserved remote Main setter advertisement; false until a native Pi commit guard exists.
+   * Kept outside capabilities: existing format-1 readers reject unknown capability strings. */
+  mainBindings?: boolean;
   status: string;
   /** Fixed expiry of a Main reload handoff; never a grace period for an exited session. */
   reloadUntil?: number;

@@ -1,12 +1,19 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as hostCompatibility from "../src/host-compatibility.js";
 
 const runtimeLoaded = vi.hoisted(() => vi.fn());
 vi.mock("../src/fabric-runtime-state.js", async original => {
   runtimeLoaded();
   return original<typeof import("../src/fabric-runtime-state.js")>();
 });
-afterEach(() => vi.unstubAllEnvs());
+beforeEach(() => {
+  vi.spyOn(hostCompatibility, "detectPiHostVersion").mockReturnValue("0.87.0");
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
 
 const host = () => {
   type Handler = (event: any, context: ExtensionContext) => unknown;
@@ -94,6 +101,38 @@ describe("fixture fork mode", () => {
     await register(api as unknown as ExtensionAPI, { managedHost: managedHost as any });
     expect(api.registerTool).not.toHaveBeenCalled();
     expect([...handlers.keys()]).not.toContain("resources_discover");
+  });
+
+  it.each(["0.80.6", "0.85.1", "0.86.0-beta.1", "0.87.0-beta.1", "unknown", "0.87.0garbage", "0.087.0", undefined])(
+    "refuses fixture startup on unsupported or unknown host %j before registering anything", async version => {
+      vi.mocked(hostCompatibility.detectPiHostVersion).mockReturnValue(version);
+      vi.stubEnv("PI_FABRIC_FIXTURE", "1");
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      const exit = vi.spyOn(process, "exit").mockImplementation(() => { throw new Error("fixture refused"); });
+      const { api } = host();
+      const { default: register } = await import("../src/index.js");
+      await expect(register(api as unknown as ExtensionAPI)).rejects.toThrow("fixture refused");
+      expect(exit).toHaveBeenCalledWith(1);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("requires Pi >= 0.86.0"));
+      expect(api.on).not.toHaveBeenCalled();
+      expect(api.registerTool).not.toHaveBeenCalled();
+      expect(api.events.on).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["0.86.0", "0.87.0", "0.87.1+fixture.1"])("admits known shell-safe host %s", async version => {
+    vi.mocked(hostCompatibility.detectPiHostVersion).mockReturnValue(version);
+    const { handlers } = await fixture();
+    expect(handlers.has("user_bash")).toBe(true);
+  });
+
+  it("does not apply the fixture-only host floor to normal registration", async () => {
+    vi.mocked(hostCompatibility.detectPiHostVersion).mockReturnValue("0.80.6");
+    vi.stubEnv("PI_FABRIC_FIXTURE", undefined);
+    const { api } = host();
+    const { default: register } = await import("../src/index.js");
+    await register(api as unknown as ExtensionAPI);
+    expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "fabric_exec" }));
   });
 
   it("blocks user shell execution too", async () => {

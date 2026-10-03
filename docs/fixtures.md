@@ -4,6 +4,16 @@ A fork copies history, not authority. A fixture launcher must set
 `PI_FABRIC_FIXTURE=1` **before loading Fabric**, including on resumes and reloads.
 Only the exact value `1` opts in; the mode is latched until extension reload.
 
+Fixtures require a **detected released Pi >= 0.86.0**: that host intercepts native RPC and
+TUI user shell requests and fails closed when the restriction hook throws.
+Older hosts (including ordinarily supported Pi 0.80.6–0.85.x), prereleases, invalid versions,
+and unknown hosts/SDK entry points are refused before Fabric registers anything.
+Fabric prints a clear error and terminates the process with status 1: merely
+throwing from an extension factory is unsafe because Pi catches the error and
+can otherwise continue without the fixture guards. Launch fixtures through a
+verifiable Pi CLI entry point; this fixture-only floor does not change normal
+Fabric compatibility. The launcher must preserve the marker on every reload.
+
 Fabric then registers only read-only restriction hooks. It does not register
 `fabric_exec`, commands, providers, skills, principal/auth capture, roots, control
 handlers, actor workers or mailbox readers. The active tool set is `read`,

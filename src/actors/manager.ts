@@ -4,6 +4,7 @@ import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
+import { ActorSessionResetCancelledError } from "./session-reset-error.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
@@ -1017,18 +1018,20 @@ export class ActorManager {
    * finishes on the old session first; it is not interrupted. The session file is archived
    * beside it; instructions, topics, bindings, the queue and the message log are kept.
    */
-  async resetSession(id: string): Promise<FabricActorInfo> {
+  async resetSession(id: string, options: { beforeCommit?: (id: string) => void } = {}): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#draining.get(actor.id);
     // A drain owns admission before it installs its abort controller, including
     // while a boundary presence write or launch preparation is awaiting.
     if (actor.draining || running || this.#inFlight.has(actor.id) || actor.abortController) {
+      options.beforeCommit?.(actor.id);
       return new Promise((resolve, reject) => {
         const waiters = this.#pendingResets.get(actor.id) ?? [];
         waiters.push({ resolve, reject });
         this.#pendingResets.set(actor.id, waiters);
       });
     }
+    options.beforeCommit?.(actor.id);
     this.#archiveSession(actor, "requested");
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -1662,16 +1665,27 @@ export class ActorManager {
     const running = this.#runningActor(id);
     if (!running) return;
     this.#stopRun(running);
+    // A caller abort detaches a worker that made progress. Public terminal stop
+    // must explicitly end that owned worker before joining its activation.
+    if (running.inFlightRun) await this.agents.stop(running.inFlightRun.id);
     await running.drain?.catch(() => undefined);
   }
 
-  async stop(id: string): Promise<FabricActorInfo> {
+  async stop(id: string, beforeCommit?: (id: string) => void, wait = false): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#runningActor(actor.id)!;
     const stopped = actor.status === "stopped";
+    beforeCommit?.(actor.id);
+    // Terminal stop cancels an unperformed repair, never rotates its journal.
+    const resets = this.#pendingResets.get(actor.id);
+    this.#pendingResets.delete(actor.id);
+    resets?.forEach(waiter => waiter.reject(new ActorSessionResetCancelledError(actor.id)));
     this.#stopRun(running);
     if (running !== actor) this.#stopRun(actor);
-    if (stopped && running === actor) return this.#publicInfo(actor);
+    if (stopped && running === actor) {
+      if (wait) await this.#joinStoppedRun(actor.id);
+      return this.#publicInfo(actor);
+    }
     this.#drop(actor, [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
     await this.#publishPresence(actor);
@@ -1682,6 +1696,7 @@ export class ActorManager {
         data: this.#publicInfo(actor),
       })
       .catch(() => undefined);
+    if (wait) await this.#joinStoppedRun(actor.id);
     return this.#publicInfo(actor);
   }
 

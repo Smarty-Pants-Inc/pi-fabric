@@ -1162,8 +1162,25 @@ export class AgentsProvider implements FabricProvider {
             : {}),
         };
       }
-      case "stop":
-        return this.stopParticipant(String(args.id));
+      case "stop": {
+        const id = String(args.id);
+        // Agent/task stop keeps its existing control route; actor lifecycle uses
+        // the same root identity and resident request fence as native setters.
+        let actorTarget = false;
+        try { this.#resolveActorTarget(id); actorTarget = true; } catch (error) {
+          if (!(error instanceof Error) || !/Unknown Fabric actor/.test(error.message)) throw error;
+        }
+        if (actorTarget) {
+          const target = this.#resolveActorTarget(id);
+          if ((target.actor?.residency ?? target.participant?.residency) === "durable" &&
+              (target.actor?.rootId ?? target.participant?.rootId) !== this.mainAgent.id) {
+            throw new ResidentActorAuthorizationError();
+          }
+          const resident = this.#residentActorOwner(id);
+          if (resident) return this.#setResidentActor(resident, { operation: "stop", id: resident.id }, context);
+        }
+        return this.stopParticipant(id);
+      }
       case "cleanup": {
         const id = String(args.id);
         return (this.residency?.ownsAgent?.(id) ?? this.residency?.hasAgent(id))
@@ -1459,8 +1476,12 @@ export class AgentsProvider implements FabricProvider {
       }
       case "clearMessages":
         return this.actorManager.clearMessages(String(args.id));
-      case "resetSession":
-        return this.actorManager.resetSession(String(args.id));
+      case "resetSession": {
+        const id = String(args.id);
+        const resident = this.#residentActorOwner(id);
+        if (resident) return this.#setResidentActor(resident, { operation: "resetSession", id: resident.id }, context);
+        return this.actorManager.resetSession(id, { beforeCommit: checkCommit });
+      }
       case "remove": {
         if (args.scope === "global") return this.globalActors.remove(String(args.id));
         const cleanup = this.actorManager.cleanupObligation(String(args.id));

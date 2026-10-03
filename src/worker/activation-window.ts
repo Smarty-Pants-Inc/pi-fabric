@@ -167,7 +167,7 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
     // Reinstall per request so refresh/registration during a transform is covered.
     // No private host fields, alternate AI runtime, auth or provider composition.
     const guarded = new WeakSet<Provider>();
-    let lastPayload: { tokens: number; contextWindow: number } | undefined;
+    let lastPayload: { tokens: number; contextWindow: number; overheadTokens: number } | undefined;
     pi.on("turn_end", async event => {
       try {
         if (!window || !lastPayload || !event.toolResults.length) return;
@@ -181,8 +181,14 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
         // Compaction may only replace our witnessed append-only activation,
         // not legitimize a prior boundary handler rewriting its messages.
         window.project(event.context.contextMessages.filter(message => !isSystem(message)));
-        const plan = compactActivationTools(event);
-        if (!plan) return; // The latest batch alone may be too big: final admission refuses once.
+        let plan = compactActivationTools(event);
+        const retained = plan?.messages ?? event.context.contextMessages.filter(message => !isSystem(message));
+        const projectedTokens = lastPayload.overheadTokens + estimateTextTokens(JSON.stringify(convertToLlm(retained))) +
+          estimateTextTokens(plan?.summary ?? "");
+        // Prefer preserving the latest batch. Only compact it when the bounded
+        // older history still cannot fit; keep every raw output in the journal.
+        if (projectedTokens > lastPayload.contextWindow) plan = compactActivationTools(event, { includeLatest: true });
+        if (!plan) return; // Irreducible instructions/schemas still refuse once at final admission.
         window.authorizeCompaction(plan.summary, plan.messages);
         return { entries: plan.entries };
       } catch (error) {
@@ -210,6 +216,7 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
         };
         const guardPayload = (
           model: Parameters<Provider["streamSimple"]>[0], options: ProviderRequestOptions | undefined,
+          context: Parameters<Provider["streamSimple"]>[1],
         ): NonNullable<ProviderRequestOptions["onPayload"]> => async (payload, requestModel) => {
           try {
             const replacement = await options?.onPayload?.(payload, requestModel);
@@ -268,7 +275,8 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             if (tokens > model.contextWindow) {
               failClosed(`Context exceeds window: estimated ${tokens} input tokens, window ${model.contextWindow}`);
             }
-            lastPayload = { tokens, contextWindow: model.contextWindow };
+            const conversationTokens = estimateTextTokens(JSON.stringify(context.messages.filter(message => message.role !== "system")));
+            lastPayload = { tokens, contextWindow: model.contextWindow, overheadTokens: Math.max(0, tokens - conversationTokens) };
             // Ordinary wire payloads dispatch the admitted JSON snapshot, not
             // stateful getters/toJSON that could change at the next serialization.
             if (!google) return admitted;
@@ -302,12 +310,12 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             verify(context);
             // Preserve the API-specific conditional options type while copying it.
             const guardedOptions = { ...options } as NonNullable<typeof options>;
-            guardedOptions.onPayload = guardPayload(model, options);
+            guardedOptions.onPayload = guardPayload(model, options, context);
             return stream.call(provider, model, context, guardedOptions);
           };
           provider.streamSimple = (model, context, options) => {
             verify(context);
-            return streamSimple.call(provider, model, context, { ...options, onPayload: guardPayload(model, options) });
+            return streamSimple.call(provider, model, context, { ...options, onPayload: guardPayload(model, options, context) });
           };
           guarded.add(provider);
         }

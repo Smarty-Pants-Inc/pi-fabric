@@ -974,7 +974,7 @@ interface FabricAgentsApi {
   remove(args: { id: string }): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }>;
   /** Drop an actor's mailbox history without stopping the actor. */
   clearMessages(args: { id: string }): Promise<FabricActorInfo>;
-  /** Start an actor's next run on a fresh Pi session; waits for an in-flight run, keeps the mailbox. */
+  /** Fresh actor session, archived history and mailbox kept. The owning Main requests resident reset directly; an admitted activation settles at the fenced boundary while other commands remain serviceable. Explicit stop cancels work and any pending reset; it is not preparation for repair. */
   resetSession(args: { id: string }): Promise<FabricActorInfo>;
   /** Stamp a global template into the current project as a fresh live actor with no inherited history. */
   "import"(args: { id?: string; name?: string; as?: string }): Promise<FabricActorInfo>;

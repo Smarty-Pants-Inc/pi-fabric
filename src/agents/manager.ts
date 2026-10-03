@@ -737,7 +737,7 @@ export class AgentManager {
     this.#sweepPath =
       options.sweepPath ?? fileURLToPath(new URL("../storage/sweep-main.js", import.meta.url));
     this.#fabricExtensionPath =
-      options.fabricExtensionPath ?? fileURLToPath(new URL("../index.js", import.meta.url));
+      options.fabricExtensionPath ?? fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "../index.ts" : "../index.js", import.meta.url));
     this.#piBinary = resolvePiBinary(options.piBinary);
     this.#claudeBinary =
       options.claudeBinary ?? process.env.PI_FABRIC_CLAUDE_BINARY ?? config.claude.binary;

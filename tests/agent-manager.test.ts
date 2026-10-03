@@ -2193,6 +2193,7 @@ describe("AgentManager", () => {
     const tools = allowlist === 'invalid' ? ["fabric_exec"] : ["read", "fabric_exec"];
     expect(JSON.parse(result.text)).toMatchObject({
       cwd: fs.realpathSync(target), trustFlags: [], tools, toolAllowlistEnv: tools,
+      extensionDiscovery: false, extensionPath: path.resolve("src/index.ts"), explicitFabricExists: true,
       grantedRisksEnv: ["agent"], fullCodeModeEnv: "true", extensions: true,
       projectRoot: process.cwd(), meshRoot: path.join(root, "mesh"),
       kernel: "python", pythonRuntime: "monty", depth: "1", mainAgentId: "root:security",
@@ -2222,7 +2223,9 @@ describe("AgentManager", () => {
     expect(inherited.status).toBe("completed");
     expect(JSON.parse(inherited.text)).toMatchObject({
       extensions: true,
-      extensionPath: expect.stringContaining("index"),
+      extensionDiscovery: false,
+      extensionPath: path.resolve("src/index.ts"),
+      explicitFabricExists: true,
       tools: ["read", "fabric_exec"],
       fullCodeModeEnv: "true",
       toolAllowlistEnv: ["read", "fabric_exec"],
@@ -2237,7 +2240,7 @@ describe("AgentManager", () => {
       timeoutMs: 5_000,
     });
     expect(native.status).toBe("completed");
-    // --no-extensions disables Fabric/discovery, not explicitly installed host helpers.
+    // --no-extensions disables discovery, not explicitly installed host helpers.
     // Principal delivery and native session observation remain installed host helpers;
     // neither widens the child's tools nor enables Fabric/discovery.
     expect(JSON.parse(native.text).extensionPaths).toEqual([
@@ -2246,6 +2249,8 @@ describe("AgentManager", () => {
     ]);
     expect(JSON.parse(native.text)).toMatchObject({
       extensions: false,
+      extensionDiscovery: false,
+      explicitFabricExists: false,
       tools: ["read"],
       fullCodeModeEnv: "false",
       toolAllowlistEnv: ["read"],

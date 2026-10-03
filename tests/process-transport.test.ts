@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { WORKER_PROTOCOL_VERSION } from "../src/agents/worker-protocol.js";
+import type { AgentHandleInfo } from "../src/agents/types.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -28,7 +29,7 @@ fs.writeFileSync(args.get("status-file"), JSON.stringify({
 }));`;
 
 const fixture = (fullCodeMode = true) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-spawn-release-"));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-spawn-release-")));
   roots.push(root);
   const profile = path.join(root, "profile");
   fs.mkdirSync(profile);
@@ -54,10 +55,16 @@ const fixture = (fullCodeMode = true) => {
 };
 
 const probe = async (f: ReturnType<typeof fixture>, expected: string) => {
-  const handle = await f.manager.spawn({ task: "probe", transport: "process" });
-  expect(handle.fabricRelease).toBe(expected);
+  let launched: AgentHandleInfo | undefined;
+  const handle = await f.manager.spawn({ task: "probe", transport: "process" }, undefined, undefined, undefined, undefined,
+    value => { launched = value; });
+  // A terminal result can precede native close on Windows. The next spawn may
+  // return a queued receipt, whose release has not been selected yet. Assert
+  // the launch callback as well as the result, never guess it at admission.
   const result = await f.manager.wait(handle.id);
   expect(result.status, result.error).toBe("completed");
+  expect(launched).toMatchObject({ id: handle.id, status: "running", fabricRelease: expected });
+  if (handle.status !== "queued") expect(handle.fabricRelease).toBe(expected);
   expect(result.fabricRelease).toBe(expected);
   expect(JSON.parse(result.text)).toMatchObject({
     worker: pathToFileURL(path.join(expected, "dist/worker.js")).href,
@@ -76,6 +83,37 @@ describe("process transport spawn-time Fabric release selection", () => {
     f.select(f.parent);
     await probe(f, f.parent);
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("selects release metadata at native launch, not when returning a queued receipt", async () => {
+    const f = fixture();
+    const gate = path.join(f.root, "finish-first");
+    // Hold the first worker before it writes its terminal record, independent
+    // of scheduling speed and the platform's native-close implementation.
+    fs.writeFileSync(path.join(f.parent, "dist/worker.js"), worker.replace("const args = new Map();", `
+await new Promise(resolve => {
+  const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { clearInterval(timer); resolve(); } }, 10);
+});
+const args = new Map();`));
+    const first = await f.manager.spawn({ task: "first", transport: "process" });
+    let launched: AgentHandleInfo | undefined;
+    const queued = await f.manager.spawn({ task: "queued", transport: "process" }, undefined, undefined, undefined, undefined,
+      value => { launched = value; });
+    expect(queued.status).toBe("queued");
+    expect(queued.fabricRelease).toBeUndefined();
+    expect(launched).toBeUndefined();
+    const current = f.release("activated-while-queued");
+    f.select(current);
+    fs.writeFileSync(gate, "release");
+    expect((await f.manager.wait(first.id)).status).toBe("completed");
+    const result = await f.manager.wait(queued.id);
+    expect(result.status, result.error).toBe("completed");
+    expect(launched).toMatchObject({ id: queued.id, status: "running", fabricRelease: current });
+    expect(result.fabricRelease).toBe(current);
+    expect(JSON.parse(result.text)).toMatchObject({
+      worker: pathToFileURL(path.join(current, "dist/worker.js")).href,
+      extension: path.join(current, "dist/index.js"), release: current,
+    });
   });
 
   it("follows canonical installed roots when the parent's worker is addressed through a symlink", async () => {

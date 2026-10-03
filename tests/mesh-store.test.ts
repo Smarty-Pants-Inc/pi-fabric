@@ -441,6 +441,73 @@ describe("MeshStore", () => {
     expect(store.oldestSequence()).toBeGreaterThan(1);                     // rotated
   });
 
+  it("prepares multi-owner batches from one locked snapshot, including tombstone recreation", async () => {
+    const store = createStore();
+    const first = await store.put({ key: "batch/live", value: { kept: true }, identity });
+    const gone = await store.put({ key: "batch/gone", value: 1, identity });
+    const tombstone = await store.delete({ key: gone.key, ifVersion: gone.version });
+    const other: MeshIdentity = { id: "session:other", name: "other", kind: "main" };
+    const after = vi.fn();
+    const lock = path.join(store.root, ".lock");
+    const results = await store.writeBatch({ identity, ops: [], prepare: (view) => {
+      expect(fs.existsSync(lock)).toBe(true);
+      expect(view.version(gone.key)).toBe(tombstone.version);
+      expect(view.get(gone.key)).toBeUndefined();
+      expect(view.listAll("batch/")).toEqual([first]);
+      // Copies cannot change this transaction's protected snapshot.
+      (view.get(first.key)!.value as { kept: boolean }).kept = false;
+      view.listAll("batch/")[0]!.updatedBy.id = "tampered";
+      return [
+        { kind: "put", key: gone.key, value: 2, identity: other, ifVersion: view.version(gone.key) },
+        { kind: "put", key: "batch/new", value: 3, ifVersion: view.version("batch/new") },
+      ];
+    }, afterCommit: (view) => {
+      expect(fs.existsSync(lock)).toBe(true);
+      expect(view.get(gone.key)!.updatedBy).toEqual(other);
+      expect(view.get("batch/new")!.updatedBy).toEqual(identity);
+      // The canonical file is already committed when the ownership-bound effect runs.
+      expect(new MeshStore(store.root, 64 * 1024, 100).get(gone.key)!.value).toBe(2);
+      after();
+    } });
+    expect(results.map(r => r.applied)).toEqual([true, true]);
+    expect(store.get(first.key)).toEqual(first);
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  it("runs no-op effects under one lock/read without a state commit", async () => {
+    const store = createStore();
+    await store.put({ key: "batch/live", value: 1, identity });
+    const canonical = path.join(store.root, "state.json");
+    const reads = vi.spyOn(fs, "readFileSync");
+    const writes = vi.spyOn(fs, "renameSync");
+    const effect = vi.fn(view => {
+      expect(fs.existsSync(path.join(store.root, ".lock"))).toBe(true);
+      expect(view.get("batch/live")!.value).toBe(1);
+    });
+    expect(await store.writeBatch({ identity, ops: [], prepare: () => [], afterCommit: effect })).toEqual([]);
+    expect(reads.mock.calls.filter(([p]) => String(p) === canonical)).toHaveLength(1);
+    expect(writes.mock.calls.filter(([, p]) => String(p) === canonical)).toHaveLength(0);
+    expect(effect).toHaveBeenCalledTimes(1);
+  });
+
+  it("validates prepared keys and keeps failed batches from committing or running effects", async () => {
+    const store = createStore();
+    const entry = await store.put({ key: "batch/live", value: 1, identity });
+    const effect = vi.fn();
+    await expect(store.writeBatch({ identity, ops: [], prepare: () => [
+      { kind: "put", key: "batch/new", value: 2 },
+      { kind: "delete", key: entry.key, ifVersion: entry.version + 1 },
+    ], afterCommit: effect })).rejects.toBeInstanceOf(MeshBatchConflictError);
+    expect(store.get("batch/new")).toBeUndefined();
+    await expect(store.writeBatch({ identity, ops: [], prepare: () => [
+      { kind: "put", key: "", value: 2 },
+    ], afterCommit: effect })).rejects.toThrow("Invalid Fabric mesh key");
+    expect(store.get(entry.key)).toEqual(entry);
+    expect(effect).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(store.root, ".lock"))).toBe(false);
+  });
+
   it("skips a batch delete whose condition fails at commit, seeing earlier ops of the batch", async () => {
     const store = createStore();
     await store.put({ key: "owner/live", value: { alive: true }, identity });

@@ -472,6 +472,8 @@ export type MeshBatchOperation =
       kind: "put";
       key: string;
       value: unknown | ((now: number) => unknown);
+      /** Overrides the batch identity for a multi-owner transaction (e.g. bridge presence). */
+      identity?: MeshIdentity;
       ifVersion?: number;
       onConflict?: "skip" | "abort" | ((current: MeshStateEntry | undefined) => "skip" | "abort");
     }
@@ -487,6 +489,13 @@ export type MeshBatchOperation =
        */
       condition?: (current: (key: string) => MeshStateEntry | undefined) => boolean;
     };
+
+export interface MeshBatchView {
+  get(key: string): MeshStateEntry | undefined;
+  listAll(prefix: string): MeshStateEntry[];
+  /** Includes an absent key's retained CAS tombstone. */
+  version(key: string): number;
+}
 
 export interface MeshBatchResult {
   key: string;
@@ -1374,13 +1383,18 @@ export class MeshStore {
   // compare-and-swap. On a version mismatch, `onConflict` decides: "skip" leaves that
   // key alone, "abort" writes nothing at all and rejects. A put value may be a function,
   // evaluated under the lock at commit time (for timestamps such as lease stamps).
+  // A synchronous prepare callback builds ops from the authoritative snapshot under the same lock. Its
+  // view returns copies, never mutable state. afterCommit runs under that lock after a successful
+  // commit (also for a no-op batch), for ownership-bound file leases; it must not call store writers.
   // Returns one result per operation, in order.
   async writeBatch(input: {
     identity: MeshIdentity;
     ops: MeshBatchOperation[];
+    prepare?: (view: MeshBatchView) => MeshBatchOperation[];
+    afterCommit?: (view: MeshBatchView) => void;
   }): Promise<MeshBatchResult[]> {
     for (const op of input.ops) this.#validateKey(op.key);
-    if (input.ops.length === 0) return [];
+    if (input.ops.length === 0 && !input.prepare && !input.afterCommit) return [];
     return this.#withLock(() => {
       // Each operation takes the same verified transition as put()/delete(), so a batch
       // advances the persistent clock exactly as the single writes would, and damaged
@@ -1393,7 +1407,15 @@ export class MeshStore {
       const now = Date.now();
       const current = (key: string): MeshStateEntry | undefined =>
         Object.hasOwn(state.entries, key) ? jsonClone(state.entries[key]) : undefined;
-      for (const op of input.ops) {
+      const view: MeshBatchView = {
+        get: current,
+        listAll: (prefix) => Object.keys(state.entries).filter((key) => key.startsWith(prefix))
+          .sort((left, right) => left.localeCompare(right)).map((key) => jsonClone(state.entries[key]!)),
+        version: (key) => stateSlot(state, key).version,
+      };
+      const ops = [...input.ops, ...(input.prepare?.(view) ?? [])];
+      for (const op of ops) this.#validateKey(op.key);
+      for (const op of ops) {
         const slot = stateSlot(state, op.key);
         const existing = state.entries[op.key];
         if (op.kind === "delete" && op.condition && !op.condition(current)) {
@@ -1416,7 +1438,7 @@ export class MeshStore {
             key: op.key,
             ifVersion: op.ifVersion,
             value: typeof op.value === "function" ? (op.value as (now: number) => unknown)(now) : op.value,
-            identity: input.identity,
+            identity: op.identity ?? input.identity,
           }, this.maxEventBytes);
         const plan = request.transition(slot.present, slot.version, slot.highWater);
         if (plan.kind === "unchanged") {
@@ -1442,11 +1464,12 @@ export class MeshStore {
       }
       if (!changed) {
         this.#cacheState(state, undefined);
-        return results;
+      } else {
+        state.tombstoneOrder = [...tombstones];
+        compactStateTombstones(state, this.#maxStateTombstones);
+        this.#commitState(state, reuse);
       }
-      state.tombstoneOrder = [...tombstones];
-      compactStateTombstones(state, this.#maxStateTombstones);
-      this.#commitState(state, reuse);
+      input.afterCommit?.(view);
       return results;
     });
   }

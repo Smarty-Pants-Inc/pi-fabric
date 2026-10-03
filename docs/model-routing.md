@@ -165,7 +165,9 @@ Terminal outcomes may contain `routeQuality: "fail" | "pass"`. A caller/actor
 can also report quality after reviewing a locally owned routed run:
 
 ```ts
-await agents.routeOutcome({ id: child.id, routeQuality: "fail" });
+// Replace with the ID returned by agents.spawn/run for the locally owned routed run.
+const runId = "owned-run-id";
+await agents.routeOutcome({ id: runId, routeQuality: "fail" });
 ```
 
 Report fail for review FAIL, red tests or a user retry; these signals are explicit

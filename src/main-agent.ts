@@ -68,6 +68,7 @@ export interface FabricFollowUpQueueDepth {
 }
 
 export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDepth> {
+  deadlineAt?: number;
   /** Sender-only observation at task admission; delivery is unchanged. */
   warning?: AgentFollowUpRunningWarning;
   /** Advisory identifier provenance notice; appended to delivered text when admission permits. */

@@ -92,7 +92,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
-const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "disconnect" | "controls" | "queue-modes", retry?: Record<string, unknown>) => {
+const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "disconnect" | "controls" | "queue-modes" | "held-follow-up" | "delayed-follow-up", retry?: Record<string, unknown>) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-overload-")); roots.push(dir);
   let firstRequestAt = 0;
   let releaseOverload!: () => void;
@@ -104,11 +104,11 @@ const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "dis
     request.on("end", async () => {
       requests.push(JSON.parse(body)); firstRequestAt ||= Date.now();
       // Hold the first response until public queue-mode controls have reached native Pi.
-      if (mode === "queue-modes" && requests.length === 1) await overloadReady;
+      if ((mode === "queue-modes" || mode === "held-follow-up" || mode === "delayed-follow-up") && requests.length === 1) await overloadReady;
       if (mode === "disconnect" && requests.length === 1) { response.destroy(); return; }
       const overloaded = mode === "forever" || (mode === "queue-modes" && requests.length <= 5) ||
         (mode === "burst" && Date.now() - firstRequestAt < 90_000 * SCALE) ||
-        ((mode === "resume" || mode === "controls") && requests.length === 1);
+        ((mode === "resume" || mode === "controls" || mode === "held-follow-up") && requests.length === 1);
       if (overloaded || mode === "400" || (mode === "429" && requests.length === 1)) {
         response.writeHead(mode === "400" ? 400 : mode === "429" ? 429 : 503, { "Content-Type": "application/json" });
         response.end(JSON.stringify({ error: { message: mode === "400" ? "invalid_request_error: invalid input" : "server_is_overloaded", type: mode === "400" ? "invalid_request_error" : "server_is_overloaded" } }));
@@ -124,7 +124,7 @@ const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "dis
         response.end("data: [DONE]\n\n");
       };
       // Keep the resumed turn streaming while native steering/follow-up arrive.
-      if (mode === "controls" && requests.length === 2) setTimeout(finish, 700);
+      if ((mode === "controls" || mode === "held-follow-up") && requests.length === 2) setTimeout(finish, 700);
       else finish();
     });
   });
@@ -148,6 +148,7 @@ const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "dis
     workerPath: path.resolve(process.env.FABRIC_OVERLOAD_TEST_WORKER ?? "src/worker.ts"),
     piBinary: path.resolve(process.env.FABRIC_OVERLOAD_TEST_PI_BINARY ?? "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
     runRoot: path.join(dir, "runs"),
+    ...(mode === "delayed-follow-up" ? { fabricExtensionPath: path.join(dir, "delay.ts") } : {}),
   });
   managers.push(manager);
   const spawn = () => manager.spawn({ task: "Finish ORIGINAL_TASK, preserving completed work.", model: "overload-test/offline", tools: [], extensions: false, transport: "process" });
@@ -197,6 +198,59 @@ describe("native backoff evidence wait", () => {
 });
 
 describe("real Pi process provider recovery (offline localhost)", () => {
+  it("keeps the native child alive through delayed follow-up input admission, without an early receipt", async () => {
+    const s = await setup("delayed-follow-up", { maxRetries: 0 });
+    const held = path.join(s.dir, "input-held");
+    fs.writeFileSync(path.join(s.dir, "delay.ts"), `import fs from 'node:fs';
+      export default function(pi) { pi.on('input', async e => {
+        if(e.source==='extension' && e.text.includes('DELAYED_NATIVE_FOLLOW_UP')) {
+          fs.writeFileSync(${JSON.stringify(held)}, 'held');
+          await new Promise(r=>setTimeout(r,250));
+        }
+      }); }`);
+    const handle = await s.manager.spawn({ task: "Finish ORIGINAL_TASK", model: "overload-test/offline", tools: [], extensions: true, transport: "process" });
+    await until(() => s.requests.length === 1 || ["failed", "completed"].includes(s.manager.status(handle.id).status));
+    if (!s.requests.length) { const failed = await s.manager.wait(handle.id); evidence("delayed-startup-failure", failed); throw new Error(explain(failed)); }
+    const receipt = s.manager.followUp(handle.id, "DELAYED_NATIVE_FOLLOW_UP", undefined, {
+      v: 1, channel: "fabric", via: "followUp", sender: { id: "test", kind: "main", verified: "mesh" },
+    }, { deadlineMs: 100 });
+    const run = s.manager.runDirectory(handle.id)!;
+    await until(() => fs.existsSync(path.join(run, "deliveries", receipt.messageId + ".json")));
+    s.releaseOverload();
+    await until(() => fs.existsSync(held));
+    expect((s.manager.status(handle.id) as any).followUpDeliveries[0].state).toBe("queued");
+    expect(entries(path.join(run, "session.jsonl")).filter(e => e.type === "message" && e.message?.role === "user" && JSON.stringify(e.message.content).includes("DELAYED_NATIVE_FOLLOW_UP"))).toHaveLength(0);
+    const result = await s.manager.wait(handle.id); evidence("delayed-native-admission", result);
+    expect(result, explain(result)).toMatchObject({ status: "completed" });
+    const delivery = (s.manager.status(handle.id) as any).followUpDeliveries[0];
+    expect(delivery).toMatchObject({ state: "delivered", alarm: { code: "FABRIC_FOLLOW_UP_DEADLINE" } });
+    expect(entries(path.join(run, "session.jsonl")).filter(e => e.type === "message" && e.message?.role === "user" && JSON.stringify(e.message.content).includes("DELAYED_NATIVE_FOLLOW_UP"))).toHaveLength(1);
+    expect(s.requests.filter(request => JSON.stringify(request).includes("DELAYED_NATIVE_FOLLOW_UP"))).toHaveLength(1);
+  }, 120_000);
+  it.each([false, true])("retains held tracked follow-ups across same-session native replacement (cancelled: %s)", async cancelled => {
+    const s = await setup("held-follow-up", { maxRetries: 0 }); const handle = await s.spawn();
+    await until(() => s.requests.length === 1);
+    const marker = "HELD_TRACKED_FOLLOW_UP";
+    const receipt = s.manager.followUp(handle.id, marker, undefined, {
+      v: 1, channel: "fabric", via: "followUp", sender: { id: "test", kind: "main", verified: "mesh" },
+    }, { deadlineMs: 60_000 });
+    // Native RPC has processed the command, but the failed provider request
+    // has not reached an eligible boundary and no native queue owns the payload.
+    const run = s.manager.runDirectory(handle.id)!;
+    await until(() => entries(path.join(run, "events.jsonl")).some(e => e.type === "response" && e.command === "prompt"));
+    await new Promise(resolve => setTimeout(resolve, 600));
+    expect((s.manager.status(handle.id) as any).followUpDeliveries[0].state).toBe("queued");
+    if (cancelled) expect(s.manager.cancelFollowUp(handle.id, receipt.messageId).state).toBe("cancelled");
+    s.releaseOverload();
+    const result = await s.manager.wait(handle.id); evidence("held-follow-up-" + cancelled, result);
+    expect(result, explain(result)).toMatchObject({ status: "completed" });
+    expect(result.runnerSessionIds).toHaveLength(1);
+    expect(events(result).filter(e => e.type === "fabric_provider_resume" && e.phase === "starting")).toHaveLength(1);
+    const users = entries(path.join(run, "session.jsonl")).filter(e => e.type === "message" && e.message?.role === "user" && JSON.stringify(e.message.content).includes(marker));
+    expect(users).toHaveLength(cancelled ? 0 : 1);
+    expect(s.requests.some(request => JSON.stringify(request).includes(marker))).toBe(!cancelled);
+    expect((s.manager.status(handle.id) as any).followUpDeliveries[0].state).toBe(cancelled ? "cancelled" : "delivered");
+  }, 120_000);
   it("survives a 90-second scaled overload burst in one native session, with no kill", async () => {
     const s = await setup("burst"); const handle = await s.spawn();
     const result = await s.manager.wait(handle.id); evidence("burst", result);

@@ -125,6 +125,7 @@ export type FabricActorStorageScope = "session" | "project";
 
 export interface FabricActorRunBinding {
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
 }
 
@@ -231,7 +232,7 @@ export interface FabricActorRequest {
   /** Host-only backend snapshot for persistent/resident sessions; not a provider argument. */
   pythonRuntime?: FabricPythonRuntime;
   model?: string;
-  /** Creation-time model justification retained on actor activation runs. */
+  /** Named model exception (non-blank, ≤200 chars), retained on activation runs. */
   modelReason?: string;
   thinking?: FabricThinking;
   /** Opt-in per-activation shadow Choice; requires explicit model/effort pins. */
@@ -301,6 +302,8 @@ export interface FabricActorInfo {
   via?: string;
   /** Canonical selection when via is present; may differ from the session's effective model. */
   selectedModel?: string;
+  /** Named exception for the effective model, retained for metering. */
+  modelReason?: string;
   /** Effective value for this caller after session bindings overlay project defaults. */
   model?: string;
   /** Effective value for this caller after session bindings overlay project defaults. */

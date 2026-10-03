@@ -864,6 +864,7 @@ export class ActorManager {
     model: string | undefined,
     scope: FabricActorBindingScope = "session",
     beforeCommit?: (id: string) => void,
+    modelReason?: string,
   ): Promise<FabricActorInfo> {
     if (scope !== "session" && scope !== "project") {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
@@ -885,13 +886,15 @@ export class ActorManager {
     }
     // Fence after model refresh and (for session scope) binding-lock acquisition.
     if (scope === "session") {
-      await this.#bindings.setModel(actor.id, resolved, beforeCommit);
+      await this.#bindings.setModel(actor.id, resolved, beforeCommit, modelReason);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
     beforeCommit?.(actor.id);
     if (resolved) actor.model = resolved;
     else delete actor.model;
+    if (resolved && modelReason !== undefined) actor.modelReason = modelReason;
+    else delete actor.modelReason;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -2925,7 +2928,7 @@ export class ActorManager {
         : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(binding.model ? { model: binding.model } : {}),
-      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
+      ...(binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}),
       ...(binding.thinking ? { thinking: binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -3997,6 +4000,7 @@ export class ActorManager {
     }
     return {
       ...(model ? { model } : {}),
+      ...(model && binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}),
       ...(isFabricThinking(binding.thinking) ? { thinking: binding.thinking } : {}),
     };
   }
@@ -4008,9 +4012,11 @@ export class ActorManager {
     const session = this.#bindings.get(actor.id);
     const call = this.#validatedRunBinding(overrides);
     const model = call.model ?? session?.model ?? actor.model;
+    const modelReason = call.model ? call.modelReason : session?.model ? session.modelReason : actor.modelReason;
     const thinking = call.thinking ?? session?.thinking ?? actor.thinking;
     return {
       ...(model ? { model } : {}),
+      ...(modelReason !== undefined ? { modelReason } : {}),
       ...(thinking ? { thinking } : {}),
     };
   }
@@ -4049,17 +4055,20 @@ export class ActorManager {
       ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
       ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(effective.model ? { model: effective.model } : {}),
+      ...(effective.modelReason !== undefined ? { modelReason: effective.modelReason } : {}),
       ...(effective.thinking ? { thinking: effective.thinking } : {}),
       binding: {
         scope: "session",
         sessionId: this.sessionId,
         ...(session?.model ? { model: session.model } : {}),
+        ...(session?.modelReason !== undefined ? { modelReason: session.modelReason } : {}),
         ...(session?.thinking ? { thinking: session.thinking } : {}),
         ...(session ? { updatedAt: session.updatedAt } : {}),
       },
       projectDefaults: {
         scope: "project",
         ...(actor.model ? { model: actor.model } : {}),
+        ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
         ...(actor.thinking ? { thinking: actor.thinking } : {}),
       },
       ...(actor.tools ? { tools: [...actor.tools] } : {}),

@@ -384,7 +384,8 @@ export const compactTerminalRunEvents = (
       now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
   const file = path.join(directory, "events.jsonl");
   const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size <= maxBytes || !canRemoveTerminalRun(directory, expired)) return false;
+  if (!stat?.isFile() || stat.size <= maxBytes || runTreeExitVeto(directory, 0, expired, true) ||
+      !canRemoveTerminalRun(directory, expired)) return false;
   try {
     const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
     let tail: Buffer;
@@ -408,7 +409,8 @@ export const compactTerminalRunEvents = (
     const checked = ownedStat(file);
     if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
         checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
-        !canRemoveTerminalRun(directory, expired) || expired() || options.isRetained?.()) return false;
+        runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
+        expired() || options.isRetained?.()) return false;
     writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained]));
     return true;
   } catch { return false; }

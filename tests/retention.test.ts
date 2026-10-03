@@ -245,6 +245,23 @@ describe("terminal run event log retention", () => {
     expect(fs.readFileSync(file).equals(log)).toBe(true);
   });
 
+  it("rechecks descendant exit immediately before atomic replacement, not just before reading the tail", () => {
+    const dir = make(temporaryDirectory(), "old", { status: "completed", finishedAt: DAY });
+    const child = path.join(dir, "nested", "child");
+    writeStatus(child, { status: "completed", transport: "process", sessionId: "2147483647" });
+    const read = fs.readSync;
+    const changed = vi.spyOn(fs, "readSync").mockImplementation((...args: Parameters<typeof read>) => {
+      // The first safety walk succeeds; a legacy/unknown writer appears during the read.
+      writeStatus(child, { status: "completed", transport: "process" });
+      return read(...args);
+    });
+    try {
+      expect(compactTerminalRunEvents(dir, { now: 3 * DAY })).toBe(false);
+      expect(changed).toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(dir, "events.jsonl"))).toEqual(log);
+    } finally { changed.mockRestore(); }
+  });
+
   it("honors custom age/cap and a zero budget, and drops an oversized final line without corrupt JSON", () => {
     const dir = make(temporaryDirectory(), "old", { status: "completed", finishedAt: DAY });
     expect(compactTerminalRunEvents(dir, { now: 3 * DAY, terminalRunEventsAgeMs: 3 * DAY })).toBe(false);

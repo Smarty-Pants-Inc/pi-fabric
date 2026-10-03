@@ -8,6 +8,7 @@ import { lockFile } from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
 import { ResidencyClient } from "../src/residency/client.js";
+import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -50,6 +51,52 @@ describe("resident loaded-path census metadata", () => {
       expect(host.config.fabricExtensionPath).toBe(loaded);
     } finally {
       await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resident retention config reload", () => {
+  it("applies a same-release client reload to an already-running host's next sweep without replacing its owner", async () => {
+    const { root, config, host } = fixture();
+    // Do not mutate the shared defaults, and leave the host's initial config immutable.
+    config.retention = { ...config.retention };
+    let client: ResidencyClient | undefined;
+    try {
+      await host.start();
+      const ownerPath = path.join(config.residencyRoot, "owner.json");
+      const owner = fs.readFileSync(ownerPath, "utf8");
+      const run = path.join(config.residencyRoot, "runs", "reload-retention");
+      fs.mkdirSync(run, { recursive: true });
+      const log = Buffer.from((JSON.stringify({ text: "x".repeat(100) }) + "\n").repeat(3000));
+      const status = JSON.stringify({ status: "completed", finishedAt: Date.now() - 8 * 60 * 60 * 1000 });
+      fs.writeFileSync(path.join(run, "status.json"), status);
+      fs.writeFileSync(path.join(run, "events.jsonl"), log);
+      fs.writeFileSync(path.join(run, "reply.json"), '{"text":"keep"}');
+      await delay(150);
+      expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(log);
+      // The real reload creates a new client; ensureHost publishes desired config and reuses the owner.
+      const next = { ...config, retention: { ...config.retention,
+        terminalRunEventsAgeMs: 6 * 60 * 60 * 1000, terminalRunEventsMaxBytes: 128 * 1024 } };
+      client = new ResidencyClient({ config: next, mesh: host.mesh, participants: host.participants,
+        mainAgent: { local: false } as FabricMainAgentTarget });
+      expect((await client.ensureHost()).pid).toBe(process.pid);
+      // Advance only the sample clock; keep the real host poll and its production 5-ms transaction.
+      const due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(true);
+      const nativeSweep = ResidentRequestRetention.prototype.sweep;
+      const sweep = vi.spyOn(ResidentRequestRetention.prototype, "sweep").mockImplementation(function (this: ResidentRequestRetention, now, ...args) {
+        return nativeSweep.call(this, now + 60_001, ...args);
+      });
+      const deadline = Date.now() + 2500;
+      while (fs.statSync(path.join(run, "events.jsonl")).size > 128 * 1024 && Date.now() < deadline) await delay(10);
+      due.mockRestore(); sweep.mockRestore();
+      expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(128 * 1024);
+      expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(status);
+      expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep"}');
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      expect(DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsMaxBytes).toBe(256 * 1024);
+    } finally {
+      vi.restoreAllMocks(); await client?.close(); await host.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

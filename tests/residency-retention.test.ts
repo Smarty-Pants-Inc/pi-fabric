@@ -46,6 +46,33 @@ describe("resident terminal event retention", () => {
     return run;
   };
 
+  it.each([
+    ["startup", false], ["startup", true], ["streaming", false], ["streaming wildcard", false],
+  ] as const)("%s retention (retainRuns=%s) requires checked descendant exit before touching an aged parent log", (phase, retainRuns) => {
+    const dir = root();
+    const unknown = [undefined, "malformed", String(process.pid)].map((sessionId, index) => {
+      const run = make(dir, `unknown-${index}`, "completed");
+      write(run, "nested/child", "status", { status: "completed", transport: "process", sessionId });
+      fs.writeFileSync(path.join(run, "nested/child/events.jsonl"), log);
+      const aged = new Date(day); fs.utimesSync(run, aged, aged);
+      return run;
+    });
+    const exited = make(dir, "checked-exited", "completed");
+    write(exited, "nested/child", "status", { status: "completed", transport: "process", sessionId: "2147483647" });
+    const snapshots = unknown.map(run => ["events.jsonl", "status.json", "reply.json", "nested/child/status.json", "nested/child/events.jsonl"]
+      .map(name => [name, fs.readFileSync(path.join(run, name))] as const));
+    if (phase === "startup") sweepResidentRuns(path.join(dir, "runs"), now, 10000, { retainRuns });
+    else {
+      const retention = new ResidentRequestRetention(dir);
+      try { retention.sweep(now, new Set(phase === "streaming wildcard" ? ["*"] : []), 10000); }
+      finally { retention.close(); }
+    }
+    for (const [index, run] of unknown.entries()) {
+      for (const [name, before] of snapshots[index]!) expect(fs.readFileSync(path.join(run, name))).toEqual(before);
+    }
+    expect(fs.statSync(path.join(exited, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+  });
+
   it("uses the existing streaming sweep to bound terminal residency runs, preserving results, latest references and idempotency", () => {
     const dir = root();
     const actorRoot = path.join(dir, "actor-registry");

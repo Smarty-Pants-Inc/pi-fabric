@@ -231,6 +231,7 @@ export class ResidentHost {
   #reloadEvent: Promise<unknown> | undefined;
   readonly #publications = new Set<Promise<unknown>>();
   #effectiveConfig: (() => ResidentHostConfig) | undefined;
+  readonly #retention: ResidentHostConfig["retention"];
 
   constructor(
     readonly config: ResidentHostConfig,
@@ -250,8 +251,11 @@ export class ResidentHost {
     this.#agentsPath = path.join(config.residencyRoot, "agents");
     this.#removalsPath = residentRemovalsPath(config.residencyRoot);
     this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
+    // All resident collectors share one mutable policy, not the constructor's
+    // config snapshot (nor the process-wide default object).
+    this.#retention = { ...config.retention };
     this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
-      [...new Set(Object.values(residentActorRoots(config)))], config.retention);
+      [...new Set(Object.values(residentActorRoots(config)))], this.#retention);
   }
 
   #initialize(): void {
@@ -296,7 +300,8 @@ export class ResidentHost {
         ...(overlay.piModels ? { piModels: overlay.piModels } : {}),
         ...(overlay.modelGuidance ? { modelGuidance: overlay.modelGuidance } : {}),
         ...(overlay.kernel ? { kernel: overlay.kernel } : {}),
-        ...(overlay.pythonRuntime ? { pythonRuntime: overlay.pythonRuntime } : {}) };
+        ...(overlay.pythonRuntime ? { pythonRuntime: overlay.pythonRuntime } : {}),
+        ...(overlay.retention ? { retention: overlay.retention } : {}) };
     };
     const currentModelGuidance = () =>
       parseFabricOwnedModelGuidance(currentConfig().modelGuidance ?? config.modelGuidance);
@@ -342,7 +347,7 @@ export class ResidentHost {
       projectRoot: config.projectRoot,
       hostId: this.hostId,
       identityId: this.identity.id,
-      retention: config.retention,
+      retention: this.#retention,
       preparePiModel: async (model) => resolveResidentPiModel(model),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;
@@ -421,7 +426,7 @@ export class ResidentHost {
         project: (typeof config.project === "string" ? config.project : projectOf(config.cwd)),
         role: typeof config.role === "string" ? config.role : undefined,
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
-        retention: config.retention,
+        retention: this.#retention,
         ...(typeof config.actors?.maxSessionBytes === "number" ? { maxSessionBytes: config.actors.maxSessionBytes } : {}),
         resolvePiModel: resolveResidentPiModel,
       },
@@ -798,6 +803,10 @@ export class ResidentHost {
   #maintainRequests(): void {
     const now = Date.now();
     if (this.#closed || !this.#requestRetention.due(now)) return;
+    // ensureHost/syncPiModels already publishes reloads to config.json. Apply
+    // only the same-release/root/session overlay at the next existing sweep;
+    // actor archives and agent collectors hold this same policy object.
+    Object.assign(this.#retention, this.#effectiveConfig?.().retention ?? this.config.retention);
     const live = this.agents.retentionReferences();
     for (const id of this.actors.inFlightActorIds()) live.add(id);
     const stoppedWritersGone = new Set<string>();

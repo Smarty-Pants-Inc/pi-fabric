@@ -105,6 +105,14 @@ export const buildExecutorSection = (
             "Wait budget before a nested shell spills to a live log. 0 disables auto-spill. Max 10m.",
           ),
         }),
+        setting("executor.landlock.mode", "Bash filesystem confinement", config.executor.landlock.mode, {
+          description: "Linux Landlock ABI >=4 only. Off until rollout; enforce denies writes outside the reviewed role list. No audit-only mode: trial enforce on one lane. A leading PI_FABRIC_LANDLOCK_ESCAPE=1 escapes one command and is logged. Non-Linux unchanged.",
+          values: ["off", "enforce"],
+        }),
+        setting("executor.landlock.disabled", "Fleet confinement kill switch", String(config.executor.landlock.disabled), {
+          description: "Host-only executor.landlock.disabled=true disables confinement for every lane. Set in the global agent fabric.json; project values are ignored.",
+          values: BOOLEANS,
+        }),
         setting(
           "executor.maxTimeoutMs",
           "Policy max",

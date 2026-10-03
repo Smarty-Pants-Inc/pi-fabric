@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
+import { scopedWorkerArguments, type ScopedScratchLaunch } from "../../storage/process-scratch-scope.js";
 
 export interface ExecFileResult {
   stdout: string;
@@ -253,16 +254,32 @@ export const workerCommand = async (
 ): Promise<string> =>
   (await scriptSpawnArgs(workerPath, workerArguments)).map(shellQuote).join(" ");
 
+/** Proof that no worker-creation side effect was attempted. */
+export class WorkerNotStartedError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "WorkerNotStartedError";
+  }
+}
+
 export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize">,
   environment?: NodeJS.ProcessEnv,
+  scope?: ScopedScratchLaunch,
 ): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean> }> => {
-  const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
-  assertTransportLaunchAllowed(authority);
-  const child = spawn(runtime, [workerPath, ...workerArguments], {
+  let runtime: string;
+  try {
+    runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
+    assertTransportLaunchAllowed(authority);
+  } catch (error) {
+    // This boundary has not invoked spawn. Errors at/after spawn are not
+    // never-started receipts, even when no PID or handle was returned.
+    throw new WorkerNotStartedError(error);
+  }
+  const child = spawn(runtime, scope ? scopedWorkerArguments(scope, workerPath, workerArguments, cwd) : [workerPath, ...workerArguments], {
     cwd,
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",

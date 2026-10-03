@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
-import { runScratchExitVeto } from "./run-scratch.js";
+import { hasNeverStartedReceipt, NEVER_STARTED_FILE, runScratchExitVeto } from "./run-scratch.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -105,7 +105,7 @@ export const runTreeExitVeto = (
   }
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
-    const scratchVeto = runScratchExitVeto(directory);
+    const scratchVeto = runScratchExitVeto(directory, expired);
     if (scratchVeto) return scratchVeto;
     if (fs.existsSync(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
@@ -122,15 +122,19 @@ export const runTreeExitVeto = (
     if (requireDescendantExit && depth > 0) {
       const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
         ? Number(record.sessionId) : undefined;
-      if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return "worker exit is unconfirmed: unknown descendant identity";
-      if (processAlive(pid)) return `its descendant worker may still be running (${directory})`;
+      if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) {
+        if (!hasNeverStartedReceipt(directory)) return "worker exit is unconfirmed: unknown descendant identity";
+      }
+      if (pid !== undefined && processAlive(pid)) return `its descendant worker may still be running (${directory})`;
     }
     const nested = path.join(directory, "nested");
     try { fs.lstatSync(nested); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
     if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
     for (const name of fs.readdirSync(nested)) {
-      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, requireDescendantExit);
+      // Every removal caller needs descendant proof, even when the tracked
+      // root has a native handle (or is absent after an earlier cleanup).
+      const reason = runTreeExitVeto(path.join(nested, name), depth + 1, expired, true);
       if (reason) return reason;
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
@@ -147,13 +151,14 @@ const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-eve
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
-  if (runTreeExitVeto(root, 0, expired)) return false;
+  if (runTreeExitVeto(root, 0, expired, true)) return false;
+  const neverStarted = hasNeverStartedReceipt(root);
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;
   if (pid !== undefined && processAlive(pid)) return false;
   if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
-    if (!childrenStopped && pid === undefined) return false;
+    if (!childrenStopped && pid === undefined && !neverStarted) return false;
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
   }
   try {
@@ -162,7 +167,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       const file = path.join(root, name);
       const stat = ownedStat(file);
       if (!stat) return false;
-      if (stat.isFile() && runFile(name)) continue;
+      if (stat.isFile() && (runFile(name) || (name === NEVER_STARTED_FILE && neverStarted))) continue;
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;

@@ -374,6 +374,9 @@ describe("temporal retention", () => {
       for (let depth = 0; depth < 20; depth++) {
         deepest = path.join(deepest, "nested", `child-${depth}`);
         completedRun(deepest);
+        // A stopped host alone cannot prove descendant exit; supply the
+        // fixture identity so this test reaches its intended deadline.
+        writeStatus(deepest, { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: 1 });
       }
       fs.writeFileSync(path.join(closed, ".fabric-owner.json"), JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
       let deepVisits = 0;

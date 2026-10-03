@@ -6,7 +6,7 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { fabricDataRoot } from "../storage/temp-root.js";
-import { runTmpDirectory } from "../storage/run-scratch.js";
+import { disposeRunTmpDirectory, prepareRunRoot, runTmpDirectory } from "../storage/run-scratch.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
@@ -1089,7 +1089,10 @@ export class AgentManager {
         throw error;
       }
       const runDirectory = path.join(this.#runRoot, id);
-      fs.mkdirSync(runDirectory, { recursive: true });
+      try {
+        prepareRunRoot(this.#runRoot);
+        fs.mkdirSync(runDirectory, { mode: 0o700 });
+      } catch (error) { release(); throw error; }
       if (this.#managedTempRoot && !this.#retentionTimer) {
         this.#retentionTimer = setInterval(() => this.#scheduleRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
         this.#retentionTimer.unref();
@@ -2674,14 +2677,15 @@ export class AgentManager {
   async #finishSettlement(managed: ManagedAgent, result: AgentRunResult): Promise<void> {
     if (managed.settled) return;
     // Join the owned worker through the supported lifecycle path after retries.
-    // This proves only worker exit: run scratch keeps its persistent custody
-    // fence because redirected/detached ordinary descendants are not contained.
+    // Worker exit alone is insufficient. A contained run can additionally
+    // issue the pinned kernel scope's empty/removal receipt below.
     if (managed.transport.kind === "process" && fs.existsSync(runTmpDirectory(managed.runDirectory))) {
       // A stop can race a replacement whose handle has not returned yet. Its
       // relaunch path sees settlement, stops that child and hands back custody.
       await managed.relaunching;
       await this.#waitForTransportExit(managed);
       await this.#noteUnconfirmedExit(managed);
+      disposeRunTmpDirectory(managed.runDirectory);
     }
     this.#drainLifecycle(managed);
     if (!beginAgentSettlement(managed)) return;

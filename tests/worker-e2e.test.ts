@@ -41,7 +41,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     return manager.run({ task, transport: "process" });
   };
 
-  it("gives concurrent real worker/Pi runs distinct private TMPDIRs and retains uncontained scratch with logs", async () => {
+  it("gives concurrent real worker/Pi runs distinct private TMPDIRs and disposes only proved-empty scopes", async () => {
     process.env.FAKE_PI_BEHAVIOR = "run-tmpdir";
     const parentTmpdir = process.env.TMPDIR;
     const parentTmp = process.env.TMP;
@@ -52,7 +52,11 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       workerPath, piBinary, runRoot: root,
     });
     managers.push(manager);
-    const results = await Promise.all(["scratch one", "scratch two"].map(task => manager.run({ task, transport: "process" })));
+    const scopedRuns = new Set<string>();
+    const results = await Promise.all(["scratch one", "scratch two"].map(task => manager.run({ task, transport: "process" }, undefined, handle => {
+      const fence = path.join(manager.runDirectory(handle.id)!, "unresolved-scratch.json");
+      if (JSON.parse(fs.readFileSync(fence, "utf8")).version === 2) scopedRuns.add(handle.id);
+    })));
     const reports = results.map(result => {
       expect(result.status).toBe("completed");
       const report = JSON.parse(result.text);
@@ -62,8 +66,8 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       expect(path.dirname(report.scratch)).toBe(report.tmpdir); // real ordinary mktemp, without -p
       if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
       else expect(report.mode).toBe(0o700);
-      expect(fs.existsSync(report.tmpdir)).toBe(true);
-      expect(fs.existsSync(path.join(runDirectory, "unresolved-scratch.json"))).toBe(true);
+      expect(fs.existsSync(report.tmpdir)).toBe(!scopedRuns.has(result.id));
+      expect(fs.existsSync(path.join(runDirectory, "unresolved-scratch.json"))).toBe(!scopedRuns.has(result.id));
       expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8")).sessionId).toBe(result.sessionId);
       expect(fs.existsSync(path.join(runDirectory, "events.jsonl"))).toBe(true);
       return report;
@@ -74,7 +78,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(process.env.TEMP).toBe(parentTemp);
   });
 
-  it("retains private scratch at run end and manager close when exit custody is unsettled", async () => {
+  it("retains run artifacts when worker custody is unsettled, disposing scratch only with an independent scope receipt", async () => {
     process.env.FAKE_PI_BEHAVIOR = "run-tmpdir";
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
     roots.push(root);
@@ -82,15 +86,17 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       workerPath, piBinary, runRoot: root,
     });
     managers.push(manager);
+    let scoped = false;
     const result = await manager.run({ task: "scratch with unsettled descendant", transport: "process" }, undefined, handle => {
+      scoped = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "unresolved-scratch.json"), "utf8")).version === 2;
       markUnresolvedWorker(manager.runDirectory(handle.id)!, "descendant exit is unsettled");
     });
     expect(result.status).toBe("completed");
     const report = JSON.parse(result.text);
-    expect(fs.existsSync(report.scratch)).toBe(true);
+    expect(fs.existsSync(report.scratch)).toBe(!scoped);
     await manager.close();
-    expect(fs.existsSync(report.tmpdir)).toBe(true);
-    expect(fs.existsSync(report.scratch)).toBe(true);
+    expect(fs.existsSync(report.tmpdir)).toBe(!scoped);
+    expect(fs.existsSync(report.scratch)).toBe(!scoped);
     await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track|still be running/);
   });
 

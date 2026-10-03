@@ -8,6 +8,7 @@ import { createRunTmpDirectory } from "../src/storage/run-scratch.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
+import { windowsDataRoot } from "../src/storage/windows-temp-root.js";
 
 // A normal Windows drive root may allow Users to create directories. Do not weaken
 // ancestor checks or rewrite the runner's C:/D: ACLs to get a positive control.
@@ -134,6 +135,12 @@ describe.skipIf(process.platform !== "win32")("native Windows temp-root ACL cont
     detach();
     if (backing) fs.rmSync(backing, { recursive: true, force: true });
   }, 120_000);
+
+  it("D5 launcher fixtures use a natively accepted private OS-temp namespace", () => {
+    // This is the namespace inherited by worker-e2e/process-utils/actor tests,
+    // not this suite's separate adversarial ACL volume.
+    expect(windowsDataRoot(os.tmpdir(), { private: true })).toBe(path.resolve(os.tmpdir()));
+  }, 30_000);
 
   it("accepts a private per-user directory and places actual scratch data there", () => {
     const directory = privateDirectory("quote'$;日本語");

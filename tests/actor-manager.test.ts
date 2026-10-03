@@ -31,6 +31,17 @@ const waitFor = async (predicate: () => boolean, timeoutMs = DEFAULT_WAIT_MS): P
   }
 };
 
+const captureScratchScopes = (): Map<string, boolean> => {
+  const scopes = new Map<string, boolean>(), launch = ProcessTransport.prototype.launch;
+  vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+    const handle = await launch.call(this, request);
+    const status = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+    scopes.set(request.id, JSON.parse(fs.readFileSync(path.join(path.dirname(status), "unresolved-scratch.json"), "utf8")).version === 2);
+    return handle;
+  });
+  return scopes;
+};
+
 const setup = (
   persistent = false,
   canManageActor?: (id: string) => boolean | undefined,
@@ -2508,8 +2519,9 @@ describe("ActorManager", () => {
     expect(listener).toHaveBeenCalledTimes(beforeUnsubscribedUpdate);
   });
 
-  it("allocates separate private scratch and retains its custody fence for every process actor activation", async () => {
+  it("allocates distinct private scratch per actor activation and disposes only proved-empty scopes", async () => {
     const { actors, agents, root } = setup(false, undefined, undefined, undefined, {}, { retainRuns: true });
+    const scoped = captureScratchScopes();
     const actor = await actors.create({ name: "scratch-reviewer", instructions: "REPORT_RUN_TMPDIR", responseMode: "text", transport: "process" });
     const reports: Array<{ tmpdir: string; scratch: string }> = [];
     for (const message of ["first review", "second review"]) {
@@ -2519,18 +2531,25 @@ describe("ActorManager", () => {
       if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
       else expect(report.mode).toBe(0o700);
       expect(path.dirname(report.scratch)).toBe(report.tmpdir);
-      expect(fs.existsSync(report.tmpdir)).toBe(true);
-      expect(fs.existsSync(path.join(path.dirname(report.tmpdir), "unresolved-scratch.json"))).toBe(true);
+      expect(fs.existsSync(report.tmpdir)).toBe(!scoped.get(reply.runId!));
+      expect(fs.existsSync(path.join(path.dirname(report.tmpdir), "unresolved-scratch.json"))).toBe(!scoped.get(reply.runId!));
       reports.push(report);
       await waitFor(() => actors.status(actor.id).status === "idle");
     }
     expect(reports[0]!.tmpdir).not.toBe(reports[1]!.tmpdir);
-    expect(agents.list()).toHaveLength(2);
-    for (const run of agents.list()) await expect(agents.cleanup(run.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
+    // Actor lifecycle copies logs and collects joined original runs even when
+    // the AgentManager alone would retain them. Uncontained originals remain.
+    expect(actors.readLog(actor.id, { type: "all" }).retainedRuns).toHaveLength(2);
+    expect(agents.list()).toHaveLength([...scoped.values()].filter(value => !value).length);
+    for (const run of agents.list()) {
+      if (scoped.get(run.id)) expect((await agents.cleanup(run.id)).cleaned).toBe(true);
+      else await expect(agents.cleanup(run.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
+    }
   });
 
   it("keeps a persistent actor identity and processes direct mailbox messages", async () => {
     const { actors, agents } = setup();
+    const scoped = captureScratchScopes();
     const actor = await actors.create({
       name: "reviewer",
       instructions: "Review messages and reply concisely.",
@@ -2542,8 +2561,9 @@ describe("ActorManager", () => {
     expect(reply.actorId).toBe(actor.id);
     await waitFor(() => actors.status(actor.id).status === "idle");
     expect(actors.status(actor.id)).toMatchObject({ status: "idle", messages: 2 });
-    // The worker exited, but arbitrary tool descendants still have no scope receipt.
-    expect(agents.list()).toMatchObject([{ id: reply.runId, status: "completed" }]);
+    // Only a complete kernel scope receipt permits the original run to leave.
+    if (scoped.get(reply.runId!)) expect(agents.list()).toEqual([]);
+    else expect(agents.list()).toMatchObject([{ id: reply.runId, status: "completed" }]);
     expect(actors.messages(actor.id)).toMatchObject([
       { direction: "in", source: "direct" },
       { direction: "out", source: "direct", text: "fake worker complete" },
@@ -2757,6 +2777,7 @@ describe("ActorManager", () => {
 
   it("stays ambient and retains the failed run when a directive run fails", async () => {
     const { actors, agents } = setup();
+    const scoped = captureScratchScopes();
     const actor = await actors.create({
       name: "supervisor",
       instructions: "Watch and steer only when needed.",
@@ -2785,10 +2806,13 @@ describe("ActorManager", () => {
       error: expect.stringContaining("Structured agent output was invalid"),
     });
 
-    // Removing an actor is not an exit receipt for uncontained scratch writers.
+    // Removal can collect a joined kernel scope, never an uncontained writer.
     await actors.remove(actor.id);
-    expect(agents.list()).toMatchObject([{ id: retained[0]!.id, status: "failed" }]);
-    await expect(agents.cleanup(retained[0]!.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
+    if (scoped.get(retained[0]!.id)) expect(agents.list()).toEqual([]);
+    else {
+      expect(agents.list()).toMatchObject([{ id: retained[0]!.id, status: "failed" }]);
+      await expect(agents.cleanup(retained[0]!.id)).rejects.toThrow(/scratch writer exit is unconfirmed/);
+    }
   });
 
   it("restores persistent ambient actors for the same Pi session", async () => {
@@ -3210,6 +3234,7 @@ describe("ActorManager", () => {
 
   it("retains completed-run logs and exposes them via readLog", async () => {
     const { actors, agents } = setup();
+    const scoped = captureScratchScopes();
     const actor = await actors.create({
       name: "reviewer",
       instructions: "Review messages and reply concisely.",
@@ -3239,9 +3264,9 @@ describe("ActorManager", () => {
     expect(eventTypes).toContain("message_end");
     expect(log.run!.status?.status).toBe("completed");
     expect(log.retainedRuns).toHaveLength(1);
-    // The copied logs and the original scratch both survive without a complete
-    // descendant exit receipt; the retained run remains inspectable.
-    expect(agents.list()).toMatchObject([{ status: "completed", actorId: actor.id }]);
+    // Log copies survive either way; only uncontained original scratch stays.
+    if ([...scoped.values()].every(Boolean)) expect(agents.list()).toEqual([]);
+    else expect(agents.list()).toMatchObject([{ status: "completed", actorId: actor.id }]);
   });
 
   it("retains failed-run logs too so readLog can inspect them", async () => {

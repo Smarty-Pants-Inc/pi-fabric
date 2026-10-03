@@ -79,11 +79,13 @@ ${crash ? 'process.kill(process.pid, "SIGKILL");' : 'process.exit(0);'}
     });
     let pid: number | undefined;
     let birth: string | undefined;
+    let directory: string | undefined, scoped = false;
     try {
       const result = await manager.run({ task: "background tool", transport: "process" });
       pid = Number(fs.readFileSync(ready, "utf8")); birth = identity(pid);
       expect(birth).toBeDefined();
-      const directory = manager.runDirectory(result.id)!;
+      directory = manager.runDirectory(result.id)!;
+      scoped = JSON.parse(fs.readFileSync(path.join(directory, UNRESOLVED_SCRATCH_FILE), "utf8")).version === 2;
       expect(fs.existsSync(path.join(directory, "tmp", "live-writer"))).toBe(true);
       expect(canRemoveTerminalRun(directory)).toBe(false);
       await manager.close();
@@ -97,6 +99,13 @@ ${crash ? 'process.kill(process.pid, "SIGKILL");' : 'process.exit(0);'}
         await vi.waitFor(() => expect(identity(pid!)).not.toBe(birth), { timeout: 17000, interval: 20 });
       }
       await manager.close();
+      // The survivor's exit, not worker exit or terminal status, completes
+      // the kernel scope. Offline cleanup may now reclaim its scratch.
+      if (directory && scoped) {
+        // Zombie observation can precede the kernel's final cgroup release.
+        await vi.waitFor(() => expect(canRemoveTerminalRun(directory!)).toBe(true), { timeout: 2000, interval: 20 });
+        expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false);
+      }
       fs.rmSync(root, { recursive: true, force: true });
     }
   }, 25000);

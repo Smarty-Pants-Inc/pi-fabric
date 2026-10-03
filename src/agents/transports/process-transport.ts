@@ -3,10 +3,10 @@ import type {
   AgentTransportHandle,
   AgentTransportLaunch,
 } from "../types.js";
-import { spawnDetached } from "./process-utils.js";
+import { spawnDetached, WorkerNotStartedError } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import path from "node:path";
-import { createRunTmpDirectory } from "../../storage/run-scratch.js";
+import { allocateRunTmpDirectory } from "../../storage/run-scratch.js";
 
 export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
@@ -20,7 +20,8 @@ export class ProcessTransport implements AgentTransportAdapter {
     const statusIndex = request.workerArguments.findIndex((arg, index) => index % 2 === 0 && arg === "--status-file");
     const statusFile = statusIndex < 0 ? undefined : request.workerArguments[statusIndex + 1];
     if (!statusFile) throw new Error("Process transport requires a run status file for private scratch");
-    const temporaryDirectory = createRunTmpDirectory(path.dirname(statusFile));
+    const allocation = allocateRunTmpDirectory(path.dirname(statusFile));
+    const temporaryDirectory = allocation.directory;
     const temporaryEnvironment = {
       TMPDIR: temporaryDirectory,
       ...(process.platform === "win32" ? { TMP: temporaryDirectory, TEMP: temporaryDirectory } : {}),
@@ -34,7 +35,11 @@ export class ProcessTransport implements AgentTransportAdapter {
       // actor identity; explicit actors alone retain the parent's role env.
       request.workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-name")
         ? { ...process.env, ...temporaryEnvironment } : { ...taskAgentEnvironment(), ...temporaryEnvironment },
-    );
+      allocation.scope,
+    ).catch(error => {
+      if (error instanceof WorkerNotStartedError) allocation.neverStarted();
+      throw error;
+    });
     return {
       kind: this.kind,
       sessionId: String(processHandle.pid),

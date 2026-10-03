@@ -1,5 +1,15 @@
 import type { ViteUserConfig as UserConfig } from "vitest/config";
 import { isolatedTestTemp, isolateTestFleetEnvironment } from "./scripts/test-temp.js";
+import { privateWindowsTestTemp } from "./scripts/windows-test-temp.js";
+
+// Process-launch fixtures must satisfy the production ancestor/DACL contract.
+// Native VHD setup failure is a failing Windows gate, not a skipped launch test.
+if (process.platform === "win32") {
+  const namespace = privateWindowsTestTemp();
+  Object.assign(process.env, { TMPDIR: namespace.directory, TMP: namespace.directory, TEMP: namespace.directory });
+  if (process.env.RUNNER_TEMP) process.env.RUNNER_TEMP = namespace.directory;
+  process.once("exit", () => namespace.close());
+}
 
 // Mutate the parent before Vitest snapshots its environment or forks any workers.
 const temp = isolatedTestTemp("pi-fabric-vitest-");

@@ -1742,7 +1742,11 @@ describe("AgentManager", () => {
   },
   30_000);
 
-  it.each(["clean", "uncertain", "failed-result"] as const)("keeps stop settlement separate from joined process custody (%s)", async outcome => {
+  it.each((["native", "win32"] as const).flatMap(platform =>
+    (["clean", "uncertain", "failed-result"] as const).map(outcome => ({ platform, outcome })),
+  ))("keeps stop settlement separate from joined process custody ($outcome, $platform)", async ({ outcome, platform }) => {
+    const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
@@ -1757,11 +1761,18 @@ describe("AgentManager", () => {
     let helperJoined = false;
     let workerJoined = false;
     let statusFile = "";
+    // The joined transport still needs a real persisted worker identity: native
+    // close is not permission to collect a missing/unknown PID under #313.
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
+    const sessionId = String(child.pid);
     const stop = vi.fn(async () => {
+      child.kill("SIGTERM");
       exited = true; // Native exit/PID absence is not captured close or tree-helper closure.
       await helper;
       helperJoined = true;
       await worker;
+      await closed; // Reap the exact captured worker before cleanup can inspect its PID.
       workerJoined = true;
       if (outcome === "failed-result") {
         const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
@@ -1770,7 +1781,7 @@ describe("AgentManager", () => {
     });
     const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async () => {
       return {
-        kind: "process", stop, isAlive: async () => !exited,
+        kind: "process", sessionId, stop, isAlive: async () => !exited,
         lostContact: () => outcome === "uncertain" && exited ? "tree helper closed without confirmed tree exit" : undefined,
       };
     });
@@ -1779,7 +1790,7 @@ describe("AgentManager", () => {
       const handle = await manager.spawn({ task: "joined stop", transport: "process" });
       statusFile = path.join(manager.runDirectory(handle.id)!, "status.json");
       writeJsonAtomic(statusFile, {
-        id: handle.id, name: "joined stop", task: "joined stop", status: "running", runner: "pi", transport: "process",
+        id: handle.id, name: "joined stop", task: "joined stop", status: "running", runner: "pi", transport: "process", sessionId,
         cwd: process.cwd(), startedAt: Date.now(), updatedAt: Date.now(), turns: 0, toolCalls: 0, text: "", exitCode: null,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
       });
@@ -1806,6 +1817,8 @@ describe("AgentManager", () => {
       expect(JSON.parse(fs.readFileSync(statusFile, "utf8")).status).toBe(expected);
       expect(workerJoined).toBe(true);
       expect(launch).toHaveBeenCalledOnce();
+      expect(JSON.parse(fs.readFileSync(statusFile, "utf8")).sessionId).toBe(sessionId);
+      expect(() => process.kill(Number(sessionId), 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
       if (outcome === "uncertain") {
         expect(fs.existsSync(path.join(manager.runDirectory(handle.id)!, "unresolved-worker.json"))).toBe(true);
         await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
@@ -1816,8 +1829,13 @@ describe("AgentManager", () => {
       }
     } finally {
       releaseHelper(); releaseWorker();
-      await stopping;
-      launch.mockRestore();
+      child.kill("SIGTERM");
+      try { await stopping; }
+      finally {
+        await closed;
+        launch.mockRestore();
+        Object.defineProperty(process, "platform", nativePlatform);
+      }
     }
   });
 

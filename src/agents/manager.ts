@@ -7,7 +7,7 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { fabricDataRoot } from "../storage/temp-root.js";
-import { disposeRunTmpDirectory, prepareRunRoot, runTmpDirectory } from "../storage/run-scratch.js";
+import { disposeRunTmpDirectory, prepareRunRoot } from "../storage/run-scratch.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
@@ -313,7 +313,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Process teardown is an ownership obligation, even after logical settlement. */
   processStop?: Promise<void>;
   processStopPending?: boolean;
-  /** Windows settlement retains native admission until captured close and any stop join. */
+  /** Settlement retains native admission/scratch custody until captured close and any stop join. */
   nativeReleasePending?: Promise<void>;
   /**
    * Its owner gave it up (a stopped or removed actor): nobody wants its result, so a worker that
@@ -1977,6 +1977,7 @@ export class AgentManager {
       // A terminal result can be published just before native worker close.
       // Explicit process stop still owes its caller that exit join.
       if (managed.transport.kind === "process") await this.#stopManagedTransport(managed);
+      await managed.nativeReleasePending;
       return this.wait(id);
     }
     managed.background = false;
@@ -1985,6 +1986,7 @@ export class AgentManager {
       if (managed.transport.kind === "process") await this.#stopManagedTransport(managed);
       const result = this.#withTransportMetadata(existing, managed) as AgentRunResult;
       await this.#settle(managed, result);
+      await managed.nativeReleasePending;
       return result;
     }
     await this.#stopManagedTransport(managed);
@@ -2009,6 +2011,7 @@ export class AgentManager {
         : failedRecord(managed, "stopped", "Agent stopped");
     if (!terminal || !terminalStatuses.has(terminal.status)) writeRecord(managed.statusFile, record);
     await this.#settle(managed, record);
+    await managed.nativeReleasePending;
     return record;
   }
 
@@ -2027,7 +2030,7 @@ export class AgentManager {
       let exitVeto: string | undefined;
       try {
         fs.lstatSync(runDirectory);
-        exitVeto = runTreeExitVeto(runDirectory, 0, undefined, true);
+        exitVeto = runTreeExitVeto(runDirectory, 0, undefined, true, { allowUnlaunchedRoot: true });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
@@ -2044,7 +2047,7 @@ export class AgentManager {
     if (managed.processStopPending) {
       throw new Error(`Cannot clean up agent ${id}: process teardown is pending`);
     }
-    // A normal Windows terminal result can precede captured native close.
+    // A normal terminal result can precede captured native close.
     // Join its existing bounded obligation instead of exposing that incidental
     // ordering as a cleanup failure. Expiry records uncertainty, not exit proof.
     if (managed.nativeReleasePending) await managed.nativeReleasePending;
@@ -2866,27 +2869,11 @@ export class AgentManager {
 
   async #finishSettlement(managed: ManagedAgent, result: AgentRunResult): Promise<void> {
     if (managed.settled) return;
-    // Join the owned worker through the supported lifecycle path after retries.
-    // Worker exit alone is insufficient. A contained run can additionally
-    // issue the pinned kernel scope's empty/removal receipt below.
-    if (managed.transport.kind === "process" && fs.existsSync(runTmpDirectory(managed.runDirectory))) {
-      // A stop can race a replacement whose handle has not returned yet. Its
-      // relaunch path sees settlement, stops that child and hands back custody.
-      await managed.relaunching;
-      await this.#waitForTransportExit(managed);
-      // POSIX liveness only observes exit; it never runs the transport's
-      // native-close wrapper, which records this launch generation's worker
-      // completion. Unscoped collection keeps main's immediate policy; this
-      // close is not a descendant-exit proof. Windows retains
-      // its separate permit-owning close join below (including tree-stop debt).
-      if (process.platform !== "win32" && managed.transport.waitForClose && !managed.lostContact) {
-        await managed.transport.waitForClose().catch(error => {
-          this.#markLost(managed, error instanceof Error ? error.message : String(error));
-        });
-      }
-      await this.#noteUnconfirmedExit(managed);
-      disposeRunTmpDirectory(managed.runDirectory);
-    }
+    // Logical completion is not native close. Publish the result without
+    // blocking on root exit; retain admission and scratch custody in the owned
+    // close join below. Cleanup/close must join it before collecting anything.
+    // A racing replacement sees settlement and hands its custody back first.
+    if (managed.transport.kind === "process") await managed.relaunching;
     this.#drainLifecycle(managed);
     const lost = managed.transport.lostContact?.();
     if (lost) this.#markLost(managed, lost);
@@ -2895,10 +2882,10 @@ export class AgentManager {
       // An uncertain Windows tree can still contain untracked native descendants.
       managed.release = () => {};
     }
-    if (managed.transport.kind === "process" && process.platform === "win32" &&
-        managed.transport.waitForClose && !managed.lostContact && !managed.processStop) {
-      // The logical result can precede native close. Keep its permit while a
-      // later explicit stop may still acquire a Windows tree-helper obligation.
+    if (managed.transport.kind === "process" && managed.transport.waitForClose && !managed.lostContact) {
+      // Keep the permit while native close records this launch generation and
+      // any later explicit stop joins its tree-helper obligation. Root close
+      // alone never overrides a scoped descendant or unresolved scratch fence.
       const release = managed.release;
       managed.release = () => {
         managed.nativeReleasePending = Promise.resolve().then(async () => {
@@ -2906,7 +2893,10 @@ export class AgentManager {
           // Stop may have begun after settlement, while native close was pending.
           await managed.processStop;
           await this.#noteUnconfirmedExit(managed);
-          if (!managed.lostContact) release();
+          if (!managed.lostContact) {
+            disposeRunTmpDirectory(managed.runDirectory);
+            release();
+          }
         }).catch(error => {
           this.#markLost(managed, error instanceof Error ? error.message : String(error));
         }).finally(() => { delete managed.nativeReleasePending; });

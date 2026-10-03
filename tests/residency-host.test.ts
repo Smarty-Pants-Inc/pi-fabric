@@ -445,12 +445,14 @@ describe("resident orphan retention", () => {
     }));
     const expiredAt = Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000;
     fs.utimesSync(run, expiredAt / 1_000, expiredAt / 1_000);
+    const expiredMtime = fs.statSync(run).mtimeMs;
     const resultPath = residentResultPath(config.residencyRoot, id);
     try {
       // Lost host: the detached worker wrote status.json, but onSettled never saved results/id.
       await host.start();
       expect(fs.existsSync(run)).toBe(true);
       expect(fs.existsSync(resultPath)).toBe(false);
+      expect(fs.statSync(run).mtimeMs).toBe(expiredMtime);
       fs.mkdirSync(path.dirname(resultPath), { recursive: true });
       for (const malformed of [
         "{", "null", "[]", JSON.stringify({ ...result, id: "b".repeat(32) }),
@@ -479,6 +481,7 @@ describe("resident orphan retention", () => {
         expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toEqual(result);
       }
       fs.writeFileSync(metadataPath, metadata);
+      expect(fs.statSync(run).mtimeMs).toBe(expiredMtime);
       // Counterexample: this SAME public task becomes collectable once its authoritative copy exists.
       expect(sweepResidentRuns(runs)).toEqual([run]);
       expect(fs.existsSync(run)).toBe(false);

@@ -54,7 +54,7 @@ describe("#369 F3 / D6 POSIX run-root custody", () => {
 });
 
 describe("#369 D4 joined kernel scratch scope", () => {
-  it.skipIf(!delegated)("removes normal completed scratch at settlement, preserving status/logs and Main TMPDIR", async () => {
+  it.skipIf(!delegated)("removes normal completed scratch after native close, preserving status/logs and Main TMPDIR", async () => {
     const root = sandbox(), before = process.env.TMPDIR;
     const worker = path.join(root, "worker.mjs");
     fs.writeFileSync(worker, `import fs from "node:fs";
@@ -67,7 +67,8 @@ const now=Date.now(); fs.writeFileSync(args.get("--status-file"),JSON.stringify(
     expect(result.status).toBe("completed");
     const run = manager.runDirectory(result.id)!, report = JSON.parse(result.text);
     expect(report.tmpdir).toBe(path.join(run,"tmp")); expect(report.mode).toBe(0o700);
-    expect(fs.existsSync(report.file)).toBe(false); expect(fs.existsSync(report.tmpdir)).toBe(false);
+    await vi.waitFor(() => expect(fs.existsSync(report.tmpdir)).toBe(false), { timeout: 2000, interval: 20 });
+    expect(fs.existsSync(report.file)).toBe(false);
     expect(fs.existsSync(path.join(run,"unresolved-scratch.json"))).toBe(false);
     expect(fs.existsSync(path.join(run,"status.json"))).toBe(true);
     expect(process.env.TMPDIR).toBe(before);

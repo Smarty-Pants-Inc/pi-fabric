@@ -138,6 +138,10 @@ export const disposeRunTmpDirectory = (runDirectory: string, expired: () => bool
   let unlock: (() => void) | undefined;
   try {
     if (expired()) return false;
+    // No scratch custody means nothing to dispose. Do not create/remove a lock
+    // merely to inspect an ordinary retained run: that mutates mtime/ctime and
+    // can indefinitely restart residency's directory-based expiry clock.
+    if (!readFence(runDirectory)) return false;
     unlock = lockScratchCustody(runDirectory);
     const receipt = readFence(runDirectory);
     const scope = checkedProcessScratchScope(receipt?.scope);
@@ -165,8 +169,8 @@ export const disposeRunTmpDirectory = (runDirectory: string, expired: () => bool
   finally { unlock?.(); }
 };
 
-export const runScratchExitVeto = (runDirectory: string, expired: () => boolean = () => false): string | undefined => {
-  disposeRunTmpDirectory(runDirectory, expired);
+export const runScratchExitVeto = (runDirectory: string, expired: () => boolean = () => false, disposeScratch = true): string | undefined => {
+  if (disposeScratch) disposeRunTmpDirectory(runDirectory, expired);
   for (const name of [UNRESOLVED_SCRATCH_FILE, RUN_TMP_DIRECTORY]) {
     try { fs.lstatSync(path.join(runDirectory, name)); }
     catch (error) {

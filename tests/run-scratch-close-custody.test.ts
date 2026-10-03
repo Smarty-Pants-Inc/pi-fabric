@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as scopes from "../src/storage/process-scratch-scope.js";
-import { allocateRunTmpDirectory, disposeRunTmpDirectory, JOINED_SCRATCH_FILE, UNRESOLVED_SCRATCH_FILE } from "../src/storage/run-scratch.js";
+import { allocateRunTmpDirectory, disposeRunTmpDirectory, runScratchExitVeto, JOINED_SCRATCH_FILE, UNRESOLVED_SCRATCH_FILE } from "../src/storage/run-scratch.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -25,6 +25,18 @@ const setup = () => {
 };
 
 describe.skipIf(process.platform === "win32")("captured scoped native-close custody", () => {
+  it("does not acquire custody or change timestamps when a run has no scratch", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "scratch-free-custody-")); roots.push(root);
+    fs.utimesSync(root, 1, 1);
+    const before = fs.statSync(root);
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    expect(disposeRunTmpDirectory(root)).toBe(false);
+    expect(runScratchExitVeto(root)).toBeUndefined();
+    expect(mkdir).not.toHaveBeenCalled();
+    const after = fs.statSync(root);
+    expect([after.ino, after.mtimeMs, after.ctimeMs]).toEqual([before.ino, before.mtimeMs, before.ctimeMs]);
+    expect(fs.readdirSync(root)).toEqual([]);
+  });
   it("joins a pre-receipt close but cannot collect a populated scope", () => {
     const { root, scope, remove } = setup();
     const allocation = allocateRunTmpDirectory(root);

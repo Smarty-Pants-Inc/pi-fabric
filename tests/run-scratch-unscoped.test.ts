@@ -54,7 +54,8 @@ describe.skipIf(process.platform !== "linux")("unscoped main-compatible terminal
     try {
       const result = await manager.run({ task: "normal unscoped manager completion", transport: "process" }); expect(result.status).toBe("completed");
       const run = manager.runDirectory(result.id)!, root = path.dirname(run);
-      expect(fs.existsSync(path.join(run, "tmp"))).toBe(false); expect(fs.existsSync(path.join(run, UNRESOLVED_SCRATCH_FILE))).toBe(false);
+      await vi.waitFor(() => expect(fs.existsSync(path.join(run, "tmp"))).toBe(false), { timeout: 2000, interval: 20 });
+      expect(fs.existsSync(path.join(run, UNRESOLVED_SCRATCH_FILE))).toBe(false);
       expect(await manager.cleanup(result.id)).toMatchObject({ cleaned: true }); expect(fs.existsSync(run)).toBe(false);
       await manager.close(); expect(fs.existsSync(root)).toBe(false);
     } finally { await manager.close(); }

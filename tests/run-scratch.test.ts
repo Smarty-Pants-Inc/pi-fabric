@@ -138,13 +138,14 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(release)}))
     await vi.waitFor(() => expect(fs.existsSync(path.join(directory, "status.json"))).toBe(true));
     let completed = false;
     const result = manager.wait(handle.id).then(result => { completed = true; return result; });
-    // The monitor has observed terminal status, but the worker is still writing.
-    await new Promise(resolve => setTimeout(resolve, 150));
-    expect(completed).toBe(false);
+    // Logical completion remains observable while the terminal writer is held.
+    // It is not authority to dispose scratch or release its native custody.
+    expect((await result).status).toBe("completed");
+    expect(completed).toBe(true);
+    expect(fs.existsSync(release)).toBe(false);
     expect(fs.existsSync(path.join(directory, "tmp", "scratch"))).toBe(true);
     fs.writeFileSync(release, "exit now");
-    expect((await result).status).toBe("completed");
-    expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false);
+    await vi.waitFor(() => expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false), { timeout: 2000, interval: 20 });
     expect(fs.existsSync(path.join(directory, "status.json"))).toBe(true);
     expect(fs.existsSync(path.join(directory, "unresolved-scratch.json"))).toBe(false);
   });

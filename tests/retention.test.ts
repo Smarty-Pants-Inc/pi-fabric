@@ -118,6 +118,37 @@ describe("shared run-tree exit veto", () => {
   });
 
 
+  it("allows only a live admission's recordless unlaunched root, never a missing descendant identity", () => {
+    const run = temporaryDirectory();
+    const options = { allowUnlaunchedRoot: true };
+    fs.writeFileSync(path.join(run, "task.txt"), "known pre-dispatch refusal");
+    expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/unknown root identity/);
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toBeUndefined();
+    expect(canRemoveTerminalRun(run)).toBe(false); // offline retention has no live admission authority
+    const child = path.join(run, "nested", "child");
+    fs.mkdirSync(child, { recursive: true });
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toMatch(/unknown descendant identity/);
+    writeStatus(child, { status: "completed", transport: "process", sessionId: String(process.pid) });
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toMatch(/descendant worker may still be running/);
+    writeStatus(child, { status: "completed", transport: "process", sessionId: "2147483647" });
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toBeUndefined();
+    writeStatus(run, { status: "stopped", transport: "process", sessionId: undefined });
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toMatch(/unknown root identity/);
+    fs.unlinkSync(path.join(run, "status.json"));
+    markUnresolvedWorker(run, "dispatched request lost its reply");
+    expect(runTreeExitVeto(run, 0, undefined, true, options)).toMatch(/unresolved worker marker/);
+  });
+
+  it("never treats an unreadable root record as a known unlaunched root", () => {
+    const run = temporaryDirectory(), status = path.join(run, "status.json");
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation((...args: Parameters<typeof lstat>) => {
+      if (String(args[0]) === status) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      return lstat(...args);
+    });
+    expect(runTreeExitVeto(run, 0, undefined, true, { allowUnlaunchedRoot: true })).toMatch(/inspection failed/);
+  });
+
   it("refuses malformed records and failed nested inspection rather than inferring exit", () => {
     const run = temporaryDirectory();
     const status = path.join(run, "status.json"); fs.writeFileSync(status, "{broken");

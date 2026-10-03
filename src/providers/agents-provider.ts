@@ -1688,7 +1688,7 @@ export class AgentsProvider implements FabricProvider {
     const target = this.participants.get(targetId, undefined, { fresh: true });
     if (!target || target.kind !== "root" || target.stale || target.interactive === false || !["idle", "running"].includes(target.status) ||
       target.rootId !== targetId || target.ownerIdentityId !== targetId || target.reloadUntil !== undefined ||
-      target.controlProtocol !== "v1" || !target.capabilities.includes("main-bindings") || !this.control) {
+      target.controlProtocol !== "v1" || target.mainBindings !== true || !this.control) {
       throw new Error(`Fabric participant ${targetId} has no live Main binding control path; nothing was queued`);
     }
     return this.control.requestResult<FabricMainAgentBindingResult>(

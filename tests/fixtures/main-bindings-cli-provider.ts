@@ -21,6 +21,10 @@ export default function (pi: ExtensionAPI) {
     }) + "\n");
     const code = `
 const packet = JSON.parse(π.packet);
+if (packet.compat) return { members: await agents.members({ scope: "project" }), sessions: await agents.sessions(), peers: await agents.peers() };
+if (packet.message) return packet.delivery === "steer"
+  ? await agents.steer({ id: packet.id, message: packet.message, data: { mixedGeneration: true } })
+  : await agents.followUp({ id: packet.id, message: packet.message, data: { mixedGeneration: true } });
 if (packet.observe) return await agents.main();
 if (packet.own) {
   const before = await agents.main();

@@ -46,7 +46,7 @@ const fixture = (meshRoot: string, id = session(), kind: MeshIdentity["kind"] = 
   const actors = new ActorDirectory([id.slice(8), identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, manager, () => {}, { rootId: id }],
     { project: path.join(cwd, "actors"), session: path.join(cwd, "session-actors") }, "project");
   const self = { format: 1, id, rootId: id, kind: kind === "main" ? "root" : "agent", ownerHostId: id, ownerIdentityId: id,
-    name: "Main", status: "running", runner: "pi", transport: "host", capabilities: ["fabric", "main-bindings"],
+    name: "Main", status: "running", runner: "pi", transport: "host", capabilities: ["fabric"], mainBindings: true,
     controlProtocol: "v1", local: true, stale: false, startedAt: 1, updatedAt: 1 } as FabricParticipantInfo;
   members.set(id, self);
   const participants: FabricParticipantSource = {
@@ -116,12 +116,14 @@ describe("live Main binding setters (smarty-dev#3626)", () => {
     expect(target.pi.setThinkingLevel).not.toHaveBeenCalled();
   });
 
-  it.each(["missing", "stale", "legacy", "no-capability"])("refuses a Main without a live control path (%s), before publication", async reason => {
+  it.each(["missing", "stale", "legacy", "no-capability", "disabled-capability", "malformed-capability"])("refuses a Main without a live control path (%s), before publication", async reason => {
     const mesh = root(), target = fixture(mesh), caller = fixture(mesh);
     if (reason === "missing") members.delete(target.main.id);
     if (reason === "stale") target.self.stale = true;
     if (reason === "legacy") target.self.controlProtocol = "legacy";
-    if (reason === "no-capability") target.self.capabilities = ["fabric"];
+    if (reason === "no-capability") delete target.self.mainBindings;
+    if (reason === "disabled-capability") target.self.mainBindings = false;
+    if (reason === "malformed-capability") Object.assign(target.self, { mainBindings: "true" });
     const send = vi.spyOn(caller.control, "requestResult");
     await expect(caller.provider.invoke("setThinking", { id: target.main.id, thinking: "high" }, caller.invocation)).rejects.toThrow(/no live Main binding control path/);
     expect(send).not.toHaveBeenCalled(); expect(target.pi.setThinkingLevel).not.toHaveBeenCalled();

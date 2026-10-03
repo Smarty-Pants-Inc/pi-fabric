@@ -164,7 +164,7 @@ interface FabricPeerInfo {
 type FabricParticipantKind = "root" | "agent" | "actor";
 type FabricParticipantResidency = "session" | "durable";
 type FabricParticipantScope = "local" | "lineage" | "project";
-type FabricParticipantCapability = "steer" | "followUp" | "stop" | "ask" | "actor-bindings" | "main-bindings" | "attach" | "fabric";
+type FabricParticipantCapability = "steer" | "followUp" | "stop" | "ask" | "actor-bindings" | "attach" | "fabric";
 interface FabricParticipantInfo {
   format: 1;
   id: string;
@@ -176,6 +176,8 @@ interface FabricParticipantInfo {
   repository?: string;
   /** False for print/JSON roots, which cannot receive messages or become project leads. */
   interactive?: boolean;
+  /** Optional Main setter support; only literal true enables the session binding path. */
+  mainBindings?: boolean;
   kind: FabricParticipantKind;
   rootId: string;
   ownerHostId: string;

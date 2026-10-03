@@ -12,7 +12,6 @@ export type FabricParticipantCapability =
   | "stop"
   | "ask"
   | "actor-bindings"
-  | "main-bindings"
   | "attach"
   | "fabric";
 
@@ -40,6 +39,9 @@ export interface FabricParticipantRecord {
   repository?: string;
   /** False for print/JSON roots: discoverable observers, never message or lead targets. */
   interactive?: boolean;
+  /** Optional Main setter support. Only literal true enables it; absent on older roots.
+   * Kept outside capabilities: existing format-1 readers reject unknown capability strings. */
+  mainBindings?: boolean;
   status: string;
   /** Fixed expiry of a Main reload handoff; never a grace period for an exited session. */
   reloadUntil?: number;

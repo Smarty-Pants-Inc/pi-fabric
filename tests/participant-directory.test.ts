@@ -698,7 +698,7 @@ describe("ParticipantDirectory role and project", () => {
     alpha = createDirectory(path.join(dir, "mesh"), identity, identity.id, () => [alpha.root(info, false)]);
     await alpha.start();
     expect(alpha.get(identity.id)).toMatchObject({ repository: "github.com/smarty-pants-inc/pi-fabric", interactive: false, capabilities: ["fabric"] });
-    expect(alpha.root(info, true)).toMatchObject({ interactive: true, capabilities: ["steer", "followUp", "fabric", "main-bindings"] });
+    expect(alpha.root(info, true)).toMatchObject({ interactive: true, capabilities: ["steer", "followUp", "fabric"], mainBindings: true });
     const reader = createDirectory(path.join(dir, "mesh"), { id: "session:reader", name: "main", kind: "main" }, "session:reader", () => []);
     expect(reader.peers()).toEqual([expect.objectContaining({ id: identity.id, repository: "github.com/smarty-pants-inc/pi-fabric", interactive: false })]);
   });

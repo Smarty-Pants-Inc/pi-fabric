@@ -2,6 +2,7 @@
 
 import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
+import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
   RESIDENT_HANDOVER_ABI, HANDOVER_DRAIN_MS, exactResidentProcess, assertAutomaticReleaseRecovery,
   residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec,
@@ -1285,7 +1286,9 @@ export class ResidentHost {
         // This handler already runs inside the authoritative durable host.
         // Keep the new actor locally owned; ceding it here created a needless
         // self-transfer window that blocked the next recruitment request.
-        const actor = await this.actors.create(command.request, { asRegistryOwner: true, beforeCommit: commit });
+        const { instructionsFile: _file, sha256: _digest, ...base } = command.request;
+        const instructions = resolveActorInstructions(command.request, this.config.agents.instructionsRoot);
+        const actor = await this.actors.create({ ...base, instructions }, { asRegistryOwner: true, beforeCommit: commit });
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,
@@ -1313,6 +1316,12 @@ export class ResidentHost {
         let updated: FabricActorInfo;
         switch (command.operation) {
           case "actorStatus": updated = actor; break;
+          case "setInstructions": {
+            const instructions = resolveActorInstructions(command, this.config.agents.instructionsRoot);
+            assertActorInstructionReplacement(this.actors.instructions(actor.id), instructions, command.replace);
+            updated = await this.actors.setInstructions(actor.id, instructions, commit);
+            break;
+          }
           // Repair is a boundary request, not terminal stop: the admitted run settles,
           // then queued deliveries resume on the fresh session under the same actor.
           case "resetSession": {
@@ -1327,7 +1336,6 @@ export class ResidentHost {
             updated = await pending;
             break;
           }
-          case "setInstructions": updated = await this.actors.setInstructions(actor.id, command.instructions, commit); break;
           case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit); break;
           case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope, commit); break;
           case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit); break;

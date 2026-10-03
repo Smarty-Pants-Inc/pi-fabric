@@ -630,10 +630,10 @@ const hostStoppedResult = (result: AgentRunResult, lastEventAt: number | undefin
 
 // Settled handles can be evicted while their descendants still use the shared
 // budget. Inspect persisted trees too; marker absence is not checked child exit.
-const runRootHasExitVeto = (root: string): boolean => {
+const runRootHasExitVeto = (root: string, prelaunchIds: ReadonlySet<string>): boolean => {
   try {
     return fs.readdirSync(root, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && !!runTreeResourceVeto(path.join(root, entry.name), 0, undefined, true));
+      .some((entry) => entry.isDirectory() && !!runTreeResourceVeto(path.join(root, entry.name), 0, undefined, true, !prelaunchIds.has(entry.name)));
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
@@ -1476,7 +1476,12 @@ export class AgentManager {
           throw error;
         }
         try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
-        if (worktree && !runTreeResourceVeto(runDirectory, 0, undefined, true)) await this.#worktrees.cleanup(id, true).catch(() => false);
+        // A launch rejected before publishing a worker record is rollback, not
+        // admitted-run collection. Archive custody does not create native debt;
+        // any persisted worker record still needs saved exit proof.
+        if (worktree && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
+          await this.#worktrees.cleanup(id, true).catch(() => false);
+        }
         throw error;
       }
     };
@@ -2099,6 +2104,7 @@ export class AgentManager {
       // Captured native close avoids a full liveness-poll interval per short run.
       if (managed.transport.waitForClose) await managed.transport.waitForClose();
       await this.#waitForTransportExit(managed);
+      await this.#noteUnconfirmedExit(managed);
     }
     // A stop may have acquired tree custody during the join. Recheck every
     // pending/uncertain fence before authorizing worktree or run collection.
@@ -2349,7 +2355,8 @@ export class AgentManager {
     // An archive failure protects that run's full source, not another exited
     // worker's files. Native uncertainty still fences the entire shared tree.
     const unresolved = all.some((managed) => managed.processStopPending || managed.nativeReleasePending || managed.lostContact || runTreeResourceVeto(managed.runDirectory, 0, undefined, true)) ||
-      [...this.#queued.values()].some((queued) => queued.cleanupPending) || runRootHasExitVeto(this.#runRoot);
+      [...this.#queued.values()].some((queued) => queued.cleanupPending) ||
+      runRootHasExitVeto(this.#runRoot, new Set([...this.#queued.values()].filter(queued => queued.terminal && !queued.cleanupPending).map(queued => queued.info.id)));
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {
       this.#unregisteredTransports.clear();
@@ -2394,6 +2401,8 @@ export class AgentManager {
       currentRoot: this.#runRoot,
       orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
       oneShotRunRetentionMs: this.#retention.oneShotRunMs,
+      terminalRunEventsAgeMs: this.#retention.terminalRunEventsAgeMs,
+      terminalRunEventsMaxBytes: this.#retention.terminalRunEventsMaxBytes,
     };
     try {
       // A Bun-compiled Pi's execPath is Pi itself: resolve a real node/bun (the override, then PATH)

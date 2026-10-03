@@ -376,10 +376,23 @@ const main = async (): Promise<void> => {
       if (!piRetrySdk) appendLog(`${JSON.stringify({ type: "fabric_retry_profile", mode: "launcher", reason: "sdk_unavailable", message: "Selected Pi launcher has no discoverable native SDK; preserving its retry settings and canonical auth path (Fabric same-session recovery remains enabled)" })}\n`);
     }
   }
+  // Resource selection must reach Pi's pre-load discovery boundary, not just -e.
+  // Keep the CLI lifecycle for activation/actors and SDK task retry semantics.
+  let piReleaseSdk: string | undefined;
+  const pinnedFabricExtension = options.fabricRelease
+    ? path.join(options.fabricRelease, "dist/index.js") : options.fabricExtensionPath;
+  if (options.runner === "pi" && options.fabricExtensionPath && pinnedFabricExtension) {
+    const profileModule = import.meta.url.endsWith(".ts") ? "./worker/retry-profile.ts" : "./worker/retry-profile.js";
+    const { resolveRetrySdk } = await import(profileModule) as typeof import("./worker/retry-profile.js");
+    piReleaseSdk = piRetrySdk ?? resolveRetrySdk(options.piBinary);
+  }
   const piArguments = ["--mode", "rpc"];
   if (piSessionFile) piArguments.push("--session", activationSession?.file ?? piSessionFile);
   else piArguments.push("--no-session");
-  if (!options.extensions) piArguments.push("--no-extensions");
+  // Opaque launchers have no supplied native discovery API. Fail closed on
+  // auto-discovery rather than reintroducing an unvalidated Fabric generation.
+  // Explicit task hooks still load; native launchers retain all other resources.
+  if (!options.extensions || (options.fabricExtensionPath && !piReleaseSdk)) piArguments.push("--no-extensions");
   if (options.judgment) piArguments.push("--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-approve", "--no-auto-compaction");
   if (options.residentStartupProbe) {
     // Explicit Fabric -e still loads. Do not execute unrelated profile hooks,
@@ -505,6 +518,8 @@ const main = async (): Promise<void> => {
     options.actorId ? { ...process.env } : taskAgentEnvironment(), process.argv.slice(2),
   );
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
+  delete childEnvironment.PI_FABRIC_PINNED_EXTENSION;
+  if (options.runner === "pi" && options.fabricExtensionPath) childEnvironment.PI_FABRIC_PINNED_EXTENSION = pinnedFabricExtension;
   // A task child has its own identity and reply contract, not its actor parent's.
   for (const key of ["PI_FABRIC_ACTOR_ID", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_ACTOR_SESSION_FILE",
     "PI_FABRIC_REPLY_SCHEMA_FILE", "PI_FABRIC_REPLY_FILE", "PI_FABRIC_REPLY_HOOK",
@@ -521,8 +536,10 @@ const main = async (): Promise<void> => {
   // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
   // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
   const taskEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/task-entry.ts" : "./worker/task-entry.js", import.meta.url));
-  const spawnChild = (): ChildProcess => spawnCli(piRetrySdk ? taskEntryPath : childBinary,
-    piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments] : childArguments, {
+  const releaseEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/release-entry.ts" : "./worker/release-entry.js", import.meta.url));
+  const spawnChild = (): ChildProcess => spawnCli(piRetrySdk ? taskEntryPath : piReleaseSdk ? releaseEntryPath : childBinary,
+    piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments]
+      : piReleaseSdk ? [piReleaseSdk, pinnedFabricExtension!, ...childArguments] : childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
     env: {

@@ -14,7 +14,10 @@ The earlier Schema, mesh-checkpoint and bridge slices remain deferred separately
 - Restored visible bytes are not receipts: queue confirmation failure stays retryable
   without advancing an actor replay cursor or launching restored work.
 - Confirm the complete native session inode and archive namespace before dependent
-  replacement/pruning. This is transcript preservation, not task-close handoff.
+  replacement/pruning/admission. Journal the inode-bound obligation before rename,
+  retain it across failed barriers and process replacement, and retry it at the
+  boundary even without a reset trigger. This is transcript preservation, not
+  task-close handoff.
 - Keep reconstructible/expiring presence, sweep hints and diagnostics non-durable;
   do not change the general atomic helper default.
 - Keep actual-main task close/stop/restore and terminal/reply writers unchanged.
@@ -81,6 +84,23 @@ enrollment and resident request/consumption receipts, not task-terminal machiner
 `atomic-review-r1.test.ts`, the completion/consumption process fixtures and the
 resident-host/client regressions cover failed barriers, healthy retries and normal
 process replacement without new ingress. They do not certify physical power loss.
+
+## Round 2 archive-receipt recovery
+
+F6 retains a live inode-bound archive obligation and durably journals it before
+rename. Failed confirmation propagates to the drain retry gate instead of allowing
+boundary continuation. Idle reset retries and prelaunch preparation repay the same
+obligation before absent-source handling, replacement or pruning. A successor
+reads the journal and confirms the original archive inode, not merely visible
+bytes; a pre-rename failure finishes preservation from the bound source. Journal
+retirement also confirms its unlink before dependent pruning, with live debt
+retained if that barrier fails.
+
+`actor-session-reset.test.ts` covers size/requested boundary continuation, immediate
+idle reset retry, pre-rename intent failure, archive inode substitution and failed
+journal retirement. `atomic-archive-receipt.test.ts` and its unclean-exit fixture
+cover process replacement with accepted backlog and unavailable confirmation,
+then storage-only recovery without new ingress or graceful close.
 
 ## Limits and before-merge holds
 

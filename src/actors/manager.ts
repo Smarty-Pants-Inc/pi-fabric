@@ -51,7 +51,7 @@ import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore } from "./registry-store.js";
-import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
+import { syncDirectoryChain, syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 
@@ -64,6 +64,12 @@ export interface ActorMessageBindingOptions {
   binding?: FabricActorRunBinding;
   /** Host-only ASK policy: Main's program ceiling ends observation, not accepted activation. */
   detachOnMainCeiling?: boolean;
+}
+
+interface SessionArchiveReceipt {
+  archived: string;
+  dev: number;
+  ino: number;
 }
 
 interface ActorQueueItem {
@@ -414,6 +420,8 @@ export class ActorManager {
   readonly #pendingStopPublication = new Set<string>();
   /** A failed queue replacement must be confirmed before accepted backlog can drain. */
   readonly #pendingQueuePublication = new Set<string>();
+  /** Inode-bound archive debt; also journaled before rename for process replacement. */
+  readonly #pendingSessionArchives = new Map<string, SessionArchiveReceipt>();
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
   /** A timed-out write stays serialized; drains need not join that same stalled chain again. */
@@ -1068,13 +1076,17 @@ export class ActorManager {
         if (fs.statSync(live.sessionFile).size > this.#maxSessionBytes) trigger = "size";
       } catch { /* no session file yet */ }
     }
-    if (!trigger) return undefined;
     try {
+      // An absent source after a failed rename receipt is not launch authority.
+      // Retry even without a reset waiter/size trigger (including after restart).
+      this.#confirmSessionArchive(live.sessionFile);
+      if (!trigger) return undefined;
       this.#archiveSession(live, trigger);
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
       waiters?.forEach((waiter) => waiter.reject(failure));
-      return undefined;
+      // Propagate to the drain retry gate instead of continuing into admission.
+      return Promise.reject(failure);
     }
     return this.#publishDrainPresence(live).then(
       () => waiters?.forEach((waiter) => waiter.resolve(this.#publicInfo(this.#liveActor(live)))),
@@ -1092,6 +1104,7 @@ export class ActorManager {
       throw new Error(`Cannot rotate actor ${actor.name} while an activation is in flight`);
     }
     const file = actor.sessionFile;
+    const recoveredArchive = this.#confirmSessionArchive(file);
     // Preserve malformed content separately from the bounded rotation history.
     if (actor.runner === "pi" && fs.existsSync(file) && !this.#hasSessionHeader(file)) this.#ensurePiSession(actor);
     const dir = path.dirname(file);
@@ -1120,7 +1133,8 @@ export class ActorManager {
       // preserve. Namespace ENOENT after rename is a failed confirmation, not
       // permission to publish a replacement or prune dependent history.
       if (sourceFound || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      archived = null;
+      archived = recoveredArchive ?? null;
+      if (archived) bytes = fs.statSync(archived).size;
     }
     const backups = listBackups()
       .sort((left, right) => {
@@ -1155,9 +1169,66 @@ export class ActorManager {
     try {
       const inode = fs.fstatSync(fd);
       fs.fsyncSync(fd);
+      // Publish intent BEFORE rename: a successor must not mistake the missing
+      // source/visible archive for a confirmed namespace. Bind it to this inode.
+      const pending = `${file}.archive-pending.json`;
+      const receipt = { archived, dev: inode.dev, ino: inode.ino };
+      this.#pendingSessionArchives.set(file, receipt);
+      writeJsonAtomic(pending, receipt, { durable: true });
       fs.renameSync(file, archived);
       syncPathNamespace(archived, inode);
+      this.#retireSessionArchive(file);
     } finally { fs.closeSync(fd); }
+  }
+
+  /** Repay a post-rename archive receipt before replacement, pruning or admission. */
+  #confirmSessionArchive(file: string): string | undefined {
+    const pending = `${file}.archive-pending.json`;
+    let receipt = this.#pendingSessionArchives.get(file);
+    if (!receipt) {
+      let text: string;
+      try { text = fs.readFileSync(pending, "utf8"); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw error;
+      }
+      receipt = JSON.parse(text) as SessionArchiveReceipt;
+    }
+    if (typeof receipt?.archived !== "string" || !receipt.archived.startsWith(`${file}.`) ||
+      !receipt.archived.endsWith(".bak") || path.dirname(receipt.archived) !== path.dirname(file) ||
+      !Number.isFinite(receipt.dev) || !Number.isFinite(receipt.ino)) {
+      throw new Error(`Invalid pending session archive receipt for ${file}`);
+    }
+    this.#pendingSessionArchives.set(file, receipt);
+    // A previous intent publication itself may have failed before rename.
+    // Reconfirm it first, so retry remains recoverable across process replacement.
+    writeJsonAtomic(pending, receipt, { durable: true });
+    let source = receipt.archived;
+    try { fs.statSync(source); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      source = file; // Crash/failure before rename: finish preserving the bound source.
+    }
+    const fd = fs.openSync(source, process.platform === "win32" ? "r+" : "r");
+    try {
+      const inode = fs.fstatSync(fd);
+      if (inode.dev !== receipt.dev || inode.ino !== receipt.ino) {
+        throw new Error(`Pending session archive inode changed for ${file}`);
+      }
+      fs.fsyncSync(fd);
+      if (source === file) fs.renameSync(file, receipt.archived);
+      syncPathNamespace(receipt.archived, inode);
+      this.#retireSessionArchive(file);
+    } finally { fs.closeSync(fd); }
+    return receipt.archived;
+  }
+
+  #retireSessionArchive(file: string): void {
+    fs.rmSync(`${file}.archive-pending.json`, { force: true });
+    // Retire the journal durably before pruning can remove its referent. If the
+    // unlink barrier fails, the live map retains debt even though the name is gone.
+    syncDirectoryChain(path.dirname(file));
+    this.#pendingSessionArchives.delete(file);
   }
 
   // A native Pi header is tiny; never read the multi-megabyte transcript just to validate it.
@@ -1178,6 +1249,8 @@ export class ActorManager {
   }
 
   #ensurePiSession(actor: ManagedActor): void {
+    // Also fence runner changes: archive preservation is independent of the next runner.
+    this.#confirmSessionArchive(actor.sessionFile);
     if (actor.runner !== "pi") return;
     let archived: string | undefined;
     try {

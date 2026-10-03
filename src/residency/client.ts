@@ -512,6 +512,9 @@ export class ResidencyClient {
 
   /** Persist session-scoped background outcomes before their retractable inbox admission. */
   enqueueCompletion(result: AgentRunResult, admittedRecipient?: CompletionRecipient): void {
+    // No manifest and no host binding means no authorized recipient. This is a
+    // deliberate prelaunch refusal, not a transient storage failure to retry.
+    if (!result.logFile && !admittedRecipient && typeof this.#completions.recipientSource === "function") return;
     this.#completions.save(result, admittedRecipient);
   }
 

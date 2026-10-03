@@ -2,6 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
+import { stageRunArchive } from "../src/agents/archive-custody.js";
+import type { AgentRunResult } from "../src/agents/types.js";
 import * as processIdentity from "../src/residency/process-identity.js";
 import {
   canRemoveManagedRunRoot,
@@ -38,6 +41,33 @@ const writeStatus = (
 
 afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("persistent archive custody", () => {
+  it("vetoes ancestor/orphan deletion until offline recovery commits the full actor outcome", () => {
+    const temp = temporaryDirectory();
+    const root = path.join(temp, "pi-fabric-runs-recovery");
+    const parent = path.join(root, "parent");
+    const id = "b".repeat(32);
+    const source = path.join(parent, "nested", id);
+    writeStatus(parent, { status: "completed" });
+    writeStatus(source, { id, status: "stopped", transport: "process", sessionId: "2147483647" });
+    const sessionFile = path.join(temp, "actor", "session.jsonl");
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); fs.writeFileSync(sessionFile, "");
+    const result = { id, name: "private child", status: "stopped", text: "full outcome".repeat(10000), startedAt: 1,
+      spawner: { id: "actor:review", kind: "actor", runId: "a".repeat(32) } } as AgentRunResult;
+    stageRunArchive(source, { format: 1, kind: "shutdown", result, actorSessionFile: sessionFile, actorOnly: true, notify: true });
+    fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 0, heartbeatAt: 0, orphanedAt: 0 }));
+    expect(runTreeExitVeto(parent)).toMatch(/archive is pending/);
+    const enqueue = vi.spyOn(ActorChildCompletionStore.prototype, "enqueue").mockImplementation(() => { throw new Error("archive unavailable"); });
+    const sweep = () => sweepTempRunRoots({ tempRoot: temp, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
+    sweep(); expect(fs.existsSync(source)).toBe(true);
+    enqueue.mockRestore(); sweep();
+    expect(fs.existsSync(root)).toBe(false);
+    const store = new ActorChildCompletionStore(sessionFile);
+    expect(JSON.parse(fs.readFileSync(store.resultFile(id), "utf8"))).toMatchObject(result);
+    expect(store.pending()).toHaveLength(1);
+  });
 });
 
 describe("shared run-tree exit veto", () => {

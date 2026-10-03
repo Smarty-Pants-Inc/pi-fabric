@@ -78,6 +78,23 @@ describe("actor child completion handoff storage", () => {
     expect(fs.readdirSync(h.store.directory)).toEqual([`${result.id}.receipt`]);
   });
 
+  it.each([false, true])("retries a persisted abandonment after restart without making a finalized observation unread (finalized=%s)", finalized => {
+    const h = setup(); const result = h.result();
+    h.store.enqueue(result, h.spawner);
+    h.store.consume(result.id, { handoff: true, publication: true });
+    const write = atomicWrites.writeJsonAtomic;
+    const blocked = vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, value, options) => {
+      if (file.endsWith(".receipt") && (value as { unread?: boolean }).unread) throw new Error("rollback lock/storage unavailable");
+      return write(file, value, options);
+    });
+    expect(() => h.store.abandonForeground(result.id)).toThrow("rollback lock/storage unavailable");
+    blocked.mockRestore();
+    if (finalized) h.store.discard(result.id);
+    const next = new ActorChildCompletionStore(h.sessionFile);
+    expect(next.pending()).toHaveLength(finalized ? 0 : 1);
+    expect(next.received(result.id)).toBe(finalized);
+  });
+
   it("claims a live batch atomically without deleting its full outcomes before delivery", () => {
     const h = setup();
     const a = h.result();

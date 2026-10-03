@@ -7,6 +7,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import * as atomicWrites from "../src/core/atomic-write.js";
+import { runTreeExitVeto } from "../src/storage/retention.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
@@ -151,6 +152,39 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     });
     await vi.waitFor(() => { h.boundary(); expect(h.sendMessage).toHaveBeenCalledOnce(); }, { timeout: 5000 });
     expect(h.sendMessage.mock.calls[0]![0].content).toContain("fake worker complete");
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("retains a failed child archive through ancestor cleanup and recovers it after both custodians close", async () => {
+    const h = await setup(residency);
+    const enqueue = ActorChildCompletionStore.prototype.enqueue;
+    const refused = vi.spyOn(ActorChildCompletionStore.prototype, "enqueue").mockImplementation(function(this: ActorChildCompletionStore, result, ...args) {
+      if (result.name === "review-subtask") throw new Error("archive storage unavailable");
+      return enqueue.call(this, result, ...args);
+    });
+    const child = await h.spawn("HANG_WITH_PROGRESS");
+    await vi.waitFor(() => expect(h.runtime.agents.status(child.id)).toMatchObject({ turns: 3 }), { timeout: 5000 });
+    const source = h.runtime.agents.runDirectory(child.id)!;
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await h.runtime.shutdown();
+    const closing = h.owner.close(); h.endActivation(); await closing;
+    expect(fs.existsSync(path.join(source, "archive-pending.json"))).toBe(true);
+    const ancestor = path.join(path.dirname(source), "ancestor");
+    const moved = path.join(ancestor, "nested", child.id);
+    fs.mkdirSync(path.dirname(moved), { recursive: true });
+    fs.writeFileSync(path.join(ancestor, "status.json"), JSON.stringify({ status: "completed" }));
+    fs.renameSync(source, moved);
+    store.trackArchiveSource(child.id, moved);
+    expect(runTreeExitVeto(ancestor)).toMatch(/archive is pending/);
+    refused.mockRestore();
+    const recovered = new ActorChildCompletionStore(h.actor.sessionFile!);
+    expect(recovered.pending({ actorId: h.actor.id })).toMatchObject([{ result: { id: child.id, status: "stopped" } }]);
+    expect(runTreeExitVeto(ancestor)).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(recovered.resultFile(child.id), "utf8"))).toMatchObject({ id: child.id, turns: 3, spawner: { id: h.actor.id } });
+    const restarted = h.makeOwner(); cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "resume after source recovery");
+    await vi.waitFor(() => expect(restarted.messages(h.actor.id).filter(m => m.id === child.id && m.direction === "in")).toHaveLength(1), { timeout: 5000 });
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 
@@ -363,6 +397,14 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     const store = new ActorChildCompletionStore(h.actor.sessionFile!);
     await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
     const abort = new AbortController();
+    const atomicWrite = atomicWrites.writeJsonAtomic;
+    let rollbackAttempts = 0;
+    const rollbackFailure = vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, value, options) => {
+      if (file === path.join(store.directory, `${child.id}.receipt`) && (value as { unread?: boolean }).unread && ++rollbackAttempts === 1) {
+        throw new Error("transient abandonment write failure");
+      }
+      return atomicWrite(file, value, options);
+    });
     const consume = ActorChildCompletionStore.prototype.consume;
     const fence = vi.spyOn(ActorChildCompletionStore.prototype, "consume").mockImplementation(function(this: ActorChildCompletionStore, id, options) {
       consume.call(this, id, options);
@@ -370,6 +412,8 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     });
     await expect(h.runtime.registry.invoke(action, { id: child.id }, { ...h.invocation, signal: abort.signal })).rejects.toThrow("discard host result after fence");
     fence.mockRestore();
+    expect(rollbackAttempts).toBeGreaterThanOrEqual(2);
+    rollbackFailure.mockRestore();
     expect(h.sendMessage).not.toHaveBeenCalled();
     await h.runtime.shutdown(); // Close before any replacement live notice is delivered.
     const closing = h.owner.close();

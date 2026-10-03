@@ -1813,7 +1813,7 @@ export class AgentsProvider implements FabricProvider {
 
   async stopParticipant(id: string, context?: FabricInvocationContext): Promise<unknown> {
     try {
-      const result = await this.manager.stop(id);
+      const result = await this.manager.stop(id, { consume: !context });
       // Host shutdown also stops children; only a guest observation consumes one.
       if (context && terminalAgentStatuses.has(result.status)) {
         if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.abandonForeground(id));

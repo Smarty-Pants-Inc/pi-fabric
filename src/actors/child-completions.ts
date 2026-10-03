@@ -4,6 +4,8 @@ import path from "node:path";
 import { syncDirectoryChain, withExclusiveFileLock, writeJsonAtomic } from "../core/atomic-write.js";
 import { ChildCompletionClaimLostError } from "../result-consumption.js";
 export { ChildCompletionClaimLostError } from "../result-consumption.js";
+import { ARCHIVE_PENDING_FILE, commitRunArchive, readPendingRunArchives } from "../agents/archive-custody.js";
+import { ownedStat, processAlive } from "../storage/scratch.js";
 import type { AgentRunResult, AgentSpawner } from "../agents/types.js";
 
 export type ActorChildResult = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "error" | "startedAt" | "finishedAt">;
@@ -13,7 +15,40 @@ export interface ActorChildCompletion {
   result: ActorChildResult;
 }
 const ID = /^[a-f0-9]{32}$/;
-const STORED_FILE = /^([a-f0-9]{32})(?:\.result\.json|\.json|\.receipt|\.live-receipt|\.consumed)$/;
+const STORED_FILE = /^([a-f0-9]{32})(?:\.result\.json|\.json|\.receipt|\.live-receipt|\.consumed|\.abandon)$/;
+
+/** Offline recovery retries exact actor-addressed archives before a dead root is collected. */
+export const recoverActorRunArchives = (directory: string, expired: () => boolean = () => false, depth = 0): void => {
+  if (expired() || depth > 32 || !ownedStat(directory)?.isDirectory()) return;
+  const file = path.join(directory, ARCHIVE_PENDING_FILE);
+  try {
+    if (ownedStat(file)?.isFile()) {
+      const archive = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (archive.awaitingResult && Number.isSafeInteger(archive.ownerPid) && !processAlive(archive.ownerPid)) {
+        const status = path.join(directory, "status.json");
+        if (ownedStat(status)?.isFile()) archive.result = { ...JSON.parse(fs.readFileSync(status, "utf8")), spawner: archive.spawner };
+      }
+      const archives = archive.awaitingResult ? [archive] : readPendingRunArchives(directory);
+      for (const pending of archives) {
+        const result = pending.result as AgentRunResult | undefined;
+        if (pending.format === 1 && !pending.routePending && pending.actorOnly && typeof pending.actorSessionFile === "string" && result?.id === path.basename(directory) &&
+            result.spawner?.kind === "actor" && ["completed", "failed", "stopped", "timed_out"].includes(result.status)) {
+          const store = new ActorChildCompletionStore(pending.actorSessionFile);
+          store.enqueue(result, result.spawner, pending.notify);
+          commitRunArchive(directory, pending.kind);
+          if (!fs.existsSync(file)) store.releaseArchiveSource(result.id);
+        }
+      }
+    }
+  } catch { /* Offline recovery cannot authorize deletion on failure. */ }
+  const nested = path.join(directory, "nested");
+  try {
+    if (ownedStat(nested)?.isDirectory()) for (const name of fs.readdirSync(nested)) {
+      if (expired()) break;
+      recoverActorRunArchives(path.join(nested, name), expired, depth + 1);
+    }
+  } catch { /* Unknown contents remain guarded by the retention tree check. */ }
+};
 
 /**
  * Write-ahead inbox shared by an actor activation and its authoritative owner.
@@ -81,12 +116,24 @@ export class ActorChildCompletionStore {
   /** Roll back only our unpublished fence, never a finalized/delivered receipt. */
   abandonForeground(id: string): void {
     if (!ID.test(id) || this.#consumed.has(id)) return;
-    this.#withClaim(() => {
-      const receipt = JSON.parse(fs.readFileSync(this.#receipt(id), "utf8"));
-      if (receipt.publication !== this.#publicationId) return;
+    // Persist cancellation independently of the contested claim lock. A later
+    // owner can retry this exact unpublished fence, but never a finalized receipt.
+    writeJsonAtomic(path.join(this.directory, `${id}.abandon`), { id, publication: this.#publicationId }, { durable: true });
+    this.#withClaim(() => this.#rollbackAbandoned(id));
+  }
+
+  #rollbackAbandoned(id: string): void {
+    const file = path.join(this.directory, `${id}.abandon`);
+    if (!fs.existsSync(file)) return;
+    const abandoned = JSON.parse(fs.readFileSync(file, "utf8"));
+    let receipt;
+    try { receipt = JSON.parse(fs.readFileSync(this.#receipt(id), "utf8")); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (abandoned.id === id && typeof abandoned.publication === "string" && receipt?.publication === abandoned.publication) {
       writeJsonAtomic(this.#receipt(id), { id, unread: true }, { durable: true });
       this.#checked.delete(id);
-    });
+    }
+    fs.rmSync(file, { force: true });
   }
 
   /** Preparation checks recoverability, but must not claim or remove an outcome. */
@@ -186,7 +233,41 @@ export class ActorChildCompletionStore {
     return ids;
   }
 
+  releaseArchiveSource(id: string): void {
+    if (ID.test(id)) fs.rmSync(path.join(this.directory, `${id}.source`), { force: true });
+  }
+
+  /** Durable address of the retained source, installed before attempting its archive. */
+  trackArchiveSource(id: string, directory: string): void {
+    if (!ID.test(id)) throw new Error("Invalid actor child archive source");
+    writeJsonAtomic(path.join(this.directory, `${id}.source`), { id, directory }, { durable: true });
+  }
+
+  /** An owner/restart retries sources even when the original activation has exited. */
+  recoverArchives(options: { actorId?: string; inFlightRunId?: string } = {}): void {
+    let files: string[];
+    try { files = fs.readdirSync(this.directory); } catch { return; }
+    for (const name of files.filter(file => file.endsWith(".source") && ID.test(file.slice(0, -7))).slice(0, 100)) {
+      try {
+        const source = JSON.parse(fs.readFileSync(path.join(this.directory, name), "utf8"));
+        if (source.id !== name.slice(0, -7) || typeof source.directory !== "string" || path.basename(source.directory) !== source.id || !ownedStat(source.directory)?.isDirectory()) continue;
+        const pending = path.join(source.directory, ARCHIVE_PENDING_FILE);
+        if (!fs.existsSync(pending)) { fs.rmSync(path.join(this.directory, name), { force: true }); continue; }
+        if (!ownedStat(pending)?.isFile()) continue;
+        for (const archive of readPendingRunArchives(source.directory)) {
+          const spawner = archive.result?.spawner;
+          if (archive.format !== 1 || archive.result?.id !== source.id || archive.actorSessionFile !== this.sessionFile || archive.routePending || !archive.actorOnly || spawner?.kind !== "actor" ||
+              (options.actorId && spawner.id !== options.actorId) || (options.inFlightRunId && spawner.runId === options.inFlightRunId)) continue;
+          this.enqueue(archive.result, spawner, archive.notify);
+          commitRunArchive(source.directory, archive.kind);
+        }
+        if (!fs.existsSync(pending)) fs.rmSync(path.join(this.directory, name), { force: true });
+      } catch { /* Unknown/uncommitted custody stays fenced and retryable. */ }
+    }
+  }
+
   pending(options: { actorId?: string; inFlightRunId?: string } = {}): ActorChildCompletion[] {
+    this.recoverArchives(options);
     try { return this.#withClaim(() => this.#pending(options)); }
     catch { return []; } // Busy/unreadable claims retry on the next owner poll.
   }
@@ -201,6 +282,7 @@ export class ActorChildCompletionStore {
     for (const file of envelopes) {
       const id = file.slice(0, -5);
       try {
+        this.#rollbackAbandoned(id);
         if (this.received(id)) {
           // An unpublished foreground fence can still be abandoned. Retain its envelope.
           if (JSON.parse(fs.readFileSync(this.#receipt(id), "utf8")).publication) continue;

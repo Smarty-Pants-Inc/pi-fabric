@@ -3,6 +3,7 @@ import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
+import { recoverActorRunArchives } from "../actors/child-completions.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -23,6 +24,7 @@ interface RunRecordSummary {
   transport?: string;
   sessionId?: string;
   processStartTime?: string;
+  queuedArchiveCommitted?: boolean;
 }
 export interface RetentionSweepResult {
   removedRoots: string[];
@@ -107,6 +109,8 @@ export const runTreeExitVeto = (
   }
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
+    if (fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (fs.existsSync(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     const statusFile = path.join(directory, "status.json");
@@ -196,7 +200,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       const file = path.join(root, name);
       const stat = ownedStat(file);
       if (!stat) return false;
-      if (stat.isFile() && runFile(name)) continue;
+      if (stat.isFile() && (runFile(name) || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
@@ -265,6 +269,7 @@ const pruneClosedRunRoot = (
     const reference = terminal ? recordAgeReference(record!, ownedStat(directory)?.mtimeMs ?? now) : owner.closedAt!;
     const retention = terminal && !record?.actorId ? oneShotMs : orphanMs;
     if (now - reference < retention) continue;
+    if (!processAlive(owner.pid)) recoverActorRunArchives(directory, expired);
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) continue;
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
@@ -351,6 +356,7 @@ export const sweepTempRunRoots = (options: {
       if (expired()) break;
       if (run.name === RUN_ROOT_OWNER_FILE || !run.isDirectory()) continue;
       const directory = path.join(root, run.name);
+      recoverActorRunArchives(directory, expired);
       if (!safeRunTree(directory, false, 0, expired)) continue;
       // Reported as the root's removal once it is empty, as before.
       try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}

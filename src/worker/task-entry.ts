@@ -6,6 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { CreateAgentSessionRuntimeFactory } from "@earendil-works/pi-coding-agent";
 import { applyTaskRetryDefaults } from "./retry-profile.js";
+import { installFabricResourcePin } from "./resource-pin.js";
 
 const [sdkDirectory, scale, ...args] = process.argv.slice(2);
 if (!sdkDirectory) throw new Error("Native Pi SDK directory is required");
@@ -17,6 +18,8 @@ const { resolveProjectTrusted } = await load("core/project-trust.js") as typeof 
 const { createProjectTrustContext } = await load("cli/project-trust.js") as typeof import("../../node_modules/@earendil-works/pi-coding-agent/dist/cli/project-trust.js");
 const { builtInExtensions } = await load("extensions/index.js") as typeof import("../../node_modules/@earendil-works/pi-coding-agent/dist/extensions/index.js");
 const { applyHttpProxySettings, configureHttpDispatcher } = await load("core/http-dispatcher.js") as typeof import("../../node_modules/@earendil-works/pi-coding-agent/dist/core/http-dispatcher.js");
+const pinnedExtension = process.env.PI_FABRIC_PINNED_EXTENSION;
+if (pinnedExtension) installFabricResourcePin(sdk.DefaultPackageManager, pinnedExtension);
 const parsed = parseArgs(args);
 if (parsed.mode !== "rpc") throw new Error("Task entry supports only native RPC mode");
 const cwd = process.cwd();

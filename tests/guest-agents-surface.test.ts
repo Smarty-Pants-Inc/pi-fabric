@@ -23,6 +23,17 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each(["spawn", "run", "wait", "join"])("types the optional observed Fabric release on agents.%s", method => {
+    const args = method === "spawn" || method === "run" ? '{ task: "work" }' : '{ id: "child" }';
+    for (const fullCodeMode of [false, true]) {
+      const code = `const result = await agents.${method}(${args});
+        const release: string | undefined = result.fabricRelease;
+        const omitted: Pick<typeof result, "fabricRelease"> = {};
+        return { release, omitted };`;
+      expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    }
+  });
+
   it.each([false, true])("#3819 types inline XOR verified file instructions (fullCodeMode=%s)", fullCodeMode => {
     const declarations = guestTypeDeclarations(fullCodeMode);
     for (const name of ["create", "createActor", "setInstructions"]) {

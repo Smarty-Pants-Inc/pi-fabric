@@ -129,6 +129,7 @@ interface ManagedActor {
   pythonRuntime?: FabricPythonRuntime;
   runnerSessionId?: string;
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
   tools?: string[];
   transport?: FabricAgentTransport;
@@ -697,6 +698,7 @@ export class ActorManager {
       ...(kernel ? { kernel } : {}),
       ...(pythonRuntime ? { pythonRuntime } : {}),
       ...(model ? { model } : {}),
+      ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
       ...(request.thinking ? { thinking: request.thinking } : {}),
       ...(request.tools ? { tools: [...new Set(request.tools)] } : {}),
       ...(request.transport ? { transport: request.transport } : {}),
@@ -1369,6 +1371,7 @@ export class ActorManager {
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       ...(actor.model ? { model: actor.model } : {}),
+      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
       ...(actor.tools ? { tools: [...actor.tools] } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -2862,6 +2865,7 @@ export class ActorManager {
         : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(binding.model ? { model: binding.model } : {}),
+      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
       ...(binding.thinking ? { thinking: binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -3366,6 +3370,7 @@ export class ActorManager {
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(actor.model ? { model: actor.model } : {}),
+      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -3567,6 +3572,7 @@ export class ActorManager {
           ? { runnerSessionId: record.runnerSessionId }
           : {}),
         ...(typeof record.model === "string" ? { model: record.model } : {}),
+        ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
         ...(isFabricThinking(record.thinking) ? { thinking: record.thinking } : {}),
         ...(Array.isArray(record.tools)
           ? { tools: record.tools.filter((tool): tool is string => typeof tool === "string") }

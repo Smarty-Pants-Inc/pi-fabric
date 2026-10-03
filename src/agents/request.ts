@@ -55,6 +55,7 @@ export const normalizeAgentRunRequest = (
       : inheritedModel
         ? { model: inheritedModel }
         : {}),
+    ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}),
     ...(typeof args.persona === "string" && args.persona.trim()
       ? { persona: args.persona.trim() }
       : {}),

@@ -771,6 +771,9 @@ export class ResidentHost {
       // Retry only pickups this running host renamed but never executed. Startup
       // recovery handles older processing entries conservatively as indeterminate.
       for (const entry of [...this.#unconfirmedPickups].slice(0, 32)) {
+        // These pickups owe execution, not just storage settlement. The prior
+        // request may have closed admission while awaited; retain custody.
+        if (this.#handover || this.#closed) break;
         const processing = path.join(this.#processingPath, entry);
         try {
           syncPathNamespace(processing);

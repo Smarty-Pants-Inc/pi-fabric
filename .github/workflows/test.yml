@@ -22,7 +22,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: ${{ matrix.name }}
     # Forge disposable VMs have 2 vCPU / 8 GB; the shared pool caps at 7 VMs.
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -136,6 +136,6 @@ jobs:
     name: check (windows-latest)
     # hosted-exception: PR-time windows-latest kept by Paul 2026-10-03 (pi-fabric#254 5964538892); exit: post-merge Windows run gets an automatic fix-or-revert owner (smarty-dev#3580), then Option A (Dev3 main-only)
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     # Share the same build/test order; OS-specific steps retain their existing guards.
     steps: *check-steps

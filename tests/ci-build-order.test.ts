@@ -8,6 +8,7 @@ type Job = {
   name: string;
   if: string;
   "runs-on": string | string[];
+  "timeout-minutes": number;
   steps: Array<{ name?: string; run?: string; uses?: string }>;
   strategy?: { "fail-fast": boolean; matrix: { include: Array<{ name: string; runner: string[] }> } };
 };
@@ -17,6 +18,10 @@ const sameRepoGuard = "github.event_name != 'pull_request' || github.event.pull_
 
 describe.each(Object.entries(jobs))("CI build prerequisites for %s", (_id, job) => {
   const steps = job.steps;
+  it("allows 60 minutes for the complete build, affected tests and platform smoke", () => {
+    expect(job["timeout-minutes"]).toBe(60);
+  });
+
   it("runs the YAML guard after installing Node and its existing parser dependency", () => {
     const guard = steps.findIndex((step) => step.run === "bash scripts/ci/no-hosted-runners.sh");
     const node = steps.findIndex((step) => step.uses === "actions/setup-node@v4");

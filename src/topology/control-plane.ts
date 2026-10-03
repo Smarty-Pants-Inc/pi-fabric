@@ -38,12 +38,13 @@ const SHARED_SEEN_GRACE_MS = 10 * 60 * 1_000;
 /** Host-reserved policy key; { version: 1, sharedClaims: "expiry" } enables expiry reclamation. */
 export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
 
+// Legacy Main setter wire names remain parseable only so owners can refuse them clearly.
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel" | "setModel" | "setThinking";
 
 // Keep the reader free to deliver cancellation while asynchronous work waits at its
 // commit fence. These commands own their handler and outcome/ACK retries after the cursor.
 const detachedControlOperation = (operation: FabricControlOperation): boolean =>
-  operation === "ask" || operation === "setModel" || operation === "setThinking";
+  operation === "ask";
 
 export interface FabricControlCommand {
   /** Hydrated from the admitted MeshEvent envelope, never event.data. */

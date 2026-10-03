@@ -101,7 +101,7 @@ try {
   assert.deepEqual(mesh.listAll("topology/participants/", { fresh: true }), [], "participants must be files-only");
   const files = fs.readdirSync(path.join(mesh.root, "participants")).filter(file => file.endsWith(".json")).map(file => JSON.parse(fs.readFileSync(path.join(mesh.root, "participants", file), "utf8")));
   const upgradedRecord = files.find(entry => entry.value.id === targetId).value;
-  assert.equal(upgradedRecord.mainBindings, true); assert.deepEqual(upgradedRecord.capabilities, ["steer", "followUp", "fabric"]);
+  assert.equal(upgradedRecord.mainBindings, false); assert.deepEqual(upgradedRecord.capabilities, ["steer", "followUp", "fabric"]);
   const found = await run(existing, { tag: "old-reader-discovery", compat: true });
   for (const collection of [found.members, found.sessions]) {
     const root = collection.find(item => item.id === targetId); assert.ok(root, "old reader lost upgraded Main");
@@ -122,14 +122,16 @@ try {
   assert.deepEqual(delivered.map(item => item.delivery).sort(), ["followUp", "steer"]);
   for (const item of delivered) assert.ok(item.content.includes(`\nmixed-generation-${item.delivery}\n`), "native message content differs from submitted text");
   assert.ok(delivered.every(item => item.from.id === existingId));
-  const changed = await run(lead, { tag: "optional-flag-setter", id: targetId, operation: "setThinking", thinking: "high" });
-  assert.equal(changed.result.thinking, "high"); assert.equal((await state(target)).thinkingLevel, "high");
-  const refused = await run(lead, { tag: "older-no-flag", id: existingId, operation: "setThinking", thinking: "high" });
-  assert.equal(refused.refused, true); assert.match(refused.error, /no live Main binding control path/);
-  assert.equal((await state(existing)).thinkingLevel, "low");
-  assert.equal(mesh.read({ topic: "fabric.control.command", limit: 100 }).filter(event => event.data.targetId === existingId && event.data.operation === "setThinking").length, 0);
-  record("assertions", { passed: true, filesOnly: true, historicalRuntimeDiscovery: true, roleRepositoryRetained: true, controlProtocol: "v1", nativeMessages: delivered.length, optionalFlagSetter: true, missingFlagRefusedBeforePublication: true });
-  console.log("PASS: actual old Fabric runtime discovers upgraded files-only Main; steer/followUp delivered natively once each; optional-flag setter succeeds and older no-flag setter refuses before publication.");
+  for (const id of [targetId, existingId]) {
+    const before = await state(id === targetId ? target : existing);
+    const refused = await run(lead, { tag: "remote-main-refused", id, operation: "setThinking", thinking: "high" });
+    assert.equal(refused.refused, true);
+    assert.equal(refused.error, "remote Main model changes are not supported yet; see smarty-dev#4153");
+    assert.equal((await state(id === targetId ? target : existing)).thinkingLevel, before.thinkingLevel);
+    assert.equal(mesh.read({ topic: "fabric.control.command", limit: 100 }).filter(event => event.data.targetId === id && event.data.operation === "setThinking").length, 0);
+  }
+  record("assertions", { passed: true, filesOnly: true, historicalRuntimeDiscovery: true, roleRepositoryRetained: true, controlProtocol: "v1", nativeMessages: delivered.length, remoteMainAdvertisement: false, remoteSettersRefusedBeforePublication: true });
+  console.log("PASS: actual old Fabric runtime discovers upgraded files-only Main; steer/followUp delivered natively once each; remote Main setters refused before publication.");
 } catch (error) {
   failure = error; record("failure", { error: String(error), stack: error.stack }); console.error(error);
 } finally {

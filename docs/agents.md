@@ -470,41 +470,36 @@ Pi-runner `model` arguments on `agents.run`, `agents.spawn`, `agents.create`, an
 
 This is the host-level equivalent of the `pi-model-switch` extension's `switch_model` tool, with aliases moved into Fabric configuration so project and agent scopes behave like every other Fabric section.
 
-### Changing a live Main by session ID
+### Changing this session's own live Main
 
-`agents.setThinking` and `agents.setModel` also accept an exact `session:<id>`:
+`agents.setThinking` and `agents.setModel` also accept this Main's exact `session:<id>`:
 
 ```ts
 const main = await agents.main();
 const effort = await agents.setThinking({ id: main.id, thinking: "high" });
-const model = await agents.setModel({ id: "session:<other-main-uuid>", model: "provider/model" });
+const model = await agents.setModel({ id: main.id, model: "provider/model" });
 ```
 
 These calls use Pi's own session setters: the in-flight inference stays unchanged,
 and the next model turn consumes the new binding. They return Main's native
 read-back state plus `previous: { model?, thinking? }` and `caller` (the exact
 calling Main ID); Pi's capability clamp is reflected in `thinking`. Model selection
-uses the target's authenticated registry, aliases and deny policy, without a
+uses this session's authenticated registry, aliases and deny policy, without a
 closest-match fallback. Only session scope is supported; a Main binding cannot
 be cleared. Actor IDs and names (including an actor named `main`) keep their
 existing binding behavior.
 
-The receiving Main authorizes only itself, its launch-recorded lead
-(`SMARTY_LEAD_SESSION` / `.local/lead`), or exact org/product-owner Main sessions
-that its trusted launcher enrolled in `PI_FABRIC_MAIN_CONTROLLERS`, a JSON array
-of `session:<id>` strings. Enrollment is snapshotted at runtime initialization;
-unset means `[]`. The launcher must obtain those IDs from explicit org/product-owner
-session bindings. Names, roles, turn principals, task escalation addresses and
-inherited task/actor lineage do **not** grant control authority. This is the same
-trusted local runtime/mesh admission boundary as other Fabric control operations,
-not isolation from a hostile same-UID process that can rewrite host state.
+Only this session's own live Main may change its binding. Cross-process changes
+to another Main are refused, even for a recorded lead or org/product owner:
+`remote Main model changes are not supported yet; see smarty-dev#4153`.
+Nothing is queued or mutated. Remote support needs a Pi commit-guard hook between
+native authentication and mutation and is tracked separately; this PR contains
+no Pi-core patch. Participant format-1 capabilities stay unchanged and
+`mainBindings` is false. Ordinary discovery and messaging remain compatible.
 
-Another Main must be live and advertise `main-bindings` over the existing control
-plane. Offline, discovery-only, older/uncontrollable, reloading or unreachable
-other-host sessions are refused, not queued for a later restart. Successful
-changes write a `pi-fabric.main-binding-change` entry in the target's native Pi
-session journal with the action, caller, target and before/after model/effort;
-the public calls retain their ordinary Fabric execution audit.
+Successful own-session changes write a `pi-fabric.main-binding-change` entry in
+this Main's native Pi journal with the action, caller, target and before/after
+model/effort; the public calls retain their ordinary Fabric execution audit.
 
 Native artifact proof (keyless, offline real Pi RPC; no external inference):
 `nice -n 19 node scripts/prove-main-bindings.mjs dist/index.js "$TASK_OUT"`.

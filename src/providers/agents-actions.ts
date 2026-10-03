@@ -623,7 +623,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "setModel",
     description:
-      "Change or clear an actor model binding, or set a live Main via session:<id>. Main changes use Pi native next-turn state, return previous/current readback, require self/recorded-lead/enrolled-org-owner authority, and support session scope only.",
+      "Change or clear an actor model binding, or set this session's own live Main via session:<id>. Main changes use Pi native next-turn state, return previous/current readback, and support session scope only. Remote Main changes are not supported yet (smarty-dev#4153).",
     inputSchema: {
       type: "object",
       properties: {
@@ -639,7 +639,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "setThinking",
     description:
-      "Change or clear an actor reasoning-effort binding, or set a live Main via session:<id>. Main changes use Pi native next-turn state, return previous/current readback, require self/recorded-lead/enrolled-org-owner authority, and support session scope only.",
+      "Change or clear an actor reasoning-effort binding, or set this session's own live Main via session:<id>. Main changes use Pi native next-turn state, return previous/current readback, and support session scope only. Remote Main changes are not supported yet (smarty-dev#4153).",
     inputSchema: {
       type: "object",
       properties: {

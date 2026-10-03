@@ -176,7 +176,7 @@ interface FabricParticipantInfo {
   repository?: string;
   /** False for print/JSON roots, which cannot receive messages or become project leads. */
   interactive?: boolean;
-  /** Optional Main setter support; only literal true enables the session binding path. */
+  /** Reserved remote Main setter advertisement; currently false/absent. */
   mainBindings?: boolean;
   kind: FabricParticipantKind;
   rootId: string;
@@ -927,9 +927,11 @@ interface FabricAgentsApi {
   stop(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
   cleanup(args: FabricAgentTargetArgs & { deleteBranch?: boolean; delete_branch?: boolean }): Promise<{ cleaned: boolean }>;
   create(args: FabricActorRequest): Promise<FabricActorInfo>;
+  /** Only this session's own Main is supported; remote Main targets are refused. */
   setModel(args: { id: \`session:\${string}\`; model: string; scope?: "session" }): Promise<FabricMainAgentBindingResult>;
   setModel<Id extends string>(args: { id: Id; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<FabricBindingTargetResult<Id>>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
+  /** Only this session's own Main is supported; remote Main targets are refused. */
   setThinking(args: { id: \`session:\${string}\`; thinking: FabricThinking; scope?: "session" }): Promise<FabricMainAgentBindingResult>;
   setThinking<Id extends string>(args: { id: Id; thinking?: FabricThinking; scope?: FabricActorBindingScope | "global" }): Promise<FabricBindingTargetResult<Id>>;
   setTools(args: { id: string; tools: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;

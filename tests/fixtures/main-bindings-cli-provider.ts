@@ -52,20 +52,7 @@ try {
       if (tool) events.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as Extract<AssistantMessage["content"][number], { type: "toolCall" }>, partial: message });
       events.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message }); events.end();
     };
-    if (packet.hold && tool) {
-      const gate = process.env.MAIN_BINDING_GATE!;
-      fs.writeFileSync(`${gate}-entered`, "1");
-      const wait = async () => {
-        const deadline = Date.now() + 30000;
-        while (!fs.existsSync(`${gate}-release`)) {
-          if (Date.now() > deadline) throw new Error("Native inference gate expired");
-          await new Promise(resolve => setTimeout(resolve, 10));
-        }
-      };
-      void wait().then(finish, error => {
-        events.push({ type: "error", reason: "error", error: { ...message, stopReason: "error", errorMessage: String(error) } }); events.end();
-      });
-    } else finish();
+    finish();
     return events;
   };
   pi.registerProvider({ id: model.provider, name: model.name,

@@ -967,7 +967,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // Format-1 readers reject the whole record on an unknown capability. Keep that
       // vocabulary stable; older readers ignore this optional feature advertisement.
       capabilities: interactive ? ["steer", "followUp", "fabric"] : ["fabric"],
-      ...(interactive ? { mainBindings: true } : {}),
+      mainBindings: false, // Cross-process Main setters await a native Pi commit guard.
       interactive,
       ...(main.cwd ? { cwd: main.cwd, projectRoot: process.env.PI_FABRIC_PROJECT_ROOT ?? main.cwd } : {}),
       ...(project ? { project } : {}),

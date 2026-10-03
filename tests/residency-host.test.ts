@@ -532,7 +532,7 @@ describe("resident host ownership", () => {
       const command = { version: 1 as const, operation, targetId: "actor", commandId: "main-only", replyTo: "caller", requestedAt: Date.now(),
         message: "must not be treated as a followUp", binding: { model: "provider/model", thinking: "high" as const } };
       await expect(handler(command, host.identity, new AbortController().signal, "mesh"))
-        .resolves.toMatchObject({ accepted: false, error: "Main binding commands require a live Main controller" });
+        .resolves.toMatchObject({ accepted: false, error: "remote Main model changes are not supported yet; see smarty-dev#4153" });
       expect(tell).not.toHaveBeenCalled();
     } finally { control.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });

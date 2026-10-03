@@ -42,7 +42,7 @@ describe("mixed-generation Main discovery (#409)", () => {
     expect(mesh().listAll("sessions/", { fresh: true })).toEqual([]);
     expect(mesh().listAll("topology/participants/", { fresh: true })).toEqual([]);
     const published = readParticipantFiles(meshRoot, { maxAgeMs: 0 }).find(entry => (entry.value as { id: string }).id === upgraded.id)!;
-    expect(published).toMatchObject({ value: { format: 1, capabilities: ["steer", "followUp", "fabric"], mainBindings: true } });
+    expect(published).toMatchObject({ value: { format: 1, capabilities: ["steer", "followUp", "fabric"], mainBindings: false } });
     const retained = { id: upgraded.id, role: "project-agent", repository: "github.com/smarty-pants-inc/pi-fabric", controlProtocol: "v1", stale: false };
     expect(reader.get(upgraded.id, undefined, { fresh: true })).toMatchObject(retained);
     expect(reader.sessions()).toEqual([expect.objectContaining(retained)]);

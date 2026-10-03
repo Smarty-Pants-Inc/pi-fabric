@@ -396,24 +396,11 @@ export const messageTargetArgs = (
   return rest.id === undefined ? { ...rest, id: to } : rest;
 };
 
-// Trusted launch enrollment, never role/name/principal inference or model-facing arguments.
-const mainBindingControllers = (): ReadonlySet<string> => {
-  const source = process.env.PI_FABRIC_MAIN_CONTROLLERS;
-  if (!source) return new Set();
-  let ids: unknown;
-  try { ids = JSON.parse(source); } catch { /* rejected below */ }
-  if (!Array.isArray(ids) || ids.some(id => typeof id !== "string" || !/^session:[^\s]+$/.test(id))) {
-    throw new Error("PI_FABRIC_MAIN_CONTROLLERS must be a JSON array of exact session:<id> strings");
-  }
-  return new Set(ids);
-};
-
 export class AgentsProvider implements FabricProvider {
   readonly #transcripts = new AgentTranscriptReader();
   readonly #toolCeiling = readChildToolAllowlist();
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
-  readonly #mainControllers = mainBindingControllers();
   readonly #taskReturnAddress = readTaskReturnAddress();
   readonly name = "agents";
   readonly description =
@@ -1625,8 +1612,8 @@ export class AgentsProvider implements FabricProvider {
       ? this.participants.self() : this.participants.get(from.id, undefined, { fresh: true });
     if (from.kind !== "main" || !caller || caller.kind !== "root" || caller.stale ||
       caller.id !== from.id || caller.rootId !== from.id || caller.ownerIdentityId !== from.id ||
-      (from.id !== this.mainAgent.id && from.id !== this.#projectLeadId && !this.#mainControllers.has(from.id))) {
-      throw new Error(`Unauthorized Main binding change by ${from.id} on ${this.mainAgent.id}; only this Main, its recorded lead, or an enrolled org/product-owner Main may change it`);
+      from.id !== this.mainAgent.id) {
+      throw new Error(`Unauthorized Main binding change by ${from.id} on ${this.mainAgent.id}; only this session's own Main may change it`);
     }
   }
 
@@ -1664,38 +1651,18 @@ export class AgentsProvider implements FabricProvider {
     if (args.scope !== undefined && args.scope !== "session") throw new Error("Main bindings support only session scope");
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
-    const targetId = id;
+    // Refuse before lookup, resolution, publication or native mutation. Even a live,
+    // enrolled peer cannot safely commit until Pi offers an after-auth commit guard.
+    if (id !== this.mainAgent.id || !this.mainAgent.local) {
+      throw new Error("remote Main model changes are not supported yet; see smarty-dev#4153");
+    }
     const from = this.actorManager.identity;
-    if (from.kind !== "main" || !this.mainAgent.local) {
+    if (from.kind !== "main") {
       throw new Error(`Unauthorized Main binding change by ${from.id}; task/actor lineage is not Main authority`);
     }
-    if (targetId === this.mainAgent.id) {
-      const result = await this.#applyMainBinding(operation, args, from, checkCommit, context.extensionContext);
-      this.participants.scheduleRefresh();
-      return result;
-    }
-    const binding: FabricActorRunBinding = {};
-    if (operation === "setThinking") {
-      const thinking = typeof args.thinking === "string" ? args.thinking.trim() : "";
-      if (!isFabricThinking(thinking)) throw new Error(`Invalid Main thinking level: ${thinking || "(missing)"}`);
-      binding.thinking = thinking;
-    } else {
-      const model = typeof args.model === "string" ? args.model.trim() : "";
-      if (!model) throw new Error("Main model is required; a live session binding cannot be cleared");
-      this.manager.assertModelAllowed(model);
-      binding.model = model;
-    }
-    const target = this.participants.get(targetId, undefined, { fresh: true });
-    if (!target || target.kind !== "root" || target.stale || target.interactive === false || !["idle", "running"].includes(target.status) ||
-      target.rootId !== targetId || target.ownerIdentityId !== targetId || target.reloadUntil !== undefined ||
-      target.controlProtocol !== "v1" || target.mainBindings !== true || !this.control) {
-      throw new Error(`Fabric participant ${targetId} has no live Main binding control path; nothing was queued`);
-    }
-    return this.control.requestResult<FabricMainAgentBindingResult>(
-      target.ownerHostId, target.id, operation,
-      { binding },
-      target.ownerIdentityId, { routedRemoteHost: target.remoteHost ?? null, ...(context.signal ? { signal: context.signal } : {}), timeoutMs: 5_000 },
-    );
+    const result = await this.#applyMainBinding(operation, args, from, checkCommit, context.extensionContext);
+    this.participants.scheduleRefresh();
+    return result;
   }
 
   async acceptControl(
@@ -1704,23 +1671,7 @@ export class AgentsProvider implements FabricProvider {
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
-    if (command.operation === "setModel" || command.operation === "setThinking") {
-      try {
-        if ((verification !== "mesh" && verification !== "bridge") || !this.mainAgent.local || command.targetId !== this.mainAgent.id) {
-          throw new Error(`Unauthorized Main binding change by ${from.id} on ${command.targetId}`);
-        }
-        const checkCommit = (): void => {
-          if (signal?.aborted || (command.deadlineAt !== undefined && Date.now() >= command.deadlineAt)) {
-            throw new Error("Main binding control command expired or cancelled; nothing was queued");
-          }
-        };
-        const result = await this.#applyMainBinding(command.operation, { ...command.binding }, from, checkCommit);
-        this.participants.scheduleRefresh();
-        return { accepted: true, messageId: command.commandId, result };
-      } catch (error) {
-        return { accepted: false, error: error instanceof Error ? error.message : String(error) };
-      }
-    }
+    // The router retains legacy wire names only to give old senders a clear refusal.
     return this.#router.acceptControl(command, from, signal, verification);
   }
 

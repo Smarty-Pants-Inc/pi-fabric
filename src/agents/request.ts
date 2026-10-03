@@ -47,6 +47,8 @@ export const normalizeAgentRunRequest = (
   return {
     task: String(args.task),
     runner,
+    ...(typeof args.routeClass === "string" ? { routeClass: args.routeClass } : {}),
+    ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
     ...(kernel !== undefined ? { kernel } : {}),
     ...(typeof args.name === "string" ? { name: args.name } : {}),
     ...(transport ? { transport } : {}),

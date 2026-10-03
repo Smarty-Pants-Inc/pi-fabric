@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { processStartTime } from "../src/residency/process-identity.js";
@@ -14,6 +15,17 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { fabricTurnProvenance } from "../src/fabric-provenance.js";
 import { FABRIC_RUN_ROOT_PREFIX, canRemoveTerminalRun, markRunRootActive, markRunRootClosed, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
 
+// Terminal publication is not the native worker's close receipt. Join the exact
+// owned instance before treating its emitted run tree as a quiescent fixture.
+const ownedProcesses: Array<{ pid: number | undefined; closed: Promise<void> }> = [];
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn((...args: Parameters<typeof spawn>) => {
+    const child = actual.spawn(...args);
+    ownedProcesses.push({ pid: child.pid, closed: new Promise<void>(resolve => child.once("close", resolve)) });
+    return child;
+  }) };
+});
 const workerPath = path.resolve("dist/worker.js");
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -24,7 +36,10 @@ const temporary = () => {
   return root;
 };
 afterEach(async () => {
-  try { await Promise.all(managers.splice(0).map(manager => manager.close())); }
+  try {
+    await Promise.all(managers.splice(0).map(manager => manager.close()));
+    await Promise.all(ownedProcesses.splice(0).map(({ closed }) => closed));
+  }
   finally {
     await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
     vi.unstubAllEnvs();
@@ -79,7 +94,10 @@ const productionRun = async (principal: boolean, retainRuns = true, nestedRunRoo
   // Copies preserve the worker PID, so even a successful archive must stay put
   // while that PID is live. Confirm exit before using this tree as an expired,
   // quiescent fixture; never weaken retention's independent live-writer fence.
-  await vi.waitFor(() => expect(processAlive(Number(result.sessionId))).toBe(false), { timeout: 7_000, interval: 50 });
+  const worker = ownedProcesses.find(child => String(child.pid) === result.sessionId);
+  expect(worker, "the production worker must have an owned close receipt").toBeDefined();
+  await worker!.closed;
+  expect(processAlive(Number(result.sessionId))).toBe(false);
   expect(requests).toHaveLength(1);
   expect(JSON.stringify(requests[0]!.messages.filter(message => message.role === "user"))).toContain(task);
   expect(fs.readdirSync(path.join(run, "deliveries"))).toEqual([]);
@@ -151,7 +169,20 @@ describe("I-2 production-worker ingress retention", () => {
     }
     const recovered = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, { runRoot: runs });
     managers.push(recovered);
-    expect(recovered.retentionReferences().has("native-descendant-actor")).toBe(false);
+    // This proves ownership semantics, not a 5ms synchronous filesystem speed
+    // budget. A scheduler pause mid-scan must conservatively protect this actor;
+    // explicitly exercise that branch, then give the same joined tree a complete
+    // scan with a deterministic clock (without changing the production budget).
+    const clock = vi.spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(6);
+    try {
+      const interrupted = recovered.retentionReferences();
+      expect(interrupted.has("native-descendant-actor")).toBe(true);
+      expect(interrupted.has("*")).toBe(true);
+      clock.mockReturnValue(0);
+      const complete = recovered.retentionReferences();
+      expect(complete.has("native-descendant-actor")).toBe(false);
+      expect(complete.has("*")).toBe(false);
+    } finally { clock.mockRestore(); }
     const aged = new Date(Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000);
     fs.utimesSync(parent, aged, aged);
     // Strict resident startup collection still accepts this checked-exited native tree.

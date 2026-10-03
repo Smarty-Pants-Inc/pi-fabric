@@ -23,12 +23,14 @@ import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
-import { resolvePiModel, type PiModelRegistryView } from "../core/model-refresh.js";
+import { resolvePiModel, resolvePiRoutePin, type PiModelRegistryView } from "../core/model-refresh.js";
+import { ShadowRouteOwner } from "../agents/model-route-owner.js";
 import {
   parseFabricOwnedModelGuidance,
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
+import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
@@ -218,9 +220,12 @@ export class ResidentHost {
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
+  // Boundary commands retain response custody without occupying serial admission.
+  readonly #boundaryRequests = new Map<string, Promise<void>>();
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
   readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
+  #routeOwner?: ShadowRouteOwner;
   readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
@@ -313,7 +318,26 @@ export class ResidentHost {
     // The session's visible models (synced at each ensureHost) plus, after a miss, this host's
     // own refreshed Pi registry: the one shared resolver, so an already-running host resolves a
     // model added to models.json after it started (pi-fabric#138).
-    const resolveResidentPiModel = async (selector?: string, options: { closest?: boolean } = {}): Promise<string> => {
+    // A bare resident registry does not load Main's provider extensions. Workers do:
+    // retain the trusted, auth-filtered catalog synced by Main for exact route pins
+    // and candidates, just as ordinary resident model selection does below.
+    // Keep one view so concurrent exact misses share the bounded registry refresh.
+    const routeRegistry: PiModelRegistryView = {
+      getAvailable: () => {
+        const live = modelRegistry?.getAvailable() ?? [];
+        const snapshot = (currentConfig().piModels ?? config.piModels)?.available ?? [];
+        return [...live, ...snapshot.filter(candidate => !live.some(model =>
+          model.provider === candidate.provider && model.id === candidate.id))];
+      },
+      ...(modelRegistry?.refresh ? { refresh: () => modelRegistry.refresh!() } : {}),
+    };
+    const residentRouteRegistry = (): PiModelRegistryView => routeRegistry;
+    const resolveResidentPiModel = async (selector?: string, options: { requiredPin?: boolean; closest?: boolean } = {}): Promise<string> => {
+      if (options.requiredPin) {
+        const exact = await resolvePiRoutePin({ selector: selector ?? "", registry: residentRouteRegistry(),
+          aliases: normalizeModelAliases((currentConfig().piModels ?? config.piModels)?.aliases) });
+        return `${exact.provider}/${exact.id}`;
+      }
       const state = currentConfig().piModels ?? config.piModels;
       const snapshot: FabricModelCandidate[] = Array.isArray(state?.available)
         ? state.available.flatMap((candidate) =>
@@ -357,7 +381,7 @@ export class ResidentHost {
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: this.#retention,
-      preparePiModel: async (model) => resolveResidentPiModel(model),
+      preparePiModel: async (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false }),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;
         return resolveFabricModelGuidance(currentModelGuidance(), {
@@ -404,6 +428,7 @@ export class ResidentHost {
     const lineageAlive = (rootId: string): boolean =>
       this.participants.lineageAlive(rootId);
     const actorRoots = residentActorRoots(config);
+    this.#routeOwner = new ShadowRouteOwner(() => currentConfig().shadowRouting ?? config.shadowRouting);
     this.actors = new ActorDirectory([
       config.sessionId,
       this.identity,
@@ -456,7 +481,14 @@ export class ResidentHost {
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: this.#retention,
         ...(typeof config.actors?.maxSessionBytes === "number" ? { maxSessionBytes: config.actors.maxSessionBytes } : {}),
-        resolvePiModel: (model) => resolveResidentPiModel(model, { closest: false }),
+        resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
+        prepareModelRoute: async (input, signal) => {
+          const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
+          return prepareModelRoute({ ...input, signal, config: config.agents.modelRouting,
+            registry: residentRouteRegistry(), aliases: normalizeModelAliases((currentConfig().piModels ?? config.piModels)?.aliases),
+            assertModelAllowed: model => this.agents.assertModelAllowed(model, "pi"),
+            evaluate: (request, routeSignal) => this.#routeOwner!.evaluate(request, routeSignal) });
+        },
       },
     ], actorRoots, config.mesh.actorScope);
     this.lifecycle = new LifecycleBroker(
@@ -580,6 +612,7 @@ export class ResidentHost {
   async close(): Promise<void> {
     if (this.#closed || !this.#started) return;
     this.#closed = true;
+    const routeClosed = this.#routeOwner?.close();
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
     this.#requestRetention.close();
@@ -594,6 +627,7 @@ export class ResidentHost {
       try {
         try {
           await this.agents?.close();
+          await routeClosed;
         } finally {
           // Fenced actor deliveries may still be acquiring custody. Join them
           // before releasing the host; closed hosts retain their durable outbox.
@@ -639,6 +673,20 @@ export class ResidentHost {
         if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
         if (!this.actors.owns(command.targetId)) {
           return { accepted: false, error: `Resident host does not own ${command.targetId}` };
+        }
+        // The resident command path remains owner-only. Legacy mesh stop also
+        // serves a detached actor after its originating Main withdraws: a
+        // verified Main may stop it, without acquiring setter/reset authority.
+        // While the root is addressable (including reload), retain its fence.
+        const now = Date.now();
+        // One snapshot includes stale/reloading roots: a lease lapse is not
+        // withdrawal, and separate live/stale reads could race a renewal.
+        const root = this.participants.list({ scope: "project", kinds: ["root"], includeStale: true, fresh: true }, now)
+          .find(candidate => candidate.id === this.config.rootId);
+        const detachedMain = !root && from.kind === "main" && (verification === "mesh" || verification === "bridge");
+        if (!detachedMain) {
+          const caller = this.participants.get(from.id, now, { fresh: true });
+          this.#authorizeResidentSetter({ identity: from, hostId: caller?.ownerHostId ?? "" });
         }
         await this.actors.stop(command.targetId);
         this.participants.scheduleRefresh();
@@ -843,12 +891,29 @@ export class ResidentHost {
         if (this.#handover || this.#closed) break;
         const source = path.join(this.#requestsPath, entry);
         const processing = path.join(this.#processingPath, entry);
+        // Never overwrite an admitted exchange while its response is still pending.
+        if (this.#boundaryRequests.has(processing)) continue;
         try {
           fs.renameSync(source, processing);
         } catch {
           continue;
         }
-        await this.#processRequest(processing);
+        let releaseAdmission!: () => void;
+        let boundary = false;
+        const admitted = new Promise<void>(resolve => { releaseAdmission = resolve; });
+        const response = this.#processRequest(processing, () => {
+          // ActorManager installed its commit fence and boundary waiter (or stop
+          // intent) synchronously. Only settlement/publication may now run aside.
+          boundary = true;
+          releaseAdmission();
+        });
+        await Promise.race([response, admitted]);
+        if (boundary) {
+          this.#boundaryRequests.set(processing, response);
+          // Shutdown/handover retains custody until the terminal response is durable.
+          this.#trackPublication(response);
+          void response.finally(() => this.#boundaryRequests.delete(processing)).catch(() => undefined);
+        }
       }
     } finally {
       this.#pollingRequests = false;
@@ -1057,7 +1122,7 @@ export class ResidentHost {
     }
   }
 
-  async #processRequest(filePath: string): Promise<void> {
+  async #processRequest(filePath: string, boundaryAdmitted?: () => void): Promise<void> {
     const command = readJson<ResidentCommand>(filePath);
     const requestId = path.basename(filePath, ".json");
     let response: ResidentCommandResponse;
@@ -1077,7 +1142,7 @@ export class ResidentHost {
       if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
         throw new Error(`Fabric residency request ${requestId} was abandoned before commit`);
       }
-      response = await this.#executeOnce(command);
+      response = await this.#executeOnce(command, boundaryAdmitted);
     } catch (error) {
       response = { format: RESIDENT_HOST_FORMAT, requestId, ok: false, error: errorMessage(error),
         ...(error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
@@ -1104,9 +1169,9 @@ export class ResidentHost {
     // Never evict an in-flight creation: retries must join the same promise.
   }
 
-  async #executeOnce(command: ResidentCommand): Promise<ResidentCommandResponse> {
+  async #executeOnce(command: ResidentCommand, boundaryAdmitted?: () => void): Promise<ResidentCommandResponse> {
     if ((command.operation !== "spawnBound" && command.operation !== "createActor") || command.idempotencyKey === undefined) {
-      return this.#executeRequest(command);
+      return this.#executeRequest(command, boundaryAdmitted);
     }
     if (typeof command.idempotencyKey !== "string" || !command.idempotencyKey.length || command.idempotencyKey.length > 256) {
       throw new Error("Resident idempotencyKey must be a string of 1 to 256 characters");
@@ -1149,7 +1214,7 @@ export class ResidentHost {
         : Math.max(Date.now(), residentRequestGeneration(command.requestId) ?? 0) };
   }
 
-  async #executeRequest(command: ResidentCommand): Promise<ResidentCommandResponse> {
+  async #executeRequest(command: ResidentCommand, boundaryAdmitted?: () => void): Promise<ResidentCommandResponse> {
     const requestId = command.requestId;
     let response: ResidentCommandResponse;
     try {
@@ -1252,7 +1317,8 @@ export class ResidentHost {
         };
       } else if (command.operation !== "removeActor") {
         if (command.operation === "setInstructions" || command.operation === "setModel" ||
-          command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools") {
+          command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools" ||
+          command.operation === "resetSession" || command.operation === "stop") {
           this.#authorizeResidentSetter(command.caller);
           if (command.operation === "setTools") assertResidentActorToolCeiling(command.tools, command.caller?.toolCeiling);
         }
@@ -1263,6 +1329,20 @@ export class ResidentHost {
         let updated: FabricActorInfo;
         switch (command.operation) {
           case "actorStatus": updated = actor; break;
+          // Repair is a boundary request, not terminal stop: the admitted run settles,
+          // then queued deliveries resume on the fresh session under the same actor.
+          case "resetSession": {
+            const pending = this.actors.resetSession(actor.id, { beforeCommit: commit });
+            boundaryAdmitted?.();
+            updated = await pending;
+            break;
+          }
+          case "stop": {
+            const pending = this.actors.stop(actor.id, commit, true);
+            boundaryAdmitted?.();
+            updated = await pending;
+            break;
+          }
           case "setInstructions": updated = await this.actors.setInstructions(actor.id, command.instructions, commit); break;
           case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit); break;
           case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope, commit); break;
@@ -1303,6 +1383,7 @@ export class ResidentHost {
         error: errorMessage(error),
         ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
           ? { errorCode: error.code } : {}),
+        ...(error instanceof ActorSessionResetCancelledError ? { errorCode: error.code } : {}),
         ...(error instanceof FabricModelDeniedError ? {
           errorCode: error.code, modelDenied: { model: error.model, ...(error.replacement ? { replacement: error.replacement } : {}) },
         } : {}),

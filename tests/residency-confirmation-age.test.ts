@@ -55,19 +55,25 @@ it("preserves shared commit age across overdue copies; consumption and sequence 
     fs.mkdirSync(path.join(root, ".lock")); fs.writeFileSync(path.join(root, ".lock", "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
     await pause(320); release(); await starting;
     expect(directory.confirmedAt()).toBeLessThanOrEqual(commitAt + 20);
+    // Block both shared renewal paths before canConsumeMesh schedules its recovery.
+    // An unchanged heartbeat now confirms writability without rewriting shared state.
+    const batch = mesh.writeBatch.bind(mesh);
+    const confirm = mesh.confirmWritable.bind(mesh);
+    vi.spyOn(mesh, "writeBatch").mockRejectedValue(new Error("shared renewal blocked"));
+    vi.spyOn(mesh, "confirmWritable").mockRejectedValue(new Error("shared confirmation blocked"));
     expect(directory.canConsumeMesh()).toBe(false);
     // Stage control traffic after the overdue copy: no handler or sequence while the lock is unavailable.
     fs.rmSync(path.join(root, ".lock"), { recursive: true });
     result = sender.request("owner", "actor", "followUp", { message: "work" }).catch(e => e);
-    // Block the owner's later renewal while allowing the sender to publish its event.
-    const batch = mesh.writeBatch.bind(mesh); vi.spyOn(mesh, "writeBatch").mockRejectedValue(new Error("shared renewal blocked"));
     await pause(180);
     expect(handler).not.toHaveBeenCalled();
     for (const dir of fs.readdirSync(path.join(root, "control-seen"))) {
       const seen = new MeshStore(path.join(root, "control-seen", dir), 65536, 1000);
       expect(seen.listAll("topology/control-seen/").every(entry => !(entry.value as { sequence?: number }).sequence)).toBe(true);
     }
-    vi.mocked(mesh.writeBatch).mockImplementation(batch); await directory.refresh();
+    vi.mocked(mesh.writeBatch).mockImplementation(batch);
+    vi.mocked(mesh.confirmWritable).mockImplementation(confirm);
+    await directory.refresh();
     expect(directory.canConsumeMesh()).toBe(true);
     expect(await result).toMatchObject({ acknowledged: true }); expect(handler).toHaveBeenCalledOnce();
   } finally { release(); fs.rmSync(path.join(root, ".lock"), { recursive: true, force: true }); await starting.catch(() => undefined); await directory.close(); await control.close(); await sender.close(); await result; vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }

@@ -367,6 +367,8 @@ export interface ResidentHostOwner {
   /** Linux /proc start ticks; absent for older hosts and on other platforms. */
   processStartTime?: string | undefined;
   token: string;
+  /** Binds ready custody transfer to the exact client-owned launch attempt. */
+  launchToken?: string;
   startedAt: number;
   readyAt: number;
   /** The immutable entry path this owner actually loaded, not the mutable config selector. */

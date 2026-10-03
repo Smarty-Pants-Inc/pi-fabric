@@ -120,6 +120,10 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
+const expectUnconfirmedClose = async (manager: AgentManager) => {
+  await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
+  managers.splice(managers.indexOf(manager), 1);
+};
 describe("AgentManager fleet model admission (#2490)", () => {
   it.each([
     ["veda", "backend-shortcut", "explicit"],
@@ -717,11 +721,15 @@ describe("AgentManager", () => {
     const queued = await manager.spawn({ task: "uncertain queued launch", transport: "process" });
     vi.spyOn(ProcessTransport.prototype, "launch").mockRejectedValueOnce(Object.assign(new Error("launch outcome unknown"), { launchOutcome: "unknown" }));
     await manager.stop(first.id);
-    expect(await manager.wait(queued.id)).toMatchObject({ status: "failed", error: "launch outcome unknown" });
+    await expect(manager.wait(queued.id, { timeoutMs: 20 })).rejects.toThrow(/still running/);
+    await expect(manager.stop(queued.id)).rejects.toThrow(/execution exit unconfirmed/);
+    const next = await manager.spawn({ task: "no replacement", transport: "process" });
+    expect(next.status).toBe("queued");
+    await manager.stop(next.id);
     const runDirectory = path.join(root, queued.id);
     expect(fs.existsSync(runDirectory)).toBe(true);
-    await expect(manager.cleanup(queued.id)).rejects.toThrow("lost track of its worker");
-    await manager.close();
+    await expect(manager.cleanup(queued.id)).rejects.toThrow("queued agent");
+    await expectUnconfirmedClose(manager);
     expect(fs.existsSync(runDirectory)).toBe(true);
   });
 
@@ -764,24 +772,24 @@ describe("AgentManager", () => {
       const stopped = manager.stop(queued.id);
       release();
       // Exit is not confirmed: even a successful stop request is not deletion authority.
-      const result = await stopped;
-      expect({ status: result.status, error: result.error, worktreeRetained: fs.existsSync(worktree!) }).toMatchObject({
-        status: "stopped", error: expect.stringContaining("cleanup pending"), worktreeRetained: true,
-      });
+      await expect(stopped).rejects.toThrow(/execution exit unconfirmed/);
+      await expect(manager.wait(queued.id, { timeoutMs: 20 })).rejects.toThrow(/still running/);
+      expect(fs.existsSync(worktree!)).toBe(true);
       expect(Date.now() - started).toBeLessThan(9_000);
       if (mode === "alive") expect(Date.now() - started).toBeGreaterThanOrEqual(6_900);
-      expect(stop).toHaveBeenCalledTimes(1);
+      expect(stop).toHaveBeenCalledTimes(mode === "lost-contact" ? 0 : 1);
       const runDirectory = path.join(root, queued.id);
-      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8"))).toMatchObject({ runId: queued.id, worktree, cleanupPending: true, sessionId: "unconfirmed-worker" });
+      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8"))).toMatchObject({ runId: queued.id, sessionId: "unconfirmed-worker" });
       expect(fs.existsSync(path.join(runDirectory, "task.txt"))).toBe(true);
       expect(fs.existsSync(worktree!)).toBe(true);
-      await expect(manager.cleanup(queued.id)).rejects.toThrow("lost track of its worker");
+      await expect(manager.cleanup(queued.id)).rejects.toThrow("running agent");
       expect(fs.existsSync(runDirectory)).toBe(true);
       expect(fs.existsSync(worktree!)).toBe(true);
-      // The manager and retention guards preserve the obligation across shutdown too.
+      // A later exact exit discharges transient custody, never a terminal-only receipt.
       workerExited = true;
+      expect((await manager.stop(queued.id)).status).toBe("stopped");
+      expect(fs.existsSync(path.join(runDirectory, "unresolved-worker.json"))).toBe(false);
       await manager.close();
-      expect(fs.existsSync(runDirectory)).toBe(true);
       expect(fs.existsSync(worktree!)).toBe(true);
     } finally {
       workerExited = true; release(); launch.mockRestore();
@@ -802,9 +810,15 @@ describe("AgentManager", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const creating = new Promise<void>((resolve) => { ready = resolve; });
     let stoppedAt: number | undefined;
+    // Main's live-PID retention fence requires a real, reaped worker identity;
+    // a synthetic handle with no PID is deliberately not collectible.
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
     const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementationOnce(async () => {
       ready(); await gate;
-      return { kind: "process", stop: async () => { stoppedAt = Date.now(); }, isAlive: async () => stoppedAt === undefined || Date.now() - stoppedAt < 150 };
+      return { kind: "process", sessionId: String(child.pid), stop: async () => {
+        child.kill("SIGTERM"); await closed; stoppedAt = Date.now();
+      }, isAlive: async () => stoppedAt === undefined || Date.now() - stoppedAt < 150 };
     });
     try {
       const queued = await manager.spawn({ task: "exit after termination", transport: "process" });
@@ -816,11 +830,11 @@ describe("AgentManager", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(settled).toBe(false);
       expect(fs.existsSync(path.join(root, queued.id, "task.txt"))).toBe(true);
-      expect(await stopped).toMatchObject({ status: "stopped", error: "Agent launch aborted" });
+      expect(await stopped).toMatchObject({ status: "stopped", error: "Agent stopped" });
       expect(fs.existsSync(path.join(root, queued.id, "unresolved-worker.json"))).toBe(false);
       expect(await manager.cleanup(queued.id)).toEqual({ cleaned: true });
       expect(fs.existsSync(path.join(root, queued.id))).toBe(false);
-    } finally { release(); launch.mockRestore(); }
+    } finally { release(); child.kill("SIGTERM"); await closed; launch.mockRestore(); }
   });
 
   it("reattaches completion notification when a queued wait reaches its bound after admission", async () => {
@@ -1331,6 +1345,44 @@ describe("AgentManager", () => {
 
   // dev-lead review D1 on #26: lost contact is not an exit. The run fails as lost, once, and
   // neither cleanup nor shutdown deletes files that the still-running worker may use.
+  it("fails a run whose transport lost contact as lost, and keeps its worker's files", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    const handles: Array<Awaited<ReturnType<typeof launch>>> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      launches++;
+      handles.push(handle);
+      // As a Herdr handle past its bound: the worker keeps running, contact is lost.
+      return { ...handle, relaunchable: false, isAlive: async () => false, lostContact: () => "the Herdr server has been unreachable for 300 s" };
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "HANG until stopped", transport: "process" });
+      expect(launches).toBe(1);
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/^Lost track of the worker: the Herdr server has been unreachable/);
+      expect(result.error).not.toContain("exited without a result");
+      const runDirectory = manager.runDirectory(result.id)!;
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
+      expect(fs.existsSync(runDirectory)).toBe(true);
+      expect(await handles[0]!.isAlive()).toBe(true);           // the real worker still runs
+      await expectUnconfirmedClose(manager);
+      expect(fs.existsSync(runDirectory)).toBe(true);           // shutdown kept its files
+    } finally {
+      spy.mockRestore();
+      for (const handle of handles) await handle.stop();
+    }
+  }, 30_000);
+
+  // dev-lead review D1 on #26: lost contact is not an exit. The run fails as lost, once, and
+  // neither cleanup nor shutdown deletes files that the still-running worker may use.
   it("preserves modelReason in the persisted terminal record and settlement callback for a lost worker", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -1365,7 +1417,7 @@ describe("AgentManager", () => {
       await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
       expect(fs.existsSync(runDirectory)).toBe(true);
       expect(await handles[0]!.isAlive()).toBe(true);           // the real worker still runs
-      await manager.close();
+      await expectUnconfirmedClose(manager);
       expect(fs.existsSync(runDirectory)).toBe(true);           // shutdown kept its files
     } finally {
       spy.mockRestore();
@@ -1391,13 +1443,48 @@ describe("AgentManager", () => {
     });
   };
 
+  it.each(["stop", "deadline"] as const)("marks a run whose worker was lost on the %s path, and refuses its cleanup", async (path_) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launched: Array<{ stop(): Promise<void> }> = [];
+    const spy = lostOnStop(launched);
+    try {
+      // A request can only extend the configured timeout, so the deadline case configures it.
+      const manager = new AgentManager(process.cwd(), {
+        ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, ...(path_ === "deadline" ? { timeoutMs: 1_500 } : {}),
+      }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      if (path_ === "stop") await expect(manager.stop(handle.id)).rejects.toThrow(/execution exit unconfirmed/);
+      else expect((await manager.wait(handle.id)).status).toBe("timed_out");
+      const runDirectory = manager.runDirectory(handle.id)!;
+      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8")).reason)
+        .toMatch(/Herdr server has been unreachable/);
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(path_ === "stop" ? /running agent/ : /lost track of its worker/);
+      await expectUnconfirmedClose(manager);
+      expect(fs.existsSync(runDirectory)).toBe(true);
+    } finally {
+      spy.mockRestore();
+      for (const handle of launched) await handle.stop();
+    }
+  }, 30_000);
+
   it.each(["stop", "deadline"] as const)("preserves modelReason in the persisted terminal record and settlement callback on the %s path", async (path_) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const modelReason = "Astra is required for this stop/timeout audit regression";
     const settled = vi.fn();
-    const launched: Array<{ stop(): Promise<void> }> = [];
-    const spy = lostOnStop(launched);
+    const launch = ProcessTransport.prototype.launch;
+    const launched: Array<Awaited<ReturnType<typeof launch>>> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      launched.push(handle);
+      // Audit terminal settlement only after the real worker confirms exit; loss is fenced above.
+      return handle;
+    });
     try {
       // A request can only extend the configured timeout, so the deadline case configures it.
       const manager = new AgentManager(process.cwd(), {
@@ -1416,11 +1503,12 @@ describe("AgentManager", () => {
       const persisted = JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8"));
       expect.soft(persisted).toMatchObject({ status, modelReason });
       expect.soft(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: handle.id, status, modelReason }));
-      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8")).reason)
-        .toMatch(/Herdr server has been unreachable/);
-      await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
+      expect(await launched[0]!.isAlive()).toBe(false);
+      expect(launched[0]!.lostContact?.()).toBeUndefined();
+      expect(fs.existsSync(path.join(runDirectory, "unresolved-worker.json"))).toBe(false);
+      expect(await manager.cleanup(handle.id)).toMatchObject({ cleaned: true });
       await manager.close();
-      expect(fs.existsSync(runDirectory)).toBe(true);
+      expect(fs.existsSync(runDirectory)).toBe(false);
     } finally {
       spy.mockRestore();
       for (const handle of launched) await handle.stop();
@@ -1454,13 +1542,16 @@ describe("AgentManager", () => {
         runRoot: root,
       });
       managers.push(manager);
-      await expect(manager.spawn({ task: "HANG until stopped", transport: "process", worktree: true })).rejects.toThrow("did not confirm");
+      const uncertain = await manager.spawn({ task: "HANG until stopped", transport: "process", worktree: true });
+      expect(uncertain.status).toBe("queued");
+      await expect(manager.stop(uncertain.id)).rejects.toThrow(/execution exit unconfirmed/);
+      await expect(manager.wait(uncertain.id, { timeoutMs: 20 })).rejects.toThrow(/still running/);
       const marked = fs.readdirSync(root).map((name) => path.join(root, name, "unresolved-worker.json")).filter((file) => fs.existsSync(file));
       expect(marked).toHaveLength(1);
       worktree = JSON.parse(fs.readFileSync(marked[0]!, "utf8")).worktree as string;
       expect(fs.existsSync(worktree)).toBe(true);
       expect(git("worktree", "list", "--porcelain")).toContain("branch refs/heads/");
-      await manager.close();
+      await expectUnconfirmedClose(manager);
       expect(fs.existsSync(path.dirname(marked[0]!))).toBe(true);
       expect(fs.existsSync(worktree)).toBe(true);
     } finally {
@@ -1506,6 +1597,7 @@ describe("AgentManager", () => {
       // review/astra on e170d9e: the worker that did not stop may still use its files.
       await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
       expect(fs.existsSync(manager.runDirectory(handle.id)!)).toBe(true);
+      await expectUnconfirmedClose(manager);
     } finally {
       spy.mockRestore();
       await first?.stop();
@@ -1821,6 +1913,18 @@ describe("AgentManager", () => {
       expect(workerJoined).toBe(false);
       expect(settled).toBe(false);
       releaseWorker();
+      if (outcome === "uncertain" && platform === "native" && process.platform !== "win32") {
+        // PR 218's POSIX tree custody is stricter than Windows logical stop:
+        // a closed primary alone cannot settle an unconfirmed execution tree.
+        await expect(stopping).rejects.toThrow(/execution exit unconfirmed/);
+        await expect(manager.wait(handle.id, { timeoutMs: 20 })).rejects.toThrow(/still running/);
+        expect(manager.status(handle.id).status).toBe("running");
+        expect(workerJoined).toBe(true);
+        expect(fs.existsSync(path.join(manager.runDirectory(handle.id)!, "unresolved-worker.json"))).toBe(true);
+        await expect(manager.cleanup(handle.id)).rejects.toThrow(/running agent/);
+        await expectUnconfirmedClose(manager);
+        return;
+      }
       const expected = outcome === "failed-result" ? "failed" : "stopped";
       expect(await stopping).toMatchObject({ status: expected });
       expect(await manager.wait(handle.id)).toMatchObject({ status: expected });
@@ -1843,9 +1947,15 @@ describe("AgentManager", () => {
     } finally {
       releaseHelper(); releaseWorker();
       child.kill("SIGTERM");
-      try { await stopping; }
+      try { await Promise.allSettled([stopping]); }
       finally {
         await closed;
+        // Join Windows logical close before restoring the native platform seam.
+        if (platform === "win32") {
+          await manager.close();
+          const index = managers.indexOf(manager);
+          if (index !== -1) managers.splice(index, 1);
+        }
         launch.mockRestore();
         Object.defineProperty(process, "platform", nativePlatform);
       }
@@ -1874,12 +1984,19 @@ describe("AgentManager", () => {
       await vi.waitFor(() => expect(fs.existsSync(statusFile)).toBe(true), { timeout: 10_000 });
       const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
       writeJsonAtomic(statusFile, { ...record, status: "completed", text: "finished before native close", finishedAt: Date.now() });
-      if (state === "settled result") await manager.wait(handle.id);
+      if (state === "settled result") {
+        // POSIX settlement now includes the execution drain. A terminal file
+        // alone remains insufficient; release the existing join before wait.
+        release();
+        await manager.wait(handle.id);
+      }
       let joined = false;
       const stopping = manager.stop(handle.id).then(result => { joined = true; return result; });
       await Promise.resolve();
       expect(stop).toHaveBeenCalledOnce();
-      expect(joined, "terminal status is not proof of worker exit").toBe(false);
+      if (state === "terminal record") {
+        expect(joined, "terminal status is not proof of worker exit").toBe(false);
+      }
       release();
       expect(await stopping).toMatchObject({ status: "completed", text: "finished before native close" });
       expect(joined).toBe(true);

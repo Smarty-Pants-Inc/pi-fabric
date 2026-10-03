@@ -27,12 +27,15 @@ export class ProcessTransport implements AgentTransportAdapter {
           ? { ...process.env } : taskAgentEnvironment(),
         request.workerArguments,
       ),
+      7_000, // worker owns a separately detached child with a five-second KILL grace
+      process.platform !== "win32", // Windows uses its helper/native-close contract, not custody IPC
     );
     return {
       kind: this.kind,
       sessionId: String(processHandle.pid),
       isAlive: processHandle.isAlive,
       lostContact: processHandle.lostContact,
+      ...(processHandle.stopDebt ? { stopDebt: processHandle.stopDebt } : {}),
       waitForClose: processHandle.waitForClose,
       stop: processHandle.stop,
     };

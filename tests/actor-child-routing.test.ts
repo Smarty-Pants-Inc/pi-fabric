@@ -114,11 +114,13 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true, 
   const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), {
     paths: { worker: fixture, extension: fixture, residentHost: fixture, skills: root },
   });
-  await runtime.initialize(context, normalizeFabricConfig({
+  const config = normalizeFabricConfig({
     fullCodeMode: true, mesh: { enabled: true, actorPollMs: 20 },
     mcp: { enabled: false, cache: { enabled: false } }, memory: { enabled: false },
     agents: { notifyOnComplete }, residency: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false },
-  }));
+  });
+  const initialize = () => runtime.initialize(context, config);
+  await initialize();
   cleanups.push(() => runtime.shutdown());
   const boundary = () => {
     for (const handler of handlers.get("turn_end") ?? []) handler({ message: { role: "assistant", stopReason: "stop" } }, context);
@@ -126,7 +128,7 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true, 
   const spawn = (task = "private review sub-result") => runtime.registry.invoke("agents.spawn", {
     task, name: "review-subtask", transport: "process", model: "fixture/review",
   }, invocation) as Promise<AgentHandleInfo>;
-  return { actor, actorRunId, owner, ownerAgents, mesh, runtime, invocation, rootDeliveries, sendMessage, boundary, spawn, endActivation, makeOwner, resolveModel };
+  return { actor, actorRunId, owner, ownerAgents, mesh, runtime, invocation, rootDeliveries, sendMessage, boundary, spawn, endActivation, makeOwner, resolveModel, initialize };
 };
 
 describe.each(["session", "durable"] as const)("%s actor process children", (residency) => {
@@ -139,6 +141,81 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     });
     await vi.waitFor(() => { h.boundary(); expect(h.sendMessage).toHaveBeenCalledOnce(); }, { timeout: 5000 });
     expect(h.sendMessage.mock.calls[0]![0].content).toContain("fake worker complete");
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it.each(["shutdown", "reload"] as const)("%s preserves unread full archives through owner restart, without replaying consumed outcomes", async (reason) => {
+    const h = await setup(residency);
+    const unread = await h.spawn("LARGE_RESULT");
+    await h.runtime.agents.join(unread.id);
+    const consumed = await h.spawn("LARGE_RESULT");
+    await h.runtime.registry.invoke("agents.wait", { id: consumed.id }, h.invocation);
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    expect(store.pending().map(({ result }) => result.id)).toEqual([unread.id]);
+    expect(store.received(unread.id)).toBe(false);
+    expect(store.received(consumed.id)).toBe(true);
+    // Close must not turn execution exit into a durable consumption receipt.
+    await h.runtime.shutdown(reason);
+    if (reason === "reload") { await h.initialize(); await h.runtime.shutdown(); }
+    expect(store.received(unread.id)).toBe(false);
+    expect(store.pending().map(({ result }) => result.id)).toEqual([unread.id]);
+    const fullResult = () => JSON.parse(fs.readFileSync(store.resultFile(unread.id), "utf8")) as AgentRunResult;
+    expect(fullResult()).toMatchObject({ text: "x".repeat(100000), value: { output: "x".repeat(100000) } });
+    expect(fs.existsSync(store.resultFile(consumed.id))).toBe(false);
+    // End the activation only after its owner stops polling, so the unread
+    // outcome must survive an actual owner restart before delivery is possible.
+    const closing = h.owner.close();
+    h.endActivation();
+    await closing;
+    const inference = vi.fn();
+    vi.mocked(h.ownerAgents.run).mockRestore();
+    const run = h.ownerAgents.run.bind(h.ownerAgents);
+    vi.spyOn(h.ownerAgents, "run").mockImplementation(async (...args) => {
+      if (args[0].task.includes(JSON.stringify(store.resultFile(unread.id)))) inference(fullResult());
+      return run(...args);
+    });
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "next activation after owner restart");
+    await vi.waitFor(() => expect(inference).toHaveBeenCalledOnce(), { timeout: 5000 });
+    expect(inference.mock.calls[0]![0].value).toEqual({ output: "x".repeat(100000) });
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(restarted.messages(h.actor.id).filter((m) => m.id === unread.id && m.direction === "in")).toHaveLength(1);
+    expect(restarted.messages(h.actor.id).filter((m) => m.id === consumed.id)).toEqual([]);
+    expect(fs.existsSync(store.resultFile(unread.id))).toBe(false);
+    await restarted.close();
+    const again = h.makeOwner();
+    cleanups.push(() => again.close());
+    await again.ask(h.actor.id, "unrelated activation after consumption");
+    await vi.waitFor(() => expect(again.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(again.messages(h.actor.id).filter((m) => m.id === unread.id && m.direction === "in")).toHaveLength(1);
+    expect(again.messages(h.actor.id).filter((m) => m.id === consumed.id)).toEqual([]);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it.each(["shutdown", "reload"] as const)("%s leaves muted full text/value archived across owner restart and unrelated work", async (reason) => {
+    const h = await setup(residency, false);
+    const child = await h.spawn("LARGE_RESULT");
+    await h.runtime.agents.join(child.id);
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await h.runtime.shutdown(reason);
+    if (reason === "reload") { await h.initialize(); await h.runtime.shutdown(); }
+    const closing = h.owner.close();
+    h.endActivation();
+    await closing;
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    expect(store.received(child.id)).toBe(false);
+    expect(store.pending()).toEqual([]);
+    await restarted.ask(h.actor.id, "unrelated activation must not consume muted work");
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8"))).toMatchObject({
+      status: "completed", text: "x".repeat(100000), value: { output: "x".repeat(100000) },
+    });
+    expect(store.received(child.id)).toBe(false);
+    expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id)).toEqual([]);
+    expect(h.sendMessage).not.toHaveBeenCalled();
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 

@@ -1417,7 +1417,7 @@ describe("AgentManager", () => {
       await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
       expect(fs.existsSync(runDirectory)).toBe(true);
       expect(await handles[0]!.isAlive()).toBe(true);           // the real worker still runs
-      await manager.close();
+      await expectUnconfirmedClose(manager);
       expect(fs.existsSync(runDirectory)).toBe(true);           // shutdown kept its files
     } finally {
       spy.mockRestore();
@@ -1477,8 +1477,14 @@ describe("AgentManager", () => {
     roots.push(root);
     const modelReason = "Astra is required for this stop/timeout audit regression";
     const settled = vi.fn();
-    const launched: Array<{ stop(): Promise<void> }> = [];
-    const spy = lostOnStop(launched);
+    const launch = ProcessTransport.prototype.launch;
+    const launched: Array<Awaited<ReturnType<typeof launch>>> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      launched.push(handle);
+      // Audit terminal settlement only after the real worker confirms exit; loss is fenced above.
+      return handle;
+    });
     try {
       // A request can only extend the configured timeout, so the deadline case configures it.
       const manager = new AgentManager(process.cwd(), {
@@ -1497,11 +1503,12 @@ describe("AgentManager", () => {
       const persisted = JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8"));
       expect.soft(persisted).toMatchObject({ status, modelReason });
       expect.soft(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: handle.id, status, modelReason }));
-      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8")).reason)
-        .toMatch(/Herdr server has been unreachable/);
-      await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
+      expect(await launched[0]!.isAlive()).toBe(false);
+      expect(launched[0]!.lostContact?.()).toBeUndefined();
+      expect(fs.existsSync(path.join(runDirectory, "unresolved-worker.json"))).toBe(false);
+      expect(await manager.cleanup(handle.id)).toMatchObject({ cleaned: true });
       await manager.close();
-      expect(fs.existsSync(runDirectory)).toBe(true);
+      expect(fs.existsSync(runDirectory)).toBe(false);
     } finally {
       spy.mockRestore();
       for (const handle of launched) await handle.stop();

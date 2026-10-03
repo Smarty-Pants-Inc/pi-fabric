@@ -132,8 +132,8 @@ export class ActorRegistryStore {
 
   fingerprint(): string | undefined {
     try {
-      const stat = fs.statSync(this.#registryPath);
-      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+      const stat = fs.statSync(this.#registryPath, { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
     } catch {
       return undefined;
     }

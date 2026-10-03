@@ -461,6 +461,9 @@ export class AgentMessageRouter {
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
+    if (command.operation === "setModel" || command.operation === "setThinking") {
+      return { accepted: false, error: "Main binding commands require a live Main controller" };
+    }
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
     }

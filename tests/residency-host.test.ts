@@ -519,6 +519,23 @@ describe("resident orphan retention", () => {
 });
 
 describe("resident host ownership", () => {
+  it.each(["setModel", "setThinking"] as const)("refuses Main-only %s commands rather than delivering them to a resident actor", async operation => {
+    const { root, host } = fixture();
+    let handler!: Parameters<typeof host.control.start>[0];
+    const control = vi.spyOn(FabricControlPlane.prototype, "start").mockImplementation(accept => { handler = accept; });
+    try {
+      await host.start(); control.mockRestore();
+      vi.spyOn(host.actors, "owns").mockReturnValue(true);
+      vi.spyOn(host.actors, "status").mockReturnValue({ rootId: host.config.rootId } as ReturnType<typeof host.actors.status>);
+      vi.spyOn(host.actors, "resolveActivationBinding").mockResolvedValue({});
+      const tell = vi.spyOn(host.actors, "tell").mockReturnValue({ messageId: "incorrectly-delivered" } as ReturnType<typeof host.actors.tell>);
+      const command = { version: 1 as const, operation, targetId: "actor", commandId: "main-only", replyTo: "caller", requestedAt: Date.now(),
+        message: "must not be treated as a followUp", binding: { model: "provider/model", thinking: "high" as const } };
+      await expect(handler(command, host.identity, new AbortController().signal, "mesh"))
+        .resolves.toMatchObject({ accepted: false, error: "Main binding commands require a live Main controller" });
+      expect(tell).not.toHaveBeenCalled();
+    } finally { control.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
   it("followUp advisory A2 resident-owned running task ACK and persisted replay preserve the warning", async () => {
     const { root, config, host } = fixture();
     config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");

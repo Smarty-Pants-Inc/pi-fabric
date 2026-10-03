@@ -22,6 +22,7 @@ import type {
 import type {
   FabricAgentMessageResult,
   FabricMainAgentTarget,
+  FabricMainAgentBindingResult,
 } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
@@ -395,11 +396,24 @@ export const messageTargetArgs = (
   return rest.id === undefined ? { ...rest, id: to } : rest;
 };
 
+// Trusted launch enrollment, never role/name/principal inference or model-facing arguments.
+const mainBindingControllers = (): ReadonlySet<string> => {
+  const source = process.env.PI_FABRIC_MAIN_CONTROLLERS;
+  if (!source) return new Set();
+  let ids: unknown;
+  try { ids = JSON.parse(source); } catch { /* rejected below */ }
+  if (!Array.isArray(ids) || ids.some(id => typeof id !== "string" || !/^session:[^\s]+$/.test(id))) {
+    throw new Error("PI_FABRIC_MAIN_CONTROLLERS must be a JSON array of exact session:<id> strings");
+  }
+  return new Set(ids);
+};
+
 export class AgentsProvider implements FabricProvider {
   readonly #transcripts = new AgentTranscriptReader();
   readonly #toolCeiling = readChildToolAllowlist();
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
+  readonly #mainControllers = mainBindingControllers();
   readonly #taskReturnAddress = readTaskReturnAddress();
   readonly name = "agents";
   readonly description =
@@ -1343,6 +1357,7 @@ export class AgentsProvider implements FabricProvider {
       }
       case "setModel": {
         const id = String(args.id);
+        if (id.startsWith("session:")) return this.#setMainBinding("setModel", id, args, context);
         const model = typeof args.model === "string" ? args.model.trim() : "";
         this.manager.assertModelAllowed(model);
         if (args.scope === "global") {
@@ -1377,6 +1392,7 @@ export class AgentsProvider implements FabricProvider {
       }
       case "setThinking": {
         const id = String(args.id);
+        if (id.startsWith("session:")) return this.#setMainBinding("setThinking", id, args, context);
         const thinking = typeof args.thinking === "string" ? args.thinking.trim() : "";
         if (thinking && !isFabricThinking(thinking)) throw new Error(`Invalid Fabric actor thinking level: ${thinking}`);
         if (args.scope === "global") {
@@ -1604,12 +1620,107 @@ export class AgentsProvider implements FabricProvider {
     this.#lifecycleScheduler.schedule(subscription.to, { subscription, event });
   }
 
+  #assertMainBindingCaller(from: MeshIdentity): void {
+    const caller = from.id === this.actorManager.identity.id
+      ? this.participants.self() : this.participants.get(from.id, undefined, { fresh: true });
+    if (from.kind !== "main" || !caller || caller.kind !== "root" || caller.stale ||
+      caller.id !== from.id || caller.rootId !== from.id || caller.ownerIdentityId !== from.id ||
+      (from.id !== this.mainAgent.id && from.id !== this.#projectLeadId && !this.#mainControllers.has(from.id))) {
+      throw new Error(`Unauthorized Main binding change by ${from.id} on ${this.mainAgent.id}; only this Main, its recorded lead, or an enrolled org/product-owner Main may change it`);
+    }
+  }
+
+  async #applyMainBinding(
+    operation: "setModel" | "setThinking",
+    args: Record<string, unknown>,
+    from: MeshIdentity,
+    checkCommit: () => void,
+    context = this.mainAgent.bindingContext?.(),
+  ): Promise<FabricMainAgentBindingResult> {
+    this.#assertMainBindingCaller(from);
+    if (!context || !this.mainAgent.local || this.mainAgent.interactive === false || !this.mainAgent.setBinding) {
+      throw new Error(`Main ${this.mainAgent.id} is not live; no binding change was queued`);
+    }
+    checkCommit();
+    if (operation === "setThinking") {
+      const thinking = typeof args.thinking === "string" ? args.thinking.trim() : "";
+      if (!isFabricThinking(thinking)) throw new Error(`Invalid Main thinking level: ${thinking || "(missing)"}`);
+      return this.mainAgent.setBinding({ operation, thinking }, from.id, context, () => {
+        checkCommit(); this.#assertMainBindingCaller(from);
+      });
+    }
+    const selector = typeof args.model === "string" ? args.model.trim() : "";
+    if (!selector) throw new Error("Main model is required; a live session binding cannot be cleared");
+    const model = await resolvePiModel({ selector, registry: context.modelRegistry,
+      aliases: this.modelsConfig().aliases, policy: this.manager.config, closest: false });
+    return this.mainAgent.setBinding({ operation, model }, from.id, context, () => {
+      checkCommit(); this.#assertMainBindingCaller(from);
+    });
+  }
+
+  async #setMainBinding(
+    operation: "setModel" | "setThinking", id: string, args: Record<string, unknown>, context: FabricInvocationContext,
+  ): Promise<FabricMainAgentBindingResult> {
+    if (args.scope !== undefined && args.scope !== "session") throw new Error("Main bindings support only session scope");
+    const checkCommit = (): void => throwIfExecutionExpired(context);
+    checkCommit();
+    const targetId = id;
+    const from = this.actorManager.identity;
+    if (from.kind !== "main" || !this.mainAgent.local) {
+      throw new Error(`Unauthorized Main binding change by ${from.id}; task/actor lineage is not Main authority`);
+    }
+    if (targetId === this.mainAgent.id) {
+      const result = await this.#applyMainBinding(operation, args, from, checkCommit, context.extensionContext);
+      this.participants.scheduleRefresh();
+      return result;
+    }
+    const binding: FabricActorRunBinding = {};
+    if (operation === "setThinking") {
+      const thinking = typeof args.thinking === "string" ? args.thinking.trim() : "";
+      if (!isFabricThinking(thinking)) throw new Error(`Invalid Main thinking level: ${thinking || "(missing)"}`);
+      binding.thinking = thinking;
+    } else {
+      const model = typeof args.model === "string" ? args.model.trim() : "";
+      if (!model) throw new Error("Main model is required; a live session binding cannot be cleared");
+      this.manager.assertModelAllowed(model);
+      binding.model = model;
+    }
+    const target = this.participants.get(targetId, undefined, { fresh: true });
+    if (!target || target.kind !== "root" || target.stale || target.interactive === false || !["idle", "running"].includes(target.status) ||
+      target.rootId !== targetId || target.ownerIdentityId !== targetId || target.reloadUntil !== undefined ||
+      target.controlProtocol !== "v1" || !target.capabilities.includes("main-bindings") || !this.control) {
+      throw new Error(`Fabric participant ${targetId} has no live Main binding control path; nothing was queued`);
+    }
+    return this.control.requestResult<FabricMainAgentBindingResult>(
+      target.ownerHostId, target.id, operation,
+      { binding },
+      target.ownerIdentityId, { routedRemoteHost: target.remoteHost ?? null, ...(context.signal ? { signal: context.signal } : {}), timeoutMs: 5_000 },
+    );
+  }
+
   async acceptControl(
     command: FabricControlCommand,
     from: MeshIdentity,
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
+    if (command.operation === "setModel" || command.operation === "setThinking") {
+      try {
+        if ((verification !== "mesh" && verification !== "bridge") || !this.mainAgent.local || command.targetId !== this.mainAgent.id) {
+          throw new Error(`Unauthorized Main binding change by ${from.id} on ${command.targetId}`);
+        }
+        const checkCommit = (): void => {
+          if (signal?.aborted || (command.deadlineAt !== undefined && Date.now() >= command.deadlineAt)) {
+            throw new Error("Main binding control command expired or cancelled; nothing was queued");
+          }
+        };
+        const result = await this.#applyMainBinding(command.operation, { ...command.binding }, from, checkCommit);
+        this.participants.scheduleRefresh();
+        return { accepted: true, messageId: command.commandId, result };
+      } catch (error) {
+        return { accepted: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
     return this.#router.acceptControl(command, from, signal, verification);
   }
 

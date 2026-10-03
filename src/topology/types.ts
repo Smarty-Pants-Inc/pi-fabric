@@ -12,6 +12,7 @@ export type FabricParticipantCapability =
   | "stop"
   | "ask"
   | "actor-bindings"
+  | "main-bindings"
   | "attach"
   | "fabric";
 

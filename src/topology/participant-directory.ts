@@ -129,6 +129,7 @@ const capabilities = new Set([
   "stop",
   "ask",
   "actor-bindings",
+  "main-bindings",
   "attach",
   "fabric",
 ]);
@@ -964,7 +965,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",
-      capabilities: interactive ? ["steer", "followUp", "fabric"] : ["fabric"],
+      capabilities: interactive ? ["steer", "followUp", "fabric", "main-bindings"] : ["fabric"],
       interactive,
       ...(main.cwd ? { cwd: main.cwd, projectRoot: process.env.PI_FABRIC_PROJECT_ROOT ?? main.cwd } : {}),
       ...(project ? { project } : {}),

@@ -1,6 +1,6 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
-import type { RouteEvaluate } from "../agents/model-route.js";
+import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
@@ -102,6 +102,12 @@ import { terminalAgentStatuses } from "../agents/lifecycle.js";
 import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
 export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "./agents-progress.js";
+
+// Keep launch/default selection separate from authoritative effective or observed model.
+// Resolution provenance belongs in action results even when no activity sink is installed.
+const modelResolutionMetadata = (selection: { model?: unknown; via?: unknown }): { selectedModel?: string; via?: string } =>
+  typeof selection.model === "string" && typeof selection.via === "string"
+    ? { selectedModel: selection.model, via: selection.via } : {};
 
 const REMOTE_ASK_ACK_GRACE_MS = 30_000;
 const MAX_ACTIVITY_CWD_CHARS = 240;
@@ -410,7 +416,7 @@ export class AgentsProvider implements FabricProvider {
     readonly modelsConfig: () => FabricModelsConfig = () => DEFAULT_FABRIC_CONFIG.models,
     /** Current host effort, including child processes where the Main target is remote. */
     readonly callerThinking: () => string | undefined = () => undefined,
-    readonly routeEvaluate: RouteEvaluate = async () => { throw new Error("Jev routing unavailable"); },
+    readonly routeEvaluate: (request: JevRequest, signal: AbortSignal, context: FabricInvocationContext) => Promise<JevResponse> = async () => { throw new Error("Jev routing unavailable"); },
   ) {
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
@@ -477,24 +483,36 @@ export class AgentsProvider implements FabricProvider {
   }
 
   /** Resolve a Pi participant selector only within this session's visible registry. */
-  async #resolvePiModel(
+  async #resolvePiModelSelection(
     model: string,
     context: FabricInvocationContext,
-  ): Promise<string> {
+    closest = true,
+  ): Promise<{ model: string; via?: string }> {
     // A model added to models.json after startup resolves after one shared refresh (smarty-dev#1830).
     const resolved = await resolvePiModel({
       selector: model,
       registry: context.extensionContext.modelRegistry,
       aliases: this.modelsConfig().aliases,
       policy: this.manager.config,
+      ...(closest ? {} : { closest: false }),
     });
-    return `${resolved.provider}/${resolved.id}`;
+    const key = `${resolved.provider}/${resolved.id}`;
+    // Never closest-match silently (smarty-dev#3326): say which model an inexact name became.
+    if (resolved.via) {
+      context.activity?.({ type: "progress", message: `Model ${JSON.stringify(model)} → ${key} (via: "${resolved.via}")` });
+    }
+    return { model: key, ...(resolved.via ? { via: resolved.via } : {}) };
+  }
+
+  async #resolvePiModel(model: string, context: FabricInvocationContext): Promise<string> {
+    return (await this.#resolvePiModelSelection(model, context)).model;
   }
 
   async #resolvePiModelArgs(
     args: Record<string, unknown>,
     context: FabricInvocationContext,
     runnerOverride?: FabricAgentRunner,
+    closest = true,
   ): Promise<Record<string, unknown>> {
     const runner = runnerOverride ??
       (args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
@@ -511,26 +529,31 @@ export class AgentsProvider implements FabricProvider {
     if (model === "auto") throw new Error('model: "auto" is supported only by agents.spawn with required routing pins');
     const thinking = isFabricThinking(args.thinking) ? args.thinking
       : aliasThinking(this.modelsConfig().aliases, model);
-    const resolved = await this.#resolvePiModel(model, context);
-    return { ...args, model: resolved, ...(thinking ? { thinking } : {}) };
+    const resolved = await this.#resolvePiModelSelection(model, context, closest);
+    return { ...args, ...resolved, ...(thinking ? { thinking } : {}) };
   }
 
-  async #runRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
+  /** `closest: false` (agents.spawn) refuses an inexact requested model instead of closest-matching it. */
+  async #runRequest(args: Record<string, unknown>, context: FabricInvocationContext, closest = true): Promise<AgentRunRequest & { via?: string }> {
     const request = runRequest(args, context, this.manager, { inheritedThinking: this.callerThinking() });
     const model = request.model ?? this.manager.defaultModel(request.runner);
-    return await this.#resolvePiModelArgs({ ...request, ...(model ? { model } : {}) }, context) as unknown as AgentRunRequest;
+    return await this.#resolvePiModelArgs(
+      { ...request, ...(model ? { model } : {}) }, context, undefined, closest || request.model === undefined,
+    ) as unknown as AgentRunRequest & { via?: string };
   }
 
-  async #admitActorRequest(request: FabricActorRequest, context: FabricInvocationContext): Promise<FabricActorRequest> {
+  async #admitActorRequest(request: FabricActorRequest, context: FabricInvocationContext, closest = true): Promise<FabricActorRequest & { via?: string }> {
     const model = request.model ?? this.manager.defaultModel(request.runner);
     if (!model && (request.runner === "pi" || this.manager.config.deniedModels.length === 0)) return request;
-    const resolved = await this.#resolvePiModelArgs({ model, thinking: request.thinking }, context, request.runner);
+    const resolved = await this.#resolvePiModelArgs(
+      { model, thinking: request.thinking }, context, request.runner, closest || request.model === undefined,
+    );
     // Templates and unbound live actors retain their dynamic defaults, after validation.
-    return request.model ? { ...request, model: resolved.model as string, ...(isFabricThinking(resolved.thinking) ? { thinking: resolved.thinking } : {}) } : request;
+    return request.model ? { ...request, ...modelResolutionMetadata(resolved), model: resolved.model as string, ...(isFabricThinking(resolved.thinking) ? { thinking: resolved.thinking } : {}) } : request;
   }
 
   async #prepareSpawnRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
-    if (args.model !== "auto") return this.#runRequest(args, context);
+    if (args.model !== "auto") return this.#runRequest(args, context, false);
     const runner = args.runner ?? this.manager.config.runner;
     const transport = args.transport ?? this.manager.config.transport;
     if (runner !== "pi" || transport !== "process" || (args.residency !== undefined && args.residency !== "session") ||
@@ -570,9 +593,9 @@ export class AgentsProvider implements FabricProvider {
     const { decideModelRoute } = await import("../agents/model-route.js");
     const routeDecision = await decideModelRoute({ routeClass: args.routeClass, protected: args.protected, pin,
       candidates, candidatesValid, parentSessionId: context.extensionContext.sessionManager?.getSessionId() ?? this.participants.self().sessionId ?? "unknown" },
-      this.routeEvaluate, context.signal);
+      (request, signal) => this.routeEvaluate(request, signal, context), context.signal);
     // PR1 invariant: the choice is recorded, but dispatch ALWAYS uses the role pin.
-    return { ...await this.#runRequest(resolved, context), routeDecision };
+    return { ...await this.#runRequest(resolved, context, false), routeDecision };
   }
 
   async #resolvePiRunBinding(
@@ -581,7 +604,9 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Promise<FabricActorRunBinding> {
     if (runner !== "pi" || !binding.model) return binding;
-    return { ...binding, model: await this.#resolvePiModel(binding.model, context) };
+    // ask/tell receipts do not expose selection provenance; refuse ranked closest picks.
+    // Remote bindings stay raw until their execution owner's admission boundary.
+    return { ...binding, model: (await this.#resolvePiModelSelection(binding.model, context, false)).model };
   }
 
   async list(
@@ -633,6 +658,7 @@ export class AgentsProvider implements FabricProvider {
       { ...args, model },
       context,
       "pi",
+      false,
     );
     delete handoffArgs.cwd;
     const request = runRequest({ ...handoffArgs, runner: "pi" }, context, this.manager);
@@ -665,6 +691,8 @@ export class AgentsProvider implements FabricProvider {
           model,
         },
         context,
+        "pi",
+        false,
       ),
       context,
       this.manager,
@@ -749,8 +777,9 @@ export class AgentsProvider implements FabricProvider {
     switch (actionName) {
       case "run": {
         const main = isInteractiveMain(context.extensionContext);
+        const request = await this.#runRequest(args, context);
         const handle = await this.manager.spawn(
-          await this.#runRequest(args, context),
+          request,
           // Only the branded Main ceiling is observation-only, including during launch.
           // Escape and ordinary deadlines retain zero-progress child cancellation.
           main ? withoutMainExecutionCeiling(context.signal) : context.signal,
@@ -765,7 +794,7 @@ export class AgentsProvider implements FabricProvider {
             name: handle.name,
           });
           context.update(agentStartedMessage(handle));
-          return await waitWithProgress(
+          const result = await waitWithProgress(
             this.manager,
             this.#transcripts,
             handle.id,
@@ -773,12 +802,13 @@ export class AgentsProvider implements FabricProvider {
             this.agentToolPreviewEnabled,
             { ...(main ? { timeoutMs, ...(context.signal ? { signal: context.signal } : {}) } : {}), ...(context.deferResultConsumption ? { deferConsumption: context.deferResultConsumption } : {}) },
           );
+          return { ...result, ...modelResolutionMetadata(request) };
         } catch (error) {
           // A launch can spend the remaining budget before its first update/wait.
           // Accepted work still needs a detached completion owner in that case.
           if (main && mainExecutionCeilingAbortReason(context.signal)) this.manager.detachSignal(handle.id);
           if (!main || !(error instanceof AgentWaitBoundError)) throw error;
-          return this.#mainWaitAtBound(this.manager.status(handle.id), timeoutMs);
+          return { ...this.#mainWaitAtBound(this.manager.status(handle.id), timeoutMs), ...modelResolutionMetadata(request) };
         }
       }
       case "handoff":
@@ -865,6 +895,7 @@ export class AgentsProvider implements FabricProvider {
           const result = this.manager.status(id);
           // Model-facing terminal status returns the result; UI polling must not acknowledge it.
           if (terminalAgentStatuses.has(result.status)) {
+            this.manager.prepareForeground(id);
             if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.detachSignal(id));
             else this.manager.markForeground(id);
           }
@@ -917,6 +948,9 @@ export class AgentsProvider implements FabricProvider {
         return this.participants.self();
       case "main":
         return this.mainAgent.info(context.extensionContext);
+      case "spawner":
+        if (!this.#router.spawner) throw new Error("This worker has no bound Fabric spawner; specify an explicit reply target");
+        return structuredClone(this.#router.spawner);
       case "sessions": {
         const stalled = this.participants.writeStalled?.();
         if (stalled) throw stalled;
@@ -1116,7 +1150,7 @@ export class AgentsProvider implements FabricProvider {
       }
       case "create": {
         const request = await this.#admitActorRequest(
-          actorRequest(args, context, this.manager, args.scope !== "global", this.callerThinking()), context,
+          actorRequest(args, context, this.manager, args.scope !== "global", this.callerThinking()), context, false,
         );
         if (args.scope === "global") {
           checkCommit();
@@ -1299,29 +1333,32 @@ export class AgentsProvider implements FabricProvider {
         if (args.scope === "global") {
           const template = this.globalActors.resolve(id);
           if (!template) throw new Error(`Unknown global actor: ${id}`);
-          const resolved = model && template.runner === "pi" ? await this.#resolvePiModel(model, context) : model;
+          const resolved = model && template.runner === "pi"
+            ? await this.#resolvePiModelSelection(model, context) : { model };
           checkCommit();
-          return this.globalActors.update(template.id, { model: resolved });
+          return { ...this.globalActors.update(template.id, { model: resolved.model }), ...modelResolutionMetadata(resolved) };
         }
         const target = this.#resolveActorTarget(id);
         const runner = target.actor?.runner ?? target.participant!.runner;
         const resident = this.#residentActorOwner(id);
-        const residentModel = resident && model
-          ? (await this.#resolvePiModelArgs({ model }, context, runner)).model as string : model;
-        if (resident) return this.#setResidentActor(resident, {
-          operation: "setModel", id: resident.id, ...(residentModel ? { model: residentModel } : {}),
-          scope: args.scope === "project" ? "project" : "session",
-        }, context);
         const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;
-        const resolvedModel = model && (ownsActor || this.manager.config.deniedModels.length > 0)
-          ? (await this.#resolvePiModelArgs({ model }, context, runner)).model as string
-          : model || undefined;
-        return this.actorManager.setModel(
+        const resolved = model && (resident || ownsActor || this.manager.config.deniedModels.length > 0)
+          ? await this.#resolvePiModelArgs({ model }, context, runner) : { model: model || undefined };
+        const resolvedModel = resolved.model as string | undefined;
+        if (resident) {
+          const actor = await this.#setResidentActor(resident, {
+            operation: "setModel", id: resident.id, ...(resolvedModel ? { model: resolvedModel } : {}),
+            scope: args.scope === "project" ? "project" : "session",
+          }, context);
+          return { ...actor, ...modelResolutionMetadata(resolved) };
+        }
+        const actor = await this.actorManager.setModel(
           id,
           resolvedModel,
           args.scope === "project" ? "project" : "session",
           checkCommit,
         );
+        return { ...actor, ...modelResolutionMetadata(resolved) };
       }
       case "setThinking": {
         const id = String(args.id);
@@ -1477,7 +1514,7 @@ export class AgentsProvider implements FabricProvider {
         const actor = await this.#createActor(resolvedRequest, context);
         this.participants.scheduleRefresh();
         context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
-        return actor;
+        return { ...actor, ...modelResolutionMetadata(resolvedRequest) };
       }
       case "export": {
         // Agents called export to read an actor and left stray global templates (smarty-dev#918).
@@ -1639,7 +1676,7 @@ export class AgentsProvider implements FabricProvider {
     const live = this.participants.get(actor.id, undefined, { fresh: true });
     // Strip passive counts and runs even when an older owner omits its live counters.
     // In particular, an idle owner without actorRun must clear a registry's stale run.
-    const { queued: _queued, messages: _messages, inFlightRun: _run, ...definition } = actor;
+    const { queued: _queued, messages: _messages, preparing: _preparing, inFlightRun: _run, ...definition } = actor;
     if (!live || live.stale || live.kind !== "actor") return { ...definition, status: "unknown" };
     const now = Date.now();
     const removal = live.actorRemoval ?? actor.removal;
@@ -1647,12 +1684,16 @@ export class AgentsProvider implements FabricProvider {
     const runId = removal?.runId ?? run?.id;
     const runAge = formatAge(now - (removal?.runStartedAt ?? run?.startedAt ?? removal?.requestedAt ?? now));
     const status = live.status === "idle" || live.status === "queued" ||
+      live.status === "preparing" || live.status === "waiting" ||
       live.status === "running" || live.status === "stopped" ? live.status : "unknown";
     return {
       ...definition,
       status,
       ...(live.actorQueued !== undefined ? { queued: live.actorQueued } : {}),
       ...(live.actorMessages !== undefined ? { messages: live.actorMessages } : {}),
+      ...(live.actorPreparing
+        ? { preparing: { ...live.actorPreparing, ageS: Math.max(0, Math.round((now - live.actorPreparing.startedAt) / 1_000)) } }
+        : {}),
       ...(run ? { inFlightRun: { ...run, ageS: Math.max(0, Math.round((now - run.startedAt) / 1_000)) } } : {}),
       ...(removal
         ? {

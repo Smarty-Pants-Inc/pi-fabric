@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { terminateWindowsTree } from "../child-process-tree.js";
 import type { VerifyStatus } from "./types.js";
 
 export interface RunCommandOptions {
@@ -35,46 +36,6 @@ const truncateUtf8 = (
   return { value: bounded, omittedBytes: bytes.length - end };
 };
 
-const terminateWindowsTree = (child: ChildProcess): Promise<void> =>
-  new Promise((resolve) => {
-    if (child.pid === undefined) {
-      resolve();
-      return;
-    }
-    let settled = false;
-    let timeout: NodeJS.Timeout | undefined;
-    const finish = (): void => {
-      if (settled) return;
-      settled = true;
-      if (timeout) clearTimeout(timeout);
-      resolve();
-    };
-    const treeKillCommand = ["task", "kill"].join("");
-    const killer = spawn(treeKillCommand, ["/pid", String(child.pid), "/T", "/F"], {
-      windowsHide: true,
-      stdio: "ignore",
-    });
-    killer.once("error", () => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // The process may already have exited.
-      }
-      finish();
-    });
-    killer.once("close", finish);
-    timeout = setTimeout(() => {
-      try {
-        killer.kill("SIGKILL");
-        child.kill("SIGKILL");
-      } catch {
-        // Bounded best effort is all Windows can guarantee here.
-      }
-      finish();
-    }, 1_000);
-    timeout.unref?.();
-  });
-
 const terminateProcessTree = async (child: ChildProcess): Promise<void> => {
   if (process.platform === "win32") {
     await terminateWindowsTree(child);
@@ -95,7 +56,8 @@ const terminateProcessTree = async (child: ChildProcess): Promise<void> => {
 // Shell evidence is trusted input. Output is streamed into a byte-bounded
 // prefix while a hash and byte count cover the complete stdout/stderr stream.
 // POSIX shells lead detached process groups so timeout/abort can kill the
-// group. Windows uses bounded taskkill tree cleanup and then a direct fallback.
+// group. Windows joins successful taskkill tree cleanup; a failed helper
+// retains an alarmed uncertain-tree fence rather than trusting a parent-only kill.
 export const runCommand = (
   command: string,
   options: RunCommandOptions,

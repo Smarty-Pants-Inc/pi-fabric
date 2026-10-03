@@ -10,10 +10,16 @@ merge_queue:
 # PR, smarty-dev#455) makes a new head that never gets them. So merge_conditions only refuse a
 # failed review, as smarty-dev's .mergify.yml does (smarty-dev#440, #1537), and still require
 # fresh CI on the updated head (smarty-dev#2974).
+# ponytail: queue runs re-run the full Ubuntu+Windows suite on a fresh merge; under fleet load the Ubuntu job has taken 30.7 min
+# (#248 at 15:13Z and 18:02Z), so a 30-min timeout dequeues green PRs. 45 min leaves headroom; revisit when CI is faster.
 queue_rules:
   - name: default
-    batch_size: 1
-    checks_timeout: 30 min
+    # ponytail: one Ubuntu+Windows run takes ~30 min under fleet load, so a serial queue of N PRs takes N
+    # half-hours (7 queued on 10-02 = 3.5 h). Batching tests up to 4 queued PRs in one CI run; Mergify
+    # bisects a failing batch. smarty-dev batches the same way (smarty-dev#2083).
+    batch_size: 4
+    batch_max_wait_time: 2 min
+    checks_timeout: 45 min
     merge_method: merge
     queue_conditions:
       - base = main

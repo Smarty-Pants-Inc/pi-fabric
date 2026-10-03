@@ -32,7 +32,8 @@ const flag = (args: string[], name: string): string | undefined => {
   const index = args.indexOf(name);
   return index < 0 ? undefined : args[index + 1];
 };
-const activeLabel = (settings: string): string => {
+const activeLabel = (settings: string | undefined): string => {
+  if (!settings) return "unknown";
   const root = activeFabricRoot(settings);
   return root ? releaseLabel(root) : "unknown";
 };
@@ -68,20 +69,26 @@ export const collectHostReleases = (options: { procRoot?: string; settingsPath?:
     } catch { skippedProcesses += 1; } // exited during snapshot or belongs to another OS user
   }
   const records = new Map<number, MainReleaseProcess>();
+  const profiles = new Map<number, string>();
   for (const process of processes.values()) {
-    const profileSettings = options.settingsPath ?? (process.env.PI_CODING_AGENT_DIR
-      ? path.join(process.env.PI_CODING_AGENT_DIR, "settings.json") : settings);
     try {
+      const profileSettings = options.settingsPath ?? (process.env.PI_CODING_AGENT_DIR
+        ? path.join(resolveAgentDir(process.env.PI_CODING_AGENT_DIR), "settings.json") : settings);
+      profiles.set(process.pid, profileSettings);
       const record = JSON.parse(fs.readFileSync(path.join(mainReleaseRecordDir(profileSettings), `${process.pid}.json`), "utf8")) as MainReleaseProcess;
       if (record.pid === process.pid && record.start === process.start && typeof record.loadedRoot === "string" && typeof record.sessionId === "string") {
         records.set(process.pid, record);
       }
-    } catch { /* Older Mains have no record. Do not label them with today's selector. */ }
+    } catch {
+      // Invalid observed profiles are skipped once, without borrowing the observer's profile.
+      if (!profiles.has(process.pid)) skippedProcesses += 1;
+      // Older Mains have no record. Do not label them with today's selector.
+    }
   }
   const mains = new Map<string, MainRelease>();
   const mainsByPid = new Map<number, MainRelease>();
-  const profile = (process: ProcessInfo): string => options.settingsPath ?? (process.env.PI_CODING_AGENT_DIR
-    ? path.join(process.env.PI_CODING_AGENT_DIR, "settings.json") : settings);
+  // Reuse the per-process resolution for Mains, residents, and workers; invalid profiles stay unknown.
+  const profile = (process: ProcessInfo): string | undefined => profiles.get(process.pid);
   for (const process of processes.values()) {
     const record = records.get(process.pid);
     const pi = process.args.slice(0, 2).map(normalizedArg).some(arg => path.posix.basename(arg) === "pi" || /(?:pi-coding-agent|pi-runtime).*\/cli\.js$/.test(arg));

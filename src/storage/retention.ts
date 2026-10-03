@@ -139,6 +139,8 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 const runFiles = new Set([
   "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
   "reply.json", "relaunches.jsonl", "route-session.jsonl",
+  // Native session of an unrouted process Pi task (worker.ts persistentPiTask); owned file only.
+  "session.jsonl",
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
@@ -160,16 +162,22 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       const stat = ownedStat(file);
       if (!stat) return false;
       if (stat.isFile() && runFile(name)) continue;
+      if (stat.isDirectory() && name === "handoff-session") {
+        // This directory is exclusively populated by Fabric's session fork writer.
+        if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "deliveries") {
         // The worker always creates this ingress directory; the native Pi hook
         // unlinks consumed items. Any remaining item is pending or unknown,
         // even when it has a known filename or valid JSON: keep the whole run.
         if (fs.readdirSync(file).length !== 0) return false;
-        continue;
-      }
-      if (stat.isDirectory() && name === "handoff-session") {
-        // This directory is exclusively populated by Fabric's session fork writer.
-        if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
+        // Only the worker's UUID-addressed private delivery envelopes are ours.
+        // Empty directories are normal; unknown content, links and non-files veto.
+        for (const child of fs.readdirSync(file)) {
+          if (expired() || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/.test(child) ||
+              !ownedStat(path.join(file, child))?.isFile()) return false;
+        }
         continue;
       }
       if (stat.isDirectory() && name === "nested") {

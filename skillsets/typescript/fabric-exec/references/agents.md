@@ -52,6 +52,14 @@ return await agents.wait({ id: handle.id });
 
 Detached `agents.spawn()` runs notify Main on terminal completion when `agents.notifyOnComplete` is enabled (the default). Unread results are batched after the current tool turn, or wake idle Main once; concise UI notices appear immediately. `agents.wait()`/`join()` and terminal `agents.status()` acknowledge the result and retract pending notifications, even if completion preceded the wait. Running status and UI/list polling do not acknowledge it. Return the relevant outcome from your program so Main sees results you consumed. Use `wait` when the program needs a result; do not poll status in a loop. Durable spawns preserve unread deliveries and acknowledgment across reconnects. Escape/error parks results until new input. Use lifecycle subscriptions for explicit event-routing policies, not to duplicate automatic completion delivery.
 
+## Immediate spawner vs root Main
+
+`agents.spawner()` returns this child's `{ id, kind, runId? }`. Use `agents.followUp({ id: "spawner", message: "..." })` for an addressed update to that participant. An actor's child is bound to the actor plus its activation run; `agents.main()` and `id: "main"` intentionally remain the lineage root, not the actor. A missing binding throws without a root fallback; respawn old workers after updating Fabric.
+
+Unread child completions join the actor's current run inbox. If it ends first, the result is stored with the actor and delivered once to its next mailbox activation; wait/status and live delivery suppress that copy. The mailbox includes `data.resultFile` for reading the full text/structured value after the original worker ends. A stopped actor keeps unread results, never silently redirects them to Main. Session-owned children still stop when their spawning worker ends; the stopped result is preserved.
+
+For review roles on older installations, use `return await agents.run({ task: "Review the bounded subtask; return findings, do not message Main.", transport: "process" });` in the same program, or spawn followed by `await agents.wait({ id: child.id })`. Inspect status/error; an expired wait/program deadline is not a completed review. Ordinary final results are returned automatically and do not require `fabric_reply`.
+
 ## Participant lifecycle subscriptions
 
 Lifecycle subscriptions are durable, source-qualified mesh routes. They let Main, an actor, or an active agent react to another root/agent/actor without model-authored polling.

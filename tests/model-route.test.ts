@@ -261,6 +261,44 @@ describe("durable route dispatch", () => {
     const rows = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null }); expect(launch).not.toHaveBeenCalled();
   });
+  it("R-2 queued worktree-preparation cancellation has one stopped receipt and ledger outcome", async () => {
+    const dir = root(); const final = root();
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"),
+    });
+    managers.push(manager);
+    const blocker = await manager.spawn({ task: "HANG", transport: "process" });
+    let release!: () => void; let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    const create = vi.spyOn(WorktreeManager.prototype, "create").mockImplementation(async () => {
+      entered(); await gate;
+      return { gitRoot: dir, path: final, cwd: final, branch: "cancelled-preparation" };
+    });
+    const cleanup = vi.spyOn(WorktreeManager.prototype, "cleanup").mockResolvedValue(true);
+    // The occupying worker is already launched: this spy counts only the queued task.
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const decision = await decideModelRoute(input, async () => response());
+      const queued = await manager.spawn({ task: "cancel during worktree creation", worktree: true, routeDecision: decision, transport: "process" });
+      expect(queued.status).toBe("queued");
+      await manager.stop(blocker.id);
+      await preparing;
+      const stopping = manager.stop(queued.id);
+      release(); // preparation succeeds after cancellation; the pre-launch check must stop it
+      const receipt = await stopping;
+      expect(receipt).toMatchObject({ id: queued.id, status: "stopped", error: "Agent launch aborted" });
+      expect(await manager.wait(queued.id)).toMatchObject({ status: "stopped" });
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledWith(queued.id, true);
+      expect(launch).not.toHaveBeenCalled();
+      const outcomes = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n").map(line => JSON.parse(line))
+        .filter(row => row.type === "outcome" && row.decisionId === decision.decisionId);
+      expect(outcomes).toHaveLength(1);
+      expect(outcomes[0]).toMatchObject({ childSessionId: queued.id, status: receipt.status, admittedModel: null, admittedEffort: null });
+    } finally { release(); }
+  });
+
   it("R2 retains and retries a failed queued outcome before cleanup", async () => {
     const dir = root(); const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs") }); managers.push(manager);
     const blocker = await manager.spawn({ task: "HANG", transport: "process" });

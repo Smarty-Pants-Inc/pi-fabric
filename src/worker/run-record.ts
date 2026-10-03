@@ -17,6 +17,19 @@ export const emptyUsage = (): AgentUsage => ({
   cost: 0,
 });
 
+// Keep the plain-Node worker boundary self-contained (see renameWithRetry).
+const workerProcessIdentity = (): Pick<AgentRunRecord, "sessionId" | "processStartTime"> => {
+  const identity: Pick<AgentRunRecord, "sessionId" | "processStartTime"> = { sessionId: String(process.pid) };
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+      const started = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+      if (started) identity.processStartTime = started;
+    } catch { /* Missing birth identity is not proof of absence; retain the PID. */ }
+  }
+  return identity;
+};
+
 export const createRunningRecord = (
   options: AgentWorkerOptions,
   task: string,
@@ -25,6 +38,7 @@ export const createRunningRecord = (
 ): AgentRunRecord => ({
   id: options.id,
   name: options.name,
+  ...(options.spawner ? { spawner: options.spawner } : {}),
   task,
   status: "running",
   runner: options.runner,
@@ -32,6 +46,9 @@ export const createRunningRecord = (
   ...(options.fabricSessionId ? { fabricSessionId: options.fabricSessionId } : {}),
   ...(options.kernel ? { kernel: options.kernel } : {}),
   transport: options.transport,
+  // The publisher must save its own identity before any terminal publication;
+  // the manager's enriched in-memory result is not a persistent exit receipt.
+  ...(options.transport === "process" ? workerProcessIdentity() : {}),
   cwd: options.cwd,
   ...(options.model ? { model: options.model, requestedModel: options.model } : {}),
   ...(thinking ? { thinking } : {}),
@@ -44,6 +61,7 @@ export const createRunningRecord = (
   startedAt,
   updatedAt: startedAt,
   turns: options.carryOver?.turns ?? 0,
+  ...(options.runner === "pi" ? { inferenceStarted: false } : {}),
   toolCalls: options.carryOver?.toolCalls ?? 0,
   text: "",
   usage: options.carryOver?.usage ?? emptyUsage(),

@@ -664,6 +664,50 @@ const setup = (
   };
 };
 
+describe("#2643 immediate bound spawner routing", () => {
+  it.each(["session", "durable"] as const)("routes a %s actor child's spawner followUp to the actor, not root Main", async (residency) => {
+    const h = setup();
+    const actor = await h.actors.create({ name: "review-parent", instructions: "Review.", residency, delivery: "mailbox", responseMode: "text" });
+    vi.stubEnv("PI_FABRIC_SPAWNER_ID", actor.id);
+    vi.stubEnv("PI_FABRIC_SPAWNER_KIND", "actor");
+    vi.stubEnv("PI_FABRIC_SPAWNER_RUN", "a".repeat(32));
+    try {
+      const child = new AgentsProvider(h.agents, h.actors, h.globalActors, h.mainAgent, h.participants, h.control, h.lifecycle);
+      expect(await child.describe("spawner", context)).toMatchObject({ name: "spawner", risk: "read" });
+      expect(await child.invoke("spawner", {}, context)).toEqual({ id: actor.id, kind: "actor", runId: "a".repeat(32) });
+      const registry = new ActionRegistry(); registry.register(child);
+      const service = new FabricExecutionService(registry, structuredClone(DEFAULT_FABRIC_CONFIG));
+      const guest = await service.execute({ code: "return await agents.spawner();", context: context.extensionContext,
+        signal: undefined, parentToolCallId: "bound-spawner-guest", onPartial() {} });
+      expect(guest.success, guest.error ?? JSON.stringify(guest.typeErrors)).toBe(true);
+      expect(guest.value).toEqual({ id: actor.id, kind: "actor", runId: "a".repeat(32) });
+      await expect(child.invoke("followUp", { id: "spawner", message: "private sub-result" }, context)).resolves.toMatchObject({ queued: true, routed: "local" });
+      expect(h.actors.messages(actor.id).filter((message) => message.direction === "in")).toEqual([
+        expect.objectContaining({ data: { message: "private sub-result" } }),
+      ]);
+      expect(h.mainDeliveries).toEqual([]);
+      // Main is still deliberately the root; this is not a lineage-id rewrite.
+      await child.invoke("followUp", { id: "main", message: "explicit root notice" }, context);
+      expect(h.mainDeliveries).toEqual([expect.objectContaining({ message: "explicit root notice" })]);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("uses Main only for a Main spawner and refuses an absent binding without root fallback", async () => {
+    vi.stubEnv("PI_FABRIC_SPAWNER_ID", "session:test");
+    vi.stubEnv("PI_FABRIC_SPAWNER_KIND", "main");
+    vi.stubEnv("PI_FABRIC_SPAWNER_RUN", "");
+    try {
+      const h = setup();
+      await h.provider.invoke("followUp", { id: "spawner", message: "root's own child" }, context);
+      expect(h.mainDeliveries).toEqual([expect.objectContaining({ message: "root's own child" })]);
+      vi.stubEnv("PI_FABRIC_SPAWNER_ID", undefined);
+      const unbound = new AgentsProvider(h.agents, h.actors, h.globalActors, h.mainAgent, h.participants, h.control, h.lifecycle);
+      await expect(unbound.invoke("followUp", { id: "spawner", message: "do not leak" }, context)).rejects.toThrow("no bound Fabric spawner");
+      expect(h.mainDeliveries).toHaveLength(1);
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
+
 describe('model: "auto" spawn routing (#2890)', () => {
   beforeEach(() => {
     const host = fs.mkdtempSync(path.join(os.tmpdir(), "route-provider-host-")); roots.push(host);
@@ -1849,12 +1893,15 @@ describe("AgentsProvider runner support", () => {
     const setThinking = await provider.describe("setThinking", context);
     const properties = (descriptor: typeof ask) =>
       (descriptor?.inputSchema as {
-        properties: Record<string, { enum?: string[] }>;
+        properties: Record<string, { enum?: string[]; description?: string }>;
       }).properties;
 
     expect(properties(ask)).toHaveProperty("model");
     expect(properties(ask).thinking?.enum).toContain("xhigh");
     expect(properties(tell)).toHaveProperty("model");
+    for (const descriptor of [ask, tell]) {
+      expect(properties(descriptor).model?.description).toContain("refuse ranked closest matches");
+    }
     expect(properties(setModel).scope?.enum).toEqual(["session", "project", "global"]);
     expect(properties(setThinking).scope?.enum).toEqual(["session", "project", "global"]);
   });
@@ -2768,6 +2815,8 @@ describe("AgentsProvider runner support", () => {
       ...context, signal: controller.signal,
       extensionContext: { ...context.extensionContext, mode: "tui", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
     };
+    const realStatus = agents.status.bind(agents);
+    vi.spyOn(agents, "status").mockImplementation(id => ({ ...realStatus(id), model: "cliproxyapi/gpt-6.1-sol" }));
     const realWait = agents.wait.bind(agents);
     let waitOptions: Parameters<AgentManager["wait"]>[1];
     const waiting = new Promise<void>(resolve => {
@@ -2778,7 +2827,7 @@ describe("AgentsProvider runner support", () => {
         return realWait(id, options);
       });
     });
-    const run = provider.invoke("run", { task: "HANG", transport: "process", timeoutMs }, mainContext);
+    const run = provider.invoke("run", { task: "HANG", transport: "process", timeoutMs, model: "gpt-sol" }, mainContext);
     try {
       await waiting;
       let settled = false;
@@ -2789,7 +2838,7 @@ describe("AgentsProvider runner support", () => {
       expect(settled).toBe(true);
       const result = await run as Record<string, unknown>;
       expect(waitOptions?.timeoutMs).toBe(60_000);
-      expect(result).toMatchObject({ status: "running", waitTimedOut: true });
+      expect(result).toMatchObject({ status: "running", waitTimedOut: true, model: "cliproxyapi/gpt-6.1-sol", selectedModel: "cliproxyapi/gpt-6-sol", via: "closest" });
       expect(result.note).toMatch(/continues.*completion message/);
       expect(mainAgent.flushHeldAtNextBoundary).toHaveBeenCalledOnce();
       controller.abort();
@@ -3722,6 +3771,42 @@ describe("#2726 resident actor live read views", () => {
     expect(state.get).toHaveBeenCalledWith(state.actor.id, undefined, { fresh: true });
     return (action === "actors" ? (result as FabricActorReadInfo[]).find(row => row.id === state.actor.id) : result) as FabricActorReadInfo;
   };
+
+  it.each([
+    ["actorStatus", "preparing"], ["actorStatus", "waiting"],
+    ["actors", "preparing"], ["actors", "waiting"],
+  ] as const)("#3307 %s preserves %s diagnostics without resident RPC and clears old receipts", async (action, status) => {
+    const state = await passiveState();
+    const resident = vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue(undefined);
+    try {
+      const preparing = {
+        phase: status === "waiting" ? "waiting" : "binding", startedAt: Date.now() - 5_000,
+        ageS: 0, attempts: 2,
+        ...(status === "waiting" ? { runId: "admission-receipt", queuePosition: 0 } : {}),
+      };
+      const { actorRun: _run, ...owner } = state.live;
+      const live = { ...owner, status, actorPreparing: preparing };
+      state.setLive(live);
+      const view = await read(state, action);
+      expect(view).toMatchObject({ status, queued: 2, messages: 7,
+        preparing: { ...preparing, ageS: expect.any(Number) } });
+      expect(view.preparing!.ageS).toBeGreaterThanOrEqual(5);
+      expect(view.inFlightRun).toBeUndefined();
+
+      // A passive snapshot must not retain diagnostics absent from the fresh owner.
+      const oldView = { ...state.actor, status, preparing };
+      const actorStatus = vi.spyOn(state.passive, "status").mockReturnValue(oldView);
+      const actors = vi.spyOn(state.passive, "list").mockReturnValue([oldView]);
+      try {
+        for (const current of [{ ...owner, status: "idle" }, { ...live, stale: true }, undefined]) {
+          state.setLive(current);
+          const cleared = await read(state, action);
+          expect(cleared.status).toBe(current && !current.stale ? "idle" : "unknown");
+          expect(cleared.preparing).toBeUndefined();
+        }
+      } finally { actorStatus.mockRestore(); actors.mockRestore(); }
+    } finally { resident.mockRestore(); }
+  });
 
   it.each(["actorStatus", "actors"] as const)("%s reads fresh running owner counts, then clears the settled run on idle", async action => {
     const state = await passiveState();
@@ -5255,6 +5340,170 @@ describe("AgentsProvider switchModel", () => {
     },
   );
 
+  it("refuses closest-match models for agents.spawn and agents.create but keeps exact ids and aliases (smarty-dev#3326)", async () => {
+    const { provider, agents, actors } = setup([], [], undefined, {
+      modelsConfig: { aliases: { sol: { targets: ["cliproxyapi/gpt-6.1-sol"] } } },
+    });
+    const spawn = vi.spyOn(agents, "spawn");
+    const invocation: FabricInvocationContext = {
+      ...context,
+      extensionContext: {
+        modelRegistry: { getAvailable: () => [
+          { provider: "cliproxyapi", id: "gpt-6-sol" },
+          { provider: "cliproxyapi", id: "gpt-6.1-sol" },
+        ] },
+      } as unknown as ExtensionContext,
+    };
+    const refused = /not an exact model id or configured alias.*Candidates: (?=.*cliproxyapi\/gpt-6-sol\b)(?=.*cliproxyapi\/gpt-6\.1-sol\b)/;
+    await expect(provider.invoke("spawn", { task: "t", model: "gpt-sol" }, invocation)).rejects.toThrow(refused);
+    await expect(provider.invoke("create", { name: "a", instructions: "i", model: "gpt-sol" }, invocation)).rejects.toThrow(refused);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(actors.list()).toEqual([]);
+    await expect(provider.invoke("spawn", { task: "t", model: "sol" }, invocation))
+      .resolves.toMatchObject({ model: "cliproxyapi/gpt-6.1-sol" });
+    await expect(provider.invoke("spawn", { task: "t", model: "cliproxyapi/gpt-6-sol" }, invocation))
+      .resolves.toMatchObject({ model: "cliproxyapi/gpt-6-sol" });
+    const activity = vi.fn();
+    await provider.invoke("run", { task: "t", model: "gpt-sol" }, { ...invocation, activity });
+    expect(activity).toHaveBeenCalledWith(expect.objectContaining({ type: "progress", message: expect.stringContaining('via: "closest"') }));
+  });
+
+  it.each(["ask", "tell"] as const)("refuses ranked closest activation overrides for agents.%s without activity", async (action) => {
+    const { provider, actors, agents } = setup();
+    const { activity: _activity, ...invocation } = context;
+    expect(invocation).not.toHaveProperty("activity");
+    const actor = await provider.invoke("create", {
+      name: "strict-activation", instructions: "i", model: "cliproxyapi/gpt-6.1-sol",
+    }, invocation) as FabricActorInfo;
+    const deliver = vi.spyOn(actors, action);
+    const spawn = vi.spyOn(agents, "spawn");
+    try {
+      await expect(provider.invoke(action, {
+        id: actor.id, message: "Do not activate", model: "gpt-sol",
+      }, invocation)).rejects.toThrow(/not an exact model id or configured alias.*Candidates: (?=.*cliproxyapi\/gpt-6-sol\b)(?=.*cliproxyapi\/gpt-6\.1-sol\b)/);
+      expect(deliver).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
+      expect(actors.status(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", status: "idle" });
+    } finally { deliver.mockRestore(); spawn.mockRestore(); }
+  });
+
+  it.each(["ask", "tell"] as const)("keeps exact ids and configured aliases for agents.%s activation overrides without activity", async (action) => {
+    const { provider, actors } = setup([], [], undefined, {
+      modelsConfig: { aliases: { closest: { targets: ["cliproxyapi/gpt-6-sol"] } } },
+    });
+    const { activity: _activity, ...invocation } = context;
+    const actor = await provider.invoke("create", {
+      name: "exact-activation", instructions: "i", model: "cliproxyapi/gpt-6.1-sol",
+    }, invocation) as FabricActorInfo;
+    const deliver = vi.spyOn(actors, action);
+    try {
+      for (const model of ["cliproxyapi/gpt-6-sol", "gpt-6-sol", "closest"]) {
+        await provider.invoke(action, { id: actor.id, message: "PING", model }, invocation);
+        expect(deliver.mock.calls.at(-1)?.at(-1)).toMatchObject({ overrides: { model: "cliproxyapi/gpt-6-sol" } });
+        expect(actors.status(actor.id).model).toBe("cliproxyapi/gpt-6.1-sol");
+      }
+    } finally { deliver.mockRestore(); }
+  });
+
+  it.each(["closest", "recent", "latest"])("allows exact marker-name alias %s in public spawn/create", async (name) => {
+    const { provider, agents } = setup([], [], undefined, {
+      modelsConfig: { aliases: { [name]: { targets: ["cliproxyapi/gpt-6.1-sol"] } } },
+    });
+    const child = await provider.invoke("spawn", { task: "t", model: name }, context) as AgentHandleInfo;
+    expect(child.model).toBe("cliproxyapi/gpt-6.1-sol");
+    await agents.wait(child.id);
+    await expect(provider.invoke("create", { name: "alias-actor", instructions: "i", model: name }, context))
+      .resolves.toMatchObject({ model: "cliproxyapi/gpt-6.1-sol" });
+  });
+
+  it("returns chosen model and via for run, setModel and import without activity", async () => {
+    const { provider, globalActors } = setup();
+    const { activity: _activity, ...invocation } = context;
+    const expected = { model: "cliproxyapi/gpt-6-sol", via: "closest" };
+    await expect(provider.invoke("run", { task: "t", model: "gpt-sol" }, invocation)).resolves.toMatchObject(expected);
+    const actor = await provider.invoke("create", { name: "selection", instructions: "i", model: "cliproxyapi/gpt-6.1-sol" }, invocation) as FabricActorInfo;
+    const template = globalActors.create({ name: "selection-template", instructions: "i", runner: "pi", model: "gpt-sol" });
+    await expect(provider.invoke("import", { id: template.id, as: "imported-selection" }, invocation)).resolves.toMatchObject(expected);
+    for (const scope of ["session", "project", "global"]) {
+      await expect(provider.invoke("setModel", { id: scope === "global" ? template.id : actor.id, scope, model: "gpt-sol" }, invocation))
+        .resolves.toMatchObject(expected);
+    }
+    await expect(provider.invoke("run", { task: "exact", model: "cliproxyapi/gpt-6.1-sol" }, invocation))
+      .resolves.not.toHaveProperty("via");
+  });
+
+  it("preserves effective model under a different session overlay with closest provenance", async () => {
+    const { provider } = setup();
+    const { activity: _activity, ...invocation } = context;
+    const actor = await provider.invoke("create", { name: "overlay-selection", instructions: "i", model: "cliproxyapi/gpt-6.1-sol" }, invocation) as FabricActorInfo;
+    await provider.invoke("setModel", { id: actor.id, scope: "session", model: "cliproxyapi/gpt-6.1-sol" }, invocation);
+    const result = await provider.invoke("setModel", { id: actor.id, scope: "project", model: "sol" }, invocation);
+    expect(result).toMatchObject({
+      model: "cliproxyapi/gpt-6.1-sol", selectedModel: "cliproxyapi/gpt-6-sol", via: "closest",
+      binding: { model: "cliproxyapi/gpt-6.1-sol" }, projectDefaults: { model: "cliproxyapi/gpt-6-sol" },
+    });
+    await expect(provider.invoke("actorStatus", { id: actor.id }, invocation))
+      .resolves.toMatchObject({ model: "cliproxyapi/gpt-6.1-sol" });
+  });
+
+  it("preserves observed run model when it differs from closest launch selection", async () => {
+    const { provider, agents } = setup();
+    const realWait = agents.wait.bind(agents);
+    const wait = vi.spyOn(agents, "wait").mockImplementation(async (id, options) => ({
+      ...await realWait(id, options), requestedModel: "cliproxyapi/gpt-6-sol", model: "cliproxyapi/gpt-6.1-sol",
+    }));
+    const { activity: _activity, ...invocation } = context;
+    try {
+      await expect(provider.invoke("run", { task: "t", model: "gpt-sol" }, invocation)).resolves.toMatchObject({
+        model: "cliproxyapi/gpt-6.1-sol", requestedModel: "cliproxyapi/gpt-6-sol", selectedModel: "cliproxyapi/gpt-6-sol", via: "closest",
+      });
+    } finally { wait.mockRestore(); }
+  });
+
+  it("refuses inexact handoff before the outer boundary but keeps exact ids and aliases", async () => {
+    const { provider, agents, root } = setup([], [], undefined, {
+      modelsConfig: { aliases: { "handoff-sol": { targets: ["cliproxyapi/gpt-6.1-sol"] } } },
+    });
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const service = new FabricExecutionService(registry, structuredClone(DEFAULT_FABRIC_CONFIG));
+    const source = SessionManager.inMemory(root);
+    const extensionContext = { ...context.extensionContext, cwd: root, sessionManager: source } as ExtensionContext;
+    const result = await service.execute({
+      code: 'return await agents.handoff({ model: "cliproxyapi/gpt-6.2-sol" });',
+      context: extensionContext, signal: undefined, parentToolCallId: "inexact-handoff", onPartial() {},
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/not an exact model id or configured alias.*cliproxyapi\/gpt-6\.1-sol/i);
+    expect(result).not.toHaveProperty("handoffRequest");
+    expect(agents.list()).toEqual([]);
+    for (const model of ["cliproxyapi/gpt-6.1-sol", "gpt-6.1-sol", "handoff-sol"]) {
+      const exact = await service.execute({
+        code: `return await agents.handoff({ model: ${JSON.stringify(model)} });`,
+        context: extensionContext, signal: undefined, parentToolCallId: "exact-handoff", onPartial() {},
+      });
+      expect(exact.success).toBe(true);
+      expect(exact.handoffRequest).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol" });
+    }
+  });
+
+  it("refuses inexact handoff at the executor boundary before launching", async () => {
+    const { provider, agents, root } = setup();
+    const source = SessionManager.inMemory(root);
+    source.appendMessage({
+      role: "assistant", content: [{ type: "toolCall", id: "handoff", name: "fabric_exec", arguments: {} }],
+      api: "anthropic", provider: "anthropic", model: "frontier", usage, stopReason: "toolUse", timestamp: 1,
+    });
+    const seed = snapshotHandoffSession(source, undefined, {
+      role: "toolResult", toolCallId: "handoff", toolName: "fabric_exec",
+      content: [{ type: "text", text: "complete" }], isError: false, timestamp: 2,
+    }, "handoff");
+    await expect(provider.executeHandoff({ model: "cliproxyapi/gpt-6.2-sol" }, context, seed))
+      .rejects.toThrow(/not an exact model id or configured alias.*cliproxyapi\/gpt-6\.1-sol/i);
+    expect(agents.list()).toEqual([]);
+    expect(fs.existsSync(path.join(root, "runs"))).toBe(false);
+  });
+
   it("launches near-miss models canonically while isolating unrelated batch failures", async () => {
     const { provider, agents } = setup();
     const spawn = vi.spyOn(agents, "spawn");
@@ -5273,10 +5522,10 @@ describe("AgentsProvider switchModel", () => {
       provider.invoke("spawn", { task: "Unrelated", model: "openai-codex/zzzz" }, invocation),
     ]);
     expect(results[0]).toMatchObject({ status: "fulfilled", value: { model: "openai-codex/gpt-6-astra" } });
-    expect(results[1]).toMatchObject({ status: "fulfilled", value: { model: "openai-codex/gpt-5.6-sol" } });
+    // agents.spawn refuses a closest-match model and names the candidate (smarty-dev#3326).
+    expect(results[1]).toMatchObject({ status: "rejected", reason: expect.objectContaining({ message: expect.stringContaining("openai-codex/gpt-5.6-sol") }) });
     expect(results[2]).toMatchObject({ status: "rejected", reason: expect.any(Error) });
-    expect(spawn).toHaveBeenCalledTimes(2);
-    expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ model: "openai-codex/gpt-5.6-sol" }), undefined);
+    expect(spawn).toHaveBeenCalledTimes(1);
     for (const result of results) {
       if (result.status !== "fulfilled") continue;
       const handle = result.value as { id: string; model: string };
@@ -5470,6 +5719,20 @@ describe("own-root resident setters and authoritative status", () => {
     expect(state.actors.status(state.actor.id)).toMatchObject({ model: "provider/session", projectDefaults: { model: "provider/project" } });
   });
 
+  it("returns model and via from resident model setters without activity", async () => {
+    const state = await remoteState();
+    state.setActor.mockResolvedValue({ ...state.effective, model: "cliproxyapi/gpt-6.1-sol" });
+    const { activity: _activity, ...invocation } = context;
+    for (const scope of ["session", "project"]) {
+      await expect(state.provider.invoke("setModel", { id: state.actor.id, scope, model: "gpt-sol" }, invocation))
+        .resolves.toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", selectedModel: "cliproxyapi/gpt-6-sol", via: "closest" });
+      expect(state.setActor).toHaveBeenLastCalledWith(
+        { operation: "setModel", id: state.actor.id, scope, model: "cliproxyapi/gpt-6-sol" },
+        invocation.signal, { identity: state.identity, hostId: state.identity.id },
+      );
+    }
+  });
+
   it("captures the turn principal for every Main-routed setter, never action args or inherited authority", async () => {
     const state = await remoteState();
     const extensionContext = { ...context.extensionContext, sessionManager: SessionManager.inMemory(process.cwd()) } as ExtensionContext;
@@ -5529,6 +5792,17 @@ describe("own-root resident setters and authoritative status", () => {
     await expect(state.provider.invoke("actors", {}, context)).resolves.toEqual([state.effective]);
     expect(state.actorStatus).toHaveBeenCalledWith(state.actor.id, context.signal);
     roster.mockRestore();
+  });
+
+  it.each(["ask", "tell"] as const)("keeps remote agents.%s model overrides raw for execution-owner resolution without activity", async (action) => {
+    const state = await remoteState();
+    const { activity: _activity, ...base } = context;
+    const getAvailable = vi.fn(() => visiblePiModels);
+    const invocation = { ...base, extensionContext: { modelRegistry: { getAvailable } } as unknown as ExtensionContext };
+    await state.provider.invoke(action, { id: state.actor.id, message: "owner resolves", model: "gpt-sol" }, invocation);
+    const routed = action === "ask" ? state.requestResult.mock.calls : state.request.mock.calls;
+    expect(routed[0]?.[3]).toMatchObject({ binding: { model: "gpt-sol" }, bindingProvenance: { kind: "owner-defaults", rootId: state.identity.id } });
+    expect(getAvailable).not.toHaveBeenCalled();
   });
 
   it("sends only raw own-root ask/tell overrides; steer defaults are not auto-resolved into pins", async () => {

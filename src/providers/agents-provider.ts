@@ -904,9 +904,9 @@ export class AgentsProvider implements FabricProvider {
           }
           // Model-facing terminal status returns the result; UI polling must not acknowledge it.
           if (terminalAgentStatuses.has(result.status) && this.manager.isSettled(id)) {
+            if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.abandonForeground(id));
             this.manager.prepareForeground(id);
-            if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.detachSignal(id));
-            else this.manager.markForeground(id);
+            if (!context.deferResultConsumption) this.manager.markForeground(id);
           }
           return result;
         } catch (error) {
@@ -1156,7 +1156,7 @@ export class AgentsProvider implements FabricProvider {
         };
       }
       case "stop":
-        return this.stopParticipant(String(args.id));
+        return this.stopParticipant(String(args.id), context);
       case "cleanup": {
         const id = String(args.id);
         return (this.residency?.ownsAgent?.(id) ?? this.residency?.hasAgent(id))
@@ -1811,9 +1811,15 @@ export class AgentsProvider implements FabricProvider {
     return value === "local" || value === "lineage" || value === "project" ? value : fallback;
   }
 
-  async stopParticipant(id: string): Promise<unknown> {
+  async stopParticipant(id: string, context?: FabricInvocationContext): Promise<unknown> {
     try {
       const result = await this.manager.stop(id);
+      // Host shutdown also stops children; only a guest observation consumes one.
+      if (context && terminalAgentStatuses.has(result.status)) {
+        if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.abandonForeground(id));
+        this.manager.prepareForeground(id);
+        if (!context.deferResultConsumption) this.manager.markForeground(id);
+      }
       this.participants.scheduleRefresh();
       return result;
     } catch (error) {

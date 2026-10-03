@@ -458,6 +458,64 @@ describe("AgentManager", () => {
     expect(listener).toHaveBeenCalledTimes(beforeCleanup);
   });
 
+  it("retries each queued settlement archive and retains its source on persistent failure", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-save-"));
+    roots.push(root);
+    let blocked = true;
+    const attempts = new Map<string, number>();
+    const save = vi.fn((result: AgentRunResult) => {
+      attempts.set(result.id, (attempts.get(result.id) ?? 0) + 1);
+      if (result.task === "queued archive" && blocked) throw new Error("queued archive unavailable");
+      writeJsonAtomic(path.join(root, `${result.id}.json`), result, { durable: true });
+    });
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"), onSettled: save,
+    });
+    managers.push(manager);
+    const blocker = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "queued archive", transport: "process" });
+    expect(queued.status).toBe("queued");
+    const result = await manager.stop(queued.id);
+    expect(result.status).toBe("stopped");
+    expect(attempts.get(queued.id)).toBe(3);
+    const source = path.join(root, "runs", queued.id, "queued-result.json");
+    expect(JSON.parse(fs.readFileSync(source, "utf8"))).toMatchObject({ id: queued.id, status: "stopped", task: "queued archive" });
+    await expect(manager.cleanup(queued.id)).rejects.toThrow(/queued archive unavailable/);
+    expect(fs.existsSync(source)).toBe(true);
+    blocked = false;
+    await manager.cleanup(queued.id);
+    expect(JSON.parse(fs.readFileSync(path.join(root, `${queued.id}.json`), "utf8"))).toMatchObject({ id: queued.id, status: "stopped", task: "queued archive" });
+    expect(fs.existsSync(source)).toBe(false);
+    await manager.stop(blocker.id);
+  });
+
+  it("retains a managed temporary run root when shutdown archival remains uncommitted", async () => {
+    const detachedSweep = vi.spyOn(retentionStorage, "claimTempRunSweep").mockReturnValue(false);
+    const inheritedRunRoot = process.env.PI_FABRIC_RUN_ROOT;
+    delete process.env.PI_FABRIC_RUN_ROOT;
+    const save = vi.fn(() => { throw new Error("shutdown archive unavailable"); });
+    let manager: AgentManager;
+    try {
+      manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, budgetUsd: 0 }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), onStoppedAtClose: save,
+      });
+    } finally {
+      if (inheritedRunRoot !== undefined) process.env.PI_FABRIC_RUN_ROOT = inheritedRunRoot;
+    }
+    managers.push(manager);
+    try {
+      const child = await manager.spawn({ task: "HANG_WITH_PROGRESS", transport: "process" });
+      await vi.waitFor(() => expect(manager.status(child.id)).toMatchObject({ turns: 3 }), { timeout: 5000 });
+      const run = manager.runDirectory(child.id)!;
+      roots.push(path.dirname(run));
+      await manager.close();
+      expect(save).toHaveBeenCalledTimes(3);
+      expect(fs.existsSync(run)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toMatchObject({ id: child.id, status: "stopped", turns: 3 });
+      expect(fs.existsSync(path.join(path.dirname(run), ".fabric-owner.json"))).toBe(true);
+    } finally { await manager.close(); detachedSweep.mockRestore(); }
+  });
+
   it("owns a returned queued handle independently of the caller's abort signal", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

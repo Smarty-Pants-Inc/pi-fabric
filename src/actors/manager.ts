@@ -25,7 +25,7 @@ import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/part
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readJsonlPage } from "../log-tail.js";
-import { ActorChildCompletionStore } from "./child-completions.js";
+import { ActorChildCompletionStore, ChildCompletionClaimLostError } from "./child-completions.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
@@ -340,6 +340,7 @@ export class ActorManager {
   // Accepted active work (preparing, waiting, or running), retained durably until settlement (#878).
   readonly #inFlight = new Map<string, ActorQueueItem>();
   readonly #deferredHandoffs = new Map<string, ActorQueueItem[]>();
+  readonly #pendingHandoffConsumption = new Map<string, Set<string>>();
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
@@ -2160,12 +2161,37 @@ export class ActorManager {
     return store;
   }
 
+  /** Bound the actual pretty-printed UTF-8 context, independently of the runnable FIFO. */
+  #handoffSnapshot(actor: ManagedActor): ActorQueueItem[] {
+    const snapshot: ActorQueueItem[] = [];
+    const encode = (items: ActorQueueItem[]): string => JSON.stringify(items.map(({ id, source, payload, activation }) =>
+      ({ id, source, payload, activation })), null, 2);
+    for (const original of this.#deferredHandoffs.get(actor.id) ?? []) {
+      if (snapshot.length === 16) break;
+      if (this.#pendingHandoffConsumption.get(actor.id)?.has(original.id) ||
+          this.#childCompletionStore(actor).handoffConsumed(original.id)) continue;
+      let item = original;
+      // One oversized summary must not starve itself or later outcomes. The full
+      // archive remains accessible, while this context carries only its reference.
+      if (Buffer.byteLength(encode([item]), "utf8") > 32 * 1024) {
+        item = { ...original, payload: {
+          message: "Unread child outcome; read the full archived result.",
+          data: { resultFile: this.#childCompletionStore(actor).resultFile(original.id) },
+        } };
+      }
+      if (Buffer.byteLength(encode([...snapshot, item]), "utf8") > 32 * 1024) break;
+      snapshot.push(item);
+    }
+    return snapshot;
+  }
+
   // Once its spawning activation ends, an unread child result belongs to the
   // actor's next activation. Stopped/removed actors keep the spool; never reroute to Main.
   #reconcileChildCompletions(): void {
     if (!this.#persistent || this.#closing) return;
     for (const actor of this.#actors.values()) {
       if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) continue;
+      this.#flushHandoffConsumption(actor);
       const store = this.#childCompletionStore(actor);
       for (const { spawner, result } of store.pending({ actorId: actor.id, ...(actor.inFlightRun ? { inFlightRunId: actor.inFlightRun.id } : {}) })) {
         try {
@@ -2186,9 +2212,27 @@ export class ActorManager {
             store.acknowledge(id, { handoff: true });
             this.#ensureDrain(actor);
           }
-        } catch { /* The actor-addressed file stays pending for the next owner poll. */ }
+        } catch (error) {
+          if (error instanceof ChildCompletionClaimLostError) {
+            this.#forgetClaimedChild(actor, result.id);
+            this.#ensureDrain(actor);
+          } // Other I/O failures leave the actor-addressed envelope pending for retry.
+        }
       }
     }
+  }
+
+  #forgetClaimedChild(actor: ManagedActor, id: string): void {
+    const keep = (item: ActorQueueItem): boolean => item.source !== "child-completion" || item.id !== id;
+    actor.queue = actor.queue.filter(keep);
+    for (const held of [this.#overflow, this.#parked, this.#deferredHandoffs]) {
+      const items = held.get(actor.id)?.filter(keep);
+      if (items?.length) held.set(actor.id, items);
+      else held.delete(actor.id);
+    }
+    this.#refill(actor);
+    if (!this.#inFlight.has(actor.id) && actor.status !== "stopped") actor.status = actor.queue.length ? "queued" : "idle";
+    this.#persistQueue(actor.id, true);
   }
 
   #enqueue(
@@ -2421,8 +2465,11 @@ export class ActorManager {
         // If receipt I/O failed, even an unrelated new message must not drain it;
         // the next poll retries the same queued id before opening this gate.
         const head = actor.queue[0];
-        if (head?.source === "child-completion" &&
-          !this.#childCompletionStore(actor).received(head.id)) break;
+        if (head?.source === "child-completion") {
+          const store = this.#childCompletionStore(actor);
+          if (!store.received(head.id)) break;
+          if (!store.mailboxClaimed(head.id)) { this.#forgetClaimedChild(actor, head.id); continue; }
+        }
         const item = actor.queue.shift();
         this.#refill(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
@@ -2465,7 +2512,7 @@ export class ActorManager {
           }
           // The current activation is fresh; retained outcomes are labelled context,
           // not retried activations with rewritten freshness facts.
-          item.handoffContext = this.#deferredHandoffs.get(actor.id)?.slice() ?? [];
+          item.handoffContext = this.#handoffSnapshot(actor);
           if (actor.requirements.length > 0 && this.#acquireCapabilityView) {
             capabilityLease = await this.#prepare(actor, "capabilities", () => this.#acquireCapabilityView!(
               actor.requirements,
@@ -3185,6 +3232,7 @@ export class ActorManager {
           ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
           .filter((item) => item?.source === "child-completion").map((item) => item!.id));
         for (const handoff of this.#inFlight.get(actor.id)?.handoffContext ?? []) keepIds.add(handoff.id);
+        for (const id of this.#pendingHandoffConsumption.get(actor.id) ?? []) keepIds.add(id);
         const store = this.#childCompletionStore(actor);
         store.prune(this.#logs.retention.actorRunArchiveMs, now, keepIds);
         // Deferred work shares the archive TTL, rather than exempting stale results
@@ -3762,12 +3810,26 @@ export class ActorManager {
     const kept = deferred.filter((handoff) => !consumedIds.has(handoff.id));
     if (kept.length) this.#deferredHandoffs.set(actorId, kept);
     else this.#deferredHandoffs.delete(actorId);
-    // Commit removal before deleting archives; failed persistence leaves them recoverable.
-    if (this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0) && actor) {
-      for (const id of consumedIds) {
-        try { this.#childCompletionStore(actor).releaseResult(id); } catch { /* The retention sweep retries cleanup. */ }
-      }
-    }
+    if (actor && consumedIds.size) {
+      const pending = this.#pendingHandoffConsumption.get(actorId) ?? new Set<string>();
+      for (const id of consumedIds) pending.add(id);
+      this.#pendingHandoffConsumption.set(actorId, pending);
+      this.#flushHandoffConsumption(actor);
+    } else this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0);
+  }
+
+  #flushHandoffConsumption(actor: ManagedActor): void {
+    const pending = this.#pendingHandoffConsumption.get(actor.id);
+    if (!pending?.size) return;
+    const store = this.#childCompletionStore(actor);
+    try {
+      // Separate durable evidence survives a failed queue rewrite. Retain both
+      // fence and queue retries, and never offer an already inferred snapshot again.
+      for (const id of pending) store.markHandoffConsumed(id);
+      if (!this.#persistQueue(actor.id, true)) return;
+      for (const id of pending) store.releaseResult(id);
+      this.#pendingHandoffConsumption.delete(actor.id);
+    } catch { /* Keep original archives and retry each owner poll. */ }
   }
 
   #readQueue(file: string): unknown {
@@ -3839,6 +3901,16 @@ export class ActorManager {
       ) continue;
       // Include this snapshot's accepted IDs too, not only the work held on entry.
       held.add(value.id);
+      if (value.source === "child-completion" && this.#childCompletionStore(actor).handoffConsumed(value.id)) {
+        const pending = this.#pendingHandoffConsumption.get(actor.id) ?? new Set<string>();
+        pending.add(value.id);
+        this.#pendingHandoffConsumption.set(actor.id, pending);
+        continue;
+      }
+      if (value.source === "child-completion") {
+        const store = this.#childCompletionStore(actor);
+        if (store.received(value.id) && !store.mailboxClaimed(value.id)) continue;
+      }
       const deferredHandoff = value.source === "child-completion" && value.deferredHandoff === true;
       // A deliberate quiescent release is not a failed attempt at untouched backlog.
       // Deferred child outcomes remain context-only and never spend restart attempts.

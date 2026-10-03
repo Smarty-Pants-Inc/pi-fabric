@@ -1,8 +1,10 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
+import * as atomicWrites from "../src/core/atomic-write.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 
 const roots: string[] = [];
@@ -22,6 +24,17 @@ const setup = () => {
     value: { private: true },
   } as AgentRunResult);
   return { root, store, spawner, result, sessionFile };
+};
+
+// Windows omits unsupported directory fsync. Exercise the same uncertain writer
+// rejection there, while Unix probes keep their physical post-rename fsync fault.
+const failPostRenameOnWindows = (target: (file: string) => boolean, fail: () => void) => {
+  if (process.platform !== "win32") return;
+  const write = atomicWrites.writeJsonAtomic;
+  return vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, value, options) => {
+    write(file, value, options);
+    if (target(file)) fail();
+  });
 };
 
 describe("actor child completion handoff storage", () => {
@@ -103,6 +116,104 @@ describe("actor child completion handoff storage", () => {
     restarted.consumeLiveBatch([a.id, b.id]);
     expect(restarted.pending()).toEqual([]);
     for (const result of [a, b]) restarted.acknowledge(result.id);
+  });
+
+  it("claims a completion exclusively across separate live and mailbox owner processes", async () => {
+    const h = setup();
+    const result = h.result();
+    h.store.enqueue(result, h.spawner);
+    const gate = path.join(h.root, "start-claims");
+    const script = (role: "live" | "mailbox") => `
+      import fs from "node:fs";
+      import { ActorChildCompletionStore, ChildCompletionClaimLostError } from ${JSON.stringify(path.resolve("src/actors/child-completions.ts"))};
+      const store = new ActorChildCompletionStore(${JSON.stringify(h.sessionFile)});
+      fs.writeFileSync(${JSON.stringify(path.join(h.root, `${role}-ready`))}, "ready");
+      const wait = new Int32Array(new SharedArrayBuffer(4));
+      while (!fs.existsSync(${JSON.stringify(gate)})) Atomics.wait(wait, 0, 0, 5);
+      try {
+        ${role === "live" ? `store.consumeLiveBatch([${JSON.stringify(result.id)}]);` : `store.acknowledge(${JSON.stringify(result.id)}, { handoff: true });`}
+        console.log("claimed");
+      } catch (error) {
+        if (!(error instanceof ChildCompletionClaimLostError)) throw error;
+        console.log("lost");
+      }
+    `;
+    const claims = (["live", "mailbox"] as const).map((role) => new Promise<string>((resolve, reject) => {
+      execFile("bun", ["--eval", script(role)], { timeout: 10000, maxBuffer: 4096 }, (error, stdout) => {
+        if (error) reject(error); else resolve(stdout.trim());
+      });
+    }));
+    try {
+      await vi.waitFor(() => {
+        for (const role of ["live", "mailbox"]) expect(fs.existsSync(path.join(h.root, `${role}-ready`))).toBe(true);
+      }, { timeout: 5000 });
+      fs.writeFileSync(gate, "go");
+      expect((await Promise.all(claims)).sort()).toEqual(["claimed", "lost"]);
+      expect(h.store.received(result.id)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(h.store.resultFile(result.id), "utf8"))).toMatchObject(result);
+    } finally {
+      fs.writeFileSync(gate, "go");
+      await Promise.allSettled(claims); // Never leave a test-owned worker behind.
+    }
+  }, 15000);
+
+  it("Q6 retries every foreground durability barrier after a post-rename failure", () => {
+    const h = setup();
+    const result = h.result();
+    h.store.enqueue(result, h.spawner);
+    const rename = fs.renameSync;
+    const sync = fs.fsyncSync;
+    let renamed = false;
+    let blocked = true;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (to === path.join(h.store.directory, `${result.id}.receipt`)) renamed = true;
+    });
+    const barriers = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      if (renamed && blocked && fs.fstatSync(fd).isDirectory()) throw new Error("foreground barrier failed after rename");
+      sync(fd);
+    });
+    failPostRenameOnWindows((file) => file === path.join(h.store.directory, `${result.id}.receipt`), () => {
+      if (blocked) throw new Error("foreground barrier failed after rename");
+    });
+    expect(() => h.store.consume(result.id, { handoff: true })).toThrow("foreground barrier failed after rename");
+    expect(fs.existsSync(path.join(h.store.directory, `${result.id}.receipt`))).toBe(true);
+    expect(() => h.store.consume(result.id, { handoff: true })).toThrow("foreground barrier failed after rename");
+    blocked = false;
+    const before = barriers.mock.calls.length;
+    h.store.consume(result.id, { handoff: true });
+    expect(barriers.mock.calls.length).toBeGreaterThan(before);
+    const restarted = new ActorChildCompletionStore(h.sessionFile);
+    expect(restarted.received(result.id)).toBe(true);
+    expect(restarted.pending()).toEqual([]);
+  });
+
+  it("Q4 withdraws an unsent live batch after its post-rename barrier fails", () => {
+    const h = setup();
+    const a = h.result();
+    const b = h.result("c".repeat(32));
+    for (const result of [a, b]) h.store.enqueue(result, h.spawner);
+    const rename = fs.renameSync;
+    const sync = fs.fsyncSync;
+    let renamed = false;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (String(to).endsWith(".live-receipt")) renamed = true;
+    });
+    const failure = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      if (renamed && fs.fstatSync(fd).isDirectory()) throw new Error("live batch barrier failed after rename");
+      sync(fd);
+    });
+    const windowsFailure = failPostRenameOnWindows((file) => file.endsWith(".live-receipt"), () => { throw new Error("live batch barrier failed after rename"); });
+    expect(() => h.store.consumeLiveBatch([a.id, b.id])).toThrow("live batch barrier failed after rename");
+    failure.mockRestore();
+    windowsFailure?.mockRestore();
+    const restarted = new ActorChildCompletionStore(h.sessionFile);
+    expect(restarted.pending().map(({ result }) => result.id).sort()).toEqual([a.id, b.id].sort());
+    restarted.consumeLiveBatch([a.id, b.id]);
+    expect(restarted.pending()).toEqual([]);
+    for (const result of [a, b]) restarted.acknowledge(result.id);
+    expect(new ActorChildCompletionStore(h.sessionFile).pending()).toEqual([]);
   });
 
   it("does not read the session for in-flight envelopes across 100 polls", () => {

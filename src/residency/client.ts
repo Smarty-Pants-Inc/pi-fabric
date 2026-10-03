@@ -989,9 +989,14 @@ export class ResidencyClient {
   }
 
   #recipient(config: ResidentHostConfig): CompletionRecipient {
-    const original = this.options.participants.lastKnown?.(config.rootId)?.participant;
+    const name = (config === this.options.config ? this.options.mainName?.() : undefined) ?? config.mainName;
+    // lastKnown performs a fresh full-fleet scan. Current Main configs already supply
+    // both fields; idle completion polls need that scan only for legacy metadata.
+    // Keep the live name callback uncached so renames still bind new admissions.
+    const original = name === undefined || config.mainStartedAt === undefined
+      ? this.options.participants.lastKnown?.(config.rootId)?.participant : undefined;
     return { rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd, projectRoot: config.projectRoot,
-      name: (config === this.options.config ? this.options.mainName?.() : undefined) ?? config.mainName ?? original?.name ?? "main", role: config.role,
+      name: name ?? original?.name ?? "main", role: config.role,
       startedAt: config.mainStartedAt ?? original?.startedAt ??
         (/^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-/.test(config.sessionId)
           ? Number.parseInt(config.sessionId.replaceAll("-", "").slice(0, 12), 16) : 0) };

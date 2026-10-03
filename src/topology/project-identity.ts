@@ -216,14 +216,29 @@ interface ProjectRoot {
 }
 
 /**
- * Where a resident host delivers its actors' messages (smarty-dev#878): its root while that root
- * is live, else the project's live project agent, else still its root, where the record waits.
+ * A resident actor's messages stay at its root until its lineage is provably dead. A lease
+ * lapse is not death (smarty-dev#3662). Only an exact launch-bound integrator may inherit;
+ * without an available binding the record still waits in the root's mailbox. Never elect.
  */
-export const deliveryRoot = (rootId: string, liveRoots: readonly ProjectRoot[], project: string): string => {
+export const deliveryRoot = (
+  rootId: string,
+  liveRoots: readonly ProjectRoot[],
+  project: string,
+  options: {
+    /** The same lineage test used by orphan adoption, not a lease-filtered root listing. */
+    lineageAlive?: (rootId: string) => boolean;
+    /** Read launch metadata only after confirmed death, never during idle registration. */
+    boundIntegrator?: () => { repository?: string; leadId?: string };
+  } = {},
+): string => {
   if (liveRoots.some((root) => root.id === rootId)) return rootId;
   try {
-    return resolveProjectAgent(liveRoots, project).id;
+    if (options.lineageAlive?.(rootId) !== false) return rootId;
+    const binding = options.boundIntegrator?.();
+    if (!binding?.leadId) return rootId;
+    return resolveProjectAgent(liveRoots, project, binding).id;
   } catch {
+    // Unknown liveness or invalid/unavailable metadata must never elect another project agent.
     return rootId;
   }
 };

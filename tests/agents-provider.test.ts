@@ -2254,9 +2254,12 @@ describe("AgentsProvider runner support", () => {
       .resolves.toMatchObject({ id: "session:lead" });
     await expect(setup([], [mirrored]).provider.invoke("projectAgent", {}, context))
       .rejects.toThrow(`No live project agent for ${project}`);
-    // The resident-actor fallback uses the same resolver: with the actor's root gone, no mirror.
-    expect(deliveryRoot("session:gone", [lead, mirrored], project)).toBe("session:lead");
-    expect(deliveryRoot("session:gone", [mirrored], project)).toBe("session:gone");
+    // Resident delivery never elects a replacement. An exact launch binding still uses the
+    // same resolver, so an unrecorded mirror cannot inherit a dead root's messages.
+    expect(deliveryRoot("session:gone", [lead, mirrored], project)).toBe("session:gone");
+    const binding = { lineageAlive: () => false, boundIntegrator: () => ({ leadId: lead.id }) };
+    expect(deliveryRoot("session:gone", [lead, mirrored], project, binding)).toBe("session:lead");
+    expect(deliveryRoot("session:gone", [mirrored], project, binding)).toBe("session:gone");
   });
 
   it("lists current and peer roots as symmetric session agents", async () => {

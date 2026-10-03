@@ -420,6 +420,48 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(log).not.toContain('"type":"auto_retry_start"');
   }, TEST_GUARD_MS);
 
+  it.skipIf(!selectedNativeBinary).each(["reducible", "irreducible"])("over-cap full-history admission recovers explicitly and is bounded (%s)", async mode => {
+    const s = await setup();
+    fs.writeFileSync(s.settingsFile, JSON.stringify({ enableInstallTelemetry: false, compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1000 } }));
+    s.manager.config.timeoutMs = 20_000;
+    const journal = path.join(s.dir, "over-cap-history.jsonl");
+    const session = SessionManager.open(journal);
+    if (mode === "reducible") {
+      for (let index = 0; index < 60; index++) {
+        session.appendMessage(user(`OLD_OBJECTIVE_${index} ` + "x".repeat(80_000)));
+        session.appendMessage(assistant(`old decision ${index}`));
+      }
+      session.appendMessage(user("SMALL_PENDING_OBJECTIVE " + "x".repeat(8_000)));
+      session.appendMessage(assistant("small recent decision"));
+    } else {
+      session.appendMessage(user("UNFITTABLE_SINGLE_EVENT " + "x".repeat(4_500_000)));
+      session.appendMessage(assistant("recent reply"));
+    }
+    const before = readJournal(journal);
+    expect(before.bytes.length).toBeGreaterThan(4_194_304);
+    expect(before.bytes.length).toBeLessThan(20 * 1024 * 1024);
+    const result = await s.manager.run({ task: "CURRENT_OVER_CAP_EVENT", model: "window-test/offline", actorId: "over-cap-actor",
+      sessionFile: journal, tools: [], extensions: false, transport: "process", timeoutMs: 20_000 });
+    const evidence = process.env.FABRIC_CONTEXT_ADMISSION_EVIDENCE_DIR;
+    if (evidence) {
+      fs.mkdirSync(evidence, { recursive: true });
+      fs.writeFileSync(path.join(evidence, `native-cap-${mode}-result.json`), JSON.stringify({ historyBytes: before.bytes.length, requestCount: s.requestCount, result }, null, 2));
+      fs.copyFileSync(result.logFile!, path.join(evidence, `native-cap-${mode}-events.jsonl`));
+    }
+    const log = fs.readFileSync(result.logFile!, "utf8");
+    expect(log, explain(result)).toContain('"type":"fabric_context_compaction"');
+    expect(result.status, explain(result)).not.toBe("timed_out");
+    if (mode === "reducible") {
+      expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+      expect(s.requests.some(payload => JSON.stringify(payload.messages).includes("CURRENT_OVER_CAP_EVENT"))).toBe(true);
+      expectJournalAppended(journal, before, true);
+    } else {
+      expect(result, explain(result)).toMatchObject({ status: "failed", error: expect.stringMatching(/Context exceeds window|Actor context admission compact failed/) });
+      expect(log.match(/"type":"fabric_context_compaction"/g)).toHaveLength(1);
+      expect(s.requests.some(payload => JSON.stringify(payload.messages).includes("CURRENT_OVER_CAP_EVENT"))).toBe(false);
+    }
+  }, TEST_GUARD_MS);
+
   it.skipIf(!selectedNativeBinary).each(["google-generative-ai", "google-vertex"].flatMap(api =>
     ["stream", "streamSimple"].flatMap(method =>
       ["success", "abort", "snapshot", "expand", "shrink", "non-json", "invalid-control"].map(mode => [api, method, mode])),

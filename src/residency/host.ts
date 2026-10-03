@@ -1232,7 +1232,9 @@ export class ResidentHost {
         let updated: FabricActorInfo;
         switch (command.operation) {
           case "actorStatus": updated = actor; break;
-          case "resetSession": updated = await this.actors.resetSession(actor.id, { refuseActive: true, beforeCommit: commit }); break;
+          // Repair is a boundary request, not terminal stop: the admitted run settles,
+          // then queued deliveries resume on the fresh session under the same actor.
+          case "resetSession": updated = await this.actors.resetSession(actor.id, { beforeCommit: commit }); break;
           case "stop": updated = await this.actors.stop(actor.id, commit, true); break;
           case "setInstructions": updated = await this.actors.setInstructions(actor.id, command.instructions, commit); break;
           case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit); break;

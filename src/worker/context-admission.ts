@@ -42,7 +42,7 @@ export class ActorContextAdmission {
     send(frame: Record<string, unknown>): void;
     ready(): void;
     fail(error: string): void;
-    compact(tokens: number, contextWindow: number): void;
+    compact(tokens: number, contextWindow: number, reason: string): void;
   };
   private pending: { id: string; command: string } | undefined;
   private sequence = 0;
@@ -67,6 +67,40 @@ export class ActorContextAdmission {
     if (this.finished) return;
     this.finished = true; this.pending = undefined;
     this.io.fail(error);
+  }
+
+  /** A dropped RPC history still completes its correlation: compact once, then remeasure. */
+  observeOversizedResponse(prefix: string, chars: number): boolean {
+    if (!this.pending || this.finished) return false;
+    // Pi serializes the response envelope before data. Parse only that small JSON
+    // object, never match ids inside historical message content or buffer the body.
+    const head = prefix.slice(0, 4096);
+    const dataStart = head.indexOf(',"data":');
+    if (dataStart < 0) return false;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(head.slice(0, dataStart) + "}") as Record<string, unknown>; }
+    catch { return false; }
+    if (event.type !== "response" || event.id !== this.pending.id) return false;
+    const command = this.pending.command;
+    this.pending = undefined;
+    if (event.command !== command || event.success !== true || command !== "get_messages") {
+      this.fail(`Actor context admission ${command} failed: oversized RPC response (${chars} characters)`);
+    } else {
+      // A wire-size overflow is an explicit recovery reason, not a token estimate.
+      // After compact commits, get_messages must fit both the wire and context limits.
+      this.recover(0, `native history response exceeds event cap (${chars} characters)`);
+    }
+    return true;
+  }
+
+  private recover(tokens: number, reason: string): void {
+    if (this.compacted) {
+      this.fail(`Context exceeds window: ${reason}; pre-dispatch compaction did not make this activation fit`);
+      return;
+    }
+    this.compacted = true;
+    this.io.compact(tokens, this.contextWindow, reason);
+    this.send("compact", { customInstructions: "Preserve the actor's active objectives, user constraints, decisions, pending work and referenced artifact paths. Bound the summary so the next activation fits the model context window." });
   }
 
   observe(event: Record<string, unknown>): boolean {
@@ -99,12 +133,7 @@ export class ActorContextAdmission {
       const tokens = this.estimate(JSON.stringify({ messages: data.messages, task: this.task, systemPrompt: this.systemPrompt }));
       const reserve = Math.min(8192, Math.floor(this.contextWindow * 0.1));
       if (tokens > this.contextWindow - reserve) {
-        if (this.compacted) this.fail(`Context exceeds window: estimated ${tokens} input tokens, window ${this.contextWindow}; pre-dispatch compaction did not make this activation fit`);
-        else {
-          this.compacted = true;
-          this.io.compact(tokens, this.contextWindow);
-          this.send("compact", { customInstructions: "Preserve the actor's active objectives, user constraints, decisions, pending work and referenced artifact paths. Bound the summary so the next activation fits the model context window." });
-        }
+        this.recover(tokens, `estimated ${tokens} input tokens, window ${this.contextWindow}`);
       } else {
         this.finished = true;
         this.io.ready();

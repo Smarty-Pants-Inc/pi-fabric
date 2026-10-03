@@ -765,8 +765,8 @@ const main = async (): Promise<void> => {
             send(frame) { if (!terminalStatus) child.stdin?.write(`${JSON.stringify(frame)}\n`); },
             ready: dispatchPiPrompt,
             fail(error) { modelControl.fail(error); },
-            compact(tokens, contextWindow) {
-              appendLog(`${JSON.stringify({ type: "fabric_context_compaction", phase: "before_dispatch", tokens, contextWindow })}\n`);
+            compact(tokens, contextWindow, reason) {
+              appendLog(`${JSON.stringify({ type: "fabric_context_compaction", phase: "before_dispatch", tokens, contextWindow, reason })}\n`);
             },
           });
         contextAdmission.start();
@@ -1593,6 +1593,9 @@ const main = async (): Promise<void> => {
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
     process.stderr.write(`[pi-fabric] ${warning}\n`);
     record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    // Never strand a correlated admission response behind the event-line cap.
+    // Only its bounded envelope is inspected; the history remains discarded.
+    contextAdmission?.observeOversizedResponse(prefix, chars);
     if (type === "message_end" && (role === undefined || role === "assistant")) lostResult = warning;
     update();
   };

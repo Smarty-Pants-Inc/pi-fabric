@@ -1015,13 +1015,12 @@ export class ActorManager {
    * finishes on the old session first; it is not interrupted. The session file is archived
    * beside it; instructions, topics, bindings, the queue and the message log are kept.
    */
-  async resetSession(id: string, options: { refuseActive?: boolean; beforeCommit?: (id: string) => void } = {}): Promise<FabricActorInfo> {
+  async resetSession(id: string, options: { beforeCommit?: (id: string) => void } = {}): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#draining.get(actor.id);
     // A drain owns admission before it installs its abort controller, including
     // while a boundary presence write or launch preparation is awaiting.
     if (actor.draining || running || this.#inFlight.has(actor.id) || actor.abortController) {
-      if (options.refuseActive) throw new Error(`Cannot reset actor ${actor.name} while a run is active; stop first`);
       options.beforeCommit?.(actor.id);
       return new Promise((resolve, reject) => {
         const waiters = this.#pendingResets.get(actor.id) ?? [];

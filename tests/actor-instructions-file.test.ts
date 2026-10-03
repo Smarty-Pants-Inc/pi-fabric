@@ -54,7 +54,7 @@ const fixture = async (durable = false) => {
     agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: factory }, mesh: meshConfig,
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
-    piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
+    piModels: { available: [{ provider: "fixture", id: "visible" }, { provider: "cliproxyapi", id: "gpt-6-astra" }], aliases: {}, defaultModel: "fixture/visible" },
   };
   const mainAgent = { id: identity.id, local: true, matches: (id: string) => id === identity.id } as FabricMainAgentTarget;
   const host = durable ? new ResidentHost(config, () => {}) : undefined;
@@ -63,18 +63,77 @@ const fixture = async (durable = false) => {
   const globalActors = new GlobalActorRegistry(root, meshConfig.maxEventBytes);
   const lifecycle = new LifecycleBroker(mesh, identity, participants, { enabled: false, pollMs: 20, maxReadEvents: 100 }, async () => {});
   const provider = new AgentsProvider(agents, actors, globalActors, mainAgent, participants, undefined, lifecycle, () => false, client, false);
-  const context: FabricInvocationContext = { cwd: root, signal: undefined, extensionContext: { modelRegistry: { getAvailable: () => [{ provider: "fixture", id: "visible" }] } } as unknown as ExtensionContext,
+  const context: FabricInvocationContext = { cwd: root, signal: undefined, extensionContext: { modelRegistry: { getAvailable: () => config.piModels!.available } } as unknown as ExtensionContext,
     parentToolCallId: "instructions-probe", nestedToolCallId: "instructions-probe", update() {} };
   const owner = host?.actors ?? actors;
   const allowed = durable ? factory : localRoot;
   const create = (args: Record<string, unknown>) => provider.invoke("createActor", { name: "role", ...(durable ? { residency: "durable", model: "fixture/visible" } : {}), ...args }, context) as Promise<FabricActorInfo>;
-  return { root, allowed, localRoot, factory, owner, provider, create, context, globalActors, client, config, identity, host,
+  return { root, allowed, localRoot, factory, owner, actors, provider, create, context, globalActors, client, config, identity, host,
     close: async () => {
       await provider.close(); await lifecycle.close(); await actors.close(); await agents.close();
       await client?.close(); await host?.close(); await participants.close(); fs.rmSync(root, { recursive: true, force: true });
     },
   };
 };
+
+for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} createActor Astra reason guard (#389)`, () => {
+  it.each((["inline", "file"] as const).flatMap(source =>
+    (["project", "global"] as const).flatMap(scope =>
+      (["direct", "guest"] as const).map(route => [source, scope, route] as const))))(
+    "refuses missing/blank reasons for %s instructions, %s scope, %s route without actor/template/registry mutation",
+    async (source, scope, route) => {
+      const state = await fixture(durable);
+      try {
+        const file = path.join(scope === "global" ? state.localRoot : state.allowed, "guard.md");
+        fs.writeFileSync(file, text);
+        const registries = [
+          path.join(state.root, "main-actors", "actors.json"),
+          path.join(state.config.actorRoot, "actors.json"),
+          path.join(state.root, "fabric", "actors", "global-actors.json"),
+        ];
+        const snapshot = () => registries.map(file => fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null);
+        const before = snapshot();
+        const registry = new ActionRegistry(); registry.register(state.provider);
+        const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
+        const service = new FabricExecutionService(registry, config);
+        const refusal = "named passes use cliproxyapi/gpt-6.1-sol thinking max; otherwise omit model (role default)";
+        for (const modelReason of [undefined, " \t\n "]) {
+          const args = {
+            name: "refused-astra", scope, residency: durable ? "durable" : "session",
+            model: "cliproxyapi/gpt-6-astra", modelReason,
+            ...(source === "file" ? fileSource(file) : { instructions: text }),
+          };
+          if (route === "direct") {
+            await expect(state.provider.invoke("createActor", args, state.context)).rejects.toMatchObject({ message: refusal });
+          } else {
+            const result = await service.execute({
+              code: `try { await agents.createActor(${JSON.stringify(args)}); return "unexpected admission"; } catch (error) { return error.message; }`,
+              signal: undefined, parentToolCallId: "guest-astra-file-guard", context: state.context.extensionContext, onPartial() {},
+            });
+            expect(result.success, result.error).toBe(true);
+            expect(result.value).toBe(refusal);
+          }
+          expect(state.actors.listOwned()).toEqual([]);
+          expect(state.owner.listOwned()).toEqual([]);
+          expect(state.globalActors.list()).toEqual([]);
+          expect(snapshot()).toEqual(before);
+        }
+      } finally { await state.close(); }
+    },
+  );
+
+  for (const source of ["inline", "file"] as const) it.skipIf(source === "file" && process.platform !== "linux")(`preserves a nonblank reason for ${source} instructions`, async () => {
+    const state = await fixture(durable);
+    try {
+      const file = path.join(state.allowed, "reason.md"); fs.writeFileSync(file, text);
+      const modelReason = "  Bounded compatibility exception  ";
+      const actor = await state.create({ model: "cliproxyapi/gpt-6-astra", modelReason,
+        ...(source === "file" ? fileSource(file) : { instructions: text }) });
+      expect(state.owner.definition(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-astra", modelReason });
+      expect(state.owner.instructions(actor.id)).toBe(text);
+    } finally { await state.close(); }
+  });
+});
 
 const rejectionCases = (root: string, allowed: string) => {
   const good = path.join(allowed, "role.md"); fs.writeFileSync(good, text);

@@ -43,11 +43,12 @@ describe("guest agents surface", () => {
       `const run = await agents.run({ task: "probe", model: "cliproxyapi/gpt-6-astra", modelReason: "Compatibility probe" });
        await agents.spawn({ task: "probe", modelReason: "Compatibility probe" });
        await agents.create({ name: "probe", instructions: "Work.", modelReason: "Compatibility probe" });
+       await agents.createActor({ name: "alias-probe", instructions: "Work.", modelReason: "Compatibility probe" });
        const reason: string | undefined = run.modelReason; return reason;`,
       guestTypeDeclarations(fullCodeMode), true,
     );
     expect(result.errors).toEqual([]);
-    for (const name of ["run", "spawn", "create"]) {
+    for (const name of ["run", "spawn", "create", "createActor"]) {
       const schema = AGENTS_ACTION_DESCRIPTORS.find(descriptor => descriptor.name === name)!.inputSchema as { properties: Record<string, unknown> };
       expect(schema.properties.modelReason).toMatchObject({ type: "string" });
     }

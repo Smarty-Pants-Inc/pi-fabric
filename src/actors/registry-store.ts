@@ -38,6 +38,8 @@ export class ActorRegistryStore {
   readonly #registryPath: string;
   readonly #actorRoot: string;
   readonly #writer: AtomicFileWriter;
+  // A receipt belongs to the confirmed inode/namespace, not just equal bytes.
+  #confirmedFingerprint: string | undefined;
 
   constructor(actorRoot: string) {
     this.#actorRoot = actorRoot;
@@ -146,30 +148,28 @@ export class ActorRegistryStore {
     return JSON.parse(fs.readFileSync(this.#registryPath, "utf8"));
   }
 
-  /** Call within withLock for read-modify-write operations. Pending decisions and custody are durable. */
+  /** Call within withLock for read-modify-write operations. Every replacement carries authoritative definitions. */
   write(actors: readonly Record<string, unknown>[], options?: { durable?: boolean }): void {
     let previous: string | undefined;
     try { previous = fs.readFileSync(this.#registryPath, "utf8"); }
     catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-    let previousActors: readonly Record<string, unknown>[] = [];
-    try {
-      const parsed = JSON.parse(previous ?? "null") as { actors?: unknown } | null;
-      if (Array.isArray(parsed?.actors)) previousActors = parsed.actors;
-    } catch { /* Malformed bytes carry no accepted, recoverable decision. */ }
-    const custody = (rows: readonly Record<string, unknown>[]): string => JSON.stringify(rows.map((row) =>
-      [row?.id, row?.rootId, row?.residency, row?.adoptedAt, row?.adoptedFrom]).sort((a, b) =>
-      String(a[0]).localeCompare(String(b[0]))));
+    const serialized = JSON.stringify({ format: 1, actors }, null, 2);
     const durable = options?.durable === true || hasRemovalDecision(actors) ||
       actors.some((actor) => actor.adoptedAt !== undefined || actor.adoptedFrom !== undefined || actor.status === "stopped") ||
-      custody(previousActors) !== custody(actors);
-    const serialized = JSON.stringify({ format: 1, actors }, null, 2);
+      serialized !== previous || this.#confirmedFingerprint === undefined ||
+      this.fingerprint() !== this.#confirmedFingerprint;
     if (!durable) {
-      // Status/time/history without a custody change are rebuildable soft metadata.
+      // Only a no-op can be soft: even changed status/time/history replaces the
+      // inode carrying authoritative definitions and must retain its durability.
       this.#writer.write(serialized);
       return;
     }
+    // Clear before attempting the write: visible equal bytes after a failed
+    // namespace barrier must not let a subsequent soft retry discharge this debt.
+    this.#confirmedFingerprint = undefined;
     try {
       this.#writer.write(serialized, { durable: true });
+      this.#confirmedFingerprint = this.fingerprint();
     } catch (error) {
       // A directory barrier may fail after rename installed the new registry. Keep the
       // visible replacement so the retry loop can re-establish its barrier; roll back

@@ -43,6 +43,47 @@ describe("ActorRegistryStore", () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
+  it.each(process.platform === "win32" ? ["file"] : ["file", "directory"])("F36 retains soft-save durability debt after a failed %s barrier, including an equal-byte retry", async barrier => {
+    const { store, actorRoot, registryPath } = setup();
+    const actor = { id: "fresh", rootId: "owner", residency: "session", instructions: "Exact definition", status: "running" };
+    await store.withLock(() => store.write([actor], { durable: true }));
+    const changed = { ...actor, status: "queued", updatedAt: 2 };
+    const files = new Map<number, string>(), events: string[] = [];
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), rename = fs.renameSync.bind(fs);
+    let fail = true;
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); files.set(fd, String(file)); return fd; });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { rename(from, to); if (String(to) === registryPath) events.push("rename"); });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = files.get(fd)!;
+      const event = file.startsWith(`${registryPath}.`) ? "file" : file === actorRoot ? "directory" : file;
+      events.push(event);
+      if (fail && event === barrier) { fail = false; throw new Error("F36 barrier unavailable"); }
+      sync(fd);
+    });
+    await expect(store.withLock(() => store.write([changed], { durable: false }))).rejects.toThrow("F36 barrier unavailable");
+    // Namespace rejection leaves changed equal bytes visible, not confirmed.
+    if (barrier === "directory") expect(store.records()).toEqual([changed]);
+    events.length = 0;
+    await store.withLock(() => store.write([changed], { durable: false }));
+    expect(events.slice(0, 2)).toEqual(["file", "rename"]);
+    if (process.platform !== "win32") expect(events[2]).toBe("directory");
+    expect(store.records()).toEqual([changed]);
+    events.length = 0;
+    await store.withLock(() => store.write([changed], { durable: false }));
+    expect(events).toEqual([]); // Confirmed unchanged snapshots still cost no barriers.
+    await store.withLock(() => store.write([changed], { durable: true }));
+    expect(events.slice(0, 2)).toEqual(["file", "rename"]); // Explicit debt never skips.
+  });
+
+  it("F36 a fresh store cannot infer a durable receipt from equal visible bytes", async () => {
+    const { store, actorRoot } = setup();
+    const actor = { id: "fresh", instructions: "Accepted" };
+    store.write([actor]);
+    const syncs = vi.spyOn(fs, "fsyncSync");
+    new ActorRegistryStore(actorRoot).write([actor], { durable: false });
+    expect(syncs).toHaveBeenCalled();
+  });
+
   it("#169 security S2 durably preserves a foreign pending decision through an ordinary replacement", async () => {
     const { store, actorRoot, registryPath } = setup();
     const pending = { id: "foreign", rootId: "remote", removal: { requestedAt: 1, runId: "pending" } };

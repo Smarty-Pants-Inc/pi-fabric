@@ -61,13 +61,13 @@ describe("unchanged atomic bytes", () => {
 });
 
 describe("registry classifications", () => {
-  it("skips unchanged snapshots; soft metadata changes once without fsync; custody changes fsync", () => {
+  it("skips confirmed unchanged snapshots; every changed whole-registry image fsyncs", () => {
     const store = new ActorRegistryStore(root()); const actor = { id: "actor", rootId: "owner", residency: "session", status: "idle" };
     store.write([actor]);
     const writes = vi.spyOn(fs, "writeFileSync"), syncs = vi.spyOn(fs, "fsyncSync");
     for (let i = 0; i < 100; i++) store.write([actor]);
     expect(writes).not.toHaveBeenCalled(); expect(syncs).not.toHaveBeenCalled();
-    store.write([{ ...actor, status: "running" }]); expect(writes).toHaveBeenCalledTimes(1); expect(syncs).not.toHaveBeenCalled();
+    store.write([{ ...actor, status: "running" }], { durable: false }); expect(writes).toHaveBeenCalledTimes(1); expect(syncs).toHaveBeenCalled();
     writes.mockClear();
     const adopted = { ...actor, rootId: "adopter", adoptedAt: 1 };
     store.write([adopted]); expect(writes).toHaveBeenCalledTimes(1); expect(syncs).toHaveBeenCalled();

@@ -31,7 +31,7 @@ The earlier Schema, mesh-checkpoint and bridge slices remain deferred separately
 
 | Path under `src/` | Correctness-bearing state / ordering |
 |---|---|
-| `actors/registry-store.ts` | Durable definitions and lineage claims before queue takeover; durable rollback restores authoritative definitions |
+| `actors/registry-store.ts` | Every changed whole-registry image durably preserves definitions and lineage claims, even for soft status/history or setter calls; only a confirmed unchanged inode skips soft saves; failed barriers retain confirmation debt and durable rollback restores authoritative definitions |
 | `actors/global-registry.ts` | Durable user template library |
 | `actors/binding-store.ts` | Durable session model/thinking overrides |
 | `actors/manager.ts` | Durable new/coalesced callerless admission before acceptance; restored queue confirmation before launch/cursor progress; predecessor unlink barriers; complete source session inode and inode-bound archive namespace before replacement/pruning; prelaunch failure settlement/parking; live adoption claim/copy retries; explicit and directive actor stop-publication retry; durable ordinary-completion backlog replacement and storage-only retry gate |

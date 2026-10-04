@@ -1132,9 +1132,11 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(store.pending().map(({ result }) => result.id).sort()).toEqual([a.id, b.id].sort());
     for (const child of [a, b]) expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8"))).toMatchObject({ id: child.id, status: "stopped", turns: 3, toolCalls: 1, usage: { input: 30, output: 10 } });
     h.endActivation();
-    await vi.waitFor(() => expect(h.owner.messages(h.actor.id).filter((m) => m.source === "child-completion" && m.direction === "out" && !m.error)).toHaveLength(2), { timeout: 5000 });
+    // Two serial activations now include durable registry/queue receipts. This
+    // checks conservation, not a five-second fsync/Windows scheduling budget.
+    await vi.waitFor(() => expect(h.owner.messages(h.actor.id).filter((m) => m.source === "child-completion" && m.direction === "out" && !m.error)).toHaveLength(2), { timeout: 15_000 });
     expect(h.rootDeliveries).not.toHaveBeenCalled();
-  });
+  }, 30_000);
 
   it("delivers a host-stopped running child to the actor's next activation", async () => {
     const h = await setup(residency);

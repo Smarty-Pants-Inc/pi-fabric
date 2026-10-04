@@ -115,6 +115,8 @@ export class JevFabricServe {
   /**
    * Sends one request. Aborting stops waiting locally; the binary still
    * answers (a long-poll ends at its own ceiling), and the answer is dropped.
+   * Effectful launches must omit this signal and retain receipt/stop custody
+   * across caller cancellation (as SessionsProvider does).
    */
   request<T>(op: string, fields: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
     if (this.#closed) return Promise.reject(this.#closed);

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { JevFabricServe } from "../src/jev-fabric/serve.js";
 import type { DurableShellBridge } from "../src/jev-fabric/bridge.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { SessionsProvider } from "../src/providers/sessions-provider.js";
@@ -11,11 +12,11 @@ const fake = fileURLToPath(new URL("./fixtures/fake-jev-fabric.mjs", import.meta
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
-const setup = (options: { shellOverride?: boolean; root?: string; writePolicy?: () => any; landlockEnforced?: () => boolean; trustedExternalControl?: () => boolean } = {}) => {
+const setup = (options: { shellOverride?: boolean; root?: string; writePolicy?: () => any; landlockEnforced?: () => boolean; trustedExternalControl?: () => boolean; launchDelayMs?: number } = {}) => {
   const root = options.root ?? fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-sessions-")));
   // PI_FABRIC_JEV_FABRIC_BIN runs the same contract against a real jev-fabric build.
   const binary = process.env.PI_FABRIC_JEV_FABRIC_BIN || path.join(root, "jev-fabric");
-  if (!process.env.PI_FABRIC_JEV_FABRIC_BIN && !fs.existsSync(binary)) fs.writeFileSync(binary, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`, { mode: 0o755 });
+  if (!process.env.PI_FABRIC_JEV_FABRIC_BIN && !fs.existsSync(binary)) fs.writeFileSync(binary, `#!/bin/sh\nFAKE_JEV_FABRIC_SERVE_LAUNCH_DELAY_MS="${options.launchDelayMs ?? 0}" exec "${process.execPath}" "${fake}" "$@"\n`, { mode: 0o755 });
   const bridge = { home: path.join(root, "home"), resolve: async () => ({ path: binary }) } as unknown as DurableShellBridge;
   const provider = new SessionsProvider(bridge, {
     cwd: root,
@@ -56,6 +57,76 @@ describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve
     expect(fs.readFileSync(path.join(owner.root, "home", opened.id, "input"), "utf8")).toBe("");
     expect(fs.existsSync(path.join(owner.root, "home", opened.id, "input.closed"))).toBe(false);
     expect(await owner.call("status", { id: opened.id })).toMatchObject({ state: "running" });
+  });
+
+  it.each([false, true])("SR-7 retains delayed launch receipts and stops cancelled children (durable=%s)", async durable => {
+    const { provider, call, root } = setup({ launchDelayMs: 250 });
+    const abort = new AbortController();
+    const pending = provider.invoke("open", { argv: ["sleep", "30"], durable }, {
+      parentToolCallId: "fabric_exec_cancel", signal: abort.signal,
+    } as unknown as FabricInvocationContext);
+    const outcome = pending.then(value => ({ value }), error => ({ error }));
+    const marker = path.join(root, "home", "launch-submitted.json");
+    await vi.waitFor(() => expect(fs.existsSync(marker)).toBe(true));
+    const { id } = JSON.parse(fs.readFileSync(marker, "utf8"));
+    cleanups.push(async () => { await call("stop", { id }); });
+    abort.abort(new Error("launch cancelled"));
+    expect(await outcome).toMatchObject({ error: expect.any(Error) });
+    expect(await call("status", { id })).toMatchObject({ state: "cancelled" });
+  });
+
+  it("SR-7 ends a Jev invocation before acknowledgement without losing its session child", async () => {
+    const { provider, call, root } = setup({ launchDelayMs: 250 });
+    const pending = call("open", { argv: ["sleep", "30"] }, "jev:delayed-owner");
+    const outcome = pending.then(value => ({ value }), error => ({ error }));
+    const marker = path.join(root, "home", "launch-submitted.json");
+    await vi.waitFor(() => expect(fs.existsSync(marker)).toBe(true));
+    const { id } = JSON.parse(fs.readFileSync(marker, "utf8"));
+    await provider.invocationEnded("jev:delayed-owner");
+    expect(await outcome).toMatchObject({ error: expect.any(Error) });
+    expect(await call("status", { id })).toMatchObject({ state: "cancelled" });
+  });
+
+  it("SR-7 joins a delayed durable acknowledgement and stops it before provider close", async () => {
+    const { provider, call, root } = setup({ launchDelayMs: 250 });
+    const pending = call("open", { argv: ["sleep", "30"], durable: true });
+    const outcome = pending.then(value => ({ value }), error => ({ error }));
+    const marker = path.join(root, "home", "launch-submitted.json");
+    await vi.waitFor(() => expect(fs.existsSync(marker)).toBe(true));
+    const { id } = JSON.parse(fs.readFileSync(marker, "utf8"));
+    const other = setup({ root, trustedExternalControl: () => true });
+    cleanups.push(async () => { await other.call("stop", { id }); });
+    await provider.close();
+    expect(await outcome).toMatchObject({ error: expect.any(Error) });
+    expect(await other.call("status", { id })).toMatchObject({ state: "cancelled" });
+  });
+
+  it("SR-7 refuses an already cancelled launch before connecting or submitting", async () => {
+    const { provider } = setup();
+    const resolve = vi.spyOn(provider.bridge, "resolve");
+    const abort = new AbortController(); abort.abort(new Error("pre-launch abort"));
+    await expect(provider.invoke("open", { argv: ["true"] }, {
+      parentToolCallId: "cancelled-owner", signal: abort.signal,
+    } as unknown as FabricInvocationContext)).rejects.toThrow("pre-launch abort");
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it("SR-7 retains a durable uncertain-launch obligation when the connection loses the receipt", async () => {
+    const { provider, root } = setup();
+    const request = vi.fn(async () => { throw new Error("connection lost after submission"); });
+    const mock = { request, exited: new Promise<void>(() => {}), close: vi.fn(async () => {}) };
+    const open = vi.spyOn(JevFabricServe, "open").mockResolvedValueOnce(mock as unknown as JevFabricServe);
+    try {
+      await expect(provider.invoke("open", { argv: ["true"], durable: true }, {
+        parentToolCallId: "uncertain-owner", signal: new AbortController().signal,
+      } as unknown as FabricInvocationContext)).rejects.toThrow(/receipt is uncertain.*custody retained/);
+      const directory = path.join(root, "home", ".fabric-launch-custody");
+      const records = fs.readdirSync(directory);
+      expect(records).toHaveLength(1);
+      expect(JSON.parse(fs.readFileSync(path.join(directory, records[0]!), "utf8")))
+        .toMatchObject({ version: 1, owner: "uncertain-owner", lifetime: "durable", state: "awaiting-receipt" });
+      expect(request).toHaveBeenCalledWith("start", expect.any(Object)); // No observation-only abort signal.
+    } finally { open.mockRestore(); }
   });
 
   it("drives a persistent interactive child with write and read by offset", async () => {

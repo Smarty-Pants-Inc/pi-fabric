@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 import { writePolicyDenial, type FabricWritePolicy } from "../agents/write-guard.js";
 import type { FabricActionDescriptor, FabricInvocationContext, FabricProvider, FabricProviderListRequest } from "../protocol.js";
 import { validationMessage } from "../core/action-arguments.js";
@@ -62,7 +64,8 @@ const descriptors: FabricActionDescriptor[] = [
   { name: "list", description: "Interactive children opened by this Pi session, with lifetime and state.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, risk: "read", effect: { kind: "none", ordering: "commutative" } },
 ];
 
-type Opened = { id: string; lifetime: "session" | "durable"; label?: string; owner?: string };
+type Opened = { id: string; lifetime: "session" | "durable"; label?: string; owner?: string; stopRequired?: boolean; custodyFile?: string };
+type PendingLaunch = { owner: string; lifetime: "session" | "durable"; ended: boolean; pending: Promise<unknown> };
 
 /**
  * Interactive children through jev-fabric's serve protocol: the same verbs,
@@ -76,6 +79,8 @@ export class SessionsProvider implements FabricProvider {
   #serve: Promise<JevFabricServe> | undefined;
   readonly #opened = new Map<string, Opened>();
   #closed = false;
+  #closePromise: Promise<void> | undefined;
+  readonly #launches = new Set<PendingLaunch>();
 
   constructor(
     readonly bridge: DurableShellBridge,
@@ -137,7 +142,10 @@ export class SessionsProvider implements FabricProvider {
       case "status": return serve.request("status", { job }, context.signal);
       case "wait": return serve.request("wait", { job, ...pick(args, ["timeoutMs"]) }, context.signal);
       case "events": return serve.request("events", { job, ...pick(args, ["after", "waitMs"]) }, context.signal);
-      case "stop": return serve.request("stop", { job }, context.signal);
+      case "stop": {
+        const opened = this.#opened.get(job);
+        return opened?.stopRequired ? this.#stopOpened(serve, opened) : serve.request("stop", { job }, context.signal);
+      }
     }
     throw new Error(`Unknown sessions action: ${name}`);
   }
@@ -155,40 +163,110 @@ export class SessionsProvider implements FabricProvider {
     }
   }
 
-  async #open(args: Record<string, unknown>, context: FabricInvocationContext): Promise<unknown> {
+  #open(args: Record<string, unknown>, context: FabricInvocationContext): Promise<unknown> {
+    const launch: PendingLaunch = { owner: context.parentToolCallId, lifetime: args.durable === true ? "durable" : "session",
+      ended: false, pending: Promise.resolve() };
+    this.#launches.add(launch);
+    launch.pending = this.#launch(args, context, launch).finally(() => this.#launches.delete(launch));
+    return launch.pending;
+  }
+
+  async #launch(args: Record<string, unknown>, context: FabricInvocationContext, launch: PendingLaunch): Promise<unknown> {
     this.#assertShellControl("open");
     if ((args.argv === undefined) === (args.cmd === undefined)) throw new Error("sessions.open needs exactly one of argv or cmd");
     const cwd = path.resolve(this.options.cwd, typeof args.cwd === "string" ? args.cwd : ".");
     if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Working directory does not exist: ${cwd}`);
     const argv = Array.isArray(args.argv) ? args.argv as string[] : [fs.existsSync("/bin/bash") ? "/bin/bash" : "bash", "-c", args.cmd as string];
     const durable = args.durable === true;
+    context.signal?.throwIfAborted();
     const serve = await this.#connect();
-    const fields = { argv, cwd, ...pick(args, ["timeoutMs", "label"]) };
-    const result = await serve.request<Record<string, unknown>>(durable ? "start" : "spawn", durable ? { ...fields, input: "pipe" } : fields, context.signal);
-    const opened: Opened = {
-      id: String(result.id), lifetime: durable ? "durable" : "session",
-      ...(typeof args.label === "string" ? { label: args.label } : {}),
-      // A Jev program's session children end with the program; fabric_exec ones stay with Pi.
-      ...(!durable && context.parentToolCallId.startsWith("jev:") ? { owner: context.parentToolCallId } : {}),
-    };
-    this.#opened.set(opened.id, opened);
-    return { ...result, lifetime: opened.lifetime };
+    context.signal?.throwIfAborted();
+    if (launch.ended || this.#closed) throw new Error("Interactive launch owner ended before submission");
+    const key = randomUUID();
+    const custodyFile = path.join(this.bridge.home, ".fabric-launch-custody", `${key}.json`);
+    const fields = { argv, cwd, ...pick(args, ["timeoutMs", "label"]), label: args.label ?? `fabric-launch:${key}` };
+    const custody = { version: 1, key, owner: launch.owner, lifetime: launch.lifetime, label: fields.label, submittedAt: Date.now() };
+    // A lost acknowledgement cannot erase an effectful launch. Retain a durable
+    // uncertain-launch obligation even if the serve connection dies without a receipt.
+    writeJsonAtomic(custodyFile, { ...custody, state: "awaiting-receipt" }, { durable: true });
+    let opened: Opened | undefined;
+    try {
+      // Abort only the observation, not launch-result custody. Always collect the
+      // acknowledgement and compensate before this provider-owned work settles.
+      const result = await serve.request<Record<string, unknown>>(durable ? "start" : "spawn", durable ? { ...fields, input: "pipe" } : fields);
+      if (typeof result.id !== "string" || !result.id || result.id.length > 128) throw new Error("Interactive launch returned no valid child receipt");
+      opened = {
+        id: result.id, lifetime: launch.lifetime,
+        ...(typeof args.label === "string" ? { label: args.label } : {}),
+        // A Jev program's session children end with the program; fabric_exec ones stay with Pi.
+        ...(!durable && context.parentToolCallId.startsWith("jev:") ? { owner: context.parentToolCallId } : {}),
+      };
+      this.#opened.set(opened.id, opened);
+      context.signal?.throwIfAborted();
+      if (launch.ended || this.#closed) throw new Error("Interactive launch owner ended before acknowledgement");
+      fs.unlinkSync(custodyFile); // Custody now belongs to #opened and the acknowledged caller.
+      return { ...result, lifetime: opened.lifetime };
+    } catch (error) {
+      if (opened) {
+        opened.stopRequired = true;
+        opened.custodyFile = custodyFile;
+        try { writeJsonAtomic(custodyFile, { ...custody, state: "stop-required", id: opened.id }, { durable: true }); }
+        catch { /* The original durable obligation and in-memory receipt still retain custody. */ }
+        try { await this.#stopOpened(serve, opened); }
+        catch (stopError) { throw new Error(`Interactive launch stop is unconfirmed for ${opened.id}; custody retained at ${custodyFile}: ${String(stopError)}`); }
+      } else {
+        throw new Error(`Interactive launch receipt is uncertain; custody retained at ${custodyFile}: ${String(error)}`);
+      }
+      throw error;
+    }
+  }
+
+  async #stopOpened(serve: JevFabricServe, opened: Opened): Promise<Record<string, unknown>> {
+    opened.stopRequired = true;
+    const result = await serve.request<Record<string, unknown>>("stop", { job: opened.id });
+    if (result.id !== opened.id || !["cancelled", "timed_out", "exited", "failed"].includes(String(result.state))) {
+      throw new Error("jev-fabric did not confirm a terminal stop receipt");
+    }
+    this.#opened.delete(opened.id);
+    if (opened.custodyFile) fs.unlinkSync(opened.custodyFile);
+    return result;
   }
 
   async invocationEnded(parentToolCallId: string): Promise<void> {
     if (!parentToolCallId.startsWith("jev:")) return;
+    const launching = [...this.#launches].filter(launch => launch.owner === parentToolCallId && launch.lifetime === "session");
+    for (const launch of launching) launch.ended = true;
+    await Promise.allSettled(launching.map(launch => launch.pending));
     const owned = [...this.#opened.values()].filter(opened => opened.owner === parentToolCallId);
     if (!owned.length || !this.#serve) return;
     const serve = await this.#serve.catch(() => undefined);
     await Promise.allSettled(owned.map(async opened => {
-      this.#opened.delete(opened.id);
-      await serve?.request("stop", { job: opened.id });
+      if (serve) await this.#stopOpened(serve, opened);
     }));
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
     this.#closed = true;
-    const serve = await this.#serve?.catch(() => undefined);
+    for (const launch of this.#launches) launch.ended = true;
+    return this.#closePromise ??= this.#close();
+  }
+
+  async #close(): Promise<void> {
+    // Join launch acknowledgements and compensating stops before ending the
+    // connection; durable children do not die merely because serve disconnects.
+    const connection = this.#serve;
+    let forcedClose: Promise<void> | undefined;
+    // A silent/lost serve acknowledgement cannot hang host teardown forever.
+    // Closing the connection rejects pending receipts; durable uncertainty stays
+    // in the write-ahead custody record, while session children die with serve.
+    const timer = this.#launches.size ? setTimeout(() => {
+      forcedClose = connection?.then(serve => serve.close()).catch(() => undefined);
+    }, 30_000) : undefined;
+    try { await Promise.allSettled([...this.#launches].map(launch => launch.pending)); }
+    finally { clearTimeout(timer); }
+    await forcedClose;
+    const serve = await connection?.catch(() => undefined);
+    if (serve) await Promise.allSettled([...this.#opened.values()].filter(opened => opened.stopRequired).map(opened => this.#stopOpened(serve, opened)));
     this.#opened.clear();
     // Ending the connection stops its session children; durable jobs stay in their store.
     await serve?.close();

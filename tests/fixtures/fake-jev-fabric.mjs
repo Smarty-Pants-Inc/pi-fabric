@@ -137,6 +137,7 @@ else if (command === "stop") {
       return { id, stream, offset, bytes: slice.length, omittedBytes: 0, ...(r.encoding === "base64" ? { data: slice.toString("base64") } : { text: slice.toString("utf8") }),
         next: offset + slice.length, eof: Boolean(receipt(id)) && offset + slice.length >= data.length, state: state(id).state };
     },
+    stop: async (r, id) => { fs.writeFileSync(path.join(dir(id), "stop"), ""); const until = Date.now() + 5000; while (!receipt(id) && Date.now() < until) await sleep(25); return { ...state(id), lifetime: "durable" }; },
     status: (r, id) => ({ ...state(id), lifetime: "durable" }),
     wait: async (r, id) => { const until = Date.now() + (r.timeoutMs ?? 30000); while (!receipt(id) && Date.now() < until) await sleep(25); return { ...state(id), lifetime: "durable" }; },
   };
@@ -202,7 +203,15 @@ else if (command === "stop") {
         const handler = handlers[request.op];
         if (!handler) throw Object.assign(new Error(`unknown op: ${request.op}`), { code: 2 });
         return handler(request);
-      }).then((result) => print({ id: request.id, ok: true, result }),
+      }).then(async (result) => {
+        const delay = Number(process.env.FAKE_JEV_FABRIC_SERVE_LAUNCH_DELAY_MS ?? 0);
+        if (delay && (request.op === "start" || request.op === "spawn")) {
+          fs.mkdirSync(home, { recursive: true });
+          fs.writeFileSync(path.join(home, "launch-submitted.json"), JSON.stringify(result));
+          await sleep(delay);
+        }
+        print({ id: request.id, ok: true, result });
+      },
         (error) => print({ id: request.id, ok: false, error: { code: error.code ?? 1, message: error.message } }));
     }
   });

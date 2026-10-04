@@ -5,6 +5,12 @@ import path from "node:path";
 import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
 import { windowsDataRoot } from "../src/storage/windows-temp-root.js";
 
+// Diskpart's maximum is in MiB, not the backing file's initial physical size.
+// The recovery fixture alone ftruncates 10,000 NTFS files to 8 GB in total;
+// NTFS does not infer sparse allocation from ftruncate. Leave room for it and
+// concurrent suites without preallocating 64 GiB on the runner's physical disk.
+export const WINDOWS_TEST_VOLUME_MAX_MIB = 64 * 1024;
+
 /** Only test-owned NTFS volumes get new ACLs. Never repair/whitelist a CI
  * runner's C:/D: drive, whose ancestors may be foreign-owned or writable. */
 export const privateWindowsTestTemp = (): { directory: string; close(): void } => {
@@ -48,7 +54,7 @@ export const privateWindowsTestTemp = (): { directory: string; close(): void } =
     const letter = [..."ZYXWVUTSRQPONMLKJIHGFE"].find(candidate => !drives.some(drive => drive[0]!.toUpperCase() === candidate));
     if (!letter) throw new Error("No free drive for private test volume");
     volume = `${letter}:\\`;
-    const output = diskpart([`create vdisk file="${vhd}" maximum=512 type=expandable`, `select vdisk file="${vhd}"`,
+    const output = diskpart([`create vdisk file="${vhd}" maximum=${WINDOWS_TEST_VOLUME_MAX_MIB} type=expandable`, `select vdisk file="${vhd}"`,
       "attach vdisk", "create partition primary", 'format fs=ntfs label="fabric-private-tests" quick', `assign letter=${letter}`]);
     if (!fs.existsSync(volume)) throw new Error(`Private Windows test volume setup failed: ${output}`);
     native(String.raw`

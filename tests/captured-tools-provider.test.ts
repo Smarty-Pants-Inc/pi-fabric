@@ -161,6 +161,8 @@ describe("CapturedToolsProvider", () => {
       expect.objectContaining({ ref: "extensions.compat_tool", risk: "execute" }),
       // The trusted interceptor changes its private invocation copy, not the approval record.
       { value: "hello" },
+      // A9 carries registry-effective cancellation into every approval hook.
+      expect.any(AbortSignal),
     );
     expect(context.update).toHaveBeenCalledWith("compat_tool: halfway");
     expect(lifecycleEvents).toEqual([

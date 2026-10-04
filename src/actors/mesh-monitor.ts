@@ -22,6 +22,7 @@ export class ActorMeshMonitor {
   #dueTimer: NodeJS.Timeout | undefined;
   #dueAt: number | undefined;
   #watcher: FSWatcher | undefined;
+  #watchWake: NodeJS.Immediate | undefined;
   #offset: number;
   #scheduled = false;
   #polling = false;
@@ -91,7 +92,14 @@ export class ActorMeshMonitor {
         const name = filename === null ? undefined : path.basename(filename.toString());
         // schedules.json re-arms the due timer when another process schedules.
         if (name !== undefined && name !== "events.jsonl" && name !== "schedules.json") return;
-        this.schedule();
+        // A filesystem burst can deliver several callbacks in one poll phase.
+        // Microtasks run between those callbacks, so schedule() alone would
+        // refresh every actor's ownership once per notification (including the
+        // schedule wakeups added by the sync), not once per readable page.
+        if (!this.#watchWake) this.#watchWake = setImmediate(() => {
+          this.#watchWake = undefined;
+          this.schedule();
+        });
       });
       this.#watcher = watcher;
       watcher.on("error", () => this.#fallback(watcher));
@@ -119,6 +127,8 @@ export class ActorMeshMonitor {
     this.#dueTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
+    if (this.#watchWake) clearImmediate(this.#watchWake);
+    this.#watchWake = undefined;
     if (this.#started) this.#persistCursor(true);
   }
 

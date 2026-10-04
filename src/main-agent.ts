@@ -113,6 +113,8 @@ export interface FabricMainAgentTarget {
   /** Local session mode, available even when its first mesh publication fails. */
   readonly interactive?: boolean;
   matches(id: string): boolean;
+  /** Native process-owned halt/abort; remote targets omit this capability. */
+  stop?(): { id: string; status: "stopped" };
   info(context?: ExtensionContext): FabricMainAgentInfo;
   deliverAgent(request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult;
   // Switch Main's live session model in place. Only local hosts hold the pi
@@ -358,6 +360,15 @@ export class MainAgentController implements FabricMainAgentTarget {
   matches(id: string): boolean {
     const target = id.trim();
     return target === MAIN_AGENT_ALIAS || target === this.id;
+  }
+
+  stop(): { id: string; status: "stopped" } {
+    if (!this.local || !this.#bindingsLive || !this.#context) {
+      throw new Error(`Main agent ${this.id} has no local stop controller`);
+    }
+    this.halt();
+    this.#context.abort();
+    return { id: this.id, status: "stopped" };
   }
 
   info(context?: ExtensionContext): FabricMainAgentInfo {

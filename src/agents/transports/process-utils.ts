@@ -288,6 +288,7 @@ export const spawnDetached = async (
   executionCustodian = false,
 ): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
+  const treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
   assertTransportLaunchAllowed(authority);
   // The new tree-custody protocol is unsupported on Windows. Even an internal
   // caller requesting it must get only the legacy native worker-exit contract.
@@ -353,6 +354,11 @@ export const spawnDetached = async (
   let birth: LinuxGroupMember | undefined;
   let birthUnknown = false;
   try { birth = process.platform === "linux" ? linuxGroupMember(pid) : undefined; } catch { birthUnknown = true; }
+  // Share the original birth anchor with sampled cleanup. A second observation
+  // must not adopt a replacement process when the captured worker was absent.
+  const ownedTree = treeOwner ? { processes: new Map<number, import("../../residency/launcher-owner.js").OwnedProcess>(
+    birth ? [[pid, { pid, processStartTime: birth.started, ppid: birth.parent, state: birth.state }]] : [],
+  ) } : undefined;
   const owned = new Map<number, string>();
   if (birth) owned.set(pid, birth.started);
   const groups = new Set([pid]);
@@ -503,6 +509,8 @@ export const spawnDetached = async (
       if (stopping) return stopping;
       stopFailed = false;
       const pending = (async () => {
+        // Retain the PR's observed detached descendants before TERM can reparent them.
+        if (ownedTree && treeOwner) treeOwner.captureDescendants(ownedTree);
         if (process.platform !== "win32") {
           if (process.platform === "linux" && !birth) {
             // A captured native handle can lag /proc absence. Bound its close
@@ -550,6 +558,9 @@ export const spawnDetached = async (
               }, 7_000);
             }),
           ]);
+          // Sampling cleanup supplements, but never replaces, the confirmed-exit
+          // custody and birth-checked group drain above. Native-close debt stays latched.
+          if (ownedTree && treeOwner) await treeOwner.stopObservedDescendants(ownedTree, pid);
           stopped = true;
         } finally { clearTimeout(force); clearTimeout(deadline); }
       })();

@@ -32,7 +32,6 @@ import {
   prepareFabricExecArguments,
   resolveFabricExecPayloads,
 } from "./fabric-exec-arguments.js";
-import { repairFabricGuestCode } from "./runtime/guest-code-repair.js";
 import {
   FABRIC_REPEAT_BLOCK,
   FABRIC_REPEAT_WARN,
@@ -40,6 +39,7 @@ import {
   fabricRepeatBlockText,
   fabricRepeatWarnText,
 } from "./repeat-guard.js";
+import { repairFabricGuestCode } from "./runtime/guest-code-repair.js";
 import { normalizeRunDisplay } from "./run-display.js";
 import type { PendingFabricHandoff } from "./prewalk/handoff.js";
 import type { FabricMediaBlock } from "./protocol.js";
@@ -87,7 +87,6 @@ import {
 } from "./ui/row-balance.js";
 import { observeAnimationRows, type SpinnerTimerState, updateSpinner } from "./ui/spinner.js";
 import type { FabricToolDisplayController } from "./ui/tool-display.js";
-import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import { formatFabricValue } from "./ui/structured.js";
 import { countNewlines } from "./util.js";
 
@@ -967,6 +966,7 @@ export const createFabricExecTool = (
           prewalkStatus.state === "armed" ? `plan awaited → ${prewalkStatus.model}` : undefined,
         );
       }
+      const { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } = await import("./output-budget.js");
       const fullFormattedValue = formatFabricValue(result.value, selectedResultFormat);
       const failureProgress = formatFailureProgress(result.trace);
       const residentPriority = result.residentOutcomes?.length

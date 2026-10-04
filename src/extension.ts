@@ -1,6 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
-import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch } from "./topology/root-inbox.js";
-import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
+import type { RootInboxBatch } from "./topology/root-inbox.js";
 import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
 import { registerFabricFixture } from "./guards/fixture-mode.js";
@@ -23,7 +22,7 @@ import { installRegisteredToolCapture } from "./capture/interceptor.js";
 import { registerFabricCommand } from "./commands/fabric.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import { FileLockTimeoutError } from "./core/file-lock.js";
-import { setActiveCompiledSurface } from "./entropy/active.js";
+import { setActiveCompiledSurface } from "./entropy/active-state.js";
 import {
   filterPrewalkContinuationMessages,
   filterPrewalkPlanningDirectives,
@@ -111,7 +110,6 @@ import { configureHighlighting } from "./ui/highlight.js";
 import { registerHandoffCompletionRenderer } from "./ui/handoff-completion.js";
 import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
-import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import path from "node:path";
 import { writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -208,11 +206,16 @@ const settledCompleted = (event: unknown, context: ExtensionContext): boolean =>
   settledOutcome(event, context) === "completed";
 
 // Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
-const inboxHeldBy = (context: ExtensionContext) => confirmedRootInboxSession(context.sessionManager);
+const inboxHeldBy = async (context: ExtensionContext) =>
+  (await import("./topology/root-inbox.js")).confirmedRootInboxSession(context.sessionManager);
+const deliverRootInbox = async (...args: Parameters<typeof import("./topology/root-inbox-delivery.js")["deliverRootInbox"]>): Promise<void> =>
+  (await import("./topology/root-inbox-delivery.js")).deliverRootInbox(...args);
 
 /** Expiry is observational: one line, never a triggered continuation. */
-const reportInboxExpiry = (pi: ExtensionAPI, inbox: RootInboxBatch | undefined): void => {
-  if (inbox?.skippedStale) sendFabricMessage(pi, rootInboxSummary(inbox), { deliverAs: "followUp", triggerTurn: false });
+const reportInboxExpiry = async (pi: ExtensionAPI, inbox: RootInboxBatch | undefined): Promise<void> => {
+  if (!inbox?.skippedStale) return;
+  const { rootInboxSummary } = await import("./topology/root-inbox.js");
+  sendFabricMessage(pi, rootInboxSummary(inbox), { deliverAs: "followUp", triggerTurn: false });
 };
 
 // An idle Main reads its inbox this often (smarty-dev#1595). With the 60 s steer grace, an event
@@ -628,7 +631,14 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
           return merged;
         }
       }();
-      await updateObservationPoolAsync(agentDir, evidence.observationWindows, observations);
+      // Avoid a write/lock attempt for unchanged evidence as in the fork, but
+      // rebase every actual update under upstream's cross-process pool lock.
+      const pooled = await entropy.loadObservationPoolAsync(agentDir);
+      if (pooled.error) throw new Error(pooled.error);
+      const planned = await observations.merge(pooled.file, evidence.observationWindows, signal);
+      if (planned.mergedSessions > 0 || !pooled.file) {
+        await updateObservationPoolAsync(agentDir, evidence.observationWindows, observations);
+      }
     } catch (error) {
       if (signal.aborted) return false;
       if (error instanceof FileLockTimeoutError) {
@@ -765,11 +775,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     inboxWake.reading = true;
     try {
       if (!idle()) return;
-      const inbox = await state.nextRootInbox(inboxHeldBy(context), idle);
-      reportInboxExpiry(pi, inbox);
+      const inbox = await state.nextRootInbox(await inboxHeldBy(context), idle);
+      await reportInboxExpiry(pi, inbox);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
-        deliverRootInbox(pi, inbox.events);
+        await deliverRootInbox(pi, inbox.events);
         return;
       }
       // Records: the same gate, re-checked after the read (F21).
@@ -977,9 +987,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // (smarty-dev#754). An aborted run waits for owner input; a failed run leaves its
     // mailbox to the idle reader above, rather than retrying at the error boundary.
     if (settledCompleted(event, context)) {
-      const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
-      reportInboxExpiry(pi, inbox);
-      if (inbox?.events.length) deliverRootInbox(pi, inbox.events);
+      const inbox = await state.nextRootInbox(await inboxHeldBy(context)).catch(() => undefined);
+      await reportInboxExpiry(pi, inbox);
+      if (inbox?.events.length) await deliverRootInbox(pi, inbox.events);
       // Records addressed to this root past its processing cursor (smarty-dev#754 C4), same hook.
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
       if (records) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
@@ -1103,6 +1113,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const executionOutcome = pending.executionOutcome;
     const boundarySucceeded = (handoff.completed === true || handoff.continued === true) &&
       executionOutcome?.success !== false && !executionOutcome?.residentOutcomes.length && !outerToolResult.isError;
+    const { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } = await import("./output-budget.js");
     const residentPriority = executionOutcome?.residentOutcomes.length
       ? formatResidentOutcomePriority(executionOutcome.residentOutcomes)
       : undefined;
@@ -1385,12 +1396,12 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     inboxWake.context = context;
     inboxWake.armed = true;
     if (!state.initialized) return;
-    const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
-    reportInboxExpiry(pi, inbox);
+    const inbox = await state.nextRootInbox(await inboxHeldBy(context)).catch(() => undefined);
+    await reportInboxExpiry(pi, inbox);
     if (!inbox?.events.length) return;
     // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result.
-    if (!fabricProvenanceSupported(pi)) return { message: rootInboxMessage(inbox.events) };
-    deliverRootInbox(pi, inbox.events, { deliverAs: "nextTurn", triggerTurn: false });
+    if (!fabricProvenanceSupported(pi)) return { message: (await import("./topology/root-inbox.js")).rootInboxMessage(inbox.events) };
+    await deliverRootInbox(pi, inbox.events, { deliverAs: "nextTurn", triggerTurn: false });
   });
 
   // Records addressed to this root reach it with its next turn (smarty-dev#754 C4).

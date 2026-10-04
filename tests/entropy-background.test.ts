@@ -69,7 +69,7 @@ import piFabric from "../src/index.js";
 import { BackgroundEntropyCompiler, compileEntropySurface } from "../src/entropy/compiler.js";
 import { FileLockTimeoutError } from "../src/core/file-lock.js";
 import * as compiledStore from "../src/entropy/compiled-store.js";
-import * as activeSurface from "../src/entropy/active.js";
+import * as activeSurface from "../src/entropy/active-state.js";
 import * as sessions from "../src/entropy/sessions.js";
 import * as poolStore from "../src/entropy/pool-store.js";
 import { SessionObservationCache } from "../src/entropy/pool.js";
@@ -157,6 +157,7 @@ const installLiveLock = (agentDir: string, name: string) => {
 
 const mockRetryIO = () => {
   vi.spyOn(compiledStore, "loadCompiledSurfaceAsync").mockResolvedValue({});
+  vi.spyOn(poolStore, "loadObservationPoolAsync").mockResolvedValue({});
   vi.spyOn(sessions, "sessionWindowEvidenceAsync").mockResolvedValue({
     traceWindows: [], traces: [], valueObservations: [], auditCalls: [], observationWindows: [],
   });

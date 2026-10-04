@@ -11,8 +11,6 @@ import { truncateMiddle } from "../util.js";
 import type { FabricUiController } from "../ui/controller.js";
 import { FABRIC_CONVERSATION_SHORTCUT } from "../ui/conversation-shortcut.js";
 import { safeText } from "../ui/format.js";
-import { FabricModelSelector } from "../ui/fabric-model-selector.js";
-import { buildModelSource } from "../ui/model-picker.js";
 import {
   FABRIC_PEER_AWAIT_SETTLE_EVENT,
   FABRIC_PEER_CARDS_EVENT,
@@ -22,9 +20,8 @@ import {
   readFabricPrewalkRequestV1,
   type FabricPrewalkRequestResultV1,
 } from "../protocol.js";
-import { awaitPeerSettle, buildPeerCards } from "../topology/peer-settle.js";
 import type { RepairStatus } from "../repairs/types.js";
-import { setActiveCompiledSurface } from "../entropy/active.js";
+import { setActiveCompiledSurface } from "../entropy/active-state.js";
 import { formatForeground } from "../core/foreground-tools.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -120,6 +117,9 @@ const resolvePrewalkModel = async (
   }
   if (typeof context.ui.custom === "function") {
     try {
+      const [{ FabricModelSelector }, { buildModelSource }] = await Promise.all([
+        import("../ui/fabric-model-selector.js"), import("../ui/model-picker.js"),
+      ]);
       // undefined = host can't show the dialog; { model: undefined } = user cancelled.
       const picked = await context.ui.custom<{ model?: string | undefined } | undefined>(
         (_tui, theme, _keybindings, done) =>
@@ -217,6 +217,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           request.respond({ ok: false, error: stalled.message });
           return;
         }
+        const { buildPeerCards } = await import("../topology/peer-settle.js");
         request.respond({ ok: true, cards: buildPeerCards(state.peerInfos()) });
       } catch (error) {
         request.respond({
@@ -236,6 +237,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           request.respond({ ok: false, error: "Fabric mesh is disabled; peers cannot be observed" });
           return;
         }
+        const { awaitPeerSettle } = await import("../topology/peer-settle.js");
         request.respond(await awaitPeerSettle({
           poll: () => state.peerInfos(),
           stalled: () => state.writeStalled?.(),

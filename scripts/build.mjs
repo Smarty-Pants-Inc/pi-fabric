@@ -46,6 +46,13 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/output-budget.ts",
+  "src/topology/root-inbox.ts",
+  "src/topology/root-inbox-delivery.ts",
+  "src/core/approval-controller.ts",
+  "src/core/auto-approval-classifier.ts",
+  "src/ui/fabric-model-selector.ts",
+  "src/topology/peer-settle.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
   "src/core/pattern-kill.ts",
@@ -104,6 +111,7 @@ const lazyEntryPoints = [
   "src/ui/conversation-native-reader.ts",
   "src/ui/model-picker.ts",
   "src/ui/settings.ts",
+  "src/worker/tool-call-stream-guard.ts",
   "src/worker/event-projection.ts",
   "src/worker/activation-window.ts",
   "src/worker/activation-compaction.ts",
@@ -177,6 +185,11 @@ const standalone = await build({
   plugins: [{
     name: "external-except-host-provided",
     setup(pluginBuild) {
+      // Preserve first-use package-local entries as upstream's split build does.
+      // Inlining them here hoists their external imports into the bootstrap,
+      // before it can publish a missing-dependency startup failure.
+      pluginBuild.onResolve({ filter: /^\.\.?\// }, (args) =>
+        args.kind === "dynamic-import" ? { path: args.path, external: true } : undefined);
       pluginBuild.onResolve({ filter: /^[^./]/ }, (args) =>
         args.kind === "entry-point" || hostProvided.test(args.path)
           ? undefined

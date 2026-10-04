@@ -1,5 +1,5 @@
 import { isPiShellRef } from "../core/pi-tools.js";
-import { isNormalFormWitness, type NormalFormWitness } from "../entropy/normal-form.js";
+import { isNormalFormWitness, type NormalFormWitness } from "../entropy/normal-form-witness.js";
 import { projectFabricAuditArgs, projectFabricAuditResult } from "./projection.js";
 
 export const FABRIC_EXECUTION_TRACE_KIND = "pi-fabric.execution" as const;

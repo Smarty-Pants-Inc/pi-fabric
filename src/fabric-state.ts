@@ -22,7 +22,7 @@ import {
   type FabricResultFormat,
   type FabricSchemaMode,
 } from "./config.js";
-import { FabricSessionApprovals } from "./core/approval-controller.js";
+import { FabricSessionApprovals } from "./core/session-approvals.js";
 import { readChildToolAllowlist } from "./core/child-tool-allowlist.js";
 import { NO_FOREGROUND, resolveForegroundTools, type FabricForegroundResolution } from "./core/foreground-tools.js";
 import { PrewalkController } from "./prewalk/controller.js";

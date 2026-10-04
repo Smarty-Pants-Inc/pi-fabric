@@ -187,6 +187,16 @@ for (const file of startupFiles) {
     }
   }
 }
+// Standalone worker first-use imports must resolve in the published package.
+// Preserve the lazy boundary without silently omitting fork-only worker entries.
+for (const file of staticClosure([join(dist, "worker.js")])) {
+  for (const match of readFileSync(file, "utf8").matchAll(/import\(\s*["']([^"']+)["']\s*\)/g)) {
+    // Source-only .ts fallbacks are unreachable from the compiled .js worker.
+    if (match[1].startsWith(".") && /\.m?js$/.test(match[1]) && !existsSync(resolve(dirname(file), match[1]))) {
+      throw new Error(`Missing worker first-use entry: ${match[1]} from ${file}`);
+    }
+  }
+}
 // The operation interpreter must load only when an action is dispatched.
 if ([...startupFiles].some(file => /class ProviderOperations|Fabric provider operation denied/.test(readFileSync(file, "utf8")))) {
   throw new Error("Provider operation interpreter escaped into the startup graph");

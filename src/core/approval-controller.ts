@@ -45,24 +45,8 @@ const onceLabel = "Allow once";
 const sessionLabel = (risk: FabricRisk): string =>
   `Allow ${risk} access for this session`;
 
-export class FabricSessionApprovals {
-  readonly approvedRisks = new Set<FabricRisk>();
-  #tail: Promise<void> = Promise.resolve();
-
-  async serialize<T>(request: () => Promise<T>): Promise<T> {
-    const previous = this.#tail;
-    let release: (() => void) | undefined;
-    this.#tail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
-    try {
-      return await request();
-    } finally {
-      release?.();
-    }
-  }
-}
+import { FabricSessionApprovals } from "./session-approvals.js";
+export { FabricSessionApprovals } from "./session-approvals.js";
 
 export interface FabricAutoApprovalAudit {
   action: string;

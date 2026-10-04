@@ -481,7 +481,12 @@ export class ActorManager {
   #mainIdle = true;
   #reloadingOwnership = false;
   #registryFingerprint: string | undefined;
-  #savedActors: { owned: string; fingerprint: string | undefined } | undefined;
+  #savedActors: { owned: string; critical: string; fingerprint: string | undefined } | undefined;
+  readonly #lazyMessages = new WeakMap<ManagedActor, Record<string, unknown>>();
+  readonly #unarchivedMessages = new WeakMap<ManagedActor, FabricActorMessage[]>();
+  #registrySaveTimer: NodeJS.Timeout | undefined;
+  #registrySavePending: Promise<void> | undefined;
+  #lastRegistrySaveAt = 0;
   readonly #canConsumeMesh: (() => boolean) | undefined;
 
   constructor(
@@ -2181,6 +2186,7 @@ export class ActorManager {
       throw new Error("Actor release boundary is not quiescent");
     }
     await Promise.all([...this.#presenceChains.values()]);
+    await this.#registrySavePending;
     let checkpointedActor = false;
     for (const actor of this.#actors.values()) {
       if (!this.#ownershipDecision(actor.id)) continue;
@@ -2208,6 +2214,9 @@ export class ActorManager {
 
   async #close(): Promise<void> {
     this.#meshMonitor.close();
+    if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
+    this.#registrySaveTimer = undefined;
+    await this.#registrySavePending;
     for (const timer of this.#drainRetries.values()) clearTimeout(timer);
     this.#drainRetries.clear();
     this.#drainRearms.clear();
@@ -3521,6 +3530,11 @@ export class ActorManager {
     if (message.source === "child-completion" && message.direction === "in" &&
       actor.messages.some((known) => known.id === message.id && known.direction === "in")) return;
     this.#logs.recordMessage(actor.messages, message);
+    if (this.#persistent && this.meshConfig.enabled) {
+      const pending = this.#unarchivedMessages.get(actor) ?? [];
+      pending.push(structuredClone(message));
+      this.#unarchivedMessages.set(actor, pending);
+    }
   }
 
   async #publishPresence(actor: ManagedActor): Promise<void> {
@@ -3703,7 +3717,11 @@ export class ActorManager {
       ...(actor.failureStreak ? { failureStreak: { ...actor.failureStreak } } : {}),
       ...(actor.validWhile ? { validWhile: actor.validWhile } : {}),
       sessionFile: actor.sessionFile,
-      messages: actor.messages,
+      ...(this.#lazyMessages.has(actor)
+        ? this.#lazyMessages.get(actor)!.messageHistory !== undefined
+          ? { messageHistory: this.#lazyMessages.get(actor)!.messageHistory }
+          : { messages: this.#lazyMessages.get(actor)!.messages ?? [] }
+        : { messages: actor.messages }),
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
@@ -3711,34 +3729,110 @@ export class ActorManager {
     };
   }
 
-  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean }): Promise<void> {
+  #installLazyMessages(actor: ManagedActor, source: Record<string, unknown>): void {
+    this.#lazyMessages.set(actor, source);
+    const install = (messages: FabricActorMessage[]) => {
+      this.#lazyMessages.delete(actor);
+      Object.defineProperty(actor, "messages", { value: messages, writable: true, enumerable: true, configurable: true });
+    };
+    Object.defineProperty(actor, "messages", {
+      enumerable: true, configurable: true,
+      get: () => {
+        const messages: FabricActorMessage[] = [];
+        for (const candidate of this.#registry.messages(source, MESSAGE_HISTORY_LIMIT)) {
+          if (typeof candidate === "object" && candidate !== null && !Array.isArray(candidate) &&
+              typeof (candidate as Partial<FabricActorMessage>).id === "string" &&
+              typeof (candidate as Partial<FabricActorMessage>).source === "string" &&
+              typeof (candidate as Partial<FabricActorMessage>).createdAt === "number") {
+            // Bounding must not mutate an inline legacy record before it is archived.
+            this.#logs.recordMessage(messages, structuredClone(candidate) as FabricActorMessage);
+          }
+        }
+        install(messages);
+        return messages;
+      },
+      set: install,
+    });
+  }
+
+  #messageCount(actor: ManagedActor): number {
+    const source = this.#lazyMessages.get(actor);
+    if (!source) return actor.messages.length;
+    const ref = source.messageHistory as { count?: number } | undefined;
+    return Math.min(MESSAGE_HISTORY_LIMIT, ref?.count ?? (Array.isArray(source.messages) ? source.messages.length : 0));
+  }
+
+  #criticalRegistryState(rows: Record<string, unknown>[]): string {
+    return JSON.stringify(rows.map(({ status, updatedAt: _updatedAt, lastRunId: _lastRunId, ...record }) =>
+      ({ ...record, stopped: status === "stopped" })));
+  }
+
+  #scheduleRegistrySave(): void {
+    if (this.#registrySaveTimer || this.#closing) return;
+    this.#registrySaveTimer = setTimeout(() => {
+      this.#registrySaveTimer = undefined;
+      this.#registrySavePending = this.#saveActors(new Set(), { flush: true }).catch((error) => {
+        console.warn(`[pi-fabric] actor registry save failed: ${error instanceof Error ? error.message : String(error)}`);
+        // Preserve dirty state and retry after the same bounded window.
+        this.#lastRegistrySaveAt = Date.now();
+        this.#scheduleRegistrySave();
+      }).finally(() => { this.#registrySavePending = undefined; });
+    }, Math.max(1, 5_000 - (Date.now() - this.#lastRegistrySaveAt)));
+    this.#registrySaveTimer.unref?.();
+  }
+
+  #deferSoftRegistrySave(rows: Record<string, unknown>[], forced: boolean): boolean {
+    if (forced || this.#closing || !this.#savedActors ||
+        this.#registry.fingerprint() !== this.#savedActors.fingerprint) return false;
+    if (JSON.stringify(rows) === this.#savedActors.owned) return true;
+    // Only status/timestamps are soft. Creation, stop/start, instructions, messages,
+    // configuration, custody and removal bypass the window and retain their barriers.
+    if (this.#criticalRegistryState(rows) === this.#savedActors.critical &&
+        Date.now() - this.#lastRegistrySaveAt < 5_000) {
+      this.#scheduleRegistrySave();
+      return true;
+    }
+    return false;
+  }
+
+  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean; flush?: boolean }): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     if (removedIds.size === 0 && !options?.durable && this.#savedActors) {
       const owned = [...this.#actors.values()].filter((actor) =>
         !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id));
-      if (JSON.stringify(owned.map((actor) => this.#serializedActor(actor))) === this.#savedActors.owned &&
-        this.#registry.fingerprint() === this.#savedActors.fingerprint) return;
+      if (this.#deferSoftRegistrySave(owned.map((actor) => this.#serializedActor(actor)), options?.flush === true)) return;
     }
-    await this.#registry.withLock(() => this.#withOwnershipRead(() => {
+    const committed = await this.#registry.withLock(() => this.#withOwnershipRead(() => {
       // Finalization fences reloads and serialization, but only this save's explicit ids
       // are authorized to revoke: their own durable write-ahead markers already exist.
       // Preserve every other finalizer's current registry row, prepared or not.
       const owned = [...this.#actors.values()].filter((actor) =>
         !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id),
       );
+      const rows = owned.map((actor) => this.#serializedActor(actor));
+      // Recheck after the lock wait: concurrent soft callers share one commit window.
+      if (this.#deferSoftRegistrySave(rows, removedIds.size > 0 || options?.durable === true || options?.flush === true)) return false;
+      if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
+      this.#registrySaveTimer = undefined;
       const replaced = new Set([...removedIds, ...owned.map((actor) => actor.id)]);
       const preserved = this.#registry.records().filter((record) => !replaced.has(record.id));
-      const actors = [...preserved, ...owned.map((actor) => this.#serializedActor(actor))];
+      const actors = [...preserved, ...rows.map((row, index) => ({ ...row,
+        registryMessageAppend: this.#unarchivedMessages.get(owned[index]!) ?? [],
+      }))];
       this.#registry.write(actors, { durable: removedIds.size > 0 || options?.durable === true });
       this.#registryFingerprint = this.#registry.fingerprint();
-      this.#savedActors = { owned: JSON.stringify(owned.map((actor) => this.#serializedActor(actor))),
+      for (const actor of owned) this.#unarchivedMessages.delete(actor);
+      this.#lastRegistrySaveAt = Date.now();
+      this.#savedActors = { owned: JSON.stringify(rows), critical: this.#criticalRegistryState(rows),
         fingerprint: this.#registryFingerprint };
       for (const id of removedIds) this.#persistedRoots.delete(id);
       for (const actor of owned) this.#persistedRoots.set(actor.id, actor.rootId);
       for (const record of preserved) {
         if (typeof record.rootId === "string") this.#persistedRoots.set(record.id, record.rootId);
       }
+      return true;
     }));
+    if (!committed) return;
     // The locked merge can preserve a remote owner write that raced this host.
     // Force one reload so passive views reflect the exact records just written.
     this.#registryFingerprint = undefined;
@@ -3836,7 +3930,12 @@ export class ActorManager {
     }
     for (const value of records) {
       if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
-      const record = value as Partial<ManagedActor>;
+      const source = value as Record<string, unknown>;
+      if (onlyMissing && typeof source.id === "string" && this.#actors.has(source.id)) continue;
+      let instructions: unknown;
+      try { instructions = this.#registry.instructions(source); }
+      catch { continue; } // Keep an unreadable payload's metadata, never rewrite a guessed value.
+      const record = { ...source, instructions } as Partial<ManagedActor>;
       if (
         typeof record.id !== "string" ||
         !/^[a-f0-9]{32}$/.test(record.id) ||
@@ -3973,20 +4072,7 @@ export class ActorManager {
             }
           : {}),
       };
-      if (Array.isArray(record.messages)) {
-        for (const candidate of record.messages.slice(-MESSAGE_HISTORY_LIMIT)) {
-          if (
-            typeof candidate === "object" &&
-            candidate !== null &&
-            !Array.isArray(candidate) &&
-            typeof (candidate as Partial<FabricActorMessage>).id === "string" &&
-            typeof (candidate as Partial<FabricActorMessage>).source === "string" &&
-            typeof (candidate as Partial<FabricActorMessage>).createdAt === "number"
-          ) {
-            this.#recordMessage(actor, candidate as FabricActorMessage);
-          }
-        }
-      }
+      this.#installLazyMessages(actor, source);
       this.#actors.set(actor.id, actor);
       // Once per process: later a live process's memory, not the file, holds its work.
       if (!this.#ownQueueRead.has(actor.id)) {
@@ -4407,7 +4493,7 @@ export class ActorManager {
       ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.validWhile ? { validWhile: structuredClone(actor.validWhile) } : {}),
       queued: actor.queue.length + (this.#overflow.get(actor.id)?.length ?? 0),
-      messages: actor.messages.length,
+      messages: this.#messageCount(actor),
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
@@ -4697,9 +4783,18 @@ export class ActorManager {
       const live = this.#actors.get(old.id);
       if (!live || live === old) continue;
       live.latestActivationSequence = Math.max(live.latestActivationSequence, old.latestActivationSequence);
+      // An unread history has no local additions to carry and must stay lazy.
+      if (this.#lazyMessages.has(old)) continue;
       const known = new Set(live.messages.map((message) => message.id));
       for (const message of old.messages) {
         if (!known.has(message.id)) this.#recordMessage(live, message);
+      }
+      // Additions that already fell out of the ring still need archival after a
+      // reload. Do not put them back in the active ring or reorder newer messages.
+      const pending = [...(this.#unarchivedMessages.get(old) ?? []), ...(this.#unarchivedMessages.get(live) ?? [])];
+      if (pending.length) {
+        const unique = new Map(pending.map(message => [`${message.id}:${message.direction}`, message]));
+        this.#unarchivedMessages.set(live, [...unique.values()]);
       }
     }
   }

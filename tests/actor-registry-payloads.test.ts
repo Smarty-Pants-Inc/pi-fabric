@@ -1,0 +1,155 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
+
+const roots: string[] = [];
+const setup = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-payload-test-")); roots.push(root);
+  const file = path.join(root, "actors.json"), id = "a".repeat(32);
+  return { root, file, id, log: path.join(root, id, "registry", "messages.jsonl"), store: new ActorRegistryStore(root) };
+};
+const messages = (count: number) => Array.from({ length: count }, (_, i) => ({ id: `m-${i}`, source: "direct", direction: "in", createdAt: i, text: "x".repeat(1_100) }));
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("compact actor registry payloads (#3752, #4383)", () => {
+  it("migrates valid actors beside invalid legacy rows without a null-record regression", async () => {
+    const { store, file, id } = setup();
+    const actor = { id, messages: messages(2) };
+    fs.writeFileSync(file, JSON.stringify({ actors: [null, 1, [], {}, actor] }));
+    await store.withLock(() => store.write(store.records()));
+    expect(store.messages(store.records().find(record => record.id === id)!)).toEqual(actor.messages);
+  });
+
+  it("migrates ALL embedded legacy messages and long instructions before replacing the registry", async () => {
+    const { store, file, id, log } = setup();
+    const legacy = { id, name: "actor", instructions: "i".repeat(20_000), messages: messages(150), extra: { future: true }, status: "idle" };
+    fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [legacy] }));
+    await store.withLock(() => store.write([{ ...legacy, messages: legacy.messages.slice(-100), status: "running" }]));
+    const record = store.records()[0]!;
+    expect(fs.statSync(file).size).toBeLessThan(1_000);
+    expect(record.messages).toEqual([]);
+    expect(record.extra).toEqual({ future: true });
+    expect(store.instructions(record)).toBe(legacy.instructions);
+    expect(store.messages(record)).toEqual(legacy.messages.slice(-100));
+    const transactions = fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+    expect(transactions).toHaveLength(1);
+    expect(transactions[0].messages).toEqual(legacy.messages); // No truncation during migration.
+  });
+
+  it("does not read/rewrite foreign history on status saves; one new message appends only its delta", async () => {
+    const { root, store, file, id, log } = setup();
+    const ring = messages(100), actor = { id, instructions: "i".repeat(20_000), messages: ring, status: "idle" };
+    await store.withLock(() => store.write([actor]));
+    const bytes = fs.statSync(log).size;
+    const instruction = fs.readdirSync(path.dirname(log)).find(name => name.startsWith("instructions-"))!;
+    const inode = fs.statSync(path.join(path.dirname(log), instruction)).ino;
+    const fresh = new ActorRegistryStore(root);
+    const read = vi.spyOn(fs, "readFileSync");
+    await fresh.withLock(() => fresh.write(fresh.records().map(record => ({ ...record, status: "running" }))));
+    expect(read.mock.calls.some(([file]) => String(file).endsWith("messages.jsonl") || String(file).endsWith(".txt"))).toBe(false);
+    expect(fs.statSync(log).size).toBe(bytes);
+    read.mockRestore();
+    const next = messages(101).slice(-100);
+    await store.withLock(() => store.write([{ ...actor, messages: next, status: "waiting" }]));
+    expect(fs.statSync(log).size - bytes).toBeLessThan(1_500);
+    expect(fs.statSync(path.join(path.dirname(log), instruction)).ino).toBe(inode);
+    expect(new ActorRegistryStore(root).messages(store.records()[0]!)).toEqual(next);
+    expect(fs.statSync(file).size).toBeLessThan(1_000);
+  });
+
+  it("archives an entire unsaved burst even when only the last 100 remain in memory", async () => {
+    const { store, id, log } = setup();
+    const burst = messages(250);
+    await store.withLock(() => store.write([{ id, messages: burst.slice(-100), registryMessageAppend: burst }]));
+    const record = store.records()[0]!;
+    expect(record.registryMessageAppend).toBeUndefined();
+    expect(store.messages(record)).toEqual(burst.slice(-100));
+    expect(JSON.parse(fs.readFileSync(log, "utf8").trim()).messages).toEqual(burst);
+  });
+
+  it("archives a reset without resurrecting old messages and keeps old accepted heads readable", async () => {
+    const { store, id, root, log } = setup();
+    await store.withLock(() => store.write([{ id, messages: messages(2) }]));
+    const accepted = store.records()[0]!;
+    const oldBytes = fs.statSync(log).size;
+    await store.withLock(() => store.write([{ id, messages: [] }]));
+    expect(store.messages(store.records()[0]!)).toEqual([]);
+    expect(new ActorRegistryStore(root).messages(accepted)).toEqual(messages(2));
+    expect(fs.statSync(log).size).toBeGreaterThan(oldBytes);
+    await store.withLock(() => store.write([{ id, messages: [messages(3)[2]] }]));
+    expect(store.messages(store.records()[0]!)).toEqual([messages(3)[2]]);
+  });
+
+  it("a failed registry commit leaves only an orphan append, not a future accepted predecessor", async () => {
+    const { store, id, file, log, root } = setup();
+    const actor = { id, messages: messages(2) };
+    await store.withLock(() => store.write([actor]));
+    const before = fs.readFileSync(file, "utf8"), bytes = fs.statSync(log).size;
+    const rename = fs.renameSync.bind(fs);
+    let fail = true;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === file && fail) { fail = false; throw new Error("publish refused"); }
+      rename(from, to);
+    });
+    await expect(store.withLock(() => store.write([{ id, messages: [...actor.messages, { id: "orphan" }] }]))).rejects.toThrow("publish refused");
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+    expect(fs.statSync(log).size).toBeGreaterThan(bytes);
+    const next = [...actor.messages, { id: "accepted" }];
+    await store.withLock(() => store.write([{ id, messages: next }]));
+    expect(new ActorRegistryStore(root).messages(store.records()[0]!)).toEqual(next);
+    expect(fs.readFileSync(log, "utf8")).toContain("orphan"); // Archived, never selected.
+  });
+
+  it("retries a failed payload barrier without publishing a guessed history or losing inline data", async () => {
+    const { store, id, file, log } = setup();
+    const actor = { id, messages: messages(3), status: "idle" };
+    const inline = JSON.stringify({ actors: [actor] }); fs.writeFileSync(file, inline);
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), fds = new Map<number, string>();
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); fds.set(fd, String(file)); return fd; });
+    let failed = false;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (!failed && fds.get(fd) === log) { failed = true; throw new Error("payload barrier unavailable"); }
+      sync(fd);
+    });
+    await expect(store.withLock(() => store.write([actor]))).rejects.toThrow("payload barrier unavailable");
+    expect(fs.readFileSync(file, "utf8")).toBe(inline);
+    await store.withLock(() => store.write([actor]));
+    expect(store.messages(store.records()[0]!)).toEqual(actor.messages);
+  });
+
+  it("reports truncated/corrupt references rather than converting them to empty histories", async () => {
+    const { store, id, file, log, root } = setup();
+    await store.withLock(() => store.write([{ id, messages: messages(2), instructions: "i".repeat(2_000) }]));
+    const record = store.records()[0]!;
+    fs.truncateSync(log, 1);
+    const fresh = new ActorRegistryStore(root);
+    expect(() => fresh.messages(record)).toThrow("Truncated actor message history");
+    expect(() => fresh.instructions({ ...record, instructionsFile: "../../escape" })).toThrow("Invalid actor instructions reference");
+    const before = fs.readFileSync(file, "utf8");
+    await expect(fresh.restoreInlineForDowngrade()).rejects.toThrow("Truncated actor message history");
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+  });
+
+  it("keeps old-loader-compatible stubs and explicitly restores inline records for downgrade", async () => {
+    const { store, id, file, log } = setup();
+    const actor = { id, name: "compatible", instructions: "i".repeat(20_000), createdAt: 1, messages: messages(110) };
+    await store.withLock(() => store.write([actor]));
+    const stub = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(stub.format).toBe(1);
+    expect(typeof stub.actors[0].instructions).toBe("string");
+    expect(Array.isArray(stub.actors[0].messages)).toBe(true);
+    expect(stub.actors[0].messages).toEqual([]);
+    const archive = fs.readFileSync(log, "utf8");
+    expect(await store.restoreInlineForDowngrade()).toBe(1);
+    expect(store.records()[0]).toEqual({ ...actor, messages: actor.messages.slice(-100) });
+    expect(fs.readFileSync(log, "utf8")).toBe(archive);
+    await store.withLock(() => store.write(store.records()));
+    expect(store.instructions(store.records()[0]!)).toBe(actor.instructions);
+    expect(store.messages(store.records()[0]!)).toEqual(actor.messages.slice(-100));
+  });
+});

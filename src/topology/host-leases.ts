@@ -13,7 +13,7 @@ import type { MeshStateEntry } from "../mesh/store.js";
 /**
  * Host-reserved historical policy key (also used for participant-file migration).
  * Directory liveness now negotiates file-only renewals through livenessLeaseFiles: 1;
- * a live older peer always restores half-life state renewal, without an operator switch.
+ * a live older peer restores only the legacy session cadence; the host record keeps this policy cadence.
  */
 export const LIVENESS_POLICY_KEY = "topology/liveness";
 /**

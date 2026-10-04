@@ -322,15 +322,13 @@ header, so unrelated nested explicit-model tasks are not misattributed.
 
 ## Real installed-Pi live-path proof
 
-Build this checkout, then run the isolated, keyless proof at the installed runtime:
+The isolated, keyless installed-runtime proof harness is owner-retained evidence
+outside this repository, not shipped product tooling. Its process-cleanup and
+scratch-path helpers, cleanup tests, and provider fixture have been removed from
+the shipped tree. Existing evidence copies are retained outside the repository;
+there is no in-repository proof command to run.
 
-```sh
-nice -n 19 bun run build
-nice -n 19 node scripts/prove-model-route-live.mjs \
-  /absolute/installed/pi-coding-agent/dist/cli.js "$TMPDIR/router-proof" "$TASK_OUT/real-cli"
-```
-
-The script starts the real `pi --mode rpc` CLI with this checkout's `dist/index.js`
+The retained harness starts the real `pi --mode rpc` CLI with the candidate's `dist/index.js`
 through `-e`, private HOME/profile/mesh, and only model/provider-boundary mocks.
 Jev fetch is intercepted; native OpenAI model requests reach a loopback HTTP
 server that records the actual `X-Smarty-Route` header. No Fabric API, manager,

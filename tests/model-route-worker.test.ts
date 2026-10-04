@@ -6,12 +6,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { decideModelRoute } from "../src/agents/model-route.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as runScratch from "../src/storage/run-scratch.js";
+import { launchWithScratchPlatform, scratchPlatforms } from "./fixtures/run-scratch-platform.js";
 
 const workerPath = path.resolve("dist/worker.js");
 const roots: string[] = [];
 const managers: AgentManager[] = [];
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -39,31 +43,61 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     const saved = JSON.parse(fs.readFileSync(path.join(root, "runs", result.id, "status.json"), "utf8"));
     return { result, rows, launch, events, pin, saved };
   };
-  it("R3 POSIX terminal publication and all-platform cleanup join owned process exit", async () => {
+  it.each(scratchPlatforms)("R3 POSIX terminal publication and all-platform cleanup join owned process exit ($label)", async ({ windows, simulate }) => {
+    const parentTemp = { tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() };
+    const allocate = vi.spyOn(runScratch, "allocateRunTmpDirectory");
+    if (simulate) vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
+      return launchWithScratchPlatform(this, request, true);
+    });
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-exit-")); roots.push(root);
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, maxConcurrent: 1 }, {
       workerPath: path.resolve("tests/fixtures/terminal-before-exit-worker.mjs"), runRoot: path.join(root, "runs"),
     }); managers.push(manager);
-    const result = await manager.run({ task: "terminal-before-exit", transport: "process", extensions: false });
-    expect(result.status).toBe("completed");
-    const pid = Number(result.sessionId);
-    expect(Number.isSafeInteger(pid)).toBe(true);
-    // POSIX custody joins the launcher before exposing a terminal result.
-    // Windows deliberately preserves main's logical-result-before-native-close
-    // contract; admission stays held and cleanup still joins that exact close.
-    if (process.platform !== "win32") {
+    let report: { tmpdir?: string; tmp?: string; temp?: string; osTmpdir: string; mode: number; scratch: string } | undefined;
+    try {
+      const result = await manager.run({ task: "terminal-before-exit REPORT_RUN_TMPDIR", transport: "process", extensions: false });
+      expect(result.status).toBe("completed");
+      report = JSON.parse(result.text);
+      const pid = Number(result.sessionId);
+      expect(Number.isSafeInteger(pid)).toBe(true);
+      // POSIX custody joins the launcher before exposing a terminal result.
+      // Windows deliberately preserves main's logical-result-before-native-close
+      // contract; admission stays held and cleanup still joins that exact close.
+      if (!windows) {
+        expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+      }
+      const directory = manager.runDirectory(result.id)!;
+      expect(fs.existsSync(directory)).toBe(true);
+      if (windows) {
+        expect({ tmpdir: report!.tmpdir, tmp: report!.tmp, temp: report!.temp, osTmpdir: report!.osTmpdir }).toEqual(parentTemp);
+        expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false);
+        expect(fs.existsSync(path.join(directory, "unresolved-scratch.json"))).toBe(false);
+        expect(allocate).not.toHaveBeenCalled();
+      } else {
+        expect(report!.tmpdir).toBe(path.join(directory, "tmp"));
+        expect(report!.osTmpdir).toBe(report!.tmpdir);
+        expect(report!.mode).toBe(0o700);
+        expect(fs.existsSync(path.join(directory, "tmp"))).toBe(true);
+      }
+      const queued = await manager.spawn({ task: "wait for native admission release", transport: "process", extensions: false });
+      expect(queued.status).toBe("queued");
+      await manager.cleanup(result.id);
       expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+      expect(fs.existsSync(directory)).toBe(false);
+      expect((await manager.wait(queued.id)).status).toBe("completed");
+      await manager.cleanup(queued.id);
+      await manager.close();
+      if (windows) {
+        expect(fs.existsSync(report!.osTmpdir)).toBe(true);
+        expect(fs.existsSync(report!.scratch)).toBe(true);
+        expect(allocate).not.toHaveBeenCalled();
+      }
+      expect({ tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() }).toEqual(parentTemp);
+    } finally {
+      await manager.close();
+      // Only remove this fixture's ordinary temp file, never the inherited root.
+      if (windows && report) fs.rmSync(report.scratch, { recursive: true, force: true });
     }
-    const directory = manager.runDirectory(result.id)!;
-    expect(fs.existsSync(directory)).toBe(true);
-    expect(fs.existsSync(path.join(directory, "tmp"))).toBe(true);
-    const queued = await manager.spawn({ task: "wait for native admission release", transport: "process", extensions: false });
-    expect(queued.status).toBe("queued");
-    await manager.cleanup(result.id);
-    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
-    expect(fs.existsSync(directory)).toBe(false);
-    expect((await manager.wait(queued.id)).status).toBe("completed");
-    await manager.cleanup(queued.id);
   });
 
   it("R3 real-Pi routed worktree uses native tool cwd and committed worktree contents, not parent edits", async () => {

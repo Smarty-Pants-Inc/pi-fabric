@@ -52,6 +52,7 @@ const lazyEntryPoints = [
   "src/topology/root-inbox-delivery.ts",
   "src/core/approval-controller.ts",
   "src/core/auto-approval-classifier.ts",
+  "src/core/file-lock.ts",
   "src/ui/fabric-model-selector.ts",
   "src/topology/peer-settle.ts",
   "src/judge/agent.ts",

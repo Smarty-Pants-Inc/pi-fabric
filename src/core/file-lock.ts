@@ -28,6 +28,8 @@ export interface ExclusiveLockOptions {
   staleMs?: number;
   attempts?: number;
   delayMs?: number;
+  /** No ownerless or age/heartbeat-only recovery: require confirmed process/incarnation death. */
+  requireDeadOwner?: boolean;
 }
 
 const errorCode = (error: unknown): string | undefined =>
@@ -61,15 +63,16 @@ const processAlive = (pid: number): boolean => {
 const ownerText = (token: string): string =>
   `${token}\n${process.pid}\n${Date.now()}\n${encodeOwnerIdentityLine()}\n`;
 
-const ownerCanBeReaped = (owner: string, mtimeMs: number, staleMs: number): boolean => {
+const ownerCanBeReaped = (owner: string, mtimeMs: number, staleMs: number, requireDeadOwner = false): boolean => {
   const [, pid, created, identity] = owner.split("\n");
+  if (requireDeadOwner && (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0)) return false;
   const timestamp = Number(created);
   // Damaged metadata must not strand the lock forever. Still protect a live
   // PID, and use filesystem age when the creation timestamp is unusable.
   const since = created?.trim() && Number.isSafeInteger(timestamp) && timestamp >= 0 && timestamp <= Date.now()
     ? timestamp
     : mtimeMs;
-  return Date.now() - since > staleMs && lockOwnerLiveness(Number(pid), since, identity, {
+  return Date.now() - since > staleMs && lockOwnerLiveness(Number(pid), requireDeadOwner ? NaN : since, identity, {
     legacyAlive: processAlive,
     maxHoldMs: Math.max(SHORT_LOCK_MAX_HOLD_MS, staleMs),
   }) === "dead";
@@ -81,7 +84,27 @@ const sleepAsync = (ms: number): Promise<void> =>
 const reapStaleLockAsync = async (
   lock: string,
   verify: (claimed: string) => Promise<boolean>,
+  fenceReapers = false,
 ): Promise<boolean> => {
+  if (fenceReapers) {
+    // Serialize recovery inside this lock incarnation. A delayed reaper must
+    // revalidate AFTER owning this marker; otherwise rename can move a live
+    // successor even when post-rename verification refuses to delete it.
+    const marker = path.join(lock, "reaping");
+    const token = randomUUID();
+    try { await fs.promises.writeFile(marker, token, { flag: "wx", mode: 0o600 }); }
+    catch { return false; }
+    try {
+      if (!(await verify(lock))) return false;
+      return await reapStaleLockAsync(lock, verify);
+    } finally {
+      // Successful recovery removed the marker with its claimed directory.
+      // Never remove a successor's marker (or an unconfirmed crashed reaper).
+      if (await fs.promises.readFile(marker, "utf8").catch(() => undefined) === token) {
+        await fs.promises.rm(marker, { force: true });
+      }
+    }
+  }
   const claim = `${lock}.reap-${process.pid}-${randomUUID()}`;
   try {
     await fs.promises.rename(lock, claim);
@@ -132,7 +155,7 @@ export const withExclusiveFileLockAsync = async <T>(
       if (errorCode(error) !== "EEXIST") throw error;
       try {
         const firstOwner = await fs.promises.readFile(ownerPath, "utf8");
-        if (ownerCanBeReaped(firstOwner, (await fs.promises.stat(lock)).mtimeMs, staleMs)) {
+        if (ownerCanBeReaped(firstOwner, (await fs.promises.stat(lock)).mtimeMs, staleMs, options.requireDeadOwner)) {
           const secondOwner = await fs.promises.readFile(ownerPath, "utf8");
           if (
             secondOwner === firstOwner &&
@@ -140,11 +163,11 @@ export const withExclusiveFileLockAsync = async <T>(
               try {
                 const owner = await fs.promises.readFile(path.join(claimed, "owner"), "utf8");
                 return owner === firstOwner &&
-                  ownerCanBeReaped(owner, (await fs.promises.stat(claimed)).mtimeMs, staleMs);
+                  ownerCanBeReaped(owner, (await fs.promises.stat(claimed)).mtimeMs, staleMs, options.requireDeadOwner);
               } catch {
                 return false;
               }
-            })
+            }, options.requireDeadOwner)
           ) {
             continue;
           }
@@ -154,7 +177,7 @@ export const withExclusiveFileLockAsync = async <T>(
         try {
           const first = await fs.promises.stat(lock);
           if (
-            Date.now() - first.mtimeMs > staleMs &&
+            !options.requireDeadOwner && Date.now() - first.mtimeMs > staleMs &&
             await reapStaleLockAsync(lock, async (claimed) => {
               try {
                 try {
@@ -202,7 +225,20 @@ export const withExclusiveFileLockAsync = async <T>(
 // path, never the live lock path. A claim that turns out to hold a live
 // lock is renamed back before any destructive step; a live lock is never
 // deleted, even if the rename-back races a fresh writer.
-const reapStaleLock = (lock: string, verify: (claimed: string) => boolean): boolean => {
+const reapStaleLock = (lock: string, verify: (claimed: string) => boolean, fenceReapers = false): boolean => {
+  if (fenceReapers) {
+    const marker = path.join(lock, "reaping");
+    const token = randomUUID();
+    try { fs.writeFileSync(marker, token, { flag: "wx", mode: 0o600 }); }
+    catch { return false; }
+    try {
+      if (!verify(lock)) return false;
+      return reapStaleLock(lock, verify);
+    } finally {
+      try { if (fs.readFileSync(marker, "utf8") === token) fs.rmSync(marker, { force: true }); }
+      catch { /* Recovery removed the claimed directory, not a successor. */ }
+    }
+  }
   const claim = `${lock}.reap-${process.pid}-${randomUUID()}`;
   try {
     fs.renameSync(lock, claim);
@@ -254,7 +290,7 @@ export const withExclusiveFileLock = <T>(
       if (errorCode(error) !== "EEXIST") throw error;
       try {
         const firstOwner = fs.readFileSync(ownerPath, "utf8");
-        if (ownerCanBeReaped(firstOwner, fs.statSync(lock).mtimeMs, staleMs)) {
+        if (ownerCanBeReaped(firstOwner, fs.statSync(lock).mtimeMs, staleMs, options.requireDeadOwner)) {
           const secondOwner = fs.readFileSync(ownerPath, "utf8");
           if (
             secondOwner === firstOwner &&
@@ -262,11 +298,11 @@ export const withExclusiveFileLock = <T>(
               try {
                 const owner = fs.readFileSync(path.join(claimed, "owner"), "utf8");
                 return owner === firstOwner &&
-                  ownerCanBeReaped(owner, fs.statSync(claimed).mtimeMs, staleMs);
+                  ownerCanBeReaped(owner, fs.statSync(claimed).mtimeMs, staleMs, options.requireDeadOwner);
               } catch {
                 return false;
               }
-            })
+            }, options.requireDeadOwner)
           ) {
             continue;
           }
@@ -278,7 +314,7 @@ export const withExclusiveFileLock = <T>(
           // the only signal, and the claim re-verifies it after the rename.
           const first = fs.statSync(lock);
           if (
-            Date.now() - first.mtimeMs > staleMs &&
+            !options.requireDeadOwner && Date.now() - first.mtimeMs > staleMs &&
             reapStaleLock(lock, (claimed) => {
               try {
                 try {

@@ -125,13 +125,14 @@ describe("content-addressed program store", () => {
     ]);
   });
 
-  it("serializes concurrent saves into one index and reaps a stale lock", async () => {
+  it("serializes concurrent saves into one index and reaps a confirmed dead owner", async () => {
     const { store } = fixture();
     const names = Array.from({ length: 8 }, (_, index) => `n${index}`);
     await Promise.all(names.map((name, index) => store.save({ name, code: `return ${index};` }, "typescript")));
     expect((await store.list()).map((entry) => entry.name).sort()).toEqual(names);
     const lock = path.join(store.directory, ".lock");
     fs.mkdirSync(lock);
+    fs.writeFileSync(path.join(lock, "owner"), `dead-owner\n2147483647\n${Date.now() - 60_000}\n`);
     const old = new Date(Date.now() - 60_000);
     fs.utimesSync(lock, old, old);
     await store.save({ name: "after-crash", code: "return 'recovered';" }, "typescript");

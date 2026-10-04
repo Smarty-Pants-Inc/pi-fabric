@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { Value } from "typebox/value";
@@ -383,38 +383,18 @@ export class ProgramStore {
     return writeJsonAtomicAsync(path.join(this.directory, "index.json"), index, { space: 2, newline: true });
   }
 
-  // A mkdir lock with rename-claimed stale reaping. Deliberately not
-  // core/file-lock: importing it here would split that module into its own
-  // startup chunk. Writes hold the lock for milliseconds.
   async #locked<T>(operation: () => Promise<T>): Promise<T> {
-    await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 });
-    const lock = path.join(this.directory, ".lock");
-    const stale = async (target: string): Promise<boolean> => {
-      const stat = await fs.promises.stat(target).catch(() => undefined);
-      return stat !== undefined && Date.now() - stat.mtimeMs > LOCK_STALE_MS;
-    };
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await fs.promises.mkdir(lock, { mode: 0o700 });
-        break;
-      } catch (error) {
-        if ((error as { code?: string }).code !== "EEXIST") throw error;
-      }
-      if (await stale(lock)) {
-        const claim = `${lock}.reap-${process.pid}-${randomUUID()}`;
-        if (await fs.promises.rename(lock, claim).then(() => true, () => false)) {
-          if (await stale(claim)) await fs.promises.rm(claim, { recursive: true, force: true });
-          else await fs.promises.rename(claim, lock).catch(() => fs.promises.rm(claim, { recursive: true, force: true }));
-        }
-        continue;
-      }
-      if (attempt >= LOCK_ATTEMPTS) throw new Error("Timed out waiting for the Fabric program store lock");
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    try {
-      return await operation();
-    } finally {
-      await fs.promises.rm(lock, { recursive: true, force: true });
-    }
+    // Load at mutation time, not registration: shared chunk splitting must not
+    // pull the optional lock implementation into the startup graph.
+    const { withExclusiveFileLockAsync } = await import("../core/file-lock.js");
+    return withExclusiveFileLockAsync({
+      directory: this.directory,
+      lockName: ".lock",
+      staleMs: LOCK_STALE_MS,
+      attempts: LOCK_ATTEMPTS,
+      delayMs: 10,
+      requireDeadOwner: true,
+      timeoutMessage: "Timed out waiting for the Fabric program store lock",
+    }, operation);
   }
 }

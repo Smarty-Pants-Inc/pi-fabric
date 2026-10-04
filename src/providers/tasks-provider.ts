@@ -1,4 +1,5 @@
 import type { FabricActionDescriptor, FabricInvocationContext, FabricProvider, FabricProviderListRequest } from "../protocol.js";
+import { StringDecoder } from "node:string_decoder";
 import { SHELL_READ_MAX_BYTES, type FabricShellJobStore } from "../core/shell-jobs.js";
 import { validationMessage } from "../core/action-arguments.js";
 
@@ -98,32 +99,50 @@ export class TasksProvider implements FabricProvider {
     if (after > job.written) throw new Error("tasks.watch after must not be past the task's output");
     const deadline = Date.now() + timeoutMs;
     const lines: string[] = [];
+    const decoder = new StringDecoder("utf8");
+    let readCursor = after;
     let cursor = after;
+    let lineStart = after;
+    let pending = "";
     let omittedBytes = 0;
+    const result = (reason: "event" | "finished" | "timeout") =>
+      ({ task: job.info(), reason, lines, omittedBytes, more: cursor < job.written, nextCursor: cursor });
     for (;;) {
-      const page = job.read(cursor);
+      const page = job.read(readCursor, SHELL_READ_MAX_BYTES, "base64");
       omittedBytes += page.omittedBytes;
-      const text = page.text ?? "";
-      let consumed = 0;
-      for (let end = text.indexOf("\n"); end >= 0 && lines.length < WATCH_LINES; end = text.indexOf("\n", consumed)) {
-        const line = text.slice(consumed, end);
-        consumed = end + 1;
+      if (page.offset > lineStart && !pending) {
+        lineStart = page.offset;
+        cursor = page.offset;
+      }
+      readCursor = page.next;
+      pending += decoder.write(Buffer.from(page.data ?? "", "base64"));
+      for (;;) {
+        const end = pending.indexOf("\n");
+        if (end < 0 || lines.length >= WATCH_LINES) break;
+        const line = pending.slice(0, end);
+        pending = pending.slice(end + 1);
+        lineStart += Buffer.byteLength(line + "\n");
+        cursor = lineStart;
         if (line.includes(match)) lines.push(clean(line).slice(0, WATCH_LINE_CHARS));
       }
-      // A final unterminated line counts once the task has ended.
-      if (page.eof && consumed < text.length && lines.length < WATCH_LINES) {
-        const line = text.slice(consumed);
-        consumed = text.length;
-        if (line.includes(match)) lines.push(clean(line).slice(0, WATCH_LINE_CHARS));
-      }
-      // A single line longer than a page would stall the cursor; consume it as clipped.
-      if (consumed === 0 && page.bytes >= SHELL_READ_MAX_BYTES) consumed = text.length;
-      cursor = page.offset + Buffer.byteLength(text.slice(0, consumed));
-      const result = (reason: "event" | "finished" | "timeout") =>
-        ({ task: job.info(), reason, lines, omittedBytes, more: cursor < job.written, nextCursor: cursor });
       if (lines.length) return result("event");
-      if (page.eof) return result("finished");
-      // Bytes already past this page (a full page, or output that raced the read).
+      if (page.eof) {
+        pending += decoder.end();
+        if (pending && lines.length < WATCH_LINES) {
+          if (pending.includes(match)) lines.push(clean(pending).slice(0, WATCH_LINE_CHARS));
+          cursor = readCursor;
+        }
+        return result("finished");
+      }
+      // Bound an unterminated line and, crucially, advance the read cursor even
+      // when a page ends in an incomplete UTF-8 sequence.
+      if (pending && readCursor - lineStart >= SHELL_READ_MAX_BYTES) {
+        if (pending.includes(match)) lines.push(clean(pending).slice(0, WATCH_LINE_CHARS));
+        pending = "";
+        lineStart = readCursor;
+        cursor = readCursor;
+        if (lines.length) return result("event");
+      }
       if (job.written > page.next) continue;
       const remaining = deadline - Date.now();
       if (remaining <= 0) return result("timeout");

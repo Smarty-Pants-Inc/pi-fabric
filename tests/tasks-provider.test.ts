@@ -6,6 +6,7 @@ import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
+import { SHELL_READ_MAX_BYTES } from "../src/core/shell-jobs.js";
 import { TasksProvider } from "../src/providers/tasks-provider.js";
 import { ShellEventInbox } from "../src/core/shell-inbox.js";
 import { ResultConsumption } from "../src/result-consumption.js";
@@ -320,6 +321,23 @@ describe("tasks provider", () => {
     expect(done).toMatchObject({ reason: "finished", lines: [], more: false });
     expect(job.abort.signal.aborted).toBe(false);
   });
+  it("does not spin on incomplete UTF-8 tails or page-boundary multibyte output", async () => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "utf8"); job.spill();
+    const encoded = Buffer.from("READY: 😀\n");
+    job.append(encoded.subarray(0, encoded.length - 2));
+    await expect(provider.invoke("watch", { id: job.id, match: "READY", timeoutMs: 10 }, context))
+      .resolves.toMatchObject({ reason: "timeout", lines: [] });
+    const pending = provider.invoke("watch", { id: job.id, match: "READY", timeoutMs: 5000 }, context);
+    job.append(encoded.subarray(encoded.length - 2));
+    expect(await pending).toMatchObject({ reason: "event", lines: ["READY: 😀"] });
+
+    const boundary = store.begin("bash", "boundary"); boundary.spill();
+    boundary.append(Buffer.concat([Buffer.alloc(SHELL_READ_MAX_BYTES - 1, 120), Buffer.from("😀NEEDLE")]));
+    await expect(provider.invoke("watch", { id: boundary.id, match: "never", timeoutMs: 10 }, context))
+      .resolves.toMatchObject({ reason: "timeout" });
+  });
+
   it("cancels an in-flight watch without stopping its monitor or consuming an event", async () => {
     const { store, provider } = setup();
     const job = store.begin("bash", "watch", { monitor: { delivery: "ui", intervalMs: 1000, timeoutMs: 300000 } });

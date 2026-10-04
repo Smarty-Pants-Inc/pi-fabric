@@ -581,6 +581,7 @@ const failedRecord = (
     ...(managed.latestRecord?.runnerSessionIds ? { runnerSessionIds: [...managed.latestRecord.runnerSessionIds] } : {}),
     ...(managed.kernel ? { kernel: managed.kernel } : {}),
     transport: managed.transport.kind,
+    ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
     cwd: managed.cwd,
     ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
     startedAt: now,
@@ -754,7 +755,7 @@ export class AgentManager {
     this.#sweepPath =
       options.sweepPath ?? fileURLToPath(new URL("../storage/sweep-main.js", import.meta.url));
     this.#fabricExtensionPath =
-      options.fabricExtensionPath ?? fileURLToPath(new URL("../index.js", import.meta.url));
+      options.fabricExtensionPath ?? fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "../index.ts" : "../index.js", import.meta.url));
     this.#piBinary = resolvePiBinary(options.piBinary);
     this.#claudeBinary =
       options.claudeBinary ?? process.env.PI_FABRIC_CLAUDE_BINARY ?? config.claude.binary;
@@ -3233,6 +3234,7 @@ export class AgentManager {
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
       transport: managed.transport.kind,
+      ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
       cwd: managed.cwd,
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       ...(model ? { model } : {}),
@@ -3299,6 +3301,7 @@ export class AgentManager {
       cwd: managed.cwd,
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
+      ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       logFile: path.join(managed.runDirectory, "events.jsonl"),
       ...(nestedAgents.length > 0 ? { nestedAgents } : {}),

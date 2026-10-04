@@ -97,9 +97,6 @@ const isJournalFile = (file: string): boolean => /^[a-f0-9]{64}\.json$/.test(fil
 const files = (dir: string): string[] => {
   try { return fs.readdirSync(dir).filter(isJournalFile); } catch { return []; }
 };
-const filesAsync = async (dir: string): Promise<string[]> => {
-  try { return (await fs.promises.readdir(dir)).filter(isJournalFile); } catch { return []; }
-};
 // Idle scans must yield on inspected entries, not just successful cleanup/delivery.
 // A setImmediate turn lets timers/IO run between slices without chaining microtasks.
 // Keep both a time budget and an entry cap: one slow read must not make a
@@ -573,10 +570,16 @@ export class CompletionJournal {
     return true;
   }
   async drain(deliver = true): Promise<void> {
+    const recipient = this.recipient; // Keep live Main renames visible even during an empty poll.
+    const claims = this.mesh.listAll(claimPrefix);
+    // An absent journal has no bodies/attempts to inspect. Do not issue directory
+    // scans or async canonicalization on the ordinary empty-root idle path.
+    // Existing journals and bodyless claims still use bounded asynchronous scans.
+    if (!claims.length && !fs.existsSync(directory(this.meshRoot))) return;
     // Gate before reading a fence, even without a body. The authenticated claim retains
     // its owner's lane so a dead Main's same-lane successor can reclaim bounded state.
     let retired = 0;
-    for await (const claim of scanSlices(this.mesh.listAll(claimPrefix))) {
+    for await (const claim of scanSlices(claims)) {
       if (!await this.#canRetireClaimAsync(claim)) continue;
       const receipt = await readReceiptAsync(path.join(directory(this.meshRoot), "receipts", `${claim.key.slice(claimPrefix.length)}.json`));
       if (typeof receipt?.id === "string" && claim.key === claimKey(receipt.id)) {
@@ -586,7 +589,6 @@ export class CompletionJournal {
         if (++retired === 128) break;
       }
     }
-    const recipient = this.recipient;
     const accepts = async (address: CompletionRecipient): Promise<boolean> =>
       (address.rootId === recipient.rootId && address.sessionId === recipient.sessionId) || await sameRecipientLaneAsync(address, recipient);
     // Bound crash-left cleanup; receipt barriers use the async filesystem, never the UI thread.
@@ -613,7 +615,13 @@ export class CompletionJournal {
       }
       if (++pruned === 128) break;
     }
-    const pending = await scanPendingCompletions(this.meshRoot, recipient.projectRoot, accepts, this.#suppressed);
+    // The inbox already owns enqueued notices until its durable carrier confirms
+    // them. Avoid reopening their legacy metadata during every idle pass: on
+    // Windows that reader can contend with a synchronous acknowledgment rename.
+    // Receipt confirmation/claim cleanup above is deliberately NOT suppressed.
+    const suppressed = new Set(this.#suppressed);
+    for (const id of this.#enqueued) suppressed.add(`${key(id)}.json`);
+    const pending = await scanPendingCompletions(this.meshRoot, recipient.projectRoot, accepts, suppressed);
     if (!pending.length) return;
     const roots = this.participants.list({ scope: "project", kinds: ["root"], fresh: true });
     for await (const envelope of scanSlices(pending)) {

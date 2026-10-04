@@ -40,7 +40,7 @@ const setup = (metadata: Pick<ResidentHostConfig, "mainName" | "mainStartedAt">,
   const mesh = new MeshStore(meshRoot, 64 * 1024, 100, { readCacheMs: 2_000 });
   const recipient = vi.spyOn(CompletionJournal.prototype, "recipient", "get");
   const client = new ResidencyClient({ config, mesh, participants, mainAgent, ...(mainName ? { mainName } : {}) });
-  return { client, lastKnown, recipient };
+  return { client, lastKnown, recipient, meshRoot };
 };
 
 // A live-name journal derives its recipient even when pending() finds no results.
@@ -60,6 +60,25 @@ describe("ResidencyClient completion recipient metadata", () => {
       expect(recipient.mock.results.at(-1)?.value).toMatchObject({ name: "renamed lane", startedAt: 456 });
       expect(lastKnown).not.toHaveBeenCalled();
     } finally { await client.close(); }
+  });
+
+  it("joins an in-flight empty journal scan with a stopped clock instead of polling a timer", async () => {
+    const { client, lastKnown, meshRoot } = setup({ mainName: "fixed lane", mainStartedAt: 456 });
+    fs.mkdirSync(path.join(meshRoot, "agent-completions"), { recursive: true });
+    let entered!: () => void, release!: () => void;
+    const reading = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(fs.promises, "realpath").mockImplementation(async target => {
+      entered(); await held; return String(target);
+    });
+    vi.useFakeTimers();
+    try {
+      client.start(); await reading;
+      const closing = client.close();
+      release(); await closing;
+      expect(lastKnown).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { release(); await client.close(); }
   });
 
   it("does not scan for a fixed recipient when both config fields are supplied, including zero", async () => {

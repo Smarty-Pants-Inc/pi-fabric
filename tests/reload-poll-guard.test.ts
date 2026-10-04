@@ -11,6 +11,16 @@ import { FABRIC_PROVIDER_REGISTER_EVENT } from "../src/protocol.js";
 
 const entry = path.resolve("dist/index.js");
 
+async function waitUntil(condition: () => boolean, description: string): Promise<void> {
+  const deadline = performance.now() + 5_000;
+  while (!condition()) {
+    if (performance.now() >= deadline) {
+      throw new Error(`Timed out after 5 s waiting for ${description}`);
+    }
+    await delay(10);
+  }
+}
+
 describe.skipIf(!fs.existsSync(entry))("real Pi reload poll guard (smarty-dev#4383)", () => {
   it("clears the old generation's timers across ten reload windows with asynchronous disposal", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-reload-poll-")));
@@ -72,8 +82,12 @@ describe.skipIf(!fs.existsSync(entry))("real Pi reload poll guard (smarty-dev#43
           undefined, undefined, runner.createContext());
         expect(result.content).toEqual(expect.arrayContaining([expect.objectContaining({ type: "text" })]));
         modal = runner.getCommand("fabric")!.handler("dashboard", runner.createCommandContext());
-        await delay(150);
-        expect(owned.some(({ timer, stack }) => !destroyed(timer) && stack.includes("#schedulePoll"))).toBe(true);
+        await waitUntil(
+          // Activation can already own a widget poll; also wait for the dashboard's custom UI.
+          () => doneCallbacks.length > 0 &&
+            owned.some(({ timer, stack }) => !destroyed(timer) && stack.includes("#schedulePoll")),
+          "the dashboard poll timer to exist before opening a reload window",
+        );
       };
       await open();
       for (const pause of [0, 17, 49, 99, 101, 149, 199, 249, 499, 999]) {

@@ -322,7 +322,16 @@ describe("round-four launch-preparation recovery (#3167)", () => {
   });
 
   it.each([false, true])("never retries an unconfirmed transport launch with a timeout-shaped error (queued: %s)", async (queued) => {
-    const { actors, agents } = setup({}, 1);
+    const { actors, agents, root } = setup({ closeGraceMs: 20 }, 1);
+    // This synthetic unknown receipt has no exact worker handle to discharge custody.
+    // Shutdown must report that obligation, not fabricate a failed activation/retry.
+    cleanups.pop();
+    cleanups.push(async () => {
+      try {
+        await expect(actors.close()).rejects.toThrow(/execution exit unconfirmed/);
+        await expect(agents.close()).rejects.toThrow(/execution exit unconfirmed/);
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
     const blocker = queued ? await agents.spawn({ task: "HANG", model: "provider/healthy" }) : undefined;
     cleanups.push(async () => { if (blocker) await agents.stop(blocker.id); });
     const actor = await actors.create({ name: "unknown-launch", instructions: "Reply", responseMode: "text", coalesce: false });
@@ -336,16 +345,21 @@ describe("round-four launch-preparation recovery (#3167)", () => {
       receiptId = actors.status(actor.id).preparing!.runId;
       await agents.stop(blocker.id);
     }
-    await waitFor(() => transport.mock.calls.length === 1 && actors.inFlightCount() === 0);
+    await waitFor(() => transport.mock.calls.length === 1 && agents.list().some(handle => handle.actorId === actor.id));
+    receiptId ??= agents.list().find(handle => handle.actorId === actor.id)!.id;
+    actors.tell(actor.id, "must not overlap the unknown launch");
     await pause(200);
     expect(run).toHaveBeenCalledTimes(1);
     expect(transport).toHaveBeenCalledTimes(1);
-    expect(actors.status(actor.id)).toMatchObject({ status: "idle", queued: 0 });
-    if (receiptId) {
-      const result = await agents.wait(receiptId);
-      expect(result.status).toBe("failed");
-      expect(result).not.toHaveProperty("launchPreparationTimeoutMs");
-    }
+    expect(actors.inFlightCount()).toBe(1);
+    expect(actors.status(actor.id).queued).toBe(1);
+    await expect(agents.wait(receiptId, { timeoutMs: 20 })).rejects.toThrow(/still running/);
+    await expect(agents.stop(receiptId)).rejects.toThrow(/execution exit unconfirmed/);
+    expect(fs.existsSync(path.join(root, "runs", receiptId, "unresolved-worker.json"))).toBe(true);
+    const replacement = await agents.spawn({ task: "must remain queued", model: "provider/healthy" });
+    expect(replacement.status).toBe("queued");
+    await agents.stop(replacement.id);
+    expect(transport).toHaveBeenCalledTimes(1);
   });
 
   it("never retries a launched worker even if its failure has the preparation timeout type", async () => {

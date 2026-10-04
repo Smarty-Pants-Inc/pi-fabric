@@ -9,7 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorCreateRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
@@ -173,7 +173,7 @@ export class ResidencyClient {
   readonly #completions: CompletionJournal;
   #deliveryTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
-  #drainingDeliveries = false;
+  #deliveryPass: Promise<void> | undefined;
   #completionFault: string | undefined;
   readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup");
   #closed = false;
@@ -199,7 +199,12 @@ export class ResidencyClient {
     this.#completions = new CompletionJournal(options.config.meshRoot,
       options.mainName ? () => this.#recipient(options.config) : this.#recipient(options.config),
       options.participants, options.mesh, (result, delivered) => {
-        const acknowledge = () => { delivered(); this.acknowledgeCompletion(result.id); };
+        const acknowledge = () => {
+          // Publish resident metadata before the journal receipt can retire the source.
+          // A refused Windows rename must leave both fences available for retry.
+          this.acknowledgeCompletion(result.id);
+          delivered();
+        };
         if (options.onBackgroundComplete) options.onBackgroundComplete(result, acknowledge);
         else {
           options.mainAgent.deliverAgent({ from: { id: result.id, name: result.name, kind: "agent" },
@@ -243,7 +248,9 @@ export class ResidencyClient {
     this.#releaseAbort.abort();
     if (this.#deliveryTimer) clearInterval(this.#deliveryTimer);
     this.#deliveryTimer = undefined;
-    while (this.#drainingDeliveries) await delay(10);
+    // Await the owned pass itself, not a timer polling its state. Real async file
+    // I/O can settle while the caller's clock (e.g. fake timers) is stopped.
+    await this.#deliveryPass?.catch(() => undefined);
     await this.#startingHost?.catch(() => undefined);
   }
 
@@ -612,13 +619,13 @@ export class ResidencyClient {
 
   /** localRunSettled is certified by the owning manager, including a failed journal save. */
   acknowledgeCompletion(id: string, localRunSettled = false): void {
-    const metadata = this.#metadata(id);
+    const metadata = this.#metadata(id, true);
     // The local-manager fallback is for its ordinary runs, never a resident worker attempt.
     if ((metadata || !localRunSettled) && !this.completionSettled(id)) return;
-    const journalConsumed = this.#completions.acknowledge(id, localRunSettled);
     if (metadata && !metadata.completionConsumedAt) {
-      atomicWrite(this.#metadataPath(id), { ...metadata, completionConsumedAt: Date.now() });
+      writeJsonAtomic(this.#metadataPath(id), { ...metadata, completionConsumedAt: Date.now() }, { space: 2, durable: true });
     }
+    const journalConsumed = this.#completions.acknowledge(id, localRunSettled);
     // Journal-only ordinary outcomes have no durable metadata, but their wait still
     // retracts an already admitted completion from this session's inbox.
     if (metadata || journalConsumed) this.options.onResultConsumed?.(id);
@@ -908,9 +915,22 @@ export class ResidencyClient {
     return path.join(this.#agentsPath, `${id}.json`);
   }
 
-  #metadata(id: string): ResidentAgentMetadata | undefined {
+  #metadata(id: string, strict = false): ResidentAgentMetadata | undefined {
     if (!AGENT_ID_PATTERN.test(id)) return undefined;
-    const metadata = readJson<ResidentAgentMetadata>(this.#metadataPath(id));
+    const file = this.#metadataPath(id);
+    let metadata: ResidentAgentMetadata | undefined;
+    try { metadata = JSON.parse(readFileRetrying(file)) as ResidentAgentMetadata; }
+    catch (error) {
+      if (!strict) return undefined;
+      // Unknown metadata is not an ordinary journal-only run. Retry consumption
+      // rather than silently dropping its resident receipt on a transient open.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        try { fs.lstatSync(file); } catch (absence) {
+          if ((absence as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        }
+      }
+      throw error;
+    }
     if (
       metadata?.format !== RESIDENT_HOST_FORMAT ||
       metadata.rootId !== this.options.config.rootId ||
@@ -1067,9 +1087,13 @@ export class ResidencyClient {
     saveCompletion(this.options.config.meshRoot, admitted ?? this.#recipient(config), result);
   }
 
-  async #drainDeliveries(): Promise<void> {
-    if (this.#drainingDeliveries || this.#closed || !this.options.mainAgent.local) return;
-    this.#drainingDeliveries = true;
+  #drainDeliveries(): Promise<void> {
+    if (this.#deliveryPass) return this.#deliveryPass;
+    if (this.#closed || !this.options.mainAgent.local) return Promise.resolve();
+    return this.#deliveryPass = this.#drainDeliveryPass().finally(() => { this.#deliveryPass = undefined; });
+  }
+
+  async #drainDeliveryPass(): Promise<void> {
     try {
       const entries = this.options.mesh.listAll("residency/deliveries/");
       let fault: unknown;
@@ -1092,8 +1116,6 @@ export class ResidencyClient {
       const diagnostic = `Fabric completion remains pending: ${String(error).slice(0, 1000)}`;
       if (diagnostic !== this.#completionFault) console.warn(diagnostic);
       this.#completionFault = diagnostic;
-    } finally {
-      this.#drainingDeliveries = false;
     }
   }
 

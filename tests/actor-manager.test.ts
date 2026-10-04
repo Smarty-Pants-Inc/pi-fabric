@@ -3421,14 +3421,16 @@ describe("ActorManager", () => {
     });
     expect(actors.status(actor.id).model).toBeUndefined();
 
-    await actors.setModel(actor.id, "anthropic/claude-sonnet-4-5");
+    await actors.setModel(actor.id, "anthropic/claude-sonnet-4-5", "session", undefined, "Named setter metering probe");
     expect(actors.status(actor.id).model).toBe("anthropic/claude-sonnet-4-5");
+    expect(actors.status(actor.id).modelReason).toBe("Named setter metering probe");
 
     // The new model is forwarded to the agent run launched for the next message.
     await actors.ask(actor.id, "Inspect auth");
     await waitFor(() => actors.status(actor.id).status === "idle");
     const run = actors.readLog(actor.id, { type: "run" });
     expect(run.run?.status?.model).toBe("anthropic/claude-sonnet-4-5");
+    expect(run.run?.status?.modelReason).toBe("Named setter metering probe");
 
     // Clearing the override falls back to the Fabric default (no stored model).
     await actors.setModel(actor.id, undefined);
@@ -3437,6 +3439,7 @@ describe("ActorManager", () => {
     await waitFor(() => actors.status(actor.id).status === "idle");
     const clearedRun = actors.readLog(actor.id, { type: "run" });
     expect(clearedRun.run?.status?.model).toBeUndefined();
+    expect(clearedRun.run?.status?.modelReason).toBeUndefined();
 
     // Whitespace-only values are treated as clearing the override.
     await actors.setModel(actor.id, "  ");

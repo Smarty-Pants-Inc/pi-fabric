@@ -79,13 +79,15 @@ describe("guest agents surface", () => {
        await agents.spawn({ task: "probe", modelReason: "Compatibility probe" });
        await agents.create({ name: "probe", instructions: "Work.", modelReason: "Compatibility probe" });
        await agents.createActor({ name: "alias-probe", instructions: "Work.", modelReason: "Compatibility probe" });
-       const reason: string | undefined = run.modelReason; return reason;`,
+       const actor = await agents.setModel({ id: "actor", model: "cliproxyapi/gpt-6-astra", modelReason: "Named probe" });
+       const actorReason: string | undefined = actor.modelReason;
+       const reason: string | undefined = run.modelReason; return { reason, actorReason };`,
       guestTypeDeclarations(fullCodeMode), true,
     );
     expect(result.errors).toEqual([]);
-    for (const name of ["run", "spawn", "create", "createActor"]) {
+    for (const name of ["run", "spawn", "create", "createActor", "setModel"]) {
       const schema = AGENTS_ACTION_DESCRIPTORS.find(descriptor => descriptor.name === name)!.inputSchema as { properties: Record<string, unknown> };
-      expect(schema.properties.modelReason).toMatchObject({ type: "string" });
+      expect(schema.properties.modelReason).toMatchObject({ type: "string", maxLength: 200 });
     }
   });
 

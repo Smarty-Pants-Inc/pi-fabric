@@ -32,6 +32,7 @@ const stable = [
   "providers/memory-provider.js",
 ];
 const lazy = [
+  "residency/launcher-owner.js",
   "judge/agent.js",
   "core/landlock.js",
   "core/pattern-kill.js",

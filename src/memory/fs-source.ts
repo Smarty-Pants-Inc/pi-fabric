@@ -72,19 +72,24 @@ const readConfinedFile = (root: string, file: string): ConfinedFile | null => {
   }
   if (!isInside(rootReal, canonical)) return null;
   let current = rootLexical;
+  let expected: fs.Stats | undefined;
   const relative = path.relative(rootLexical, file);
   for (const segment of relative.split(path.sep)) {
     if (!segment || segment === ".") continue;
     current = path.join(current, segment);
     try {
-      if (fs.lstatSync(current).isSymbolicLink()) return null;
+      const component = fs.lstatSync(current);
+      if (component.isSymbolicLink()) return null;
+      expected = component;
     } catch {
       return null;
     }
   }
   let fd: number | undefined;
   try {
-    const expected = fs.statSync(canonical);
+    // Pin the leaf identity observed during the no-link traversal, not a new
+    // stat through parents which an attacker can redirect immediately before open.
+    if (!expected?.isFile()) return null;
     const noFollow = fs.constants.O_NOFOLLOW ?? 0;
     fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
     const stat = fs.fstatSync(fd);
@@ -92,6 +97,13 @@ const readConfinedFile = (root: string, file: string): ConfinedFile | null => {
     // Linux exposes the opened handle's actual target. A parent may have been
     // replaced after lexical/component checks; never read that escaped handle.
     if (process.platform === "linux" && !isInside(rootReal, fs.realpathSync(`/proc/self/fd/${fd}`))) return null;
+    if (fs.realpathSync(rootLexical) !== rootReal || fs.realpathSync(file) !== canonical) return null;
+    // All platforms must bind the opened handle to the post-open checked path.
+    // Restoring a swapped parent can satisfy realpath alone; it cannot make an
+    // outside handle match the restored leaf's device/inode. lstat also refuses
+    // a final link on platforms where O_NOFOLLOW is unavailable.
+    const after = fs.lstatSync(file);
+    if (!after.isFile() || after.dev !== stat.dev || after.ino !== stat.ino) return null;
     if (fs.realpathSync(file) !== canonical) return null;
     return { content: fs.readFileSync(fd, "utf8"), mtimeMs: stat.mtimeMs };
   } catch {

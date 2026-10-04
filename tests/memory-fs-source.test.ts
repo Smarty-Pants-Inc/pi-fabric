@@ -160,6 +160,47 @@ describe("filesystem memory source adapter", () => {
     } finally { spy.mockRestore(); read.mockRestore(); }
   });
 
+  it("SR-5 rejects non-Linux redirect-before-stat and restore-before-final-realpath parent swaps", async () => {
+    const root = track(rootDir("late-race"));
+    const outside = track(rootDir("late-race-outside"));
+    const dir = path.join(root, "nested");
+    const file = writeSessionFile(dir, "s.jsonl", recordsFor("safe", "/work", ["safe"]));
+    writeSessionFile(outside, "s.jsonl", recordsFor("secret", "/private", ["private session"]));
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    const stat = fs.statSync.bind(fs), open = fs.openSync.bind(fs), realpath = fs.realpathSync.bind(fs);
+    let swapped = false, opened = false, restored = false;
+    const swap = () => {
+      if (swapped) return;
+      fs.renameSync(dir, dir + "-original"); fs.symlinkSync(outside, dir, "dir"); swapped = true;
+    };
+    const statSpy = vi.spyOn(fs, "statSync").mockImplementation(((target: any, ...rest: any[]) => {
+      if (target === file) swap();
+      return (stat as any)(target, ...rest);
+    }) as typeof fs.statSync);
+    const openSpy = vi.spyOn(fs, "openSync").mockImplementation(((target: any, flags: any, mode: any) => {
+      if (target === file) swap(); // Also exercise the race if the unsafe pre-open stat is removed.
+      const fd = open(target, flags, mode);
+      if (target === file) opened = true;
+      return fd;
+    }) as typeof fs.openSync);
+    const realSpy = vi.spyOn(fs, "realpathSync").mockImplementation(((target: any, ...rest: any[]) => {
+      if (target === file && opened && !restored) {
+        fs.unlinkSync(dir); fs.renameSync(dir + "-original", dir); restored = true;
+      }
+      return (realpath as any)(target, ...rest);
+    }) as typeof fs.realpathSync);
+    const readSpy = vi.spyOn(fs, "readFileSync");
+    try {
+      expect(await createFileSystemMemorySource({ id: "late-race", root }).loadSession("nested/s.jsonl", {})).toBeNull();
+      expect(swapped).toBe(true);
+      expect(readSpy).not.toHaveBeenCalled();
+    } finally {
+      statSpy.mockRestore(); openSpy.mockRestore(); realSpy.mockRestore(); readSpy.mockRestore();
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
+
   it("loads sessions with normalizeSession-compatible parsing and no filesystem escape", async () => {
     const root = track(rootDir("loads"));
     const outside = track(rootDir("loads-outside"));

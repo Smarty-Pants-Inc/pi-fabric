@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentTools } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -77,11 +77,18 @@ describe.skipIf(!built)("fabric_reply in a real Pi session with Fabric", () => {
     const active = session.getActiveToolNames();
     expect(active).toContain("fabric_exec");
     expect(active).toContain("fabric_reply");
-    expect(active).not.toContain("bash");                         // Fabric does own the model's tools
+    expect(active).toContain("bash"); // Pi 1.0 keeps nested tools callable; prepareLoadout hides model declarations.
 
+    const declarations: string[][] = [];
     faux.setResponses([
-      fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })),
-      fauxAssistantMessage(fauxToolCall("fabric_reply", { action: "message", message: "Look at #85." })),
+      (context) => {
+        declarations.push(getCurrentTools(context.messages).map(tool => tool.name));
+        return fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" }));
+      },
+      (context) => {
+        declarations.push(getCurrentTools(context.messages).map(tool => tool.name));
+        return fauxAssistantMessage(fauxToolCall("fabric_reply", { action: "message", message: "Look at #85." }));
+      },
     ]);
     const replyOrder: Array<{ role: string; replyExists: boolean }> = [];
     const unsubscribe = session.subscribe(event => {
@@ -94,6 +101,7 @@ describe.skipIf(!built)("fabric_reply in a real Pi session with Fabric", () => {
     });
     await session.prompt("an event");
     unsubscribe();
+    expect(declarations).toEqual([["fabric_exec", "fabric_reply"], ["fabric_exec", "fabric_reply"]]);
     expect(replyOrder).toEqual([
       { role: "assistant", replyExists: false },
       { role: "toolResult", replyExists: true },

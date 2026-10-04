@@ -33,7 +33,15 @@ describe("Fabric compaction extension hooks", () => {
 
   it("repairs orphaned tool results in the outgoing context and keeps clean lists untouched", async () => {
     const handlers = await loadExtension();
-    const [context] = handlers.get("context")!;
+    // Pi chains every context transformer; principal capture may register first.
+    const context = async (event: { type: string; messages: unknown[] }, ctx: ReturnType<typeof hostContext>) => {
+      let result: { messages: unknown[] } | undefined;
+      for (const handler of handlers.get("context") ?? []) {
+        const transformed = await handler({ ...event, messages: result?.messages ?? event.messages }, ctx) as { messages: unknown[] } | undefined;
+        if (transformed) result = transformed;
+      }
+      return result;
+    };
     const clean = [
       { role: "user", content: "go", timestamp: 1 },
       { role: "assistant", content: [{ type: "toolCall", id: "a", name: "read", arguments: {} }], stopReason: "toolUse", timestamp: 1 },

@@ -477,6 +477,8 @@ describe("agent scope narrowing", () => {
     const handle = { id: "child", name: "child", status: "running", runner: "pi", transport: "process", cwd: "/" };
     const manager = {
       config: DEFAULT_FABRIC_CONFIG.agents,
+      assertModelAllowed: AgentManager.prototype.assertModelAllowed,
+      defaultModel: AgentManager.prototype.defaultModel,
       resolveKernel: () => undefined,
       resolvePythonRuntime: () => "monty",
       resolveCwd: (cwd: string) => cwd,
@@ -493,7 +495,11 @@ describe("agent scope narrowing", () => {
       { scheduleRefresh() {} } as unknown as FabricParticipantSource, undefined, {} as LifecycleBroker,
       () => true, residency as unknown as ConstructorParameters<typeof AgentsProvider>[8],
     );
-    const context = { ...invocation(), extensionContext: { model: { provider: "p", id: "m" } } as unknown as ExtensionContext };
+    const context = { ...invocation(), extensionContext: {
+      model: { provider: "p", id: "m" },
+      modelRegistry: { getAvailable: () => [{ provider: "p", id: "m" }], getAll: () => [{ provider: "p", id: "m" }],
+        find: (provider: string, id: string) => provider === "p" && id === "m" ? { provider, id } : undefined },
+    } as unknown as ExtensionContext };
     const parent = root();
     scoped(parent);
     const forged = normalizeScope({ principal: { id: "user:mallory" }, grants: [{ resource: "fs:*", actions: ["write"] }] });

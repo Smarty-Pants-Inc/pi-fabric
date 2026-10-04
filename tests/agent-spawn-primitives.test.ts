@@ -291,6 +291,7 @@ const now = Date.now();
 fs.writeFileSync(statusFile, JSON.stringify({
   id: args.get("id"), name: args.get("name"), task, status: "completed",
   runner: args.get("runner"), transport: args.get("transport"), cwd: process.cwd(),
+  ...(args.get("transport") === "process" ? { sessionId: String(process.pid) } : {}),
   startedAt: now, updatedAt: now, finishedAt: now, turns: 1, toolCalls: 0, text, exitCode: 0,
   usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 },
 }));
@@ -462,9 +463,9 @@ describe("worker child environment contract", () => {
     expect(readAgentLineage(report.lineage)).toMatchObject({ rootSessionId: "root-session", runId: result.id, depth: 1 });
     expect(JSON.parse(report.writePolicy)).toEqual({ readOnly: false, writableRoots: [root], shell: "deny" });
     expect(report.args).toContain("--no-extensions");
-    const guard = report.args[report.args.indexOf("-e") + 1];
-    expect(guard).toBe(path.resolve(guardPath!));
-    expect(fs.existsSync(guard!)).toBe(true);
+    const guards = report.args.flatMap((argument, index) => argument === "-e" ? [report.args[index + 1]] : []);
+    expect(guards).toContain(path.resolve(guardPath!));
+    expect(fs.existsSync(path.resolve(guardPath!))).toBe(true);
   }, 30_000);
 });
 
@@ -473,6 +474,8 @@ describe("agents provider seeds and confinement", () => {
     const requests: AgentRunRequest[] = [];
     const manager = {
       config: DEFAULT_FABRIC_CONFIG.agents,
+      assertModelAllowed: AgentManager.prototype.assertModelAllowed,
+      defaultModel: AgentManager.prototype.defaultModel,
       resolveKernel: () => undefined,
       resolvePythonRuntime: () => "monty",
       resolveCwd: (cwd: string) => cwd,
@@ -502,6 +505,11 @@ describe("agents provider seeds and confinement", () => {
     cwd: "/", signal: undefined, parentToolCallId: "outer", nestedToolCallId: "nested",
     extensionContext: {
       model: { provider: "anthropic", id: "caller" },
+      modelRegistry: {
+        getAvailable: () => [{ provider: "anthropic", id: "caller" }],
+        getAll: () => [{ provider: "anthropic", id: "caller" }],
+        find: (provider: string, id: string) => provider === "anthropic" && id === "caller" ? { provider, id } : undefined,
+      },
       ...(branch
         ? {
             sessionManager: {

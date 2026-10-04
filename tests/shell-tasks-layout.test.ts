@@ -6,7 +6,7 @@ import { ShellTasksView } from "../src/ui/shell-tasks.js";
 
 const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text } as Theme;
 const cleanup: Array<() => void | Promise<void>> = [];
-afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); vi.useRealTimers(); });
+afterEach(async () => { vi.useRealTimers(); for (const close of cleanup.splice(0).reverse()) await close(); });
 const fixture = () => {
   vi.useFakeTimers(); vi.setSystemTime(10000);
   const jobs = new FabricShellJobStore();

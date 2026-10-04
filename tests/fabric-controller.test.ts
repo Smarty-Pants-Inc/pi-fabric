@@ -271,13 +271,13 @@ describe("FabricUiController dashboard wiring", () => {
     state.config.ui.refreshMs = 500;
     vi.mocked(state.actors.list).mockReturnValue([]);
     const remoteAgent = {
-      format: 1, id: "agent:remote", kind: "agent", rootId: "session:other", ownerHostId: "session:other",
+      format: 1, id: "agent:remote", kind: "agent", rootId: "session:test", ownerHostId: "session:other",
       ownerIdentityId: "session:other", name: "remote", status: "running", runner: "pi", transport: "host",
       capabilities: [], startedAt: 1, updatedAt: 1, local: false, stale: false,
     };
     Object.assign(state, {
       peerInfos: vi.fn(() => [{ id: "session:other", name: "other", kind: "main", status: "idle" }]),
-      participantInfos: vi.fn(() => [remoteAgent]),
+      participantInfos: vi.fn(() => [remoteAgent, { ...remoteAgent, id: "agent:foreign", rootId: "session:foreign" }]),
     });
     const context = {
       mode: "tui",
@@ -287,6 +287,7 @@ describe("FabricUiController dashboard wiring", () => {
     try {
       controller.start(context);
       expect(controller.snapshot().agents.map((agent) => agent.id)).toContain("agent:remote");
+      expect(controller.snapshot().agents.map((agent) => agent.id)).not.toContain("agent:foreign");
       expect(state.activity.runs).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(4_999);
       expect(state.activity.runs).toHaveBeenCalledTimes(1);          // no 500 ms poll for peers
@@ -697,7 +698,7 @@ describe("FabricUiController dashboard wiring", () => {
     vi.mocked(state.actors.list).mockReturnValue([]);
     const activity = new FabricActivityStore();
     const participantInfos = () => readParticipantFiles(root, { maxAgeMs: 2_000 }).map((entry) => ({
-      ...(entry.value as object), kind: "agent", name: "peer", rootId: "peer", ownerHostId: "h", startedAt: 1, updatedAt: 1,
+      ...(entry.value as object), kind: "agent", name: "peer", rootId: "session:test", ownerHostId: "h", startedAt: 1, updatedAt: 1,
       runner: "pi", transport: "process", capabilities: [], local: false, stale: false,
     }));
     Object.assign(state, { activity, participantInfos, config: { ...state.config, mesh: { enabled: true } }, mesh });

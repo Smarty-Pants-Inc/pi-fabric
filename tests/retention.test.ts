@@ -2,6 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
+import { stageRunArchive } from "../src/agents/archive-custody.js";
+import type { AgentRunResult } from "../src/agents/types.js";
 import * as processIdentity from "../src/residency/process-identity.js";
 import {
   canRemoveManagedRunRoot,
@@ -11,6 +14,7 @@ import {
   markRunRootClosed,
   hasUnresolvedWorker,
   runTreeExitVeto,
+  runTreeResourceVeto,
   markUnresolvedWorker,
   pruneActorRunArchives,
   compactTerminalRunEvents,
@@ -40,6 +44,182 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("persistent archive custody", () => {
+  it("retains full terminal event sources until archive commit, then permits main compaction", () => {
+    const directory = temporaryDirectory();
+    writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" });
+    const events = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
+    const file = path.join(directory, "events.jsonl");
+    fs.writeFileSync(file, events);
+    fs.writeFileSync(path.join(directory, "reply.json"), '{"text":"full outcome"}');
+    const status = fs.readFileSync(path.join(directory, "status.json"), "utf8");
+    const pending = path.join(directory, "archive-pending.json");
+    fs.writeFileSync(pending, JSON.stringify({ format: 1, awaitingResult: true }));
+    expect(runTreeResourceVeto(directory, 0, undefined, true)).toBeUndefined();
+    expect(compactTerminalRunEvents(directory, { now: DAY })).toBe(false);
+    expect(fs.readFileSync(file, "utf8")).toBe(events);
+    fs.unlinkSync(pending);
+    expect(compactTerminalRunEvents(directory, { now: DAY })).toBe(true);
+    expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(201);
+    expect(fs.readFileSync(path.join(directory, "status.json"), "utf8")).toBe(status);
+    expect(fs.readFileSync(path.join(directory, "reply.json"), "utf8")).toBe('{"text":"full outcome"}');
+  });
+
+  it("never lets committed prelaunch custody exempt an unknown descendant or admitted root", () => {
+    const directory = temporaryDirectory();
+    writeStatus(directory, { status: "stopped", queuedArchiveCommitted: true });
+    expect(canRemoveTerminalRun(directory)).toBe(true);
+    const child = path.join(directory, "nested", "child");
+    writeStatus(child, { status: "stopped", queuedArchiveCommitted: true });
+    expect(runTreeExitVeto(directory, 0, undefined, true)).toMatch(/unknown descendant identity/);
+    fs.rmSync(path.join(directory, "nested"), { recursive: true });
+    writeStatus(directory, { status: "stopped", queuedArchiveCommitted: true, transport: "unknown" });
+    expect(runTreeExitVeto(directory, 0, undefined, true)).toMatch(/unknown root identity/);
+  });
+  it("separates pending archives from native resource debt without authorizing source deletion", () => {
+    const parent = temporaryDirectory();
+    writeStatus(parent, { status: "completed", transport: "process", sessionId: "2147483647" });
+    const child = path.join(parent, "nested", "child");
+    writeStatus(child, { status: "completed", transport: "process", sessionId: "2147483647" });
+    fs.writeFileSync(path.join(child, "archive-pending.json"), JSON.stringify({ format: 1, awaitingResult: true }));
+    const probe = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
+    try {
+      expect(runTreeResourceVeto(parent, 0, undefined, true)).toBeUndefined();
+      expect(runTreeExitVeto(parent, 0, undefined, true)).toMatch(/archive is pending/);
+      expect(canRemoveTerminalRun(parent)).toBe(false);
+      markUnresolvedWorker(child, "tree exit unknown");
+      expect(runTreeResourceVeto(parent, 0, undefined, true)).toMatch(/unresolved worker/);
+      fs.rmSync(path.join(child, "unresolved-worker.json"));
+      writeStatus(child, { status: "running", transport: "process", sessionId: "2147483647" });
+      expect(runTreeResourceVeto(parent, 0, undefined, true)).toMatch(/nonterminal process/);
+      expect(runTreeResourceVeto(parent, 0, () => true, true)).toMatch(/inspection was incomplete/);
+    } finally { probe.mockRestore(); }
+  });
+  it("vetoes ancestor/orphan deletion until offline recovery commits the full actor outcome", () => {
+    const temp = temporaryDirectory();
+    const root = path.join(temp, "pi-fabric-runs-recovery");
+    const parent = path.join(root, "parent");
+    const id = "b".repeat(32);
+    const source = path.join(parent, "nested", id);
+    writeStatus(parent, { status: "completed", transport: "process", sessionId: "2147483647" });
+    writeStatus(source, { id, status: "stopped", transport: "process", sessionId: "2147483647" });
+    const sessionFile = path.join(temp, "actor", "session.jsonl");
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); fs.writeFileSync(sessionFile, "");
+    const result = { id, name: "private child", status: "stopped", text: "full outcome".repeat(10000), startedAt: 1,
+      spawner: { id: "actor:review", kind: "actor", runId: "a".repeat(32) } } as AgentRunResult;
+    stageRunArchive(source, { format: 1, kind: "shutdown", result, actorSessionFile: sessionFile, actorOnly: true, notify: true });
+    fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 0, heartbeatAt: 0, orphanedAt: 0 }));
+    expect(runTreeExitVeto(parent)).toMatch(/archive is pending/);
+    const enqueue = vi.spyOn(ActorChildCompletionStore.prototype, "enqueue").mockImplementation(() => { throw new Error("archive unavailable"); });
+    const sweep = () => sweepTempRunRoots({ tempRoot: temp, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
+    sweep(); expect(fs.existsSync(source)).toBe(true);
+    enqueue.mockRestore(); sweep();
+    expect(fs.existsSync(root)).toBe(false);
+    const store = new ActorChildCompletionStore(sessionFile);
+    expect(JSON.parse(fs.readFileSync(store.resultFile(id), "utf8"))).toMatchObject(result);
+    expect(store.pending()).toHaveLength(1);
+  });
+});
+
+describe("owned follow-up retention artifacts", () => {
+  const id = "00000000-0000-0000-0000-000000000001";
+  const fixture = (state?: string) => {
+    const temp = temporaryDirectory();
+    const root = path.join(temp, FABRIC_RUN_ROOT_PREFIX + "follow-ups"); markRunRootActive(root, 1);
+    // Final message receipts do not prove worker exit. Persist the same
+    // confirmed-absent process identity used by the other retention fixtures.
+    const run = path.join(root, "run");
+    writeStatus(run, { status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" });
+    const dir = path.join(run, "follow-ups"); fs.mkdirSync(dir);
+    const admission = path.join(dir, id + ".json");
+    fs.writeFileSync(admission, JSON.stringify({ messageId: id, deadlineAt: 1 }));
+    if (state !== undefined) { fs.mkdirSync(admission + ".settled"); if (state) fs.writeFileSync(path.join(admission + ".settled", "state"), state); }
+    markRunRootClosed(root, 1, true);
+    return { temp, root, run, dir, admission };
+  };
+  const writeTrackedEnvelope = (run: string): void => {
+    const deliveries = path.join(run, "deliveries"); fs.mkdirSync(deliveries);
+    fs.writeFileSync(path.join(deliveries, id + ".json"), JSON.stringify({
+      message: "retained payload", delivery: "followUp", followUpId: id,
+      provenance: { v: 1, channel: "fabric", via: "followUp", sender: { id: "test", kind: "main", verified: "mesh" } },
+    }));
+  };
+  it.each(["delivered", "cancelled"])("collects terminal runs and closed temp roots with confirmed %s receipts", state => {
+    const p = fixture(state);
+    expect(canRemoveTerminalRun(p.run)).toBe(true);
+    expect(canRemoveManagedRunRoot(p.root)).toBe(true);
+    const result = sweepTempRunRoots({ tempRoot: p.temp, now: 100_000, orphanedTempRunRetentionMs: 1, oneShotRunRetentionMs: 1 });
+    expect(result.removedRuns).toContain(p.run);
+    expect(fs.existsSync(p.root)).toBe(false);
+  });
+  it.each(["delivered", "cancelled"])("collects final %s tracked envelopes left by a crash between receipt and unlink", state => {
+    const p = fixture(state);
+    writeTrackedEnvelope(p.run);
+    expect(canRemoveTerminalRun(p.run)).toBe(true);
+    expect(canRemoveManagedRunRoot(p.root)).toBe(true);
+    const result = sweepTempRunRoots({ tempRoot: p.temp, now: 100_000, orphanedTempRunRetentionMs: 1, oneShotRunRetentionMs: 1 });
+    expect(result.removedRuns).toContain(p.run);
+    expect(fs.existsSync(p.root)).toBe(false);
+  });
+  const custodyCases = ["delivered", "cancelled"].flatMap(state =>
+    [false, true].flatMap(envelope =>
+      ["missing identity", "live worker", "unknown liveness", "cleanup pending"].map(custody => ({ state, envelope, custody })),
+    ),
+  );
+  it.each(custodyCases)("retains $state receipts with envelope=$envelope when custody is $custody", ({ state, envelope, custody }) => {
+    const p = fixture(state);
+    if (envelope) writeTrackedEnvelope(p.run);
+    if (custody === "missing identity") writeStatus(p.run, { status: "completed", finishedAt: 1 });
+    if (custody === "live worker") writeStatus(p.run, { status: "completed", finishedAt: 1, transport: "process", sessionId: String(process.pid) });
+    if (custody === "cleanup pending") writeStatus(p.run, { status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647", cleanupPending: true });
+    const probe = custody === "unknown liveness" ? vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("denied"), { code: "EPERM" });
+    }) : undefined;
+    try {
+      expect(runTreeExitVeto(p.run, 0, undefined, true)).toBeDefined();
+      expect(canRemoveTerminalRun(p.run)).toBe(false);
+      expect(canRemoveManagedRunRoot(p.root)).toBe(false);
+      const result = sweepTempRunRoots({ tempRoot: p.temp, now: 100_000, orphanedTempRunRetentionMs: 1, oneShotRunRetentionMs: 1 });
+      expect(result.removedRuns).toEqual([]);
+      expect(fs.readFileSync(path.join(p.admission + ".settled", "state"), "utf8")).toBe(state);
+      if (envelope) expect(fs.existsSync(path.join(p.run, "deliveries", id + ".json"))).toBe(true);
+    } finally { probe?.mockRestore(); }
+  });
+  it.each(["pending", "untracked", "malformed", "foreign-id", "bad-provenance", "unknown-key", "link"])("retains unsafe leftover delivery envelopes: %s", kind => {
+    const p = fixture(kind === "pending" ? undefined : "delivered");
+    const dir = path.join(p.run, "deliveries"); fs.mkdirSync(dir);
+    const file = path.join(dir, id + ".json");
+    const item: Record<string, unknown> = { message: "retained payload", delivery: "followUp", followUpId: id,
+      provenance: { v: 1, channel: "fabric", via: "followUp", sender: { id: "test", kind: "main", verified: "mesh" } } };
+    if (kind === "untracked") delete item.followUpId;
+    if (kind === "foreign-id") item.followUpId = "foreign";
+    if (kind === "bad-provenance") item.provenance = {};
+    if (kind === "unknown-key") item.unknown = "data";
+    fs.writeFileSync(file, kind === "malformed" ? "{" : JSON.stringify(item));
+    if (kind === "link") { const target = path.join(p.temp, "payload"); fs.renameSync(file, target); fs.symlinkSync(target, file); }
+    expect(canRemoveTerminalRun(p.run)).toBe(false);
+  });
+  it.each([undefined, "", "queued", "settling", "unknown", "delivered\n"])("retains expired queued or uncertain receipt %s", state => {
+    const p = fixture(state);
+    expect(canRemoveTerminalRun(p.run)).toBe(false);
+    expect(canRemoveManagedRunRoot(p.root)).toBe(false);
+    expect(sweepTempRunRoots({ tempRoot: p.temp, now: 100_000, orphanedTempRunRetentionMs: 1, oneShotRunRetentionMs: 1 }).removedRuns).toEqual([]);
+  });
+  it.each(["malformed", "wrong-id", "bad-deadline", "unknown-file", "unknown-receipt-file", "orphan-receipt", "admission-link", "state-link"])("retains unsafe follow-up artifact: %s", kind => {
+    const p = fixture("delivered");
+    if (kind === "malformed") fs.writeFileSync(p.admission, "{");
+    if (kind === "wrong-id") fs.writeFileSync(p.admission, JSON.stringify({ messageId: "foreign", deadlineAt: 1 }));
+    if (kind === "bad-deadline") fs.writeFileSync(p.admission, JSON.stringify({ messageId: id, deadlineAt: "1" }));
+    if (kind === "unknown-file") fs.writeFileSync(path.join(p.dir, "unknown"), "data");
+    if (kind === "unknown-receipt-file") fs.writeFileSync(path.join(p.admission + ".settled", "unknown"), "data");
+    if (kind === "orphan-receipt") fs.unlinkSync(p.admission);
+    if (kind === "admission-link" || kind === "state-link") {
+      const file = kind === "admission-link" ? p.admission : path.join(p.admission + ".settled", "state");
+      const target = path.join(p.temp, "link-target"); fs.renameSync(file, target); fs.symlinkSync(target, file);
+    }
+    expect(canRemoveTerminalRun(p.run)).toBe(false);
+  });
+});
 describe("shared run-tree exit veto", () => {
   it.each(["running", "queued", "unknown", undefined])("vetoes a nested nonterminal process record (%s) even with a dead saved PID", status => {
     const run = temporaryDirectory();

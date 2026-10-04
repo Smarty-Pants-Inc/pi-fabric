@@ -76,6 +76,7 @@ export const parseWorkerOptions = (
   }
   const thinking = optional(args, "thinking");
   const fabricExtensionPath = optional(args, "fabric-extension");
+  const fabricRelease = optional(args, "fabric-release");
   const schemaFile = optional(args, "schema-file");
   const replyTool = optional(args, "reply-tool") === "true";
   const imagesFile = optional(args, "images-file");
@@ -185,6 +186,7 @@ export const parseWorkerOptions = (
   return {
     ...(residentStartupProbe ? { residentStartupProbe: true } : {}),
     id: required(args, "id"),
+    ...(fabricRelease ? { fabricRelease } : {}),
     runner,
     ...(kernel ? { kernel, pythonRuntime } : {}),
     name: required(args, "name"),

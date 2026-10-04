@@ -1028,14 +1028,14 @@ describe("FabricControlPlane", () => {
       expect(receive).toHaveBeenCalledTimes(1);
     });
 
-    // A detached ask has passed the cursor: the bounded owned queue retries only its ACK,
+    // Detached asynchronous commands pass the cursor: the owned queue retries only the ACK,
     // not the handler. A later replay still consults the durable claim/outcome.
-    it("of a detached ask, the bounded notification queue retries its outcome without re-execution", async () => {
+    it.each(["ask"] as const)("of a detached %s, the bounded notification queue retries its outcome without re-execution", async operation => {
       const { meshRoot, receive } = await run();
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
       const ask = {
-        topic: "fabric.control.command", kind: "ask", from: identity("host:sender"), to: "host:receiver",
-        data: { version: 1, commandId: "command:ask", targetId: "agent:target", operation: "ask", replyTo: "host:sender",
+        topic: "fabric.control.command", kind: operation, from: identity("host:sender"), to: "host:receiver",
+        data: { version: 1, commandId: "command:ask", targetId: "agent:target", operation, replyTo: "host:sender",
           message: "inspect", requestedAt: Date.now(), deadlineAt: Date.now() + 60_000 },
       };
       const acks = () => store.read({ topic: "fabric.control.ack", limit: 100 })

@@ -28,7 +28,7 @@ import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/
 import type { ModelRouteDecision } from "../agents/model-route.js";
 
 import { readJsonlPage } from "../log-tail.js";
-import { ActorChildCompletionStore } from "./child-completions.js";
+import { ActorChildCompletionStore, ChildCompletionClaimLostError } from "./child-completions.js";
 import { pruneActorSessionBackups } from "../storage/retention.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
@@ -92,8 +92,11 @@ interface ActorQueueItem {
   bindingVersion?: 2;
   resolve?: (message: FabricActorMessage) => void;
   reject?: (error: Error) => void;
-  /** Owner restorations without settlement; only #restoreQueue consumes this budget. */
+  /** Interrupted launched runs; untouched backlog never consumes this budget. */
   attempts?: number;
+  /** Versioned evidence: only an actual worker launch spends a restart attempt. */
+  launchEvidenceVersion?: 1;
+  executionStarted?: boolean;
   /** Unlaunched preparation failures, independent of the crash/drop budget (#3167). */
   preparationAttempts?: number;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
@@ -353,6 +356,7 @@ export class ActorManager {
   // Accepted active work (preparing, waiting, or running), retained durably until settlement (#878).
   readonly #inFlight = new Map<string, ActorQueueItem>();
   readonly #deferredHandoffs = new Map<string, ActorQueueItem[]>();
+  readonly #pendingHandoffConsumption = new Map<string, Set<string>>();
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
@@ -449,6 +453,7 @@ export class ActorManager {
   #mainIdle = true;
   #reloadingOwnership = false;
   #registryFingerprint: string | undefined;
+  readonly #canConsumeMesh: (() => boolean) | undefined;
 
   constructor(
     readonly sessionId: string,
@@ -479,6 +484,8 @@ export class ActorManager {
       project?: string | undefined;
       role?: string | undefined;
       meshCursorPath?: string;
+      /** Resident lease fence, also defers archive retention until initial publication. */
+      canConsumeMesh?: () => boolean;
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
       /** Per-await preparation deadline; independent of model/run and permit wait timeouts. */
@@ -525,6 +532,7 @@ export class ActorManager {
     this.#role = options.role;
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
     this.#deadSessionReap = options.reapDeadSessionPresence ?? true;
+    this.#canConsumeMesh = options.canConsumeMesh;
     this.#logs = new ActorLogStore(
       mesh,
       meshConfig,
@@ -546,9 +554,10 @@ export class ActorManager {
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
       cursorPath: options.meshCursorPath,
+      canConsumeMesh: options.canConsumeMesh,
       maxReplayAgeMs: options.meshReplayAgeMs,
       beforePoll: () => {
-        if (this.#releasePaused) return false;
+        if (this.#releasePaused || options.canConsumeMesh?.() === false) return false;
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();
         // Preserve deferred events while halted; fencing remains manager-owned.
@@ -2200,12 +2209,37 @@ export class ActorManager {
     return store;
   }
 
+  /** Bound the actual pretty-printed UTF-8 context, independently of the runnable FIFO. */
+  #handoffSnapshot(actor: ManagedActor): ActorQueueItem[] {
+    const snapshot: ActorQueueItem[] = [];
+    const encode = (items: ActorQueueItem[]): string => JSON.stringify(items.map(({ id, source, payload, activation }) =>
+      ({ id, source, payload, activation })), null, 2);
+    for (const original of this.#deferredHandoffs.get(actor.id) ?? []) {
+      if (snapshot.length === 16) break;
+      if (this.#pendingHandoffConsumption.get(actor.id)?.has(original.id) ||
+          this.#childCompletionStore(actor).handoffConsumed(original.id)) continue;
+      let item = original;
+      // One oversized summary must not starve itself or later outcomes. The full
+      // archive remains accessible, while this context carries only its reference.
+      if (Buffer.byteLength(encode([item]), "utf8") > 32 * 1024) {
+        item = { ...original, payload: {
+          message: "Unread child outcome; read the full archived result.",
+          data: { resultFile: this.#childCompletionStore(actor).resultFile(original.id) },
+        } };
+      }
+      if (Buffer.byteLength(encode([...snapshot, item]), "utf8") > 32 * 1024) break;
+      snapshot.push(item);
+    }
+    return snapshot;
+  }
+
   // Once its spawning activation ends, an unread child result belongs to the
   // actor's next activation. Stopped/removed actors keep the spool; never reroute to Main.
   #reconcileChildCompletions(): void {
     if (!this.#persistent || this.#closing) return;
     for (const actor of this.#actors.values()) {
       if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) continue;
+      this.#flushHandoffConsumption(actor);
       const store = this.#childCompletionStore(actor);
       for (const { spawner, result } of store.pending({ actorId: actor.id, ...(actor.inFlightRun ? { inFlightRunId: actor.inFlightRun.id } : {}) })) {
         try {
@@ -2226,9 +2260,27 @@ export class ActorManager {
             store.acknowledge(id, { handoff: true });
             this.#ensureDrain(actor);
           }
-        } catch { /* The actor-addressed file stays pending for the next owner poll. */ }
+        } catch (error) {
+          if (error instanceof ChildCompletionClaimLostError) {
+            this.#forgetClaimedChild(actor, result.id);
+            this.#ensureDrain(actor);
+          } // Other I/O failures leave the actor-addressed envelope pending for retry.
+        }
       }
     }
+  }
+
+  #forgetClaimedChild(actor: ManagedActor, id: string): void {
+    const keep = (item: ActorQueueItem): boolean => item.source !== "child-completion" || item.id !== id;
+    actor.queue = actor.queue.filter(keep);
+    for (const held of [this.#overflow, this.#parked, this.#deferredHandoffs]) {
+      const items = held.get(actor.id)?.filter(keep);
+      if (items?.length) held.set(actor.id, items);
+      else held.delete(actor.id);
+    }
+    this.#refill(actor);
+    if (!this.#inFlight.has(actor.id) && actor.status !== "stopped") actor.status = actor.queue.length ? "queued" : "idle";
+    this.#persistQueue(actor.id, true);
   }
 
   #enqueue(
@@ -2461,8 +2513,11 @@ export class ActorManager {
         // If receipt I/O failed, even an unrelated new message must not drain it;
         // the next poll retries the same queued id before opening this gate.
         const head = actor.queue[0];
-        if (head?.source === "child-completion" &&
-          !this.#childCompletionStore(actor).received(head.id)) break;
+        if (head?.source === "child-completion") {
+          const store = this.#childCompletionStore(actor);
+          if (!store.received(head.id)) break;
+          if (!store.mailboxClaimed(head.id)) { this.#forgetClaimedChild(actor, head.id); continue; }
+        }
         const item = actor.queue.shift();
         this.#refill(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
@@ -2505,7 +2560,7 @@ export class ActorManager {
           }
           // The current activation is fresh; retained outcomes are labelled context,
           // not retried activations with rewritten freshness facts.
-          item.handoffContext = this.#deferredHandoffs.get(actor.id)?.slice() ?? [];
+          item.handoffContext = this.#handoffSnapshot(actor);
           if (actor.requirements.length > 0 && this.#acquireCapabilityView) {
             capabilityLease = await this.#prepare(actor, "capabilities", () => this.#acquireCapabilityView!(
               actor.requirements,
@@ -2559,6 +2614,9 @@ export class ActorManager {
             abortController.signal,
             (handle) => {
               workerLaunched = true;
+              item.launchEvidenceVersion = 1;
+              item.executionStarted = true;
+              this.#persistQueue(actor.id);
               delete actor.preparing;
               actor.status = "running";
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
@@ -3169,12 +3227,12 @@ export class ActorManager {
   // Returns false when an owned receiver's queue was full; the monitor then offers the event
   // again while it catches up, and actors that already took it are skipped.
   #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
-    // One ownership refresh per event. Each decision reads the participant directory, and
-    // re-deciding for every actor per actor (and before the topic filter) cost 182 directory
-    // reads per event on a host with 13 actors and saturated its event loop (smarty-dev#784).
-    // The snapshot holds for this synchronous delivery (enqueue, drain start, message record);
-    // work that resumes later decides again.
-    this.#refreshOwnership();
+    // beforePoll already refreshed all owners for this synchronous page. No
+    // await separates that snapshot from dispatch, including archive catch-up.
+    // Re-refreshing per event or full-queue retry repeats directory reads without
+    // adding an authority boundary. Async activation continuations recheck their
+    // own target after every wait.
+
     this.#ownershipSnapshot = true;
     try {
       return this.#deliverMeshEvent(event);
@@ -3229,7 +3287,7 @@ export class ActorManager {
   }
 
   #sweepRetainedRuns(now = Date.now()): void {
-    if (this.#closing) return;
+    if (this.#closing || this.#canConsumeMesh?.() === false) return;
     this.#refreshOwnership();
     for (const actor of this.#actors.values()) {
       if (this.#canManage(actor.id)) {
@@ -3238,6 +3296,7 @@ export class ActorManager {
           ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
           .filter((item) => item?.source === "child-completion").map((item) => item!.id));
         for (const handoff of this.#inFlight.get(actor.id)?.handoffContext ?? []) keepIds.add(handoff.id);
+        for (const id of this.#pendingHandoffConsumption.get(actor.id) ?? []) keepIds.add(id);
         const store = this.#childCompletionStore(actor);
         store.prune(this.#logs.retention.actorRunArchiveMs, now, keepIds);
         // Deferred work shares the archive TTL, rather than exempting stale results
@@ -3718,7 +3777,8 @@ export class ActorManager {
   // - Reads: its own file once per process, when the actor first loads; the predecessor files that
   //   its registry claim names, on adoption and again at that load. A regain reads nothing: memory
   //   already holds the work, without what was cancelled or finished (F4). An item can run twice
-  //   when its process died mid-run; one restored three times without finishing is dropped.
+  //   when its process died mid-run; three interrupted launched runs exhaust its budget.
+  //   Mere failed host starts do not spend the versioned launch-evidence budget.
   #lineageKey(parts: readonly string[]): string {
     return createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 16);
   }
@@ -3778,6 +3838,8 @@ export class ActorManager {
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
             attempts: item.attempts ?? 0,
+            launchEvidenceVersion: 1,
+            executionStarted: item.executionStarted === true,
             preparationAttempts: item.preparationAttempts ?? 0,
             ...(item === inFlight || item.resumed ? { resumed: true } : {}),
             ...(item.deferredHandoff ? { deferredHandoff: true } : {}),
@@ -3821,12 +3883,26 @@ export class ActorManager {
     const kept = deferred.filter((handoff) => !consumedIds.has(handoff.id));
     if (kept.length) this.#deferredHandoffs.set(actorId, kept);
     else this.#deferredHandoffs.delete(actorId);
-    // Commit removal before deleting archives; failed persistence leaves them recoverable.
-    if (this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0) && actor) {
-      for (const id of consumedIds) {
-        try { this.#childCompletionStore(actor).releaseResult(id); } catch { /* The retention sweep retries cleanup. */ }
-      }
-    }
+    if (actor && consumedIds.size) {
+      const pending = this.#pendingHandoffConsumption.get(actorId) ?? new Set<string>();
+      for (const id of consumedIds) pending.add(id);
+      this.#pendingHandoffConsumption.set(actorId, pending);
+      this.#flushHandoffConsumption(actor);
+    } else this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0);
+  }
+
+  #flushHandoffConsumption(actor: ManagedActor): void {
+    const pending = this.#pendingHandoffConsumption.get(actor.id);
+    if (!pending?.size) return;
+    const store = this.#childCompletionStore(actor);
+    try {
+      // Separate durable evidence survives a failed queue rewrite. Retain both
+      // fence and queue retries, and never offer an already inferred snapshot again.
+      for (const id of pending) store.markHandoffConsumed(id);
+      if (!this.#persistQueue(actor.id, true)) return;
+      for (const id of pending) store.releaseResult(id);
+      this.#pendingHandoffConsumption.delete(actor.id);
+    } catch { /* Keep original archives and retry each owner poll. */ }
   }
 
   #readQueue(file: string): unknown {
@@ -3898,11 +3974,23 @@ export class ActorManager {
       ) continue;
       // Include this snapshot's accepted IDs too, not only the work held on entry.
       held.add(value.id);
+      if (value.source === "child-completion" && this.#childCompletionStore(actor).handoffConsumed(value.id)) {
+        const pending = this.#pendingHandoffConsumption.get(actor.id) ?? new Set<string>();
+        pending.add(value.id);
+        this.#pendingHandoffConsumption.set(actor.id, pending);
+        continue;
+      }
+      if (value.source === "child-completion") {
+        const store = this.#childCompletionStore(actor);
+        if (store.received(value.id) && !store.mailboxClaimed(value.id)) continue;
+      }
       const deferredHandoff = value.source === "child-completion" && value.deferredHandoff === true;
-      // A deliberate quiescent release is not a failed attempt at untouched backlog.
-      // Deferred child outcomes remain context-only and never spend restart attempts.
-      const attempts = deferredHandoff ? 0 : (typeof value.attempts === "number" ? value.attempts : 0) +
-        (saved.cleanHandover === true && (value as { resumed?: unknown }).resumed !== true ? 0 : 1);
+      // New snapshots prove whether a worker actually launched since the last
+      // restoration. Failed starts/preparation never consume accepted backlog.
+      // Unmarked legacy snapshots remain conservative: they may have run.
+      const interrupted = value.launchEvidenceVersion === 1 ? value.executionStarted === true
+        : !(saved.cleanHandover === true && (value as { resumed?: unknown }).resumed !== true);
+      const attempts = deferredHandoff ? 0 : (typeof value.attempts === "number" ? value.attempts : 0) + (interrupted ? 1 : 0);
       const provenance = copyFabricProvenance(value.provenance);
       // Old records may still name the launch requester after native-session steering.
       // Even an unmarked item can have run: older snapshots did not always mark in-flight work.
@@ -3927,6 +4015,8 @@ export class ActorManager {
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
         ...((value as { resumed?: unknown }).resumed === true ? { resumed: true } : {}),
         attempts,
+        launchEvidenceVersion: 1,
+        executionStarted: false, // this restoration has not launched a new worker
         preparationAttempts: counter(value.preparationAttempts),
       } as ActorQueueItem & { attempts: number };
       if (deferredHandoff) {
@@ -4242,10 +4332,14 @@ export class ActorManager {
     this.#emitChange();
   }
 
-  #refreshOwnership(): void {
+  #refreshOwnership(id?: string): void {
     if (!this.#canManageActor || this.#reloadingOwnership) return;
     let acquired = false;
-    for (const actor of this.#actors.values()) {
+    // Async activation boundaries recheck their target, not every actor for
+    // every target. Polls and mesh delivery still refresh the complete snapshot.
+    const target = id === undefined ? undefined : this.#actors.get(id);
+    const actors = id === undefined ? this.#actors.values() : target ? [target] : [];
+    for (const actor of actors) {
       const previous = this.#ownership.get(actor.id) ?? false;
       const next = this.#ownershipDecision(actor.id);
       this.#ownership.set(actor.id, next);
@@ -4489,7 +4583,7 @@ export class ActorManager {
   }
 
   #canManage(id: string): boolean {
-    if (!this.#ownershipSnapshot) this.#refreshOwnership();
+    if (!this.#ownershipSnapshot) this.#refreshOwnership(id);
     return this.#canManageCached(id);
   }
 

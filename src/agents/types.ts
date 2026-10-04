@@ -149,6 +149,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Canonical Fabric package root selected for the process worker at spawn time. */
+  fabricRelease?: string;
   /** Always populated for new runs; optional for legacy records. */
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
@@ -184,6 +186,8 @@ export interface AgentRunRecord {
   updatedAt: number;
   finishedAt?: number;
   currentTool?: string;
+  currentToolStartedAt?: number;
+  followUpDeliveries?: AgentFollowUpDelivery[];
   turns: number;
   /** Actual model output/tool execution, not worker startup or an error-only turn. */
   inferenceStarted?: boolean;
@@ -237,6 +241,9 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  /** Canonical Fabric package root selected for the process worker at spawn time. */
+  fabricRelease?: string;
+  followUpDeliveries?: AgentFollowUpDelivery[];
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
   protected?: boolean;
@@ -270,6 +277,8 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  /** Spawn-selected Fabric package root, retained in the durable run record. */
+  fabricRelease?: string;
   /** Host-created record metadata, independent of the route header/decision. */
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
@@ -379,6 +388,8 @@ export type AgentTransportObservation =
   | { state: "unknown"; reason: string };
 
 export interface AgentTransportHandle {
+  /** Actual worker release, not the parent manager's loaded generation. */
+  fabricRelease?: string;
   kind: FabricAgentTransport;
   sessionId?: string;
   attachCommand?: string;
@@ -398,6 +409,8 @@ export interface AgentTransportHandle {
   observe?(options?: AgentTransportObservationOptions): Promise<AgentTransportObservation>;
   /** Bounded join of the captured process worker's native close (not PID absence). */
   waitForClose?(): Promise<void>;
+  /** Passive native close notification; wakes monitoring, never itself grants collection. */
+  closed?: Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;
 }
@@ -430,8 +443,30 @@ export interface FabricAgentLog {
 
 export type FabricSteeringMode = "all" | "one-at-a-time";
 
+export interface AgentFollowUpAlarm {
+  code: "FABRIC_FOLLOW_UP_DEADLINE";
+  messageId: string;
+  targetId: string;
+  targetName: string;
+  deadlineAt: number;
+  status: AgentRunStatus;
+  currentTool?: string;
+  currentToolStartedAt?: number;
+  options: ["wait", "steer", "cancel"];
+  message: string;
+}
+
+export interface AgentFollowUpDelivery {
+  messageId: string;
+  deadlineAt: number;
+  state: "queued" | "settling" | "delivered" | "cancelled";
+  alarm?: AgentFollowUpAlarm;
+}
+
 export interface AgentSteerEntry {
   provenance?: FabricTurnProvenance | undefined;
+  followUpId?: string;
+  deadlineAt?: number;
   type: "steer" | "follow_up" | "set_steering_mode" | "set_follow_up_mode" | "compact";
   id: string;
   message?: string;
@@ -453,6 +488,7 @@ export interface AgentFollowUpRunningWarning {
 }
 
 export interface AgentSteerResult {
+  deadlineAt?: number;
   warning?: AgentFollowUpRunningWarning;
   queued: true;
   messageId: string;

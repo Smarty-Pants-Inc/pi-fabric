@@ -298,9 +298,10 @@ export const legacyCompletionConsumed = (meshRoot: string, rootId: string, id: s
   return metadata.completionConsumedAt !== undefined;
 };
 const pendingCompletion = (meshRoot: string, projectRoot: string, project: string, target: string,
-  accepts: (recipient: CompletionRecipient) => boolean): CompletionEnvelope[] => {
+  accepts: (recipient: CompletionRecipient) => boolean, consumed?: ReadonlySet<string>): CompletionEnvelope[] => {
   // The immutable address precedes the potentially huge body. Foreign lanes never touch fences.
   const file = path.basename(target);
+  if (consumed?.has(file)) return [];
   const recipient = readRecipient(target);
   if (!recipient || canonical(recipient.projectRoot) !== project || !accepts(recipient)) return [];
   if (readReceipt(path.join(directory(meshRoot), "receipts", file))) return [];
@@ -318,13 +319,16 @@ const pendingCompletion = (meshRoot: string, projectRoot: string, project: strin
   return legacyCompletionConsumed(meshRoot, value.recipient.rootId, value.result.id) ? [] : [value];
 };
 export const pendingCompletions = (meshRoot: string, projectRoot: string,
-  accepts: (recipient: CompletionRecipient) => boolean = () => true): CompletionEnvelope[] => {
+  accepts: (recipient: CompletionRecipient) => boolean = () => true): CompletionEnvelope[] =>
+  pendingCompletionsExcept(meshRoot, projectRoot, accepts);
+const pendingCompletionsExcept = (meshRoot: string, projectRoot: string,
+  accepts: (recipient: CompletionRecipient) => boolean = () => true, consumed?: ReadonlySet<string>): CompletionEnvelope[] => {
   promoteOrphans(meshRoot, projectRoot, accepts);
   const project = canonical(projectRoot);
-  return files(directory(meshRoot)).flatMap(file => pendingCompletion(meshRoot, projectRoot, project, path.join(directory(meshRoot), file), accepts));
+  return files(directory(meshRoot)).flatMap(file => pendingCompletion(meshRoot, projectRoot, project, path.join(directory(meshRoot), file), accepts, consumed));
 };
 const scanPendingCompletions = async (meshRoot: string, projectRoot: string,
-  accepts: (recipient: CompletionRecipient) => boolean): Promise<CompletionEnvelope[]> => {
+  accepts: (recipient: CompletionRecipient) => boolean, consumed?: ReadonlySet<string>): Promise<CompletionEnvelope[]> => {
   const promotionProject = canonical(projectRoot);
   for await (const target of scanTargets([path.join(directory(meshRoot), "attempts")])) {
     promoteOrphan(meshRoot, projectRoot, promotionProject, target, accepts);
@@ -332,7 +336,7 @@ const scanPendingCompletions = async (meshRoot: string, projectRoot: string,
   const project = canonical(projectRoot);
   const pending: CompletionEnvelope[] = [];
   for await (const target of scanTargets([directory(meshRoot)])) {
-    pending.push(...pendingCompletion(meshRoot, projectRoot, project, target, accepts));
+    pending.push(...pendingCompletion(meshRoot, projectRoot, project, target, accepts, consumed));
   }
   return pending;
 };
@@ -343,6 +347,14 @@ export const pendingCompletionResult = (envelope: CompletionEnvelope): AgentRunR
 
 export class CompletionJournal {
   readonly #enqueued = new Set<string>();
+  // A monotonic local suppression fence, not a cached durability confirmation.
+  // Destructive claim retirement continues to reopen/sync its exact receipt.
+  readonly #suppressed = new Set<string>();
+  #rememberConsumed(id: string): void {
+    this.#suppressed.add(`${key(id)}.json`);
+    if (this.#suppressed.size > 1024) this.#suppressed.delete(this.#suppressed.values().next().value!);
+  }
+
   // Explicit cleanup is logically final for this client even while durable retirement
   // is delayed/refused. Keep the receipt and envelope for crash-safe drain retries.
   readonly #forgotten = new Set<string>();
@@ -378,11 +390,12 @@ export class CompletionJournal {
     if (envelope && !this.#canRead(envelope)) return;
     consumeCompletion(this.meshRoot, id, this.recipient.sessionId);
     this.#forgotten.add(id);
+    this.#rememberConsumed(id);
     this.#enqueued.delete(id);
     this.#consumed.delete(id);
     void this.#retireClaim(id).catch(() => undefined); // A crash/failure is reconciled by drain.
   }
-  pending(): CompletionEnvelope[] { return pendingCompletions(this.meshRoot, this.recipient.projectRoot); }
+  pending(): CompletionEnvelope[] { return pendingCompletionsExcept(this.meshRoot, this.recipient.projectRoot, undefined, this.#suppressed); }
   result(id: string): AgentRunResult | CompletionSummary | undefined {
     if (this.#forgotten.has(id)) return undefined;
     const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id) ?? this.#consumed.get(id);
@@ -405,6 +418,7 @@ export class CompletionJournal {
     if (envelope ? !this.#canRead(envelope) : !localRunSettled) return false;
     consumeCompletion(this.meshRoot, id, this.recipient.sessionId);
     if (envelope) this.#remember(envelope);
+    this.#rememberConsumed(id);
     this.#enqueued.delete(id);
     void this.#retireClaim(id).catch(() => undefined);
     return true;
@@ -450,7 +464,7 @@ export class CompletionJournal {
       }
       if (++pruned === 128) break;
     }
-    const pending = await scanPendingCompletions(this.meshRoot, recipient.projectRoot, accepts);
+    const pending = await scanPendingCompletions(this.meshRoot, recipient.projectRoot, accepts, this.#suppressed);
     if (!pending.length) return;
     const roots = this.participants.list({ scope: "project", kinds: ["root"], fresh: true });
     for await (const envelope of scanSlices(pending)) {
@@ -480,6 +494,7 @@ export class CompletionJournal {
           try {
             consumeCompletion(this.meshRoot, envelope.result.id, this.recipient.sessionId);
             this.#remember(envelope);
+            this.#rememberConsumed(envelope.result.id);
             void this.#retireClaim(envelope.result.id).catch(() => undefined);
           } finally { this.#enqueued.delete(envelope.result.id); }
         });

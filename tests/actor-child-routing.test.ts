@@ -155,11 +155,32 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 
-  it("resolves agents.main to the live actor during an actor turn, not the lineage root", async () => {
+  it("binds task slices to the actor spawner even when launch identity names the lineage Main", async () => {
     const h = await setup(residency);
-    const main = await h.runtime.registry.invoke("agents.main", {}, h.invocation) as { id: string; kind: string };
-    expect(main).toMatchObject({ id: h.actor.id, kind: "actor" });
-    expect(main.id).not.toBe("session:root-main");
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const manager = new AgentManager(h.invocation.cwd, DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: fixture, runRoot: path.join(h.invocation.cwd, "bound-child-runs"),
+      identityId: "session:root-main", mainAgentId: "session:root-main",
+    });
+    cleanups.push(() => manager.close());
+    const result = await manager.run({ task: "actor-owned return", transport: "process", model: "fixture/review" });
+    const args = launch.mock.calls[0]![0].workerArguments;
+    const address = JSON.parse(args[args.indexOf("--task-return-address") + 1]!);
+    expect(address.spawnerId).toBe(h.actor.id);
+    expect(args[args.indexOf("--spawner-id") + 1]).toBe(h.actor.id);
+    expect(args[args.indexOf("--main-agent-id") + 1]).toBe("session:root-main");
+    expect(result.spawner).toMatchObject({ id: h.actor.id, kind: "actor", runId: h.actorRunId });
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("keeps agents.main bound to the owning Main during an actor turn", async () => {
+    const h = await setup(residency);
+    const main = await h.runtime.registry.invoke("agents.main", {}, h.invocation) as { id: string };
+    expect(main.id).toBe("session:root-main");
+    expect(main.id).not.toBe(h.actor.id);
+    const child = await h.spawn();
+    await vi.waitFor(() => expect(h.runtime.agents.status(child.id).status).toBe("completed"));
+    expect(h.runtime.agents.status(child.id).spawner).toMatchObject({ id: h.actor.id, kind: "actor" });
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 

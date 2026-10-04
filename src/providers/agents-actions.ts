@@ -306,7 +306,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "main",
     description:
-      "Return this turn's return target: an actor receives its own nested-work target, while Main receives the root user-facing Main Pi agent. The stable alias main is also accepted by agents.steer and agents.followUp.",
+      "Return the root user-facing Main Pi agent target. The stable alias main is also accepted by agents.steer and agents.followUp.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     risk: "read",
   },

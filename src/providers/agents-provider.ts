@@ -961,9 +961,6 @@ export class AgentsProvider implements FabricProvider {
         return this.participants.self();
       case "main": {
         const address = this.#taskReturnAddress;
-        // A resident actor is its own nested-work return target. The lineage root
-        // remains the Main target only for work started by Main itself.
-        if (!address?.spawnerId && this.actorManager.identity.kind === "actor") return this.participants.self();
         const info = this.mainAgent.info(context.extensionContext);
         return address?.spawnerId ? {
           ...info, id: address.spawnerId, local: false, status: "remote",

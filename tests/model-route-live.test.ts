@@ -212,6 +212,73 @@ describe("live model routing", () => {
     expect(await prepareModelRoute(input)).toMatchObject({ mode: "live", reasonCode: "live-choice" });
     run.dispatch.outcome({ status: "completed" }); expect(rows().filter(row => row.type === "outcome")).toHaveLength(1);
   });
+  it.each(["EFBIG", "ENOSPC", "EIO"])("pins fresh Main and actor dispatch when both 8192-byte journals reject %s appends", async code => {
+    const run = await dispatch();
+    const journals = ["model-routing-pending.jsonl", "model-routing-refused.jsonl"].map(name => path.join(path.dirname(state()), name));
+    const prefix = JSON.stringify({ type: "committed", receiptId: "full-fixture", at: 1, padding: "" });
+    const full = prefix.slice(0, -2) + "x".repeat(8192 - Buffer.byteLength(prefix) - 1) + '"}\n';
+    for (const journal of journals) fs.writeFileSync(journal, full, { mode: 0o600 });
+    expect(Buffer.byteLength(full)).toBe(8192);
+    expect(fs.statSync(ledger()).size).toBeLessThan(8192);
+    // Native append-open/fstat/fsync all pass; only a real append reveals the fault.
+    for (const journal of journals) { const fd = fs.openSync(journal, "a"); fs.fsyncSync(fd); fs.closeSync(fd); }
+    const write = fs.writeFileSync;
+    const fault = vi.spyOn(fs, "writeFileSync").mockImplementation((file, ...args) => {
+      if (typeof file === "number" && fs.fstatSync(file).size === 8192) throw Object.assign(new Error(code), { code });
+      return write(file, ...args);
+    });
+    expect(() => run.dispatch.reportQuality("fail")).toThrow(code);
+    fault.mockRestore();
+    for (const journal of journals) expect(fs.readFileSync(journal, "utf8")).toBe(full); // No durable failure fence at all.
+    const fresh = spawnSync("bun", ["-e", `import fs from "node:fs";
+      import {prepareModelRoute} from ${JSON.stringify(path.resolve("src/agents/model-route-prepare.ts"))};
+      import {AgentManager} from ${JSON.stringify(path.resolve("src/agents/manager.ts"))};
+      import {DEFAULT_FABRIC_CONFIG} from ${JSON.stringify(path.resolve("src/config.ts"))};
+      const write = fs.writeFileSync;
+      let refusedAppends = 0;
+      fs.writeFileSync = (file, ...args) => {
+        if (typeof file === "number" && fs.fstatSync(file).size === 8192) {
+          refusedAppends++; throw Object.assign(new Error(${JSON.stringify(code)}), {code:${JSON.stringify(code)}});
+        }
+        return write(file, ...args);
+      };
+      const results = [];
+      const m = new AgentManager(${JSON.stringify(root)}, {...DEFAULT_FABRIC_CONFIG.agents,retainRuns:true}, {
+        workerPath:${JSON.stringify(path.resolve("tests/fixtures/fake-worker.mjs"))},runRoot:${JSON.stringify(path.join(root, "fresh-runs"))},preparePiModel:async model=>model});
+      try {
+        for (const owner of ["fresh-main", "fresh-actor"]) {
+          const decision = await prepareModelRoute({routeClass:"status-groom",protected:false,pinModel:"test/sol",pinThinking:"high",parentSessionId:owner,
+            ...(owner === "fresh-actor" ? {actorId:"actor:fresh",activationId:"activation:fresh"} : {}),
+            registry:{getAvailable:()=>[{provider:"test",id:"sol"},{provider:"test",id:"luna"}]},aliases:{},config:${JSON.stringify(config)},assertModelAllowed(){},evaluate:async()=>(${JSON.stringify(answer())})});
+          if (decision.mode !== "live") throw new Error("Fixture already fenced before the real append");
+          const h = await m.spawn({task:"ECHO_MODEL",routeDecision:decision});
+          results.push({decision,result:await m.wait(h.id)});
+        }
+      } finally { await m.close(); }
+      console.log(JSON.stringify({results,refusedAppends}));`], { encoding: "utf8", env: process.env, timeout: 30000 });
+    expect(fresh.status, fresh.stderr).toBe(0);
+    const evidence = JSON.parse(fresh.stdout.trim());
+    expect(evidence.refusedAppends).toBe(2);
+    for (const result of evidence.results) expect(result).toMatchObject({ decision: { ...pin, mode: "shadow", reasonCode: "record-failed" }, result: { status: "completed", model: pin.model, thinking: pin.effort } });
+    for (const journal of journals) expect(fs.statSync(journal).size).toBe(8192);
+  }, 30000);
+
+  it("requires the shared admission append even for a pre-recorded decision and pins on fsync failure", async () => {
+    const decision = await prepareModelRoute(input);
+    const journal = path.join(path.dirname(state()), "model-routing-pending.jsonl");
+    fs.mkdirSync(path.dirname(journal), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(journal, "", { mode: 0o600 });
+    const sync = fs.fsyncSync;
+    const fault = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fs.fstatSync(fd).isFile() && fs.fstatSync(fd).size > 0) throw new Error("EIO admission fsync");
+      return sync(fd);
+    });
+    prepareRouteDispatch(decision, undefined, path.join(root, decision.decisionId), decision.decisionId, { decisionRecorded: true });
+    expect(decision).toMatchObject({ ...pin, mode: "shadow", reasonCode: "record-failed" });
+    fault.mockRestore();
+    expect(JSON.parse(fs.readFileSync(journal, "utf8").trim())).toMatchObject({ type: "admission", decisionId: decision.decisionId });
+  });
+
   it.each([0, 128])("fails closed across fresh owners when the writable safety journal has only %s bytes left", async remaining => {
     const decision = await prepareModelRoute(input), m = manager();
     const run = await m.spawn({ task: "ECHO_MODEL", routeDecision: decision }); await m.wait(run.id);

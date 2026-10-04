@@ -305,6 +305,12 @@ original decision/run identity. While any save remains unresolved, that class
 uses the pin, including after restart; a journal that cannot accept write-ahead
 intents refuses live admission. Committed markers follow confirmed ledger/state
 saves, and terminal/quality retries deduplicate their original decision joins.
+Every LIVE dispatch must first append and fsync an `admission` record to that
+same safety journal, even when its decision was already recorded elsewhere.
+Open/fstat/fsync probes and the size reserve alone cannot prove appendability:
+`EFBIG`, `ENOSPC`, `EIO`, or any append/fsync failure demotes that dispatch to the
+pin with `record-failed`. Fresh Main and resident owners perform the same real
+append; a shorter separate decision ledger cannot grant LIVE authority.
 The exact pending ledger row is also kept in `pending-route-outcome.json` for
 reconciliation after close/reload; it is removed only after a successful append
 and deliberately remains outside the global sweeper's collectable-file allowlist.
@@ -355,6 +361,11 @@ activation, another class remaining live, and Jev error fallback. `evidence.json
 joins actual native model/effort, HTTP header and decision/outcome ledger by ID;
 `transcript.jsonl`, copied routing/resident state and `summary.json` retain the
 exact HEAD, bundle hash, installed Pi version and all-processes-exited receipt.
+The proof also covers two valid committed 8192-byte pending/refused journals
+whose appends (including the bounded refusal fence) fail with injected `EFBIG`.
+A fresh Main and resident dispatch pin while a shorter decision ledger remains
+writable. Every LIVE decision is joined to its shared durable admission record.
+`candidate-identity.json` records the exact head, bundle hash and installed Pi.
 The proof also injects first quality-intent, actor archive and terminal-state save
 failures: fresh Main and resident dispatch pin while shared saves are pending,
 A survives B until its archive retry succeeds, and terminal repair preserves the

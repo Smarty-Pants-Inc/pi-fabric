@@ -172,7 +172,7 @@ interface RouteStateEvent {
 const routeStateFile = () => path.join(resolveAgentDir(), "fabric", "model-routing-state.jsonl");
 
 /** No symlinks, FIFOs, foreign ownership, hardlinks or unbounded journal reads. */
-function readRouteRecords(file: string): Array<Record<string, unknown>> {
+function readRouteRecords(file: string, reservedBytes = 0): Array<Record<string, unknown>> {
   routeDirectory(file);
   let fd: number;
   try {
@@ -182,7 +182,7 @@ function readRouteRecords(file: string): Array<Record<string, unknown>> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.nlink !== 1 || stat.size > 64 * 1024 * 1024 ||
+    if (!stat.isFile() || stat.nlink !== 1 || stat.size > 64 * 1024 * 1024 - reservedBytes ||
       (process.platform !== "win32" && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0))) throw new Error("Unsafe routing state");
     return fs.readFileSync(fd, "utf8").split("\n").filter(Boolean).map(line => {
       const value: unknown = JSON.parse(line);
@@ -254,7 +254,7 @@ function beginRouteSave(intent: PendingRouteSave): void {
       if (!readRouteRecords(refusedFile()).some(row => row.type === "pending" && row.receiptId === intent.receiptId)) appendRouteRecord(refusedFile(), intent);
     } catch {
       // Even a record-size refusal has a bounded durable class fence. If all
-      // storage is unavailable, the admission probes below fail closed too.
+      // storage is unavailable, the real admission append below fails closed too.
       appendRouteRecord(refusedFile(), { type: "refused", receiptId: intent.receiptId,
         routeClass: intent.decision.routeClass, reset: intent.decision.revertReset ?? "", at: intent.at });
     }
@@ -283,11 +283,21 @@ function commitRouteSave(intent: PendingRouteSave): void {
 }
 
 function replayRouteSaves(routeClass: string, reset: string): boolean {
-  const rows = [...readRouteRecords(safetyFile()), ...readRouteRecords(refusedFile())];
+  // Retain the bounded intent + commit reserve, but do not mistake size or
+  // open/fsync checks for appendability: dispatch must append to safetyFile().
+  const rows = [...readRouteRecords(safetyFile(), 2 * 64 * 1024), ...readRouteRecords(refusedFile(), 2 * 64 * 1024)];
   const pending = new Map<string, PendingRouteSave>();
   const refused = new Set<string>();
   const committed = new Set<string>();
   for (const row of rows) {
+    if (row.type === "admission") {
+      if (typeof row.decisionId !== "string" || !row.decisionId || typeof row.runId !== "string" || !row.runId ||
+        typeof row.routeClass !== "string" || !ROUTABLE_CLASSES.includes(row.routeClass) ||
+        typeof row.reset !== "string" || row.reset.length > 128 || typeof row.at !== "number" || !Number.isFinite(row.at)) {
+        throw new Error("Malformed routing admission");
+      }
+      continue; // Admission is durable execution evidence, not a pending outcome.
+    }
     if (typeof row.receiptId !== "string" || !row.receiptId || typeof row.at !== "number" || !Number.isFinite(row.at) ||
       (row.type !== "pending" && row.type !== "committed" && row.type !== "refused")) throw new Error("Malformed routing safety fence");
     if (row.type === "refused") {
@@ -358,22 +368,8 @@ export function readRouteQualityReceipt(file: string): RouteQualityReceipt | und
 export function isRouteClassReverted(routeClass: string, reset = ""): boolean {
   // Read state first: unsafe/corrupt state cannot be repaired by replaying intent.
   let rows = readRouteState();
-  // If even the write-ahead journal cannot accept intents, every owner refuses
-  // live admission (including a fresh process with no local failed-write map).
-  for (const journal of [safetyFile(), refusedFile()]) {
-    const fd = fs.openSync(journal, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT |
-      fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
-    try {
-      const stat = fs.fstatSync(fd);
-      // Reserve the maximum accepted intent AND its commit record. Open/fsync
-      // alone succeeds on a full journal and is not write-ahead capacity.
-      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 64 * 1024 * 1024 - 2 * 64 * 1024 ||
-        (process.platform !== "win32" && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0))) {
-        throw new Error("Routing write-ahead storage is unsafe or capacity exhausted");
-      }
-      fs.fsyncSync(fd);
-    } finally { fs.closeSync(fd); }
-  }
+  // Reading/replaying state is not execution authority. Every LIVE dispatch
+  // must also durably append its admission to this same shared safety journal.
   let fenced = replayRouteSaves(routeClass, reset);
   rows = readRouteState();
   const journal = qualityFile();
@@ -445,6 +441,25 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
     // Direct callers may already know the final cwd; manager binds after worktree creation.
     fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
     if (cwd !== undefined) bindSession(cwd);
+    if (decision.mode === "live") {
+      try {
+        // Recheck after Choice: another owner may have fenced the class meanwhile.
+        if (isRouteClassReverted(decision.routeClass, decision.revertReset ?? "")) {
+          decision.mode = "shadow"; decision.reasonCode = "class-reverted";
+          Object.assign(decision, decision.pin);
+        } else {
+          // This is the appendability test AND durable admission record. A shorter
+          // decision ledger (including decisionRecorded callers) cannot bypass it.
+          appendRouteRecord(safetyFile(), { type: "admission", decisionId: decision.decisionId,
+            runId: childId, routeClass: decision.routeClass, reset: decision.revertReset ?? "", at: Date.now() });
+        }
+      } catch {
+        // Any append/fsync failure denies LIVE for this dispatch. Still audit the
+        // dispatched pin when its separate decision ledger remains writable.
+        decision.mode = "shadow"; decision.reasonCode = "record-failed";
+        Object.assign(decision, decision.pin);
+      }
+    }
     if (!options.decisionRecorded) appendRouteRecord(file, { type: "decision", ...decision, childSessionId: decision.actorId ? null : childId, childAgentId: childId, runId: childId, at: Date.now() });
     writeJsonAtomic(path.join(runDirectory, "route-quality-receipt.json"), { decision, ledger: file, runId: childId }, { durable: true });
   } catch (error) {

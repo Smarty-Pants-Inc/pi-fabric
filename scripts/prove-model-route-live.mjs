@@ -14,7 +14,7 @@ const scratch = path.resolve(scratchArg), out = path.resolve(outArg), candidate 
 fs.mkdirSync(scratch, { recursive: true, mode: 0o700 }); fs.mkdirSync(out, { recursive: true, mode: 0o700 });
 const cwd = path.join(scratch, 'workspace'), home = path.join(scratch, 'home'), profile = path.join(scratch, 'profile'), mesh = path.join(scratch, 'mesh');
 for (const directory of [cwd, home, profile]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-const transcript = path.join(out, 'transcript.jsonl'), queue = path.join(scratch, 'queue.json'), failJev = path.join(scratch, 'fail-jev');
+const transcript = path.join(out, 'transcript.jsonl'), queue = path.join(scratch, 'queue.json'), failJev = path.join(scratch, 'fail-jev'), fullJournals = path.join(scratch, 'full-journals');
 fs.writeFileSync(transcript, ''); fs.writeFileSync(queue, '[]');
 const record = row => fs.appendFileSync(transcript, JSON.stringify(row) + '\n');
 const pin = 'router-proof/gpt-5-pin', cheap = 'router-proof/gpt-5-cheap';
@@ -59,6 +59,21 @@ const endpoint = `http://127.0.0.1:${server.address().port}/v1`;
 const preload = path.join(scratch, 'jev-boundary.mjs');
 fs.writeFileSync(preload, `
 import fs from 'node:fs';
+const open = fs.openSync, close = fs.closeSync, write = fs.writeFileSync;
+const journalFds = new Map();
+fs.openSync = (file, ...args) => {
+  const fd = open(file, ...args);
+  if (typeof file === 'string' && /model-routing-(pending|refused)\\.jsonl$/.test(file)) journalFds.set(fd, file);
+  return fd;
+};
+fs.closeSync = fd => { journalFds.delete(fd); return close(fd); };
+fs.writeFileSync = (file, ...args) => {
+  if (typeof file === 'number' && journalFds.has(file) && fs.existsSync(process.env.ROUTER_PROOF_FULL_JOURNALS) && fs.fstatSync(file).size >= 8192) {
+    fs.appendFileSync(process.env.ROUTER_PROOF_TRANSCRIPT, JSON.stringify({type:'injected_journal_append_efbig',pid:process.pid,journal:journalFds.get(file),record:JSON.parse(String(args[0]))})+'\\n');
+    throw Object.assign(new Error('EFBIG: offline full journal append'), {code:'EFBIG'});
+  }
+  return write(file, ...args);
+};
 const original = globalThis.fetch;
 const boundaryFetch = async (url, options) => {
   const address = typeof url === 'string' ? url : (url.url ?? url.href ?? String(url));
@@ -90,10 +105,14 @@ fs.writeFileSync(path.join(profile, 'settings.json'), JSON.stringify({ extension
 const env = { PATH: process.env.PATH, HOME: home, TMPDIR: scratch, PI_CODING_AGENT_DIR: profile, PI_OFFLINE: '1',
   PI_FABRIC_PI_BINARY: path.resolve(cli), PI_FABRIC_MESH_ROOT: mesh, PI_FABRIC_RUN_ROOT: path.join(scratch, 'runs'),
   NODE_OPTIONS: '--import=' + preload, TYPESAFE_API_KEY: 'offline-proof-not-a-credential',
-  ROUTER_PROOF_ENDPOINT: endpoint, ROUTER_PROOF_TRANSCRIPT: transcript, ROUTER_PROOF_FAIL_JEV: failJev };
+  ROUTER_PROOF_ENDPOINT: endpoint, ROUTER_PROOF_TRANSCRIPT: transcript, ROUTER_PROOF_FAIL_JEV: failJev, ROUTER_PROOF_FULL_JOURNALS: fullJournals };
 const args = [path.resolve(cli), '--mode', 'rpc', '--offline', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files', '--approve',
   '--provider', 'router-proof', '--model', 'gpt-5-pin', '--thinking', 'high', '-e', candidate, '--tools', 'fabric_exec', '--session-dir', path.join(scratch, 'sessions')];
 const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: lane, encoding: 'utf8' }).trim();
+fs.writeFileSync(path.join(out, 'candidate-identity.json'), JSON.stringify({ head, candidate, installedCli: path.resolve(cli),
+  candidateSha256: createHash('sha256').update(fs.readFileSync(candidate)).digest('hex'),
+  piVersion: execFileSync(process.execPath, [cli, '--version'], { env, encoding: 'utf8' }).trim(),
+  dirtyTrackedFiles: execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], {cwd:lane,encoding:'utf8'}).trim() }, null, 2));
 record({ type: 'proof_command', executable: process.execPath, args, cwd, env: { ...env, TYPESAFE_API_KEY: '<offline fixture sentinel>' }, head,
   candidateSha256: createHash('sha256').update(fs.readFileSync(candidate)).digest('hex'),
   piVersion: execFileSync(process.execPath, [cli, '--version'], { env, encoding: 'utf8' }).trim(), config });
@@ -137,7 +156,7 @@ async function guest(code, expectedResidentFailure = false) {
   assert.ok(event && !event.isError && event.result.details.success, JSON.stringify(event ?? events.slice(before)));
   let text = event.result.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
   if (expectedResidentFailure) {
-    assert.match(text, /^ResidentOutcomeUnknownError:/); assert.match(text, /EACCES/);
+    assert.match(text, /^ResidentOutcomeUnknownError:/); assert.match(text, /EACCES|EFBIG/);
     const resultStart = text.indexOf('\n\n{'); assert.ok(resultStart >= 0, text); text = text.slice(resultStart + 2);
   }
   const result = JSON.parse(text);
@@ -212,6 +231,46 @@ try {
   assert.ok(safetyRows().some(row=>row.type==='committed' && row.receiptId===f1Intent.receiptId));
   safetyScenarios.push({finding:'F1',passed:true,report:f1Report,pendingIntent:f1Intent,mainRunId:f1Main.handle.id,residentRunId:f1Resident.runId,freshMain:true});
 
+  // Residual F1: both pending and refused (including the bounded refusal)
+  // appends fail. Fresh Main has no in-memory obligation and must still pin.
+  await restartMain('astra-r6-F1-full-journals');
+  const fullActor = await createActor('status-groom-f1-full');
+  const fullFirst = await ask(fullActor.id,'PROOF_F1_FULL_LIVE'); assert.match(fullFirst.text,/gpt-5-cheap/);
+  await wait(()=>fs.existsSync(path.join(fullActor.logDir,fullFirst.runId,'route-quality-receipt.json')));
+  const refusedJournal = path.join(profile,'fabric/model-routing-refused.jsonl');
+  const backups = [safetyJournal, refusedJournal].map(file => ({file,text:fs.existsSync(file)?fs.readFileSync(file,'utf8'):''}));
+  const prefix = JSON.stringify({type:'committed',receiptId:'full-fixture',at:1,padding:''});
+  const full = prefix.slice(0,-2)+'x'.repeat(8192-Buffer.byteLength(prefix)-1)+'"}\n';
+  assert.equal(Buffer.byteLength(full),8192);
+  for (const {file} of backups) {
+    fs.writeFileSync(file,full,{mode:0o600});
+    const fd=fs.openSync(file,'a'); assert.equal(fs.fstatSync(fd).size,8192); fs.fsyncSync(fd); fs.closeSync(fd);
+    fs.copyFileSync(file,path.join(out,'f1-full-'+path.basename(file)));
+  }
+  fs.writeFileSync(fullJournals,'Inject only journal append EFBIG; open/fstat/fsync and the decision ledger stay writable');
+  const fullReport = await guest(`try { await agents.routeOutcome({id:'${fullFirst.runId}',routeQuality:'fail'}); return {acknowledged:true}; } catch(error) {return {acknowledged:false,error:String(error)};}`,true);
+  assert.equal(fullReport.acknowledged,false); assert.match(fullReport.error,/EFBIG/);
+  for (const {file} of backups) assert.equal(fs.readFileSync(file,'utf8'),full);
+  // A new, shorter decision ledger must not bypass the two full journals.
+  const ledgerBackup = fs.readFileSync(ledgerPath,'utf8'); fs.writeFileSync(ledgerPath,'');
+  await restartMain();
+  const fullMain = await mainRun('PROOF_F1_FULL_FRESH_MAIN_PIN'), fullResident = await ask(fullActor.id,'PROOF_F1_FULL_RESIDENT_PIN');
+  checkPin(fullMain); checkPin(fullResident);
+  assert.equal(fullMain.handle.routeDecision.mode,'shadow');
+  assert.equal(fullMain.handle.routeDecision.reasonCode,'record-failed');
+  const shortLedgerBytes = fs.statSync(ledgerPath).size; assert.ok(shortLedgerBytes < 8192);
+  fs.copyFileSync(ledgerPath,path.join(out,'f1-short-decision-ledger.jsonl'));
+  for (const {file} of backups) assert.equal(fs.readFileSync(file,'utf8'),full);
+  const appendFaults = fs.readFileSync(transcript,'utf8').trim().split('\n').map(line=>JSON.parse(line)).filter(row=>row.type==='injected_journal_append_efbig');
+  assert.ok(appendFaults.some(row=>row.record.type==='pending'));
+  assert.ok(appendFaults.some(row=>row.record.type==='refused'));
+  assert.ok(appendFaults.some(row=>row.pid===child.pid && row.record.type==='admission'),'Fresh Main bypassed shared admission append');
+  safetyScenarios.push({finding:'F1-residual',passed:true,journalBytes:8192,report:fullReport,freshMain:true,
+    mainPid:child.pid,mainRunId:fullMain.handle.id,residentRunId:fullResident.runId,shortLedgerBytes,appendFaults});
+  fs.writeFileSync(ledgerPath,ledgerBackup+fs.readFileSync(ledgerPath,'utf8'));
+  fs.rmSync(fullJournals);
+  for (const {file,text} of backups) fs.writeFileSync(file,text);
+
   // F2: native model completion races no mocks. A filesystem denial prevents
   // archival, B completes, and A's sole source receipt must still be usable.
   await restartMain('astra-r3-F2');
@@ -264,11 +323,13 @@ try {
     const selected = decision.mode === 'live' ? decision : decision.pin;
     assert.equal(outcome.admittedModel, selected.model); assert.equal(outcome.admittedEffort, selected.effort);
     assert.equal(http.routeHeader, `${decision.routeClass}/${encodeURIComponent(selected.model)}-${selected.effort}/${decision.reasonCode}:${decision.decisionId}`);
+    const admission = safetyRows().find(row => row.type === 'admission' && row.decisionId === decision.decisionId && row.runId === decision.runId);
+    if (decision.mode === 'live') assert.ok(admission, 'LIVE dispatch bypassed the shared durable admission journal');
     const nativeRun = fs.readFileSync(transcript, 'utf8').trim().split('\n').map(line => JSON.parse(line)).find(row => row.type === 'native_activation' && row.runId === decision.runId);
     assert.ok(nativeRun, 'Missing native Pi worker activation'); assert.equal(nativeRun.mode, 'rpc');
     assert.equal(nativeRun.model, outcome.admittedModel); assert.equal(nativeRun.thinking, outcome.admittedEffort);
     return { runId: decision.runId, decisionId: decision.decisionId, actorId: decision.actorId ?? null, routeClass: decision.routeClass,
-      mode: decision.mode, reason: decision.reasonCode, model: outcome.admittedModel, effort: outcome.admittedEffort, actualHttpHeader: http.routeHeader, status: outcome.status };
+      mode: decision.mode, reason: decision.reasonCode, model: outcome.admittedModel, effort: outcome.admittedEffort, actualHttpHeader: http.routeHeader, status: outcome.status, safetyAdmission: admission ?? null };
   });
   assert.equal(evidence[0].reason, 'live-choice'); assert.equal(evidence[1].reason, 'live-choice');
   assert.equal(evidence[2].reason, 'class-reverted'); assert.equal(evidence[3].reason, 'live-choice'); assert.equal(evidence[4].reason, 'jev-error');
@@ -277,7 +338,7 @@ try {
     cleanedResidentActivation: nativeFirst, realResidentOwner: beforeQuality, durableQualityFence: qualityRows, safetyScenarios,
     candidateSha256: createHash('sha256').update(fs.readFileSync(candidate)).digest('hex'),
     mocks: ['Jev fetch boundary', 'loopback OpenAI model/provider HTTP boundary'],
-    faultInjection: ['0400 quality journal', '0500 actor A archive directory', '0400 terminal state journal'] };
+    faultInjection: ['0400 quality journal', 'EFBIG append on two valid 8192-byte safety journals', '0500 actor A archive directory', '0400 terminal state journal'] };
   fs.writeFileSync(path.join(out, 'evidence.json'), JSON.stringify(proof, null, 2));
   console.log('PASS: installed Pi RPC + built Fabric; public live task/actor, durable quality demotion/pin, class isolation, Jev error fallback, actual HTTP X-Smarty-Route joins.');
 } catch (error) { failure = error; record({ type: 'proof_failure', error: String(error), stack: error.stack }); console.error(error); }

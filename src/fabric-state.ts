@@ -442,7 +442,7 @@ export class FabricState {
     if (this.#shutDown) throw new Error("Pi Fabric is shut down for this session (reload or session replacement); retry in the new session");
   }
 
-  async shutdown(reason?: string): Promise<void> {
+  async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     this.#shutDown = true;
     this.#deactivationHook?.();
     const generation = ++this.#generation;
@@ -453,7 +453,9 @@ export class FabricState {
     const runtime = this.#runtime;
     this.#runtime = undefined;
     try {
-      await runtime?.shutdown(reason);
+      // Preserve the existing one-argument shutdown contract unless a native rotation supplies a target.
+      if (targetSessionFile === undefined) await runtime?.shutdown(reason);
+      else await runtime?.shutdown(reason, targetSessionFile);
       await this.#managedHost?.close();
     } finally {
       if (generation === this.#generation) {

@@ -306,6 +306,12 @@ export interface FabricMeshConfig {
   followUpFlushMs: number;
   /** A Main idle with a held followUp this old tells its senders the queue is stalled; 0 disables. */
   followUpStallSeconds: number;
+  /** Owning-host root absence alarm, independent of actor status (default 15 min). */
+  rootPresenceAlarmMs: number;
+  /** Undelivered Main message alarm to sender and target owner (default 30 min). */
+  undeliveredAlarmMs: number;
+  /** Explicit undeliverable receipt after root absence without a successor (default 2 h). */
+  rootGoneTtlMs: number;
 }
 
 interface FabricRepairsConfig {
@@ -557,6 +563,9 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     actorContextEntries: 14,
     followUpFlushMs: 120_000,
     followUpStallSeconds: 600,
+    rootPresenceAlarmMs: 15 * 60_000,
+    undeliveredAlarmMs: 30 * 60_000,
+    rootGoneTtlMs: 2 * 60 * 60_000,
   },
   models: {
     aliases: {},
@@ -1344,6 +1353,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         0,
         7 * 24 * 60 * 60,
       ),
+      rootPresenceAlarmMs: boundedInteger(mesh.rootPresenceAlarmMs, DEFAULT_FABRIC_CONFIG.mesh.rootPresenceAlarmMs, 1, 7 * 24 * 60 * 60_000),
+      undeliveredAlarmMs: boundedInteger(mesh.undeliveredAlarmMs, DEFAULT_FABRIC_CONFIG.mesh.undeliveredAlarmMs, 1, 7 * 24 * 60 * 60_000),
+      rootGoneTtlMs: boundedInteger(mesh.rootGoneTtlMs, DEFAULT_FABRIC_CONFIG.mesh.rootGoneTtlMs, 1, 7 * 24 * 60 * 60_000),
     },
     models: {
       aliases: normalizeModelAliases(modelsSection.aliases),

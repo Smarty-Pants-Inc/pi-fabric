@@ -370,6 +370,19 @@ describe("FabricState lazy bootstrap", () => {
     } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
   });
 
+  it.each(["new", "resume"])("forwards the %s rotation target to the activated runtime", async (reason) => {
+    const cwd = project({ mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    const targetSessionFile = path.join(cwd, "successor.jsonl");
+    try {
+      await state.bootstrap(contextAt(cwd));
+      await state.ensure(contextAt(cwd));
+      await state.shutdown(reason, targetSessionFile);
+      expect(harness.instances[0]?.shutdown).toHaveBeenCalledExactlyOnceWith(reason, targetSessionFile);
+    } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
   it("cleans failed activation and retries with a fresh runtime", async () => {
     const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
     const harness = runtimeHarness();

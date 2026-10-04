@@ -43,6 +43,7 @@ import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
+import { rootPresenceAlarms } from "../topology/stall-alarms.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
   RESIDENT_HOST_FORMAT,
@@ -284,6 +285,8 @@ export class ResidentHost {
       rootId: config.rootId,
       identity: this.identity,
       reapDeadHosts: false,                                    // its session's runtime sweeps
+      presencePass: () => rootPresenceAlarms(this.mesh, this.identity, this.hostId,
+        this.participants.list({ scope: "project", includeStale: true, fresh: true }), config.mesh.rootPresenceAlarmMs),
     });
     this.control = new FabricControlPlane(this.mesh, this.identity, {
       enabled: true,

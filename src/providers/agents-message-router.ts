@@ -302,7 +302,12 @@ export class AgentMessageRouter {
     context?.signal?.throwIfAborted();
     const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
     // In a task child, main is the immutable immediate return address, not a role lookup.
-    if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
+    // An actor turn has the same local return contract: its inherited lineage Main
+    // must not receive a nested slice addressed to `main`.
+    if (id.trim() === "main") {
+      if (this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
+      else if (this.actorManager.identity.kind === "actor") id = this.actorManager.identity.id;
+    }
     id = this.#messageTarget(id);
     if (options.deadlineMs !== undefined) {
       // Do not silently lose the requested guarantee on a Main/actor/remote route.

@@ -155,6 +155,14 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 
+  it("resolves agents.main to the live actor during an actor turn, not the lineage root", async () => {
+    const h = await setup(residency);
+    const main = await h.runtime.registry.invoke("agents.main", {}, h.invocation) as { id: string; kind: string };
+    expect(main).toMatchObject({ id: h.actor.id, kind: "actor" });
+    expect(main.id).not.toBe("session:root-main");
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
   it("retains a failed child archive through ancestor cleanup and recovers it after both custodians close", async () => {
     const h = await setup(residency);
     const enqueue = ActorChildCompletionStore.prototype.enqueue;

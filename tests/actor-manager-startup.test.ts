@@ -168,6 +168,31 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     } finally { release(); await vi.advanceTimersByTimeAsync(10); vi.useRealTimers(); }
   });
 
+  it.each(["resumeQueued", "resumeAfterRelease", "poll"] as const)("retries deferred startup retention after publication through %s", async boundary => {
+    const f = fixture(1); let published = false;
+    const manager = f.make({ canConsumeMesh: () => published });
+    await turn(); await turn();
+    expect(fs.existsSync(f.runDir(0, 0))).toBe(true);
+    published = true;
+    if (boundary !== "poll") manager[boundary]();
+    // The publication boundary itself must remain archive-I/O free.
+    expect(fs.existsSync(f.runDir(0, 0))).toBe(true);
+    await eventually(() => !fs.existsSync(f.runDir(0, 8)));
+  });
+
+  it("rechecks publication between maintenance slices and retries an interrupted startup sweep", async () => {
+    const f = fixture(17); let published = true;
+    const manager = f.make({ canConsumeMesh: () => published });
+    // A callback queued behind the first maintenance slice withdraws publication
+    // before the second slice, like quiesce/reload while slow filesystem work yields.
+    await turn(); published = false;
+    await turn(); await turn();
+    expect(fs.existsSync(f.runDir(0, 8))).toBe(false);
+    expect(fs.existsSync(f.runDir(16, 8))).toBe(true);
+    published = true; manager.resumeQueued();
+    await eventually(() => !fs.existsSync(f.runDir(16, 8)));
+  });
+
   it("does not consume archives when the resident lease is lost before the deferred sweep", async () => {
     const f = fixture(1); let lease = true;
     f.make({ canConsumeMesh: () => lease });

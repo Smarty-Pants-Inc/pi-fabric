@@ -422,6 +422,7 @@ export class ActorManager {
   readonly #listeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
   #retentionSweep: Promise<void> | undefined;
+  #initialRetentionPending = true;
   readonly #pendingPresence = new Set<string>();
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
@@ -490,7 +491,7 @@ export class ActorManager {
       project?: string | undefined;
       role?: string | undefined;
       meshCursorPath?: string;
-      /** Resident lease fence, also defers archive retention until initial publication. */
+      /** Host publication/lease fence, also defers archive retention until initial publication. */
       canConsumeMesh?: () => boolean;
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
@@ -567,6 +568,9 @@ export class ActorManager {
       maxReplayAgeMs: options.meshReplayAgeMs,
       beforePoll: () => {
         if (this.#releasePaused || options.canConsumeMesh?.() === false) return false;
+        // Initial publication may have outlived the first deferred slice (or
+        // failed and later recovered). Retry once ready, never on the constructor.
+        if (this.#initialRetentionPending) this.#startRetentionSweep();
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();
         // Preserve deferred events while halted; fencing remains manager-owned.
@@ -608,6 +612,7 @@ export class ActorManager {
     if (this.#closing || this.#halted) return;
     this.#syncActorsFromRegistry();
     this.#refreshOwnership();
+    if (this.#initialRetentionPending) this.#startRetentionSweep();
     this.#scheduleRestoreParked();
     for (const actor of this.#actors.values()) {
       if (actor.queue.length > 0 || this.#inFlight.has(actor.id)) this.#requestDrain(actor);
@@ -2127,6 +2132,7 @@ export class ActorManager {
   pauseForRelease(): void { this.#releasePaused = true; }
   resumeAfterRelease(): void {
     this.#releasePaused = false;
+    if (this.#initialRetentionPending) this.#startRetentionSweep();
     for (const actor of this.#actors.values()) if (actor.queue.length) this.#ensureDrain(actor);
     this.#meshMonitor.schedule();
   }
@@ -3358,6 +3364,7 @@ export class ActorManager {
         ...(typeof this.#deadSessionReap === "object" ? { deadAfterMs: this.#deadSessionReap.deadAfterMs } : {}),
       }));
     }
+    this.#initialRetentionPending = false;
   }
 
   #recordMessage(actor: ManagedActor, message: FabricActorMessage): void {

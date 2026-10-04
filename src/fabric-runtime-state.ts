@@ -848,6 +848,10 @@ export class FabricRuntimeState {
       (this.#participants?.list({ scope: "project", fresh: true }) ?? [])
         .map((participant) => [participant.id, participant.ownerHostId === hostId]),
     );
+    // Capture this generation's directory: replacement/quiesce must veto old
+    // deferred slices, and new actors cannot maintain archives before publication.
+    const actorParticipants = this.#participants;
+    const canConsumeActorMesh = () => actorParticipants.canConsumeMesh();
     const lineageAlive = (rootId: string): boolean =>
       this.#participants?.lineageAlive(rootId) ?? true;
     const actorRoots = {
@@ -890,6 +894,7 @@ export class FabricRuntimeState {
             mainAgent,
             canManageActor,
             snapshotActorOwnership,
+            canConsumeMesh: canConsumeActorMesh,
             isOwnResidentActor: (id) => isOwnResidentActor(this.#participants!, id, mainAgentId),
             lineageAlive,
             claimResidency: "session",
@@ -912,6 +917,7 @@ export class FabricRuntimeState {
             mainAgent,
             canManageActor,
             snapshotActorOwnership,
+            canConsumeMesh: canConsumeActorMesh,
             lineageAlive,
             claimResidency: "session",
             rootId: mainAgentId,

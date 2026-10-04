@@ -1,3 +1,4 @@
+import { retryDelayMs } from "./retry-backoff.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -571,11 +572,14 @@ export class MeshBackgroundRetry {
       return false;
     }
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
-    this.#retryAt = Date.now() + this.#delay;
+    // Keep the exponential ceiling separate from the randomized draw. Timers
+    // have a 1ms scheduling floor so a zero draw cannot form a microtask spin.
+    const delayMs = Math.max(1, retryDelayMs(0, this.#delay, this.maxMs));
+    this.#retryAt = Date.now() + delayMs;
     if (!this.#reported) {
       // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
       // not once per poll, which would flood a throttled host's stderr.
-      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${this.#delay} ms: ${error instanceof Error ? error.message : String(error)}`);
+      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
       this.#reported = true;
     }
     return transient;

@@ -2,13 +2,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { ACTOR_FAILURE_NOTICE_AFTER } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MainAgentController } from "../src/main-agent.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, type ResidentHostConfig } from "../src/residency/protocol.js";
+
+// Only isolated same-process fixtures use this adapter on unsupported platforms.
+// Linux continues to exercise the real kernel fence.
+beforeEach(() => installInProcessResidentFence());
 
 const waitFor = async (predicate: () => boolean): Promise<void> => {
   const deadline = Date.now() + 5_000;

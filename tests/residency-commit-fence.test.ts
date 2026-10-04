@@ -1613,11 +1613,15 @@ describe("invocation-local spawn receipts (#2947)", { timeout: 25_000 }, () => {
 });
 
 describe("round 2 public execution receipt contract", { timeout: 25_000 }, () => {
-  for (const engine of engines) {
-    it(`${engine} public Main ceiling retains committed resident receipts through normalized provider signals`, async () => {
+  for (const engine of engines) for (const startupDelayMs of engine === "cpython" ? [0, 1_700] : [0]) {
+    it(`${engine} public Main ceiling retains committed resident receipts through normalized provider signals${startupDelayMs ? " with slow startup" : ""}`, async () => {
       const state = await harness(false, undefined, 10_000);
       const main = mainProvider(state);
       const controller = new AbortController();
+      const execute = CPythonRuntime.prototype.execute;
+      const startup = startupDelayMs ? vi.spyOn(CPythonRuntime.prototype, "execute").mockImplementationOnce(async function (this: CPythonRuntime, ...args) {
+        await delay(startupDelayMs); return execute.apply(this, args);
+      }) : undefined;
       const original = ActorDirectory.prototype.create;
       vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
         const actor = await original.apply(this, args);
@@ -1625,9 +1629,16 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
       });
       try {
         const run = publicExecution(state, main, engine, 1_500, true);
-        const outcome = run(`return ${publicCall(engine, "create", requestArgs(state, "create"))}`, controller.signal);
-        await state.entered.promise;
-        const result = await outcome;
+        let admitted = false;
+        void state.entered.promise.then(() => { admitted = true; });
+        // Receipt conservation starts after commitment, not during Python startup
+        // or the PR's additional durable request/registry barriers on Windows.
+        // Preserve the 1500 ms Main ceiling and bound/observe pre-admission exits
+        // instead of waiting forever when execution settles before create runs.
+        const result = await executeAfterAdmission(
+          signal => run(`return ${publicCall(engine, "create", requestArgs(state, "create"))}`, AbortSignal.any([controller.signal, signal])),
+          () => admitted,
+        );
         expect(result.success).toBe(false);
         expect(result.trace.outcome).toBe("timed_out");
         expect(result.error).toContain("MainExecutionCeilingError");
@@ -1640,7 +1651,7 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
         state.release.resolve();
         await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
         expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
-      } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
+      } finally { startup?.mockRestore(); controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
     });
   }
   for (const engine of engines) for (const operation of ["spawn", "create"] as const) {

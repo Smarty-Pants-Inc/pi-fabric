@@ -303,7 +303,10 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     await h.runtime.shutdown();
     h.endActivation();
     await vi.waitFor(() => expect(h.owner.status(h.actor.id).status).toBe("idle"));
-    expect(store.received(child.id)).toBe(true);
+    // Idle publishes the activation's end; the independent owner poll then
+    // reconciles its native receipts. Durable registry I/O can expose the gap.
+    // Observe that receipt before asserting conservation, not an incidental tick.
+    await vi.waitFor(() => expect(store.received(child.id)).toBe(true));
     expect(store.pending()).toEqual([]);
     expect(h.owner.messages(h.actor.id).filter((m) => m.id === child.id)).toEqual([]);
   });

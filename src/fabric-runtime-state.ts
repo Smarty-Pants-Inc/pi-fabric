@@ -79,7 +79,7 @@ import {
 import { RuntimeStateSpeculation } from "./runtime-state-speculation.js";
 import { schemaRefAllowedInEnforce } from "./schema/policy.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
-import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "./mesh/store.js";
+import { MeshStore, type MeshIdentity } from "./mesh/store.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "./core/atomic-write.js";
 import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
@@ -594,7 +594,12 @@ export class FabricRuntimeState {
       meshRoot,
       this.#config.mesh.maxEventBytes,
       this.#config.mesh.maxReadEvents,
-      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: this.#config.mesh.lockProtocol },
+      {
+        readCacheMs: this.#config.mesh.idleReadCoalesceMs,
+        readActive: () => !context.isIdle() || context.hasPendingMessages() ||
+          (this.#agents?.runningCount() ?? 0) > 0 || (this.#actors?.inFlightCount() ?? 0) > 0,
+        lockProtocol: this.#config.mesh.lockProtocol,
+      },
     );
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
@@ -840,12 +845,12 @@ export class FabricRuntimeState {
       enqueue: (run, delivered) => completionInbox.enqueue(run, delivered),
       appendEntry: (data) => this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, data),
     });
-    const canManageActor = (actorId: string): boolean | undefined => {
-      const participant = this.#participants?.get(actorId);
+    const canManageActor = (actorId: string, fresh = true): boolean | undefined => {
+      const participant = this.#participants?.get(actorId, undefined, { fresh });
       return participant ? participant.ownerHostId === hostId : undefined;
     };
-    const snapshotActorOwnership = (): ReadonlyMap<string, boolean> => new Map(
-      (this.#participants?.list({ scope: "project", fresh: true }) ?? [])
+    const snapshotActorOwnership = (fresh = true): ReadonlyMap<string, boolean> => new Map(
+      (this.#participants?.list({ scope: "project", fresh }) ?? [])
         .map((participant) => [participant.id, participant.ownerHostId === hostId]),
     );
     // Capture this generation's directory: replacement/quiesce must veto old

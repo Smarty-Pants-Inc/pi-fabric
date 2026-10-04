@@ -80,6 +80,23 @@ describe("host-only actor instruction root (#3819)", () => {
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBeUndefined();
   });
 });
+describe("host-only processSlice (#4383)", () => {
+  it("defaults off and only accepts a slice unit name", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.processSlice).toBeUndefined();
+    expect(normalizeFabricConfig({ agents: { processSlice: "batch.slice" } }).agents.processSlice).toBe("batch.slice");
+    for (const processSlice of ["", "../bad.slice", "bad.service", 12]) {
+      expect(normalizeFabricConfig({ agents: { processSlice } }).agents.processSlice).toBeUndefined();
+    }
+  });
+  it.each([true, false])("ignores even trusted project overrides (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { processSlice: "workspace.slice" } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processSlice: "batch.slice" } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBe("batch.slice");
+  });
+});
+
 describe("Fabric configuration", () => {
   it("defaults automatic per-host reload concurrency to six and preserves explicit unlimited mode", () => {
     expect(DEFAULT_FABRIC_CONFIG.selfReloadConcurrency).toBe(6);

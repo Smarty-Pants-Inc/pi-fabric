@@ -605,10 +605,14 @@ describe("FabricControlPlane", () => {
         const outcome = settle(f.sender.request("host:owner", "agent:target", operation, {}, "identity:owner"));
         // Messages retain their existing single notRun retry; stop never retries.
         const attempts = operation === "stop" ? 1 : 2;
+        vi.spyOn(Math, "random").mockReturnValue(0.5);
         for (let attempt = 0; attempt < attempts; attempt++) {
-          await vi.advanceTimersByTimeAsync(0);
+          // The sole proven-notRun resend draws 50ms, not an immediate lockstep retry.
+          await vi.advanceTimersByTimeAsync(attempt === 0 ? 0 : 50);
           const command = f.commands().filter((event) => event.kind !== "cancel")[attempt]!.data as FabricControlCommand;
-          expect(command.deadlineAt).toBe(command.requestedAt + 30_000);
+          // The retry draw is charged after the bridge floor, so jitter never
+          // adds time to the original second-attempt admission/ACK budget.
+          expect(command.deadlineAt).toBe(command.requestedAt + 30_000 - (attempt === 0 ? 0 : 50));
           await vi.advanceTimersByTimeAsync(30_001);
           await f.sender.mesh.publish({
             topic: "fabric.control.ack", kind: "rejected", from: identity("identity:owner"), to: "host:sender",

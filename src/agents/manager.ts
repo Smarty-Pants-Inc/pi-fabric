@@ -799,7 +799,7 @@ export class AgentManager {
     this.#budgetOwned =
       !inheritedBudget && this.#currentDepth === 0 && config.budgetUsd > 0;
     const adapters: AgentTransportAdapter[] = [
-      new ProcessTransport(),
+      new ProcessTransport(config.processSlice),
       new TmuxTransport(),
       new ScreenTransport(),
       new LocaltermTransport(),

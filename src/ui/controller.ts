@@ -658,7 +658,7 @@ export class FabricUiController {
       clearTimeout(this.#timer);
       this.#timer = undefined;
     }
-    if (this.#timer || !this.#context) return;
+    if (this.#timer || !this.#context || !this.state.initialized) return;
     const expiryDelay = this.#widgetRetention.nextExpiryDelay(this.#snapshot, Date.now());
     const localActive =
       expiryDelay !== undefined ||
@@ -684,27 +684,49 @@ export class FabricUiController {
     // 5 s UI poll window after the store's 5 s reuse window (smarty-dev#4383).
     const remaining = this.state.config.mesh.enabled ? this.state.mesh.readCacheRemainingMs : 0;
     const delay = remaining > 0 ? Math.min(pollDelay, remaining) : pollDelay;
-    this.#timer = setTimeout(() => {
+    const epoch = this.#epoch;
+    this.#timer = setTimeout(() => this.#runBackground(epoch, () => {
       this.#timer = undefined;
       this.#refresh(false);
       this.#schedulePoll();
-    }, Math.min(delay, expiryDelay ?? Infinity));
+    }), Math.min(delay, expiryDelay ?? Infinity));
     this.#timer.unref();
   }
 
   #scheduleRefresh(): void {
-    if (this.#scheduledRefresh || !this.#context) return;
+    if (this.#scheduledRefresh || !this.#context || !this.state.initialized) return;
     const elapsed = performance.now() - this.#lastRefreshAt;
     const delay = Math.max(
       0,
       Math.min(ACTIVITY_REFRESH_MS, this.state.config.ui.refreshMs) - elapsed,
     );
-    this.#scheduledRefresh = setTimeout(() => {
+    const epoch = this.#epoch;
+    this.#scheduledRefresh = setTimeout(() => this.#runBackground(epoch, () => {
       this.#scheduledRefresh = undefined;
       this.#refresh();
       this.#schedulePoll(true);
-    }, delay);
+    }), delay);
     this.#scheduledRefresh.unref();
+  }
+
+  /** Both poll and coalesced refresh own their faults; a queued old tick cannot rearm. */
+  #runBackground(epoch: number, callback: () => void): void {
+    if (epoch !== this.#epoch || !this.#context || !this.state.initialized) return;
+    try {
+      callback();
+    } catch (error) {
+      this.#reportRefreshError(error);
+    }
+  }
+
+  #reportRefreshError(error: unknown): void {
+    const now = Date.now();
+    if (this.#lastRefreshErrorAt && now - this.#lastRefreshErrorAt < 10_000) return;
+    this.#lastRefreshErrorAt = now;
+    const message = error instanceof Error ? error.message : String(error);
+    // A host UI can already be disposed. Error reporting must not escape a timer either.
+    try { this.#context?.ui.notify(`Fabric dashboard refresh failed: ${message}`, "warning"); }
+    catch { /* stale UI; the lifecycle cleanup owns it */ }
   }
 
   #agentTranscriptSource(agent: FabricUiAgent): FabricTranscriptSource {
@@ -843,12 +865,7 @@ export class FabricUiController {
       if (this.#dashboardTui) this.#dashboardTui.requestRender();
       else if (this.#widgetTui && this.#widget?.hasChanged()) this.#widgetTui.requestRender();
     } catch (error) {
-      const now = Date.now();
-      if (now - this.#lastRefreshErrorAt >= 10_000) {
-        this.#lastRefreshErrorAt = now;
-        const message = error instanceof Error ? error.message : String(error);
-        context.ui.notify(`Fabric dashboard refresh failed: ${message}`, "warning");
-      }
+      this.#reportRefreshError(error);
     }
   }
 

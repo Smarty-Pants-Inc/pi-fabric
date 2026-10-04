@@ -264,7 +264,7 @@ export interface AgentRunRecord {
   /** Set while a routed child dialog waits for an answer (status detail waiting_for_answer). */
   blockedOn?: { decisionId?: string; since: number };
   compaction?: AgentCompactionStatus;
-  /** Unconsumed outcome, including recovery from a dead Main to its exact lane successor. */
+  /** Unconsumed outcome retained for its exact bound Main root/session. */
   completionDelivery?: { status: "undelivered"; addressedTo: string; redeliveredFrom?: string };
   /** Terminal event-log optimization was skipped; the full original log remains. */
   compactionSkipped?: string;

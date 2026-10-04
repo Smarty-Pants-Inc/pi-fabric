@@ -85,6 +85,8 @@ export class FabricState {
   #shutDown = false;
   #activationHook: ActivationHook | undefined;
   #activationFailureHook: ActivationFailureHook | undefined;
+  // Synchronous: presentation timers must stop before the runtime becomes unavailable.
+  #deactivationHook: (() => void) | undefined;
   readonly #externalProviders = new Map<string, FabricProvider>();
   readonly #externalComponents = new Map<string, FabricComponentDefinition>();
   readonly #options: FabricStateOptions;
@@ -203,9 +205,10 @@ export class FabricState {
   get repairs(): FabricRuntimeState["repairs"] { return this.#required().repairs; }
   get components(): FabricRuntimeState["components"] { return this.#required().components; }
 
-  setActivationHook(hook: ActivationHook, onFailure?: ActivationFailureHook): void {
+  setActivationHook(hook: ActivationHook, onFailure?: ActivationFailureHook, onDeactivate?: () => void): void {
     this.#activationHook = hook;
     this.#activationFailureHook = onFailure;
+    this.#deactivationHook = onDeactivate;
   }
 
   async bootstrap(context: ExtensionContext): Promise<void> {
@@ -482,6 +485,7 @@ export class FabricState {
 
   async shutdown(reason?: string): Promise<void> {
     this.#shutDown = true;
+    this.#deactivationHook?.();
     const generation = ++this.#generation;
     const activation = this.#activation;
     if (activation) await activation.catch(() => undefined);
@@ -520,6 +524,9 @@ export class FabricState {
     const existing = this.#runtime;
     const reusable = existing?.initialized ? existing : undefined;
     const orphan = existing && !existing.initialized ? existing : undefined;
+    // Reinitialization/session switches reuse this facade. Stop the old UI before
+    // initialize() awaits teardown and state getters start rejecting (smarty-dev#4383).
+    if (existing) this.#deactivationHook?.();
     this.#runtime = undefined;
     let candidate: FabricRuntimeState | undefined;
     const assertCurrent = (): void => {

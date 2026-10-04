@@ -194,6 +194,13 @@ describe("resident terminal event retention", () => {
     const collector = new ResidentRequestRetention(dir, [actorRoot]);
     try {
       for (let slice = 0; slice < 100 && collector.due(now); slice++) collector.sweep(now, new Set(["live"]), 5);
+      if (slow === "slow safety walk") {
+        // An interrupted proof is not collection authority. Keep the original
+        // bytes, then retry when the full proof fits a later slice.
+        expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
+        vi.mocked(fs.readFileSync).mockRestore();
+        for (let slice = 0; slice < 100 && collector.due(now + 60001); slice++) collector.sweep(now + 60001, new Set(["live"]), 5);
+      }
       expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
       for (const run of [latest, live, worker]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
       expect(registryReads).toBeGreaterThan(0);

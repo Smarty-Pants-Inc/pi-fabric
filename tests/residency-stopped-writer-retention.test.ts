@@ -315,7 +315,9 @@ it.skipIf(process.platform === "win32").each([
     expect(await settlement).toMatchObject({ status: "failed" });
     expect((restart ? host.actors.status(actor.id) : await client.actorStatus(actor.id)).inFlightRun).toBeUndefined();
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ status: "completed", turns: 5 });
-    expect(host.agents.retentionReferences().has(actor.id)).toBe(false);
+    // Explicitly finish a fresh offline proof; idle snapshots may conservatively
+    // retain an exited descendant until the next 60-second refresh.
+    expect(host.agents.retentionReferences({ refresh: true, budgetMs: 5 }).has(actor.id)).toBe(false);
     const before = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);
@@ -451,7 +453,7 @@ it("retention ownership uses checked orphan exit evidence, not terminal status, 
     expect(refs.has("live")).toBe(true);
     expect(refs.has("live_actor")).toBe(true); // A terminal file never overrides a live PID.
     record("live", "live_actor", "2147483647");
-    expect(manager.retentionReferences().has("live_actor")).toBe(false);
+    expect(manager.retentionReferences({ refresh: true }).has("live_actor")).toBe(false);
     const unresolved = record("unresolved", "unresolved_actor", "2147483647");
     markUnresolvedWorker(unresolved, "worker exit unconfirmed");
     const nested = path.join(record("parent", "parent_actor", "2147483647"), "nested", "child");
@@ -468,7 +470,7 @@ it("retention ownership uses checked orphan exit evidence, not terminal status, 
     expect(manager.retentionReferences().has("*")).toBe(true);
     fs.rmSync(path.join(runs, "unknown"), { recursive: true });
     clock.mockReturnValueOnce(0).mockReturnValue(10);
-    expect(manager.retentionReferences().has("*")).toBe(true);
+    expect(manager.retentionReferences({ refresh: true }).has("*")).toBe(true);
   } finally {
     clock.mockRestore();
     await manager.close();

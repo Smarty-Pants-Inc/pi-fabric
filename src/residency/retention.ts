@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
+import { boundedRunTree } from "../storage/reference-scan.js";
 import { canRemoveTerminalRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
@@ -57,6 +58,8 @@ const validResponse = (value: ResidentCommandResponse | undefined, id: string): 
 export class ResidentRequestRetention {
   #directory: fs.Dir | undefined;
   #index = 0;
+  #pendingRun: { entry: fs.Dirent; attempts: number } | undefined;
+  #resample = false;
   #nextSample = 0;
   #scanning = false;
   #expiredBefore = 0;
@@ -67,13 +70,17 @@ export class ResidentRequestRetention {
     readonly root: string,
     readonly actorRoots: readonly string[] = [],
     readonly retention: TerminalRunEventsRetention & { retainRuns?: boolean } = {},
-    readonly recoverRunArchives?: (directory: string) => void,
+    readonly recoverRunArchives?: (directory: string, expired: () => boolean) => void,
+    readonly custody?: { run: (id: string) => boolean; reference: (id: string) => boolean },
   ) {}
+
+  resample(): void { this.#resample = true; this.#nextSample = 0; }
 
   due(now = Date.now()): boolean { return this.#scanning || now >= this.#nextSample; }
 
   close(): void {
     this.#runReferences = undefined;
+    this.#pendingRun = undefined;
     const directory = this.#directory; this.#directory = undefined;
     try { directory?.closeSync(); } catch { this.#health.unknown++; }
   }
@@ -88,10 +95,12 @@ export class ResidentRequestRetention {
     }
     const started = performance.now();
     const expired = () => performance.now() - started >= budgetMs;
-    while (!expired()) {
+    let entries = 0;
+    while (!expired() && entries++ < 64) {
       const kind = directories[this.#index];
       if (kind === undefined) {
-        this.#scanning = false; this.#nextSample = now + SAMPLE_INTERVAL_MS;
+        this.#scanning = false; this.#nextSample = this.#resample ? now : now + SAMPLE_INTERVAL_MS;
+        this.#resample = false;
         try { writeJsonAtomic(path.join(this.root, "request-retention.json"), this.#health); } catch { /* next sample retries */ }
         return;
       }
@@ -113,40 +122,56 @@ export class ResidentRequestRetention {
           if (expired()) return;
         }
       }
+      const pending = kind === "runs" ? this.#pendingRun : undefined;
+      this.#pendingRun = undefined;
       let entry: fs.Dirent | null;
-      try { entry = this.#directory.readSync(); }
+      try { entry = pending?.entry ?? this.#directory.readSync(); }
       catch { this.#health.unknown++; this.close(); this.#index++; continue; }
       if (!entry) { this.close(); this.#index++; continue; }
       const file = path.join(directory, entry.name);
       if (kind === "runs") {
         // The request-proof wildcard is not an exit receipt for any particular run.
         const retainedRuns = this.#runReferences!.ids;
+        // Incomplete reference preparation is a veto, never authority to walk
+        // or discharge unknown custody. Legacy archival has its own full proof.
+        const defer = () => {
+          // Retry a unit that started after reference/recovery consumed its
+          // budget, but never let a permanently oversized tree starve later IDs.
+          if ((pending?.attempts ?? 0) < 2) this.#pendingRun = { entry: entry!, attempts: (pending?.attempts ?? 0) + 1 };
+        };
+        if (entry.isDirectory()) this.recoverRunArchives?.(file, expired);
+        if (expired()) { defer(); return; }
+        // Wildcards never authorize request expiry, but run collection has
+        // independent fresh native exit/tree proof and O(1) manager custody.
+        if (this.custody?.run(entry.name)) continue;
         // Replay one untracked run (and its nested sources) under the host fence,
         // before any compaction/deletion. Never walk the archive during startup
         // or discharge the custody of a live manager's in-memory settlement.
-        if (entry.isDirectory() && !liveIds.has(entry.name)) this.recoverRunArchives?.(file);
+        // The targeted manager callback above independently checks handle custody.
         if (entry.isDirectory() && !liveIds.has(entry.name) &&
             !retainedRuns.has("*") && !retainedRuns.has(entry.name)) {
           // One complete safety-check + atomic replacement is the progress unit.
           // The poll's budget is soft at this boundary, like a synchronous file
           // read: stop BETWEEN runs, not midway through every retry of a large
           // tree. Never cache worker-exit proofs or skip either fresh safety walk.
+          if (!boundedRunTree(file, expired)) { if (expired()) { defer(); return; } continue; }
           const fingerprint = this.#runReferences!.fingerprint;
           // Same exit/result fences as the former startup sweep, now streaming
           // after the lease is up. A terminal marker alone is never exit evidence.
           const stat = ownedStat(file);
           if (this.retention.retainRuns === false && stat && now - stat.mtimeMs > 24 * 60 * 60 * 1_000 &&
-              !runTreeExitVeto(file, 0, undefined, true) && canRemoveTerminalRun(file) &&
+              !runTreeExitVeto(file, 0, expired, true) && canRemoveTerminalRun(file, expired) &&
               hasPreservedResidentResult(directory, entry.name) &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
             try { fs.rmSync(file, { recursive: true, force: true }); } catch { /* retry next scan */ }
             continue;
           }
-          compactTerminalRunEvents(file, { ...this.retention, now,
+          const compacted = compactTerminalRunEvents(file, { ...this.retention, now, expired,
             // Another owner can publish a new latest run during a long safety
             // walk. Recheck the registry generation immediately before replace.
             isRetained: () => actorReferenceFingerprint(this.actorRoots) !== fingerprint,
           });
+          if (!compacted && expired()) { defer(); return; }
         }
         continue;
       }
@@ -195,6 +220,7 @@ export class ResidentRequestRetention {
     const decision = decisionValue === undefined ? undefined : readResidentRequestDecision(this.root, id);
     if (decision && decision.requestFormat !== 3) throw new Error("Legacy decision is not collectable");
     if (decision?.state === "committed" && !/^[A-Za-z0-9_-]+$/.test(decision.id!)) throw new Error("Invalid resident entity ID");
+    if (decision?.state === "committed" && this.custody?.reference(decision.id!)) return false;
     if (decision?.state === "committed" && (!isResidentCommandOperation(decision.operation) || liveIds.has("*") || liveIds.has(decision.id!))) return false;
     if (ack.pending && (!decision?.id || liveIds.has(decision.id))) return false;
     if (decision?.state === "committed") {

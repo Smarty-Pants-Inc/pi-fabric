@@ -179,7 +179,7 @@ describe("I-2 production-worker ingress retention", () => {
       expect(interrupted.has("native-descendant-actor")).toBe(true);
       expect(interrupted.has("*")).toBe(true);
       clock.mockReturnValue(0);
-      const complete = recovered.retentionReferences();
+      const complete = recovered.retentionReferences({ refresh: true });
       expect(complete.has("native-descendant-actor")).toBe(false);
       expect(complete.has("*")).toBe(false);
     } finally { clock.mockRestore(); }

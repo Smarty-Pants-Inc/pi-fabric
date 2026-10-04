@@ -265,6 +265,10 @@ export interface FabricRetentionConfig {
   terminalRunEventsAgeMs: number;
   /** Total retained events.jsonl bytes, including the truncation marker. */
   terminalRunEventsMaxBytes: number;
+  /** Reversibly archive eligible identity-less legacy resident runs on Linux. */
+  legacyRunArchiveEnabled?: boolean;
+  /** Minimum terminal finishedAt age before legacy archival (default 48 hours). */
+  legacyRunArchiveAgeMs?: number;
 }
 
 export interface FabricActorsConfig {
@@ -532,6 +536,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
     terminalRunEventsAgeMs: 6 * 60 * 60 * 1_000,
     terminalRunEventsMaxBytes: 256 * 1024,
+    legacyRunArchiveEnabled: true,
+    legacyRunArchiveAgeMs: 48 * 60 * 60 * 1_000,
   },
   actors: {
     maxSessionBytes: 20 * 1024 * 1024,
@@ -1214,6 +1220,10 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       tokenThresholds: compactionTokenThresholds,
     },
     retention: {
+      legacyRunArchiveEnabled: booleanValue(retention.legacyRunArchiveEnabled, DEFAULT_FABRIC_CONFIG.retention.legacyRunArchiveEnabled ?? true),
+      legacyRunArchiveAgeMs: boundedInteger(retention.legacyRunArchiveAgeMs,
+        DEFAULT_FABRIC_CONFIG.retention.legacyRunArchiveAgeMs ?? 48 * 60 * 60 * 1_000,
+        60 * 60 * 1_000, 365 * 24 * 60 * 60 * 1_000),
       orphanedTempRunMs: boundedInteger(
         retention.orphanedTempRunMs,
         DEFAULT_FABRIC_CONFIG.retention.orphanedTempRunMs,

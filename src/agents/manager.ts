@@ -100,6 +100,7 @@ import {
   removeEmptyRunRoot,
   type TempRunSweepRequest,
 } from "../storage/retention.js";
+import { boundedRunTree, RetentionReferenceScan } from "../storage/reference-scan.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
 
 const removeManagedRunRoot = async (root: string, managed: boolean): Promise<void> => {
@@ -731,6 +732,10 @@ export class AgentManager {
   #retentionSweep: Promise<void> | undefined;
   #budgetSummaryCache: { at: number; value: FabricBudgetSummary } | undefined;
   #claudeModelsCache: { at: number; value: ClaudeModelInfo[] } | undefined;
+  readonly #referenceScan = new RetentionReferenceScan();
+  readonly #retentionActors = new Map<string, Set<string>>();
+  #retentionActorRuns = 0;
+  #retentionIndexUnsafe = true;
   #uiListRevision = 0;
   #uiListCache:
     | { revision: number; value: Array<AgentRunRecord | AgentHandleInfo> }
@@ -2016,57 +2021,103 @@ export class AgentManager {
     return value;
   }
 
-  /** Full ownership references for retention, never the bounded UI/status snapshot.
-   * A terminal status or abandonment is not worker-exit evidence. "*" vetoes
-   * stopped-actor exit proofs when untracked ownership cannot be determined. */
-  retentionReferences(): Set<string> {
-    const refs = new Set<string>();
-    const protect = (id: string, actorId?: string) => { refs.add(id); if (actorId) refs.add(actorId); };
+  /** Cached, progressing ownership preparation. Unknown/unfinished proof is a
+   * wildcard veto; terminal status never substitutes for checked worker exit.
+   * refresh is for explicit offline verification, not the resident poll. */
+  retentionReferences(options: { refresh?: boolean; now?: number; budgetMs?: number; maxEntries?: number } = {}): Set<string> {
+    const generation = this.#retentionGeneration();
+    return this.#referenceScan.snapshot(generation, (protect, expired) => this.#scanRetentionReferences(protect, expired), options);
+  }
+
+  /** Archival never discharges a live manager's result/publication custody,
+   * even if its saved status is terminal or its handle has settled. */
+  hasRunCustody(id: string): boolean { return this.#runs.has(id) || this.#queued.has(id); }
+
+  #retentionGeneration(): string {
+    return `${this.#uiListRevision}:${this.#runs.size}:${this.#queued.size}:${RetentionReferenceScan.directoryGeneration(this.#runRoot)}`;
+  }
+
+  /** Prepared references are protective hints, NOT cached authority. Before
+   * expiring an exchange, re-evaluate the exact writer/tree under a count/time
+   * budget. In-place nested/status changes need no run-set mtime. */
+  retentionCustodyVeto(id: string): boolean {
+    const started = performance.now(), expired = () => performance.now() - started >= 2;
+    const check = (runId: string): boolean => {
+      const queued = this.#queued.get(runId);
+      if (queued) return !queued.terminal || !!queued.cleanupPending ||
+        !boundedRunTree(path.join(this.#runRoot, runId), expired) || hasUnresolvedWorker(path.join(this.#runRoot, runId), 0, expired);
+      const managed = this.#runs.get(runId);
+      const directory = managed?.runDirectory ?? path.join(this.#runRoot, runId);
+      if (managed) {
+        const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
+        if (!managed.settled || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
+            (pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid)))) return true;
+      }
+      return !boundedRunTree(directory, expired) || !!runTreeExitVeto(directory, 0, expired, true) || expired();
+    };
+    if (this.#runs.has(id) || this.#queued.has(id) || ownedStat(path.join(this.#runRoot, id))?.isDirectory()) return check(id);
+    if (this.#retentionIndexUnsafe || !this.#referenceScan.current(this.#retentionGeneration())) return true;
+    let count = 0;
+    for (const runId of this.#retentionActors.get(id) ?? []) {
+      if (++count > 64 || expired() || check(runId)) return true;
+    }
+    return expired();
+  }
+
+  *#scanRetentionReferences(protect: (id: string, actorId?: string) => void, expired: () => boolean): Generator<void> {
+    this.#retentionActors.clear(); this.#retentionActorRuns = 0; this.#retentionIndexUnsafe = false;
+    const index = (id: string, actorId?: unknown) => {
+      if (actorId === undefined) return;
+      if (typeof actorId !== "string" || !/^[A-Za-z0-9_-]+$/.test(actorId) || ++this.#retentionActorRuns > 1024) {
+        this.#retentionIndexUnsafe = true; protect("*"); return;
+      }
+      let ids = this.#retentionActors.get(actorId);
+      if (!ids) this.#retentionActors.set(actorId, ids = new Set());
+      ids.add(id);
+    };
     for (const queued of this.#queued.values()) {
-      if (!queued.terminal || queued.cleanupPending || hasUnresolvedWorker(path.join(this.#runRoot, queued.info.id))) {
+      index(queued.info.id, queued.info.actorId);
+      if (!queued.terminal || queued.cleanupPending || !boundedRunTree(path.join(this.#runRoot, queued.info.id), expired) || hasUnresolvedWorker(path.join(this.#runRoot, queued.info.id), 0, expired)) {
         protect(queued.info.id, queued.info.actorId);
       }
+      yield;
     }
     for (const managed of this.#runs.values()) {
+      index(managed.id, managed.actorId);
       const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
       const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
       if (!managed.settled || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
-          // Settlement and primary exit do not prove descendant exit. The
-          // persistent tree veto checks every descendant's worker identity too.
-          unconfirmedProcess || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) protect(managed.id, managed.actorId);
+          unconfirmedProcess || !boundedRunTree(managed.runDirectory, expired) || runTreeExitVeto(managed.runDirectory, 0, expired, true)) protect(managed.id, managed.actorId);
+      yield;
     }
-    // A restarted host does not own handles for the previous host's actor workers.
-    // Reuse offline retention's exit/ownership predicate; a truncated or unknown
-    // tree vetoes all stopped-actor proofs, rather than guessing its association.
-    const started = performance.now();
-    const expired = () => performance.now() - started >= 5;
     let directory: fs.Dir | undefined;
     try {
       try { fs.lstatSync(this.#runRoot); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return refs; throw error; }
-      if (!ownedStat(this.#runRoot)?.isDirectory()) { refs.add("*"); return refs; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+      if (!ownedStat(this.#runRoot)?.isDirectory()) { protect("*"); return; }
       directory = fs.opendirSync(this.#runRoot);
       let entry: fs.Dirent | null;
-      while (!expired() && (entry = directory.readSync())) {
-        if (this.#managedTempRoot && entry.name === ".fabric-owner.json") continue;
-        if (this.#runs.has(entry.name) || this.#queued.has(entry.name)) continue;
-        const run = path.join(this.#runRoot, entry.name);
-        if (!entry.isDirectory()) { refs.add("*"); continue; }
-        const status = ownedStat(path.join(run, "status.json"));
-        const record = status?.isFile() && status.size <= 1024 * 1024 ? readRecord(path.join(run, "status.json")) : undefined;
-        // Without a surviving handle, only a checked process identity can
-        // establish exit; a terminal record with no PID is still uncertain.
-        const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
-          ? Number(record.sessionId) : undefined;
-        if (pid !== undefined && !processAlive(pid) && !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired)) continue;
-        const actorId = record?.actorId;
-        if (typeof actorId === "string" && /^[A-Za-z0-9_-]+$/.test(actorId)) protect(entry.name, actorId);
-        else refs.add("*");
+      while ((entry = directory.readSync())) {
+        if (!(this.#managedTempRoot && entry.name === ".fabric-owner.json") && !this.#runs.has(entry.name) && !this.#queued.has(entry.name)) {
+          const run = path.join(this.#runRoot, entry.name);
+          if (!entry.isDirectory()) protect("*");
+          else {
+            const status = ownedStat(path.join(run, "status.json"));
+            const record = status?.isFile() && status.size <= 1024 * 1024 ? readRecord(path.join(run, "status.json")) : undefined;
+            index(entry.name, record?.actorId);
+            const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
+              ? Number(record.sessionId) : undefined;
+            if (!(pid !== undefined && !processAlive(pid) && boundedRunTree(run, expired) && !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired))) {
+              const actorId = record?.actorId;
+              if (typeof actorId === "string" && /^[A-Za-z0-9_-]+$/.test(actorId)) protect(entry.name, actorId);
+              else protect("*");
+            }
+          }
+        }
+        yield;
       }
-      if (expired()) refs.add("*");
-    } catch { refs.add("*"); }
-    finally { try { directory?.closeSync(); } catch { refs.add("*"); } }
-    return refs;
+    } catch { protect("*"); }
+    finally { try { directory?.closeSync(); } catch { protect("*"); } }
   }
 
   runDirectory(id: string): string | undefined {
@@ -2454,6 +2505,7 @@ export class AgentManager {
 
   close(): Promise<void> {
     this.#closing = true;
+    this.#referenceScan.close();
     for (const timer of this.#followUpTimers.values()) clearTimeout(timer);
     this.#followUpTimers.clear();
     this.#closeAbort.abort(new Error("Fabric agent manager is closing"));
@@ -3292,15 +3344,27 @@ export class AgentManager {
   }
 
   /** Retry retained full outcomes after the original manager exited. No worker is relaunched. */
-  recoverPendingArchives(runDirectory?: string): number {
-    let recovered = 0;
+  recoverPendingArchives(runDirectory?: string, expired: () => boolean = () => false): number {
+    let recovered = 0, entries = 0;
+    const visitChildren = (directory: string, depth: number): void => {
+      if (expired() || entries >= 128 || !ownedStat(directory)?.isDirectory()) return;
+      let cursor: fs.Dir | undefined;
+      try {
+        cursor = fs.opendirSync(directory);
+        let entry: fs.Dirent | null;
+        while (!expired() && entries < 128 && (entry = cursor.readSync())) { entries++; visit(path.join(directory, entry.name), depth); }
+      } catch { /* Unknown/unvisited sources retain their persistent custody marker. */ }
+      finally { try { cursor?.closeSync(); } catch { /* retry next sweep */ } }
+    };
     const visit = (directory: string, depth: number): void => {
-      if (depth > 32 || !ownedStat(directory)?.isDirectory()) return;
+      if (expired() || depth > 32 || entries >= 128 || !ownedStat(directory)?.isDirectory()) return;
       const file = path.join(directory, ARCHIVE_PENDING_FILE);
       const ageReference = ownedStat(directory);
-      if (ownedStat(file)?.isFile()) {
+      const pending = ownedStat(file);
+      if (pending?.isFile() && pending.size <= 1024 * 1024) {
         try {
           for (const archive of readPendingRunArchives(directory)) {
+            if (expired()) break;
             if (archive.routePending || archive.result?.id !== path.basename(directory)) continue;
             if (archive.actorSessionFile && archive.actorOnly && archive.result.spawner?.kind === "actor") {
               new ActorChildCompletionStore(archive.actorSessionFile).enqueue(archive.result, archive.result.spawner, archive.notify);
@@ -3308,22 +3372,16 @@ export class AgentManager {
             else if (archive.kind === "settlement" && this.#onSettled) this.#onSettled(archive.result, archive.recipient);
             else continue;
             commitRunArchive(directory, archive.kind);
-            // Replaying an old result is not new worker activity. Removing its
-            // custody marker must not reset the source's retention age and make
-            // an already expired, durably archived run uncollectible at startup.
             const current = ownedStat(directory);
-            if (ageReference && current?.dev === ageReference.dev && current.ino === ageReference.ino) {
-              fs.utimesSync(directory, ageReference.atime, ageReference.mtime);
-            }
+            if (ageReference && current?.dev === ageReference.dev && current.ino === ageReference.ino) fs.utimesSync(directory, ageReference.atime, ageReference.mtime);
             recovered++;
           }
         } catch { /* The persisted veto remains for the next recovery attempt. */ }
       }
-      const nested = path.join(directory, "nested");
-      if (ownedStat(nested)?.isDirectory()) for (const name of fs.readdirSync(nested)) visit(path.join(nested, name), depth + 1);
+      visitChildren(path.join(directory, "nested"), depth + 1);
     };
-    if (runDirectory) visit(runDirectory, 0);
-    else if (ownedStat(this.#runRoot)?.isDirectory()) for (const name of fs.readdirSync(this.#runRoot)) visit(path.join(this.#runRoot, name), 0);
+    if (runDirectory) visit(runDirectory, 0); else visitChildren(this.#runRoot, 0);
+    if (recovered) this.#invalidateUiList();
     return recovered;
   }
 

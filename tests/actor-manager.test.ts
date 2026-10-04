@@ -706,9 +706,13 @@ describe("ActorManager across a session reload", () => {
         try { return fs.readFileSync(path.join(runs, run, "task.txt"), "utf8").match(/"text":\s*"(w\d+)"/)?.[1]; } catch { return undefined; }
       }) : [];
     };
-    await waitFor(() => runTexts().length >= 41 && after.status(actor.id).status === "idle" && after.status(actor.id).queued === 0, 60_000);
+    // #369 adds fresh native root/scratch ACL checks and joined disposal to
+    // every activation. Budget all 41 sequential Windows launches, not just
+    // one; the exact archive replay and no-drop assertions are unchanged.
+    await waitFor(() => runTexts().length >= 41 && after.status(actor.id).status === "idle" && after.status(actor.id).queued === 0,
+      process.platform === "win32" ? 180_000 : 60_000);
     expect(runTexts().sort()).toEqual(Array.from({ length: 41 }, (_, index) => `w${index}`).sort());
-  }, 90_000);
+  }, process.platform === "win32" ? 210_000 : 90_000);
 
   it("holds live work events a full queue and overflow cannot take, and delivers each once", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-work-live-"));

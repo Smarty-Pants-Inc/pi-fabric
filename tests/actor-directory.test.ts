@@ -55,7 +55,9 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => directory.close()));
   await Promise.all(agents.splice(0).map((manager) => manager.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
-});
+  // #369 teardown joins scratch disposal's fresh native ACL checks as well as
+  // stopping both scopes' live Windows workers (each stop has its own bound).
+}, process.platform === "win32" ? 30_000 : 10_000);
 
 describe("ActorDirectory", () => {
   it("#169 round 2 permits public same-name create while a waiting removal is behind a live run", async () => {

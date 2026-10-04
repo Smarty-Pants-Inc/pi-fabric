@@ -659,7 +659,9 @@ describe("AgentManager", () => {
     expect(fs.existsSync(path.join(root, abandonedId))).toBe(false);
     expect(manager.runningCount()).toBe(0);
     expect(await manager.run({ task: "capacity released", transport: "process" })).toMatchObject({ status: "completed" });
-  });
+    // #369 adds fresh native ACL checks at launch and joined scratch disposal
+    // on stop; the queued case also stops a real Windows tree before relaunch.
+  }, process.platform === "win32" ? 45_000 : 15_000);
 
   it("revokes a queued activation when its owner generation changes without aborting the signal", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
@@ -860,7 +862,9 @@ describe("AgentManager", () => {
     await expect(manager.cleanup(queued.id)).rejects.toThrow("lost track of its worker");
     await manager.close();
     expect(fs.existsSync(runDirectory)).toBe(true);
-  });
+    // #369 joins the first worker's native scratch retirement before queued
+    // admission; Windows must perform fresh ACL I/O on both paths.
+  }, process.platform === "win32" ? 45_000 : 15_000);
 
   it.each(["alive", "failed-probe", "lost-contact", "hung-probe", "failed-stop"] as const)("retains cancelled queued worker files and reports cleanup pending (%s)", async (mode) => {
     const repository = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-cancelled-repo-"));
@@ -2405,7 +2409,9 @@ describe("AgentManager", () => {
     expect(recursive.tools).toEqual(["read", "fabric_exec"]);
     expect(recursive.mainAgentId).toBe("session:root-main");
     expect(recursive.grantedRisks).toEqual(["agent"]);
-  });
+    // #369 adds native root/scratch ACL snapshots and retirement to each of
+    // these two real Windows launches; retain all surface-inheritance checks.
+  }, process.platform === "win32" ? 45_000 : 15_000);
 
   it("keeps explicit extensions:false children native in a full-code parent", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));

@@ -470,6 +470,7 @@ export class ActorManager {
   #mainIdle = true;
   #reloadingOwnership = false;
   #registryFingerprint: string | undefined;
+  #savedActors: { owned: string; fingerprint: string | undefined } | undefined;
   readonly #canConsumeMesh: (() => boolean) | undefined;
 
   constructor(
@@ -3587,6 +3588,12 @@ export class ActorManager {
 
   async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean }): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
+    if (removedIds.size === 0 && !options?.durable && this.#savedActors) {
+      const owned = [...this.#actors.values()].filter((actor) =>
+        !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id));
+      if (JSON.stringify(owned.map((actor) => this.#serializedActor(actor))) === this.#savedActors.owned &&
+        this.#registry.fingerprint() === this.#savedActors.fingerprint) return;
+    }
     await this.#registry.withLock(() => {
       // Finalization fences reloads and serialization, but only this save's explicit ids
       // are authorized to revoke: their own durable write-ahead markers already exist.
@@ -3599,6 +3606,8 @@ export class ActorManager {
       const actors = [...preserved, ...owned.map((actor) => this.#serializedActor(actor))];
       this.#registry.write(actors, { durable: removedIds.size > 0 || options?.durable === true });
       this.#registryFingerprint = this.#registry.fingerprint();
+      this.#savedActors = { owned: JSON.stringify(owned.map((actor) => this.#serializedActor(actor))),
+        fingerprint: this.#registryFingerprint };
       for (const id of removedIds) this.#persistedRoots.delete(id);
       for (const actor of owned) this.#persistedRoots.set(actor.id, actor.rootId);
       for (const record of preserved) {
@@ -3805,7 +3814,7 @@ export class ActorManager {
         draining: false,
         messages: [],
         createdAt: record.createdAt,
-        updatedAt: Date.now(),
+        updatedAt: typeof record.updatedAt === "number" ? record.updatedAt : Date.now(),
         ...(typeof record.lastRunId === "string" ? { lastRunId: record.lastRunId } : {}),
         ...(typeof record.removal?.requestedAt === "number"
           ? {
@@ -3839,7 +3848,9 @@ export class ActorManager {
         firstLoads.push(actor);
       }
       added++;
-      void this.#publishPresence(actor).catch(() => undefined);
+      // A watcher reload is observation, not a registry mutation. Publishing via
+      // #publishPresence saved every reloaded row and fed the next watcher poll.
+      void this.#writePresence(actor.id).catch(() => undefined);
     }
     // After every own file, whose counters the predecessors' activations shift against.
     for (const actor of firstLoads) this.#takeOverPredecessors(actor);
@@ -4389,7 +4400,7 @@ export class ActorManager {
         actor.adoptedAt = Date.now();
         actor.updatedAt = Date.now();
         const preserved = records.filter((record) => record.id !== actor.id);
-        this.#registry.write([...preserved, this.#serializedActor(actor)]);
+        this.#registry.write([...preserved, this.#serializedActor(actor)], { durable: true });
         this.#registryFingerprint = this.#registry.fingerprint();
         return true;
       }));

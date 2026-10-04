@@ -321,6 +321,35 @@ export const writeFileAtomic = (
   }
 };
 
+/** A single-owner writer (or used under its protocol lock). Equal bytes may skip
+ * only a soft-state replacement; durable writes always establish fresh barriers.
+ */
+export class AtomicFileWriter {
+  constructor(readonly file: string) {}
+
+  #stamp(): string {
+    const stat = fs.statSync(this.file);
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  }
+
+  write(contents: string, options?: AtomicWriteOptions): boolean {
+    let unchanged = false;
+    try {
+      const before = this.#stamp();
+      const current = readFileRetrying(this.file);
+      const after = this.#stamp();
+      unchanged = before === after && current === contents;
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+    }
+    // The retained equal-bytes cache is a soft-state optimization only. Durable
+    // writes are receipts: always replace, fsync, and re-confirm the namespace.
+    if (unchanged && !options?.durable) return false;
+    writeFileAtomic(this.file, contents, options);
+    return true;
+  }
+}
+
 export interface ExclusiveLockOptions {
   directory: string;
   lockName: string;

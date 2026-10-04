@@ -23,6 +23,19 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("types per-filter telemetry and expiry (fullCodeMode=%s)", fullCodeMode => {
+    const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000 });
+      const actor = await agents.actorStatus({ id: "reviewer" });
+      const count: number = actor.filterSkipped.count;
+      const key: string | null = actor.filterSkipped.lastKey;
+      const topic: string | null = actor.filterSkipped.lastTopic;
+      const at: number | null = actor.filterSkipped.lastAt;
+      const expiry: number | undefined = actor.activationFilterExpiresAt;
+      return { count, key, topic, at, expiry };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    const descriptor = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "setActivationFilter")!;
+    expect(descriptor.inputSchema.properties).toHaveProperty("expiresAt");
+  });
   it.each(["spawn", "run", "wait", "join"])("types the optional observed Fabric release on agents.%s", method => {
     const args = method === "spawn" || method === "run" ? '{ task: "work" }' : '{ id: "child" }';
     for (const fullCodeMode of [false, true]) {
@@ -79,13 +92,15 @@ describe("guest agents surface", () => {
        await agents.spawn({ task: "probe", modelReason: "Compatibility probe" });
        await agents.create({ name: "probe", instructions: "Work.", modelReason: "Compatibility probe" });
        await agents.createActor({ name: "alias-probe", instructions: "Work.", modelReason: "Compatibility probe" });
-       const reason: string | undefined = run.modelReason; return reason;`,
+       const actor = await agents.setModel({ id: "actor", model: "cliproxyapi/gpt-6-astra", modelReason: "Named probe" });
+       const actorReason: string | undefined = actor.modelReason;
+       const reason: string | undefined = run.modelReason; return { reason, actorReason };`,
       guestTypeDeclarations(fullCodeMode), true,
     );
     expect(result.errors).toEqual([]);
-    for (const name of ["run", "spawn", "create", "createActor"]) {
+    for (const name of ["run", "spawn", "create", "createActor", "setModel"]) {
       const schema = AGENTS_ACTION_DESCRIPTORS.find(descriptor => descriptor.name === name)!.inputSchema as { properties: Record<string, unknown> };
-      expect(schema.properties.modelReason).toMatchObject({ type: "string" });
+      expect(schema.properties.modelReason).toMatchObject({ type: "string", maxLength: 200 });
     }
   });
 

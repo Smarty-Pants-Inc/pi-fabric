@@ -181,6 +181,23 @@ setInterval(() => {}, 1000);`, async (_handle, root) => {
 });
 
 describe("spawnDetached", () => {
+  it("retains the fixed scratch gate rather than migrating custody into a configured slice", async () => {
+    const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn() });
+    vi.mocked(spawn).mockClear().mockReturnValueOnce(child as unknown as ChildProcess);
+    const scratch = { directory: "/sys/fs/cgroup/private-test", dev: 1, ino: 1, bootId: "test", joinedFile: "joined", launchNonce: "nonce" };
+    const warn = vi.fn();
+    const handle = await spawnDetached("worker.mjs", [], process.cwd(), undefined, {}, { executable: "systemd-run", slice: "batch.slice", warn }, scratch);
+    try {
+      expect(warn).toHaveBeenCalledExactlyOnceWith("private scratch containment takes precedence over systemd slice placement");
+      expect(spawn).toHaveBeenCalledExactlyOnceWith("/bin/sh", expect.arrayContaining(["-p", "pi-fabric-scratch-gate", scratch.directory]), expect.any(Object));
+      const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+      expect(args[2]).toContain('"$1/cgroup.procs"');
+      expect(args).not.toContain("--scope");
+    } finally {
+      child.emit("exit", 0); child.emit("close", 0);
+      await handle.waitForClose();
+    }
+  });
   it.each(["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "LD_ORIGIN_PATH", "GCONV_PATH"])("refuses a scoped launch before spawn when the explicit environment has %s", async key => {
     vi.mocked(spawn).mockClear();
     const scope = { directory: "unused", dev: 1, ino: 1, bootId: "unused", joinedFile: "unused", launchNonce: "unused" };

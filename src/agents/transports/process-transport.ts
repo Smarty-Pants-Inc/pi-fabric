@@ -9,7 +9,7 @@ import type {
 import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/agent-dir.js";
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
-import { spawnDetached, WorkerNotStartedError } from "./process-utils.js";
+import { findExecutable, spawnDetached, WorkerNotStartedError } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import { allocateRunTmpDirectory } from "../../storage/run-scratch.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
@@ -48,6 +48,15 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
 
 export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
+  #scopeWarningLogged = false;
+
+  constructor(private readonly processSlice?: string) {}
+
+  #warnScope = (reason: string): void => {
+    if (this.#scopeWarningLogged) return;
+    this.#scopeWarningLogged = true;
+    console.warn(`[pi-fabric] agents.processSlice=${this.processSlice}: ${reason}; launching worker normally`);
+  };
 
   async available(): Promise<boolean> {
     return true;
@@ -64,6 +73,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       TMPDIR: temporaryDirectory,
       ...(process.platform === "win32" ? { TMP: temporaryDirectory, TEMP: temporaryDirectory } : {}),
     };
+    const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
+    if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const selected = selectWorkerRelease(request.workerPath);
     const workerArguments = [...request.workerArguments];
     if (selected.extensionPath) {
@@ -98,6 +109,7 @@ export class ProcessTransport implements AgentTransportAdapter {
           ? { ...process.env, ...temporaryEnvironment } : { ...taskAgentEnvironment(), ...temporaryEnvironment },
         workerArguments,
       ),
+      executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
       allocation.scope,
     ).catch(error => {
       if (error instanceof WorkerNotStartedError) allocation.neverStarted();

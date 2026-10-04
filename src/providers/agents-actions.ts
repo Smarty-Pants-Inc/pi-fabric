@@ -35,7 +35,8 @@ const runProperties = {
   protected: { type: "boolean", description: "Trusted issue/PR protection snapshot, never task text: true for review/security/audit/named passes/needs-security-pass; false only for known-clear state. Omitted stays unknown and excluded from routing." },
   modelReason: {
     type: "string",
-    description: "Reason for an explicit model selection, recorded on the run. Required and non-blank for cliproxyapi/gpt-6-astra; named passes use cliproxyapi/gpt-6.1-sol thinking max, otherwise omit model (role default).",
+    maxLength: 200,
+    description: "Named exception for an explicit model selection, recorded on the run/actor and spawn event. Required and non-blank for agents.modelPolicy.requireReason (default gpt-6-astra on any provider); omit model to use the role default. See smarty-dev#3134.",
   },
   persona: {
     type: "string",
@@ -661,6 +662,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
       properties: {
         id: { type: "string" },
         model: { type: "string" },
+        modelReason: runProperties.modelReason,
         scope: actorBindingScopeSchema,
       },
       required: ["id"],
@@ -717,12 +719,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "setActivationFilter",
-    description: "Set or clear (null or []) the actor's skip-only activation filter: preset names (hold, never-message-events) or rule objects. Invalid rules are rejected. It applies from the next queued event on.",
+    description: "Set or clear (null or []) the actor's skip-only activation filter: preset names (hold, never-message-events) or rule objects. Invalid rules are rejected. Applies from the next queued event and resets filterSkipped. Optional expiresAt (epoch ms, live actors only) clears on the next event or poll, with an actor audit message.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
         activationFilter: { anyOf: [activationFilterSchema, { type: "null" }] },
+        expiresAt: { type: "number", description: "Epoch milliseconds; clear at/after this time on the next event or poll. Live actors only." },
         scope: { type: "string", enum: ["project", "global"] },
       },
       required: ["id", "activationFilter"],

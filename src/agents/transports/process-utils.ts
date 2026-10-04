@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
@@ -269,42 +270,62 @@ export const spawnDetached = async (
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
-  scope?: ScopedScratchLaunch,
+  scope?: { executable: string; slice: string; warn: (reason: string) => void } | ScopedScratchLaunch,
+  scratchScope?: ScopedScratchLaunch,
 ): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
+  // Retain the existing sixth-argument scratch seam for direct callers.
+  if (scope && "directory" in scope) { scratchScope = scope; scope = undefined; }
   let runtime: string;
   try {
     runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
     assertTransportLaunchAllowed(authority);
-    // The fixed shell gate must itself have no dynamic-loader execution hook,
-    // including on retries or when an explicit child environment was supplied.
-    if (scope && SCRATCH_GATE_LOADER_HOOKS.some(key => (environment ?? process.env)[key]?.trim())) {
+    // No loader may run before the fixed scratch attachment gate.
+    if (scratchScope && SCRATCH_GATE_LOADER_HOOKS.some(key => (environment ?? process.env)[key]?.trim())) {
       throw new Error("Unproved scratch attachment: launch gate has a loader hook");
     }
   } catch (error) {
-    // This boundary has not invoked spawn. Errors at/after spawn are not
-    // never-started receipts, even when no PID or handle was returned.
     throw new WorkerNotStartedError(error);
   }
-  // Attach BEFORE exec of any runtime: Bun's bunfig preloads execute before
-  // --eval, so the JavaScript receipt gate alone cannot contain their forks.
-  // /bin/sh -p -c is fixed and noninteractive; -p disables inherited shell
-  // functions/startup hooks without changing uid. Only shell builtins run
-  // before attachment. Positional arguments
-  // preserve paths/argv without evaluating worker-controlled shell text.
-  const arguments_ = scope ? ["-p", "-c", `
+  if (scope && scratchScope) {
+    // A process belongs to only one cgroup-v2 placement. Migrating it into a
+    // systemd slice would leave the pinned scratch scope and invalidate custody.
+    // Placement is best-effort; containment must never be silently bypassed.
+    scope.warn("private scratch containment takes precedence over systemd slice placement");
+    scope = undefined;
+  }
+  // Attach BEFORE runtime startup, including Bun/project preloads. Only fixed
+  // shell builtins execute before attachment; positional arguments retain argv.
+  const arguments_ = scratchScope ? ["-p", "-c", `
 printf '%s' "$$" > "$1/cgroup.procs" || exit 125
 IFS= read -r membership < /proc/self/cgroup || exit 125
 [ "$membership" = "0::\${1#/sys/fs/cgroup}" ] || exit 125
 shift
 exec "$@"
-`, "pi-fabric-scratch-gate", scope.directory, runtime, ...scopedWorkerArguments(scope, workerPath, workerArguments, cwd)] : [workerPath, ...workerArguments];
-  const child = spawn(scope ? "/bin/sh" : runtime, arguments_, {
+`, "pi-fabric-scratch-gate", scratchScope.directory, runtime, ...scopedWorkerArguments(scratchScope, workerPath, workerArguments, cwd)] : [workerPath, ...workerArguments];
+  const workerExecutable = scratchScope ? "/bin/sh" : runtime;
+  // systemd admission execs in place, preserving captured PID/PGID. A marker
+  // distinguishes failed admission from an admitted worker that exits nonzero.
+  const scopeRoot = scope ? fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scope-")) : undefined;
+  const marker = scopeRoot ? path.join(scopeRoot, "admitted") : undefined;
+  const child = spawn(scope?.executable ?? workerExecutable, scope ? [
+    "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", "--",
+    "/bin/sh", "-c", 'printf admitted > "$1" || exit 125; shift; exec "$@"',
+    "fabric-scope", marker!, workerExecutable, ...arguments_,
+  ] : arguments_, {
     cwd,
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
     stdio: "ignore",
   });
-  if (!child.pid) throw new Error("Failed to launch Fabric worker process");
+  let spawnError: Error | undefined;
+  child.once("error", error => { spawnError = error; });
+  if (!child.pid) {
+    if (!scope) throw new Error("Failed to launch Fabric worker process");
+    await new Promise<void>(resolve => child.once("close", () => resolve()));
+    fs.rmSync(scopeRoot!, { recursive: true, force: true });
+    scope.warn(spawnError?.message ?? "systemd-run did not launch");
+    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, scratchScope);
+  }
   const pid = child.pid;
   // Once the worker exited, its numeric id is no identity: after its group empties, the id
   // can name an unrelated process (group). So nothing is signalled or probed by number then.
@@ -322,7 +343,7 @@ exec "$@"
     try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
   };
   child.unref();
-  return {
+  const handle = {
     pid,
     closed,
     lostContact: () => lost,
@@ -396,4 +417,24 @@ exec "$@"
       return false;
     },
   };
+  if (scope && marker) {
+    let nativeClosed = false;
+    void closed.then(() => { nativeClosed = true; });
+    const admissionDeadline = Date.now() + 5_000;
+    try {
+      while (!fs.existsSync(marker) && !nativeClosed && Date.now() < admissionDeadline && !authority?.signal?.aborted) {
+        await new Promise<void>(resolve => setTimeout(resolve, 10));
+      }
+      if (fs.existsSync(marker)) return handle;
+      // Join the captured close before any fallback. Unconfirmed custody vetoes
+      // a replacement just as it does for an ordinary owned worker.
+      if (!nativeClosed) await handle.stop();
+      if (handle.lostContact()) throw new Error(handle.lostContact());
+      assertTransportLaunchAllowed(authority);
+      if (fs.existsSync(marker)) return handle; // admitted during teardown; never replay
+      scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
+      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, scratchScope);
+    } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }
+  }
+  return handle;
 };

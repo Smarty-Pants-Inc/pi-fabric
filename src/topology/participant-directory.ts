@@ -644,6 +644,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       };
     }
     const token = this.mesh.stateToken(read);
+    // Freshness is paid once; every namespace below is selected from that exact
+    // canonical snapshot, never by issuing four independent fresh parses.
+    const snapshot = { snapshot: token };
     // Participant files are a second source (smarty-dev#2004): their listing is the same array
     // while no file changed, so it keys the cache with the state token.
     const files = this.#participantFiles(read);
@@ -651,7 +654,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (cached?.token === token && cached.files === files) return cached.value;
     const previous = this.#parsedEntries;
     const next = new Map<string, { version: number; updatedAt: number; entry: MeshStateEntry }>();
-    const copies = (prefix: string): MeshStateEntry[] => this.mesh.listAllShared(prefix, read).map((shared) => {
+    const copies = (prefix: string): MeshStateEntry[] => this.mesh.listAllShared(prefix, snapshot).map((shared) => {
       const known = previous.get(shared.key);
       const entry = known && known.version === shared.version && known.updatedAt === shared.updatedAt
         ? known.entry

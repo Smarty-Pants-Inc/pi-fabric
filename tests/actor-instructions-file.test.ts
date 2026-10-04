@@ -96,8 +96,10 @@ for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} 
         const registry = new ActionRegistry(); registry.register(state.provider);
         const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
         const service = new FabricExecutionService(registry, config);
-        const refusal = "named passes use cliproxyapi/gpt-6.1-sol thinking max; otherwise omit model (role default)";
-        for (const modelReason of [undefined, " \t\n "]) {
+        // #436 unifies #389's createActor guard with run/spawn/setModel policy.
+        // Keep the complete instructions/scope/route matrix on the shared refusal.
+        const refusal = "model cliproxyapi/gpt-6-astra requires modelReason (named exception); omit model to use the role default pi default (inherited session model), see smarty-dev#3134";
+        for (const modelReason of [undefined, "", " \t\n "]) {
           const args = {
             name: "refused-astra", scope, residency: durable ? "durable" : "session",
             model: "cliproxyapi/gpt-6-astra", modelReason,

@@ -1123,9 +1123,13 @@ describe("AgentManager", () => {
     });
     managers.push(manager);
 
-    const result = await manager.run({ task: "Observe lifecycle", transport: "process" });
+    const result = await manager.run({ task: "Observe lifecycle", transport: "process", model: "cliproxyapi/gpt-6-astra", modelReason: "Named lifecycle metering probe" });
+    expect(result.modelReason).toBe("Named lifecycle metering probe");
+    expect(lifecycle[0]).toMatchObject({ event: "run.spawned", runId: result.id,
+      data: { model: "cliproxyapi/gpt-6-astra", modelReason: "Named lifecycle metering probe" } });
 
     expect(lifecycle.map((event) => event.event)).toEqual([
+      "run.spawned",
       "pi.agent_start",
       "pi.turn_end",
       "pi.agent_end",

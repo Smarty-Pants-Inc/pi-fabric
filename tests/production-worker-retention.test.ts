@@ -108,6 +108,16 @@ const productionRun = async (principal: boolean, retainRuns = true, nestedRunRoo
     const rows = fs.readFileSync(path.join(agent, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows.map(row => row.type)).toEqual(["decision", "outcome"]);
   }
+  if (retainRuns) {
+    // A raw child close is not the manager's scratch-disposal receipt. Close the
+    // real retaining owner before copying an expired fixture: custody is pinned
+    // to this namespace and cannot be transferred by cpSync. Keep every emitted
+    // persistent artifact, but never copy still-owned scratch into safe controls.
+    await manager.close();
+    for (const name of ["tmp", "unresolved-scratch.json", "scratch-scope-joined.json"]) {
+      expect(fs.existsSync(path.join(run, name)), `owned close must dispose ${name} before copying`).toBe(false);
+    }
+  }
   console.info("production artifact tree", JSON.stringify({ principal, run, files: fs.readdirSync(run).sort(), deliveries: fs.readdirSync(path.join(run, "deliveries")), status: result.status }));
   return { manager, result, run, runRoot };
 };

@@ -1985,6 +1985,56 @@ describe("AgentManager", () => {
     } finally { release(); spy.mockRestore(); }
   });
 
+  it("joins deadline scratch release for existing and late result observers", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 1_000, retainRuns: false, budgetUsd: 0 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const launch = ProcessTransport.prototype.launch;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let joining = false;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const transport = await launch.call(new ProcessTransport(), request);
+      return { ...transport, async waitForClose() {
+        joining = true;
+        await gate;
+        await transport.waitForClose!();
+      } };
+    });
+    const results: Array<Promise<unknown>> = [];
+    try {
+      const handle = await manager.spawn({ task: "HANG until deadline", transport: "process" });
+      const run = manager.runDirectory(handle.id)!;
+      let early = false, late = false, joined = false;
+      results.push(manager.wait(handle.id).then(result => { early = true; return result; }));
+      await vi.waitFor(() => expect(joining).toBe(true), { timeout: 10_000 });
+      expect(manager.isSettled(handle.id)).toBe(true);
+      expect(manager.status(handle.id).status).toBe("timed_out");
+      results.push(manager.wait(handle.id).then(result => { late = true; return result; }));
+      results.push(manager.join(handle.id).then(() => { joined = true; }));
+      await Promise.resolve();
+      expect([early, late, joined], "a claimed settlement cannot bypass the owned release").toEqual([false, false, false]);
+      expect(fs.existsSync(path.join(run, "tmp"))).toBe(true);
+      expect(fs.existsSync(path.join(run, "unresolved-scratch.json"))).toBe(true);
+      await expect(manager.checkpointForRelease()).rejects.toThrow(/pending/);
+      release();
+      expect(await Promise.all(results)).toEqual([expect.objectContaining({ status: "timed_out" }), expect.objectContaining({ status: "timed_out" }), undefined]);
+      expect(fs.existsSync(path.join(run, "tmp"))).toBe(false);
+      expect(fs.existsSync(path.join(run, "unresolved-scratch.json"))).toBe(false);
+      await expect(manager.checkpointForRelease()).resolves.toBeUndefined();
+      await manager.close();
+      expect(fs.existsSync(root)).toBe(false);
+    } finally {
+      release();
+      await Promise.allSettled(results);
+      await manager.close();
+      spy.mockRestore();
+    }
+  });
+
   it("never resumes a run an operator stopped, and aborts only unused runs", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

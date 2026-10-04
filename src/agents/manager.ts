@@ -1624,7 +1624,7 @@ export class AgentManager {
   async join(id: string): Promise<void> {
     if (this.#previousRun(id)) return;
     const managed = this.#requireRun(id);
-    if (!managed.settled) {
+    if (!managed.settled || managed.result) {
       if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
       await managed.result;
     }
@@ -1660,7 +1660,9 @@ export class AgentManager {
     }
     const managed = this.#requireRun(id);
     if (!options.deferConsumption) managed.background = false;
-    if (!managed.settled) {
+    // Settlement can claim the run before an explicit stop/deadline has joined
+    // its owned release. New observers must join the same unpublished result.
+    if (!managed.settled || managed.result) {
       if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
       const result = options.timeoutMs === undefined && options.signal === undefined
         ? await managed.result
@@ -2932,6 +2934,11 @@ export class AgentManager {
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
     const reported = this.#withTransportMetadata(result, managed) as AgentRunResult;
+    // Ordinary completion remains observable before native close. An explicit
+    // stop (including the run deadline) already owns teardown, so its result
+    // also joins generation-bound scratch disposal before callers can release
+    // the manager. This is the same bounded obligation stop()/close() join.
+    if (managed.stopRequested && managed.transport.kind === "process") await managed.nativeReleasePending;
     finishAgentSettlement(managed, reported);
     managed.task = "";
     this.#notifyBackgroundComplete(managed, reported);

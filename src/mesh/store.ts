@@ -528,6 +528,9 @@ export class MeshBatchConflictError extends Error {
   }
 }
 
+/** Events scanned for a publish whose dedupe receipt is missing (crash recovery). */
+const DEDUPE_RECOVERY_WINDOW = 4096;
+
 export class MeshStore {
   readonly #eventsPath: string;
   readonly #statePath: string;
@@ -665,7 +668,10 @@ export class MeshStore {
         }
         // A crash after the append but before its receipt must not publish twice. The
         // append and receipt share the existing mesh lock; compaction comes afterwards.
-        for (let after = 0;;) {
+        // ponytail: that crash window is the newest events, so scan only the live tail.
+        // Scanning from sequence 0 read the whole event archive under the lock and
+        // wedged the fleet mesh for minutes per fresh Pi (smarty-dev#4383).
+        for (let after = Math.max(0, this.#readLastEventSequence() - DEDUPE_RECOVERY_WINDOW);;) {
           const page = this.read({ after, limit: this.maxReadEvents });
           const prior = page.find(event => event.dedupeKey === input.dedupeKey);
           if (prior) {

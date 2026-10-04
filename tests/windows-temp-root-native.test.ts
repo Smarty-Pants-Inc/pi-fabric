@@ -132,7 +132,26 @@ describe.skipIf(process.platform !== "win32")("native Windows temp-root ACL cont
     expect(sddl(directory)).toBe(before);
   }, 30_000);
 
-  it("exports private run scratch only under a natively proven private explicit run root", async () => {
+  it("leaves per-run scratch off and inherits the normal user temp environment", async () => {
+    const directory = privateDirectory("inherited-run-temp");
+    const environment = path.join(directory, "environment.json");
+    const worker = path.join(directory, "worker.mjs");
+    fs.writeFileSync(worker, `import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(environment)}, JSON.stringify({tmpdir:process.env.TMPDIR,tmp:process.env.TMP,temp:process.env.TEMP}));`);
+    const expected = { tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP };
+    const nativeSpawn = vi.spyOn(childProcess, "spawnSync");
+    const handle = await new ProcessTransport().launch({ id: "inherited", name: "inherited", cwd: directory,
+      workerPath: worker, workerArguments: ["--status-file", path.join(directory, "status.json")] });
+    try {
+      await handle.waitForClose!();
+      expect(JSON.parse(fs.readFileSync(environment, "utf8"))).toEqual(expected);
+      expect(fs.existsSync(path.join(directory, "tmp"))).toBe(false);
+      expect(fs.existsSync(path.join(directory, "unresolved-scratch.json"))).toBe(false);
+      expect(nativeSpawn).not.toHaveBeenCalled();
+    } finally { await handle.stop(); }
+  }, 30000);
+
+  it.skipIf(process.platform === "win32")("exports private run scratch only under a natively proven private explicit run root", async () => {
     const directory = privateDirectory("explicit-run");
     const before = sddl(directory);
     const worker = path.join(directory, "worker.mjs");
@@ -152,7 +171,7 @@ fs.writeFileSync(${JSON.stringify(path.join(directory, "environment.json"))}, JS
     }
   }, 60000);
 
-  it.each([0x1, 0x3])("rejects explicit run roots with another ordinary user's read/read-write grant (%s) before spawn", async mask => {
+  it.skipIf(process.platform === "win32").each([0x1, 0x3])("rejects explicit run roots with another ordinary user's read/read-write grant (%s) before spawn", async mask => {
     const directory = privateDirectory("foreign-grant");
     const sid = native("([System.Security.Principal.WindowsIdentity]::GetCurrent().User.AccountDomainSid.Value) + '-424242'");
     grant(directory, sid, mask);
@@ -163,7 +182,7 @@ fs.writeFileSync(${JSON.stringify(path.join(directory, "environment.json"))}, JS
     expect(sddl(directory)).toBe(before);
   }, 30000);
 
-  it("rejects an existing read-public scratch directory even inside a private explicit run root", () => {
+  it.skipIf(process.platform === "win32")("rejects an existing read-public scratch directory even inside a private explicit run root", () => {
     const directory = privateDirectory("existing-scratch");
     const tmp = path.join(directory, "tmp");
     fs.mkdirSync(tmp);

@@ -239,6 +239,13 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     expect(runId).toBeTruthy();
     const runDirectory = path.join(runsDirectory, runId);
     const allocationIndex = allocations.mock.calls.findIndex(([directory]) => directory === runDirectory);
+    if (process.platform === "win32") {
+      expect(allocations).not.toHaveBeenCalled();
+      expect(fs.existsSync(runDirectory)).toBe(false);
+      scratchEvidence(`actor-auth-${queued}-${recreate}-${responseMode}`, { containment: "Windows inherited TEMP",
+        runId, perRunScratchEnabled: false, runRemovedImmediately: true });
+      return;
+    }
     expect(allocationIndex).toBeGreaterThanOrEqual(0);
     const allocation = allocations.mock.results[allocationIndex]!;
     expect(allocation.type).toBe("return");

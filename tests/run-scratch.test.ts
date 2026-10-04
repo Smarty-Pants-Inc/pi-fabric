@@ -64,7 +64,7 @@ describe("runner-owned scratch", () => {
     expect(safeRunTmpTree(tmp, () => false)).toBe(false);
   });
 
-  it("joins a replacement launch before disposing a proved-empty scope when stop races its handle", async () => {
+  it.skipIf(process.platform === "win32")("joins a replacement launch before disposing a proved-empty scope when stop races its handle", async () => {
     const root = sandbox();
     const worker = path.join(root, "retry-worker.mjs");
     const attempts = path.join(root, "attempts");
@@ -119,7 +119,7 @@ if (!failed) setInterval(() => {}, 1000);
     }
   }, 20_000);
 
-  it("joins actual worker exit before disposing scratch on scoped and unscoped hosts", async () => {
+  it.skipIf(process.platform === "win32")("joins actual worker exit before disposing scratch on scoped and unscoped hosts", async () => {
     const root = sandbox();
     const release = path.join(root, "release");
     const worker = path.join(root, "terminal-writer.mjs");

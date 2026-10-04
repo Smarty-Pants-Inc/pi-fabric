@@ -67,12 +67,10 @@ export class ProcessTransport implements AgentTransportAdapter {
     const statusIndex = request.workerArguments.findIndex((arg, index) => index % 2 === 0 && arg === "--status-file");
     const statusFile = statusIndex < 0 ? undefined : request.workerArguments[statusIndex + 1];
     if (!statusFile) throw new Error("Process transport requires a run status file for private scratch");
-    const allocation = allocateRunTmpDirectory(path.dirname(statusFile));
-    const temporaryDirectory = allocation.directory;
-    const temporaryEnvironment = {
-      TMPDIR: temporaryDirectory,
-      ...(process.platform === "win32" ? { TMP: temporaryDirectory, TEMP: temporaryDirectory } : {}),
-    };
+    // ponytail: smarty-dev#4800 — Windows inherits the user's normal TEMP;
+    // per-run private scratch/ACL work is deferred to the Windows isolation follow-up.
+    const allocation = process.platform === "win32" ? undefined : allocateRunTmpDirectory(path.dirname(statusFile));
+    const temporaryEnvironment = allocation ? { TMPDIR: allocation.directory } : {};
     const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
     if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const selected = selectWorkerRelease(request.workerPath);
@@ -112,9 +110,9 @@ export class ProcessTransport implements AgentTransportAdapter {
       executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // preserve Windows native-close/helper contract
-      allocation.scope,
+      allocation?.scope,
     ).catch(error => {
-      if (error instanceof WorkerNotStartedError) allocation.neverStarted();
+      if (error instanceof WorkerNotStartedError) allocation?.neverStarted();
       throw error;
     });
     return {
@@ -126,11 +124,11 @@ export class ProcessTransport implements AgentTransportAdapter {
       ...(processHandle.stopDebt ? { stopDebt: processHandle.stopDebt } : {}),
       async waitForClose() {
         await processHandle.waitForClose();
-        if (!processHandle.lostContact()) allocation.workerClosed(processHandle.pid);
+        if (!processHandle.lostContact()) allocation?.workerClosed(processHandle.pid);
       },
       async stop() {
         await processHandle.stop();
-        if (!processHandle.lostContact()) allocation.workerClosed(processHandle.pid);
+        if (!processHandle.lostContact()) allocation?.workerClosed(processHandle.pid);
       },
       closed: processHandle.closed,
     };

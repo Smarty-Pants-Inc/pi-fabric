@@ -411,6 +411,20 @@ describe("agent manager spawning primitives", () => {
     await manager.cleanup(result.id, true);
   });
 
+  it("rejects worktree setup before creating a worktree for a confined caller", async () => {
+    const repository = initRepository();
+    process.env.PI_FABRIC_WRITE_POLICY = JSON.stringify({
+      readOnly: false, writableRoots: [repository], shell: "deny",
+    });
+    const { manager } = createManager(repository);
+    await expect(manager.spawn({
+      task: "never launched", transport: "process", recursive: true, worktree: true,
+      worktreeSetup: process.platform === "win32" ? "echo escaped > escaped.txt" : "touch escaped.txt",
+    })).rejects.toThrow(/Confined agents cannot use worktreeSetup/);
+    expect(git(repository, "worktree", "list", "--porcelain")).not.toContain(".pi/fabric/worktrees");
+    expect(fs.existsSync(path.join(repository, "escaped.txt"))).toBe(false);
+  });
+
   it("runs the worktree setup hook and fails the run on a non-zero exit", async () => {
     const repository = initRepository();
     const { manager } = createManager(repository, {}, { worktree: { setup: "echo ready > setup.txt" } });

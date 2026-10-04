@@ -1244,6 +1244,12 @@ export class AgentManager {
     if (worktreeSetup !== undefined && (typeof worktreeSetup !== "string" || worktreeSetup.length > 8_192)) {
       throw new Error("worktreeSetup must be a shell command of at most 8192 characters");
     }
+    // Worktree setup is a host shell command. A confined caller cannot safely
+    // delegate it: the worktree does not exist yet, so its effective policy
+    // cannot be applied before the command runs. Reject inherited setup too.
+    if (worktreeSetup?.trim() && (this.#parentWritePolicy !== undefined || requestsWritePolicy(request))) {
+      throw new Error("Confined agents cannot use worktreeSetup; it would bypass the caller's shell/write policy");
+    }
     // Fail closed before admission or budget side effects.
     const scope = launchScope(request.scope, request.inheritedScope);
     const thinkingBounds = this.childThinkingBounds(request.thinkingBounds);

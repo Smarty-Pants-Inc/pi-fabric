@@ -346,6 +346,8 @@ export class FabricControlPlane {
   // Cancellation may become publishable after close, when an admitted command finally commits.
   // Its queue owns that final obligation until success/deadline; idle has no timer or resources.
   readonly #backgroundCancellations = new MeshBackgroundQueue("control cancellation");
+  // A proven-notRun request remains close-owned while waiting to resend.
+  readonly #resendWaits = new Set<() => void>();
   #closed = false;
   #paused = false;
   #releasePublicationFailed = false;
@@ -429,7 +431,7 @@ export class FabricControlPlane {
         !error.notRun
       ) throw error;
       const delayMs = retryDelayMs(0, 100, 1_000, Math.max(0, timeoutMs - this.#pollMs * 4));
-      await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+      await this.#waitForResend(delayMs);
       // The delay consumes the pre-existing second-attempt budget, not a new one.
       sent = await send(delayMs);
     }
@@ -444,6 +446,22 @@ export class FabricControlPlane {
       ...runningTaskWarningOf(acceptance as unknown as Record<string, unknown>, targetId),
       ...triggeredOf(acceptance as unknown as Record<string, unknown>),
     };
+  }
+
+  #waitForResend(delayMs: number): Promise<void> {
+    if (this.#closed) return Promise.reject(new Error("Fabric control plane closed"));
+    return new Promise<void>((resolve, reject) => {
+      const cancel = (): void => {
+        clearTimeout(timer);
+        this.#resendWaits.delete(cancel);
+        reject(new Error("Fabric control plane closed"));
+      };
+      const timer = setTimeout(() => {
+        this.#resendWaits.delete(cancel);
+        resolve();
+      }, delayMs);
+      this.#resendWaits.add(cancel);
+    });
   }
 
   async requestResult<T>(
@@ -479,6 +497,7 @@ export class FabricControlPlane {
     messageRequest = false,
     retryBudgetSpentMs = 0,
   ): Promise<{ commandId: string; acceptance: FabricControlAcceptance }> {
+    if (this.#closed) throw new Error("Fabric control plane closed");
     if (!this.options.enabled) {
       throw new Error("Fabric mesh is disabled; cannot control a remote participant");
     }
@@ -737,18 +756,20 @@ export class FabricControlPlane {
     await this.#polling;
     await Promise.all([...this.#activeHandlers]);
     await this.#backgroundCancellations.checkpointForRelease();
-    if (this.#activeCommands.size || this.#pending.size || this.#sharedClaims.size || this.#ownedCommands.size || this.#releasePublicationFailed) {
+    if (this.#activeCommands.size || this.#pending.size || this.#resendWaits.size || this.#sharedClaims.size || this.#ownedCommands.size || this.#releasePublicationFailed) {
       throw new Error("Control release has unsettled publication obligations");
     }
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
+    // Fence new requests before joining polls: a late notRun ACK must not arm a resend.
+    this.#closed = true;
+    for (const cancel of this.#resendWaits) cancel();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     await this.#polling?.catch(() => undefined);
     if (!this.#paused) await this.#drain().catch(() => undefined);
-    this.#closed = true;
     this.#sharedClaims.clear();
     const cancellations: Promise<void>[] = [];
     for (const id of [...this.#pending.keys()]) {

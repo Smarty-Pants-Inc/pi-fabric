@@ -270,6 +270,66 @@ describe("hosted runners", () => {
     expect(fake.calls).toContain("stop:confirmed");
     expect(fs.existsSync(path.join(manager.runDirectory(result.id)!, "hosted-exit.json"))).toBe(true);
   });
+  it("SR-6 stops terminal indeterminate session submissions on close and persists their owner", async () => {
+    const root = tempRoot();
+    const fake = fakeHosted("lost-reply", { onStart: () => { throw new Error("remote started, reply lost"); }, stopConfirmed: false });
+    register(fake.adapter);
+    const manager = managerFor(root, {}, { fabricSessionId: "owner-session" });
+    const result = await manager.run({ task: "Uncertain launch", runner: "lost-reply" });
+    expect(result).toMatchObject({ status: "failed", outcome: "indeterminate" });
+    await manager.close();
+    expect(fake.calls).toContain("stop:shutdown");
+    const state = JSON.parse(fs.readFileSync(path.join(root, result.id, "hosted.json"), "utf8"));
+    expect(state.stopObligation).toMatchObject({ runId: result.id, owner: "owner-session" });
+    expect(JSON.parse(fs.readFileSync(path.join(root, result.id, "status.json"), "utf8"))).toMatchObject({ status: "failed", outcome: "indeterminate" });
+  });
+
+  it("SR-6 restores stop custody for terminal unconfirmed durable runs without resubmitting", async () => {
+    const root = tempRoot();
+    const fake = fakeHosted("uncertain-stop", { stopConfirmed: false });
+    const stoppedLocators: unknown[] = [];
+    const stop = fake.adapter.stop;
+    fake.adapter.stop = (locator, reason) => { stoppedLocators.push(locator); return stop(locator, reason); };
+    register(fake.adapter);
+    const first = managerFor(root, {}, { fabricSessionId: "original-owner" });
+    const handle = await first.spawn({ task: "Retain control", runner: "uncertain-stop", residency: "durable" });
+    expect(await first.stop(handle.id)).toMatchObject({ status: "stopped", outcome: "indeterminate" });
+    await first.close();
+    const second = managerFor(root, {}, { fabricSessionId: "replacement-owner" });
+    expect(await second.recoverHostedRuns()).toEqual([handle.id]);
+    expect(await second.wait(handle.id)).toMatchObject({ status: "stopped", outcome: "indeterminate" });
+    expect(await second.stop(handle.id)).toMatchObject({ status: "stopped", outcome: "indeterminate" });
+    expect(stoppedLocators).toEqual([{ daemon: "local", job: handle.id }, { daemon: "local", job: handle.id }]);
+    expect(fake.calls.filter(call => call.startsWith("start:"))).toHaveLength(1);
+    expect(fake.calls.filter(call => call.startsWith("attach:"))).toHaveLength(0);
+    expect(JSON.parse(fs.readFileSync(path.join(root, handle.id, "hosted.json"), "utf8")).stopObligation)
+      .toMatchObject({ runId: handle.id, owner: "original-owner" });
+  });
+
+  it("SR-6 retains the absolute deadline after an indeterminate result", async () => {
+    const fake = fakeHosted("terminal-deadline", { onStart: () => { throw new Error("reply lost"); }, stopConfirmed: false });
+    register(fake.adapter);
+    const manager = managerFor(tempRoot(), { timeoutMs: 1000 });
+    const result = await manager.run({ task: "Lost reply", runner: "terminal-deadline", timeoutMs: 1000 });
+    expect(result.outcome).toBe("indeterminate");
+    await waitFor(() => fake.calls.includes("stop:timeout"), 3000);
+    expect(manager.status(result.id)).toMatchObject({ status: "failed", outcome: "indeterminate" });
+  });
+
+  it("SR-6 confirmed release ends control custody but never repairs the indeterminate outcome", async () => {
+    const root = tempRoot();
+    const fake = fakeHosted("released-terminal", { onStart: () => { throw new Error("reply lost"); } });
+    register(fake.adapter);
+    const first = managerFor(root);
+    const result = await first.run({ task: "Lost reply", runner: "released-terminal", residency: "durable" });
+    expect(await first.stop(result.id)).toMatchObject({ status: "failed", outcome: "indeterminate" });
+    await first.close();
+    const second = managerFor(root);
+    expect(await second.recoverHostedRuns()).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(path.join(root, result.id, "status.json"), "utf8"))).toMatchObject({ status: "failed", outcome: "indeterminate" });
+    expect(fake.calls.filter(call => call.startsWith("start:"))).toHaveLength(1);
+  });
+
   it("persists the locator before start, routes questions, and finishes", async () => {
     const root = tempRoot();
     const fake = fakeHosted("daemon", {

@@ -70,6 +70,7 @@ import { ProcessTransport } from "./transports/process-transport.js";
 import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
+import { confirmedHostedRelease } from "./hosted-exit.js";
 import { resolveAgentSpawner } from "./spawner.js";
 import type {
   AgentSpawner,
@@ -2017,6 +2018,7 @@ export class AgentManager {
 
   #hostedHooks(managed: () => ManagedAgent | undefined): HostedRunHooks {
     return {
+      ownerId: this.#fabricSessionId ?? this.#identityId ?? this.#spawner?.id,
       questionTimeoutMs: this.config.childQuestionTimeoutMs ?? DEFAULT_CHILD_QUESTION_TIMEOUT_MS,
       ...(this.config.childQuestions === "route" && this.#onChildQuestion
         ? {
@@ -2122,7 +2124,10 @@ export class AgentManager {
         !state ||
         record.id !== entry ||
         state.context.id !== entry ||
-        terminalStatuses.has(record.status)
+        state.runner !== record.runner ||
+        path.resolve(state.context.runDirectory) !== path.resolve(runDirectory) ||
+        (state.stopObligation !== undefined && (state.stopObligation.runId !== entry || !state.stopObligation.owner)) ||
+        (terminalStatuses.has(record.status) && (state.neverSubmitted === true || confirmedHostedRelease(runDirectory, record)))
       ) {
         continue;
       }
@@ -2168,7 +2173,10 @@ export class AgentManager {
         this.#hostedHooks(() => managed),
       );
       managed = this.#adoptHosted(hosted, { release: () => {}, recovered: true });
-      await hosted.attach();
+      await hosted.resumeCustody();
+      // Terminal observation cannot revoke execution control. Rebuild custody,
+      // preserve the result, and never attach/resubmit a settled observation.
+      if (!hosted.terminal) await hosted.attach();
       void this.#monitor(managed, Math.max(0, state.context.deadlineAt - Date.now()));
       recovered.push(entry);
     }
@@ -2973,10 +2981,11 @@ export class AgentManager {
     for (const id of this.#pendingAbandonment) this.#retryAbandonment(id);
     // Adapter-owned durable runs detach; native workers still require proven exit.
     const detached = [...this.#runs.values()].filter(
-      (managed) => !managed.settled && managed.hosted && managed.residency === "durable",
+      (managed) => managed.hosted && !managed.hosted.executionReleased && managed.residency === "durable",
     );
     for (const managed of detached) managed.hosted!.detach();
-    const running = [...this.#runs.values()].filter((managed) => !managed.settled && !detached.includes(managed));
+    const running = [...this.#runs.values()].filter((managed) =>
+      (!managed.settled || (managed.hosted && !managed.hosted.executionReleased)) && !detached.includes(managed));
     for (const managed of running) managed.hosted?.markShutdown();
     const lastEventAt = new Map(running.map((managed) => [managed.id, lastEventTime(managed)]));
     const stopped = await Promise.allSettled([
@@ -3008,6 +3017,7 @@ export class AgentManager {
     const all = [...this.#runs.values()].filter((managed) => !detached.includes(managed));
     for (const managed of all) if (managed.settlementSaveFailure) this.#saveSettledResult(managed, managed.settlementSaveFailure.result);
     await Promise.allSettled(all.flatMap(managed => [managed.processStop, managed.nativeReleasePending]));
+    await Promise.allSettled([...this.#runs.values()].map(managed => managed.hosted?.suspendCustody()));
     await Promise.allSettled(all.map((managed) => this.#waitForTransportExit(managed)));
     const transports = [...all.map((managed) => managed.transport), ...this.#unregisteredTransports];
     // Lost contact is not an exit: such a worker may still use its files.

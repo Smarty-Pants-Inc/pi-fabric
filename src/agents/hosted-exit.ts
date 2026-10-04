@@ -76,10 +76,10 @@ export const writeConfirmedHostedExit = (
   writeJsonAtomic(path.join(directory, HOSTED_EXIT_FILE), receipt, { durable: true });
 };
 
-/** Offline collection requires the same persisted run, locator and explicit stop receipt. */
-export const confirmedHostedExit = (directory: string, record: HostedExitRecord): boolean => {
+/** Control custody can end on confirmed release even when the logical outcome stays indeterminate. */
+export const confirmedHostedRelease = (directory: string, record: HostedExitRecord): boolean => {
   try {
-    if (record.transport !== "hosted" || !terminal.has(record.status ?? "") || record.outcome !== undefined) return false;
+    if (record.transport !== "hosted" || !terminal.has(record.status ?? "")) return false;
     const receipt = readOwned(path.join(directory, HOSTED_EXIT_FILE)) as unknown as HostedExitReceipt | undefined;
     return !!receipt && receipt.version === 1 && receipt.id === record.id && receipt.runner === record.runner &&
       receipt.runDirectory === path.resolve(directory) && receipt.startedAt === record.startedAt &&
@@ -88,3 +88,7 @@ export const confirmedHostedExit = (directory: string, record: HostedExitRecord)
       typeof receipt.locatorDigest === "string" && /^[a-f0-9]{64}$/.test(receipt.locatorDigest) && matchesState(directory, receipt);
   } catch { return false; }
 };
+
+/** Collection still refuses an indeterminate outcome; release is not a repaired result. */
+export const confirmedHostedExit = (directory: string, record: HostedExitRecord): boolean =>
+  record.outcome === undefined && confirmedHostedRelease(directory, record);

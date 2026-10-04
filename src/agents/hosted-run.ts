@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import { writeConfirmedHostedExit } from "./hosted-exit.js";
+import { confirmedHostedRelease, writeConfirmedHostedExit } from "./hosted-exit.js";
 import type {
   FabricHostedLiveness,
   FabricHostedReporter,
@@ -48,6 +48,10 @@ export interface HostedRunState {
   runner: string;
   locator: unknown;
   context: FabricHostedRunContext;
+  /** Execution custody is independent of terminal result settlement. */
+  stopObligation?: { runId: string; owner: string };
+  /** An abandoned prepared locator was never submitted. */
+  neverSubmitted?: true;
 }
 
 export interface HostedRunFiles {
@@ -58,6 +62,8 @@ export interface HostedRunFiles {
 }
 
 export interface HostedRunHooks {
+  /** Stable host/session identity that owns teardown, persisted before submission. */
+  ownerId?: string | undefined;
   /** Route a dialog through the parent (UI or decision); absent when childQuestions is not "route". */
   ask?: (question: Record<string, unknown>) => Promise<AgentChildQuestionResponse>;
   questionTimeoutMs: number;
@@ -126,10 +132,13 @@ export class HostedRun {
   #record: AgentRunRecord;
   /** Settled or detached: adapter reports are ignored from here on. */
   #closed = false;
-  /** The adapter confirmed release, or the owner explicitly detached. */
+  /** Only an adapter-confirmed release (or proven non-submission) ends execution custody. */
   #released = false;
   #detached = false;
   #shutdown = false;
+  readonly #stopOwner: string;
+  #custodyDeadline: ReturnType<typeof setTimeout> | undefined;
+  #stopping: Promise<void> | undefined;
   #pendingQuestions = 0;
   #deliveries: Promise<void> = Promise.resolve();
   lastLiveness: FabricHostedLiveness = "running";
@@ -142,7 +151,9 @@ export class HostedRun {
     readonly files: HostedRunFiles,
     record: AgentRunRecord,
     readonly hooks: HostedRunHooks,
+    stopOwner = hooks.ownerId || context.lineage.parentSessionId || context.lineage.rootSessionId || context.runDirectory,
   ) {
+    this.#stopOwner = stopOwner;
     this.#record = record;
     this.handle = {
       kind: "hosted",
@@ -170,8 +181,7 @@ export class HostedRun {
   ): Promise<HostedRun> {
     const locator = checkedLocator(adapter.id, await withTimeout(() => adapter.prepare(context), `${adapter.id}.prepare`));
     const run = new HostedRun(adapter, locator, context, files, { ...record, hosted: { locator } }, hooks);
-    const state: HostedRunState = { version: 1, runner: adapter.id, locator, context };
-    writeJsonAtomic(files.stateFile, state, { space: 2 });
+    run.#persistCustody();
     run.#write();
     return run;
   }
@@ -184,7 +194,11 @@ export class HostedRun {
     record: AgentRunRecord,
     hooks: HostedRunHooks,
   ): HostedRun {
-    return new HostedRun(adapter, state.locator, state.context, files, { ...record, hosted: { locator: state.locator } }, hooks);
+    const run = new HostedRun(adapter, state.locator, state.context, files, { ...record, hosted: { locator: state.locator } }, hooks, state.stopObligation?.owner);
+    run.#released = state.neverSubmitted === true || confirmedHostedRelease(state.context.runDirectory, record);
+    run.#closed = run.terminal;
+    if (!run.#released) run.#persistCustody();
+    return run;
   }
 
   get record(): AgentRunRecord {
@@ -193,6 +207,33 @@ export class HostedRun {
 
   get terminal(): boolean {
     return TERMINAL.has(this.#record.status);
+  }
+
+  get executionReleased(): boolean { return this.#released; }
+
+  #persistCustody(neverSubmitted = false): void {
+    const state: HostedRunState = { version: 1, runner: this.adapter.id, locator: this.locator, context: this.context,
+      ...(neverSubmitted ? { neverSubmitted: true as const } : { stopObligation: { runId: this.context.id, owner: this.#stopOwner } }) };
+    writeJsonAtomic(this.files.stateFile, state, { space: 2, durable: true });
+  }
+
+  /** Restore a deadline owner even if observation already has a terminal result. */
+  async resumeCustody(): Promise<void> {
+    if (this.#released || this.#detached) return;
+    if (Date.now() >= this.context.deadlineAt) { await this.stop(); return; }
+    this.#custodyDeadline ??= setTimeout(() => {
+      this.#custodyDeadline = undefined;
+      if (Date.now() < this.context.deadlineAt) { void this.resumeCustody().catch(() => undefined); return; }
+      void this.stop().catch(() => { /* The durable obligation remains retryable. */ });
+    }, Math.min(2_147_483_647, this.context.deadlineAt - Date.now()));
+    this.#custodyDeadline.unref?.();
+  }
+
+  /** Join any deadline stop before transferring the obligation to the next host. */
+  async suspendCustody(): Promise<void> {
+    clearTimeout(this.#custodyDeadline);
+    this.#custodyDeadline = undefined;
+    await this.#stopping;
   }
 
   /** Submit once. A failed submission may still have started remote work. */
@@ -207,6 +248,8 @@ export class HostedRun {
         return;
       }
       this.#settle({ status: "failed", error: `Hosted runner start failed: ${message(error)}`, outcome: "indeterminate" });
+    } finally {
+      await this.resumeCustody();
     }
   }
 
@@ -238,7 +281,12 @@ export class HostedRun {
     return this.#record;
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (this.#released) return Promise.resolve();
+    return this.#stopping ??= this.#stop().finally(() => { this.#stopping = undefined; });
+  }
+
+  async #stop(): Promise<void> {
     if (this.#released) return;
     const reason: FabricRunStopReason = Date.now() >= this.context.deadlineAt
       ? "timeout"
@@ -260,6 +308,7 @@ export class HostedRun {
       await withTimeout(() => this.adapter.abort!(this.locator, reason), `${this.adapter.id}.abort`).catch(() => undefined);
     }
     this.#released = confirmed;
+    if (confirmed) { clearTimeout(this.#custodyDeadline); this.#custodyDeadline = undefined; }
     if (this.terminal) return;
     const base = reason === "timeout"
       ? `Agent timed out after ${Math.max(0, this.context.deadlineAt - this.#record.startedAt)}ms`
@@ -278,6 +327,7 @@ export class HostedRun {
 
   /** Settle a prepared run that was never submitted; recovery must not attach to it. */
   abandon(error: string): void {
+    this.#persistCustody(true);
     this.#released = true; // Never submitted: there is no remote execution to release.
     this.#settle({ status: "failed", error });
     this.#closed = true;
@@ -285,8 +335,11 @@ export class HostedRun {
 
   /** Keep the remote run alive and stop observing it; recovery re-attaches. */
   detach(): void {
+    // The on-disk obligation, not result settlement, transfers to recovery.
+    this.#persistCustody();
+    clearTimeout(this.#custodyDeadline);
+    this.#custodyDeadline = undefined;
     this.#closed = true;
-    this.#released = true;
     this.#detached = true;
   }
 

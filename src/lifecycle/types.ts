@@ -13,6 +13,7 @@ export const FABRIC_LIFECYCLE_EVENTS = [
   "pi.agent_settled",
   "pi.tool_error",
   "pi.session_compact",
+  "run.spawned",
   "run.completed",
   "run.failed",
   "run.stopped",

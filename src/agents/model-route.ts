@@ -34,6 +34,8 @@ export interface ModelRouteDecision extends RouteCandidate {
   /** Durable activation identity; never inferred from task text. */
   actorId?: string;
   activationId?: string;
+  /** Accepted exception for the dispatched pin; never sent to Choice inference. */
+  modelReason?: string;
   pin: RouteCandidate;
   candidates: RouteCandidate[];
   shadowChoice: RouteCandidate;
@@ -57,7 +59,7 @@ export function routeLaunchCandidate(decision: ModelRouteDecision): RouteCandida
 /** One finite Choice. No prompt, task text, history, credentials or generated reason leaves Fabric. */
 export async function decideModelRoute(input: {
   routeClass: string; protected: unknown; pin: RouteCandidate; candidates: RouteCandidate[];
-  parentSessionId: string; candidatesValid?: boolean; actorId?: string; activationId?: string;
+  parentSessionId: string; candidatesValid?: boolean; actorId?: string; activationId?: string; modelReason?: string;
   live?: boolean; revertReset?: string;
 }, evaluate: RouteEvaluate, signal?: AbortSignal): Promise<ModelRouteDecision> {
   const started = performance.now();
@@ -67,6 +69,7 @@ export async function decideModelRoute(input: {
   const decision: ModelRouteDecision = {
     ...input.pin, decisionId: allocateDecisionId(), mode: "shadow",
     routeClass: input.routeClass, parentSessionId: input.parentSessionId, pin: { ...input.pin },
+    ...(input.modelReason !== undefined ? { modelReason: input.modelReason } : {}),
     ...(input.actorId ? { actorId: input.actorId, activationId: input.activationId } : {}),
     candidates, shadowChoice: { ...input.pin }, confidence: null, probability: null,
     reasonCode: "jev-error", latencyMs: 0,
@@ -436,6 +439,7 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
         status: result.status, admittedModel: result.admittedModel ?? (result.status === "completed" ? result.model ?? null : null),
         admittedEffort: result.admittedThinking ?? (result.status === "completed" ? result.thinking ?? null : null),
         observedModel: result.model ?? null,
+        ...(decision.modelReason !== undefined ? { modelReason: decision.modelReason } : {}),
         tokens: result.usage ?? null, routeQuality: result.routeQuality ?? null, reasonCode: decision.reasonCode, at: Date.now() };
       try {
         if (decision.mode === "live") {

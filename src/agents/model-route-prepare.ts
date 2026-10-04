@@ -6,7 +6,7 @@ import { decideModelRoute, isRouteClassReverted, ROUTABLE_CLASSES, type ModelRou
 /** Shared auto-task/actor preparation: exact pins, finite authenticated candidates, one shadow Choice. */
 export async function prepareModelRoute(input: {
   routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown;
-  parentSessionId: string; actorId?: string; activationId?: string;
+  parentSessionId: string; actorId?: string; activationId?: string; modelReason?: string;
   registry: PiModelRegistryView; aliases: FabricModelAliases; config?: ModelRoutingConfig | undefined;
   assertModelAllowed: (model: string) => void; evaluate: RouteEvaluate; signal?: AbortSignal | undefined;
 }): Promise<ModelRouteDecision> {
@@ -55,6 +55,7 @@ export async function prepareModelRoute(input: {
   }
   const decision = await decideModelRoute({ routeClass: input.routeClass, protected: input.protected, pin, candidates,
     candidatesValid, live, revertReset: reset, parentSessionId: input.parentSessionId,
+    ...(input.modelReason !== undefined ? { modelReason: input.modelReason } : {}),
     ...(input.actorId ? { actorId: input.actorId } : {}), ...(input.activationId ? { activationId: input.activationId } : {}) }, input.evaluate, input.signal);
   if (revertReason) { decision.mode = "shadow"; decision.reasonCode = revertReason; Object.assign(decision, pin); }
   return decision;

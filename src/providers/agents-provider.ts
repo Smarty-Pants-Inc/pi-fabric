@@ -584,6 +584,7 @@ export class AgentsProvider implements FabricProvider {
     const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
     const routeDecision = await prepareModelRoute({ routeClass: args.routeClass, protected: args.protected,
       pinModel, pinThinking, config, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases,
+      ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}),
       parentSessionId: context.extensionContext.sessionManager?.getSessionId() ?? this.participants.self().sessionId ?? "unknown",
       assertModelAllowed: model => this.manager.assertModelAllowed(model, "pi"),
       evaluate: (request, signal) => this.routeEvaluate(request, signal, context), signal: context.signal });
@@ -774,11 +775,12 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
-    // Guard only explicit public launch selections, never inherited/default models.
-    if ((actionName === "run" || actionName === "spawn" || actionName === "create" || actionName === "createActor") &&
-      typeof args.model === "string" && args.model.trim() === "cliproxyapi/gpt-6-astra" &&
-      !(typeof args.modelReason === "string" && args.modelReason.trim())) {
-      throw new Error("named passes use cliproxyapi/gpt-6.1-sol thinking max; otherwise omit model (role default)");
+    // Only explicit public selections: inherited/default models and existing actors are untouched.
+    if (actionName === "run" || actionName === "spawn" || actionName === "create" || actionName === "createActor") {
+      const runner = args.runner === "pi" || args.runner === "claude" || args.runner === "veda" ? args.runner : this.manager.config.runner;
+      const inherited = runner === "pi" && args.scope !== "global" ? context.extensionContext.model : undefined;
+      this.manager.assertExplicitModelReason(args.model, args.modelReason, runner,
+        inherited ? `${inherited.provider}/${inherited.id}` : undefined);
     }
     switch (actionName) {
       case "run": {
@@ -1391,16 +1393,18 @@ export class AgentsProvider implements FabricProvider {
         if (args.scope === "global") {
           const template = this.globalActors.resolve(id);
           if (!template) throw new Error(`Unknown global actor: ${id}`);
+          this.manager.assertExplicitModelReason(model, args.modelReason, template.runner);
           const resolved = model && template.runner === "pi"
             ? template.routeClass !== undefined
               ? { model: (await this.#resolvePiRunBinding({ model }, "pi", context, true)).model! }
               : await this.#resolvePiModelSelection(model, context)
             : { model };
           checkCommit();
-          return { ...this.globalActors.update(template.id, { model: resolved.model }), ...modelResolutionMetadata(resolved) };
+          return { ...this.globalActors.update(template.id, { model: resolved.model, ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}) }), ...modelResolutionMetadata(resolved) };
         }
         const target = this.#resolveActorTarget(id);
         const runner = target.actor?.runner ?? target.participant!.runner;
+        this.manager.assertExplicitModelReason(model, args.modelReason, runner);
         const resident = this.#residentActorOwner(id);
         const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;
         const resolved = model && target.actor?.routeClass !== undefined
@@ -1411,6 +1415,7 @@ export class AgentsProvider implements FabricProvider {
         if (resident) {
           const actor = await this.#setResidentActor(resident, {
             operation: "setModel", id: resident.id, ...(resolvedModel ? { model: resolvedModel } : {}),
+            ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}),
             scope: args.scope === "project" ? "project" : "session",
           }, context);
           return { ...actor, ...modelResolutionMetadata(resolved) };
@@ -1420,6 +1425,7 @@ export class AgentsProvider implements FabricProvider {
           resolvedModel,
           args.scope === "project" ? "project" : "session",
           checkCommit,
+          typeof args.modelReason === "string" ? args.modelReason : undefined,
         );
         return { ...actor, ...modelResolutionMetadata(resolved) };
       }

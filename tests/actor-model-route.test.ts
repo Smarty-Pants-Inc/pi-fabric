@@ -12,6 +12,7 @@ import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { resolvePiRoutePin } from "../src/core/model-refresh.js";
 import { JevClient } from "../src/jev/client.js";
 import type { JevResponse } from "../src/jev/types.js";
+import type { FabricLifecyclePublishRequest } from "../src/lifecycle/types.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -43,8 +44,10 @@ const actorSpec = { name: "supervisor", instructions: "Status only or no-op.", r
 const setup = (routePolicy = policy(), routeConfig = { ...config, liveClasses: [] as string[] }) => {
   const dir = root();
   const mesh = new MeshStore(path.join(dir, "mesh"), 64 * 1024, 100);
+  const lifecycle: FabricLifecyclePublishRequest[] = [];
   const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, modelRouting: routeConfig, retainRuns: true }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"),
+    onLifecycle: event => lifecycle.push(event),
     preparePiModel: async (model, requiredPin) => {
       if (!requiredPin) return model;
       const exact = await resolvePiRoutePin({ selector: model ?? "", registry, aliases: {} });
@@ -66,7 +69,7 @@ const setup = (routePolicy = policy(), routeConfig = { ...config, liveClasses: [
   const identity = { id: "session:owner", name: "main", kind: "main" as const, sessionId: "owner" };
   const actors = new ActorManager("owner", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, options);
   closers.push(() => actors.close());
-  return { actors, agents, dir, mesh, options, identity };
+  return { actors, agents, dir, mesh, options, identity, lifecycle };
 };
 const flag = (args: string[], key: string) => args[args.indexOf(key) + 1];
 
@@ -155,6 +158,33 @@ describe("actor status-groom shadow routing", () => {
       expect(decision).toMatchObject({ mode: "live", actorId: actor.id });
       expect(records().find(row => row.type === "outcome" && row.decisionId === decision.decisionId)).toMatchObject({ admittedModel: cheap.model, admittedEffort: cheap.effort });
     }
+  });
+  it.each([[false, false], [true, false], [false, true], [true, true]])("preserves the effective exception in routed activation records and run.spawned (session override: %s, live: %s)", async (sessionOverride, live) => {
+    const evaluate = vi.spyOn(JevClient.prototype, "evaluate").mockImplementation(async () => answer());
+    const { actors, agents, dir, lifecycle } = setup(policy(), { ...config, liveClasses: live ? ["status-groom"] : [] });
+    const creationReason = "  Named creation exception  ";
+    const sessionReason = "  Named session binding exception  ";
+    const actor = await actors.create({ ...actorSpec, modelReason: creationReason });
+    if (sessionOverride) await actors.setModel(actor.id, cheap.model, "session", undefined, sessionReason);
+    const modelReason = sessionOverride ? sessionReason : creationReason;
+    const pinModel = sessionOverride ? cheap.model : pin.model;
+    const model = live ? cheap.model : pinModel;
+    await actors.ask(actor.id, "ECHO_MODEL", "test");
+    const decision = records().find(row => row.type === "decision")!;
+    expect(decision).toMatchObject({ modelReason, mode: live ? "live" : "shadow", pin: { model: pinModel, effort: pin.effort } });
+    expect(records().find(row => row.type === "outcome")).toMatchObject({ modelReason });
+    expect(agents.status(decision.runId)).toMatchObject({ model, modelReason, status: "completed" });
+    expect(lifecycle.find(event => event.event === "run.spawned")).toMatchObject({
+      runId: decision.runId, data: { model, modelReason },
+    });
+    for (const file of [path.join(dir, "runs", decision.runId, "status.json"),
+      path.join(dir, "actors", actor.id, "runs", decision.runId, "status.json")]) {
+      await vi.waitFor(() => expect(fs.existsSync(file)).toBe(true));
+      expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ model, modelReason });
+    }
+    expect(actors.definition(actor.id).modelReason).toBe(creationReason);
+    expect(JSON.stringify(evaluate.mock.calls)).not.toContain(modelReason.trim());
+
   });
   it.each([true, undefined])("does not route protected or unknown actor state: %s", async protectedFlag => {
     const evaluate = vi.spyOn(JevClient.prototype, "evaluate").mockImplementation(async () => answer());

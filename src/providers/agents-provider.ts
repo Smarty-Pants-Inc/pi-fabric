@@ -584,6 +584,7 @@ export class AgentsProvider implements FabricProvider {
     const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
     const routeDecision = await prepareModelRoute({ routeClass: args.routeClass, protected: args.protected,
       pinModel, pinThinking, config, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases,
+      ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}),
       parentSessionId: context.extensionContext.sessionManager?.getSessionId() ?? this.participants.self().sessionId ?? "unknown",
       assertModelAllowed: model => this.manager.assertModelAllowed(model, "pi"),
       evaluate: (request, signal) => this.routeEvaluate(request, signal, context), signal: context.signal });

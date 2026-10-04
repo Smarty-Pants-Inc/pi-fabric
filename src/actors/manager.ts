@@ -61,7 +61,7 @@ import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { ModelRoutePinError } from "../core/model-refresh.js";
 
 export interface ActorModelRouteInput {
-  routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown;
+  routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown; modelReason?: string;
   parentSessionId: string; actorId: string; activationId: string;
 }
 
@@ -2553,11 +2553,12 @@ export class ActorManager {
             ? await this.#prepare(actor, "binding", () => {
               if (!this.#prepareModelRoute) throw new Error("Actor shadow routing host unavailable");
               return this.#prepareModelRoute({ routeClass: actor.routeClass!, protected: actor.protected,
-                pinModel: binding.model, pinThinking: binding.thinking, parentSessionId: this.sessionId,
+                pinModel: binding.model, pinThinking: binding.thinking,
+                ...(binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}), parentSessionId: this.sessionId,
                 actorId: actor.id, activationId: item.id }, abortController.signal);
             })
             : undefined;
-          const launchBinding = routeDecision ? { model: routeDecision.pin.model, thinking: routeDecision.pin.effort }
+          const launchBinding = routeDecision ? { ...binding, model: routeDecision.pin.model, thinking: routeDecision.pin.effort }
             : await this.#prepare(actor, "binding", () => this.#resolvedRunBinding(actor, binding));
           // Admission is held, but no child writer has launched yet. Repair/create
           // the native session before handing its path to the process.

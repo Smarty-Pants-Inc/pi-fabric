@@ -897,13 +897,17 @@ describe('model: "auto" spawn routing (#2890)', () => {
     const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
     const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
       agentsConfig: { modelRouting: { shadowCandidates: [{ model: "provider/model-b", effort: "medium" }] } } });
-    const handle = await provider.invoke("spawn", { ...request, cwd: root }, context) as AgentHandleInfo & { routeDecision: { model: string } };
-    expect(handle).toMatchObject({ model: "provider/model-a", thinking: "high", routeDecision: { model: "provider/model-b", effort: "medium", reasonCode: "shadow-choice" } });
+    const modelReason = "  Named routed-task exception  ";
+    const handle = await provider.invoke("spawn", { ...request, cwd: root, modelReason }, context) as AgentHandleInfo & { routeDecision: { model: string } };
+    expect(handle).toMatchObject({ model: "provider/model-a", modelReason, thinking: "high", routeDecision: { model: "provider/model-b", modelReason, effort: "medium", reasonCode: "shadow-choice" } });
     const result = await agents.wait(handle.id);
-    expect(result).toMatchObject({ status: "completed", model: "provider/model-a", thinking: "high",
+    expect(result).toMatchObject({ status: "completed", model: "provider/model-a", modelReason, thinking: "high",
       routeClass: "bounded-lookup", routeClassSource: "explicit", protected: false });
     const rows = fs.readFileSync(path.join(process.env.PI_CODING_AGENT_DIR!, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows).toHaveLength(2); expect(rows[1].decisionId).toBe(rows[0].decisionId);
+    for (const row of rows) expect(row.modelReason).toBe(modelReason);
+    expect(agents.status(handle.id).modelReason).toBe(modelReason);
+    expect(JSON.stringify(evaluate.mock.calls)).not.toContain(modelReason.trim());
     expect(evaluate).toHaveBeenCalledTimes(1);
   });
   it.each([true, undefined])("excludes protected/unknown before Jev at the public API: %s", async protectedFlag => {

@@ -262,7 +262,7 @@ export const spawnDetached = async (
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
   scope?: { executable: string; slice: string; warn: (reason: string) => void },
-): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
   // --scope execs its command in place. The shell records successful scope admission
@@ -308,6 +308,7 @@ export const spawnDetached = async (
   child.unref();
   const handle = {
     pid,
+    closed,
     lostContact: () => lost,
     async waitForClose() {
       let deadline: ReturnType<typeof setTimeout> | undefined;

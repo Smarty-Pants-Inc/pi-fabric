@@ -409,6 +409,8 @@ export interface AgentTransportHandle {
   observe?(options?: AgentTransportObservationOptions): Promise<AgentTransportObservation>;
   /** Bounded join of the captured process worker's native close (not PID absence). */
   waitForClose?(): Promise<void>;
+  /** Passive native close notification; wakes monitoring, never itself grants collection. */
+  closed?: Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;
 }

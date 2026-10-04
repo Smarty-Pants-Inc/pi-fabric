@@ -107,6 +107,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       isAlive: processHandle.isAlive,
       lostContact: processHandle.lostContact,
       waitForClose: processHandle.waitForClose,
+      closed: processHandle.closed,
       stop: processHandle.stop,
     };
   }

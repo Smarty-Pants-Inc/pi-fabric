@@ -1,3 +1,4 @@
+import { retryDelayMs } from "./retry-backoff.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -180,8 +181,7 @@ const sameInode = (left: Inode, right: Inode): boolean => left.dev === right.dev
  * A second walk detects replacements, including links retargeted to the SAME inode.
  * Windows skips unsupported directory fsync, but still binds the opened receipt.
  */
-export const syncPathNamespace = (target: string, receipt?: Inode): void => {
-  const walk = () => {
+const namespaceSnapshot = (target: string, receipt?: Inode) => {
     const absolute = path.isAbsolute(target) ? target : `${process.cwd()}${path.sep}${target}`;
     const split = (value: string) => value.split(path.sep === "\\" ? /[\\/]+/ : /\/+/);
     let current = path.parse(absolute).root;
@@ -236,8 +236,10 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
     if (receipt && !sameInode(receipt, endpoint)) throw new Error("Session receipt inode changed during namespace confirmation");
     parents.push(endpoint.isDirectory() ? current : path.dirname(current));
     return { entries, directories, parents };
-  };
-  const before = walk();
+};
+
+export const syncPathNamespace = (target: string, receipt?: Inode): void => {
+  const before = namespaceSnapshot(target, receipt);
   if (process.platform !== "win32") {
     const synced = new Set<string>();
     for (const parent of before.parents.reverse()) {
@@ -256,11 +258,30 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
       }
     }
   }
-  if (JSON.stringify(walk().entries) !== JSON.stringify(before.entries)) {
+  if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
     throw new Error("Namespace changed during durability barriers");
   }
 };
 
+/** Same namespace fence as the synchronous writer, with barriers off the event loop.
+ * Always confirm all parent entries: an unchanged ancestor inode does not prove
+ * that a newly created or replaced child directory is durably linked. */
+export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Promise<void> => {
+  const before = namespaceSnapshot(target, receipt);
+  if (process.platform !== "win32") {
+    for (const [directory, expected] of [...before.directories].reverse()) {
+      const handle = await fs.promises.open(directory, fs.constants.O_RDONLY);
+      try {
+        const opened = await handle.stat();
+        if (!opened.isDirectory() || !sameInode(opened, expected)) throw new Error("Namespace directory changed before barrier");
+        await handle.sync();
+      } finally { await handle.close(); }
+    }
+  }
+  if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
+    throw new Error("Namespace changed during durability barriers");
+  }
+};
 /** Existence is not a receipt; retry every required directory barrier without a cache. */
 export const syncDirectoryChain = (directory: string): void => {
   if (process.platform !== "win32") syncPathNamespace(directory);
@@ -320,6 +341,35 @@ export const writeFileAtomic = (
     fs.rmSync(temporary, { force: true });
   }
 };
+
+/** A single-owner writer (or used under its protocol lock). Equal bytes may skip
+ * only a soft-state replacement; durable writes always establish fresh barriers.
+ */
+export class AtomicFileWriter {
+  constructor(readonly file: string) {}
+
+  #stamp(): string {
+    const stat = fs.statSync(this.file);
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  }
+
+  write(contents: string, options?: AtomicWriteOptions): boolean {
+    let unchanged = false;
+    try {
+      const before = this.#stamp();
+      const current = readFileRetrying(this.file);
+      const after = this.#stamp();
+      unchanged = before === after && current === contents;
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+    }
+    // The retained equal-bytes cache is a soft-state optimization only. Durable
+    // writes are receipts: always replace, fsync, and re-confirm the namespace.
+    if (unchanged && !options?.durable) return false;
+    writeFileAtomic(this.file, contents, options);
+    return true;
+  }
+}
 
 export interface ExclusiveLockOptions {
   directory: string;
@@ -571,11 +621,14 @@ export class MeshBackgroundRetry {
       return false;
     }
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
-    this.#retryAt = Date.now() + this.#delay;
+    // Keep the exponential ceiling separate from the randomized draw. Timers
+    // have a 1ms scheduling floor so a zero draw cannot form a microtask spin.
+    const delayMs = Math.max(1, retryDelayMs(0, this.#delay, this.maxMs));
+    this.#retryAt = Date.now() + delayMs;
     if (!this.#reported) {
       // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
       // not once per poll, which would flood a throttled host's stderr.
-      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${this.#delay} ms: ${error instanceof Error ? error.message : String(error)}`);
+      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
       this.#reported = true;
     }
     return transient;

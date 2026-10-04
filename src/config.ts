@@ -165,6 +165,8 @@ export interface FabricAgentConfig {
   enabled: boolean;
   runner: FabricAgentRunner;
   transport: FabricAgentTransport;
+  /** Host-only Linux user scope slice; unset launches workers directly. */
+  processSlice?: string;
   model?: string;
   /** Host-only fleet policy; workspace configuration cannot override these keys. */
   deniedModels: string[];
@@ -1054,6 +1056,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       enabled: booleanValue(agents.enabled, DEFAULT_FABRIC_CONFIG.agents.enabled),
       runner: runnerValue(agents.runner, DEFAULT_FABRIC_CONFIG.agents.runner),
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
+      ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
+        ? { processSlice: agents.processSlice } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
         ? { modelRouting: (() => {
@@ -1608,6 +1612,7 @@ const resolveFabricConfig = (
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;
       delete agents.instructionsRoot;
+      delete agents.processSlice;
       document.agents = agents;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

@@ -50,10 +50,9 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, maxConcurrent: 2, retainRuns: true }, {
-      workerPath: path.resolve("tests/fixtures/real-worker-close-gate.mjs"), piBinary, runRoot: root,
+      workerPath, piBinary, runRoot: root,
     });
     managers.push(manager);
-    const releaseFile = path.join(root, "release-native-close");
     let results: AgentRunResult[] = [];
     try {
       results = await Promise.all(["scratch one", "scratch two"].map(task => manager.run({ task, transport: "process" })));
@@ -66,9 +65,9 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
         expect(path.dirname(report.scratch)).toBe(report.tmpdir); // real ordinary mktemp, without -p
         if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
         else expect(report.mode).toBe(0o700);
-        // The explicit gate still owns native close: a result is not exit proof.
-        expect(fs.existsSync(report.tmpdir)).toBe(true);
-        expect(fs.existsSync(report.scratch)).toBe(true);
+        // Main's POSIX execution fence joins native exit before completion.
+        // Windows may still publish before its bounded native-close join.
+        // The post-close assertions below require scratch disposal on both.
         return report;
       });
       expect(reports[0].tmpdir).not.toBe(reports[1].tmpdir);
@@ -76,9 +75,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       expect(process.env.TMP).toBe(parentTmp);
       expect(process.env.TEMP).toBe(parentTemp);
     } finally {
-      // Always unblock the workers, even when a pre-close assertion fails.
-      fs.writeFileSync(releaseFile, "release");
-      // Unlike result observation, close joins native close AND scratch disposal.
+      // Close joins native close AND scratch disposal on both platforms.
       await manager.close();
     }
     for (const result of results) {
@@ -111,7 +108,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     await manager.close();
     expect(fs.existsSync(report.tmpdir)).toBe(!scoped);
     expect(fs.existsSync(report.scratch)).toBe(!scoped);
-    await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track|still be running/);
+    await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track|still be running|exit is unconfirmed/);
   });
   it("persists the spawn-selected compatible installed release in the real worker record", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-installed-e2e-"));
@@ -841,7 +838,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     await new Promise((resolve) => setTimeout(resolve, 200));
     ac.abort();
     const result = await manager.wait(handle.id);
-    expect(result.status).toBe("stopped");
+    expect(result.status, JSON.stringify(result)).toBe("stopped");
   });
 
   it("reports a terminal failure (not exited-without-a-result) when the worker crashes mid-stream", async () => {

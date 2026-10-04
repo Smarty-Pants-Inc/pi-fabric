@@ -1,3 +1,4 @@
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import * as childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -68,6 +69,7 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.mocked(childProce
 
 /** No fake host/response: real pickup, managers, model refresh, worker launch and ownership. */
 const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig) => void, commandTimeoutMs = 500) => {
+  installInProcessResidentFence();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-commit-fence-"));
   const meshRoot = path.join(root, "mesh");
   const rootId = `session:fence:${path.basename(root)}`;
@@ -105,7 +107,22 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
   const shutdown = new AbortController();
   const signalListeners = new Map(["SIGTERM", "SIGINT"].map((name) => [name, new Set(process.listeners(name))]));
   const host = runResidentHostFromConfigPath(configPath, shutdown.signal, registry);
-  await waitFor(() => fs.existsSync(path.join(residencyRoot, "owner.json")));
+  let startupFailure: unknown;
+  void host.catch(error => { startupFailure = error; });
+  try {
+    await waitFor(() => {
+      if (startupFailure) throw startupFailure;
+      return fs.existsSync(path.join(residencyRoot, "owner.json"));
+    });
+  } catch (error) {
+    release.resolve(); shutdown.abort();
+    await host.catch(() => undefined); await participants.close();
+    for (const [name, previous] of signalListeners) {
+      for (const listener of process.listeners(name)) if (!previous.has(listener)) process.removeListener(name, listener);
+    }
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+    throw error; // Report the startup cause, not an unrelated eight-second exchange timeout.
+  }
   const client = new ResidencyClient({
     config, mesh, participants, commandTimeoutMs,
     mainAgent: { id: rootId, local: true, matches: (id) => id === rootId, info: () => { throw new Error("unused"); },
@@ -370,6 +387,11 @@ describe("resident creation cache boundaries", () => {
 });
 
 describe("resident fence harness teardown", () => {
+  it.skipIf(process.platform !== "linux")("runs real commit-fence exchange under injected Windows absence of POSIX UID", async () => {
+    vi.spyOn(process, "getuid").mockReturnValue(undefined as never);
+    const state = await harness(false);
+    await state.close();
+  });
   it("retries a transient Windows EBUSY after the resident host has closed", async () => {
     const state = await harness(false);
     const rm = fs.promises.rm.bind(fs.promises);
@@ -1703,7 +1725,8 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
           const reconcile = engine === "cpython" || engine === "monty"
             ? `return {"status": await agents.${operation === "spawn" ? "status" : "actorStatus"}(id="${id}"), "stop": await agents.stop(id="${id}")}`
             : `return {status:await agents.${operation === "spawn" ? "status" : "actorStatus"}({id:"${id}"}),stop:await agents.stop({id:"${id}"})}`;
-          expect(await run(reconcile)).toMatchObject({ success: true, value: { status: { id } } });
+          const reconciled = await run(reconcile);
+          expect(reconciled, reconciled.error).toMatchObject({ success: true, value: { status: { id } } });
         }
       } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
     });

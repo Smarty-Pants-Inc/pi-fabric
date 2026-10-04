@@ -2,9 +2,11 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { expect, it, vi } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { canRemoveTerminalRun, hasUnresolvedWorker, markUnresolvedWorker } from "../src/storage/retention.js";
 import { processAlive } from "../src/storage/scratch.js";
 import { cancellationError } from "../src/async-settlement.js";
@@ -32,6 +34,22 @@ const mainParticipants = (config: ResidentHostConfig) => {
     startedAt: Date.now(), updatedAt: Date.now(),
   }]);
   return participants;
+};
+
+beforeEach(() => installInProcessResidentFence());
+
+// Recovered-owner cases model a legacy primary-only exit receipt. New transports
+// retain observed descendants and drain them at close; the non-restart cases below
+// exercise that real tree-custody contract. Workers and persisted trees stay real.
+const installLegacyPrimaryExitReceipt = () => {
+  const launch = ProcessTransport.prototype.launch;
+  vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+    const handle = await launch.call(this, request);
+    const primaryAlive = () => processAlive(Number(handle.sessionId));
+    return { ...handle, isAlive: async () => primaryAlive(), stop: async () => {
+      if (primaryAlive()) await handle.stop();
+    } };
+  });
 };
 
 const waitFor = async (predicate: () => boolean) => {
@@ -147,7 +165,8 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
 it.skipIf(process.platform === "win32").each([
   ["project", false, "known"], ["session", false, "known"], ["project", true, "known"], ["session", true, "known"],
   ["project", true, "unknown"], ["session", true, "unknown"],
-] as const)("a settled tracked activation retains reconciliation IDs while its real nested writer survives, then collects once (%s scope, restart=%s, descendant=%s)", async (scope, restart, descendant) => {
+] as const)("a crashed tracked activation retains custody or legacy reconciliation IDs while its real nested writer survives, then collects once (%s scope, restart=%s, descendant=%s)", async (scope, restart, descendant) => {
+  if (restart) installLegacyPrimaryExitReceipt();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nested-writer-retention-"));
   const rootId = "session:nested-writer-retention";
   const meshRoot = path.join(root, "mesh");
@@ -201,17 +220,26 @@ it.skipIf(process.platform === "win32").each([
     expect(processAlive(child.pid)).toBe(true);
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ id: child.id, status: "running", turns: 4 });
     expect(await control.request(client.hostId, actor.id, "stop", {}, client.hostId)).toMatchObject({ acknowledged: true });
-    // Crash only the primary. Its real monitor settles the failed tracked run and
-    // releases the actor drain, but the detached nested worker keeps writing.
+    // Crash only the primary. A dead primary is not a tree-exit receipt: the
+    // process transport retains the observed nested writer and the actor drain.
     fs.writeFileSync(crash, "crash");
-    await waitFor(() => host.agents.status(writer.id).status === "failed" && host.actors.inFlightCount() === 0);
-    expect(await client.actorStatus(actor.id)).toMatchObject({ id: actor.id, status: "stopped" });
-    expect((await client.actorStatus(actor.id)).inFlightRun).toBeUndefined();
-    expect(processAlive(Number(writer.sessionId))).toBe(false);
+    await waitFor(() => !processAlive(Number(writer.sessionId)));
+    if (restart) {
+      // Legacy primary-only receipts can release the actor drain, but never
+      // authorize removal of the still-live descendant's ownership evidence.
+      await waitFor(() => host.agents.status(writer.id).status === "failed" && host.actors.inFlightCount() === 0);
+      expect((await client.actorStatus(actor.id)).inFlightRun).toBeUndefined();
+    } else {
+      expect(await client.actorStatus(actor.id)).toMatchObject({ id: actor.id, status: "stopped", inFlightRun: { id: writer.id } });
+      expect(host.actors.inFlightCount()).toBe(1);
+      expect(host.agents.status(writer.id).status).toBe("running");
+    }
+    let settled = false;
+    const settlement = host.agents.wait(writer.id).then(result => { settled = true; return result; });
     expect(processAlive(child.pid)).toBe(true);
     expect(host.agents.runDirectory(writer.id)).toBeDefined(); // Still tracked, disk-scan skip applies.
     expect(hasUnresolvedWorker(host.agents.runDirectory(writer.id)!)).toBe(false);
-    await expect(host.agents.cleanup(writer.id)).rejects.toThrow(/descendant worker may still be running/);
+    await expect(host.agents.cleanup(writer.id)).rejects.toThrow(restart ? /descendant worker may still be running/ : /Cannot clean up a running agent/);
     expect(processAlive(child.pid)).toBe(true);
 
     scanTime = ack.acknowledgedAt + RESIDENT_REQUEST_RETENTION_MS + 1;
@@ -237,6 +265,7 @@ it.skipIf(process.platform === "win32").each([
     expect(Object.isFrozen(outcome.residentOutcome)).toBe(true);
     expect(create).toHaveBeenCalledTimes(1);
 
+    expect(settled, "only legacy primary-only receipts can settle before descendant exit").toBe(restart);
     if (restart) {
       const runDirectory = host.agents.runDirectory(writer.id)!;
       expect(config.agents.retainRuns).toBe(false);
@@ -282,6 +311,9 @@ it.skipIf(process.platform === "win32").each([
 
     fs.writeFileSync(release, "finish nested");
     await waitFor(() => !processAlive(child.pid));
+    await waitFor(() => settled && host.actors.inFlightCount() === 0);
+    expect(await settlement).toMatchObject({ status: "failed" });
+    expect((restart ? host.actors.status(actor.id) : await client.actorStatus(actor.id)).inFlightRun).toBeUndefined();
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ status: "completed", turns: 5 });
     // Native process absence can precede the kernel's last scope release.
     // Wait for the same production custody/ownership proof, not a fabricated exit.
@@ -318,6 +350,7 @@ it.skipIf(process.platform === "win32").each([
 }, 30_000);
 
 it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)("public recovered durable cleanup retains a real live descendant through the client fallback (%s owner)", async owner => {
+  installLegacyPrimaryExitReceipt();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-durable-descendant-cleanup-"));
   const rootId = "session:durable-descendant-cleanup";
   const meshRoot = path.join(root, "mesh");

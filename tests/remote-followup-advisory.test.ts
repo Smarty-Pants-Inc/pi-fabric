@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
@@ -74,6 +75,9 @@ describe("remote followUp advisory ACK budget (#3005)", () => {
             piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
             piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
           };
+          // Only this isolated same-process host uses the test fence on unsupported platforms;
+          // Linux continues to exercise the real kernel fence.
+          installInProcessResidentFence();
           resident = new ResidentHost(residentConfig);
           await resident.start();
         }

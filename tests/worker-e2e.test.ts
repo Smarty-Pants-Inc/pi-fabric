@@ -753,7 +753,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(events.some((event) => event.type === "abort")).toBe(false);
   });
 
-  it("aborts a hanging run as stopped, not exited-without-a-result", async () => {
+  it.each(["abort", "stop"] as const)("%s ends a hanging run as stopped, not exited-without-a-result", async (method) => {
     process.env.FAKE_PI_BEHAVIOR = "hang";
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
     roots.push(root);
@@ -767,9 +767,11 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     const ac = new AbortController();
     const handle = await manager.spawn({ task: "hang", transport: "process" }, ac.signal);
     await new Promise((resolve) => setTimeout(resolve, 200));
-    ac.abort();
+    if (method === "abort") ac.abort();
+    else expect((await manager.stop(handle.id)).status).toBe("stopped");
     const result = await manager.wait(handle.id);
     expect(result.status, JSON.stringify(result)).toBe("stopped");
+    expect(manager.status(handle.id).status).toBe("stopped");
   });
 
   it("reports a terminal failure (not exited-without-a-result) when the worker crashes mid-stream", async () => {

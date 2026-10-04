@@ -10,6 +10,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { spawnDetached } from "../src/agents/transports/process-utils.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { canRemoveTerminalRun, hasUnresolvedWorker } from "../src/storage/retention.js";
+import * as launcherOwner from "../src/residency/launcher-owner.js";
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -33,8 +34,17 @@ describe.skipIf(process.platform === "win32")("POSIX stop deadline (#360 Astra R
     const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
     const unconfirmed = vi.fn();
     const handle = await spawnDetached("worker.mjs", [], process.cwd(), { onUnconfirmedExit: unconfirmed });
+    const capture = process.platform === "linux" ? vi.spyOn(launcherOwner, "captureDescendants") : undefined;
+    const descendants = process.platform === "linux"
+      ? vi.spyOn(launcherOwner, "stopObservedDescendants").mockImplementation(async () => {
+        // Even without native close, cleanup starts after the original bound
+        // and the custody fence is already published before it can return.
+        expect(handle.lostContact()).toBeDefined();
+        expect(unconfirmed).toHaveBeenCalledOnce();
+      }) : undefined;
     let stopped = false;
     const first = handle.stop();
+    if (capture) expect(capture.mock.invocationCallOrder[0]).toBeLessThan(kill.mock.invocationCallOrder[0]!);
     expect(handle.stop()).toBe(first);
     const pending = first.then(() => { stopped = true; });
     try {
@@ -45,8 +55,10 @@ describe.skipIf(process.platform === "win32")("POSIX stop deadline (#360 Astra R
       await vi.advanceTimersByTimeAsync(1);
       if (mode === "alive") expect(kill).toHaveBeenCalledWith(-child.pid, "SIGKILL");
       else expect(kill).not.toHaveBeenCalledWith(-child.pid, "SIGKILL");
+      expect(descendants?.mock.calls.length ?? 0, "worker gets its native-close grace before descendants are signalled").toBe(0);
       vi.setSystemTime(new Date(0)); // Deadline is a native timer, not adjustable wall time.
       await vi.advanceTimersByTimeAsync(1_000);
+      if (descendants) expect(descendants).toHaveBeenCalledOnce();
       expect(stopped, "native-close join has a finite deadline").toBe(true);
       expect(handle.lostContact()).toMatch(/unconfirmed|did not confirm/);
       expect(unconfirmed).toHaveBeenCalledOnce();
@@ -77,7 +89,10 @@ describe.skipIf(process.platform === "win32")("POSIX stop deadline (#360 Astra R
       fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(record(handle.id)));
       let done = false;
       pending = (action === "stop" ? manager.stop(handle.id) : action === "deadline" ? manager.wait(handle.id) : manager.close())
-        .then(result => { done = true; return result; });
+        .then(result => {
+          if (action !== "close") expect(result).toMatchObject({ status: action === "stop" ? "stopped" : "timed_out" });
+          done = true; return result;
+        });
       await vi.advanceTimersByTimeAsync(30_000);
       expect(done, "stop, run deadline, and host shutdown must not hang on close").toBe(true);
       expect(hasUnresolvedWorker(run)).toBe(true);

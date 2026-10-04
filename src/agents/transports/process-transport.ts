@@ -9,7 +9,7 @@ import type {
 import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/agent-dir.js";
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
-import { spawnDetached } from "./process-utils.js";
+import { findExecutable, spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 
@@ -47,12 +47,23 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
 
 export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
+  #scopeWarningLogged = false;
+
+  constructor(private readonly processSlice?: string) {}
+
+  #warnScope = (reason: string): void => {
+    if (this.#scopeWarningLogged) return;
+    this.#scopeWarningLogged = true;
+    console.warn(`[pi-fabric] agents.processSlice=${this.processSlice}: ${reason}; launching worker normally`);
+  };
 
   async available(): Promise<boolean> {
     return true;
   }
 
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
+    const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
+    if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const selected = selectWorkerRelease(request.workerPath);
     const workerArguments = [...request.workerArguments];
     if (selected.extensionPath) {
@@ -88,6 +99,7 @@ export class ProcessTransport implements AgentTransportAdapter {
         workerArguments,
       ),
       { captureStderr: true },
+      executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
     );
     return {
       kind: this.kind,

@@ -292,7 +292,10 @@ export interface FabricActorInfo {
   coalesce: boolean;
   coalesceKey?: string;
   activationFilter?: FabricActorActivationFilter;
-  /** Events the activation filter skipped without a model run. */
+  /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
+  filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
+  activationFilterExpiresAt?: number;
+  /** Lifetime events the activation filter skipped without a model run (legacy). */
   filteredCount?: number;
   lastFilteredAt?: number;
   /**

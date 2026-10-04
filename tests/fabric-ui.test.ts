@@ -182,6 +182,7 @@ const snapshot = (): FabricDashboardSnapshot => {
     ],
     actors: [
       {
+        filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
         id: "actor-1",
         scope: "project",
         name: "advisor",
@@ -3176,6 +3177,7 @@ describe("Fabric dashboard global actors and instructions editor", () => {
       agents: [],
       actors: [
         {
+          filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
           id: "actor-1",
           scope: "project",
           name: "advisor",

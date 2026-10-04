@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
@@ -262,10 +263,20 @@ export const spawnDetached = async (
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit"> & { captureStderr?: boolean },
   environment?: NodeJS.ProcessEnv,
   options: { captureStderr?: boolean } = {},
+  scope?: { executable: string; slice: string; warn: (reason: string) => void },
 ): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void>; readStderr(): string }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
-  const child = spawn(runtime, [workerPath, ...workerArguments], {
+  // --scope execs its command in place. The shell records successful scope admission
+  // then execs the runtime in place too: captured child.pid remains worker PID/PGID.
+  // A marker distinguishes systemd failure from a worker that legitimately exits 1.
+  const scopeRoot = scope ? fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scope-")) : undefined;
+  const marker = scopeRoot ? path.join(scopeRoot, "admitted") : undefined;
+  const child = spawn(scope?.executable ?? runtime, scope ? [
+    "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", "--",
+    "/bin/sh", "-c", 'printf admitted > "$1" || exit 125; shift; exec "$@"',
+    "fabric-scope", marker!, runtime, workerPath, ...workerArguments,
+  ] : [workerPath, ...workerArguments], {
     cwd,
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
@@ -273,6 +284,8 @@ export const spawnDetached = async (
     stdio: ["ignore", "ignore", (options.captureStderr ?? authority?.captureStderr) ? "pipe" : "ignore"],
   });
   // Install native exit/close receipts before awaiting spawn acknowledgement.
+  let spawnError: Error | undefined;
+  child.once("error", error => { spawnError = error; });
   // Once the worker exited, its numeric id is no identity: after its group empties, the id
   // can name an unrelated process (group). So nothing is signalled or probed by number then.
   // ponytail: descendants an exited worker left in its group are not signalled; liveness
@@ -296,7 +309,8 @@ export const spawnDetached = async (
   });
   child.stderr?.on("end", () => { stderr = (stderr + decoder.end()).slice(-20_000); });
   child.stderr?.on("error", () => {});
-  await new Promise<void>((resolve, reject) => {
+  try {
+    await new Promise<void>((resolve, reject) => {
     child.once("spawn", resolve);
     child.once("error", (error) => {
       if (child.pid) unconfirmed(`Owned process worker emitted a native error: ${error.message}`);
@@ -306,13 +320,22 @@ export const spawnDetached = async (
     // Retain the fork's immediate owned-handle contract; a pid-less failed spawn
     // must still await its native error instead of leaving it unhandled.
     if (child.pid) resolve();
-  });
+    });
+  } catch (error) {
+    // A failed scoped spawn owns no worker; join its native close before retry.
+    // A pid-bearing native error remains unconfirmed custody, never replayable.
+    if (!scope || child.pid) throw error;
+    await closed;
+    fs.rmSync(scopeRoot!, { recursive: true, force: true });
+    scope.warn(spawnError?.message ?? "systemd-run did not launch");
+    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, options);
+  }
   if (!child.pid) throw new Error("Failed to launch Fabric worker process");
   const pid = child.pid;
   child.unref();
   // A diagnostic pipe must not keep the owner process alive on its own.
   (child.stderr as (NodeJS.ReadableStream & { unref?: () => void }) | null)?.unref?.();
-  return {
+  const handle = {
     pid,
     readStderr: () => stderr,
     closed,
@@ -387,4 +410,24 @@ export const spawnDetached = async (
       return false;
     },
   };
+  if (scope && marker) {
+    let nativeClosed = false;
+    void closed.then(() => { nativeClosed = true; });
+    const admissionDeadline = Date.now() + 5_000;
+    try {
+      while (!fs.existsSync(marker) && !nativeClosed && Date.now() < admissionDeadline && !authority?.signal?.aborted) {
+        await new Promise<void>(resolve => setTimeout(resolve, 10));
+      }
+      if (fs.existsSync(marker)) return handle;
+      // Join the captured close before any fallback. Unconfirmed custody vetoes
+      // a replacement just as it does for an ordinary owned worker.
+      if (!nativeClosed) await handle.stop();
+      if (handle.lostContact()) throw new Error(handle.lostContact());
+      assertTransportLaunchAllowed(authority);
+      if (fs.existsSync(marker)) return handle; // admitted during teardown; never replay
+      scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
+      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, options);
+    } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }
+  }
+  return handle;
 };

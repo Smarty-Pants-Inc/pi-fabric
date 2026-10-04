@@ -2165,6 +2165,7 @@ describe("AgentsProvider runner support", () => {
         delivery: request.delivery ?? "mailbox",
         responseMode: request.responseMode ?? "text",
         triggerTurn: request.triggerTurn ?? false,
+        filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
         coalesce: request.coalesce ?? true,
         residency: "durable",
         queued: 0,
@@ -5218,6 +5219,12 @@ describe("AgentsProvider steering", () => {
       name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], activationFilter: ["hold", "never-message-events"],
     }, context)) as { id: string; activationFilter?: unknown };
     expect(actor.activationFilter).toEqual(["hold", "never-message-events"]);
+    const expiresAt = Date.now() + 60_000;
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt }, context))
+      .resolves.toMatchObject({ activationFilterExpiresAt: expiresAt, filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } });
+    for (const invalid of [NaN, Infinity, "tomorrow"]) {
+      await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt: invalid }, context)).rejects.toThrow("expiresAt");
+    }
     await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: null }, context)).resolves.not.toHaveProperty("activationFilter");
     await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"] }, context))
       .resolves.toMatchObject({ activationFilter: ["hold"] });
@@ -5228,6 +5235,7 @@ describe("AgentsProvider steering", () => {
       name: "template", instructions: "Supervise.", scope: "global", activationFilter: ["never-message-events"],
     }, context)) as { id: string; activationFilter?: unknown };
     expect(template.activationFilter).toEqual(["never-message-events"]);
+    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], expiresAt, scope: "global" }, context)).rejects.toThrow("only supported for live actors");
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], scope: "global" }, context))
       .resolves.toMatchObject({ activationFilter: ["hold"] });
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: null, scope: "global" }, context))
@@ -6084,10 +6092,18 @@ describe("own-root resident setters and authoritative status", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it("forwards resident expiry to the execution owner", async () => {
+    const state = await remoteState();
+    const expiresAt = Date.now() + 60000;
+    await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], expiresAt }, context);
+    expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], expiresAt });
+  });
+
   it("returns host effective status/list rather than a stale Main overlay", async () => {
     const state = await remoteState();
+    state.effective.filterSkipped = { count: 7, lastKey: "review-key", lastTopic: "github.demo", lastAt: 1234 };
     const roster = vi.spyOn(ResidentActorClient.prototype, "actors").mockResolvedValue([state.effective]);
-    await expect(state.provider.invoke("actorStatus", { id: state.actor.id }, context)).resolves.toMatchObject({ model: "provider/model-b", thinking: "max" });
+    await expect(state.provider.invoke("actorStatus", { id: state.actor.id }, context)).resolves.toMatchObject({ model: "provider/model-b", thinking: "max", filterSkipped: state.effective.filterSkipped });
     await expect(state.provider.invoke("actors", {}, context)).resolves.toEqual([state.effective]);
     expect(state.actorStatus).toHaveBeenCalledWith(state.actor.id, context.signal);
     roster.mockRestore();

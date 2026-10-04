@@ -523,7 +523,7 @@ export type ResidentActorMutation =
   | { operation: "setTools"; id: string; tools: string[] }
   | { operation: "setModel"; id: string; model?: string; modelReason?: string; scope: FabricActorBindingScope }
   | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
-  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null };
+  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number };
 
 type ResidentActorMutationCommand = ResidentActorMutation & {
   caller?: ResidentActorCaller;

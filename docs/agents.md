@@ -927,7 +927,7 @@ Pass `coalesceKey` to `agents.create` for a new actor, or `null` to `agents.setC
 
 An actor that runs a model on every event spends most runs on events it always ignores. Set `activationFilter` to a list of skip rules. Fabric checks each queued mesh or host event against the rules just before it would run the model. When a rule matches, Fabric skips the event with no model call. A rule only skips: it never acts, replies or changes the event. Direct messages (`ask`, `tell`) are never filtered. Fabric checks an event when it arrives, before it can join or replace a queued item, and again just before the run (for items queued before the filter was set). So a skipped event never replaces a queued one by `coalesceKey`: a comment edit that arrives while its comment's creation waits in the queue is skipped, and the creation still runs.
 
-Each skip adds a record to the actor's message log: direction `in`, the event's `source`, and reason `filtered: <rule id>`. The actor status counts skips in `filteredCount` and `lastFilteredAt`.
+Each skip adds a record to the actor's message log: direction `in`, the event's `source`, and reason `filtered: <rule id>`. `agents.actorStatus({ id })` returns `filterSkipped: { count, lastKey, lastTopic, lastAt }`. `count` counts rejections since the filter was last set or cleared; the last fields are `null` until a rejection. `lastKey` is the queue's coalesce key (the JSON tuple `["mesh", topic, value]`) when present, otherwise the mesh event ID used for deduplication (or the host item's ID); `lastTopic` is the mesh topic or host event name, and `lastAt` is the rejection time in epoch milliseconds. This soft telemetry is stored with actor state, coalesced at the existing poll boundary without an extra fsync per skip, and restored after a host restart. A crash may lose the latest unflushed poll window. Resident actors return the execution owner's telemetry through the existing owner status RPC, including when read by the owning Main. The legacy `filteredCount` and `lastFilteredAt` remain lifetime counters.
 
 Two presets come ready to use. Each had zero false skips in 24 hours of supervisor runs (smarty-dev#1579):
 
@@ -957,7 +957,17 @@ const supervisor = (await agents.actors()).find((actor) => actor.name === "dev-s
 if (supervisor) await agents.setActivationFilter({ id: supervisor.id, activationFilter: ["hold", "never-message-events"] });
 ```
 
-Pass `activationFilter` to `agents.create` for a new actor, or `null` to `agents.setActivationFilter` to clear it. A change applies from the next queued event; the counter stays.
+Pass `activationFilter` to `agents.create` for a new actor, or `null` (or `[]`) to `agents.setActivationFilter` to clear it. A change applies from the next queued event and resets `filterSkipped`, even when setting the same filter; legacy lifetime counters stay.
+
+For a temporary review claim, set a finite `expiresAt` (epoch milliseconds) on a live actor:
+
+```ts
+await agents.setActivationFilter({
+  id: "release-reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60_000,
+});
+```
+
+At or after that time, the next event or existing poll clears the filter **before** testing an event, resets `filterSkipped`, and records an actor message with source `actor:activation-filter` and reason `activationFilter cleared: expired`. Explicit clears record `activationFilter cleared: explicit`. The expiry survives restart and is visible as `activationFilterExpiresAt` in actor status; setting a filter without `expiresAt` removes any previous expiry. No additional timers are created. Global templates do not support expiry. `clearWhen` verdict-based clearing is not implemented: use expiry or explicitly clear after observing the PR's complete verdict.
 
 A stored filter that this version cannot read (for example, one written by a newer version or edited by hand) never removes or rewrites its actor or global template. Fabric keeps the stored value unchanged, applies no filter (every event is delivered), logs a `PI_FABRIC_ACTIVATION_FILTER` warning, and shows the reason in `activationFilterError`. Set a valid filter to repair it.
 

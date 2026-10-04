@@ -67,6 +67,8 @@ interface MeshStateFile {
 export interface MeshReadOptions {
   /** Read and parse the canonical file on every call, without reusing a cached snapshot. */
   fresh?: boolean;
+  /** Reuse one already-captured canonical state for a multi-namespace scan. */
+  snapshot?: object;
 }
 
 export interface MeshStoreOptions {
@@ -1126,7 +1128,9 @@ export class MeshStore {
   #select(prefix: string, options: MeshReadOptions): MeshStateEntry[] {
     if (prefix) this.#validateKey(prefix);
     const fresh = options.fresh === true;
-    const state = (!fresh && this.#signalledState(prefix)) || this.#readCachedState(fresh);
+    const state = options.snapshot !== undefined
+      ? options.snapshot as MeshStateFile
+      : (!fresh && this.#signalledState(prefix)) || this.#readCachedState(fresh);
     const memo = this.#memoOf(state);
     let selection = memo.selections.get(prefix);
     if (!selection) {

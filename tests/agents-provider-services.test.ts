@@ -129,8 +129,10 @@ const command = (operation: FabricControlCommand["operation"]): FabricControlCom
 });
 
 describe("agents.stop directory outage (#2386 F5)", () => {
-  const fixture = async () => {
+  const fixture = async (workerSource?: string) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-stop-outage-"));
+    const workerPath = workerSource ? path.join(root, "worker.mjs") : path.resolve("tests/fixtures/fake-worker.mjs");
+    if (workerSource) fs.writeFileSync(workerPath, workerSource);
     const ports = routing();
     const identity = { id: "session:stop-owner", name: "Main", kind: "main" as const };
     const abort = vi.fn();
@@ -140,7 +142,7 @@ describe("agents.stop directory outage (#2386 F5)", () => {
     main.attachFollowUpDrain(context, 0);
     const halt = vi.spyOn(main, "halt");
     const manager = new AgentManager(root, DEFAULT_FABRIC_CONFIG.agents, {
-      runRoot: path.join(root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fullCodeMode: false,
+      runRoot: path.join(root, "runs"), workerPath, fullCodeMode: false,
     });
     const meshRoot = path.join(root, "mesh");
     const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000);
@@ -169,8 +171,41 @@ describe("agents.stop directory outage (#2386 F5)", () => {
       await directory.close();
       fs.rmSync(root, { recursive: true, force: true });
     };
-    return { provider, manager, main, directory, actors, control: ports.control, invocation, abort, halt, setActor, outage, close, state };
+    return { root, provider, manager, main, directory, actors, control: ports.control, invocation, abort, halt, setActor, outage, close, state };
   };
+
+  it.skipIf(process.platform !== "linux")("joins detached child and grandchild sleep before stopped during a directory outage", async () => {
+    const intermediate = `import fs from "node:fs";
+import { spawn } from "node:child_process";
+const sleep = spawn("sleep", ["240"], { detached: true, stdio: "ignore" });
+sleep.once("spawn", () => fs.writeFileSync("descendants.json", JSON.stringify([process.pid, sleep.pid])));
+setInterval(() => {}, 1000);`;
+    const source = `import { spawn } from "node:child_process";
+spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(intermediate)}], { detached: true, stdio: "ignore" });
+setInterval(() => {}, 1000);`;
+    const f = await fixture(source);
+    let descendants: number[] = [];
+    try {
+      const task = await f.manager.spawn({ task: "HANG", transport: "process" });
+      const pidFile = path.join(f.root, "descendants.json");
+      await vi.waitFor(() => expect(fs.existsSync(pidFile)).toBe(true), { timeout: 10_000 });
+      descendants = JSON.parse(fs.readFileSync(pidFile, "utf8")) as number[];
+      expect(descendants).toHaveLength(2);
+      await f.outage();
+      const probe = vi.spyOn(f.directory, "refreshRoutingView");
+      const started = Date.now();
+      await expect(f.provider.invoke("stop", { id: task.id }, f.invocation)).resolves.toMatchObject({ id: task.id, status: "stopped" });
+      expect(Date.now() - started).toBeLessThan(12_000);
+      for (const pid of descendants) expect(() => process.kill(pid, 0), `descendant ${pid} still exists at stop return`).toThrow();
+      expect(probe).not.toHaveBeenCalled();
+      expect(f.control.request).not.toHaveBeenCalled();
+      expect(fs.readFileSync(f.state, "utf8")).toBe("{");
+    } finally {
+      // Only birth-owned fixture PIDs; assertion failure must not leave sleeps.
+      for (const pid of descendants) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+      await f.close();
+    }
+  });
 
   it("provider.invoke stops a canonical process task and native Main without probing the damaged directory", async () => {
     const f = await fixture();

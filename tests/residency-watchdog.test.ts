@@ -80,6 +80,9 @@ describe("resident watchdog", () => {
   });
 
   it("keeps watchdog restart independent of mesh delivery outage backoff", async () => {
+    // Near-ceiling full jitter preserves the 100/200/400 ms polling schedule
+    // this test probes, without relying on production randomness.
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.999999);
     const { root, config, client } = fixture();
     fs.mkdirSync(config.actorRoot, { recursive: true });
     fs.writeFileSync(path.join(config.actorRoot, "actors.json"), JSON.stringify({ actors: [
@@ -109,7 +112,7 @@ describe("resident watchdog", () => {
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       await client.close();
-      read.mockRestore(); start.mockRestore(); warn.mockRestore();
+      read.mockRestore(); start.mockRestore(); warn.mockRestore(); random.mockRestore();
       vi.useRealTimers(); fs.rmSync(root, { recursive: true, force: true });
     }
   });

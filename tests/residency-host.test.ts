@@ -8,7 +8,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { projectOf, repositoryOf } from "../src/topology/project-identity.js";
-import { residentDeliveryPrefix } from "../src/residency/protocol.js";
+import { residentDeliveryPrefix, residentRoot } from "../src/residency/protocol.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { removeParticipantFileIf, writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
@@ -22,28 +22,69 @@ import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
-import { RESIDENT_HOST_FORMAT, residentRoot, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}) => {
+const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}, canonicalRoot = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-host-review-"));
   const config: ResidentHostConfig = {
     format: RESIDENT_HOST_FORMAT, rootId: "session:review", sessionId: "review",
     cwd: process.cwd(), projectRoot: process.cwd(), meshRoot: path.join(root, "mesh"),
-    actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
+    actorRoot: path.join(root, "actors"), residencyRoot: canonicalRoot ? residentRoot(path.join(root, "mesh"), "session:review") : path.join(root, "resident"),
     fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh,
     retention: { ...DEFAULT_FABRIC_CONFIG.retention, ...retention }, workerPath: path.resolve("dist/agents/worker.js"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
-  fs.mkdirSync(config.residencyRoot);
+  fs.mkdirSync(config.residencyRoot, { recursive: true });
   const configPath = path.join(config.residencyRoot, "config.json");
   fs.writeFileSync(configPath, JSON.stringify(config));
   const idle = vi.fn();
   const host = new ResidentHost(config, idle);
   return { root, config, host, idle };
 };
+
+describe("resident activation filter telemetry", () => {
+  it("returns owning-host skips and expiry through the Main's resident status path", async () => {
+    const { root, config, host } = fixture({}, true);
+    const client = new ResidentActorClient(config.meshRoot, config.rootId);
+    const caller = { identity: { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId }, hostId: config.rootId };
+    const filter = [{ id: "review-claim", topic: ["github.demo"] }];
+    const participants = new ParticipantDirectory(new MeshStore(config.meshRoot, 65536, 1000), {
+      enabled: true, hostId: caller.hostId, rootId: config.rootId, identity: caller.identity,
+    });
+    participants.registerSource(() => [{
+      format: 1, id: config.rootId, kind: "root", rootId: config.rootId, ownerHostId: caller.hostId, ownerIdentityId: config.rootId,
+      name: "Main", status: "idle", residency: "session", runner: "pi", transport: "host", capabilities: [],
+      sessionId: config.sessionId, startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    }]);
+    try {
+      await participants.start();
+      await host.start();
+      const actor = await host.actors.create({ name: "claimed-review", instructions: "x", residency: "durable", topics: ["github.demo"], coalesceKey: "payload.number" });
+      const expiresAt = Date.now() + 30_000;
+      await client.setActor({ operation: "setActivationFilter", id: actor.id, activationFilter: filter, expiresAt }, undefined, caller);
+      const event = await new MeshStore(config.meshRoot, 65536, 1000).publish({ topic: "github.demo", from: caller.identity, data: { payload: { number: 7 } } });
+      const deadline = Date.now() + 5000;
+      while (host.actors.status(actor.id).filterSkipped.count !== 1) {
+        if (Date.now() > deadline) throw new Error("Resident skip did not arrive");
+        await delay(20);
+      }
+      expect(await client.actorStatus(actor.id)).toMatchObject({
+        activationFilterExpiresAt: expiresAt,
+        filterSkipped: { count: 1, lastKey: JSON.stringify(["mesh", event.topic, 7]), lastTopic: event.topic, lastAt: expect.any(Number) },
+      });
+      await client.setActor({ operation: "setActivationFilter", id: actor.id, activationFilter: filter, expiresAt: Date.now() - 1 }, undefined, caller);
+      while (host.actors.status(actor.id).activationFilter) {
+        if (Date.now() > deadline) throw new Error("Resident expiry did not clear");
+        await delay(20);
+      }
+      expect(await client.actorStatus(actor.id)).toMatchObject({ filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } });
+      expect(host.actors.messages(actor.id)).toContainEqual(expect.objectContaining({ reason: "activationFilter cleared: expired" }));
+    } finally { await host.close(); await participants.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
 
 describe("resident maintenance readiness attachment", () => {
   it("waits for the published live generation before one accepted create, without another launcher", async () => {

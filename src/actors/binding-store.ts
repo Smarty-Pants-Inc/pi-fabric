@@ -6,6 +6,7 @@ import { isFabricThinking, type FabricThinking } from "../thinking.js";
 
 export interface ActorSessionBindingRecord {
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
   updatedAt: number;
 }
@@ -56,11 +57,14 @@ export class ActorBindingStore {
     actorId: string,
     model: string | undefined,
     beforeCommit?: (id: string) => void,
+    modelReason?: string,
   ): Promise<ActorSessionBindingRecord | undefined> {
     const next = model?.trim();
     return this.#update(actorId, (binding) => {
       if (next) binding.model = next;
       else delete binding.model;
+      if (next && modelReason !== undefined) binding.modelReason = modelReason;
+      else delete binding.modelReason;
     }, beforeCommit);
   }
 
@@ -142,6 +146,7 @@ export class ActorBindingStore {
       if (!model && !thinking) continue;
       bindings.set(actorId, {
         ...(model ? { model } : {}),
+        ...(model && typeof value.modelReason === "string" ? { modelReason: value.modelReason } : {}),
         ...(thinking ? { thinking } : {}),
         updatedAt: value.updatedAt,
       });

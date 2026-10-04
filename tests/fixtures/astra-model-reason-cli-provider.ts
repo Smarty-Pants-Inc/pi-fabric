@@ -18,10 +18,26 @@ for (const action of ["run", "spawn", "create"]) {
 const after = await agents.list({ scope: "local" });
 const afterActors = await agents.actors();
 const modelReason = "  Explicit exception for the offline Astra CLI audit proof  ";
-const taskResult = await agents.run({ task: "ASTRA_REASON_TASK", model: "cliproxyapi/gpt-6-astra", modelReason, transport: "process" });
-const actor = await agents.create({ name: "astra-reason-actor", instructions: "ASTRA_REASON_ACTOR", model: "cliproxyapi/gpt-6-astra", modelReason, responseMode: "text", triggerTurn: false, transport: "process" });
+// Occupy the sole permit so the accepted spawn has an observable queued identity.
+const blocker = await agents.spawn({ task: "DEFAULT_BLOCKER", transport: "process" });
+const task = await agents.spawn({ task: "ASTRA_REASON_TASK", model: "cliproxyapi/gpt-6-astra", modelReason, transport: "process" });
+await agents.subscribe({ from: task.id, events: ["run.spawned"], delivery: "followUp", triggerTurn: false });
+const defaultResult = await agents.wait({ id: blocker.id, timeoutMs: 45000 });
+const taskResult = await agents.wait({ id: task.id, timeoutMs: 45000 });
+const actor = await agents.create({ name: "astra-reason-actor", instructions: "ASTRA_REASON_ACTOR", model: "cliproxyapi/gpt-6-astra", modelReason,
+  thinking: "max", routeClass: "status-groom", protected: true, responseMode: "text", triggerTurn: false, transport: "process" });
+await agents.subscribe({ from: actor.id, events: ["run.spawned"], delivery: "followUp", triggerTurn: false });
 const activation = await agents.ask({ id: actor.id, message: "ASTRA_REASON_ACTOR" });
-return { refusals, before, after, beforeActors, afterActors, modelReason, taskResult, actor, activation };
+const beforeSetter = await agents.status({ id: actor.id });
+try { await agents.setModel({ id: actor.id, model: "cliproxyapi/gpt-6-astra" }); refusals.push({ action: "setModel", admitted: true }); }
+catch (error) { refusals.push({ action: "setModel", message: error.message }); }
+const afterSetter = await agents.status({ id: actor.id });
+const sessionReason = "  Explicit session-binding exception for the offline Astra CLI audit proof  ";
+const rebound = await agents.setModel({ id: actor.id, model: "cliproxyapi/gpt-6-astra", modelReason: sessionReason });
+const reboundActivation = await agents.ask({ id: actor.id, message: "ASTRA_REASON_ACTOR_REBOUND" });
+const lifecycle = await mesh.read({ topic: "fabric.participant.lifecycle", limit: 100 });
+return { refusals, before, after, beforeActors, afterActors, modelReason, task, taskResult, defaultResult,
+  actor, activation, beforeSetter, afterSetter, sessionReason, rebound, reboundActivation, lifecycle };
 `;
 
 export default function (pi: ExtensionAPI) {
@@ -30,10 +46,12 @@ export default function (pi: ExtensionAPI) {
     reasoning: true, thinkingLevelMap: { max: "max", xhigh: "xhigh" }, input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 4096,
   };
+  let mainIssued = false;
   const stream = (selected: Model<Api>, context: TranscriptContext) => {
     const events = createAssistantMessageEventStream();
     const main = !process.env.PI_FABRIC_PARENT_RUN && JSON.stringify(context.messages).includes("ASTRA_CLI_MAIN");
-    const tool = main && context.messages.at(-1)?.role !== "toolResult";
+    const tool = main && !mainIssued;
+    if (tool) mainIssued = true;
     const message: AssistantMessage = {
       role: "assistant", provider: selected.provider, model: selected.id, api: selected.api, timestamp: Date.now(),
       content: tool ? [{ type: "toolCall", id: `astra-proof-${Date.now()}`, name: "fabric_exec", arguments: { code: mainCode, resultFormat: "json" } }]
@@ -41,6 +59,10 @@ export default function (pi: ExtensionAPI) {
       stopReason: tool ? "toolUse" : "stop",
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
     };
+    if (!main && JSON.stringify(context.messages).includes("DEFAULT_BLOCKER")) {
+      setTimeout(() => { events.push({ type: "done", reason: "stop", message }); events.end(); }, 10000);
+      return events;
+    }
     events.push({ type: "start", partial: message });
     if (tool) events.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as Extract<AssistantMessage["content"][number], { type: "toolCall" }>, partial: message });
     events.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });

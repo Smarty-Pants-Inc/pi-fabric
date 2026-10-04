@@ -229,7 +229,7 @@ export class GlobalActorRegistry {
       runner: patch.runner ?? existing.runner,
       ...(patch.kernel !== undefined ? { kernel: patch.kernel } : existing.kernel ? { kernel: existing.kernel } : {}),
       ...(patch.model !== undefined ? { model: patch.model } : existing.model ? { model: existing.model } : {}),
-      ...(patch.modelReason !== undefined ? { modelReason: patch.modelReason } : existing.modelReason !== undefined ? { modelReason: existing.modelReason } : {}),
+      ...(patch.modelReason !== undefined ? { modelReason: patch.modelReason } : patch.model === undefined && existing.modelReason !== undefined ? { modelReason: existing.modelReason } : {}),
       ...(patch.thinking !== undefined ? { thinking: patch.thinking } : existing.thinking ? { thinking: existing.thinking } : {}),
       ...(patch.routeClass !== undefined ? { routeClass: patch.routeClass } : existing.routeClass ? { routeClass: existing.routeClass } : {}),
       ...(typeof (patch.protected ?? existing.protected) === "boolean" ? { protected: patch.protected ?? existing.protected } : {}),

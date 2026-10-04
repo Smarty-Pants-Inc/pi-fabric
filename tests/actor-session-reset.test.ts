@@ -108,7 +108,7 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
       new MeshStore(path.join(root, "mesh"), 65536, 100), { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
       { actorRoot: path.join(root, "actors"), persistent: true, maxSessionBytes: 64, preparationRetryMs: 25 });
     managers.push(actors, agents);
-    const launch = vi.spyOn(agents, "run"), namespace = atomic.syncPathNamespace, write = atomic.writeJsonAtomic;
+    const launch = vi.spyOn(agents, "run"), namespace = atomic.syncPathNamespace, write = atomic.AtomicFileWriter.prototype.write;
     let unavailable = true, failures = 0, archived: string | undefined;
     try {
       const actor = await actors.create({ name: "native size reset", instructions: "Work.", residency: "durable", runner: "claude", model: "claude/haiku", transport: "process" });
@@ -126,9 +126,9 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
         }
         namespace(file, inode);
       });
-      vi.spyOn(atomic, "writeJsonAtomic").mockImplementation((file, value, options) => {
-        if (file === registry && archived && unavailable && fault === "registry") { failures++; throw new Error("reset registry unavailable"); }
-        write(file, value, options);
+      vi.spyOn(atomic.AtomicFileWriter.prototype, "write").mockImplementation(function(this: atomic.AtomicFileWriter, contents, options) {
+        if (this.file === registry && archived && unavailable && fault === "registry") { failures++; throw new Error("reset registry unavailable"); }
+        return write.call(this, contents, options);
       });
       actors.tell(actor.id, "after native reset");
       await waitFor(() => failures > 0, 15000); await new Promise(resolve => setTimeout(resolve, 150));

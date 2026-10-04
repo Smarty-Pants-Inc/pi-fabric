@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { AtomicFileWriter, writeFileAtomic } from "../core/atomic-write.js";
 
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
 const ACTOR_REGISTRY_STALE_LOCK_MS = 30_000;
@@ -37,10 +37,12 @@ const hasRemovalDecision = (actors: readonly unknown[]): boolean => actors.some(
 export class ActorRegistryStore {
   readonly #registryPath: string;
   readonly #actorRoot: string;
+  readonly #writer: AtomicFileWriter;
 
   constructor(actorRoot: string) {
     this.#actorRoot = actorRoot;
     this.#registryPath = path.join(actorRoot, "actors.json");
+    this.#writer = new AtomicFileWriter(this.#registryPath);
   }
 
   records(): Array<Record<string, unknown> & { id: string }> {
@@ -134,7 +136,7 @@ export class ActorRegistryStore {
   fingerprint(): string | undefined {
     try {
       const stat = fs.statSync(this.#registryPath);
-      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
     } catch {
       return undefined;
     }
@@ -144,24 +146,42 @@ export class ActorRegistryStore {
     return JSON.parse(fs.readFileSync(this.#registryPath, "utf8"));
   }
 
-  /** Call within withLock. Definitions, lineage claims and pending decisions are durable. */
+  /** Call within withLock for read-modify-write operations. Pending decisions and custody are durable. */
   write(actors: readonly Record<string, unknown>[], options?: { durable?: boolean }): void {
-    // A barrier belongs to an inode, not its contents. Every replacement carrying an
-    // accepted removal must establish its own barriers, including foreign/preserved rows.
-    if (!options?.durable && !hasRemovalDecision(actors)) {
-      writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2, durable: true });
+    let previous: string | undefined;
+    try { previous = fs.readFileSync(this.#registryPath, "utf8"); }
+    catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+    let previousActors: readonly Record<string, unknown>[] = [];
+    try {
+      const parsed = JSON.parse(previous ?? "null") as { actors?: unknown } | null;
+      if (Array.isArray(parsed?.actors)) previousActors = parsed.actors;
+    } catch { /* Malformed bytes carry no accepted, recoverable decision. */ }
+    const custody = (rows: readonly Record<string, unknown>[]): string => JSON.stringify(rows.map((row) =>
+      [row?.id, row?.rootId, row?.residency, row?.adoptedAt, row?.adoptedFrom]).sort((a, b) =>
+      String(a[0]).localeCompare(String(b[0]))));
+    const durable = options?.durable === true || hasRemovalDecision(actors) ||
+      actors.some((actor) => actor.adoptedAt !== undefined || actor.adoptedFrom !== undefined || actor.status === "stopped") ||
+      custody(previousActors) !== custody(actors);
+    const serialized = JSON.stringify({ format: 1, actors }, null, 2);
+    if (!durable) {
+      // Status/time/history without a custody change are rebuildable soft metadata.
+      this.#writer.write(serialized);
       return;
     }
-    const previous = fs.readFileSync(this.#registryPath, "utf8");
-    const rollbackDurable = true; // The restored definitions/lineage are authoritative too.
     try {
-      writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2, durable: true });
+      this.#writer.write(serialized, { durable: true });
     } catch (error) {
-      // A directory barrier can fail after rename installed the new registry. Restore the
-      // live decision under the lock. The replacement restores authoritative definitions
-      // and lineage as well as removal decisions, so it needs barriers too.
-      // Never report the failed commit as accepted.
-      writeFileAtomic(this.#registryPath, previous, { durable: rollbackDurable });
+      // A directory barrier may fail after rename installed the new registry. Keep the
+      // visible replacement so the retry loop can re-establish its barrier; roll back
+      // only when replacement never became visible.
+      let installed = false;
+      try { installed = fs.readFileSync(this.#registryPath, "utf8") === serialized; } catch { /* absent */ }
+      // Removal decisions are accepted only with a complete barrier sequence; unlike
+      // live custody adoption, a visible-but-unfenced removal must be rolled back.
+      if (!installed || hasRemovalDecision(actors)) {
+        if (previous === undefined) fs.rmSync(this.#registryPath, { force: true });
+        else writeFileAtomic(this.#registryPath, previous, { durable: true });
+      }
       throw error;
     }
   }

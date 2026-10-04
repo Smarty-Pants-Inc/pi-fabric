@@ -158,14 +158,14 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       manager.tell(actor.id, "immediate post-restart activation");
       await running;
       expect(tasks).toHaveLength(1);
-      expect(tasks[0]).not.toContain(store.resultFile(expired));
-      expect(tasks[0]).toContain(store.resultFile(fresh));
+      expect(tasks[0]).not.toContain(JSON.stringify(store.resultFile(expired)).slice(1, -1));
+      expect(tasks[0]).toContain(JSON.stringify(store.resultFile(fresh)).slice(1, -1));
       expect(fs.existsSync(store.resultFile(expired))).toBe(true); // No sweep yet.
       for (const suffix of [".result.json", ".receipt"]) fs.utimesSync(path.join(store.directory, fresh + suffix), old, old);
       await vi.advanceTimersByTimeAsync(10);
       expect(fs.existsSync(store.resultFile(expired))).toBe(false);
       expect(fs.existsSync(store.resultFile(fresh))).toBe(true); // Already-active context is fenced.
-    } finally { release(); vi.useRealTimers(); }
+    } finally { release(); await vi.advanceTimersByTimeAsync(10); vi.useRealTimers(); }
   });
 
   it("does not consume archives when the resident lease is lost before the deferred sweep", async () => {

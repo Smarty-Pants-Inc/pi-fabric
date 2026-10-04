@@ -2153,6 +2153,11 @@ export class ActorManager {
     if (!this.#closePromise) {
       this.#closing = true;
       this.#closePromise = this.#close();
+      // Retention/presence joins may yield before #close reaches its owned rows.
+      // Cancel current preparations now; a released model resolver must not launch
+      // a worker while shutdown waits for a deferred maintenance slice. Cache the
+      // close promise first so an abort listener can safely join close reentrantly.
+      for (const actor of this.#draining.values()) actor.abortController?.abort();
     }
     return this.#closePromise;
   }

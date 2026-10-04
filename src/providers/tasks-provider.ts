@@ -108,6 +108,8 @@ export class TasksProvider implements FabricProvider {
     const result = (reason: "event" | "finished" | "timeout") =>
       ({ task: job.info(), reason, lines, omittedBytes, more: cursor < job.written, nextCursor: cursor });
     for (;;) {
+      signal?.throwIfAborted();
+      const previousReadCursor = readCursor;
       const page = job.read(readCursor, SHELL_READ_MAX_BYTES, "base64");
       omittedBytes += page.omittedBytes;
       if (page.offset > lineStart && !pending) {
@@ -143,10 +145,12 @@ export class TasksProvider implements FabricProvider {
         cursor = readCursor;
         if (lines.length) return result("event");
       }
-      if (job.written > page.next) continue;
+      signal?.throwIfAborted();
       const remaining = deadline - Date.now();
       if (remaining <= 0) return result("timeout");
-      await job.whenOutput(page.next, remaining, signal);
+      if (readCursor > previousReadCursor && job.written > readCursor) continue;
+      // A shortened/empty read must wait beyond the raw tail, not rescan it.
+      await job.whenOutput(job.written, remaining, signal);
     }
   }
 }

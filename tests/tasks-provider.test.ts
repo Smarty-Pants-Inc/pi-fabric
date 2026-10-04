@@ -338,6 +338,31 @@ describe("tasks provider", () => {
       .resolves.toMatchObject({ reason: "timeout" });
   });
 
+  it("checks cancellation and deadlines while draining many raw output pages", async () => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "many pages"); job.spill();
+    job.append(Buffer.alloc(SHELL_READ_MAX_BYTES * 4, 120));
+    const abort = new AbortController();
+    const original = job.read.bind(job);
+    const spy = vi.spyOn(job, "read").mockImplementation((...args) => {
+      const page = original(...args);
+      abort.abort(new Error("cancel draining"));
+      return page;
+    });
+    try {
+      await expect(provider.invoke("watch", { id: job.id, match: "never" }, { ...context, signal: abort.signal })).rejects.toThrow("cancel draining");
+      expect(spy).toHaveBeenCalledOnce();
+    } finally { spy.mockRestore(); }
+    const clock = vi.spyOn(Date, "now");
+    clock.mockReturnValueOnce(0).mockReturnValue(100);
+    try {
+      const reader = vi.spyOn(job, "read");
+      await expect(provider.invoke("watch", { id: job.id, match: "never", timeoutMs: 10 }, context)).resolves.toMatchObject({ reason: "timeout" });
+      expect(reader).toHaveBeenCalledOnce();
+      reader.mockRestore();
+    } finally { clock.mockRestore(); }
+  });
+
   it("cancels an in-flight watch without stopping its monitor or consuming an event", async () => {
     const { store, provider } = setup();
     const job = store.begin("bash", "watch", { monitor: { delivery: "ui", intervalMs: 1000, timeoutMs: 300000 } });

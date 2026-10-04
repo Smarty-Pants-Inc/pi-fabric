@@ -224,6 +224,9 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let holdResolution = false;
     let resolutionHeld = false;
+    // Keep the initial retention slice pending across close/model resolution.
+    // Shutdown must cancel preparation before joining this maintenance turn.
+    if (operation === "close") vi.useFakeTimers({ toFake: ["setImmediate", "clearImmediate"] });
     const { actors, agents, mesh, deliveries, sendMessage } = setup({
       resolvePiModel: (model) => {
         // Arm after creation: unpinned owner defaults resolve at drain admission,
@@ -253,6 +256,10 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
     } finally {
       release();
       await activation;
+      if (operation === "close") {
+        await vi.advanceTimersByTimeAsync(0);
+        vi.useRealTimers();
+      }
       if (closing) await closing;
       await waitFor(() => actors.inFlightCount() === 0);
     }
@@ -429,6 +436,17 @@ describe("actor session reset (smarty-dev#1439)", () => {
     expect(backups(actor.sessionFile!)).toEqual([`session.jsonl.${stamp}-2.bak`]);
     expect(backups(actor.sessionFile!)).not.toContain(`session.jsonl.${stamp}-1.bak`);
     expect(backups(actor.sessionFile!)).not.toContain(`session.jsonl.${stamp}.bak`);
+  });
+
+  it("preserves a native session tail published after terminal status before reset", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "tail", instructions: "Flush the session." });
+    await actors.ask(actor.id, "DELAY_SESSION_TAIL charlie");
+    await actors.resetSession(actor.id);
+    const [backup] = backups(actor.sessionFile!);
+    const archived = fs.readFileSync(path.join(path.dirname(actor.sessionFile!), backup!), "utf8");
+    expect(archived).toContain("charlie");
+    expect(archived).toContain("fake actor advice");
   });
 
   // review/astra F1 on #101: a pruned name was reused, sorted oldest and deleted at once.

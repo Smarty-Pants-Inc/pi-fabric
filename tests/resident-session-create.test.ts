@@ -16,8 +16,10 @@ import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
 const fixture = async (residentRootId = "session:create", scope: "session" | "project" = "session") => {
+  installInProcessResidentFence();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-session-create-"));
   const identity = { id: "session:create", name: "Main", kind: "main" as const, sessionId: "create" };
   const meshRoot = path.join(root, "mesh");

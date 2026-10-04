@@ -6,8 +6,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { StoreBridgeSide } from "../src/mesh/bridge.js";
 import { deadHostRecords, reapDeadHostRecords } from "../src/topology/host-reaper.js";
-import { LIVENESS_POLICY_KEY, readHostLeases } from "../src/topology/host-leases.js";
+import { LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { isLiveLegacyRootEntry, sessionLiveness } from "../src/topology/legacy-root-liveness.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 const directories: ParticipantDirectory[] = [];
@@ -18,12 +19,12 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const key = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
-const setup = async (files: boolean, leaseMs = 15_000) => {
+const setup = async (files: boolean, leaseMs = 15_000, kind: MeshIdentity["kind"] = "main", legacyPeer = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-heartbeat-contention-"));
   roots.push(root);
   let now = Date.now();
   vi.spyOn(Date, "now").mockImplementation(() => now);
-  const identity: MeshIdentity = { id: "session:live", name: "main", kind: "main", sessionId: "live" };
+  const identity: MeshIdentity = { id: "session:live", name: "main", kind, sessionId: "live" };
   const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 0 });
   if (files) await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity });
   const record: FabricParticipantRecord = {
@@ -38,6 +39,13 @@ const setup = async (files: boolean, leaseMs = 15_000) => {
   });
   directories.push(directory);
   directory.registerSource(() => [{ ...record, updatedAt: Date.now() }]);
+  if (legacyPeer) {
+    const peer: MeshIdentity = { id: "session:legacy", name: "main", kind: "main", sessionId: "legacy" };
+    await mesh.put({ key: key("topology/hosts/", peer.id), identity: peer, value: {
+      format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: now,
+      updatedAt: now, expiresAt: now + 1_000_000,
+    } });
+  }
   await directory.refresh();
   const writes = vi.spyOn(mesh, "writeBatch");
   const hostKey = key("topology/hosts/", identity.id);
@@ -47,6 +55,131 @@ const setup = async (files: boolean, leaseMs = 15_000) => {
 };
 
 describe("#3752 participant heartbeat contention", () => {
+  it.each([false, true])("all-new fleet renews both TTLs only in the small file (policy: %s)", async files => {
+    const { root, directory, mesh, writes, advance, hostKey, participantKey } = await setup(files, 120_000);
+    const before = fs.readFileSync(path.join(root, "state.json"), "utf8");
+    const session = mesh.get("sessions/live")!;
+    const host = mesh.get(hostKey)!;
+    const participant = mesh.get(participantKey)!;
+    expect(participant.value).toMatchObject({ livenessLeaseFiles: 1 });
+    for (let tick = 0; tick < 24; tick++) {
+      advance(5_000);
+      await directory.refresh();
+      expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(true);
+      expect(sessionLiveness(session, root)).toEqual({ updatedAt: Date.now(), expiresAt: Date.now() + 15_000 });
+    }
+    expect(writes).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(before);
+    expect(mesh.get(hostKey)).toEqual(host);
+    expect(mesh.get(participantKey)).toEqual(participant);
+    advance(15_001); // a crashed Main's session still lapses at the original fixed TTL
+    expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(false);
+    await directory.refresh(); // lock-confirmed re-acquisition, without another identity rewrite
+    expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(true);
+    expect(writes).not.toHaveBeenCalled();
+  });
+
+  it("cached sessions and peers follow fresh file liveness, lapse at 15 s and re-acquire without state writes", async () => {
+    const { root, directory, identity, writes, advance } = await setup(false);
+    const observerIdentity: MeshIdentity = { id: "session:observer", name: "main", kind: "main", sessionId: "observer" };
+    const observer = new ParticipantDirectory(new MeshStore(root, 64 * 1024, 100, { readCacheMs: 60_000 }), {
+      enabled: true, identity: observerIdentity, rootId: observerIdentity.id, hostId: observerIdentity.id, reapDeadHosts: false,
+    });
+    directories.push(observer);
+    expect(observer.sessions().map(root => root.id)).toEqual([identity.id]); // cache the identity
+    advance(20_000);
+    await directory.refresh();
+    expect(observer.sessions().map(root => root.id)).toEqual([identity.id]);
+    expect(observer.peers().map(peer => peer.id)).toEqual([identity.id]);
+    expect(writes).not.toHaveBeenCalled();
+    advance(15_001);
+    expect(observer.sessions()).toEqual([]);
+    expect(observer.peers()).toEqual([]);
+    await directory.refresh();
+    expect(observer.sessions().map(root => root.id)).toEqual([identity.id]);
+    expect(writes).not.toHaveBeenCalled();
+  });
+
+  it("re-enters legacy mode on an old peer joining, then stops state renewal when it lapses", async () => {
+    const { directory, mesh, writes, advance } = await setup(false);
+    advance(20_000);
+    await directory.refresh();
+    expect(writes).not.toHaveBeenCalled();
+    const peer: MeshIdentity = { id: "session:legacy", name: "main", kind: "main", sessionId: "legacy" };
+    await mesh.put({ key: "sessions/legacy", identity: peer, value: {
+      id: peer.id, sessionId: "legacy", cwd: "/tmp/legacy", status: "idle", startedAt: Date.now(),
+    } });
+    await directory.refresh();
+    expect(writes).toHaveBeenCalledOnce();
+    expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
+    advance(10_000);
+    await directory.refresh();
+    expect(writes).toHaveBeenCalledTimes(2);
+    advance(10_000); // older session is now stale: compatibility writes stop automatically
+    await directory.refresh();
+    expect(writes).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["root", "identity", "session", "incarnation", "host incarnation"])("a mismatched %s lease cannot revive a stale session", async mismatch => {
+    const { root, mesh, identity, advance } = await setup(false);
+    const session = mesh.get("sessions/live")!;
+    const lease = readHostLeases(root).get(identity.id)!;
+    advance(20_000);
+    writeHostLease(root, { ...lease, updatedAt: Date.now(), expiresAt: Date.now() + 15_000,
+      ...(mismatch === "root" ? { rootId: "another" } : {}),
+      ...(mismatch === "host incarnation" ? { startedAt: lease.startedAt! + 1 } : {}),
+      ...(mismatch === "identity" ? { identityId: "another" } : {}),
+      session: { ...lease.session!, updatedAt: Date.now(), expiresAt: Date.now() + 15_000,
+        ...(mismatch === "session" ? { id: "another" } : {}),
+        ...(mismatch === "incarnation" ? { startedAt: lease.session!.startedAt + 1 } : {}),
+      },
+    });
+    expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(false);
+  });
+
+  it("temporarily restores state advertisements if an old peer joins a participant-file fleet", async () => {
+    const { directory, mesh, identity, advance, participantKey } = await setup(true);
+    await mesh.put({ key: LIVENESS_POLICY_KEY, identity, value: { version: 1, hostLeases: "files", participants: "files" } });
+    await directory.refresh();
+    expect(mesh.get("sessions/live")).toBeUndefined();
+    expect(mesh.get(participantKey)).toBeUndefined();
+    const peer: MeshIdentity = { id: "session:legacy", name: "main", kind: "main", sessionId: "legacy" };
+    await mesh.put({ key: "sessions/legacy", identity: peer, value: {
+      id: peer.id, sessionId: "legacy", cwd: "/tmp/legacy", status: "idle", startedAt: Date.now(),
+    } });
+    await directory.refresh();
+    expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
+    expect(mesh.get(participantKey)?.value).toMatchObject({ livenessLeaseFiles: 1 });
+    advance(10_000);
+    await directory.refresh();
+    expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
+    advance(10_000);
+    await directory.refresh();
+    expect(mesh.get("sessions/live")).toBeUndefined();
+    expect(mesh.get(participantKey)).toBeUndefined();
+  });
+
+  it("an unadvertised live participant triggers fallback even under an advertised host", async () => {
+    const { directory, mesh, writes, advance, record } = await setup(false);
+    const peer: MeshIdentity = { id: "session:peer", name: "main", kind: "main", sessionId: "peer" };
+    const participantKey = key("topology/participants/", peer.id);
+    const participant = { ...record, id: peer.id, rootId: peer.id, ownerHostId: peer.id,
+      ownerIdentityId: peer.id, sessionId: "peer" };
+    await mesh.writeBatch({ identity: peer, ops: [
+      { kind: "put", key: key("topology/hosts/", peer.id), value: { format: 1, id: peer.id, rootId: peer.id,
+        identity: peer, startedAt: Date.now(), updatedAt: Date.now(), expiresAt: Date.now() + 120_000, livenessLeaseFiles: 1 } },
+      { kind: "put", key: participantKey, value: participant },
+    ] });
+    writes.mockClear();
+    advance(10_000);
+    await directory.refresh();
+    expect(writes).toHaveBeenCalledOnce();
+    await mesh.put({ key: participantKey, value: { ...participant, livenessLeaseFiles: 1 }, identity: peer });
+    advance(10_000);
+    await directory.refresh();
+    expect(writes).toHaveBeenCalledOnce(); // all live peers now advertise the reader contract
+  });
+
   it.each([false, true])("timestamp-only refresh does not write state (file policy: %s)", async files => {
     const { root, directory, writes, identity, advance } = await setup(files);
     const before = fs.readFileSync(path.join(root, "state.json"), "utf8");
@@ -91,7 +224,7 @@ describe("#3752 participant heartbeat contention", () => {
   });
 
   it("renews state leases at half-life without rewriting timestamp-only participants", async () => {
-    const { directory, mesh, hostKey, participantKey, writes, advance } = await setup(false);
+    const { directory, mesh, hostKey, participantKey, writes, advance } = await setup(false, 15_000, "main", true);
     const participant = mesh.get(participantKey)!;
     const host = mesh.get(hostKey)!;
     advance(5_000);
@@ -104,8 +237,33 @@ describe("#3752 participant heartbeat contention", () => {
     expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
   });
 
+  it("skips just before half-life and renews exactly at the legacy session half-life", async () => {
+    const { directory, mesh, writes, advance } = await setup(false, 120_000, "main", true);
+    advance(7_499);
+    await directory.refresh();
+    expect(writes).not.toHaveBeenCalled();
+    advance(1);
+    await directory.refresh();
+    expect(writes).toHaveBeenCalledOnce();
+    expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
+  });
+
+  it("uses a long host lease's own half-life when there is no legacy session lease", async () => {
+    const { directory, mesh, hostKey, participantKey, writes, advance } = await setup(false, 120_000, "actor", true);
+    const participant = mesh.get(participantKey)!;
+    const host = mesh.get(hostKey)!;
+    expect(mesh.get("sessions/live")).toBeUndefined();
+    for (let tick = 1; tick <= 12; tick++) {
+      advance(10_000);
+      await directory.refresh();
+      expect(writes).toHaveBeenCalledTimes(Math.floor(tick / 6));
+    }
+    expect(mesh.get(hostKey)!.version).toBeGreaterThan(host.version);
+    expect(mesh.get(participantKey)).toEqual(participant);
+  });
+
   it("keeps the legacy session TTL fresh even with a longer host lease", async () => {
-    const { directory, mesh, writes, advance } = await setup(false, 120_000);
+    const { directory, mesh, writes, advance } = await setup(false, 120_000, "main", true);
     advance(10_000);
     await directory.refresh();
     expect(writes).toHaveBeenCalledTimes(1);

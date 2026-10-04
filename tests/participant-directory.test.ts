@@ -672,6 +672,20 @@ describe("ParticipantDirectory actor operational counters", () => {
       return { actor, owner, read, stable };
     };
 
+    it("#4444 publishes and clears host admission state through a separate reader", async () => {
+      const { actor, owner, read } = await setup();
+      actor.status = "waiting";
+      actor.hostQueue = { position: 2, waitingSince: Date.now(), limit: 4 };
+      actor.updatedAt += 1;
+      await owner.refresh();
+      expect(read()).toMatchObject({ status: "waiting", actorHostQueue: actor.hostQueue });
+      actor.status = "running";
+      delete actor.hostQueue;
+      actor.updatedAt += 1;
+      await owner.refresh();
+      expect(read()?.actorHostQueue).toBeUndefined();
+    });
+
     it.each([
       { change: "queue/message", counts: [[1, 2], [2, 3]] },
       { change: "message-only", counts: [[0, 2], [0, 3]] },

@@ -3923,6 +3923,29 @@ describe("#2726 resident actor live read views", () => {
     return (action === "actors" ? (result as FabricActorReadInfo[]).find(row => row.id === state.actor.id) : result) as FabricActorReadInfo;
   };
 
+  it.each(["actorStatus", "actors"] as const)("#4444 %s forwards live hostQueue and clears stale or settled tickets", async action => {
+    const state = await passiveState();
+    const resident = vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue(undefined);
+    const hostQueue = { position: 3, waitingSince: Date.now() - 1_000, limit: 4 };
+    const { actorRun: _run, ...owner } = state.live;
+    const live = { ...owner, status: "waiting", actorHostQueue: hostQueue };
+    try {
+      state.setLive(live);
+      const view = await read(state, action);
+      expect(view).toMatchObject({ status: "waiting", hostQueue });
+      expect(view.hostQueue).not.toBe(hostQueue);
+      const oldView = { ...state.actor, hostQueue };
+      const status = vi.spyOn(state.passive, "status").mockReturnValue(oldView);
+      const list = vi.spyOn(state.passive, "list").mockReturnValue([oldView]);
+      try {
+        for (const current of [{ ...owner, status: "idle" }, { ...live, stale: true }, undefined]) {
+          state.setLive(current);
+          expect((await read(state, action)).hostQueue).toBeUndefined();
+        }
+      } finally { status.mockRestore(); list.mockRestore(); }
+    } finally { resident.mockRestore(); }
+  });
+
   it.each([
     ["actorStatus", "preparing"], ["actorStatus", "waiting"],
     ["actors", "preparing"], ["actors", "waiting"],

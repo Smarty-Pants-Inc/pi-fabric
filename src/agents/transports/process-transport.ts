@@ -12,6 +12,7 @@ import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
 import { findExecutable, spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
+import type { HostActivationPolicy } from "./host-activation.js";
 
 const regularFile = (file: string): boolean => {
   try { return fs.statSync(file).isFile(); } catch { return false; }
@@ -49,7 +50,7 @@ export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
   #scopeWarningLogged = false;
 
-  constructor(private readonly processSlice?: string) {}
+  constructor(private readonly processSlice?: string, private readonly hostActivation?: HostActivationPolicy) {}
 
   #warnScope = (reason: string): void => {
     if (this.#scopeWarningLogged) return;
@@ -62,53 +63,65 @@ export class ProcessTransport implements AgentTransportAdapter {
   }
 
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
-    const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
-    if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
-    const selected = selectWorkerRelease(request.workerPath);
-    const workerArguments = [...request.workerArguments];
-    if (selected.extensionPath) {
-      let pinned = false;
-      for (let index = 0; index < workerArguments.length; index += 2) {
-        if (workerArguments[index] === "--fabric-extension") {
-          const explicitExtension = workerArguments[index + 1]!;
-          // Only replace a Fabric generation. Explicit caller hooks are not
-          // release selectors (e.g. resident probes testing a broken factory).
-          if (fabricResourceRoot(explicitExtension, "extensions")) {
-            workerArguments[index + 1] = selected.extensionPath;
+    const isActor = request.workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id");
+    const token = this.hostActivation && (isActor || this.hostActivation.scope === "all")
+      ? await (await import("./host-activation.js")).acquireHostActivation(this.hostActivation, request)
+      : undefined;
+    try {
+      // Host admission can wait across an installed generation change. Resolve the
+      // worker at the actual native launch boundary, not when joining the queue.
+      const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
+      if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
+      const selected = selectWorkerRelease(request.workerPath);
+      const workerArguments = [...request.workerArguments];
+      if (selected.extensionPath) {
+        let pinned = false;
+        for (let index = 0; index < workerArguments.length; index += 2) {
+          if (workerArguments[index] === "--fabric-extension") {
+            const explicitExtension = workerArguments[index + 1]!;
+            // Only replace a Fabric generation. Explicit caller hooks are not
+            // release selectors (e.g. resident probes testing a broken factory).
+            if (fabricResourceRoot(explicitExtension, "extensions")) {
+              workerArguments[index + 1] = selected.extensionPath;
+            }
+            pinned = true;
           }
-          pinned = true;
+        }
+        const args = new Map<string, string>();
+        for (let index = 0; index < workerArguments.length; index += 2) args.set(workerArguments[index]!, workerArguments[index + 1]!);
+        if (!pinned && args.get("--runner") === "pi" && args.get("--extensions") === "true") {
+          workerArguments.push("--fabric-extension", selected.extensionPath);
         }
       }
-      const args = new Map<string, string>();
-      for (let index = 0; index < workerArguments.length; index += 2) args.set(workerArguments[index]!, workerArguments[index + 1]!);
-      if (!pinned && args.get("--runner") === "pi" && args.get("--extensions") === "true") {
-        workerArguments.push("--fabric-extension", selected.extensionPath);
-      }
-    }
-    if (selected.fabricRelease) workerArguments.push("--fabric-release", selected.fabricRelease);
-    const processHandle = await spawnDetached(
-      selected.workerPath,
-      workerArguments,
-      request.cwd,
-      request,
-      // Worker arguments are flag/value pairs. A flag-shaped value is not an
-      // actor identity; explicit actor ids alone retain the parent's role env.
-      applyTaskReturnAddress(
-        workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id")
-          ? { ...process.env } : taskAgentEnvironment(),
+      if (selected.fabricRelease) workerArguments.push("--fabric-release", selected.fabricRelease);
+      const processHandle = await spawnDetached(
+        selected.workerPath,
         workerArguments,
-      ),
-      executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
-    );
-    return {
-      kind: this.kind,
-      ...(selected.fabricRelease ? { fabricRelease: selected.fabricRelease } : {}),
-      sessionId: String(processHandle.pid),
-      isAlive: processHandle.isAlive,
-      lostContact: processHandle.lostContact,
-      waitForClose: processHandle.waitForClose,
-      closed: processHandle.closed,
-      stop: processHandle.stop,
-    };
+        request.cwd,
+        request,
+        // Worker arguments are flag/value pairs. A flag-shaped value is not an
+        // actor identity; explicit actor ids alone retain the parent's role env.
+        applyTaskReturnAddress(
+          isActor ? { ...process.env } : taskAgentEnvironment(),
+          workerArguments,
+        ),
+        executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
+        token?.fd,
+      );
+      return {
+        kind: this.kind,
+        ...(selected.fabricRelease ? { fabricRelease: selected.fabricRelease } : {}),
+        sessionId: String(processHandle.pid),
+        isAlive: processHandle.isAlive,
+        lostContact: processHandle.lostContact,
+        waitForClose: processHandle.waitForClose,
+        closed: processHandle.closed,
+        stop: processHandle.stop,
+      };
+    } finally {
+      // The worker inherits the same locked open file description as FD 3.
+      // Close only the launcher's reference; worker exit releases the token.
+      if (token) fs.closeSync(token.fd);
+    }
   }
 }

@@ -151,6 +151,7 @@ export const effectiveAgentTimeoutMs = (
 export interface AgentLaunchPreparationOptions {
   timeoutMs: number;
   onPreparing?: () => void;
+  onHostQueue?: AgentTransportLaunch["onHostQueue"];
 }
 
 export class AgentLaunchPreparationTimeoutError extends Error {
@@ -717,6 +718,8 @@ export class AgentManager {
     readonly config: FabricAgentConfig,
     options: {
       workerPath?: string;
+      /** Trusted embedding/test storage override; never read from workspace config. */
+      hostActivationDirectory?: string;
       /** The detached temp-root sweep entry (dist/storage/sweep-main.js). */
       sweepPath?: string;
       fabricExtensionPath?: string;
@@ -811,7 +814,11 @@ export class AgentManager {
     this.#budgetOwned =
       !inheritedBudget && this.#currentDepth === 0 && config.budgetUsd > 0;
     const adapters: AgentTransportAdapter[] = [
-      new ProcessTransport(config.processSlice),
+      new ProcessTransport(config.processSlice, config.hostActivationLimit === undefined ? undefined : {
+        limit: config.hostActivationLimit,
+        ...(config.hostActivationLimitScope ? { scope: config.hostActivationLimitScope } : {}),
+        ...(options.hostActivationDirectory ? { directory: options.hostActivationDirectory } : {}),
+      }),
       new TmuxTransport(),
       new ScreenTransport(),
       new LocaltermTransport(),
@@ -1361,6 +1368,7 @@ export class AgentManager {
           workerPath: this.#workerPath,
           workerArguments,
           signal,
+          ...(preparation?.onHostQueue ? { onHostQueue: preparation.onHostQueue } : {}),
           onUnconfirmedExit: (reason) => {
             const managed = this.#runs.get(id);
             if (managed) this.#markLost(managed, reason);
@@ -2825,7 +2833,14 @@ export class AgentManager {
 
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
-      managed.transport = await this.#launchTransport(managed.adapter, managed.launch);
+      managed.transport = await this.#launchTransport(managed.adapter, {
+        ...managed.launch,
+        // Detached task agents ignore caller aborts, but a host token wait
+        // must still end on explicit stop or abandonment. #launchTransport
+        // separately binds every launch to manager shutdown.
+        authorize: () => !managed.settled && !this.#closing && !managed.stopRequested && !managed.abandoned &&
+          (managed.launch.authorize?.() ?? true),
+      });
       this.#unregisteredTransports.delete(managed.transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
       delete managed.relaunchFailure;
@@ -2857,6 +2872,7 @@ export class AgentManager {
       this.#invalidateUiList();
       return true;
     } catch (error) {
+      if (managed.settled) return false; // Stop may have settled the run during host admission.
       const retryError = error instanceof Error ? error.message : String(error);
       try {
         fs.appendFileSync(
@@ -2929,6 +2945,7 @@ export class AgentManager {
         if (await this.#resumeStopped(managed, record, deadline)) continue;
         // A relaunch that failed is terminal: no fallback launch may run after it.
         if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
+        if (managed.settled) return; // A stop can settle while a relaunch waits for a host token.
         this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
         return;
       }
@@ -3012,6 +3029,7 @@ export class AgentManager {
               managed.lastRetriedTransportFailure = failed;
               continue;
             }
+            if (managed.settled) return;
             const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
             writeRecord(managed.statusFile, settled);
             this.#settle(managed, settled);

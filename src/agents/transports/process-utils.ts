@@ -262,6 +262,7 @@ export const spawnDetached = async (
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
   scope?: { executable: string; slice: string; warn: (reason: string) => void },
+  hostTokenFd?: number,
 ): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
@@ -278,7 +279,7 @@ export const spawnDetached = async (
     cwd,
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
-    stdio: "ignore",
+    stdio: hostTokenFd === undefined ? "ignore" : ["ignore", "ignore", "ignore", hostTokenFd],
   });
   let spawnError: Error | undefined;
   child.once("error", error => { spawnError = error; });
@@ -287,7 +288,7 @@ export const spawnDetached = async (
     await new Promise<void>(resolve => child.once("close", () => resolve()));
     fs.rmSync(scopeRoot!, { recursive: true, force: true });
     scope.warn(spawnError?.message ?? "systemd-run did not launch");
-    return spawnDetached(workerPath, workerArguments, cwd, authority, environment);
+    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, hostTokenFd);
   }
   const pid = child.pid;
   // Once the worker exited, its numeric id is no identity: after its group empties, the id
@@ -396,7 +397,7 @@ export const spawnDetached = async (
       assertTransportLaunchAllowed(authority);
       if (fs.existsSync(marker)) return handle; // admitted during teardown; never replay
       scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
-      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment);
+      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, hostTokenFd);
     } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }
   }
   return handle;

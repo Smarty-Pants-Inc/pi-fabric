@@ -97,6 +97,28 @@ describe("host-only processSlice (#4383)", () => {
   });
 });
 
+describe("host-only activation cap (#4444)", () => {
+  it("defaults off, validates positive safe integer limits, and accepts explicit task scope", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.hostActivationLimit).toBeUndefined();
+    expect(normalizeFabricConfig({}).agents.hostActivationLimitScope).toBeUndefined();
+    expect(normalizeFabricConfig({ agents: { hostActivationLimit: 4, hostActivationLimitScope: "all" } }).agents)
+      .toMatchObject({ hostActivationLimit: 4, hostActivationLimitScope: "all" });
+    for (const value of [0, -1, 1.5, "4", null, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => normalizeFabricConfig({ agents: { hostActivationLimit: value } })).toThrow("positive safe integer");
+    }
+    expect(() => normalizeFabricConfig({ agents: { hostActivationLimitScope: "tasks" } })).toThrow("actors or all");
+  });
+  it.each([true, false])("never accepts a workspace cap or scope (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { hostActivationLimit: 99, hostActivationLimitScope: "all" } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.hostActivationLimit).toBeUndefined();
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { hostActivationLimit: 4, hostActivationLimitScope: "actors" } }));
+    for (const config of [loadFabricConfig({ cwd, agentDir, projectTrusted }), loadFabricConfigForScope({ cwd, agentDir, projectTrusted }, projectTrusted ? "project" : "global")]) {
+      expect(config.agents).toMatchObject({ hostActivationLimit: 4, hostActivationLimitScope: "actors" });
+    }
+  });
+});
+
 describe("Fabric configuration", () => {
   it("defaults automatic per-host reload concurrency to six and preserves explicit unlimited mode", () => {
     expect(DEFAULT_FABRIC_CONFIG.selfReloadConcurrency).toBe(6);

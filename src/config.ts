@@ -167,6 +167,10 @@ export interface FabricAgentConfig {
   transport: FabricAgentTransport;
   /** Host-only Linux user scope slice; unset launches workers directly. */
   processSlice?: string;
+  /** Host-only cross-process activation cap. Unset means no host cap. */
+  hostActivationLimit?: number;
+  /** Defaults to actors only; all also caps one-shot task workers. */
+  hostActivationLimitScope?: "actors" | "all";
   model?: string;
   /** Host-only fleet policy; workspace configuration cannot override these keys. */
   deniedModels: string[];
@@ -1055,6 +1059,18 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
         ? { processSlice: agents.processSlice } : {}),
+      ...(agents.hostActivationLimit !== undefined ? { hostActivationLimit: (() => {
+        if (typeof agents.hostActivationLimit !== "number" || !Number.isSafeInteger(agents.hostActivationLimit) || agents.hostActivationLimit < 1) {
+          throw new Error("agents.hostActivationLimit must be a positive safe integer");
+        }
+        return agents.hostActivationLimit;
+      })() } : {}),
+      ...(agents.hostActivationLimitScope !== undefined ? { hostActivationLimitScope: (() => {
+        if (agents.hostActivationLimitScope !== "actors" && agents.hostActivationLimitScope !== "all") {
+          throw new Error("agents.hostActivationLimitScope must be actors or all");
+        }
+        return agents.hostActivationLimitScope;
+      })() } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
         ? { modelRouting: (() => {
@@ -1587,6 +1603,8 @@ const resolveFabricConfig = (
       delete agents.deniedModelReplacement;
       delete agents.instructionsRoot;
       delete agents.processSlice;
+      delete agents.hostActivationLimit;
+      delete agents.hostActivationLimitScope;
       document.agents = agents;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

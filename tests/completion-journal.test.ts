@@ -3,9 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { monitorEventLoopDelay, performance } from "node:perf_hooks";
+import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, saveCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
+import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, saveCompletion, setCompletionJournalSliceObserver, type CompletionRecipient } from "../src/agents/completion-journal.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import type { MeshStore } from "../src/mesh/store.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
@@ -34,21 +34,15 @@ const setup = () => {
   return { root, meshRoot, recipient, result, file, receipt, journal, seed, mesh };
 };
 
-// Observe the maximum event-loop slice, not the wall time of an async scan/pass.
+// Instrument the scan generator itself; event-loop delay also observes unrelated test/GC work.
 const measureIdleSlices = async (operation: () => Promise<void>) => {
-  const delay = monitorEventLoopDelay({ resolution: 1 });
-  delay.enable();
+  const observed: number[] = [];
+  setCompletionJournalSliceObserver(durationMs => observed.push(durationMs));
+  const start = performance.now();
   try {
-    await new Promise(resolve => setTimeout(resolve, 10)); // Arm before the first synchronous slice.
-    delay.reset();
-    const start = performance.now();
-    const pending = operation();
-    const initialMs = performance.now() - start; // A scan that never yields can finish before the monitor fires.
-    await pending;
-    const passMs = performance.now() - start;
-    await new Promise(resolve => setTimeout(resolve, 10)); // Record the final slice too.
-    return { maxMs: Math.max(initialMs, delay.max / 1e6), samples: delay.count, passMs };
-  } finally { delay.disable(); }
+    await operation();
+    return { maxMs: Math.max(...observed), samples: observed.length, passMs: performance.now() - start };
+  } finally { setCompletionJournalSliceObserver(undefined); }
 };
 
 describe("completion journal idle scans", () => {

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { createHash } from "node:crypto";
 import { syncPathNamespace, syncPathNamespaceAsync, writeJsonAtomic } from "../core/atomic-write.js";
 import { residentProcessAlive } from "../residency/process-identity.js";
@@ -70,20 +71,36 @@ const files = (dir: string): string[] => {
   try { return fs.readdirSync(dir).filter(isJournalFile); } catch { return []; }
 };
 // Idle scans must yield on inspected entries, not just successful cleanup/delivery.
-// Two entries leave headroom for slower filesystems. A timer turn lets timers/IO
-// run between slices rather than chaining adjacent immediate callbacks.
-// Yield before the next entry, not after the last: small native reconciles must not
-// require a trailing timer turn before they can admit completion notifications.
+// A timer turn lets timers/IO run between slices rather than chaining adjacent immediate
+// callbacks. Keep both a time budget and an entry cap: one slow read must not make a
+// slice unbounded, while the cap protects against cheap work starving the event loop.
+const SCAN_SLICE_BUDGET_MS = 4;
+const SCAN_SLICE_ENTRY_LIMIT = 2;
+export type CompletionJournalSliceObserver = (durationMs: number) => void;
+let sliceObserver: CompletionJournalSliceObserver | undefined;
+export const setCompletionJournalSliceObserver = (observer: CompletionJournalSliceObserver | undefined): void => {
+  sliceObserver = observer;
+};
 async function* scanSlices<T>(entries: Iterable<T>): AsyncGenerator<T> {
   let scanned = 0;
+  let sliceStartedAt = performance.now();
+  const finishSlice = (): void => {
+    sliceObserver?.(performance.now() - sliceStartedAt);
+  };
   for (const entry of entries) {
-    if (scanned === 2) {
+    if (scanned > 0 && (scanned >= SCAN_SLICE_ENTRY_LIMIT || performance.now() - sliceStartedAt >= SCAN_SLICE_BUDGET_MS)) {
+      finishSlice();
       await new Promise<void>(resolve => setTimeout(resolve, 0));
+      sliceStartedAt = performance.now();
       scanned = 0;
     }
     scanned++;
     yield entry;
+    // The consumer may await between entries; that is a separate event-loop turn,
+    // so do not charge its idle time to this generator slice.
+    sliceStartedAt = performance.now();
   }
+  if (scanned > 0) finishSlice();
 }
 async function* scanTargets(dirs: readonly string[]): AsyncGenerator<string> {
   for (const dir of dirs) {

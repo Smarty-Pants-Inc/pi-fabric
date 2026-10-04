@@ -383,6 +383,9 @@ export interface ParticipantDirectoryOptions {
    * 15 min, the first sweep waiting as long). false disables it (secondary directories, tests).
    */
   reapDeadHosts?: false | { deadAfterMs?: number; sweepMs?: number };
+  /** Stall checks share the committed heartbeat; secondary/resident hosts can participate. */
+  presencePass?: () => Promise<void>;
+  presencePassMs?: number;
 }
 
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
@@ -416,6 +419,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshError: unknown;
   #leaseConfirmed = false;
   #deadHostSweepAt = Date.now();
+  #presencePassAt = Date.now();
   #quiescing = false;
   #reloadUntil: number | undefined;
   #reloadPublished = false;
@@ -529,7 +533,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#refreshedAt = committed;
       this.#leaseConfirmed = true;
       this.#refreshError = undefined;
-      if (full) this.#sweepDeadHosts();
+      if (full) {
+        this.#sweepDeadHosts();
+        if (this.options.enabled && !this.#closed && !this.#quiescing && this.options.presencePass &&
+          Date.now() - this.#presencePassAt >= (this.options.presencePassMs ?? 60_000)) {
+          this.#presencePassAt = Date.now();
+          void this.#notifications.enqueue(this.options.presencePass);
+        }
+      }
     } catch (error) {
       this.#refreshError = error;
       throw error;

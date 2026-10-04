@@ -56,7 +56,7 @@ export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind">): boolea
   event.topic === "fabric.control.command" ||
   event.topic === "fabric.control.ack" ||
   event.topic.startsWith("fleet.work.") ||
-  (event.topic === "ops.owner" && event.kind === "pr.wake");
+  (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm"));
 
 /** The stamp a bridged event carries; an event with one is never forwarded again (no loops). */
 export const bridgeStampOf = (event: Pick<MeshEvent, "data">): { from: string; id: string } | undefined => {

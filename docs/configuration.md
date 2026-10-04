@@ -204,7 +204,10 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "actorQueueLimit": 32,
     "eventContextChars": 40000,
     "followUpFlushMs": 120000,
-    "followUpStallSeconds": 600
+    "followUpStallSeconds": 600,
+    "rootPresenceAlarmMs": 900000,
+    "undeliveredAlarmMs": 1800000,
+    "rootGoneTtlMs": 7200000
   },
   "actors": {
     "maxSessionBytes": 20971520
@@ -611,6 +614,14 @@ call override → session binding → project default → Fabric default
 `mesh.followUpFlushMs` (default 120000) bounds how late an agent `followUp` reaches a busy Main. Fabric holds such a followUp while Main works. At the next boundary between tool calls, it sends every followUp that has waited this long as one batched steer, oldest first, behind any steer already queued. When the run is about to settle (`agent_before_settle`), it hands the rest to Pi's followUp queue, so Pi continues the run for them unless the user cancelled. `0` keeps Pi's own followUp queue, which Pi reads only when Main has no more work. Pi hosts older than 0.87.0 have no `agent_before_settle` and always keep Pi's queue.
 
 `mesh.followUpStallSeconds` (default 600) makes a stuck followUp queue visible to its sender. When Main is idle and the oldest followUp that Fabric still holds for it, from any sender, is at least this old, no boundary will release the queue: the owner marks its acknowledgement `stalled: true`, and `agents.followUp` and `agents.tell` to that Main throw `Fabric followUp to <target> was accepted but is not being delivered: <n> held, oldest <age> s, target idle.` The message stays held, not withdrawn; use `agents.steer` meanwhile. A busy Main is never reported stalled, because a long turn holds followUps until its next boundary. `0` disables the check. Owners older than this setting never report `stalled`.
+
+The owning host's existing committed presence heartbeat also checks runtime stalls (at most once per minute; no extra timer):
+
+- `mesh.rootPresenceAlarmMs` (default 900000, 15 minutes) publishes one `ops.owner` / `root.presence.alarm` per root absence episode when actors or agents remain after their root disappears from live discovery. It reports member counts by kind and status, including idle/stopped members. The durable identity is the root plus its first observed absence time; a returning root re-arms it. This is an alert, not proof that permits orphan adoption.
+- `mesh.undeliveredAlarmMs` (default 1800000, 30 minutes) publishes `ops.owner` / `inbox.age.alarm` to the sender and target owner for an unconfirmed Main followUp or steer, once per message/address. A queue ACK is not delivery: only the canonical synced native session receipt counts. Addressed age alarms cross the existing mesh bridge; unrelated `ops.owner` kinds remain excluded.
+- `mesh.rootGoneTtlMs` (default 7200000, 2 hours) supplies an explicit `undeliverable: root gone` receipt when a departed root has no recorded successor. A lapsed lease alone never moves a live writer's queue.
+
+Native `new`/`resume` session replacement records its explicit `targetSessionFile` after closing the old drainer. Only that exact successor inherits undelivered Main messages. A durable per-message claim precedes source removal; successor admission reuses the original native message ID and the existing journal/delivery-ID receipt machinery. A crash between move, admission and receipt is recoverable without delivery into both inboxes. The sender receives `rerouted: <old> -> <new>` through `fleet.work.inbox-receipts`, the existing root inbox and bridge work-event path. Recorded native deliveries never move. Reload does not rotate; labels, cwd matches and missing leases cannot invent a successor. The pre-switch abort boundary cannot flush to the old inbox; if another extension cancels a switch, explicit owner input reopens that inbox.
 
 `mesh.eventContextChars` bounds the sanitized JSON context attached to each host-event activation. Fabric extracts images first. It stores redacted image descriptors in the mailbox and registry, then sends the raw images to the actor out of band. The character limit never truncates image base64 because base64 is not part of that JSON context.
 

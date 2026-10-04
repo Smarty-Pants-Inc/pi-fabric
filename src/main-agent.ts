@@ -194,7 +194,7 @@ const mainSenderClaimAllowed = (sender: MeshIdentity, deliveryId: unknown, sourc
   source !== "fabric-host" && !(sender.kind === "actor" && typeof deliveryId === "string" &&
     deliveryId.startsWith("resident:") && source !== "actor-output");
 
-interface HeldAgentMessage {
+export interface HeldAgentMessage {
   id: string;
   from: MeshIdentity;
   /** Resident producer evidence, retained even on hosts without Pi provenance support. */
@@ -306,6 +306,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #scanned: number | undefined;
   #sessionFileIdentity: string | undefined;
   #journal: string | undefined;
+  #inboxFence: { owns(id: string): boolean; active(): boolean } | undefined;
   // Delivery ids whose message the session holds, or that will never go (replaced, dropped):
   // persisted beside the journal, bounded, oldest first. This index also retains the owner halt
   // after the message journal is empty. With the journal's own items they make
@@ -334,6 +335,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #haltIndexUnknown = false;
   #closed = false;
   #reloading = false;
+  #switching = false;
   #bindingsLive = false;
   #bindingMutation: Promise<unknown> = Promise.resolve();
   #wake: ReturnType<typeof setInterval> | undefined;
@@ -473,6 +475,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   deliverAgent(request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult {
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
+    if (this.#inboxFence && !this.#inboxFence.active()) throw new Error("Main root rotated; address its successor");
     const message = request.message.trim();
     if (!message) throw new Error("Main agent message must not be empty");
     const sender = senderIdentity(request.from);
@@ -575,7 +578,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         triggered = canTrigger && this.#sent.includes(item);
       }
 
-    } else if (deliveryId !== undefined) {
+    } else if (deliveryId !== undefined || this.#journal) {
       // A sent message may wait in Pi's volatile queue (prompt preflight, a settle): it stays in
       // the journal until the session holds it, and a restart replays it (#confirm, #replay).
       item.handed = true;
@@ -607,6 +610,24 @@ export class MainAgentController implements FabricMainAgentTarget {
       // straight to Pi (#123 review F1).
       ...(held ? this.#depthReport(item.from.id) : this.queueDepth(item.from.id)),
     };
+  }
+
+  /** Presence maintenance confirms only the existing durable native receipt path. */
+  confirmInbox(): void { this.#confirm(); }
+
+  /** Admit a claimed rotation carrier with its ORIGINAL native message id. The existing
+   * delivery-id index and journal-before-Pi barrier make a crash/retry idempotent. */
+  receiveInboxItem(original: HeldAgentMessage): void {
+    if (!this.#journal || !this.local) throw new Error("Main inbox is not open");
+    if (this.#inboxFence && (!this.#inboxFence.active() || !this.#inboxFence.owns(original.id))) throw new Error("Main inbox claim belongs elsewhere");
+    const deliveryId = original.deliveryId ?? `inbox:${original.id}`;
+    if (this.#admitted(deliveryId) || this.#refreshDelivered(true).has(original.id)) return;
+    const { handed: _handed, ...item } = original;
+    const retained = { ...item, deliveryId };
+    this.#admit(retained);
+    this.#held.push(retained);
+    try { this.#save(); } catch (error) { this.#held.pop(); throw error; }
+    if (this.#context?.isIdle()) this.#release(true);
   }
 
   /**
@@ -939,6 +960,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (!other || rank(item) > rank(other)) last.set(chainOf(item), item);
     }
     for (const item of items.sort((a, b) => a.sentAt - b.sentAt)) {
+      if (this.#inboxFence && !this.#inboxFence.owns(item.id)) continue;
       if (delivered.has(item.id) || delivered.has(chainOf(item)) || last.get(chainOf(item)) !== item ||
         (item.deliveryId !== undefined && this.#consumed.has(item.deliveryId))) {
         this.#consume(item);
@@ -956,7 +978,8 @@ export class MainAgentController implements FabricMainAgentTarget {
    * flushMs at the next boundary between tool calls (turn_end, the hook the shell and
    * completion inboxes use). flushMs 0 keeps Pi's followUp queue, as before.
    */
-  attachFollowUpDrain(context: ExtensionContext, flushMs: number, journal?: string, stallSeconds = 600): void {
+  attachFollowUpDrain(context: ExtensionContext, flushMs: number, journal?: string, stallSeconds = 600,
+    inboxFence?: { owns(id: string): boolean; active(): boolean }): void {
     this.closeFollowUpDrain();
     if (!this.local) return;
     this.#stallS = stallSeconds;
@@ -964,18 +987,27 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#bindingsLive = true;
     this.#closed = false;
     this.#reloading = false;
+    this.#switching = false;
     this.#halted = false;
     this.#recoverProvider();
     this.#haltIndexUnknown = false;
     this.#journal = journal === undefined ? undefined : path.resolve(journal);
+    this.#inboxFence = inboxFence;
     const on = (name: string, fn: (event: any, ctx: ExtensionContext) => unknown): void => {
       if (typeof this.pi.on !== "function") return;
       const off = (this.pi.on as (name: string, fn: (event: any, ctx: ExtensionContext) => unknown) => unknown)(name, fn);
       if (typeof off === "function") this.#unsubscribe.push(off as () => void);
     };
+    // Native replacement aborts/settles the old run BEFORE session_shutdown. Fence
+    // that boundary now so undelivered followUps cannot be appended to the old root.
+    // A later extension may cancel the switch; explicit owner input reopens that inbox.
+    on("session_before_switch", (event: { reason?: string }) => {
+      if (event.reason === "new" || event.reason === "resume") { this.#switching = true; this.prepareReload(); }
+    });
     on("input", (event: { source?: string }, ctx) => {
       this.#context = ctx;
       if (event.source === "extension") return;
+      if (this.#switching) { this.#switching = false; this.#reloading = false; this.#bindingsLive = true; }
       this.#halted = false;
       this.#recoverProvider(false);
       this.#haltIndexUnknown = false;
@@ -1430,6 +1462,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     triggerTurn: boolean,
     flushed: boolean,
   ): boolean | undefined {
+    items = items.filter(item => !this.#inboxFence || this.#inboxFence.owns(item.id));
+    if (this.#reloading || !items.length || (this.#inboxFence && !this.#inboxFence.active())) return false;
     triggerTurn &&= !this.#halted && !this.#providerBackoffActive() && !this.#context?.signal?.aborted;
     // Persist a downgraded explicit replay policy, including handoffs retried after a later reload.
     if (!triggerTurn) for (const item of items) if (item.deliverAs !== undefined) item.triggerTurn = false;

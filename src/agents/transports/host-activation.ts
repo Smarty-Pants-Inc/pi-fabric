@@ -36,8 +36,8 @@ const startTime = (pid: number): string | undefined => {
 /** flock(1) locks the inherited open file description. Its exit closes only
  * its reference: our FD retains the kernel lock, and is handed to the worker.
  * No helper/lease timeout can release an activation that is still running. */
-const tryLock = async (executable: string, file: string): Promise<number | undefined> => {
-  const fd = fs.openSync(file, "a+", 0o600);
+const tryLock = async (executable: string, file: string, retainedFd?: number): Promise<number | undefined> => {
+  const fd = retainedFd ?? fs.openSync(file, "a+", 0o600);
   try {
     const code = await new Promise<number | null>((resolve, reject) => {
       const child = spawn(executable, ["--exclusive", "--nonblock", "--conflict-exit-code", "75", "3"], {
@@ -48,9 +48,9 @@ const tryLock = async (executable: string, file: string): Promise<number | undef
     });
     if (code === 0) return fd;
     if (code !== 75) throw new Error(`Host activation flock failed (exit ${code})`);
-    fs.closeSync(fd);
+    if (retainedFd === undefined) fs.closeSync(fd);
     return undefined;
-  } catch (error) { fs.closeSync(fd); throw error; }
+  } catch (error) { if (retainedFd === undefined) fs.closeSync(fd); throw error; }
 };
 
 const pause = (signal?: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
@@ -67,6 +67,8 @@ const pause = (signal?: AbortSignal): Promise<void> => new Promise((resolve, rej
 export const acquireHostActivation = async (
   policy: HostActivationPolicy,
   request: Pick<AgentTransportLaunch, "id" | "signal" | "authorize" | "onHostQueue">,
+  // Trusted native custody: reacquire the same inherited open description.
+  retainedFd?: number,
 ): Promise<{ fd: number; ticket: number }> => {
   if (!Number.isSafeInteger(policy.limit) || policy.limit < 1) throw new Error("agents.hostActivationLimit must be a positive safe integer");
   if (process.platform !== "linux") throw new Error("agents.hostActivationLimit requires Linux flock; refusing an uncapped launch");
@@ -135,8 +137,8 @@ export const acquireHostActivation = async (
         const index = queue.findIndex(ticket => ticket.id === own!.id);
         if (index < 0) throw new Error("Host activation ticket disappeared");
         if (index === 0) {
-          for (let token = 0; token < policy.limit; token++) {
-            acquired = await tryLock(executable, path.join(directory, `token-${token}.lock`));
+          for (let token = 0; token < (retainedFd === undefined ? policy.limit : 1); token++) {
+            acquired = await tryLock(executable, path.join(directory, `token-${token}.lock`), retainedFd);
             if (acquired !== undefined) { queue.splice(0, 1); break; }
           }
         }
@@ -155,7 +157,7 @@ export const acquireHostActivation = async (
       await pause(request.signal);
     }
   } catch (error) {
-    if (acquired !== undefined) fs.closeSync(acquired);
+    if (acquired !== undefined && retainedFd === undefined) fs.closeSync(acquired);
     throw error;
   } finally {
     try {

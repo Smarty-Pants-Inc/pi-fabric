@@ -52,6 +52,13 @@ describe.skipIf(process.platform !== "linux")("host-wide activation admission (#
     if (limit === 1) expect(proof.fifo).toBe(true);
   }, 60_000);
 
+  it("rejects host-engine dependencies without an enclosing execution fence before releasing custody", async () => {
+    const { yieldHostActivation } = await import("../src/agents/transports/host-activation-yield.js");
+    // There is deliberately no FD 3 or host token here: rejection must precede
+    // descriptor access, ticket creation, or dependency launch.
+    await expect(yieldHostActivation("detached-host-engine")).rejects.toThrow("enclosing fabric_exec");
+  });
+
   it("cold import and idle registration do not create host queue or token files", async () => {
     const cwd = root(); const directory = path.join(cwd, "idle-tokens");
     const runtime = await resolveScriptRuntime({ requireBun: true });
@@ -184,6 +191,51 @@ describe.skipIf(process.platform !== "linux")("host-wide activation admission (#
     // Token is still occupied: cleanup cannot depend on spare capacity.
     expect(fs.fstatSync(blocker.fd).isFile()).toBe(true);
   }, 20_000);
+
+  it.each(["startup-retry", "resume"] as const)("gives a %s worker runtime after host admission exceeds the remaining deadline", async recovery => {
+    const cwd = root(); const directory = path.join(cwd, "tokens");
+    const target = path.resolve(recovery === "startup-retry" ? "tests/fixtures/fake-worker-startup-retry.mjs" : "tests/fixtures/fake-worker.mjs");
+    const marker = recovery === "startup-retry" ? "startup-attempts" : "resume-attempts";
+    const workerPath = path.join(cwd, "recovery.mjs");
+    fs.writeFileSync(workerPath, `import fs from "node:fs"; import path from "node:path";
+const args = new Map(); for(let i=2;i<process.argv.length;i+=2) args.set(process.argv[i],process.argv[i+1]);
+if(fs.existsSync(path.join(path.dirname(args.get("--status-file")),${JSON.stringify(marker)}))) await new Promise(resolve=>setTimeout(resolve,500));
+await import(${JSON.stringify(target)});`);
+    const agent = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, hostActivationLimit: 1, hostActivationLimitScope: "all",
+      maxConcurrent: 4, budgetUsd: 0, sessionExport: false, timeoutMs: 1_000 }, {
+      hostActivationDirectory: directory, workerPath, runRoot: path.join(cwd, "runs"),
+    }); managers.push(agent);
+    const handle = await agent.spawn({ task: recovery === "startup-retry" ? "Recover startup" : "RESUME_AFTER_STOP", transport: "process" });
+    const blocker = await acquireHostActivation({ limit: 1, directory }, { id: "other-root" }); fds.push(blocker.fd);
+    const queue = () => JSON.parse(fs.readFileSync(path.join(directory, "queue.json"), "utf8")) as { activationId: string }[];
+    await wait(() => queue().some(ticket => ticket.activationId === handle.id));
+    // Exceeds even the 1s runtime + 1s native-exit grace; attempt two must still
+    // receive the unspent runtime, not be started and immediately terminated.
+    await new Promise(resolve => setTimeout(resolve, 2_500));
+    expect(fs.readFileSync(path.join(agent.runDirectory(handle.id)!, marker), "utf8")).toBe("1");
+    closeFd(blocker.fd);
+    const result = await agent.wait(handle.id);
+    expect(result, JSON.stringify(result)).toMatchObject({ status: "completed", text: recovery === "startup-retry" ? "startup retry recovered" : "resumed attempt 2" });
+    expect(fs.readFileSync(path.join(agent.runDirectory(handle.id)!, marker), "utf8")).toBe("2");
+  }, 20_000);
+
+  it("rejects a replacement whose non-queue preparation spends the remaining runtime before launch", async () => {
+    const cwd = root(); const directory = path.join(cwd, "tokens");
+    const agent = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, hostActivationLimit: 1, hostActivationLimitScope: "all",
+      maxConcurrent: 4, budgetUsd: 0, sessionExport: false, timeoutMs: 1_000 }, {
+      hostActivationDirectory: directory, workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: path.join(cwd, "runs"),
+    }); managers.push(agent);
+    const handle = await agent.spawn({ task: "Recover startup", transport: "process" });
+    const prepare = agent.prepareModelForAdmission.bind(agent);
+    vi.spyOn(agent, "prepareModelForAdmission").mockImplementation(async (...args) => {
+      await new Promise(resolve => setTimeout(resolve, 2_300));
+      return prepare(...args);
+    });
+    const result = await agent.wait(handle.id);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("relaunch failed");
+    expect(fs.readFileSync(path.join(agent.runDirectory(handle.id)!, "startup-attempts"), "utf8")).toBe("1");
+  }, 10_000);
 
   it("actorStatus exposes hostQueue; stop preserves ordering and removes a claimed activation ticket", async () => {
     const cwd = root(); const directory = path.join(cwd, "tokens"); const blocker = await acquireHostActivation({ limit: 1, directory }, { id: "block" }); fds.push(blocker.fd);

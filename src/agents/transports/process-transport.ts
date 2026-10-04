@@ -94,6 +94,12 @@ export class ProcessTransport implements AgentTransportAdapter {
         }
       }
       if (selected.fabricRelease) workerArguments.push("--fabric-release", selected.fabricRelease);
+      const environment = applyTaskReturnAddress(
+        isActor ? { ...process.env } : taskAgentEnvironment(), workerArguments,
+      );
+      // A nested worker gets only its own admission, never its parent's lease.
+      delete environment.PI_FABRIC_HOST_ACTIVATION_LIMIT;
+      if (token) environment.PI_FABRIC_HOST_ACTIVATION_LIMIT = String(this.hostActivation!.limit);
       const processHandle = await spawnDetached(
         selected.workerPath,
         workerArguments,
@@ -101,10 +107,7 @@ export class ProcessTransport implements AgentTransportAdapter {
         request,
         // Worker arguments are flag/value pairs. A flag-shaped value is not an
         // actor identity; explicit actor ids alone retain the parent's role env.
-        applyTaskReturnAddress(
-          isActor ? { ...process.env } : taskAgentEnvironment(),
-          workerArguments,
-        ),
+        environment,
         executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
         7_000, // allow the worker's five-second execution-child cleanup
         process.platform !== "win32", // Windows retains its native-close/helper contract

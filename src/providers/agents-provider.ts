@@ -745,6 +745,13 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     context = snapshotFabricInvocation(context);
     try {
+      // Yield for the whole program, not just spawn(): the caller may need to
+      // deliver a message before joining its child. Reacquire at the outer fence.
+      if (process.env.PI_FABRIC_HOST_ACTIVATION_LIMIT &&
+          ["ask", "run", "spawn", "wait", "join", "handoff"].includes(actionName)) {
+        throwIfExecutionExpired(context);
+        await (await import("../agents/transports/host-activation-yield.js")).yieldHostActivation(context.parentToolCallId);
+      }
       return await this.#invoke(actionName, args, context);
     } catch (error) {
       // smarty-dev#2184 item 8: name a pending removal (or a long host request) that these

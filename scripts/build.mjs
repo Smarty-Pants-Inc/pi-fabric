@@ -50,6 +50,7 @@ const lazyEntryPoints = [
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/transports/host-activation.ts",
+  "src/agents/transports/host-activation-yield.ts",
   "src/agents/result.ts",
   "src/agents/veda-cli.ts",
   "src/fabric-runtime-state.ts",

@@ -641,7 +641,10 @@ const main = async (): Promise<void> => {
         : {}),
       ...(options.runRoot ? { PI_FABRIC_RUN_ROOT: options.runRoot } : {}),
     },
-    stdio: ["pipe", "pipe", "pipe"],
+    // Only the Pi execution host shares our admitted open description. It can
+    // yield during nested Fabric programs; ordinary tools do not inherit it.
+    stdio: options.runner === "pi" && process.env.PI_FABRIC_HOST_ACTIVATION_LIMIT
+      ? ["pipe", "pipe", "pipe", 3] : ["pipe", "pipe", "pipe"],
   });
   // Every provider resume is a new execution obligation. Drain each attempt
   // before replacement, but retain the worker's custody until the whole run ends.

@@ -50,7 +50,26 @@ and close-fenced fallback; the launcher closes its own reference only after
 launch. The kernel releases the lock when the worker's last reference closes.
 A killed launcher therefore does not free a live worker's token, and a killed
 worker does not leak a token. Ordinary worker descendants do not inherit FD 3.
-The cooperating worker must retain this reserved descriptor for its lifetime.
+The cooperating worker retains this reserved descriptor for its lifetime. Its
+native Pi execution host also inherits the same description as FD 3. Other
+descendants do not inherit it.
+
+A capped Pi program that calls `agents.ask`, `run`, `spawn`, `wait`/`join` or
+`handoff` releases its slot before dependency admission. It stays released for
+the entire Fabric program, so spawn-then-message-then-join cannot reclaim the
+slot prematurely. At the outer execution fence (including errors/cancellation),
+Pi reacquires the **same open description** through FIFO admission before any
+subsequent inference. Parallel programs share one yield and all fence their
+return on resumption. Failure to restore custody terminates that Pi execution
+host rather than allowing slotless inference; the worker owns tree teardown.
+Host-engine dependencies without an enclosing Fabric execution fence are
+rejected before admission instead of releasing a slot with no resumption owner.
+Suspended parents remain live processes but do not occupy execution capacity.
+The cap bounds admitted, non-suspended workers, not blocked dependency stacks.
+
+Replacement attempts exclude reported host-queue time from the monitor runtime
+budget, just like initial launches. The native launch authority also rejects a
+replacement whose remaining runtime expired during non-queue preparation.
 
 A short `queue.lock` guards ticket reservation and token selection. `sequence`
 is an append-only monotonic integer counter; a crash may leave a gap, never
@@ -71,7 +90,40 @@ FIFO means **ticket admission**, not CPU scheduling order after independent
 workers are spawned. With a limit greater than one, the OS can schedule admitted
 workers differently; with limit one their observed execution order is FIFO.
 
-## Isolated proof
+## Real Pi/Fabric acceptance and deadlock regression
+
+After a fresh build, run the offline, keyless native entry-point proof:
+
+```sh
+PI_FABRIC_TEST_PI_BINARY=/absolute/path/to/installed/pi \
+  nice -n 19 bun tests/fixtures/host-activation-real-pi-proof.ts
+```
+
+Set `TMPDIR` and `TASK_OUT`. The runner creates three isolated home/profile/root
+sets per case, loads the **built extension as a Pi package**, and drives the
+installed Pi CLI in native RPC mode. A custom provider supplies deterministic
+inference only; it does not replace Pi, construct Fabric managers, substitute
+a worker, or bypass the public `fabric_exec` / `agents` surfaces. No model
+service, credential, live mesh, or live token directory is used.
+
+Rows cover cap 2 with four `agents.run` tasks (N+2), cap 4 with eight tasks across
+three roots, and cap 1 with an actor awaiting another root's actor, a task using
+`agents.run`, and a task using `spawn` then `wait`. Independent rows also queue
+three actors and retain real public `agents.actorStatus` host-queue snapshots.
+The controller temporarily holds scratch tokens only to make queuing observable.
+It observes actual native worker PIDs and their token FD lock state, including
+worker startup before Pi's `session_start`. Independent cases have at most N
+live workers; nested cases may have a live but slotless waiting parent. Every
+worker inference call must hold a slot. All native Main processes close with
+exit code zero. Evidence (RPC output, native events, PID/slot samples, results,
+profiles and built artifact hashes) is retained under `$TASK_OUT/real-pi/`.
+
+`tests/host-activation-real-pi.test.ts` retains the cap-one native deadlock
+regression. `tests/host-activation.test.ts` covers startup retry and mid-run
+resume that queue longer than their entire remaining runtime+exit-grace budget,
+and refuses an attempt whose non-queue preparation actually spends its budget.
+
+## Isolated transport proof
 
 After `bun run build`, run:
 

@@ -15,6 +15,7 @@ import { LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
+import { sessionLiveness } from "../src/topology/legacy-root-liveness.js";
 import { awaitPeerSettle, type PeerSettleResult } from "../src/topology/peer-settle.js";
 
 const roots: string[] = [];
@@ -473,13 +474,14 @@ describe("ParticipantDirectory host leases", () => {
 
   // #411 R1: a lock acquisition can outlast the pre-confirmation renewal decision.
   it.each([
-    { crossing: "host threshold", leaseMs: 4_000, delayMs: 2_001, policy: false },
-    { crossing: "host expiry", leaseMs: 4_000, delayMs: 4_001, policy: false },
-    { crossing: "legacy threshold", leaseMs: 60_000, delayMs: 7_501, policy: false },
-    { crossing: "legacy expiry", leaseMs: 60_000, delayMs: 15_001, policy: false },
-    { crossing: "default minute threshold", leaseMs: 60_000, delayMs: 60_001, policy: false },
-    { crossing: "policy threshold", leaseMs: 60_000, delayMs: STATE_LEASE_RENEW_MS, policy: true },
-  ])("renews after delayed confirmation crosses $crossing", async ({ crossing, leaseMs, delayMs, policy }) => {
+    { crossing: "host threshold", leaseMs: 4_000, delayMs: 2_001, policy: false, legacy: true },
+    { crossing: "host expiry", leaseMs: 4_000, delayMs: 4_001, policy: false, legacy: true },
+    { crossing: "legacy threshold", leaseMs: 60_000, delayMs: 7_501, policy: false, legacy: true },
+    { crossing: "legacy expiry", leaseMs: 60_000, delayMs: 15_001, policy: false, legacy: true },
+    { crossing: "all-new minute delay", leaseMs: 60_000, delayMs: 60_001, policy: false, legacy: false },
+    { crossing: "all-new policy delay", leaseMs: 60_000, delayMs: STATE_LEASE_RENEW_MS, policy: true, legacy: false },
+    { crossing: "mixed policy delay", leaseMs: 60_000, delayMs: STATE_LEASE_RENEW_MS, policy: true, legacy: true },
+  ])("renews after delayed confirmation crosses $crossing", async ({ leaseMs, delayMs, policy, legacy }) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-delayed-confirm-"));
     roots.push(root);
     const identity = identityOf("delayed");
@@ -495,13 +497,13 @@ describe("ParticipantDirectory host leases", () => {
     const lockPath = path.join(mesh.root, ".lock");
     try {
       if (policy) await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity });
-      if (!policy && crossing !== "default minute threshold") {
+      if (legacy) {
         const peer = identityOf("state-only");
         await mesh.put({ key: "sessions/state-only", identity: peer, value: { id: peer.id, sessionId: "state-only",
           cwd: "/tmp/project", startedAt: now, status: "idle" } });
         // Keep this compatibility reader alive across the deterministic lock delay.
         await mesh.put({ key: "topology/hosts/" + createHash("sha256").update(peer.id).digest("hex"), identity: peer,
-          value: { format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: now, updatedAt: now, expiresAt: now + 120_000 } });
+          value: { format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: now, updatedAt: now, expiresAt: now + 1_000_000 } });
       }
       await directory.refresh(); // no heartbeat timer: only this awaited refresh can renew
       const hostBefore = mesh.listAll("topology/hosts/").find(entry => (entry.value as { id: string }).id === identity.id)!;
@@ -511,8 +513,8 @@ describe("ParticipantDirectory host leases", () => {
       const confirm = mesh.confirmWritable.bind(mesh);
       let entered!: () => void;
       const confirming = new Promise<void>((resolve) => { entered = resolve; });
-      const confirmations = vi.spyOn(mesh, "confirmWritable").mockImplementation(async () => {
-        const pending = confirm(); // the real acquisition waits behind a live lock
+      const confirmations = vi.spyOn(mesh, "confirmWritable").mockImplementation(async onAcquired => {
+        const pending = confirm(onAcquired); // the real acquisition waits behind a live lock
         entered();
         await pending;
       });
@@ -527,14 +529,22 @@ describe("ParticipantDirectory host leases", () => {
       fs.rmSync(lockPath, { recursive: true, force: true });
       await refresh;
       expect(confirmations).toHaveBeenCalledOnce();
-      expect.soft(writes).toHaveBeenCalledOnce(); // host + legacy in one locked commit
       const hostAfter = mesh.listAll("topology/hosts/", { fresh: true }).find(entry => (entry.value as { id: string }).id === identity.id)!;
-      expect.soft(hostAfter.version).toBeGreaterThan(hostBefore.version);
-      expect.soft(hostAfter.value).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
       const legacyAfter = mesh.get("sessions/delayed", { fresh: true })!;
-      expect.soft(legacyAfter.version).toBeGreaterThan(legacyBefore.version);
-      expect.soft(legacyAfter.updatedAt).toBe(now);
-      expect.soft(legacyAfter.value).toMatchObject({ updatedAt: now });
+      if (legacy) {
+        expect(writes).toHaveBeenCalledOnce(); // legacy host + session in one locked commit
+        expect(hostAfter.version).toBeGreaterThan(hostBefore.version);
+        expect(hostAfter.value).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
+        expect(legacyAfter.version).toBeGreaterThan(legacyBefore.version);
+        expect(legacyAfter.updatedAt).toBe(now);
+      } else {
+        // Thresholds no longer require state commits when every live reader uses lease files.
+        expect(writes).not.toHaveBeenCalled();
+        expect(hostAfter).toEqual(hostBefore);
+        expect(legacyAfter).toEqual(legacyBefore);
+      }
+      expect(readHostLeases(mesh.root).get(identity.id)).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
+      expect(sessionLiveness(legacyAfter, mesh.root)).toEqual({ updatedAt: now, expiresAt: now + 15_000 });
       expect(mesh.listAll("topology/participants/", { fresh: true })[0]).toEqual(participantBefore);
       expect(directory.confirmedAt()).toBe(now);
     } finally {
@@ -561,6 +571,10 @@ describe("ParticipantDirectory host leases", () => {
     const trace = path.join(root, "commits.jsonl");
     vi.stubEnv("PI_FABRIC_COMMIT_TRACE", trace);
     try {
+      // Keep an actual old reader live: this test retains the legacy half-life contract.
+      const peer = identityOf("state-only");
+      await mesh.put({ key: "topology/hosts/" + createHash("sha256").update(peer.id).digest("hex"), identity: peer,
+        value: { format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: now, updatedAt: now, expiresAt: now + 600_000 } });
       await directory.refresh();
       fs.writeFileSync(trace, "");
       const participant = mesh.listAll("topology/participants/")[0]!;
@@ -618,13 +632,17 @@ describe("ParticipantDirectory host leases", () => {
     } finally { clock.mockRestore(); }
   });
 
-  it("under the policy, still renew the shared record every STATE_LEASE_RENEW_MS", async () => {
-    const { hostEntry } = await setup(true);
+  it("all-new peers need no periodic shared record renewal, even under the old policy", async () => {
+    const { hostEntry, alpha, meshRoot } = await setup(true);
     const shared = hostEntry()!;
     const now = Date.now;
-    vi.spyOn(Date, "now").mockImplementation(() => now() + STATE_LEASE_RENEW_MS);
-    await vi.waitFor(() => expect(hostEntry()!.version).toBeGreaterThan(shared.version), { timeout: 2_000, interval: 20 });
-    vi.restoreAllMocks();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now() + STATE_LEASE_RENEW_MS);
+    try {
+      await alpha.refresh();
+      expect(hostEntry()).toEqual(shared);
+      expect(readHostLeases(meshRoot).get("session:alpha")?.updatedAt).toBeGreaterThan(shared.updatedAt);
+      expect(alpha.get("session:alpha")?.stale).toBe(false);
+    } finally { clock.mockRestore(); }
   });
 });
 

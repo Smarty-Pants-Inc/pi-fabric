@@ -167,6 +167,9 @@ interface ManagedActor {
   requirements: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
+  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** Durable alarm deduplication for the uninterrupted activation failure streak. */
+  failureStreak?: { count: number; notified: boolean };
   validWhile?: FabricActorValidWhileSource;
   /** The creating principal's scope; absent for unscoped actors. */
   principalScope?: FabricScope;
@@ -357,6 +360,7 @@ export class ActorRegistryOwnershipError extends Error {
 export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
 /** Three preparation requeues, independent of the owner-restoration/drop budget. */
 const ACTOR_PREPARATION_MAX_RETRIES = 3;
+export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
 
 export class ActorPreparationError extends Error {
   readonly code: string = "FABRIC_ACTOR_PREPARATION_FAILED";
@@ -376,7 +380,6 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
 
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
-  readonly #failureStreaks = new Map<string, { count: number; notified: boolean }>();
   /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
   readonly #parked = new Map<string, ActorQueueItem[]>();
   // Accepted active work (preparing, waiting, or running), retained durably until settlement (#878).
@@ -2544,7 +2547,11 @@ export class ActorManager {
         ...(error instanceof ActorPreparationError ? { code: error.code, phase: error.phase } : {}),
         ...(item ? { itemId: item.id, attempts: item.preparationAttempts ?? 0 } : {}) },
     });
-    this.#noteFailedActivation(actor, message, undefined, false);
+    // A requeued item has not failed its activation yet. Its separate, durable
+    // preparation budget alarms at terminal exhaustion in #drain; counting the
+    // retries here would notify early and persist a consumed alarm across owners.
+    // Failures outside an item retry still need fail-loud host reporting.
+    if (!item) this.#noteFailedActivation(actor, message, undefined, false);
   }
 
   async #drain(actor: ManagedActor): Promise<void> {
@@ -2759,7 +2766,9 @@ export class ActorManager {
           if (principal) message.principal = principal;
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
-          this.#failureStreaks.delete(actor.id);
+          delete actor.failureStreak;
+          delete actor.activationBlocked;
+          actor.updatedAt = Date.now();
           const beforeDelivery = await this.#validity(actor, item);
           if (!this.#canManage(actor.id)) {
             throw new Error(`Fabric actor ownership moved before delivery: ${actor.id}`);
@@ -2934,16 +2943,36 @@ export class ActorManager {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
-    const streak = this.#failureStreaks.get(actor.id) ?? { count: 0, notified: false };
-    // Retry exhaustion must still alarm after recreation discarded the in-memory streak.
+    const streak = actor.failureStreak ?? { count: 0, notified: false };
+    // Retry exhaustion must still alarm immediately when its finite budget is spent.
     streak.count = Math.max(streak.count + 1, countFloor);
-    this.#failureStreaks.set(actor.id, streak);
+    actor.failureStreak = streak;
+    // Worker stderr can prefix the terminal failure with compatibility warnings.
+    // Report the last actual error line, never the legacy-provenance warning.
+    // A V8 stack frame can contain "Error" in a Windows or POSIX path; it is
+    // context for the error above it, not a later terminal activation failure.
+    const lines = error.split("\n").map(line => line.trim()).filter(line => line &&
+      !/^at\s/.test(line) &&
+      !/^\s*(?:\[pi-fabric\]\s*)?(?:warning\b|Pi does not advertise\b)/i.test(line));
+    const lastError = lines.filter(line => /\berror\b|\bfailed\b|\bexited\b|Context exceeds window/i.test(line)).at(-1)
+      ?? lines.at(-1) ?? "Unknown activation failure";
+    const code = /Activation window lost current activation messages/i.test(lastError) ? "activation-window-lost"
+      : /Context exceeds window/i.test(lastError) ? "context-overflow"
+      : /Child Pi exited before requested model admission completed/i.test(lastError) ? "child-exit-before-admission"
+      : "unknown";
+    const reason = lastError.slice(0, 300);
+    const previous = actor.activationBlocked;
+    actor.activationBlocked = {
+      reason, code, since: previous?.code === code ? previous.since : Date.now(),
+      count: previous?.code === code ? previous.count + 1 : 1,
+    };
+    actor.updatedAt = Date.now();
+    void this.#publishPresence(actor).catch(() => undefined);
     // Deterministic budget failures need operator action, not three silent
     // activations. Existing host reporting bypasses mailbox/silent delivery.
-    const contextOverflow = /Context exceeds window:/i.test(error);
+    const contextOverflow = code === "context-overflow";
     if (streak.notified || (!contextOverflow && streak.count < ACTOR_FAILURE_NOTICE_AFTER)) return;
     streak.notified = true;
-    const reason = error.split("\n")[0]!.slice(0, 300);
     const text =
       `Fabric host notice: actor ${actor.name} failed its last ${streak.count} activations, so it is not acting on its events. ` +
       `Last error: ${reason}${runId ? ` (run ${runId})` : ""}. ` +
@@ -2959,6 +2988,11 @@ export class ActorManager {
       void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
         text, data: { actorId: actor.id, reason: "context_window", error, runId } }).catch(() => undefined);
     }
+    void this.#publishNotification({
+      topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
+      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code,
+        since: actor.activationBlocked?.since, count: actor.activationBlocked?.count, ...(runId ? { runId } : {}) },
+    }).catch(() => undefined);
     try {
       this.onDeliver({
         actor: this.#publicInfo(actor),
@@ -3613,6 +3647,8 @@ export class ActorManager {
       ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
       requirements: actor.requirements,
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
+      ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
+      ...(actor.failureStreak ? { failureStreak: { ...actor.failureStreak } } : {}),
       ...(actor.validWhile ? { validWhile: actor.validWhile } : {}),
       ...(actor.principalScope ? { principalScope: actor.principalScope } : {}),
       sessionFile: actor.sessionFile,
@@ -3845,6 +3881,14 @@ export class ActorManager {
         requirements,
         ...(typeof record.capabilityDigest === "string"
           ? { capabilityDigest: record.capabilityDigest }
+          : {}),
+        ...(typeof record.activationBlocked?.reason === "string" && typeof record.activationBlocked?.code === "string" &&
+          typeof record.activationBlocked?.since === "number" && typeof record.activationBlocked?.count === "number"
+          ? { activationBlocked: { reason: record.activationBlocked.reason, code: record.activationBlocked.code, since: record.activationBlocked.since, count: record.activationBlocked.count } }
+          : {}),
+        ...(Number.isSafeInteger(record.failureStreak?.count) && (record.failureStreak?.count ?? 0) > 0 &&
+          typeof record.failureStreak?.notified === "boolean"
+          ? { failureStreak: { count: record.failureStreak.count, notified: record.failureStreak.notified } }
           : {}),
         ...(record.validWhile?.version === 1 && typeof record.validWhile.source === "string"
           ? { validWhile: record.validWhile }
@@ -4294,6 +4338,7 @@ export class ActorManager {
       ...(actor.missingCapabilities
         ? { missingCapabilities: [...actor.missingCapabilities] }
         : {}),
+      ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.validWhile ? { validWhile: structuredClone(actor.validWhile) } : {}),
       ...(actor.principalScope
         ? { principal: { id: actor.principalScope.principal.id, digest: actor.principalScope.digest } }

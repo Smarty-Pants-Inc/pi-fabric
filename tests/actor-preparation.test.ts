@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ACTOR_PREPARATION_TIMEOUT_MS, ActorManager, ActorPreparationError, ActorPreparationTimeoutError } from "../src/actors/manager.js";
+import { ACTOR_PREPARATION_TIMEOUT_MS, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, ActorManager, ActorPreparationError, ActorPreparationTimeoutError } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import * as predicate from "../src/actors/predicate.js";
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../src/agents/manager.js";
@@ -269,13 +269,16 @@ describe("round-four launch-preparation recovery (#3167)", () => {
   it("preserves the exhausted preparation budget and alarms once after owner recreation", async () => {
     const gate = deferred<void>();
     let calls = 0;
-    const { actors: before, agents: oldAgents, mesh, root } = setup({ preparationRetryMs: 80 }, 1, {
+    const { actors: before, agents: oldAgents, mesh, root, notices: beforeNotices } = setup({ preparationRetryMs: 80 }, 1, {
       preparePiModel: async (model) => { calls++; await gate.promise; return model; },
     });
     cleanups.push(async () => { gate.resolve(); });
     const actor = await before.create({ name: "exhausted-recreation", model: "provider/stalled", instructions: "Reply", responseMode: "text", coalesce: false });
     before.tell(actor.id, "preserve retry budget across owner recreation");
     await waitFor(() => calls === 3 && before.inFlightCount() === 0 && readQueue(actor.sessionFile!)[0]?.preparationAttempts === 3);
+    expect(beforeNotices).toEqual([]); // Requeues have not terminally failed the activation.
+    expect(before.status(actor.id).activationBlocked).toBeUndefined();
+    expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toEqual([]);
     const directory = path.dirname(actor.sessionFile!);
     const queueFile = path.join(directory, fs.readdirSync(directory).find((file) => file.startsWith("queue-"))!);
     const snapshot = fs.readFileSync(queueFile, "utf8");
@@ -295,11 +298,27 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     await waitFor(() => calls === 4 && after.inFlightCount() === 0 && after.status(actor.id).queued === 0);
     expect(run).toHaveBeenCalledTimes(1);
     expect(notices).toHaveLength(1);
+    expect(after.status(actor.id)).toMatchObject({
+      status: "idle", queued: 0, activationBlocked: { code: "unknown", count: 1 },
+    });
+    expect(after.messages(actor.id).filter(message => message.direction === "out" && message.error)).toHaveLength(4);
     expect(fs.readdirSync(directory).filter((file) => file.startsWith("queue-"))).toEqual([]);
     gate.resolve(); await pause(200);
     expect(calls).toBe(4);
     expect(run).toHaveBeenCalledTimes(1);
     expect(notices).toHaveLength(1);
+    await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
+    await after.close();
+    const next = new ActorManager("preparation", { id: "session:preparation", name: "main", kind: "main" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, (delivery) => {
+        if (delivery.message.source === "fabric-host") notices.push(delivery.message.text ?? "");
+      }, { actorRoot: path.join(root, "actors"), persistent: true });
+    cleanups.push(async () => { await next.close(); });
+    await pause(200);
+    expect(next.status(actor.id)).toMatchObject({ status: "idle", queued: 0, activationBlocked: { code: "unknown", count: 1 } });
+    expect(run).toHaveBeenCalledTimes(1); // Terminal work never returns after another restart.
+    expect(notices).toHaveLength(1);
+    expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toHaveLength(1);
   });
 
   it.each([false, true])("never retries an unconfirmed transport launch with a timeout-shaped error (queued: %s)", async (queued) => {

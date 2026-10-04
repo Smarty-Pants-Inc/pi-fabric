@@ -505,11 +505,13 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   }
 
   it("cleanup that times out behind a real wait is fenced before file/worktree mutation", { timeout: 10_000 }, async () => {
-    const state = await harness(false);
+    // Worker admission is setup; retain the original 500 ms cleanup deadline below.
+    const state = await harness(false, undefined, 5_000);
     const original = AgentManager.prototype.join;
     const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
     try {
       const handle = await state.client.spawnAgent({ task: "settle before cleanup", model: state.model });
+      state.client.options.commandTimeoutMs = 500;
       vi.spyOn(AgentManager.prototype, "join").mockImplementation(async function (this: AgentManager, ...args) {
         const result = await original.apply(this, args);
         state.entered.resolve(); await state.release.promise;
@@ -639,7 +641,8 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   });
 
   it.each(["main spawn", "main create"] as const)("%s aborted during participant publication retains the confirmed ID", async (kind) => {
-    const state = await harness(false);
+    // Reach the publication barrier before testing explicit abort, not a setup timeout.
+    const state = await harness(false, undefined, 5_000);
     const original = state.participants.get.bind(state.participants);
     const get = vi.spyOn(state.participants, "get").mockImplementation((id) => id === state.config.rootId ? original(id) : undefined);
     const controller = new AbortController();
@@ -1989,10 +1992,12 @@ describe("round 1 public cancellation contract", () => {
   });
 
   it("durable create never enters activation compensation when committed removal would be unknown", async () => {
-    const state = await harness(false, undefined, 200); const main = mainProvider(state);
+    // Creation must complete before the adverse 200 ms compensation budget applies.
+    const state = await harness(false, undefined, 5_000); const main = mainProvider(state);
     const activationFailure = new Error("injected activation failure");
     const ensure = vi.spyOn(state.client, "ensureActor").mockImplementation(async (id) => {
       await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
+      state.client.options.commandTimeoutMs = 200;
       throw activationFailure;
     });
     let removalError: unknown;

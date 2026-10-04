@@ -32,8 +32,20 @@ export interface FabricHostLease {
 const fileName = (hostId: string): string =>
   createHash("sha256").update(hostId).digest("hex").slice(0, 32) + ".json";
 
+/**
+ * Soft liveness only, including the first write and identity replacement: this is not
+ * an ownership/custody fence. A lost renewal lapses and the next heartbeat recreates it.
+ * Keep atomic visibility (temp + rename), but never force a stable-storage barrier.
+ * Residency acquisition is fenced by its lock; release custody has separate durable receipts.
+ */
 export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void =>
-  writeJsonAtomic(path.join(meshRoot, LEASE_DIR, fileName(lease.id)), { format: 1, ...lease });
+  writeJsonAtomic(path.join(meshRoot, LEASE_DIR, fileName(lease.id)), { format: 1, ...lease }, { durable: false });
+
+/** Stable per-host ±20% cadence; no eager randomness, timer, or shared fleet phase. */
+export const hostLeaseRenewalInterval = (intervalMs: number, hostId: string): number => {
+  const fraction = createHash("sha256").update(hostId).digest().readUInt32BE(0) / 0xffffffff;
+  return intervalMs * (0.8 + 0.4 * fraction);
+};
 
 export const removeHostLease = (meshRoot: string, hostId: string): void =>
   fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });

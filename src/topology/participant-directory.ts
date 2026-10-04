@@ -18,6 +18,7 @@ import { isLiveLegacyRootEntry, LEGACY_ROOT_LEASE_MS as PARTICIPANT_LEASE_MS } f
 import {
   fileLeasesOnly,
   hostLeaseExpiry,
+  hostLeaseRenewalInterval,
   LIVENESS_POLICY_KEY,
   readHostLease,
   readHostLeases,
@@ -376,7 +377,9 @@ export interface ParticipantDirectoryOptions {
   onRootCollision?: (collision: FabricRootCollision) => void;
   selfOwnerHostId?: string;
   selfOwnerIdentityId?: string;
+  /** Nominal renewal cadence (default 5 s), with stable per-host ±20% jitter. */
   heartbeatMs?: number;
+  /** TTL (default 15 s), at least three nominal renewals. Recommend 30 s / 90 s. */
   leaseMs?: number;
   /**
    * Sweep records of hosts gone for this long (default 6 h), at most every sweepMs (default
@@ -427,7 +430,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     readonly options: ParticipantDirectoryOptions,
   ) {
     this.#heartbeatMs = Math.max(100, options.heartbeatMs ?? PARTICIPANT_HEARTBEAT_MS);
-    this.#leaseMs = Math.max(this.#heartbeatMs * 2, options.leaseMs ?? PARTICIPANT_LEASE_MS);
+    this.#leaseMs = Math.max(this.#heartbeatMs * 3, options.leaseMs ?? PARTICIPANT_LEASE_MS);
   }
 
   registerSource(source: ParticipantSnapshotSource): () => void {
@@ -461,7 +464,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           return;
         }
         void this.#backgroundRefresh.run(() => this.refresh(), false);
-      }, this.#heartbeatMs);
+      }, hostLeaseRenewalInterval(this.#heartbeatMs, this.options.hostId));
       this.#timer.unref();
     }
     await this.refresh();

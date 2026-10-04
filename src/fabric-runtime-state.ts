@@ -12,7 +12,6 @@ import { loadedFabricRoot } from "./core/agent-dir.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin } from "./core/model-refresh.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { fabricProvenanceSupported } from "./fabric-provenance.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
@@ -897,7 +896,6 @@ export class FabricRuntimeState {
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
             prepareModelRoute: prepareActorModelRoute,
             acquireCapabilityView: acquireActorCapabilityView,
-            supportsTurnProvenance: fabricProvenanceSupported(this.pi),
             // A /reload or restart of this session resumes its actors' mesh stream where the
             // last runtime stopped, so events published in between still reach them
             // (smarty-dev#472). A longer downtime replays only its last minutes.
@@ -918,7 +916,6 @@ export class FabricRuntimeState {
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
             prepareModelRoute: prepareActorModelRoute,
             acquireCapabilityView: acquireActorCapabilityView,
-            supportsTurnProvenance: fabricProvenanceSupported(this.pi),
           },
     ], actorRoots, this.#config.mesh.actorScope);
     // A removal this Main accepted behind a run that its restart ended (a same-name create) is

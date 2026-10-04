@@ -1,6 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { runResidentHostFromConfigPath } from "./host.js";
-import { fabricProvenanceSupported } from "../fabric-provenance.js";
 
 const configPath = process.env.PI_FABRIC_RESIDENT_CONFIG;
 
@@ -15,7 +14,7 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
     controller = new AbortController();
-    host = runResidentHostFromConfigPath(configPath, controller.signal, ctx.modelRegistry, fabricProvenanceSupported(pi))
+    host = runResidentHostFromConfigPath(configPath, controller.signal, ctx.modelRegistry)
       .catch(() => undefined)
       .finally(() => ctx.shutdown());
   });

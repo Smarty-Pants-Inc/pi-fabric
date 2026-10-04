@@ -2809,7 +2809,7 @@ describe("ActorManager", () => {
     await actors.ask(actor.id, "FAIL_DIRECTIVE");
     expect(notices()).toEqual([expect.stringContaining(`actor supervisor failed its last ${ACTOR_FAILURE_NOTICE_AFTER} activations`)]);
     expect(notices()[0]).toContain("Structured agent output was invalid");
-    expect(actors.status(actor.id).activationBlocked).toMatchObject({ code: "activation-failed", count: ACTOR_FAILURE_NOTICE_AFTER });
+    expect(actors.status(actor.id).activationBlocked).toMatchObject({ code: "unknown", count: ACTOR_FAILURE_NOTICE_AFTER });
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
     await actors.ask(actor.id, "FAIL_DIRECTIVE");
     expect(notices()).toHaveLength(1);                       // once per streak
@@ -2820,55 +2820,63 @@ describe("ActorManager", () => {
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 2);
   }, 60_000);
 
-  it("refuses activation actors when the owning Pi lacks turn provenance", async () => {
-    const s = setup(true);
-    const denied = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
-      actorRoot: path.join(s.root, "denied-actors"), persistent: true, supportsTurnProvenance: false,
-    });
-    actorManagers.push(denied);
-    await expect(denied.create({ name: "blocked", instructions: "Activate.", inferenceContext: "activation" }))
-      .rejects.toThrow(/turnProvenance.*reload or rotate/i);
-    const ordinary = await denied.create({ name: "ordinary", instructions: "Run." });
-    await expect(denied.setInferenceContext(ordinary.id, "activation")).rejects.toThrow(/turnProvenance.*reload or rotate/i);
-    const existing = await s.actors.create({ name: "existing", instructions: "Activate.", inferenceContext: "activation" });
-    await s.actors.close();
-    const reloaded = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
-      actorRoot: path.join(s.root, "actors"), persistent: true, supportsTurnProvenance: false,
-    });
-    actorManagers.push(reloaded);
-    await expect(reloaded.setInstructions(existing.id, "Updated activation."))
-      .rejects.toThrow(/turnProvenance.*reload or rotate/i);
+  it("creates, reconfigures and runs activation actors without a host turn-provenance capability gate", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "legacy-host", instructions: "Activate.", inferenceContext: "activation" });
+    await expect(actors.setInstructions(actor.id, "Updated activation.")).resolves.toMatchObject({ inferenceContext: "activation" });
+    const ordinary = await actors.create({ name: "ordinary", instructions: "Run." });
+    await expect(actors.setInferenceContext(ordinary.id, "activation")).resolves.toMatchObject({ inferenceContext: "activation" });
+    await actors.ask(actor.id, "activate");
+    expect(actors.status(actor.id).activationBlocked).toBeUndefined();
   });
 
-  it("settles restored unsupported activation asks and callerless work without stranded in-flight items", async () => {
+  it.each([
+    ["[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.\nFabric activation window failed: Error: Activation window lost current activation messages",
+      "activation-window-lost", "Fabric activation window failed: Error: Activation window lost current activation messages"],
+    ["Error: earlier failure\nError: Context exceeds window: 100 > 80", "context-overflow", "Error: Context exceeds window: 100 > 80"],
+    ["Child Pi exited before requested model admission completed; task was not sent", "child-exit-before-admission", "Child Pi exited before requested model admission completed; task was not sent"],
+    ["Error: Activation window lost current activation messages\nError: unrelated terminal failure\nWarning: turnProvenance is unavailable", "unknown", "Error: unrelated terminal failure"],
+    ["[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; legacy behavior", "unknown", "Unknown activation failure"],
+  ])("classifies the last actual activation error (%s)", async (error, code, reason) => {
+    const { actors, agents, mesh, deliveries } = setup();
+    vi.spyOn(agents, "run").mockRejectedValue(new Error(error));
+    const actor = await actors.create({ name: "failed-activation", instructions: "Activate.", inferenceContext: "activation", responseMode: "text" });
+    for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
+      await expect(actors.ask(actor.id, "activate")).rejects.toThrow(error);
+      await waitFor(() => actors.status(actor.id).status === "idle");
+    }
+    expect(actors.status(actor.id).activationBlocked).toMatchObject({ reason, code, count: ACTOR_FAILURE_NOTICE_AFTER, since: expect.any(Number) });
+    await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
+    expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data).toMatchObject({ reason, code });
+    expect(deliveries.filter(text => text.startsWith("Fabric host notice:"))).toHaveLength(1);
+    expect(deliveries.find(text => text.startsWith("Fabric host notice:"))).toContain(`Last error: ${reason}`);
+  });
+
+  it("settles restored failed activation asks and callerless work without stranded in-flight items", async () => {
     const s = setup(true);
     const actor = await s.actors.create({ name: "restored", instructions: "Activate.", inferenceContext: "activation", coalesce: false });
     await s.actors.close();
+    vi.spyOn(s.agents, "run").mockRejectedValue(new Error("Fabric activation window failed: Error: Activation window lost current activation messages"));
     const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
-      actorRoot: path.join(s.root, "actors"), persistent: true, supportsTurnProvenance: false,
+      actorRoot: path.join(s.root, "actors"), persistent: true,
     });
     actorManagers.push(restored);
-    const rejected = restored.ask(actor.id, "caller").then(() => "unexpected success", error => String(error));
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const result = await Promise.race([rejected, new Promise<string>(resolve => { timer = setTimeout(() => resolve("unsettled"), 2000); })]);
-      expect(result).toMatch(/turnProvenance.*reload or rotate/i);
-    } finally { clearTimeout(timer); }
+    await expect(restored.ask(actor.id, "caller")).rejects.toThrow("Activation window lost current activation messages");
     await restored.tell(actor.id, "event-one");
     await restored.tell(actor.id, "event-two");
     await waitFor(() => restored.status(actor.id).status === "idle");
-    expect(restored.status(actor.id)).toMatchObject({ queued: 0, activationBlocked: { count: 3 } });
-    expect(restored.messages(actor.id).filter(message => message.direction === "out" && message.error?.includes("turnProvenance"))).toHaveLength(3);
-    // Closing persists the queue: no abandoned in-flight work may reappear on restart.
+    expect(restored.status(actor.id)).toMatchObject({ queued: 0, activationBlocked: { code: "activation-window-lost", count: 3 } });
+    expect(restored.messages(actor.id).filter(message => message.direction === "out" && message.error)).toHaveLength(3);
     await restored.close();
     const next = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
-      actorRoot: path.join(s.root, "actors"), persistent: true, supportsTurnProvenance: false,
+      actorRoot: path.join(s.root, "actors"), persistent: true,
     });
     actorManagers.push(next);
-    expect(next.status(actor.id)).toMatchObject({ status: "idle", queued: 0, activationBlocked: { count: 3 } });
-    await expect(next.ask(actor.id, "next caller")).rejects.toThrow(/turnProvenance/);
+    expect(next.status(actor.id)).toMatchObject({ status: "idle", queued: 0, activationBlocked: { code: "activation-window-lost", count: 3 } });
+    await expect(next.ask(actor.id, "next caller")).rejects.toThrow("Activation window lost current activation messages");
     await waitFor(() => next.status(actor.id).status === "idle");
     expect(next.status(actor.id).activationBlocked?.count).toBe(4);
+    expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toHaveLength(1);
   });
 
   it("persists the failure budget and one alarm per uninterrupted streak across restarts", async () => {

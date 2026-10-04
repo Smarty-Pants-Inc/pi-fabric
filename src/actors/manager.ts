@@ -335,7 +335,6 @@ export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
 /** Three preparation requeues, independent of the owner-restoration/drop budget. */
 const ACTOR_PREPARATION_MAX_RETRIES = 3;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
-const ACTIVATION_HOST_CAPABILITIES = ["turnProvenance"] as const;
 
 export class ActorPreparationError extends Error {
   readonly code: string = "FABRIC_ACTOR_PREPARATION_FAILED";
@@ -397,7 +396,6 @@ export class ActorManager {
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
-  readonly #supportsTurnProvenance: boolean;
   readonly #project: string | undefined;
   readonly #role: string | undefined;
   readonly #meshMonitor: ActorMeshMonitor;
@@ -491,8 +489,6 @@ export class ActorManager {
       meshCursorPath?: string;
       /** Resident lease fence, also defers archive retention until initial publication. */
       canConsumeMesh?: () => boolean;
-      /** Capability of the Pi runtime owning this manager. Legacy direct test hosts default true. */
-      supportsTurnProvenance?: boolean;
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
       /** Per-await preparation deadline; independent of model/run and permit wait timeouts. */
@@ -535,7 +531,6 @@ export class ActorManager {
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
     this.#rootId = options.rootId ?? identity.id;
-    this.#supportsTurnProvenance = options.supportsTurnProvenance ?? true;
     this.#project = options.project;
     this.#role = options.role;
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
@@ -677,7 +672,6 @@ export class ActorManager {
       throw new Error(`Invalid Fabric actor runner: ${String(request.runner)}`);
     }
     validateActorInferenceContext(request.inferenceContext, runner);
-    this.#assertActivationCapabilities(request.inferenceContext);
     validateActorCoalesceKey(request.coalesceKey);
     const activationFilter = request.activationFilter === undefined
       ? undefined
@@ -966,7 +960,6 @@ export class ActorManager {
     const actor = this.#requireOwnedActor(id);
     validateActorInferenceContext(inferenceContext, actor.runner);
     if (inferenceContext === undefined) throw new Error("inferenceContext is required");
-    this.#assertActivationCapabilities(inferenceContext);
     actor.inferenceContext = inferenceContext;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
@@ -1242,7 +1235,6 @@ export class ActorManager {
     if (Buffer.byteLength(instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
     }
-    this.#assertActivationCapabilities(actor.inferenceContext);
     beforeCommit?.(actor.id);
     actor.instructions = instructions;
     actor.updatedAt = Date.now();
@@ -2566,7 +2558,6 @@ export class ActorManager {
         let workerLaunched = false;
         const preparationAbort = new AbortController();
         try {
-          this.#assertActivationCapabilities(inferenceContext);
           await this.#publishDrainPresence(actor);
           const beforeRun = await this.#prepare(actor, "validity", () => this.#validity(actor, item));
           if (!beforeRun.valid) {
@@ -2903,8 +2894,17 @@ export class ActorManager {
     // Retry exhaustion must still alarm immediately when its finite budget is spent.
     streak.count = Math.max(streak.count + 1, countFloor);
     actor.failureStreak = streak;
-    const reason = error.split("\n")[0]!.slice(0, 300);
-    const code = error.includes("turnProvenance") ? "host-capability-missing:turnProvenance" : "activation-failed";
+    // Worker stderr can prefix the terminal failure with compatibility warnings.
+    // Report the last actual error line, never the legacy-provenance warning.
+    const lines = error.split("\n").map(line => line.trim()).filter(line => line &&
+      !/^\s*(?:\[pi-fabric\]\s*)?(?:warning\b|Pi does not advertise\b)/i.test(line));
+    const lastError = lines.filter(line => /\berror\b|\bfailed\b|\bexited\b|Context exceeds window/i.test(line)).at(-1)
+      ?? lines.at(-1) ?? "Unknown activation failure";
+    const code = /Activation window lost current activation messages/i.test(lastError) ? "activation-window-lost"
+      : /Context exceeds window/i.test(lastError) ? "context-overflow"
+      : /Child Pi exited before requested model admission completed/i.test(lastError) ? "child-exit-before-admission"
+      : "unknown";
+    const reason = lastError.slice(0, 300);
     const previous = actor.activationBlocked;
     actor.activationBlocked = {
       reason, code, since: previous?.code === code ? previous.since : Date.now(),
@@ -2914,7 +2914,7 @@ export class ActorManager {
     void this.#publishPresence(actor).catch(() => undefined);
     // Deterministic budget failures need operator action, not three silent
     // activations. Existing host reporting bypasses mailbox/silent delivery.
-    const contextOverflow = /Context exceeds window:/i.test(error);
+    const contextOverflow = code === "context-overflow";
     if (streak.notified || (!contextOverflow && streak.count < ACTOR_FAILURE_NOTICE_AFTER)) return;
     streak.notified = true;
     const text =
@@ -2958,12 +2958,6 @@ export class ActorManager {
       (this.#inFlight.get(actor.id) !== item || !this.#persistQueue(actor.id, true))) {
       throw new Error(`Cannot persist output-principal downgrade for Fabric actor ${actor.id}; steering rejected`);
     }
-  }
-
-  #assertActivationCapabilities(inferenceContext: FabricActorInferenceContext | undefined): void {
-    if (inferenceContext !== "activation" || this.#supportsTurnProvenance) return;
-    const missing = ACTIVATION_HOST_CAPABILITIES.join(", ");
-    throw new Error(`Actor activation requires host capability ${missing}; reload or rotate the owning root onto a Pi that advertises hostCapabilities.turnProvenance === 1.`);
   }
 
   #runRequest(

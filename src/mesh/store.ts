@@ -1359,8 +1359,8 @@ export class MeshStore {
    * Runs an operation under the mesh lock without touching the state: for a rare step that must
    * be serialized fleet-wide, such as recovering a per-key lock whose holder died.
    */
-  async exclusive<T>(operation: () => T): Promise<T> {
-    return this.#withLock(operation);
+  async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
+    return this.#withLock(operation, lockTimeoutMs);
   }
 
   /**
@@ -1612,9 +1612,9 @@ export class MeshStore {
     }
   }
 
-  async #withLock<T>(operation: () => T): Promise<T> {
+  async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
-    const deadline = Date.now() + this.#lockTimeoutMs;
+    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, lockTimeoutMs));
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
     const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;

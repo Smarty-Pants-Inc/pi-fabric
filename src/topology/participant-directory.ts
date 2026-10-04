@@ -19,6 +19,7 @@ import { reapDeadHostRecords } from "./host-reaper.js";
 import { effectiveLiveness } from "./liveness.js";
 import { isLiveLegacyRootEntry, sessionLiveness, LEGACY_ROOT_LEASE_MS as PARTICIPANT_LEASE_MS } from "./legacy-root-liveness.js";
 import {
+  fileLeasesOnly,
   hostLeaseExpiry,
   hostLiveness,
   LIVENESS_POLICY_KEY,
@@ -29,6 +30,7 @@ import {
   type RoutingLeaseWaitOptions,
   readHostLeases,
   removeHostLease,
+  STATE_LEASE_RENEW_MS,
   writeHostLease,
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
@@ -392,6 +394,9 @@ export interface ParticipantDirectoryOptions {
    * 15 min, the first sweep waiting as long). false disables it (secondary directories, tests).
    */
   reapDeadHosts?: false | { deadAfterMs?: number; sweepMs?: number };
+  /** Stall checks share the committed heartbeat; secondary/resident hosts can participate. */
+  presencePass?: () => Promise<void>;
+  presencePassMs?: number;
 }
 
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
@@ -428,6 +433,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #routingError: unknown;
   #leaseConfirmed = false;
   #deadHostSweepAt = Date.now();
+  #presencePassAt = Date.now();
   #quiescing = false;
   #reloadUntil: number | undefined;
   #reloadPublished = false;
@@ -546,7 +552,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#leaseConfirmed = true;
       this.#refreshError = undefined;
       this.#routingError = undefined;
-      if (full) this.#sweepDeadHosts();
+      if (full) {
+        this.#sweepDeadHosts();
+        if (this.options.enabled && !this.#closed && !this.#quiescing && this.options.presencePass &&
+          Date.now() - this.#presencePassAt >= (this.options.presencePassMs ?? 60_000)) {
+          this.#presencePassAt = Date.now();
+          void this.#notifications.enqueue(this.options.presencePass);
+        }
+      }
     } catch (error) {
       this.#refreshError = error;
       this.#routingReadAt = 0;
@@ -1320,10 +1333,16 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // A live pre-capability reader temporarily vetoes that migration.
     // An explicit participant-file policy must not hide our legacy advertisement from
     // an old runtime that joins later. Resume dual publication until that reader lapses.
+    const legacyRenewalsRequired = this.#legacyRenewalsRequired(now, snapshot);
+    const hostPolicyFilesOnly = fileLeasesOnly(this.mesh.get(LIVENESS_POLICY_KEY, read)?.value);
     const filesOnly = participantFilesOnly(this.mesh.get(LIVENESS_POLICY_KEY, read)?.value) &&
-      !this.#legacyRenewalsRequired(now, snapshot);
+      !legacyRenewalsRequired;
     const legacySessionKey = this.#legacySessionKey();
-    if (legacySessionKey && (this.#quiescing || filesOnly)) {
+    let legacyPut: MeshBatchOperation | undefined;
+    let legacyChanged = false;
+    // 6b15d905's sessions()/peers() prefer native participants and their host file lease.
+    // Its raw sessions/ fallback has a fixed 15 s TTL, but is not needed under this policy.
+    if (legacySessionKey && (this.#quiescing || filesOnly || hostPolicyFilesOnly)) {
       const legacy = this.mesh.get(legacySessionKey, read);
       if (legacy?.updatedBy.id === this.options.identity.id) {
         ops.push({ kind: "delete", key: legacy.key, ifVersion: legacy.version, onConflict: "skip" });
@@ -1352,12 +1371,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
       };
       const current = this.mesh.get(legacySessionKey, read)?.value;
       if (JSON.stringify({ ...(isObject(current) ? current : {}), updatedAt: undefined }) !==
-        JSON.stringify({ ...legacyValue, updatedAt: undefined })) changed = true;
-      ops.push({
+        JSON.stringify({ ...legacyValue, updatedAt: undefined })) {
+        legacyChanged = true;
+        changed = true;
+      }
+      legacyPut = {
         kind: "put",
         key: legacySessionKey,
         value: (leaseAt: number) => ({ ...legacyValue, updatedAt: leaseAt }),
-      });
+      };
     }
 
     const ownParticipant = (entry: MeshStateEntry | undefined): FabricParticipantRecord | undefined => {
@@ -1503,48 +1525,62 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     if (activity && now - this.#recordsWrittenAt >= ACTIVITY_REFRESH_MS) changed = true;
     if (!full && !changed) return false;                       // nothing to publish
-    // Liveness stays in the matching per-host file, with the original TTL, every tick.
-    // All-capable fleets renew ONLY the file. Any live unadvertised peer restores the legacy
-    // session/host half-life cadence, even under the historical host-file policy.
+    // Liveness stays in the matching per-host file on every tick. Old directory readers
+    // already use that host lease for native sessions, so the explicit policy never
+    // renews a legacy session. Without the policy, retain the fixed 7.5 s fallback
+    // threshold (10 s on the default 5 s heartbeat) for genuinely state-only readers.
     // Real record/ownership changes above bypass this idle-only decision.
+    let renewHost = changed;
+    let renewSession = changed || legacyChanged;
     if (!this.#quiescing || this.#reloadUntil !== undefined) {
-      const leaseAt = this.#renewFileLease();
+      const decideRenewal = (leaseAt: number, snapshot?: object): { skip: boolean; host: boolean; session: boolean } => {
+        const read = snapshot ? { snapshot } : {};
+        const own = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), read);
+        const host = own && hostFromEntry(own);
+        const hostValid = !!host &&
+          host.remoteHost === undefined &&
+          host.rootId === this.options.rootId &&
+          JSON.stringify(host.identity) === JSON.stringify(this.options.identity) &&
+          host.startedAt === this.#startedAt;
+        if (!hostValid) return { skip: false, host: true, session: false };
+        if (!this.#legacyRenewalsRequired(leaseAt, snapshot)) return { skip: true, host: false, session: false };
+        const legacy = root && legacySessionKey ? this.mesh.get(legacySessionKey, read) : undefined;
+        // The host retains its configured policy cadence (10 min under hostLeases: files).
+        const hostDue = hostPolicyFilesOnly
+          ? leaseAt - host.updatedAt >= STATE_LEASE_RENEW_MS
+          : host.expiresAt - leaseAt <= this.#leaseMs / 2;
+        const sessionDue = !hostPolicyFilesOnly && !!legacyPut &&
+          (!legacy || legacy.updatedAt + PARTICIPANT_LEASE_MS - leaseAt <= PARTICIPANT_LEASE_MS / 2);
+        return { skip: !hostDue && !sessionDue, host: hostDue, session: sessionDue };
+      };
       if (!changed) {
-        const canSkip = (leaseAt: number, snapshot?: object): boolean => {
-          const read = snapshot ? { snapshot } : {};
-          const own = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), read);
-          const host = own && hostFromEntry(own);
-          const leaseCapableFleet = !this.#legacyRenewalsRequired(leaseAt, snapshot);
-          const legacy = root && legacySessionKey ? this.mesh.get(legacySessionKey, read) : undefined;
-          return !!host &&
-            host.remoteHost === undefined &&
-            host.rootId === this.options.rootId &&
-            JSON.stringify(host.identity) === JSON.stringify(this.options.identity) &&
-            host.startedAt === this.#startedAt &&
-            (leaseCapableFleet || (host.expiresAt - leaseAt > this.#leaseMs / 2 &&
-                // Legacy sessions have their own fixed TTL, even with a longer host lease.
-                (!legacy || legacy.updatedAt + PARTICIPANT_LEASE_MS - leaseAt > PARTICIPANT_LEASE_MS / 2)));
-        };
-        if (canSkip(leaseAt, snapshot)) {
+        let decision = decideRenewal(Date.now(), snapshot);
+        renewHost ||= decision.host;
+        renewSession ||= decision.session;
+        if (decision.skip) {
           // The file shows only that this host is alive. A committed heartbeat also certifies
           // that the shared state is writable (confirmedAt; peer-settle relies on it, #24), so
           // take the lock once without a write: a stalled mesh still stops confirmation.
           let acquiredAt = 0;
           await this.mesh.confirmWritable(at => { acquiredAt = at; });
-          // Acquiring the lock may cross the renewal threshold (or expiry). Confirmation
-          // invalidates the cached state; re-read it against the completion time before
-          // certifying this heartbeat. If due, fall through to the single locked batch
-          // below, whose host/session leases are stamped at commit time.
-          if (canSkip(this.#renewFileLease())) return acquiredAt;
+          // Re-check after the lock: the threshold may have elapsed while confirming.
+          decision = decideRenewal(this.#renewFileLease());
+          if (decision.skip) return acquiredAt;
+          renewHost ||= decision.host;
+          renewSession ||= decision.session;
         }
       }
     }
+
+    // A compatibility tick may be due for only the session or only the host. Keep each
+    // record at its old cadence, but append both to this one locked batch when both are due.
+    if (renewSession && legacyPut) ops.push(legacyPut);
 
     // Stamp this host's lease at commit time, under the lock: a refresh that
     // outruns its own lease must not publish an already-expired lease, which
     // would make peers — and this host's own list() — read the records it just
     // wrote as stale.
-    ops.push({
+    if (renewHost) ops.push({
       kind: "put",
       key: keyFor(HOST_PREFIX, this.options.hostId),
       value: (leaseAt: number): FabricHostRecord => ({

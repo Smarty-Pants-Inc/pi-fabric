@@ -445,7 +445,7 @@ export class FabricExecutionService {
       recordAutoDecision,
       this.brokeredNetwork,
       this.#headlessApproval
-        ? (action, reason) => this.#headlessApproval!(action, reason, options.signal)
+        ? (action, reason, signal) => this.#headlessApproval!(action, reason, signal)
         : undefined,
     );
     const audits: FabricCallAudit[] = [];
@@ -705,11 +705,11 @@ export class FabricExecutionService {
           : {}),
         approve: async (action, preparedArgs) => {
           if (action.ref === "schema.commit") {
-            await approval.approve({ ...action, risk: "write" }, preparedArgs);
-            await approval.approve({ ...action, risk: "execute" }, preparedArgs);
+            await approval.approve({ ...action, risk: "write" }, preparedArgs, callContext.signal);
+            await approval.approve({ ...action, risk: "execute" }, preparedArgs, callContext.signal);
             return;
           }
-          await approval.approve(action, preparedArgs);
+          await approval.approve(action, preparedArgs, callContext.signal);
         },
         audits,
         maxResultChars: this.config.executor.maxNestedResultChars,

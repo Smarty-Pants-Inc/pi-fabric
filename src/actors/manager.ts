@@ -2321,9 +2321,9 @@ export class ActorManager {
 
   // Once its spawning activation ends, an unread child result belongs to the
   // actor's next activation. Stopped/removed actors keep the spool; never reroute to Main.
-  #reconcileChildCompletions(): void {
+  #reconcileChildCompletions(completed?: ManagedActor): void {
     if (!this.#persistent || this.#closing) return;
-    for (const actor of this.#actors.values()) {
+    for (const actor of completed ? [completed] : this.#actors.values()) {
       if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) continue;
       this.#flushHandoffConsumption(actor);
       const store = this.#childCompletionStore(actor);
@@ -2943,6 +2943,10 @@ export class ActorManager {
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           // Failed handoffs wait as context; never obstruct the next runnable item.
           this.#finishInFlight(actor.id, item, handoffConsumed);
+          // Status coalescing can make the idle boundary visible before the next
+          // monitor poll. Reconcile native live receipts before exposing that
+          // boundary or admitting a mailbox activation, not via incidental save I/O.
+          if (!this.#halted) this.#reconcileChildCompletions(this.#actors.get(actor.id) ?? actor);
           if (this.#canManage(actor.id)) {
             await this.#publishDrainPresence(actor).catch((error: unknown) => {
               this.#recordPreparationFailure(actor, error);

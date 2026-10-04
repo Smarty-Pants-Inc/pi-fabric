@@ -18,12 +18,12 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const key = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
-const setup = async (files: boolean, leaseMs = 15_000) => {
+const setup = async (files: boolean, leaseMs = 15_000, kind: MeshIdentity["kind"] = "main") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-heartbeat-contention-"));
   roots.push(root);
   let now = Date.now();
   vi.spyOn(Date, "now").mockImplementation(() => now);
-  const identity: MeshIdentity = { id: "session:live", name: "main", kind: "main", sessionId: "live" };
+  const identity: MeshIdentity = { id: "session:live", name: "main", kind, sessionId: "live" };
   const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 0 });
   if (files) await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity });
   const record: FabricParticipantRecord = {
@@ -102,6 +102,31 @@ describe("#3752 participant heartbeat contention", () => {
     expect(mesh.get(hostKey)!.version).toBeGreaterThan(host.version);
     expect(mesh.get(participantKey)!.version).toBe(participant.version);
     expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
+  });
+
+  it("skips just before half-life and renews exactly at the legacy session half-life", async () => {
+    const { directory, mesh, writes, advance } = await setup(false, 120_000);
+    advance(7_499);
+    await directory.refresh();
+    expect(writes).not.toHaveBeenCalled();
+    advance(1);
+    await directory.refresh();
+    expect(writes).toHaveBeenCalledOnce();
+    expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
+  });
+
+  it("uses a long host lease's own half-life when there is no legacy session lease", async () => {
+    const { directory, mesh, hostKey, participantKey, writes, advance } = await setup(false, 120_000, "actor");
+    const participant = mesh.get(participantKey)!;
+    const host = mesh.get(hostKey)!;
+    expect(mesh.get("sessions/live")).toBeUndefined();
+    for (let tick = 1; tick <= 12; tick++) {
+      advance(10_000);
+      await directory.refresh();
+      expect(writes).toHaveBeenCalledTimes(Math.floor(tick / 6));
+    }
+    expect(mesh.get(hostKey)!.version).toBeGreaterThan(host.version);
+    expect(mesh.get(participantKey)).toEqual(participant);
   });
 
   it("keeps the legacy session TTL fresh even with a longer host lease", async () => {

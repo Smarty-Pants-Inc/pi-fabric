@@ -544,7 +544,7 @@ describe("ParticipantDirectory host leases", () => {
     }
   });
 
-  it("#4383 coalesces idle state commits to a minute without extending file TTL, and commits real changes immediately", async () => {
+  it("renews idle state leases at half-life without rewriting timestamp-only participants, and commits real changes immediately", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-idle-"));
     roots.push(root);
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000);
@@ -568,31 +568,37 @@ describe("ParticipantDirectory host leases", () => {
       for (let tick = 1; tick <= 24; tick++) {
         now = start + tick * 5_000;
         await directory.refresh();
-        const lease = readHostLeases(mesh.root).get(identity.id)!;
+        // A legacy reader has no host-file fallback: its fixed 15 s TTL must never lapse.
+        expect(now - mesh.get("sessions/idle", { fresh: true })!.updatedAt).toBeLessThan(15_000);
+        // Read the canonical file here; fake wall-clock jumps do not change filesystem clocks.
+        const leaseFile = fs.readdirSync(path.join(mesh.root, "host-leases"))[0]!;
+        const lease = JSON.parse(fs.readFileSync(path.join(mesh.root, "host-leases", leaseFile), "utf8"));
         expect(lease.expiresAt).toBe(now + 15_000);
         expect(observer.get(identity.id, now, { fresh: true })?.stale).toBe(false);
       }
       const commits = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
-      expect(commits).toHaveLength(2);
-      expect(commits.map(commit => commit.at - start)).toEqual([60_000, 120_000]);
+      expect(commits).toHaveLength(12);
+      expect(commits.map(commit => commit.at - start)).toEqual(
+        Array.from({ length: 12 }, (_, index) => (index + 1) * 10_000),
+      );
       expect(commits.every(commit => commit.keys.length === 2 && commit.keys.includes("sessions/idle"))).toBe(true);
       expect(mesh.get(participant.key)).toEqual(participant); // timestamp-only participant unchanged
       now += 15_001;
       expect(observer.get(identity.id, now, { fresh: true })).toBeUndefined(); // original TTL lapses
       await directory.refresh();
       expect(observer.get(identity.id, now, { fresh: true })?.stale).toBe(false); // re-acquire via file
-      expect(fs.readFileSync(trace, "utf8").trim().split("\n")).toHaveLength(2);
+      expect(fs.readFileSync(trace, "utf8").trim().split("\n")).toHaveLength(13);
       status = "running";
       await directory.refresh();
       expect(mesh.get(participant.key)?.value).toMatchObject({ status: "running" });
       const changed = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
-      expect(changed).toHaveLength(3);
-      expect(changed[2].at).toBe(now); // no minute delay for durable state/authority changes
-      expect(changed[2].keys).toContain(participant.key);
+      expect(changed).toHaveLength(14);
+      expect(changed[13].at).toBe(now); // no lease delay for durable state/authority changes
+      expect(changed[13].keys).toContain(participant.key);
     } finally { clock.mockRestore(); vi.unstubAllEnvs(); }
   });
 
-  it("#4383 preserves short renewals for a live native host with a missing or mismatched file lease", async () => {
+  it("renews at the stored host half-life even with a matching file lease", async () => {
     const { store, alpha, hostEntry, meshRoot } = await setup(false);
     const peer = identityOf("state-only-host");
     const now = Date.now();
@@ -608,7 +614,7 @@ describe("ParticipantDirectory host leases", () => {
       const shared = hostEntry()!;
       clock.mockReturnValue(now + 400);
       await alpha.refresh();
-      expect(hostEntry()!.version).toBe(shared.version);
+      expect(hostEntry()!.version).toBeGreaterThan(shared.version);
     } finally { clock.mockRestore(); }
   });
 

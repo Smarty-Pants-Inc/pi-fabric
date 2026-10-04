@@ -23,7 +23,6 @@ import {
   readHostLeases,
   removeHostLease,
   STATE_LEASE_RENEW_MS,
-  STATE_LEASE_COALESCE_MS,
   writeHostLease,
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
@@ -1345,9 +1344,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (activity && now - this.#recordsWrittenAt >= ACTIVITY_REFRESH_MS) changed = true;
     if (!full && !changed) return false;                       // nothing to publish
     // Liveness stays in the matching per-host file, with the original TTL, every tick.
-    // Coalesce idle state renewals to a minute unless a live state-only peer still needs
-    // the old half-TTL advertisements. The explicit fleet policy retains its ten-minute
-    // cadence. Real record/ownership changes above bypass this idle-only decision.
+    // Shared-state leases still renew at half-life: legacy readers use the stored session entry
+    // and host lease directly, so a minute-based refresh can let either expire even while the
+    // newer file lease remains live. The explicit file-only policy keeps its existing ten-minute
+    // compatibility refresh. Real record/ownership changes above bypass this idle-only decision.
     if (!this.#quiescing || this.#reloadUntil !== undefined) {
       const leaseAt = this.#renewFileLease();
       if (!changed) {
@@ -1355,8 +1355,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           const own = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
           const host = own && hostFromEntry(own);
           const fileOnly = fileLeasesOnly(this.mesh.get(LIVENESS_POLICY_KEY)?.value);
-          const stateOnlyPeers = !fileOnly && this.#hasStateOnlyPeers(leaseAt);
-          const legacy = stateOnlyPeers && root && legacySessionKey ? this.mesh.get(legacySessionKey) : undefined;
+          const legacy = !fileOnly && root && legacySessionKey ? this.mesh.get(legacySessionKey) : undefined;
           return !!host &&
             host.remoteHost === undefined &&
             host.rootId === this.options.rootId &&
@@ -1364,11 +1363,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
             host.startedAt === this.#startedAt &&
             (fileOnly
               ? leaseAt - host.updatedAt < STATE_LEASE_RENEW_MS
-              : !stateOnlyPeers
-                ? leaseAt - host.updatedAt < STATE_LEASE_COALESCE_MS
-                : host.expiresAt - leaseAt > this.#leaseMs / 2 &&
-                  // Legacy sessions have their own fixed TTL, even with a longer host lease.
-                  (!legacy || legacy.updatedAt + PARTICIPANT_LEASE_MS - leaseAt > PARTICIPANT_LEASE_MS / 2));
+              : host.expiresAt - leaseAt > this.#leaseMs / 2 &&
+                // Legacy sessions have their own fixed TTL, even with a longer host lease.
+                (!legacy || legacy.updatedAt + PARTICIPANT_LEASE_MS - leaseAt > PARTICIPANT_LEASE_MS / 2));
         };
         if (canSkip(leaseAt)) {
           // The file shows only that this host is alive. A committed heartbeat also certifies
@@ -1441,27 +1438,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
       return committed?.version === version && participant && isLocal(participant, this.options.hostId)
         ? committed : undefined;
     }));
-  }
-
-  // A mixed rollout must not strand an advertising state-only runtime. Its native host
-  // or legacy session is positive evidence it still needs short shared-state renewals.
-  // Expired synthetic/history records and mirrored hosts are not local readers. Recheck
-  // after confirmWritable too: a legacy peer can join while the lock is contended.
-  #hasStateOnlyPeers(now: number): boolean {
-    const leases = readHostLeases(this.mesh.root);
-    for (const entry of this.mesh.listAll(HOST_PREFIX)) {
-      const host = hostFromEntry(entry);
-      if (!host || host.remoteHost !== undefined || host.expiresAt < now) continue;
-      const lease = leases.get(host.id);
-      if (!lease || lease.rootId !== host.rootId || lease.identityId !== host.identity.id) return true;
-    }
-    // Even a lapsed matching file proves the peer supports this lease protocol, not
-    // that it is alive. Visibility still uses the original expiry checks elsewhere.
-    const fileRoots = new Set([...leases.values()].map(lease => JSON.stringify([lease.rootId, lease.identityId])));
-    for (const entry of this.mesh.listAll(LEGACY_SESSION_PREFIX)) {
-      if (isLiveLegacyRootEntry(entry, now) && !fileRoots.has(JSON.stringify([entry.value.id, entry.updatedBy.id]))) return true;
-    }
-    return false;
   }
 
   #renewFileLease(): number {

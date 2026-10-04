@@ -18,8 +18,6 @@ export const LIVENESS_POLICY_KEY = "topology/liveness";
  * version (they remove hosts gone for hours) takes a live host for a dead one.
  */
 export const STATE_LEASE_RENEW_MS = 10 * 60 * 1000;
-/** Default idle shared-state cadence when every advertising native peer has a file lease. */
-export const STATE_LEASE_COALESCE_MS = 60_000;
 
 const LEASE_DIR = "host-leases";
 

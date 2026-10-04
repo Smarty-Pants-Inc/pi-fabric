@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
@@ -86,6 +87,10 @@ export class ActorLogStore {
     if (!runDirectory || !fs.existsSync(runDirectory)) return;
     const dest = path.join(path.dirname(actor.sessionFile), "runs", runId);
     fs.mkdirSync(dest, { recursive: true, mode: 0o700 });
+    const receipt = path.join(runDirectory, "route-quality-receipt.json");
+    if (fs.existsSync(receipt)) {
+      writeJsonAtomic(path.join(dest, "route-quality-receipt.json"), JSON.parse(fs.readFileSync(receipt, "utf8")), { durable: true });
+    }
     for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
       const src = path.join(runDirectory, file);
       if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dest, file));

@@ -138,6 +138,35 @@ describe("live model routing", () => {
     expect(rows().find(row => row.type === "quality")).toMatchObject({ decisionId: decision.decisionId, runId: run.id, routeQuality: "fail" });
     expect(() => m.reportRouteQuality("foreign-run", "fail")).toThrow();
   });
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fences a quality fail with readable unwritable state across restart and retries without losing its join", async () => {
+    const run = await dispatch();
+    fs.writeFileSync(state(), "", { mode: 0o400 }); fs.chmodSync(state(), 0o400);
+    expect(fs.readFileSync(state(), "utf8")).toBe("");
+    expect(() => run.dispatch.reportQuality("fail")).toThrow();
+    expect(rows().find(row => row.type === "quality")).toMatchObject({ decisionId: run.decision.decisionId, routeQuality: "fail" });
+    const journal = path.join(path.dirname(state()), "model-routing-quality.jsonl");
+    const receipts = () => fs.readFileSync(journal, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(receipts().map(row => row.type)).toEqual(["pending"]);
+    restartedSwitch(); // Fresh process still sees pending receipt, not the empty safety state.
+    const next = await prepareModelRoute(input);
+    expect(next).toMatchObject({ ...pin, mode: "shadow", reasonCode: "class-reverted" });
+    const m = manager(); const handle = await m.spawn({ task: "ECHO_MODEL", routeDecision: next });
+    expect(await m.wait(handle.id)).toMatchObject({ model: pin.model, thinking: pin.effort });
+    expect(fs.readFileSync(state(), "utf8")).toBe("");
+    fs.chmodSync(state(), 0o600);
+    expect(isRouteClassReverted("status-groom")).toBe(true);
+    expect(receipts().map(row => row.type)).toEqual(["pending", "committed"]);
+    expect(rows().filter(row => row.type === "quality")).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(state(), "utf8").trim())).toMatchObject({ decisionId: run.decision.decisionId, routeQuality: "fail" });
+    restartedSwitch();
+  });
+  it("keeps non-live quality feedback audit-only without poisoning live admission", async () => {
+    const shadow = await prepareModelRoute({ ...input, routeClass: "critical-read", protected: true });
+    const report = prepareRouteDispatch(shadow, undefined, path.join(root, shadow.decisionId), shadow.decisionId);
+    report.reportQuality("fail");
+    expect(rows().find(row => row.type === "quality")).toMatchObject({ routeClass: "critical-read", routeQuality: "fail" });
+    expect(await prepareModelRoute(input)).toMatchObject({ mode: "live", reasonCode: "live-choice" });
+  });
   it("reverts after two consecutive failed/aborted runs, not after one or duplicate settlement", async () => {
     const first = await dispatch(); first.dispatch.outcome({ status: "failed" }); first.dispatch.outcome({ status: "failed" });
     expect(isRouteClassReverted("status-groom")).toBe(false);

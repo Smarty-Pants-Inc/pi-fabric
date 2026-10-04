@@ -308,6 +308,7 @@ export class ResidentHost {
     this.#effectiveConfig = () => {
       const overlay = currentConfig();
       return { ...config,
+        ...(overlay.agents?.modelRouting ? { agents: { ...config.agents, modelRouting: overlay.agents.modelRouting } } : {}),
         ...(overlay.piModels ? { piModels: overlay.piModels } : {}),
         ...(overlay.modelGuidance ? { modelGuidance: overlay.modelGuidance } : {}),
         ...(overlay.kernel ? { kernel: overlay.kernel } : {}),
@@ -485,8 +486,9 @@ export class ResidentHost {
         resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
         prepareModelRoute: async (input, signal) => {
           const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
-          return prepareModelRoute({ ...input, signal, config: config.agents.modelRouting,
-            registry: residentRouteRegistry(), aliases: normalizeModelAliases((currentConfig().piModels ?? config.piModels)?.aliases),
+          const overlay = currentConfig();
+          return prepareModelRoute({ ...input, signal, config: overlay.agents?.modelRouting ?? config.agents.modelRouting,
+            registry: residentRouteRegistry(), aliases: normalizeModelAliases((overlay.piModels ?? config.piModels)?.aliases),
             assertModelAllowed: model => this.agents.assertModelAllowed(model, "pi"),
             evaluate: (request, routeSignal) => this.#routeOwner!.evaluate(request, routeSignal) });
         },
@@ -1321,6 +1323,15 @@ export class ResidentHost {
           actors: this.actors.listOwned().filter((actor) => actor.rootId === this.config.rootId),
           completedAt: Date.now(),
         };
+      } else if (command.operation === "routeQuality") {
+        this.#authorizeResidentSetter(command.caller);
+        const target = await this.actors.routeQualityTarget(command.id);
+        if (!target || target.actor.rootId !== this.config.rootId || !this.actors.owns(target.actor.id)) {
+          throw new ResidentActorAuthorizationError("Resident host does not own this actor activation");
+        }
+        commit(target.actor.id);
+        const actor = await this.actors.reportRouteQuality(command.id, command.routeQuality);
+        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, completedAt: Date.now() };
       } else if (command.operation !== "removeActor") {
         if (command.operation === "setInstructions" || command.operation === "setModel" ||
           command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools" ||

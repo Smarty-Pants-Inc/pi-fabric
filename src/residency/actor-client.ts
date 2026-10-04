@@ -80,7 +80,7 @@ export class ResidentActorClient {
     catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
   }
 
-  async setActor(mutation: ResidentActorMutation, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<FabricActorInfo> {
+  async setActor(mutation: ResidentActorMutation | import("./protocol.js").ResidentRouteQuality, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<FabricActorInfo> {
     // Nested proxies cannot manufacture the Main's control identity. A genuine
     // Main fallback must supply the identity captured by its provider.
     if (this.#toolCeiling !== undefined && caller) caller = { ...caller, toolCeiling: [...this.#toolCeiling] };

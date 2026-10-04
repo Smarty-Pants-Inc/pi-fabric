@@ -177,7 +177,11 @@ only that live class to shadow. Completed runs reset the failure streak. A pass
 after a fail does not clear a demotion. Task and actor settlements share this
 path. Replayed/duplicate terminal receipts do not increment the streak twice.
 The API accepts an owned run ID, not an arbitrary class, decision or storage path;
-quality reports should be sent before run retention collects the handle.
+the owning Main can also report a completed durable actor activation by its run ID,
+after the successful worker handle has been cleaned up. The resident host authorizes
+the actual Main control identity and resolves its execution-owned archived decision
+receipt. Actor receipts follow the existing actor run archive retention window;
+foreign Mains, nested inherited identities and unknown activations are refused.
 
 The append-only host file `<host Pi agent dir>/fabric/model-routing-state.jsonl`
 stores the per-class switch/streak and survives process restart; its trust boundary,
@@ -186,9 +190,18 @@ writes a `revert` row to `model-routing.jsonl`, with class, reset generation,
 triggering `decisionId` and `quality-fail` or `consecutive-failures`. Unsafe or
 corrupt state falls back to the pin with `revert-state-error`. Outcome storage
 failures retain the existing pending receipt/retry fence rather than claiming a
-durable save.
+durable save. Quality updates first fsync a `pending` receipt in
+`model-routing-quality.jsonl`, then confirm the ledger and state updates, then fsync
+a `committed` receipt before acknowledgement. An uncommitted receipt vetoes live
+admission across restart and is retried at the next activation; a readable but
+unwritable state journal cannot leave the class live. The decision/class/reset join
+is preserved, even after successful actor cleanup.
 
-**Rollback:** set `liveClasses: []`. **Re-enable one reverted class:** keep it
+**Rollback:** set `liveClasses: []` in trusted config and refresh Main through its
+normal config reload path. The existing resident config refresh writes the overlay
+and reuses the ready host. New resident activations reread that same-release,
+root/session-fenced policy, including reset tokens; already-admitted model/effort
+pins do not change, and no resident restart is required. **Re-enable one reverted class:** keep it
 listed and change its trusted `revertReset` token, for example
 `"revertReset": { "status-groom": "approved-retry-2" }`. Tokens default to `""`;
 use a new, never-reused token for each reset. Old in-flight outcomes stay in their
@@ -272,7 +285,9 @@ known and before launch; a failed bind settles preparation failure instead of
 launching against the parent checkout. Retries and resumes retain that session
 and child ID.
 Once the terminal join is durable and workers have exited, `route-session.jsonl`
-is an owned run artifact collected by normal close/expiry retention. Pending
+and `route-quality-receipt.json` are owned run artifacts collected by normal
+close/expiry retention (actor decision receipts are first durably archived with
+the actor run). Pending
 outcomes, unresolved workers, links and unknown content still veto collection.
 Terminal `outcome` rows join on `decisionId`, with status, verified admitted model
 and effort, observed model, token/cache/cost counters when known and time.
@@ -309,6 +324,32 @@ free-text reasons. A standalone explicit `-e` child hook mutates Pi's
 `before_provider_headers` map in place; it also loads for `extensions: false`.
 Worker launch strips inherited route metadata before passing this child's own
 header, so unrelated nested explicit-model tasks are not misattributed.
+
+## Real installed-Pi live-path proof
+
+Build this checkout, then run the isolated, keyless proof at the installed runtime:
+
+```sh
+nice -n 19 bun run build
+nice -n 19 node scripts/prove-model-route-live.mjs \
+  /absolute/installed/pi-coding-agent/dist/cli.js "$TMPDIR/router-proof" "$TASK_OUT/real-cli"
+```
+
+The script starts the real `pi --mode rpc` CLI with this checkout's `dist/index.js`
+through `-e`, private HOME/profile/mesh, and only model/provider-boundary mocks.
+Jev fetch is intercepted; native OpenAI model requests reach a loopback HTTP
+server that records the actual `X-Smarty-Route` header. No Fabric API, manager,
+resident host, worker, registry or header hook is substituted. The proof covers
+public auto task spawn/wait and run, live durable `status-groom`, completed actor
+cleanup, owning-Main quality fail with pending/committed durability, next pinned
+activation, another class remaining live, and Jev error fallback. `evidence.json`
+joins actual native model/effort, HTTP header and decision/outcome ledger by ID;
+`transcript.jsonl`, copied routing/resident state and `summary.json` retain the
+exact HEAD, bundle hash, installed Pi version and all-processes-exited receipt.
+These artifacts are the pre-merge isolated entrypoint evidence, not production
+model-quality, gateway metering or spending-parity acceptance. The owner must
+post the exact-head evidence and separately confirm those gates before live
+production enablement.
 
 **Required before merge/install:** a named **Sol-max security pass** on the
 header/identity plumbing and local ledger trust boundary. Unit tests and an

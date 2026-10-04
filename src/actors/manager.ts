@@ -826,6 +826,29 @@ export class ActorManager {
     return this.#canManage(actor.id);
   }
 
+  /** Resolve only execution-owned activation receipts, never a caller-selected path. */
+  async routeQualityTarget(runId: string): Promise<{ actor: FabricActorInfo; receipt: import("../agents/model-route.js").RouteQualityReceipt } | undefined> {
+    if (!/^[a-f0-9]{32}$/.test(runId)) return undefined;
+    const { readRouteQualityReceipt } = await import("../agents/model-route.js");
+    for (const actor of this.listOwned()) {
+      if (!actor.sessionFile) continue;
+      const archive = path.join(path.dirname(actor.sessionFile), "runs", runId, "route-quality-receipt.json");
+      const runDirectory = this.agents.runDirectory(runId);
+      const receipt = (fs.existsSync(archive) ? readRouteQualityReceipt(archive) : undefined) ?? (runDirectory
+        ? readRouteQualityReceipt(path.join(runDirectory, "route-quality-receipt.json")) : undefined);
+      if (receipt?.runId === runId && receipt.decision.actorId === actor.id) return { actor, receipt };
+    }
+    return undefined;
+  }
+
+  async reportRouteQuality(runId: string, quality: "pass" | "fail"): Promise<FabricActorInfo> {
+    const target = await this.routeQualityTarget(runId);
+    if (!target || !this.owns(target.actor.id)) throw new Error("Unknown execution-owned actor activation");
+    const { reportRouteQualityReceipt } = await import("../agents/model-route.js");
+    reportRouteQualityReceipt(target.receipt, quality);
+    return this.status(target.actor.id);
+  }
+
   /** Resolve a caller-local view for foreign routing; own-root defaults stay dynamic. */
   resolveBinding(
     id: string,
@@ -2770,15 +2793,16 @@ export class ActorManager {
           // actor sent to and received from its model, even after a successful
           // run cleans up the in-memory handle and tmp run directory. Failed
           // runs stay in the agent registry for agents.status(lastRunId).
+          let archived = false;
           if (runId) {
-            await this.#retainRunLog(actor, runId).catch(() => undefined);
+            archived = await this.#retainRunLog(actor, runId).then(() => true, () => false);
           }
           // Release the in-memory handle and tmp run dir for completed runs;
           // failed runs are retained for agents.status(actor.lastRunId).
           if (previousRunId && previousRunId !== runId) {
             await this.agents.cleanup(previousRunId).catch(() => ({ cleaned: false }));
           }
-          if (runId && runCompleted) {
+          if (runId && runCompleted && archived) {
             await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
           }
           delete actor.abortController;

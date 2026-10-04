@@ -519,7 +519,9 @@ export type ResidentActorMutation =
   | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
   | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null };
 
-type ResidentActorMutationCommand = ResidentActorMutation & {
+export type ResidentRouteQuality = { operation: "routeQuality"; id: string; routeQuality: "pass" | "fail" };
+
+type ResidentActorMutationCommand = (ResidentActorMutation | ResidentRouteQuality) & {
   caller?: ResidentActorCaller;
   format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
   requestId: string;
@@ -560,7 +562,7 @@ export const residentCommandForOwner = (command: ResidentCommand, owner: Residen
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "setInstructions", "setModel",
-  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange",
+  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange", "routeQuality",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>

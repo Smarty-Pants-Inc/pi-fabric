@@ -288,13 +288,14 @@ describe("shared run-tree exit veto", () => {
 describe("safe run roots", () => {
   const sweep = (tempRoot: string, now = 100 * DAY) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
 
-  it.each(["closed", "orphan"])("R3 collects owned route sessions in expired %s roots without weakening fences", kind => {
+  it.each(["closed", "orphan"])("R3 collects owned route sessions and quality receipts in expired %s roots without weakening fences", kind => {
     const tempRoot = temporaryDirectory();
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + kind);
     for (const name of ["done", "pending", "live", "unresolved"]) {
       const directory = path.join(root, name);
       writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: name === "live" ? String(process.pid) : "2147483647" });
       fs.writeFileSync(path.join(directory, "route-session.jsonl"), '{"type":"session"}\n');
+      fs.writeFileSync(path.join(directory, "route-quality-receipt.json"), '{"runId":"owned-receipt"}');
       if (name === "pending") fs.writeFileSync(path.join(directory, "pending-route-outcome.json"), "{}");
       if (name === "unresolved") markUnresolvedWorker(directory, "not joined");
     }

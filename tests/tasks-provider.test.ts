@@ -334,8 +334,11 @@ describe("tasks provider", () => {
 
     const boundary = store.begin("bash", "boundary"); boundary.spill();
     boundary.append(Buffer.concat([Buffer.alloc(SHELL_READ_MAX_BYTES - 1, 120), Buffer.from("😀NEEDLE")]));
-    await expect(provider.invoke("watch", { id: boundary.id, match: "never", timeoutMs: 10 }, context))
-      .resolves.toMatchObject({ reason: "timeout" });
+    const clipped = await provider.invoke("watch", { id: boundary.id, match: "never", timeoutMs: 10 }, context) as { nextCursor: number };
+    expect(clipped).toMatchObject({ reason: "timeout", nextCursor: SHELL_READ_MAX_BYTES - 1 });
+    const resumed = provider.invoke("watch", { id: boundary.id, match: "NEEDLE", after: clipped.nextCursor, timeoutMs: 5000 }, context);
+    boundary.append(Buffer.from([10]));
+    await expect(resumed).resolves.toMatchObject({ reason: "event", lines: ["😀NEEDLE"], nextCursor: boundary.written });
   });
 
   it("checks cancellation and deadlines while draining many raw output pages", async () => {

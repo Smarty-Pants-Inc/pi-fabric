@@ -112,7 +112,7 @@ export class TasksProvider implements FabricProvider {
       const previousReadCursor = readCursor;
       const page = job.read(readCursor, SHELL_READ_MAX_BYTES, "base64");
       omittedBytes += page.omittedBytes;
-      if (page.offset > lineStart && !pending) {
+      if (page.offset > previousReadCursor && !pending) {
         lineStart = page.offset;
         cursor = page.offset;
       }
@@ -140,9 +140,12 @@ export class TasksProvider implements FabricProvider {
       // when a page ends in an incomplete UTF-8 sequence.
       if (pending && readCursor - lineStart >= SHELL_READ_MAX_BYTES) {
         if (pending.includes(match)) lines.push(clean(pending).slice(0, WATCH_LINE_CHARS));
+        // The decoder may still hold bytes of the next UTF-8 character.
+        // Publish only a complete-character cursor so the next watch can replay
+        // that character intact, even after clipping an unterminated page.
+        lineStart += Buffer.byteLength(pending);
         pending = "";
-        lineStart = readCursor;
-        cursor = readCursor;
+        cursor = lineStart;
         if (lines.length) return result("event");
       }
       signal?.throwIfAborted();

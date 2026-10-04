@@ -296,6 +296,81 @@ describe.skipIf(process.platform !== "linux")("legacy run archive proof", () => 
     expect(await linuxRunFilesIdle([dir], proc)).toBe(true);
   });
 
+  it.each(["residency", "mesh", "runs"])("vetoes a %s symlink ancestor with a real held descriptor before staging", async kind => {
+    const sandbox = temporary(), physical = path.join(sandbox, "physical");
+    fs.mkdirSync(physical, { mode: 0o700 });
+    const realRoot = kind === "mesh" ? path.join(physical, "residency", "host") : physical;
+    const realDir = run(realRoot, "aliased-held"), proc = emptyProc(sandbox);
+    fs.symlinkSync(`/proc/${process.pid}`, path.join(proc, String(process.pid)));
+    const view = path.join(sandbox, "view"); fs.symlinkSync(physical, view);
+    let root = kind === "mesh" ? path.join(view, "residency", "host") : view;
+    if (kind === "runs") {
+      root = path.join(sandbox, "resident"); fs.mkdirSync(root, { mode: 0o700 });
+      fs.symlinkSync(path.join(physical, "runs"), path.join(root, "runs"));
+    }
+    const dir = path.join(root, "runs", "aliased-held"), file = path.join(dir, "events.jsonl");
+    const fd = fs.openSync(file, "a"), archive = archiver(root, proc);
+    try {
+      expect(fs.readlinkSync(`/proc/self/fd/${fd}`)).toBe(path.join(realDir, "events.jsonl"));
+      expect(fs.fstatSync(fd).ino).toBe(fs.statSync(file).ino);
+      expect(await linuxRunFilesIdle([dir], proc)).toBe(false);
+      // The veto is the namespace, not restricted /proc visibility or PID death.
+      expect(await linuxRunFilesIdle([dir], emptyProc(realRoot))).toBe(false);
+      expect(await legacyRunTreeProof(dir, now, 0)).toBeUndefined();
+      await archive.sweep(now, 32, 1000);
+      expect(archive.health.archived).toBe(0); expect(fs.existsSync(dir)).toBe(true);
+      expect(fs.existsSync(path.join(root, "archive"))).toBe(false);
+      fs.writeSync(fd, "still held\n"); expect(fs.readFileSync(file, "utf8")).toContain("still held");
+    } finally { fs.closeSync(fd); await archive.close(); }
+  });
+
+  it("vetoes the staged alias while an original-path descriptor follows the renamed inode", async () => {
+    const sandbox = temporary(), physical = path.join(sandbox, "physical"); fs.mkdirSync(physical, { mode: 0o700 });
+    const view = path.join(sandbox, "view"); fs.symlinkSync(physical, view);
+    const dir = run(view, "held"), proc = emptyProc(sandbox);
+    fs.symlinkSync(`/proc/${process.pid}`, path.join(proc, String(process.pid)));
+    const batch = path.join(view, "archive", ".staging-probe"); fs.mkdirSync(batch, { recursive: true, mode: 0o700 });
+    const fd = fs.openSync(path.join(dir, "events.jsonl"), "a");
+    try {
+      const staged = path.join(batch, "held"); fs.renameSync(dir, staged);
+      expect(fs.readlinkSync(`/proc/self/fd/${fd}`)).toBe(path.join(physical, "archive", ".staging-probe", "held", "events.jsonl"));
+      expect(fs.fstatSync(fd).ino).toBe(fs.statSync(path.join(staged, "events.jsonl")).ino);
+      expect(await linuxRunFilesIdle([staged], proc)).toBe(false);
+      expect(await linuxRunFilesIdle([staged], emptyProc(physical))).toBe(false);
+      const archive = archiver(view, proc);
+      try { await archive.sweep(now, 32, 1000); expect(archive.health.archived).toBe(0); expect(fs.existsSync(staged)).toBe(true); }
+      finally { await archive.close(); }
+      fs.writeSync(fd, "after staging\n"); expect(fs.readFileSync(path.join(staged, "events.jsonl"), "utf8")).toContain("after staging");
+    } finally { fs.closeSync(fd); }
+  });
+
+  it.each([2, 3, 4])("keeps a real file holder when archive becomes aliased at custody boundary %i", async boundary => {
+    const root = temporary(), dir = run(root, "held"), proc = emptyProc(root);
+    fs.symlinkSync(`/proc/${process.pid}`, path.join(proc, String(process.pid)));
+    let calls = 0, fd: number | undefined, heldFile = "", observedIdle: boolean | undefined;
+    const archive = archiver(root, proc, { processFilesIdle: async (dirs: readonly string[]) => {
+      if (++calls === boundary) {
+        const original = path.join(root, "archive"), physical = path.join(root, "physical-archive");
+        fs.renameSync(original, physical); fs.symlinkSync(physical, original);
+        heldFile = path.join(dirs[0]!, "events.jsonl"); fd = fs.openSync(heldFile, "a");
+        expect(fs.readlinkSync(`/proc/self/fd/${fd}`)).toContain("/physical-archive/");
+        observedIdle = await linuxRunFilesIdle(dirs, proc);
+        // Even a custom observer claiming idleness cannot bypass the post-I/O veto.
+        return true;
+      }
+      return linuxRunFilesIdle(dirs, proc);
+    } });
+    try {
+      await archive.sweep(now, 32, 1000);
+      expect(archive.health.archived).toBe(0); expect(observedIdle).toBe(false);
+      expect(calls).toBe(boundary); expect(fd).toBeDefined();
+      const retained = boundary === 2 ? path.join(dir, "events.jsonl") : heldFile;
+      expect(fs.existsSync(retained)).toBe(true);
+      fs.writeSync(fd!, "retained writer\n"); expect(fs.readFileSync(retained, "utf8")).toContain("retained writer");
+      if (boundary > 2) expect(archive.health.error).toMatch(/proof changed/);
+    } finally { if (fd !== undefined) fs.closeSync(fd); await archive.close(); }
+  });
+
   it("checks real open descriptors, cwd and mmap paths and fails closed for incomplete /proc", async () => {
     const root = temporary(), dir = run(root, "held"), proc = emptyProc(root);
     const pid = path.join(proc, String(process.pid)); fs.symlinkSync(`/proc/${process.pid}`, pid);

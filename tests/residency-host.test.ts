@@ -883,6 +883,14 @@ describe("resident orphan retention", () => {
       await host.start();
       // Startup does not inspect archives; the streaming collector runs later.
       expect(fs.existsSync(old)).toBe(true);
+      // This case tests streaming collection, not the separately covered
+      // reference-preparation budget. Finish that synchronous preparation before
+      // the first collector tick so transient live hints cannot skip this sample.
+      const references = host.agents.retentionReferences({ budgetMs: 100, maxEntries: 64 });
+      // Malformed/live fixtures deliberately retain the wildcard; neither
+      // collectable ID may be a transient per-run hint in this first sample.
+      expect(references.has("terminal-old")).toBe(false);
+      expect(references.has("actor-old")).toBe(false);
       await vi.waitFor(() => {
         expect(fs.existsSync(old)).toBe(false);
         expect(fs.existsSync(actor)).toBe(false);

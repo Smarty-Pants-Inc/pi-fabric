@@ -527,11 +527,13 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   }
 
   it("cleanup that times out behind a real wait is fenced before file/worktree mutation", { timeout: 10_000 }, async () => {
-    const state = await harness(false);
+    // Worker admission is setup, not the abandonment deadline being tested.
+    const state = await harness(false, undefined, 5_000);
     const original = AgentManager.prototype.join;
     const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
     try {
       const handle = await state.client.spawnAgent({ task: "settle before cleanup", model: state.model });
+      state.client.options.commandTimeoutMs = 500;
       vi.spyOn(AgentManager.prototype, "join").mockImplementation(async function (this: AgentManager, ...args) {
         const result = await original.apply(this, args);
         state.entered.resolve(); await state.release.promise;

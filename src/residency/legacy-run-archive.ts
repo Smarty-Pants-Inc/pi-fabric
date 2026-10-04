@@ -23,6 +23,25 @@ const owned = async (file: string): Promise<fs.Stats> => {
   if (stat.isSymbolicLink() || (stat.isFile() && stat.nlink !== 1) || (process.getuid && stat.uid !== process.getuid())) throw new Error("unsafe ownership/link");
   return stat;
 };
+/** /proc reports physical names, not the spelling used to open a file. Veto
+ * every symlink component (including mesh/residency ancestors), rather than
+ * treating a lexical containment miss as absence of custody. Revalidate at
+ * each archive boundary; this is never cached authorization. */
+const unaliasedDirectory = async (directory: string): Promise<boolean> => {
+  try {
+    const absolute = path.resolve(directory);
+    // Only absolute, normalized spellings can be used for lexical containment.
+    if (directory !== absolute || await fsp.realpath(absolute) !== absolute) return false;
+    let ancestor = absolute;
+    for (;;) {
+      const stat = await fsp.lstat(ancestor);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) return true;
+      ancestor = parent;
+    }
+  } catch { return false; }
+};
 interface TreeProof { fingerprint: string; status: string; finishedAt: number }
 
 /** Separate legacy proof, NOT a relaxation of runTreeExitVeto or deletion.
@@ -75,7 +94,9 @@ export const legacyRunTreeProof = async (directory: string, now: number, ageMs: 
   };
   try {
     if (!Number.isSafeInteger(ageMs) || ageMs < 0) return;
+    if (!await unaliasedDirectory(directory)) return;
     await walk(directory, 0);
+    if (!await unaliasedDirectory(directory)) return;
     identities.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
     return rootRecord && { ...rootRecord, fingerprint: JSON.stringify(identities) };
   } catch { return; }
@@ -86,6 +107,7 @@ export const legacyRunTreeProof = async (directory: string, now: number, ageMs: 
  * injection seam for isolated tests, never a configurable production bypass. */
 export const linuxRunFilesIdle = async (directories: readonly string[], procRoot = "/proc"): Promise<boolean> => {
   if (process.platform !== "linux") return false;
+  for (const directory of directories) if (!await unaliasedDirectory(directory)) return false;
   const contains = (value: string) => {
     const target = value.replace(/ \(deleted\)$/, "");
     return directories.some(dir => target === dir || target.startsWith(dir + path.sep));
@@ -162,7 +184,11 @@ export const linuxRunFilesIdle = async (directories: readonly string[], procRoot
   };
   // Both censuses include TIDs, not only process leaders. New/reused tasks
   // invalidate the proof; disappeared tasks have released their custody.
-  try { return await census(false) && await census(true) && !expired(); }
+  try {
+    if (!await census(false) || !await census(true) || expired()) return false;
+    for (const directory of directories) if (!await unaliasedDirectory(directory)) return false;
+    return true;
+  }
   catch { return false; }
 };
 
@@ -189,6 +215,15 @@ export class ResidentLegacyRunArchive {
 
   #enabled(): boolean { return this.policy.legacyRunArchiveEnabled !== false; }
 
+  async #filesIdle(directories: readonly string[]): Promise<boolean> {
+    // The injection seam may supply a complete isolated process view, but it
+    // must not bypass the namespace veto. Check both sides of asynchronous I/O.
+    for (const directory of directories) if (!await unaliasedDirectory(directory)) return false;
+    if (!await (this.options.processFilesIdle ?? linuxRunFilesIdle)(directories)) return false;
+    for (const directory of directories) if (!await unaliasedDirectory(directory)) return false;
+    return true;
+  }
+
   start(): void {
     if (this.#timer || this.#closed) return;
     this.#timer = setInterval(() => {
@@ -211,10 +246,14 @@ export class ResidentLegacyRunArchive {
   async sweep(now = Date.now(), maxEntries = 32, budgetMs = 20): Promise<void> {
     if (this.#closed || this.#blocked || !this.#enabled() || process.platform !== "linux" || now < this.#nextScan) return;
     const runs = path.join(this.root, "runs"), archive = path.join(this.root, "archive");
-    const idle = this.options.processFilesIdle ?? linuxRunFilesIdle;
+    const idle = (directories: readonly string[]) => this.#filesIdle(directories);
     const started = performance.now(), candidates: Array<{ id: string; proof: TreeProof }> = [];
     let stagedBatch: string | undefined;
     try {
+      if (!await unaliasedDirectory(runs)) {
+        await fsp.lstat(runs); // An absent runs directory is not a permanent fault.
+        throw new Error("aliased/unknown run namespace");
+      }
       if (!this.#archiveChecked) {
         try {
           const archiveStat = await owned(archive);
@@ -256,7 +295,7 @@ export class ResidentLegacyRunArchive {
       if (!this.#enabled() || this.#closed) return;
       await fsp.mkdir(archive, { recursive: true, mode: 0o700 });
       const archiveStat = await owned(archive);
-      if (!archiveStat.isDirectory() || (archiveStat.mode & 0o077) !== 0) throw new Error("unsafe archive root");
+      if (!archiveStat.isDirectory() || (archiveStat.mode & 0o077) !== 0 || !await unaliasedDirectory(archive)) throw new Error("unsafe archive root");
       if (await this.#referenceFence(candidates.map(run => run.id)) !== fence) return;
       const batch = await fsp.mkdtemp(path.join(archive, ".staging-"));
       stagedBatch = batch;
@@ -348,7 +387,7 @@ export class ResidentLegacyRunArchive {
       await output.sync();
     } finally { await output.close(); }
     // tar cannot authorize deletion if anything changed while compression ran.
-    if (!await (this.options.processFilesIdle ?? linuxRunFilesIdle)(runs.map(run => path.join(batch, run.id)))) throw new Error("process proof changed; staged bytes retained");
+    if (!await this.#filesIdle(runs.map(run => path.join(batch, run.id)))) throw new Error("process proof changed; staged bytes retained");
     for (const run of runs) {
       if (this.options.isRetained(run.id) || (await legacyRunTreeProof(path.join(batch, run.id), now, this.policy.legacyRunArchiveAgeMs ?? DEFAULT_AGE_MS))?.fingerprint !== run.proof.fingerprint) {
         throw new Error("run proof changed; staged bytes retained");
@@ -392,7 +431,7 @@ export class ResidentLegacyRunArchive {
     // even after slow compression/append; new custody keeps both copies.
     if (await this.#referenceFence(fenceIds) !== fence || !this.#enabled() ||
         runs.some(run => this.options.isRetained(run.id)) ||
-        !await (this.options.processFilesIdle ?? linuxRunFilesIdle)(runs.map(run => path.join(batch, run.id)))) {
+        !await this.#filesIdle(runs.map(run => path.join(batch, run.id)))) {
       throw new Error("final custody/process proof changed; staged bytes retained");
     }
     for (const run of runs) {
@@ -402,6 +441,9 @@ export class ResidentLegacyRunArchive {
     }
     const archiveDirectory = await fsp.open(archive, "r");
     try { await archiveDirectory.sync(); } finally { await archiveDirectory.close(); }
+    if (!await unaliasedDirectory(batch) || !await unaliasedDirectory(path.join(this.root, "runs"))) {
+      throw new Error("final namespace changed; staged bytes retained");
+    }
     await fsp.rm(batch, { recursive: true });
     this.health.archived += runs.length;
   }

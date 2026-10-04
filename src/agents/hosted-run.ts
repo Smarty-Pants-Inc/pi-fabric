@@ -126,7 +126,7 @@ export class HostedRun {
   #record: AgentRunRecord;
   /** Settled or detached: adapter reports are ignored from here on. */
   #closed = false;
-  /** Stop finished; the monitor must not poll liveness again. */
+  /** The adapter confirmed release, or the owner explicitly detached. */
   #released = false;
   #detached = false;
   #shutdown = false;
@@ -233,7 +233,7 @@ export class HostedRun {
   }
 
   async stop(): Promise<void> {
-    if (this.#released || this.#closed || this.terminal) return;
+    if (this.#released) return;
     const reason: FabricRunStopReason = Date.now() >= this.context.deadlineAt
       ? "timeout"
       : this.#shutdown ? "shutdown" : "requested";
@@ -253,7 +253,7 @@ export class HostedRun {
     if (!confirmed && this.adapter.abort) {
       await withTimeout(() => this.adapter.abort!(this.locator, reason), `${this.adapter.id}.abort`).catch(() => undefined);
     }
-    this.#released = true;
+    this.#released = confirmed;
     if (this.terminal) return;
     const base = reason === "timeout"
       ? `Agent timed out after ${Math.max(0, this.context.deadlineAt - this.#record.startedAt)}ms`
@@ -272,6 +272,7 @@ export class HostedRun {
 
   /** Settle a prepared run that was never submitted; recovery must not attach to it. */
   abandon(error: string): void {
+    this.#released = true; // Never submitted: there is no remote execution to release.
     this.#settle({ status: "failed", error });
     this.#closed = true;
   }

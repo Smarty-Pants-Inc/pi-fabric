@@ -2583,8 +2583,8 @@ export class AgentManager {
     if (managed.settled && options.consume !== false) this.#onResultConsumed?.(id);
     if (managed.settled) {
       // A terminal result can be published just before native worker close.
-      // Explicit process stop still owes its caller that exit join.
-      if (managed.transport.kind === "process") await this.#stopManagedTransport(managed);
+      // Native exit still needs a join; hosted terminal reporting is not release.
+      if (managed.transport.kind === "process" || managed.hosted) await this.#stopManagedTransport(managed);
       const record = readRecord(managed.statusFile) ?? managed.latestRecord;
       if (!record || !terminalStatuses.has(record.status)) throw new Error(`Agent ${id} settled without a result`);
       return this.#withTransportMetadata(record, managed) as AgentRunResult;
@@ -2592,7 +2592,7 @@ export class AgentManager {
     managed.background = false;
     const existing = readRecord(managed.statusFile);
     if (existing && terminalStatuses.has(existing.status)) {
-      if (managed.transport.kind === "process") await this.#stopManagedTransport(managed);
+      if (managed.transport.kind === "process" || managed.hosted) await this.#stopManagedTransport(managed);
       const result = this.#withTransportMetadata(existing, managed) as AgentRunResult;
       await this.#captureWorktree(managed);
       this.#settle(managed, result);

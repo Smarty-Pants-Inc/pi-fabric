@@ -232,6 +232,22 @@ describe("custom worker runners", () => {
 });
 
 describe("hosted runners", () => {
+  it("A6 sends explicit stop after an indeterminate submission failure and retains its outcome", async () => {
+    const fake = fakeHosted("failed-submit", { onStart: () => { throw new Error("remote started, reply lost"); }, stopConfirmed: false });
+    let confirmed = false;
+    fake.adapter.stop = () => { fake.calls.push(confirmed ? "stop:confirmed" : "stop:requested"); return { confirmed }; };
+    register(fake.adapter);
+    const manager = managerFor(tempRoot());
+    const result = await manager.run({ task: "Start remotely", runner: "failed-submit" });
+    expect(result).toMatchObject({ status: "failed", outcome: "indeterminate" });
+    expect(await manager.stop(result.id)).toMatchObject({ status: "failed", outcome: "indeterminate" });
+    expect(fake.calls.filter(call => call === "stop:requested")).toHaveLength(1);
+    // An unconfirmed stop is not release: operators can retry the trusted adapter.
+    confirmed = true;
+    expect(await manager.stop(result.id)).toMatchObject({ status: "failed", outcome: "indeterminate" });
+    expect(fake.calls).toContain("stop:confirmed");
+    expect(fs.existsSync(path.join(manager.runDirectory(result.id)!, "hosted-exit.json"))).toBe(true);
+  });
   it("persists the locator before start, routes questions, and finishes", async () => {
     const root = tempRoot();
     const fake = fakeHosted("daemon", {

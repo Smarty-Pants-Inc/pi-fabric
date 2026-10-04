@@ -103,6 +103,7 @@ const agentLines = (
 };
 
 export const isFabricWidgetStreaming = (snapshot: FabricDashboardSnapshot): boolean =>
+  snapshot.main.status === "running" ||
   snapshot.runs.some((run) => run.status === "running") ||
   ownAgents(snapshot).some((agent) => isActiveStatus(agent.status)) ||
   snapshot.actors.some((actor) => actor.status !== "stopped" && isActiveStatus(actor.status)) ||
@@ -181,6 +182,10 @@ export class FabricWidget implements Component {
     const streaming = this.stableWhileStreaming && isFabricWidgetStreaming(snapshot);
     if (streaming) this.#turnRowLimit ??= limit;
     else this.#turnRowLimit = undefined;
+    // A stable turn budget must still fit the live pane after a resize.
+    // Keep the smaller reservation for the rest of this turn, avoiding growth
+    // when the pane is expanded again.
+    if (streaming) this.#turnRowLimit = Math.min(this.#turnRowLimit!, limit);
     const renderLimit = streaming ? this.#turnRowLimit! : limit;
     const lines =
       this.#pending?.width === width &&
@@ -208,6 +213,10 @@ export class FabricWidget implements Component {
     const streaming = this.stableWhileStreaming && isFabricWidgetStreaming(snapshot);
     if (streaming) this.#turnRowLimit ??= this.#lastLimit ?? limit;
     else this.#turnRowLimit = undefined;
+    // A stable turn budget must still fit the live pane after a resize.
+    // Keep the smaller reservation for the rest of this turn, avoiding growth
+    // when the pane is expanded again.
+    if (streaming) this.#turnRowLimit = Math.min(this.#turnRowLimit!, limit);
     const renderLimit = streaming ? this.#turnRowLimit! : limit;
     const lines = this.#renderLines(snapshot, this.#lastWidth, renderLimit, streaming);
     this.#pending = { width: this.#lastWidth, limit: renderLimit, snapshot, lines };

@@ -2243,11 +2243,12 @@ describe("AgentsProvider runner support", () => {
   });
 
   it("keeps session: stop targets out of actor classification (#2386)", async () => {
-    const { provider, actors } = setup();
+    const { provider, actors, agents } = setup();
     const status = vi.spyOn(actors, "status");
-    const stop = vi.spyOn(provider, "stopParticipant").mockResolvedValue({ status: "stopped" });
-    await expect(provider.invoke("stop", { id: "session:peer" }, context)).resolves.toEqual({ status: "stopped" });
-    expect(stop).toHaveBeenCalledWith("session:peer");
+    const failure = new Error("stop dispatch reached");
+    const stop = vi.spyOn(agents, "stop").mockRejectedValue(failure);
+    await expect(provider.invoke("stop", { id: "session:peer" }, context)).rejects.toBe(failure);
+    expect(stop).toHaveBeenCalledWith("session:peer", { consume: false });
     expect(status).not.toHaveBeenCalled();
   });
 

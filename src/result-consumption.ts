@@ -1,3 +1,8 @@
+/** A competing carrier owns these outcomes; suppress only the losing delivery. */
+export class ChildCompletionClaimLostError extends Error {
+  constructor(readonly ids: readonly string[]) { super("Actor child completion already claimed"); }
+}
+
 /** A host-owned receipt for a result observation, never serialized to the guest. */
 export class ResultConsumption {
   #pending: Array<{ consume: () => void; abandon: (() => void) | undefined }> = [];

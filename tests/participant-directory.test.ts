@@ -361,8 +361,11 @@ describe("ParticipantDirectory host leases", () => {
   const alphaBatches = (spy: { mock: { calls: unknown[][] } }) =>
     spy.mock.calls.filter((call) => (call[0] as { identity: MeshIdentity }).identity.id === "session:alpha").length;
 
-  it("renew a file lease on every heartbeat, and still the shared record without the fleet owner's policy", async () => {
-    const { meshRoot, hostEntry } = await setup(false);
+  it("keeps half-TTL state renewals for an advertising state-only peer", async () => {
+    const { meshRoot, store, hostEntry } = await setup(false);
+    const identity = identityOf("legacy-reader");
+    await store.put({ key: "sessions/legacy-reader", identity, value: { id: identity.id, sessionId: "legacy-reader",
+      cwd: "/tmp/project", startedAt: Date.now(), status: "idle" } });
     const before = hostEntry()!.updatedAt;
     await new Promise((resolve) => setTimeout(resolve, 450));      // several 100 ms heartbeats
     expect(readHostLeases(meshRoot).get("session:alpha")?.expiresAt).toBeGreaterThan(Date.now());
@@ -474,8 +477,9 @@ describe("ParticipantDirectory host leases", () => {
     { crossing: "host expiry", leaseMs: 4_000, delayMs: 4_001, policy: false },
     { crossing: "legacy threshold", leaseMs: 60_000, delayMs: 7_501, policy: false },
     { crossing: "legacy expiry", leaseMs: 60_000, delayMs: 15_001, policy: false },
+    { crossing: "default minute threshold", leaseMs: 60_000, delayMs: 60_001, policy: false },
     { crossing: "policy threshold", leaseMs: 60_000, delayMs: STATE_LEASE_RENEW_MS, policy: true },
-  ])("renews after delayed confirmation crosses $crossing", async ({ leaseMs, delayMs, policy }) => {
+  ])("renews after delayed confirmation crosses $crossing", async ({ crossing, leaseMs, delayMs, policy }) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-delayed-confirm-"));
     roots.push(root);
     const identity = identityOf("delayed");
@@ -491,8 +495,16 @@ describe("ParticipantDirectory host leases", () => {
     const lockPath = path.join(mesh.root, ".lock");
     try {
       if (policy) await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity });
+      if (!policy && crossing !== "default minute threshold") {
+        const peer = identityOf("state-only");
+        await mesh.put({ key: "sessions/state-only", identity: peer, value: { id: peer.id, sessionId: "state-only",
+          cwd: "/tmp/project", startedAt: now, status: "idle" } });
+        // Keep this compatibility reader alive across the deterministic lock delay.
+        await mesh.put({ key: "topology/hosts/" + createHash("sha256").update(peer.id).digest("hex"), identity: peer,
+          value: { format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: now, updatedAt: now, expiresAt: now + 120_000 } });
+      }
       await directory.refresh(); // no heartbeat timer: only this awaited refresh can renew
-      const hostBefore = mesh.listAll("topology/hosts/")[0]!;
+      const hostBefore = mesh.listAll("topology/hosts/").find(entry => (entry.value as { id: string }).id === identity.id)!;
       const legacyBefore = mesh.get("sessions/delayed")!;
       const participantBefore = mesh.listAll("topology/participants/")[0]!;
       const writes = vi.spyOn(mesh, "writeBatch");
@@ -516,7 +528,7 @@ describe("ParticipantDirectory host leases", () => {
       await refresh;
       expect(confirmations).toHaveBeenCalledOnce();
       expect.soft(writes).toHaveBeenCalledOnce(); // host + legacy in one locked commit
-      const hostAfter = mesh.listAll("topology/hosts/", { fresh: true })[0]!;
+      const hostAfter = mesh.listAll("topology/hosts/", { fresh: true }).find(entry => (entry.value as { id: string }).id === identity.id)!;
       expect.soft(hostAfter.version).toBeGreaterThan(hostBefore.version);
       expect.soft(hostAfter.value).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
       const legacyAfter = mesh.get("sessions/delayed", { fresh: true })!;
@@ -530,6 +542,74 @@ describe("ParticipantDirectory host leases", () => {
       clock.mockRestore();
       vi.restoreAllMocks();
     }
+  });
+
+  it("#4383 coalesces idle state commits to a minute without extending file TTL, and commits real changes immediately", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-idle-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000);
+    const identity = identityOf("idle");
+    let status = "idle";
+    const record = () => ({ ...rootRecord(identity.id, identity.id, "idle"), status, updatedAt: Date.now() });
+    const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id,
+      identity, heartbeatMs: 5_000, leaseMs: 15_000, reapDeadHosts: false });
+    directory.registerSource(() => [record()]);
+    directories.push(directory);
+    const observer = createDirectory(mesh.root, identityOf("observer"), "session:observer", () => []);
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const trace = path.join(root, "commits.jsonl");
+    vi.stubEnv("PI_FABRIC_COMMIT_TRACE", trace);
+    try {
+      await directory.refresh();
+      fs.writeFileSync(trace, "");
+      const participant = mesh.listAll("topology/participants/")[0]!;
+      const start = now;
+      for (let tick = 1; tick <= 24; tick++) {
+        now = start + tick * 5_000;
+        await directory.refresh();
+        const lease = readHostLeases(mesh.root).get(identity.id)!;
+        expect(lease.expiresAt).toBe(now + 15_000);
+        expect(observer.get(identity.id, now, { fresh: true })?.stale).toBe(false);
+      }
+      const commits = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(commits).toHaveLength(2);
+      expect(commits.map(commit => commit.at - start)).toEqual([60_000, 120_000]);
+      expect(commits.every(commit => commit.keys.length === 2 && commit.keys.includes("sessions/idle"))).toBe(true);
+      expect(mesh.get(participant.key)).toEqual(participant); // timestamp-only participant unchanged
+      now += 15_001;
+      expect(observer.get(identity.id, now, { fresh: true })).toBeUndefined(); // original TTL lapses
+      await directory.refresh();
+      expect(observer.get(identity.id, now, { fresh: true })?.stale).toBe(false); // re-acquire via file
+      expect(fs.readFileSync(trace, "utf8").trim().split("\n")).toHaveLength(2);
+      status = "running";
+      await directory.refresh();
+      expect(mesh.get(participant.key)?.value).toMatchObject({ status: "running" });
+      const changed = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(changed).toHaveLength(3);
+      expect(changed[2].at).toBe(now); // no minute delay for durable state/authority changes
+      expect(changed[2].keys).toContain(participant.key);
+    } finally { clock.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("#4383 preserves short renewals for a live native host with a missing or mismatched file lease", async () => {
+    const { store, alpha, hostEntry, meshRoot } = await setup(false);
+    const peer = identityOf("state-only-host");
+    const now = Date.now();
+    await store.put({ key: "topology/hosts/" + createHash("sha256").update(peer.id).digest("hex"), identity: peer,
+      value: { format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: now, updatedAt: now, expiresAt: now + 120_000 } });
+    writeHostLease(meshRoot, { id: peer.id, rootId: "wrong-root", identityId: peer.id, updatedAt: now, expiresAt: now + 120_000 });
+    const before = hostEntry()!;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 200);
+    try {
+      await alpha.refresh();
+      expect(hostEntry()!.version).toBeGreaterThan(before.version);
+      writeHostLease(meshRoot, { id: peer.id, rootId: peer.id, identityId: peer.id, updatedAt: now, expiresAt: now + 120_000 });
+      const shared = hostEntry()!;
+      clock.mockReturnValue(now + 400);
+      await alpha.refresh();
+      expect(hostEntry()!.version).toBe(shared.version);
+    } finally { clock.mockRestore(); }
   });
 
   it("under the policy, still renew the shared record every STATE_LEASE_RENEW_MS", async () => {

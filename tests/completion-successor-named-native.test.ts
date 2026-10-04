@@ -12,9 +12,9 @@ import { AGENT_COMPLETION_MESSAGE_TYPE } from "../src/agents/completion-inbox.js
 import { completionConsumed, saveCompletion, saveWorkerCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 
-// Astra r4 P1 / security F9, native Pi: real AgentSession + real SessionManager name (`pi --name`
-// appends session info before extensions bind). Named lane A dies; equally named B recovers once;
-// unnamed and differently named Mains on the same cwd get neither bodies nor receipts.
+// #3178, native Pi: real AgentSession + SessionManager name (`pi --name`).
+// The old expectation transferred named A's results to equally named B without adoption.
+// Names remain metadata; only resuming A's exact persistent session grants access.
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
@@ -29,7 +29,7 @@ const waitFor = async (predicate: () => boolean, ms = 10_000) => {
 };
 
 describe("named lane succession in native Pi sessions", () => {
-  it("named successor receives ordinary and durable results once; unnamed/other-named Mains receive nothing", async () => {
+  it("equal-name new root receives nothing; exact resumed session receives ordinary and durable results once", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-named-native-")));
     cleanups.push(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
     const agentDir = path.join(root, "agent"); fs.mkdirSync(agentDir, { recursive: true });
@@ -61,11 +61,11 @@ describe("named lane succession in native Pi sessions", () => {
     const faux = fauxProvider();
     const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "unused-auth.json") });
     modelRuntime.registerNativeProvider(faux.provider);
-    const open = async (name?: string) => {
+    const open = async (name?: string, sessionFile?: string) => {
       const loader = new DefaultResourceLoader({ cwd: root, agentDir, noSkills: true, noPromptTemplates: true, noThemes: true,
         noContextFiles: true, extensionFactories: [{ name: "pi-fabric-source", factory: piFabric }] });
       await loader.reload();
-      const sessionManager = SessionManager.create(root, path.join(root, "sessions"));
+      const sessionManager = sessionFile ? SessionManager.open(sessionFile, path.join(root, "sessions")) : SessionManager.create(root, path.join(root, "sessions"));
       if (name) sessionManager.appendSessionInfo(name);           // what `pi --name` does before binding
       const { session } = await createAgentSession({ cwd: root, agentDir, modelRuntime, model: faux.getModel(),
         resourceLoader: loader, sessionManager });
@@ -76,7 +76,7 @@ describe("named lane succession in native Pi sessions", () => {
       let closed = false;
       const close = async () => { if (closed) return; closed = true; await state.shutdown("exit"); session.dispose(); };
       cleanups.push(close);
-      return { session, state, close, id: `session:${sessionManager.getSessionId()}` };
+      return { session, state, close, sessionFile: sessionManager.getSessionFile()!, id: `session:${sessionManager.getSessionId()}` };
     };
     const bodies = (session: AgentSession) => session.messages.filter((message) =>
       message.role === "custom" && (message as { customType?: string }).customType === AGENT_COMPLETION_MESSAGE_TYPE).map(m => JSON.stringify(m));
@@ -120,14 +120,25 @@ describe("named lane succession in native Pi sessions", () => {
     for (const value of [ordinary, durable]) expect(completionConsumed(meshRoot, value.id)).toBe(false);
 
     const successor = await open("probe-lane");
+    // #3178: B is not a successor record; name equality grants neither delivery nor receipt.
+    for (let tick = 0; tick < 5; tick++) await nudge(successor.session);
+    expect(bodies(successor.session)).toEqual([]);
+    for (const value of [ordinary, durable]) expect(completionConsumed(meshRoot, value.id)).toBe(false);
+
+    const returned = await open("renamed-owner", a.sessionFile);
+    expect(returned.id).toBe(a.id);
     const deadline = Date.now() + 15_000;
-    while (!(bodies(successor.session).some(b => b.includes(ordinary.text!)) && bodies(successor.session).some(b => b.includes(durable.text!)))) {
-      if (Date.now() > deadline) throw new Error(`successor did not receive: ${JSON.stringify(bodies(successor.session))}`);
-      await nudge(successor.session);
+    while (!(bodies(returned.session).some(b => b.includes(ordinary.text!)) && bodies(returned.session).some(b => b.includes(durable.text!)))) {
+      if (Date.now() > deadline) throw new Error(`owner did not receive: ${JSON.stringify(bodies(returned.session))}`);
+      await nudge(returned.session);
     }
     await waitFor(() => [ordinary, durable].every(value => completionConsumed(meshRoot, value.id)), 15_000);
-    await nudge(successor.session); await nudge(unnamed.session); await nudge(other.session);
-    for (const value of [ordinary, durable]) expect(bodies(successor.session).filter(b => b.includes(value.text!))).toHaveLength(1);
-    for (const bystander of [unnamed, other]) expect(bodies(bystander.session)).toEqual([]);
+    await nudge(returned.session); await nudge(successor.session); await nudge(unnamed.session); await nudge(other.session);
+    for (const value of [ordinary, durable]) expect(bodies(returned.session).filter(b => b.includes(value.text!))).toHaveLength(1);
+    for (const bystander of [unnamed, other, successor]) expect(bodies(bystander.session)).toEqual([]);
+
+    // Actor-output native proof is scripts/prove-exact-completion-recipient.mjs:
+    // real installed Pi, agents.create/tell, fabric_reply, owner death and exact-session
+    // restart. A fabricated deliveryRoot assertion is not native actor evidence.
   }, 90_000);
 });

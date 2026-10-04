@@ -749,6 +749,10 @@ describe("FabricUiController dashboard wiring", () => {
     try {
       controller.start(context);
       activity.start("live", { name: "T06 slice A" });
+      await vi.advanceTimersByTimeAsync(110);
+      expect(widget).toBeDefined();
+      const reserved = widget!.render(80);
+      expect(reserved).toHaveLength(6);
       for (let index = 0; index < 6; index++) {
         const callId = `c${index}`;
         activity.beginCall("live", { callId, ref: "pi.read", args: { path: `${index}.ts` } });
@@ -759,6 +763,7 @@ describe("FabricUiController dashboard wiring", () => {
       const first = widget!.render(80).join("\n");
       expect(first).toContain("T06 slice A");
       expect(first).toContain("6/6 calls");
+      expect(first.split("\n")).toHaveLength(reserved.length);
       // Sub-second elapsed stays hidden, so the clock shows its first real tick.
       expect(first).toMatch(/1s/);
       expect(controller.snapshot().runs[0]?.status).toBe("running");
@@ -770,6 +775,9 @@ describe("FabricUiController dashboard wiring", () => {
       expect(elapsedMs).toBeGreaterThanOrEqual(5_000);
       expect(second).toMatch(/6s/);
       expect(requestRender).toHaveBeenCalled();
+      activity.finish("live", true);
+      await vi.advanceTimersByTimeAsync(110);
+      expect(widget!.render(80).length).toBeLessThan(reserved.length);
     } finally {
       controller.stop();
       vi.useRealTimers();

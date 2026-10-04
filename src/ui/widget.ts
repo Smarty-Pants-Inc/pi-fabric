@@ -102,6 +102,12 @@ const agentLines = (
   ];
 };
 
+export const isFabricWidgetStreaming = (snapshot: FabricDashboardSnapshot): boolean =>
+  snapshot.runs.some((run) => run.status === "running") ||
+  ownAgents(snapshot).some((agent) => isActiveStatus(agent.status)) ||
+  snapshot.actors.some((actor) => actor.status !== "stopped" && isActiveStatus(actor.status)) ||
+  snapshot.shells?.some((job) => job.finishedAt === undefined) === true;
+
 export const shouldShowFabricWidget = (
   snapshot: FabricDashboardSnapshot,
   mode: FabricUiWidgetMode,
@@ -145,6 +151,9 @@ export class FabricWidget implements Component {
     // Live terminal height. pi re-renders the widget on resize, so reading the
     // pane per render bounds the box without a resize subscription.
     readonly terminalRows?: () => number | undefined,
+    // Controller-owned above-editor widgets reserve rows for streamed turns.
+    // Standalone renderers keep the historical compact behavior.
+    readonly stableWhileStreaming = false,
   ) {}
 
   #rowLimit(): number {
@@ -155,6 +164,10 @@ export class FabricWidget implements Component {
   #lastLimit: number | undefined;
   #lastSnapshot: FabricDashboardSnapshot | undefined;
   #lastLines: string[] | undefined;
+  // Above-editor components must not change height while a streamed turn is in
+  // flight: pi-tui may have to redraw the whole screen when their line count
+  // changes, and terminals such as Herdr can leave that redraw in scrollback.
+  #turnRowLimit: number | undefined;
   #pending:
     | { width: number; limit: number; snapshot: FabricDashboardSnapshot; lines: string[] }
     | undefined;
@@ -165,20 +178,24 @@ export class FabricWidget implements Component {
     // The pane can shrink between renders, so the row budget is part of the
     // cache key: a box measured against a taller terminal must not be reused.
     const limit = this.#rowLimit();
+    const streaming = this.stableWhileStreaming && isFabricWidgetStreaming(snapshot);
+    if (streaming) this.#turnRowLimit ??= limit;
+    else this.#turnRowLimit = undefined;
+    const renderLimit = streaming ? this.#turnRowLimit! : limit;
     const lines =
       this.#pending?.width === width &&
-      this.#pending.limit === limit &&
+      this.#pending.limit === renderLimit &&
       this.#pending.snapshot === snapshot
         ? this.#pending.lines
         : this.#lastWidth === width &&
-            this.#lastLimit === limit &&
+            this.#lastLimit === renderLimit &&
             this.#lastSnapshot === snapshot &&
             this.#lastLines
           ? this.#lastLines
-          : this.#renderLines(snapshot, width, limit);
+          : this.#renderLines(snapshot, width, renderLimit, streaming);
     this.#pending = undefined;
     this.#lastWidth = width;
-    this.#lastLimit = limit;
+    this.#lastLimit = renderLimit;
     this.#lastSnapshot = snapshot;
     this.#lastLines = lines;
     return lines;
@@ -188,12 +205,21 @@ export class FabricWidget implements Component {
     if (this.#lastWidth === undefined || this.#lastLines === undefined) return true;
     const snapshot = this.snapshot();
     const limit = this.#rowLimit();
-    const lines = this.#renderLines(snapshot, this.#lastWidth, limit);
-    this.#pending = { width: this.#lastWidth, limit, snapshot, lines };
-    return (
-      lines.length !== this.#lastLines.length ||
-      lines.some((line, index) => line !== this.#lastLines?.[index])
-    );
+    const streaming = this.stableWhileStreaming && isFabricWidgetStreaming(snapshot);
+    if (streaming) this.#turnRowLimit ??= this.#lastLimit ?? limit;
+    else this.#turnRowLimit = undefined;
+    const renderLimit = streaming ? this.#turnRowLimit! : limit;
+    const lines = this.#renderLines(snapshot, this.#lastWidth, renderLimit, streaming);
+    this.#pending = { width: this.#lastWidth, limit: renderLimit, snapshot, lines };
+    if (lines.length === this.#lastLines.length &&
+        lines.every((line, index) => line === this.#lastLines?.[index])) return false;
+    // Spinner-only differences are allowed to ride on the next Pi render.
+    // Calling requestRender for every animation tick defeats Pi's render
+    // coalescing and is especially noisy for above-editor widgets.
+    const normalizeSpinner = (line: string): string => line.replace(/[◐◓◑◒]/g, "◐");
+    if (!this.stableWhileStreaming) return true;
+    return lines.length !== this.#lastLines.length ||
+      lines.some((line, index) => normalizeSpinner(line) !== normalizeSpinner(this.#lastLines?.[index] ?? ""));
   }
 
   invalidate(): void {
@@ -204,8 +230,11 @@ export class FabricWidget implements Component {
     this.#lastLines = undefined;
   }
 
-  #renderLines(snapshot: FabricDashboardSnapshot, width: number, limit: number): string[] {
-    return this.#boundContent(this.#buildContent(snapshot), width, limit);
+  #renderLines(snapshot: FabricDashboardSnapshot, width: number, limit: number, streaming: boolean): string[] {
+    const lines = this.#boundContent(this.#buildContent(snapshot), width, limit);
+    if (!streaming) return lines;
+    while (lines.length < limit) lines.push("");
+    return lines;
   }
 
   #buildContent(snapshot: FabricDashboardSnapshot): string[] {

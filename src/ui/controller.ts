@@ -22,7 +22,7 @@ import type { ModelSource } from "./model-picker.js";
 import { createDashboardSnapshot, FabricDashboardSnapshotCache } from "./snapshot.js";
 import { safeText } from "./format.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
-import { FabricWidget, shouldShowFabricWidget } from "./widget.js";
+import { FabricWidget, isFabricWidgetStreaming, shouldShowFabricWidget } from "./widget.js";
 import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript.js";
 
 const WIDGET_ID = "pi-fabric";
@@ -845,7 +845,12 @@ export class FabricUiController {
     const shouldShow =
       context.mode === "tui" &&
       shouldShowFabricWidget(this.#snapshot, config.widget);
-    if (shouldShow) {
+    // Keep the above-editor component mounted for the entire streamed turn.
+    // A transient status gap must not turn into a remove/add pair while Pi is
+    // diff-rendering the conversation.
+    const keepForStreaming =
+      context.mode === "tui" && isFabricWidgetStreaming(this.#snapshot);
+    if (shouldShow || keepForStreaming) {
       if (this.#widgetMounted) return;
       this.#widgetMounted = true;
       context.ui.setWidget(
@@ -857,6 +862,7 @@ export class FabricUiController {
             () => this.#snapshot,
             config.maxRows,
             () => tui.terminal?.rows ?? process.stdout.rows,
+            true,
           );
           return this.#widget;
         },

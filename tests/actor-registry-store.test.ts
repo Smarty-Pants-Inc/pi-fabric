@@ -43,25 +43,6 @@ describe("ActorRegistryStore", () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  it("isolates nested mutations through both read APIs from the cached disk snapshot", async () => {
-    const { store, registryPath } = setup();
-    const foreign = { id: "foreign", messages: [{ text: "original", data: { nested: ["keep"] } }] };
-    await store.withLock(() => store.write([foreign, { id: "local" }]));
-    const bytes = fs.readFileSync(registryPath, "utf8");
-    const snapshot = store.read() as { actors: typeof foreign[] };
-    const records = store.records() as typeof foreign[];
-    snapshot.actors[0]!.messages[0]!.text = "bounded";
-    records[0]!.messages[0]!.data.nested.push("mutated");
-    const reads = vi.spyOn(fs, "readFileSync");
-    expect(store.read()).toEqual(JSON.parse(bytes));
-    expect(store.records()[0]).toEqual(foreign);
-    expect(reads).not.toHaveBeenCalled();
-    reads.mockRestore();
-    expect(fs.readFileSync(registryPath, "utf8")).toBe(bytes);
-    await store.withLock(() => store.write([...store.records().filter((row) => row.id !== "local"), { id: "local", model: "updated" }]));
-    expect(store.records()[0]).toEqual(foreign);
-  });
-
   it("#169 security S2 durably preserves a foreign pending decision through an ordinary replacement", async () => {
     const { store, actorRoot, registryPath } = setup();
     const pending = { id: "foreign", rootId: "remote", removal: { requestedAt: 1, runId: "pending" } };

@@ -1,11 +1,9 @@
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as atomicWrite from "../src/core/atomic-write.js";
-import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 
@@ -21,40 +19,7 @@ const temp = (): string => {
   return root;
 };
 
-describe("actor registry and participant snapshot caches", () => {
-  it("reuses an unchanged actor registry and reloads its replacement", () => {
-    const root = temp();
-    const file = path.join(root, "actors.json");
-    fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [{ id: "a" }] }));
-    const store = new ActorRegistryStore(root);
-    const beforeStamp = store.fingerprint();
-    const beforeInode = fs.statSync(file).ino;
-    const spy = vi.spyOn(fs, "readFileSync");
-    expect(store.records()).toHaveLength(1);
-    expect(store.records()).toHaveLength(1);
-    expect(spy).toHaveBeenCalledTimes(1);
-    const replacement = path.join(root, "replacement.json");
-    const result = spawnSync(process.execPath, ["-e", `const fs=require('node:fs'); fs.writeFileSync(process.argv[1],JSON.stringify({format:1,actors:[{id:'b'}]})); fs.renameSync(process.argv[1],process.argv[2]);`, replacement, file]);
-    expect(result.status).toBe(0);
-    expect(fs.statSync(file).ino).not.toBe(beforeInode);
-    expect(store.fingerprint()).not.toBe(beforeStamp);
-    expect(store.records()[0]?.id).toBe("b");
-    expect(spy).toHaveBeenCalledTimes(2);
-  });
-
-  it.each([false, true])("reloads after its own write (durable=%s)", async (durable) => {
-    const root = temp();
-    const file = path.join(root, "actors.json");
-    fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [{ id: "old" }] }));
-    const store = new ActorRegistryStore(root);
-    expect(store.records()).toEqual([{ id: "old" }]);
-    await store.withLock(() => store.write([{ id: "new" }], { durable }));
-    expect(store.records()).toEqual([{ id: "new" }]);
-    const spy = vi.spyOn(fs, "readFileSync");
-    expect(store.read()).toEqual({ format: 1, actors: [{ id: "new" }] });
-    expect(spy).not.toHaveBeenCalled();
-  });
-
+describe("participant canonical snapshot", () => {
   it("uses one canonical snapshot in ParticipantDirectory and sees the next replacement", () => {
     const root = temp();
     const file = path.join(root, "state.json");

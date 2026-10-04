@@ -671,7 +671,9 @@ export class MeshStore {
         // ponytail: that crash window is the newest events, so scan only the live tail.
         // Scanning from sequence 0 read the whole event archive under the lock and
         // wedged the fleet mesh for minutes per fresh Pi (smarty-dev#4383).
-        for (let after = Math.max(0, this.#readLastEventSequence() - DEDUPE_RECOVERY_WINDOW);;) {
+        // A short retained log must not route recovery through the archive.
+        const liveFloor = Math.max(0, (this.oldestSequence() ?? 1) - 1);
+        for (let after = Math.max(liveFloor, this.#readLastEventSequence() - DEDUPE_RECOVERY_WINDOW);;) {
           const page = this.read({ after, limit: this.maxReadEvents });
           const prior = page.find(event => event.dedupeKey === input.dedupeKey);
           if (prior) {

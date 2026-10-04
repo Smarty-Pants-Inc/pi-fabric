@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
 import {
   MeshBatchConflictError,
   MeshStore,
@@ -39,6 +40,14 @@ const createStore = (options?: MeshStoreOptions, Store: typeof MeshStore = MeshS
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-"));
   roots.push(root);
   return new Store(root, 64 * 1024, 100, options);
+};
+const createArchivedStore = (): { store: MeshStore; archiveDir: string } => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-archive-"));
+  roots.push(root);
+  const archiveDir = path.join(root, "event-archive");
+  fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir: archiveDir }));
+  return { store: new MeshStore(root, 64 * 1024, 100), archiveDir };
 };
 
 // A simulated native platform must not inherit the process-wide own-PID promise
@@ -120,6 +129,65 @@ describe("MeshStore", () => {
     const secondTail = store.tail(firstTail.nextOffset, 10);
     expect(secondTail.events).toMatchObject([{ sequence: 2, text: "two" }]);
     expect(secondTail.nextOffset).toBe(store.latestOffset());
+  });
+
+  it("does not read an event archive while recovering a new dedupe key", async () => {
+    const { store } = createArchivedStore();
+    const seed = await store.publish({ topic: "mesh.dedupe", from: identity, text: "seed" });
+    const archive = MeshArchive.fromRoot(store.root)!;
+    // Bulk catch-up avoids thousands of durable publishes. Only the last event
+    // stays live: even a short retained log must not fall back to the archive.
+    const archived = Array.from({ length: 4_200 }, (_, index) => ({
+      ...seed,
+      id: `archived-${index + 2}`,
+      sequence: index + 2,
+      text: `archived-${index + 2}`,
+    }));
+    archive.catchUp(archived.map(event => ({ event, line: JSON.stringify(event) })));
+    const last = archived.at(-1)!;
+    fs.writeFileSync(path.join(store.root, "events.jsonl"), `${JSON.stringify(last)}\n`);
+    fs.writeFileSync(path.join(store.root, "sequence"), `${last.sequence}\n`);
+    expect(archive.readAfter(0, last.sequence, () => true, 1)[0]?.id).toBe(seed.id);
+    const dedupeKey = "new-dedupe-key";
+    const receipt = path.join(store.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + ".json");
+    expect(fs.existsSync(receipt)).toBe(false);
+
+    const readAfter = vi.spyOn(MeshArchive.prototype, "readAfter");
+    const read = vi.spyOn(store, "read");
+    const published = await store.publish({ topic: "mesh.dedupe", from: identity, dedupeKey, text: "new" });
+
+    expect(published.sequence).toBe(last.sequence + 1);
+    expect(readAfter).not.toHaveBeenCalled();
+    expect(read.mock.calls[0]?.[0]?.after).toBe(last.sequence - 1);
+    expect(read.mock.calls.every(([input]) => (input?.after ?? 0) > 0)).toBe(true);
+  });
+
+  it("recovers a directly appended dedupe event with 4095 newer events", async () => {
+    const { store } = createArchivedStore();
+    const seed = await store.publish({ topic: "mesh.dedupe", from: identity, text: "seed" });
+    const older = Array.from({ length: 4_200 }, (_, index) => ({ ...seed, id: `older-${index}`, sequence: index + 2 }));
+    const dedupeKey = "crashed-dedupe-key";
+    const crashed = { ...seed, id: "crashed-event", sequence: older.at(-1)!.sequence + 1, dedupeKey, text: "crashed" };
+    const newer = Array.from({ length: 4_095 }, (_, index) => ({
+      ...seed,
+      id: `newer-${index}`,
+      sequence: crashed.sequence + index + 1,
+    }));
+    const live = path.join(store.root, "events.jsonl");
+    fs.appendFileSync(live, [...older, crashed, ...newer].map(event => `${JSON.stringify(event)}\n`).join(""));
+    fs.writeFileSync(path.join(store.root, "sequence"), `${newer.at(-1)!.sequence}\n`);
+    const receipt = path.join(store.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + ".json");
+    expect(fs.existsSync(receipt)).toBe(false); // Append completed, but its receipt write crashed.
+    const before = fs.readFileSync(live, "utf8");
+    const read = vi.spyOn(store, "read");
+
+    const recovered = await store.publish({ topic: "mesh.dedupe", from: identity, dedupeKey, text: "retry" });
+
+    expect(read.mock.calls[0]?.[0]?.after).toBe(crashed.sequence - 1);
+    expect(recovered).toEqual(crashed);
+    expect(JSON.parse(fs.readFileSync(receipt, "utf8"))).toEqual(crashed);
+    expect(await store.publish({ topic: "mesh.dedupe", from: identity, dedupeKey, text: "retry again" })).toEqual(crashed);
+    expect(fs.readFileSync(live, "utf8")).toBe(before); // Neither retry appends a duplicate.
   });
 
   it("captures a coherent tail cursor without using reserved or partial sequences", async () => {

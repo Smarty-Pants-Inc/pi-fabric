@@ -1250,6 +1250,12 @@ export class AgentManager {
     if (worktreeSetup?.trim() && (this.#parentWritePolicy !== undefined || requestsWritePolicy(request))) {
       throw new Error("Confined agents cannot use worktreeSetup; it would bypass the caller's shell/write policy");
     }
+    // Git worktree preparation mutates repository metadata and a new tree outside
+    // the inherited roots. It has no write-guard executor, so fail closed before
+    // any worktree effect, even when no setup hook was requested.
+    if (request.worktree && this.#parentWritePolicy !== undefined) {
+      throw new Error("Confined callers cannot create worktrees; Git cannot preserve the inherited write policy");
+    }
     // Fail closed before admission or budget side effects.
     const scope = launchScope(request.scope, request.inheritedScope);
     const thinkingBounds = this.childThinkingBounds(request.thinkingBounds);

@@ -91,6 +91,9 @@ export class RuntimeStateBuiltins {
           provider: "sessions", description: "Interactive jev-fabric children: open, write, read, wait and stop",
           create: () => new SessionsProvider(durable, {
             cwd, shellOverride: () => capturedTools.get("bash") !== undefined,
+            // Only an unconstrained root invocation may adopt external store jobs.
+            // The provider also applies current shell hooks and Landlock before any input.
+            trustedExternalControl: () => readWritePolicy() === undefined,
             writePolicy: () => {
               // Read in the invocation process so malformed/inherited policy fails closed.
               return readWritePolicy();

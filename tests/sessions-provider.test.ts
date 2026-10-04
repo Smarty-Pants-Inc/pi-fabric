@@ -11,7 +11,7 @@ const fake = fileURLToPath(new URL("./fixtures/fake-jev-fabric.mjs", import.meta
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
-const setup = (options: { shellOverride?: boolean; root?: string; writePolicy?: () => any; landlockEnforced?: () => boolean } = {}) => {
+const setup = (options: { shellOverride?: boolean; root?: string; writePolicy?: () => any; landlockEnforced?: () => boolean; trustedExternalControl?: () => boolean } = {}) => {
   const root = options.root ?? fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-sessions-")));
   // PI_FABRIC_JEV_FABRIC_BIN runs the same contract against a real jev-fabric build.
   const binary = process.env.PI_FABRIC_JEV_FABRIC_BIN || path.join(root, "jev-fabric");
@@ -22,6 +22,7 @@ const setup = (options: { shellOverride?: boolean; root?: string; writePolicy?: 
     shellOverride: () => options.shellOverride === true,
     ...(options.writePolicy ? { writePolicy: options.writePolicy } : {}),
     ...(options.landlockEnforced ? { landlockEnforced: options.landlockEnforced } : {}),
+    ...(options.trustedExternalControl ? { trustedExternalControl: options.trustedExternalControl } : {}),
   });
   if (!options.root) cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
   cleanups.push(() => provider.close());
@@ -37,6 +38,24 @@ describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve
     await expect(setup({ writePolicy: policy }).call("open", { cmd: "true", durable })).rejects.toThrow(/write policy|shell/);
     await expect(setup({ landlockEnforced: () => true }).call("open", { argv: ["true"], durable })).rejects.toThrow(/Landlock enforce/);
     await expect(setup({ landlockEnforced: () => true }).call("open", { cmd: "true", durable })).rejects.toThrow(/Landlock enforce/);
+  });
+
+  it.each([
+    { writePolicy: () => ({ readOnly: false, writableRoots: [process.cwd()], shell: "deny" as const }) },
+    { writePolicy: () => ({ readOnly: false, writableRoots: [process.cwd()], shell: "unconfined" as const }) },
+    { landlockEnforced: () => true },
+    { shellOverride: true },
+    {},
+  ])("SR-2 refuses existing durable job input/control without effective confinement and trusted authority: %j", async restriction => {
+    const owner = setup();
+    const opened = await owner.call("open", { cmd: "cat", durable: true });
+    cleanups.push(async () => { await owner.call("closeInput", { id: opened.id }); await owner.call("wait", { id: opened.id, timeoutMs: 10000 }); });
+    const other = setup({ root: owner.root, ...restriction });
+    await expect(other.call("write", { id: opened.id, text: "escaped\n" })).rejects.toThrow(/shell|policy|Landlock|trusted/i);
+    await expect(other.call("closeInput", { id: opened.id })).rejects.toThrow(/shell|policy|Landlock|trusted/i);
+    expect(fs.readFileSync(path.join(owner.root, "home", opened.id, "input"), "utf8")).toBe("");
+    expect(fs.existsSync(path.join(owner.root, "home", opened.id, "input.closed"))).toBe(false);
+    expect(await owner.call("status", { id: opened.id })).toMatchObject({ state: "running" });
   });
 
   it("drives a persistent interactive child with write and read by offset", async () => {
@@ -64,7 +83,7 @@ describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve
     expect(await call("read", { id: opened.id, offset: 0, waitMs: 10000 })).toMatchObject({ text: "kept\n", next: 5 });
     await provider.close();
     // Another connection (another Pi session, or the CLI) still reaches the durable child.
-    const other = setup({ root });
+    const other = setup({ root, trustedExternalControl: () => true });
     await other.call("closeInput", { id: opened.id });
     expect(await other.call("wait", { id: opened.id, timeoutMs: 10000 })).toMatchObject({ state: "exited" });
   });

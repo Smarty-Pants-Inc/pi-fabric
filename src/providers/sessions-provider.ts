@@ -86,6 +86,8 @@ export class SessionsProvider implements FabricProvider {
       writePolicy?: () => FabricWritePolicy | undefined;
       /** Durable jev-fabric cannot run inside the host Landlock sandbox. */
       landlockEnforced?: () => boolean;
+      /** Explicit root-session authority to control jobs not opened here; IDs are not capabilities. */
+      trustedExternalControl?: () => boolean;
     },
   ) {}
 
@@ -119,8 +121,14 @@ export class SessionsProvider implements FabricProvider {
     if (invalid) throw new Error(`Invalid sessions.${name} arguments: ${invalid}`);
     if (name === "list") return [...this.#opened.values()].map(opened => ({ ...opened }));
     if (name === "open") return this.#open(args, context);
-    const serve = await this.#connect();
     const job = args.id as string;
+    if (name === "write" || name === "closeInput") {
+      this.#assertShellControl(name);
+      if (!this.#opened.has(job) && !this.options.trustedExternalControl?.()) {
+        throw new Error("Interactive job control requires explicit trusted external control authority; a store ID is not authority");
+      }
+    }
+    const serve = await this.#connect();
     switch (name) {
       case "write": return serve.request("write", { job, text: args.text }, context.signal);
       case "closeInput": return serve.request("closeInput", { job }, context.signal);
@@ -134,7 +142,7 @@ export class SessionsProvider implements FabricProvider {
     throw new Error(`Unknown sessions action: ${name}`);
   }
 
-  async #open(args: Record<string, unknown>, context: FabricInvocationContext): Promise<unknown> {
+  #assertShellControl(action: string): void {
     // Sessions run outside pi.bash: never let them bypass an extension's shell gate.
     if (this.options.shellOverride()) throw new Error("Interactive sessions are unavailable while an extension overrides bash; they would bypass its shell protection");
     if (this.options.landlockEnforced?.()) throw new Error("Interactive sessions are unavailable while Landlock enforce is active; the jev-fabric runner cannot preserve the sandbox");
@@ -142,9 +150,13 @@ export class SessionsProvider implements FabricProvider {
     if (policy) {
       // The external runner cannot apply Pi's effective roots and shell hook.
       // Refuse both argv and cmd forms rather than delegate an unrestricted child.
-      const denial = writePolicyDenial(policy, "bash", { command: "sessions.open" }, this.options.cwd);
+      const denial = writePolicyDenial(policy, "bash", { command: `sessions.${action}` }, this.options.cwd);
       throw new Error(denial ?? "Interactive sessions are unavailable while a child write policy is active; the runner cannot preserve it");
     }
+  }
+
+  async #open(args: Record<string, unknown>, context: FabricInvocationContext): Promise<unknown> {
+    this.#assertShellControl("open");
     if ((args.argv === undefined) === (args.cmd === undefined)) throw new Error("sessions.open needs exactly one of argv or cmd");
     const cwd = path.resolve(this.options.cwd, typeof args.cwd === "string" ? args.cwd : ".");
     if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Working directory does not exist: ${cwd}`);

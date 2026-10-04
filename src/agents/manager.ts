@@ -3101,8 +3101,14 @@ export class AgentManager {
       runRootHasExitVeto(this.#runRoot, new Set([...this.#queued.values()].filter(queued => queued.terminal && !queued.cleanupPending).map(queued => queued.info.id)));
     // An unrelated retained tree fences shared budget/root deletion, not an
     // independently joined tracked run with its full outcome durably archived.
-    if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
-      await Promise.all(all.filter(managed => this.#canCollect(managed))
+    if (!this.config.retainRuns) {
+      // Ordinary nested transcripts belong to the enclosing run. Actor children
+      // instead transfer their full outcome to the actor's durable archive at
+      // settlement; activation-end close still collects their execution files.
+      // The existing exit/archive vetoes must join before either policy collects.
+      await Promise.all(all.filter(managed =>
+        (!this.#parentOwnedRunRoot || (managed.spawner?.kind === "actor" && this.#onSettled !== undefined)) &&
+        this.#canCollect(managed))
         .map(managed => removeTree(managed.runDirectory).catch(() => undefined)));
     }
     // A failed stop is not authority to delete a child's working files.

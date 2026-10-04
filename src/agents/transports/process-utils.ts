@@ -333,8 +333,18 @@ export const spawnDetached = async (
   // Exit is latched: after the worker/group empties its numeric id is not identity.
 
   let exited = false;
+  let nativeExited = false;
+  let closeRequested = false;
+  // Windows native close also waits for the newly captured diagnostic pipe.
+  // That pipe is not execution custody: after an OWNED native exit, retire our
+  // read end when joining close, just as main's ignored stderr had no pipe join.
+  // A liveness probe cannot retire it, and the captured close/helper joins and
+  // immutable tree debt below remain mandatory.
+  const retireDiagnostics = (): void => {
+    if (process.platform === "win32" && nativeExited && closeRequested) child.stderr?.destroy();
+  };
   let force: ReturnType<typeof setTimeout> | undefined;
-  child.once("exit", () => { exited = true; clearTimeout(force); });
+  child.once("exit", () => { nativeExited = true; exited = true; clearTimeout(force); retireDiagnostics(); });
   const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
   let stopping: Promise<void> | undefined;
   let lost: string | undefined;
@@ -349,7 +359,14 @@ export const spawnDetached = async (
   child.stderr?.on("data", (chunk: Buffer) => {
     stderr = (stderr + decoder.write(chunk)).slice(-20_000);
   });
-  child.stderr?.on("end", () => { stderr = (stderr + decoder.end()).slice(-20_000); });
+  let stderrEnded = false;
+  const finishStderr = (): void => {
+    if (stderrEnded) return;
+    stderrEnded = true;
+    stderr = (stderr + decoder.end()).slice(-20_000);
+  };
+  child.stderr?.on("end", finishStderr);
+  child.stderr?.on("close", finishStderr);
   child.stderr?.on("error", () => {});
   try {
     await new Promise<void>((resolve, reject) => {
@@ -539,6 +556,8 @@ export const spawnDetached = async (
     lostContact: () => lost,
     stopDebt: () => stopFailed ? undefined : lost,
     async waitForClose() {
+      closeRequested = true;
+      retireDiagnostics();
       let deadline: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([closed, new Promise<void>(resolve => {
@@ -550,6 +569,8 @@ export const spawnDetached = async (
       } finally { clearTimeout(deadline); }
     },
     stop() {
+      closeRequested = true;
+      retireDiagnostics();
       if (stopping) return stopping;
       stopFailed = false;
       const pending = (async () => {

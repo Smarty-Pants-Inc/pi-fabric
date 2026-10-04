@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentTranscriptReader } from "../src/ui/transcript-reader.js";
@@ -52,6 +53,43 @@ const writeNested = (directory: string, record: AgentRunRecord) => {
 };
 
 describe("nested agent shutdown", () => {
+  it.each([false, true])("collects an archived actor child's execution files only after archive success (failure=%s)", async (archiveFailure) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nested-actor-archive-"));
+    roots.push(root);
+    const nested = path.join(root, "activation", "nested");
+    const actorId = "b".repeat(32);
+    const session = path.join(root, "actor", "session.jsonl");
+    const store = new ActorChildCompletionStore(session);
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", nested);
+    vi.stubEnv("PI_FABRIC_DEPTH", "1");
+    vi.stubEnv("PI_FABRIC_LINEAGE", JSON.stringify({
+      version: 1, rootSessionId: "root", runId: "activation", depth: 1, childIndex: 0, worker: true,
+    }));
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", actorId);
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "activation");
+    vi.stubEnv("PI_FABRIC_ACTOR_SESSION_FILE", session);
+    const manager = new AgentManager(process.cwd(), {
+      ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: false, sessionExport: false,
+    }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fullCodeMode: false,
+      onSettled: result => {
+        if (archiveFailure) throw new Error("archive unavailable");
+        store.enqueue(result, result.spawner!, false);
+      },
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "private actor child", extensions: false });
+    expect(result).toMatchObject({ status: "completed", spawner: { id: actorId, kind: "actor", runId: "activation" } });
+    const directory = path.dirname(result.logFile!);
+    await manager.close();
+    expect(fs.existsSync(directory)).toBe(archiveFailure);
+    expect(fs.existsSync(nested), "the enclosing run still owns its root").toBe(true);
+    expect(fs.existsSync(store.resultFile(result.id))).toBe(!archiveFailure);
+    if (!archiveFailure) expect(JSON.parse(fs.readFileSync(store.resultFile(result.id), "utf8"))).toMatchObject({
+      id: result.id, status: "completed", text: result.text, spawner: result.spawner,
+    });
+  });
+
   it("preserves nested terminal records and readable transcripts until the owning run is cleaned up", async () => {
     const { parent, handle, root, directory } = await startParent();
     const nestedRoot = path.join(directory, "nested");

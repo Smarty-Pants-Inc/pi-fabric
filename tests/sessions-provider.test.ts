@@ -31,12 +31,12 @@ const setup = (options: { shellOverride?: boolean; root?: string; writePolicy?: 
 };
 
 describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve", () => {
-  it("fails closed for child write policy and Landlock, for both command forms", async () => {
+  it.each([false, true])("fails closed for child write policy and Landlock, for both command forms (durable=%s)", async durable => {
     const policy = () => ({ readOnly: false, writableRoots: [process.cwd()], shell: "deny" as const });
-    await expect(setup({ writePolicy: policy }).call("open", { argv: ["true"] })).rejects.toThrow(/write policy|shell/);
-    await expect(setup({ writePolicy: policy }).call("open", { cmd: "true" })).rejects.toThrow(/write policy|shell/);
-    await expect(setup({ landlockEnforced: () => true }).call("open", { argv: ["true"] })).rejects.toThrow(/Landlock enforce/);
-    await expect(setup({ landlockEnforced: () => true }).call("open", { cmd: "true" })).rejects.toThrow(/Landlock enforce/);
+    await expect(setup({ writePolicy: policy }).call("open", { argv: ["true"], durable })).rejects.toThrow(/write policy|shell/);
+    await expect(setup({ writePolicy: policy }).call("open", { cmd: "true", durable })).rejects.toThrow(/write policy|shell/);
+    await expect(setup({ landlockEnforced: () => true }).call("open", { argv: ["true"], durable })).rejects.toThrow(/Landlock enforce/);
+    await expect(setup({ landlockEnforced: () => true }).call("open", { cmd: "true", durable })).rejects.toThrow(/Landlock enforce/);
   });
 
   it("drives a persistent interactive child with write and read by offset", async () => {

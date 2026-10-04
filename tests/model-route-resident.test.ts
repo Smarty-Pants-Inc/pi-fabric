@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorDirectory } from "../src/actors/directory.js";
+import { ActorLogStore } from "../src/actors/log-store.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { ResidentHost } from "../src/residency/host.js";
@@ -115,6 +116,43 @@ describe("public resident route feedback and config rollback", () => {
     fs.chmodSync(file, 0o600); expect(isRouteClassReverted("status-groom")).toBe(true);
     const journal = fs.readFileSync(path.join(root, "profile/fabric/model-routing-quality.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(journal.map(row => row.type)).toEqual(["pending", "committed"]);
+  }, 20000);
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fences the first resident quality-intent write for both Main and resident dispatch", async () => {
+    const state = await fixture(); const first = await state.activate();
+    const journal = path.join(root, "profile/fabric/model-routing-quality.jsonl");
+    fs.writeFileSync(journal, "", { mode: 0o400 }); fs.chmodSync(journal, 0o400);
+    await expect(state.provider.invoke("routeOutcome", { id: first.runId, routeQuality: "fail" }, state.context)).rejects.toThrow();
+    expect(fs.readFileSync(journal, "utf8")).toBe("");
+    expect((await state.activate()).text).toContain(pin.model);
+    const main = await state.provider.invoke("spawn", { task: "ECHO_MODEL", model: "auto", routeClass: "status-groom", protected: false }, state.context) as { id: string };
+    expect(await state.provider.invoke("wait", { id: main.id }, state.context)).toMatchObject({ model: pin.model });
+    fs.chmodSync(journal, 0o600); expect(isRouteClassReverted("status-groom")).toBe(true);
+    expect(rows().find(row => row.type === "quality")).toMatchObject({ runId: first.runId, routeQuality: "fail" });
+  }, 20000);
+
+  it("retains A through B and C when its archive fails, accepts owning-Main feedback, and retries before cleanup", async () => {
+    const retain = ActorLogStore.prototype.retainRun;
+    let failedRun: string | undefined;
+    const archive = vi.spyOn(ActorLogStore.prototype, "retainRun").mockImplementation(async function (this: ActorLogStore, actor, runId, directory) {
+      failedRun ??= runId;
+      if (runId === failedRun) throw new Error("Injected A receipt archive failure");
+      return retain.call(this, actor, runId, directory);
+    });
+    const state = await fixture(); const first = await state.host.actors.ask(state.actor.id, "ECHO_MODEL", "test");
+    await vi.waitFor(() => expect(state.host.actors.status(state.actor.id).status).toBe("idle"));
+    expect(state.host.agents.runDirectory(first.runId!)).toBeDefined();
+    await state.activate(); await state.activate();
+    expect(archive.mock.calls.filter(([, runId]) => runId === first.runId)).toHaveLength(3);
+    const source = state.host.agents.runDirectory(first.runId!)!;
+    expect(fs.existsSync(path.join(source, "route-quality-receipt.json"))).toBe(true);
+    await expect(state.provider.invoke("routeOutcome", { id: first.runId, routeQuality: "fail" }, state.context)).resolves.toEqual({ id: first.runId, routeQuality: "fail" });
+    expect((await state.activate()).text).toContain(pin.model);
+    expect(state.host.agents.runDirectory(first.runId!)).toBe(source);
+    archive.mockRestore(); expect((await state.activate()).text).toContain(pin.model);
+    expect(state.host.agents.runDirectory(first.runId!)).toBeUndefined();
+    expect(fs.existsSync(path.join(state.actor.logDir!, first.runId!, "route-quality-receipt.json"))).toBe(true);
+    expect(rows().find(row => row.type === "quality")).toMatchObject({ runId: first.runId, routeQuality: "fail" });
   }, 20000);
 
   it("rereads same-generation empty allowlist and fresh per-class reset on the next activation without replacing its host", async () => {

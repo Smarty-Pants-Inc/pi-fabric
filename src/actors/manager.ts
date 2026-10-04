@@ -399,6 +399,9 @@ export class ActorManager {
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
   readonly #logs: ActorLogStore;
+  // Failed archives outlive lastRunId changes. Retry every retained join, not just
+  // the immediately previous activation; cleanup follows confirmed archival.
+  readonly #pendingRunArchives = new Map<string, Set<string>>();
   readonly #childCompletionStores = new Map<string, ActorChildCompletionStore>();
   readonly #acquireCapabilityView:
     | ((
@@ -2846,8 +2849,12 @@ export class ActorManager {
           }
           // Release the in-memory handle and tmp run dir for completed runs;
           // failed runs are retained for agents.status(actor.lastRunId).
-          if (previousRunId && previousRunId !== runId) {
-            await this.agents.cleanup(previousRunId).catch(() => ({ cleaned: false }));
+          const priorArchives = new Set(this.#pendingRunArchives.get(actor.id));
+          if (previousRunId && previousRunId !== runId) priorArchives.add(previousRunId);
+          for (const priorRunId of priorArchives) {
+            if (priorRunId === runId) continue;
+            const priorArchived = await this.#retainRunLog(actor, priorRunId).then(() => true, () => false);
+            if (priorArchived) await this.agents.cleanup(priorRunId).catch(() => ({ cleaned: false }));
           }
           if (runId && runCompleted && archived) {
             await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
@@ -3309,7 +3316,12 @@ export class ActorManager {
   }
 
   async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {
+    let pending = this.#pendingRunArchives.get(actor.id);
+    if (!pending) this.#pendingRunArchives.set(actor.id, pending = new Set());
+    pending.add(runId);
     await this.#logs.retainRun(actor, runId, this.agents.runDirectory(runId));
+    pending.delete(runId);
+    if (!pending.size) this.#pendingRunArchives.delete(actor.id);
   }
 
   #sweepRetainedRuns(now = Date.now()): void {

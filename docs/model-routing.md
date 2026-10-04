@@ -298,12 +298,21 @@ manager's cleanup obligation rather than falsely reported as a completed child.
 Outcome writes use the manager's terminal-save retry/retention fence. Queued
 outcomes retry at most three times per settlement/cleanup/close attempt; persistent
 failure surfaces a warning and retains the full terminal receipt and run files.
+Before the first quality-intent or terminal write, a durable class/reset obligation
+is appended to the shared host-owned `model-routing-pending.jsonl` write-ahead
+journal. Every Main/resident admission replays unresolved obligations with their
+original decision/run identity. While any save remains unresolved, that class
+uses the pin, including after restart; a journal that cannot accept write-ahead
+intents refuses live admission. Committed markers follow confirmed ledger/state
+saves, and terminal/quality retries deduplicate their original decision joins.
 The exact pending ledger row is also kept in `pending-route-outcome.json` for
 reconciliation after close/reload; it is removed only after a successful append
 and deliberately remains outside the global sweeper's collectable-file allowlist.
-Cleanup refuses collection until the outcome has been written. A process
-crash before terminal settlement still requires a later outcome reconciler; PR1
-does not add one or invent quality/price estimates.
+Cleanup refuses collection until the outcome has been written. Actor archive
+failures also retain the source run/quality receipt: subsequent activations retry
+all failed archives, and only confirmed archival permits prior-run cleanup.
+A process crash before terminal settlement still requires a later outcome
+reconciler; PR1 does not invent missing terminal or quality/price estimates.
 
 If the decision write fails, pinned work still dispatches with `record-failed` in
 the handle and header. If storage stays unavailable, no durable record can be
@@ -346,7 +355,12 @@ activation, another class remaining live, and Jev error fallback. `evidence.json
 joins actual native model/effort, HTTP header and decision/outcome ledger by ID;
 `transcript.jsonl`, copied routing/resident state and `summary.json` retain the
 exact HEAD, bundle hash, installed Pi version and all-processes-exited receipt.
-These artifacts are the pre-merge isolated entrypoint evidence, not production
+The proof also injects first quality-intent, actor archive and terminal-state save
+failures: fresh Main and resident dispatch pin while shared saves are pending,
+A survives B until its archive retry succeeds, and terminal repair preserves the
+original failed/stopped decision joins without double-counting. The bundle manifest
+hashes every compiled JavaScript chunk, not just the entrypoint.
+These artifacts are exact-candidate isolated entrypoint evidence, not production
 model-quality, gateway metering or spending-parity acceptance. The owner must
 post the exact-head evidence and separately confirm those gates before live
 production enablement.

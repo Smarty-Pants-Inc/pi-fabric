@@ -19,6 +19,8 @@ fs.writeFileSync(transcript, ''); fs.writeFileSync(queue, '[]');
 const record = row => fs.appendFileSync(transcript, JSON.stringify(row) + '\n');
 const pin = 'router-proof/gpt-5-pin', cheap = 'router-proof/gpt-5-cheap';
 const requests = [];
+let archiveActor, archiveFailureDirectory, failedResponse, stoppedResponse;
+const mainExits = [], safetyScenarios = [];
 const server = http.createServer(async (req, res) => {
   try {
     let text = ''; for await (const chunk of req) text += chunk;
@@ -26,6 +28,17 @@ const server = http.createServer(async (req, res) => {
     const row = { type: 'provider_http_request', model: body.model, effort: body.reasoning_effort ?? null,
       routeHeader, url: req.url, messages: body.messages };
     requests.push(row); record(row);
+    const prompt = JSON.stringify(body.messages.filter(message => message.role === 'user').at(-1));
+    if (routeHeader && prompt.includes('PROOF_ARCHIVE_FAIL_A')) {
+      const decisionId = routeHeader.split(':').at(-1);
+      const decision = ledger().find(row => row.type === 'decision' && row.decisionId === decisionId);
+      assert.equal(decision.actorId, archiveActor.id);
+      archiveFailureDirectory = path.join(archiveActor.logDir, decision.runId);
+      fs.mkdirSync(archiveFailureDirectory, { recursive: true, mode: 0o700 }); fs.chmodSync(archiveFailureDirectory, 0o500);
+      record({type:'injected_archive_failure',runId:decision.runId,directory:archiveFailureDirectory});
+    }
+    if (routeHeader && prompt.includes('PROOF_TERMINAL_FAILED')) { failedResponse = res; return; }
+    if (routeHeader && prompt.includes('PROOF_TERMINAL_STOPPED')) { stoppedResponse = res; return; }
     const specs = JSON.parse(fs.readFileSync(queue, 'utf8'));
     const spec = !routeHeader ? specs.shift() : undefined;
     if (spec) fs.writeFileSync(queue, JSON.stringify(specs));
@@ -84,9 +97,12 @@ const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: lane, encoding: '
 record({ type: 'proof_command', executable: process.execPath, args, cwd, env: { ...env, TYPESAFE_API_KEY: '<offline fixture sentinel>' }, head,
   candidateSha256: createHash('sha256').update(fs.readFileSync(candidate)).digest('hex'),
   piVersion: execFileSync(process.execPath, [cli, '--version'], { env, encoding: 'utf8' }).trim(), config });
-const child = spawn(process.execPath, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
-const exited = new Promise(resolve => child.once('close', (code, signal) => resolve({ code, signal, pid: child.pid })));
+let child, exited;
 const events = [], pending = new Map(); let buffer = '', serial = 0, stderr = '', failure, proof;
+function launchMain() {
+  child = spawn(process.execPath, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const instance = child;
+  exited = new Promise(resolve => instance.once('close', (code, signal) => resolve({ code, signal, pid: instance.pid })));
 child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
 child.stderr.on('data', text => { stderr += text; record({ type: 'stderr', text }); });
 child.stdout.on('data', text => {
@@ -102,6 +118,8 @@ child.stdout.on('data', text => {
     }
   }
 });
+}
+launchMain();
 const request = frame => new Promise((resolve, reject) => {
   const id = 'rpc-' + (++serial), timer = setTimeout(() => { pending.delete(id); reject(new Error('RPC deadline: ' + frame.type)); }, 90000);
   pending.set(id, { resolve, reject, timer }); record({ type: 'rpc_command', ...frame, id }); child.stdin.write(JSON.stringify({ ...frame, id }) + '\n');
@@ -110,14 +128,19 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const wait = async (check, timeout = 90000) => { const until = Date.now() + timeout; while (!check()) {
   assert.equal(child.exitCode, null, 'Pi unexpectedly exited: ' + stderr); assert.ok(Date.now() < until, 'Proof observation deadline: ' + stderr); await sleep(25);
 } };
-async function guest(code) {
+async function guest(code, expectedResidentFailure = false) {
   const before = events.length, id = 'guest-' + (++serial);
   fs.writeFileSync(queue, JSON.stringify([{ id, code }])); record({ type: 'public_fabric_exec', id, code });
   await request({ type: 'prompt', message: 'Execute ' + id });
   await wait(() => events.slice(before).some(event => event.type === 'agent_settled'));
   const event = events.slice(before).find(event => event.type === 'tool_execution_end' && event.toolCallId === id);
   assert.ok(event && !event.isError && event.result.details.success, JSON.stringify(event ?? events.slice(before)));
-  const result = JSON.parse(event.result.content.filter(part => part.type === 'text').map(part => part.text).join('\n'));
+  let text = event.result.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
+  if (expectedResidentFailure) {
+    assert.match(text, /^ResidentOutcomeUnknownError:/); assert.match(text, /EACCES/);
+    const resultStart = text.indexOf('\n\n{'); assert.ok(resultStart >= 0, text); text = text.slice(resultStart + 2);
+  }
+  const result = JSON.parse(text);
   record({ type: 'public_result', id, result }); return result;
 }
 const files = dir => !fs.existsSync(dir) ? [] : fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
@@ -147,14 +170,92 @@ try {
   const qualityRows = fs.readFileSync(path.join(profile, 'fabric/model-routing-quality.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
   assert.deepEqual(qualityRows.map(row => row.type), ['pending', 'committed']);
   const next = await guest(`return await agents.ask({ id: '${actor.actor.id}', message: 'PROOF_ACTOR_PINNED' });`); assert.match(next.text, /gpt-5-pin/);
-  const stillLive = await guest(`return await agents.run({ task: 'PROOF_TASK_OTHER_CLASS', model: 'auto', routeClass: 'task:exact-checks', protected: false });`);
+  const stillLive = await guest(`const h = await agents.spawn({ task: 'PROOF_TASK_OTHER_CLASS', model: 'auto', routeClass: 'task:exact-checks', protected: false }); return await agents.wait({id:h.id});`);
   assert.equal(stillLive.model, cheap);
   fs.writeFileSync(failJev, 'inject only a Jev provider-boundary failure');
-  const fallback = await guest(`return await agents.run({ task: 'PROOF_TASK_ERROR_FALLBACK', model: 'auto', routeClass: 'task:exact-checks', protected: false });`);
+  const fallback = await guest(`const h = await agents.spawn({ task: 'PROOF_TASK_ERROR_FALLBACK', model: 'auto', routeClass: 'task:exact-checks', protected: false }); return await agents.wait({id:h.id});`);
   assert.equal(fallback.model, pin); fs.rmSync(failJev);
   assert.ok(!fs.readFileSync(transcript, 'utf8').includes('blocked_external_network'), 'Proof attempted external networking');
+  const afterQuality = owners(); assert.equal(afterQuality[0].owner.token, beforeQuality[0].owner.token);
+  const restartMain = async reset => {
+    child.stdin.end();
+    const exit = await exited; mainExits.push(exit); assert.equal(exit.code, 0);
+    if (reset) config.agents.modelRouting.revertReset = { 'status-groom': reset };
+    fs.writeFileSync(path.join(profile, 'fabric.json'), JSON.stringify(config));
+    record({type:'fresh_main',reset:config.agents.modelRouting.revertReset,pid:exit.pid});
+    buffer = ''; launchMain();
+    const state = await request({type:'get_state'}); assert.equal(state.model.provider + '/' + state.model.id, pin);
+  };
+  const createActor = async name => guest(`return await agents.create({ name: '${name}', instructions: 'Bounded status checks only', residency: 'durable', runner: 'pi', transport: 'process', model: '${pin}', thinking: 'high', routeClass: 'status-groom', protected: false, tools: [], extensions: true, events: [], topics: [], delivery: 'mailbox', triggerTurn: false });`);
+  const ask = (id, message) => guest(`return await agents.ask({id:'${id}',message:'${message}'});`);
+  const mainRun = message => guest(`const h = await agents.spawn({task:'${message}',model:'auto',routeClass:'status-groom',protected:false}); const result = await agents.wait({id:h.id}); return {handle:h,result};`);
+  const checkPin = run => { const result = run.result ?? run; assert.match(result.text, /gpt-5-pin/); if (run.result) { assert.equal(result.model,pin); assert.equal(result.thinking,'high'); } };
+  const safetyJournal = path.join(profile,'fabric/model-routing-pending.jsonl');
+  const safetyRows = () => fs.readFileSync(safetyJournal,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+
+  // F1: the very first quality-intent append fails. No in-memory map is shared
+  // with the new Main; the real resident execution owner must see the same fence.
+  await restartMain('astra-r3-F1');
+  const f1Actor = await createActor('status-groom-f1');
+  const f1First = await ask(f1Actor.id,'PROOF_F1_LIVE'); assert.match(f1First.text,/gpt-5-cheap/);
+  await wait(()=>fs.existsSync(path.join(f1Actor.logDir,f1First.runId,'route-quality-receipt.json')));
+  const qualityJournal = path.join(profile,'fabric/model-routing-quality.jsonl');
+  fs.copyFileSync(qualityJournal,path.join(out,'quality-before-f1.jsonl'));
+  fs.writeFileSync(qualityJournal,''); fs.chmodSync(qualityJournal,0o400);
+  const f1Report = await guest(`try { await agents.routeOutcome({id:'${f1First.runId}',routeQuality:'fail'}); return {acknowledged:true}; } catch(error) {return {acknowledged:false,error:String(error)};}`, true);
+  assert.equal(f1Report.acknowledged,false); assert.equal(fs.readFileSync(qualityJournal,'utf8'),'');
+  const f1Intent = safetyRows().find(row=>row.type==='pending' && row.runId===f1First.runId && row.result.routeQuality==='fail'); assert.ok(f1Intent);
+  await restartMain();
+  const f1Main = await mainRun('PROOF_F1_MAIN_PIN'), f1Resident = await ask(f1Actor.id,'PROOF_F1_RESIDENT_PIN'); checkPin(f1Main); checkPin(f1Resident);
+  assert.equal(fs.readFileSync(qualityJournal,'utf8'),'');
+  fs.chmodSync(qualityJournal,0o600); checkPin(await ask(f1Actor.id,'PROOF_F1_REPAIRED_PIN'));
+  assert.ok(safetyRows().some(row=>row.type==='committed' && row.receiptId===f1Intent.receiptId));
+  safetyScenarios.push({finding:'F1',passed:true,report:f1Report,pendingIntent:f1Intent,mainRunId:f1Main.handle.id,residentRunId:f1Resident.runId,freshMain:true});
+
+  // F2: native model completion races no mocks. A filesystem denial prevents
+  // archival, B completes, and A's sole source receipt must still be usable.
+  await restartMain('astra-r3-F2');
+  archiveActor = await createActor('status-groom-f2');
+  const f2A = await ask(archiveActor.id,'PROOF_ARCHIVE_FAIL_A'); assert.match(f2A.text,/gpt-5-cheap/);
+  const nativeA = fs.readFileSync(transcript,'utf8').trim().split('\n').map(line=>JSON.parse(line)).find(row=>row.type==='native_activation' && row.runId===f2A.runId);
+  assert.ok(nativeA); await wait(()=>!live(nativeA.pid));
+  const f2B = await ask(archiveActor.id,'PROOF_ARCHIVE_OK_B'); assert.match(f2B.text,/gpt-5-cheap/);
+  await wait(()=>fs.existsSync(path.join(archiveActor.logDir,f2B.runId,'route-quality-receipt.json')));
+  assert.ok(fs.existsSync(path.join(nativeA.runDirectory,'route-quality-receipt.json')),'A receipt was deleted after B despite failed archive');
+  assert.ok(!fs.existsSync(path.join(archiveFailureDirectory,'route-quality-receipt.json')));
+  const f2Report = await guest(`return await agents.routeOutcome({id:'${f2A.runId}',routeQuality:'fail'});`); assert.equal(f2Report.routeQuality,'fail');
+  const f2Pinned = await ask(archiveActor.id,'PROOF_F2_NEXT_PIN'); checkPin(f2Pinned);
+  assert.ok(fs.existsSync(path.join(nativeA.runDirectory,'route-quality-receipt.json')));
+  fs.chmodSync(archiveFailureDirectory,0o700); checkPin(await ask(archiveActor.id,'PROOF_F2_ARCHIVE_RETRY_PIN'));
+  await wait(()=>fs.existsSync(path.join(archiveFailureDirectory,'route-quality-receipt.json')) && !fs.existsSync(nativeA.runDirectory));
+  safetyScenarios.push({finding:'F2',passed:true,failedArchiveRunId:f2A.runId,successfulNextRunId:f2B.runId,retainedReceipt:path.join(nativeA.runDirectory,'route-quality-receipt.json'),quality:f2Report,pinnedRunId:f2Pinned.runId,confirmedArchive:path.join(archiveFailureDirectory,'route-quality-receipt.json')});
+
+  // F5: two native live runs are admitted before their failed/stopped outcomes.
+  // Their state saves fail, then a new Main and the resident both dispatch pins.
+  await restartMain('astra-r3-F5');
+  const f5Actor = await createActor('status-groom-f5');
+  const f5Failed = await guest(`return await agents.spawn({task:'PROOF_TERMINAL_FAILED',model:'auto',routeClass:'status-groom',protected:false});`);
+  const f5Stopped = await guest(`return await agents.spawn({task:'PROOF_TERMINAL_STOPPED',model:'auto',routeClass:'status-groom',protected:false});`);
+  await wait(()=>failedResponse && stoppedResponse);
+  const stateJournal = path.join(profile,'fabric/model-routing-state.jsonl'); fs.chmodSync(stateJournal,0o400);
+  failedResponse.writeHead(400,{'Content-Type':'application/json'}); failedResponse.end(JSON.stringify({error:{message:'Offline proof injected nonretryable invalid request',type:'invalid_request_error',code:'invalid_request'}}));
+  const f5FailedResult = await guest(`return await agents.wait({id:'${f5Failed.id}'});`); assert.equal(f5FailedResult.status,'failed');
+  const f5StoppedResult = await guest(`await agents.stop({id:'${f5Stopped.id}'}); return await agents.wait({id:'${f5Stopped.id}'});`); assert.equal(f5StoppedResult.status,'stopped');
+  if (!stoppedResponse.destroyed) stoppedResponse.end();
+  const f5Pending = safetyRows().filter(row=>row.type==='pending' && [f5Failed.id,f5Stopped.id].includes(row.runId)); assert.equal(f5Pending.length,2);
+  const stateBefore = fs.readFileSync(stateJournal,'utf8');
+  const f5Same = await mainRun('PROOF_F5_SAME_MAIN_PIN'); checkPin(f5Same);
+  await restartMain();
+  const f5Main = await mainRun('PROOF_F5_FRESH_MAIN_PIN'), f5Resident = await ask(f5Actor.id,'PROOF_F5_RESIDENT_PIN'); checkPin(f5Main); checkPin(f5Resident);
+  assert.equal(fs.readFileSync(stateJournal,'utf8'),stateBefore);
+  fs.chmodSync(stateJournal,0o600); checkPin(await ask(f5Actor.id,'PROOF_F5_REPAIRED_PIN'));
+  const repaired = fs.readFileSync(stateJournal,'utf8').trim().split('\n').map(line=>JSON.parse(line)).filter(row=>row.type==='result' && row.reset==='astra-r3-F5');
+  assert.deepEqual(repaired.map(row=>[row.decisionId,row.status]),[[f5Failed.routeDecision.decisionId,'failed'],[f5Stopped.routeDecision.decisionId,'stopped']]);
+  checkPin(await mainRun('PROOF_F5_RETRY_NO_DOUBLE_COUNT')); assert.equal(fs.readFileSync(stateJournal,'utf8').trim().split('\n').map(line=>JSON.parse(line)).filter(row=>row.type==='result' && row.reset==='astra-r3-F5').length,2);
+  safetyScenarios.push({finding:'F5',passed:true,failedRunId:f5Failed.id,stoppedRunId:f5Stopped.id,pending:f5Pending,sameMainRunId:f5Same.handle.id,mainRunId:f5Main.handle.id,residentRunId:f5Resident.runId,repairedResults:repaired,freshMain:true});
+  assert.ok(!fs.readFileSync(transcript,'utf8').includes('blocked_external_network'),'Proof attempted external networking');
   const rows = ledger(), decisions = rows.filter(row => row.type === 'decision');
-  assert.equal(decisions.length, 5);
+  assert.ok(decisions.length >= 5);
   const evidence = decisions.map(decision => {
     const outcome = rows.find(row => row.type === 'outcome' && row.decisionId === decision.decisionId);
     const http = requests.find(row => row.routeHeader?.endsWith(':' + decision.decisionId));
@@ -172,9 +273,11 @@ try {
   assert.equal(evidence[0].reason, 'live-choice'); assert.equal(evidence[1].reason, 'live-choice');
   assert.equal(evidence[2].reason, 'class-reverted'); assert.equal(evidence[3].reason, 'live-choice'); assert.equal(evidence[4].reason, 'jev-error');
   assert.ok(rows.some(row => row.type === 'revert' && row.decisionId === evidence[1].decisionId && row.reason === 'quality-fail'));
-  const afterQuality = owners(); assert.equal(afterQuality[0].owner.token, beforeQuality[0].owner.token);
   proof = { passed: true, head, installedCli: path.resolve(cli), candidate, evidence, quality, actorId: actor.actor.id,
-    cleanedResidentActivation: nativeFirst, realResidentOwner: beforeQuality, durableQualityFence: qualityRows, mocks: ['Jev fetch boundary', 'loopback OpenAI model/provider HTTP boundary'] };
+    cleanedResidentActivation: nativeFirst, realResidentOwner: beforeQuality, durableQualityFence: qualityRows, safetyScenarios,
+    candidateSha256: createHash('sha256').update(fs.readFileSync(candidate)).digest('hex'),
+    mocks: ['Jev fetch boundary', 'loopback OpenAI model/provider HTTP boundary'],
+    faultInjection: ['0400 quality journal', '0500 actor A archive directory', '0400 terminal state journal'] };
   fs.writeFileSync(path.join(out, 'evidence.json'), JSON.stringify(proof, null, 2));
   console.log('PASS: installed Pi RPC + built Fabric; public live task/actor, durable quality demotion/pin, class isolation, Jev error fallback, actual HTTP X-Smarty-Route joins.');
 } catch (error) { failure = error; record({ type: 'proof_failure', error: String(error), stack: error.stack }); console.error(error); }
@@ -199,11 +302,11 @@ finally {
   const killUntil = Date.now() + 5000; while ([...ownedPids].some(live) && Date.now() < killUntil) await sleep(25);
   if ([...ownedPids].some(live)) failure ??= new Error('Isolated resident processes did not exit');
   if (child.exitCode === null && child.signalCode === null) child.stdin.end();
-  const kill = setTimeout(() => child.kill('SIGTERM'), 10000); const mainExit = await exited; clearTimeout(kill);
+  const kill = setTimeout(() => child.kill('SIGTERM'), 10000); const mainExit = await exited; clearTimeout(kill); mainExits.push(mainExit);
   for (const waiter of pending.values()) { clearTimeout(waiter.timer); waiter.reject(new Error('Proof exited')); } pending.clear();
   await new Promise(resolve => server.close(resolve));
   fs.writeFileSync(path.join(out, 'stderr.log'), stderr);
-  const cleanup = { type: 'proof_cleanup', mainExit, ownedPids: [...ownedPids], allExited: [...ownedPids].every(pid => !live(pid)) }; record(cleanup);
+  const cleanup = { type: 'proof_cleanup', mainExit, mainExits, ownedPids: [...ownedPids], allExited: [...ownedPids, ...mainExits.map(row => row.pid)].every(pid => !live(pid)) }; record(cleanup);
   fs.writeFileSync(path.join(out, 'summary.json'), JSON.stringify({ passed: !failure, head, error: failure ? String(failure) : null, ...cleanup }, null, 2));
   fs.writeFileSync(path.join(out, 'bundle-manifest.json'), JSON.stringify(files(path.join(lane, 'dist')).filter(file => /\.(js|mjs)$/.test(file)).map(file => ({ path: path.relative(lane, file), sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex') })), null, 2));
   fs.rmSync(scratch, { recursive: true, force: true });

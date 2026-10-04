@@ -33,8 +33,14 @@ const dispatch = async () => { const decision = await prepareModelRoute(input); 
 
 // This is a fresh process with no module/cache state: the host journal alone restores the switch.
 const restartedSwitch = () => {
-  const probe = spawnSync("bun", ["-e", `import { isRouteClassReverted } from ${JSON.stringify(path.resolve("src/agents/model-route.ts"))}; console.log(isRouteClassReverted("status-groom"));`], { encoding: "utf8", env: process.env });
-  expect(probe.status, probe.stderr).toBe(0); expect(probe.stdout.trim()).toBe("true");
+  const probe = spawnSync("bun", ["-e", `import { isRouteClassReverted } from ${JSON.stringify(path.resolve("src/agents/model-route.ts"))};
+    import { prepareModelRoute } from ${JSON.stringify(path.resolve("src/agents/model-route-prepare.ts"))};
+    const reverted = isRouteClassReverted("status-groom");
+    const decision = await prepareModelRoute({routeClass:"status-groom",protected:false,pinModel:"test/sol",pinThinking:"high",parentSessionId:"fresh-main",
+      registry:{getAvailable:()=>[{provider:"test",id:"sol"},{provider:"test",id:"luna"}]},aliases:{},config:${JSON.stringify(config)},assertModelAllowed(){},evaluate:async()=>(${JSON.stringify(answer())})});
+    console.log(JSON.stringify({reverted,decision}));`], { encoding: "utf8", env: process.env });
+  expect(probe.status, probe.stderr).toBe(0);
+  expect(JSON.parse(probe.stdout.trim())).toMatchObject({ reverted: true, decision: { ...pin, mode: "shadow", reasonCode: "class-reverted" } });
 };
 
 describe("live model routing", () => {
@@ -159,6 +165,52 @@ describe("live model routing", () => {
     expect(rows().filter(row => row.type === "quality")).toHaveLength(1);
     expect(JSON.parse(fs.readFileSync(state(), "utf8").trim())).toMatchObject({ decisionId: run.decision.decisionId, routeQuality: "fail" });
     restartedSwitch();
+  });
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fences the FIRST quality intent failure through the public report in a fresh process", async () => {
+    const m = manager(); const decision = await prepareModelRoute(input);
+    const run = await m.spawn({ task: "ECHO_MODEL", routeDecision: decision }); await m.wait(run.id);
+    const journal = path.join(path.dirname(state()), "model-routing-quality.jsonl");
+    fs.writeFileSync(journal, "", { mode: 0o400 }); fs.chmodSync(journal, 0o400);
+    expect(() => m.reportRouteQuality(run.id, "fail")).toThrow();
+    expect(fs.readFileSync(journal, "utf8")).toBe("");
+    const safety = fs.readFileSync(path.join(path.dirname(state()), "model-routing-pending.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(safety.at(-1)).toMatchObject({ type: "pending", decision: { decisionId: decision.decisionId }, result: { routeQuality: "fail" } });
+    restartedSwitch();
+    const next = await prepareModelRoute(input);
+    expect(next).toMatchObject({ ...pin, mode: "shadow", reasonCode: "class-reverted" });
+    const pinned = await m.spawn({ task: "ECHO_MODEL", routeDecision: next });
+    expect(await m.wait(pinned.id)).toMatchObject({ model: pin.model, thinking: pin.effort });
+    expect(await prepareModelRoute({ ...input, routeClass: "bounded-lookup", config: { ...config, liveClasses: ["bounded-lookup"] } })).toMatchObject({ mode: "live" });
+    fs.chmodSync(journal, 0o600); expect(isRouteClassReverted("status-groom")).toBe(true); restartedSwitch();
+    expect(rows().filter(row => row.type === "quality")).toHaveLength(1);
+    expect(rows().find(row => row.type === "quality")).toMatchObject({ decisionId: decision.decisionId, runId: run.id, routeQuality: "fail" });
+  });
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fences failed/stopped terminal saves across restart and repairs the original streak exactly once", async () => {
+    // Both runs were admitted before the first terminal save failed.
+    const first = await dispatch(), second = await dispatch();
+    fs.writeFileSync(state(), "", { mode: 0o400 }); fs.chmodSync(state(), 0o400);
+    expect(() => first.dispatch.outcome({ status: "failed" })).toThrow();
+    expect(() => second.dispatch.outcome({ status: "stopped" })).toThrow();
+    restartedSwitch();
+    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "class-reverted" });
+    expect(fs.readFileSync(state(), "utf8")).toBe("");
+    fs.chmodSync(state(), 0o600); expect(isRouteClassReverted("status-groom")).toBe(true);
+    first.dispatch.outcome({ status: "failed" }); second.dispatch.outcome({ status: "stopped" });
+    const saved = fs.readFileSync(state(), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(saved).toHaveLength(2);
+    expect(saved.map(row => [row.decisionId, row.status])).toEqual([[first.decision.decisionId, "failed"], [second.decision.decisionId, "stopped"]]);
+    expect(rows().filter(row => row.type === "outcome")).toHaveLength(2);
+    expect(rows().filter(row => row.type === "revert")).toHaveLength(1);
+    expect(rows().find(row => row.type === "revert")).toMatchObject({ reason: "consecutive-failures", decisionId: second.decision.decisionId });
+    restartedSwitch();
+  });
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("pins even one pending successful terminal save and resumes only after repair", async () => {
+    const run = await dispatch(); fs.writeFileSync(state(), "", { mode: 0o400 }); fs.chmodSync(state(), 0o400);
+    expect(() => run.dispatch.outcome({ status: "completed" })).toThrow(); restartedSwitch();
+    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, reasonCode: "class-reverted" });
+    fs.chmodSync(state(), 0o600); expect(isRouteClassReverted("status-groom")).toBe(false);
+    expect(await prepareModelRoute(input)).toMatchObject({ mode: "live", reasonCode: "live-choice" });
+    run.dispatch.outcome({ status: "completed" }); expect(rows().filter(row => row.type === "outcome")).toHaveLength(1);
   });
   it("keeps non-live quality feedback audit-only without poisoning live admission", async () => {
     const shadow = await prepareModelRoute({ ...input, routeClass: "critical-read", protected: true });

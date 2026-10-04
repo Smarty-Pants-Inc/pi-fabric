@@ -1,4 +1,8 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { AgentManager } from "../src/agents/manager.js";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import * as scratch from "../src/storage/run-scratch.js";
@@ -12,6 +16,40 @@ vi.mock("../src/agents/transports/process-utils.js", async importOriginal => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 describe("Windows per-run scratch scope cut (#4800)", () => {
+  it("keeps manager admission on main's mkdir path without ACL or scratch inspection", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-windows-off-manager-"));
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, sessionExport: false }, {
+      runRoot: path.join(root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+    });
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const acl = vi.spyOn(windowsRoots, "windowsDataRoot");
+    const allocate = vi.spyOn(scratch, "allocateRunTmpDirectory");
+    const dispose = vi.spyOn(scratch, "disposeRunTmpDirectory");
+    const waitForClose = vi.fn(async () => {});
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      fs.writeFileSync(statusFile, JSON.stringify({ id: request.id, name: request.name, task: "off", status: "completed",
+        runner: "pi", transport: "process", sessionId: "2147483647", cwd: request.cwd,
+        startedAt: Date.now(), updatedAt: Date.now(), finishedAt: Date.now(), text: "done", turns: 1, toolCalls: 0,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
+      return { kind: "process", sessionId: "2147483647", isAlive: async () => false, stop: async () => {}, waitForClose };
+    });
+    try {
+      const result = await manager.run({ task: "off", extensions: false });
+      expect(result.status).toBe("completed");
+      await manager.close();
+      expect(waitForClose).toHaveBeenCalled();
+      expect(acl).not.toHaveBeenCalled();
+      expect(allocate).not.toHaveBeenCalled();
+      expect(dispose).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(manager.runDirectory(result.id)!, "tmp"))).toBe(false);
+    } finally {
+      await manager.close();
+      vi.restoreAllMocks();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each([false, true])("inherits normal user temp without scratch or per-run ACL work (actor=%s)", async actor => {
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     vi.stubEnv("TEMP", "C:\\Users\\runner\\AppData\\Local\\Temp");
@@ -20,8 +58,9 @@ describe("Windows per-run scratch scope cut (#4800)", () => {
     const allocate = vi.spyOn(scratch, "allocateRunTmpDirectory");
     const acl = vi.spyOn(windowsRoots, "windowsDataRoot");
     const closed = Promise.resolve();
+    const waitForClose = vi.fn(async () => {}), stop = vi.fn(async () => {});
     vi.mocked(spawnDetached).mockResolvedValue({ pid: 123, isAlive: async () => false,
-      lostContact: () => undefined, waitForClose: async () => {}, stop: async () => {}, closed });
+      lostContact: () => undefined, waitForClose, stop, closed });
     const workerArguments = ["--status-file", path.resolve("run/status.json"), ...(actor ? ["--actor-id", "test-actor"] : [])];
     const handle = await new ProcessTransport().launch({ id: "test", name: "test", cwd: process.cwd(),
       workerPath: path.resolve("custom-worker.mjs"), workerArguments });
@@ -32,6 +71,8 @@ describe("Windows per-run scratch scope cut (#4800)", () => {
     expect(vi.mocked(spawnDetached).mock.calls.at(-1)![8]).toBeUndefined();
     await handle.waitForClose!();
     await handle.stop();
+    expect(handle.waitForClose).toBe(waitForClose);
+    expect(handle.stop).toBe(stop);
     expect(allocate).not.toHaveBeenCalled();
     expect(acl).not.toHaveBeenCalled();
   });

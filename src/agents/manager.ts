@@ -1210,9 +1210,10 @@ export class AgentManager {
       }
       const runDirectory = path.join(this.#runRoot, id);
       try {
-        // Route dispatch and resident commit may already have created this
-        // private directory. Validate it without repairing existing custody.
-        prepareRunRoot(runDirectory);
+        // Windows inherits the caller TEMP under #4800; do not spend a
+        // native ACL snapshot on an unexported per-run scratch namespace.
+        if (process.platform === "win32") fs.mkdirSync(runDirectory, { recursive: true });
+        else prepareRunRoot(runDirectory);
       } catch (error) { release(); throw error; }
       // Establish custody before a worker can produce its only full outcome. A
       // later disk failure cannot leave a terminal source collectible without a fence.
@@ -3318,7 +3319,7 @@ export class AgentManager {
           await managed.processStop;
           await this.#noteUnconfirmedExit(managed);
           if (!managed.lostContact) {
-            disposeRunTmpDirectory(managed.runDirectory);
+            if (process.platform !== "win32") disposeRunTmpDirectory(managed.runDirectory);
             fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
             release();
           }

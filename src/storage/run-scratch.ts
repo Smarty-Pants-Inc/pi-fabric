@@ -15,8 +15,9 @@ export const NEVER_STARTED_FILE = "never-started.json";
 export const JOINED_SCRATCH_FILE = "scratch-scope-joined.json";
 
 /** Validate the selected explicit/env/default root before the manager writes
- * even task.txt. Windows missing descendants inherit only a checked private
- * parent; POSIX uses the exact temp-root policy, including safe sticky ancestors. */
+ * even task.txt. Windows direct callers retain the native ACL proof; the
+ * AgentManager Windows admission path deliberately bypasses this for the
+ * inheritance-only #4800 scope. */
 export const prepareRunRoot = (root: string): string => {
   if (process.platform !== "win32") return posixDataRoot(root, { create: true });
   const missing: string[] = [];

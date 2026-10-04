@@ -237,23 +237,22 @@ describe("#3752 participant heartbeat contention", () => {
     expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
   });
 
-  it.each([false, true])("renews the legacy session and host together at the old half-life (policy: %s)", async files => {
-    const { directory, mesh, writes, advance } = await setup(files, 120_000, "main", true);
+  it.each([false, true])("compat renews legacy sessions at the fixed 7.5 s threshold without pulling host policy forward (policy: %s)", async files => {
+    const { directory, mesh, writes, advance, hostKey } = await setup(files, 120_000, "main", true);
+    const host = mesh.get(hostKey)!;
     advance(7_499);
     await directory.refresh();
     expect(writes).not.toHaveBeenCalled();
     advance(1);
     await directory.refresh();
     expect(writes).toHaveBeenCalledOnce();
-    expect(writes.mock.calls[0]?.[0].ops.map(operation => operation.key)).toEqual([
-      "sessions/live",
-      expect.stringContaining("topology/hosts/"),
-    ]);
-    expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
+    expect(writes.mock.calls[0]?.[0].ops.map(operation => operation.key)).toEqual(["sessions/live"]);
+    expect(mesh.get(hostKey)).toEqual(host);
+    expect(isLiveLegacyRootEntry(mesh.get("sessions/live")!, Date.now())).toBe(true);
   });
 
-  it.each([false, true])("mixed idle renewal is six paired commits per minute on the default heartbeat (policy: %s)", async files => {
-    const { directory, mesh, writes, advance, hostKey, participantKey, now } = await setup(files, 15_000, "main", true);
+  it("default-policy compat renewals coalesce host and session at the shared half-life", async () => {
+    const { directory, mesh, writes, advance, hostKey, participantKey, now } = await setup(false, 15_000, "main", true);
     const participant = mesh.get(participantKey)!;
     const start = now();
     const committedAt: number[] = [];
@@ -262,15 +261,38 @@ describe("#3752 participant heartbeat contention", () => {
       const before = writes.mock.calls.length;
       await directory.refresh();
       if (writes.mock.calls.length > before) committedAt.push(now() - start);
-      // This is the OLD session-only reader's check: no meshRoot/file-lease fallback.
       expect(isLiveLegacyRootEntry(mesh.get("sessions/live")!, now())).toBe(true);
     }
     expect(committedAt).toEqual(Array.from({ length: 12 }, (_, index) => (index + 1) * 10_000));
-    expect(writes.mock.calls).toHaveLength(12);
-    for (const [batch] of writes.mock.calls) {
-      expect(batch.ops.map(operation => operation.key)).toEqual(["sessions/live", hostKey]);
-    }
+    expect(writes).toHaveBeenCalledTimes(12);
+    for (const [batch] of writes.mock.calls) expect(batch.ops.map(operation => operation.key)).toEqual(["sessions/live", hostKey]);
     expect(mesh.get(participantKey)).toEqual(participant);
+  });
+
+  it("explicit host policy keeps session readers live without renewing the host early", async () => {
+    const { directory, mesh, writes, advance, hostKey, now } = await setup(true, 120_000, "main", true);
+    const host = mesh.get(hostKey)!;
+    for (let tick = 1; tick <= 24; tick++) {
+      advance(5_000);
+      await directory.refresh();
+      expect(isLiveLegacyRootEntry(mesh.get("sessions/live")!, now())).toBe(true);
+    }
+    expect(writes).toHaveBeenCalledTimes(12);
+    expect(mesh.get(hostKey)).toEqual(host);
+    expect(writes.mock.calls.every(([batch]) => batch.ops.map(operation => operation.key).every(key => key === "sessions/live"))).toBe(true);
+  });
+
+  it("explicit host and session renewals share one commit when both are due", async () => {
+    const { directory, mesh, writes, advance, hostKey, now } = await setup(true, 120_000, "main", true);
+    for (let tick = 1; tick <= 120; tick++) {
+      advance(5_000);
+      await directory.refresh();
+      expect(isLiveLegacyRootEntry(mesh.get("sessions/live")!, now())).toBe(true);
+    }
+    expect(writes).toHaveBeenCalledTimes(60);
+    const paired = writes.mock.calls.filter(([batch]) => batch.ops.map(operation => operation.key).join(",") === "sessions/live," + hostKey);
+    expect(paired).toHaveLength(1);
+    expect(writes.mock.calls.at(-1)?.[0].ops.map(operation => operation.key)).toEqual(["sessions/live", hostKey]);
   });
 
   it("session-only readers retain the fixed 15 s TTL, ignoring a stored expiry", async () => {

@@ -618,11 +618,17 @@ describe("ParticipantDirectory host leases", () => {
       const hostAfter = mesh.listAll("topology/hosts/", { fresh: true }).find(entry => (entry.value as { id: string }).id === identity.id)!;
       const legacyAfter = mesh.get("sessions/delayed", { fresh: true })!;
       if (legacy) {
-        expect(writes).toHaveBeenCalledOnce(); // legacy host + session in one locked commit
-        expect(hostAfter.version).toBeGreaterThan(hostBefore.version);
-        expect(hostAfter.value).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
-        expect(legacyAfter.version).toBeGreaterThan(legacyBefore.version);
-        expect(legacyAfter.updatedAt).toBe(now);
+        const hostDue = policy ? delayMs >= STATE_LEASE_RENEW_MS : delayMs >= leaseMs / 2;
+        const sessionDue = delayMs >= 7_500;
+        expect(writes).toHaveBeenCalledTimes(hostDue || sessionDue ? 1 : 0);
+        if (hostDue) {
+          expect(hostAfter.version).toBeGreaterThan(hostBefore.version);
+          expect(hostAfter.value).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
+        } else expect(hostAfter).toEqual(hostBefore);
+        if (sessionDue) {
+          expect(legacyAfter.version).toBeGreaterThan(legacyBefore.version);
+          expect(legacyAfter.updatedAt).toBe(now);
+        } else expect(legacyAfter).toEqual(legacyBefore);
       } else {
         // Thresholds no longer require state commits when every live reader uses lease files.
         expect(writes).not.toHaveBeenCalled();

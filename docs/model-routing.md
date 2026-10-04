@@ -197,6 +197,35 @@ admission across restart and is retried at the next activation; a readable but
 unwritable state journal cannot leave the class live. The decision/class/reset join
 is preserved, even after successful actor cleanup.
 
+### Quality reporting durability and the reporter-exit residual (smarty-dev#4521)
+
+A live report that cannot complete its shared write-ahead/state persistence throws
+`quality-report-not-durable` (`RouteQualityNotDurableError`, `retryable: true` in
+local calls). Public task, actor, and `agents.routeOutcome` callers propagate the
+failure; resident transport errors retain the same error token. The factory/owner
+must retain the run ID and FAIL assertion and retry after storage capacity or
+permissions recover. A process-local pin is **not** a successful quality report.
+
+Independently of shared pending/refused/bounded-fence writes, the reporter first
+attempts a durable update of the execution-owned `route-quality-receipt.json`:
+`routeQuality: "fail"` plus an unresolved `qualityFail` marker. Admission records
+index each run receipt; successful actor archival durably indexes the archived
+receipt before releasing its source. Every new admission reads bounded,
+host-owned receipts for its class and reset generation and replays unresolved
+FAILs into the shared switch. Pending receipt FAILs veto source collection and
+archive rotation. A PASS or repeated archival cannot erase an unresolved FAIL;
+only successful durable replay discharges its marker, retaining FAIL history.
+This recovery requires a surviving, indexed receipt; it does not scan arbitrary
+caller paths or infer quality from run text.
+
+**Documented residual:** if *all* durable writes refuse the FAIL (including the
+run receipt), the reporting process exits, and the factory/owner never retries,
+there is no persistent FAIL for a fresh owner to recover. Once capacity recovers,
+a fresh admission may be LIVE. This is explicitly a failed, retryable report—not
+acknowledged persistence or a guarantee against total storage loss. Receipt-only
+success survives reporter exit and pins the fresh owner; if no sink succeeded,
+the caller's retry records the FAIL and restores the durable pin.
+
 **Rollback:** set `liveClasses: []` in trusted config and refresh Main through its
 normal config reload path. The existing resident config refresh writes the overlay
 and reuses the ready host. New resident activations reread that same-release,

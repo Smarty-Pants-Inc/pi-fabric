@@ -40,6 +40,14 @@ const readJson = <T>(file: string, maxBytes = 1024 * 1024): T | undefined => {
     return JSON.parse(fs.readFileSync(file, "utf8")) as T;
   } catch { return; }
 };
+// Receipt-only safety survives source cleanup and actor archive rotation. A
+// corrupt/unreadable receipt also vetoes collection; recovery must inspect it.
+const routeQualityRecoveryPending = (directory: string): boolean => {
+  const file = path.join(directory, "route-quality-receipt.json");
+  if (!fs.existsSync(file)) return false;
+  const receipt = readJson<{ qualityFail?: unknown }>(file, 64 * 1024);
+  return !receipt || receipt.qualityFail !== undefined;
+};
 const time = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
 const validOwner = (owner: RunRootOwner | undefined): owner is RunRootOwner => !!owner &&
   Number.isSafeInteger(owner.pid) && owner.pid > 0 && time(owner.startedAt) && time(owner.heartbeatAt) &&
@@ -123,6 +131,8 @@ const runTreeVeto = (
   }
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
+    if (preserveArchives && routeQualityRecoveryPending(directory)) return "route quality FAIL recovery is pending";
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (preserveArchives && fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (preserveArchives && fs.existsSync(path.join(directory, "actor-run-archive-pending.json"))) return "actor run receipt archive is pending";
@@ -602,7 +612,7 @@ export const pruneActorRunArchives = (options: {
     if (!entry.isDirectory() || entry.name === options.latestRunId) continue;
     const directory = path.join(options.runsDirectory, entry.name);
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-    if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false)) continue;
+    if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false) || routeQualityRecoveryPending(directory)) continue;
     if (now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < options.retentionMs) {
       compactTerminalRunEvents(directory, { ...options, now });
       continue;

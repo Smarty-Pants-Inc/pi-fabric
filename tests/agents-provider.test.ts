@@ -930,6 +930,15 @@ describe('model: "auto" spawn routing (#2890)', () => {
     const registry = new ActionRegistry(); registry.register(provider);
     const handle = await provider.invoke("spawn", request, context) as AgentHandleInfo;
     await agents.wait(handle.id);
+    const write = fs.writeFileSync;
+    const refusal = vi.spyOn(fs, "writeFileSync").mockImplementation((file, ...args) => {
+      if (typeof file === "number") throw Object.assign(new Error("EFBIG"), { code: "EFBIG" });
+      return write(file, ...args);
+    });
+    await expect(registry.invoke("agents.routeOutcome", { id: handle.id, routeQuality: "fail" }, { ...context, approve: async () => {}, audits: [], maxResultChars: 100000 }))
+      .rejects.toMatchObject({ code: "quality-report-not-durable", retryable: true });
+    refusal.mockRestore();
+    // The public caller retries rather than accepting a report with zero durable writes.
     expect(await registry.invoke("agents.routeOutcome", { id: handle.id, routeQuality: "fail" }, { ...context, approve: async () => {}, audits: [], maxResultChars: 100000 })).toMatchObject({ id: handle.id, routeQuality: "fail" });
     const second = await provider.invoke("spawn", request, context) as AgentHandleInfo & { routeDecision: { reasonCode: string } };
     expect(second).toMatchObject({ model: request.pinModel, routeDecision: { reasonCode: "class-reverted" } });

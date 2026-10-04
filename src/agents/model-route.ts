@@ -224,7 +224,37 @@ function revertReason(rows: Array<Record<string, unknown>>, routeClass: string, 
   return undefined;
 }
 
-export interface RouteQualityReceipt { decision: ModelRouteDecision; ledger: string; runId: string }
+export interface RouteQualityReceipt {
+  decision: ModelRouteDecision; ledger: string; runId: string;
+  /** Supplied only by execution-owned dispatch/read paths, never launch arguments. */
+  receiptFile?: string;
+  /** Sticky across subsequent PASS reports; only a trusted reset generation clears the class. */
+  qualityFail?: { receiptId: string; at: number };
+  /** Persisted FAIL history remains after the pending marker is discharged. */
+  routeQuality?: "pass" | "fail";
+}
+
+/** The owner must retry: no successful return can acknowledge an unsaved safety assertion. */
+export class RouteQualityNotDurableError extends Error {
+  readonly code = "quality-report-not-durable";
+  readonly retryable = true;
+  constructor(cause: unknown) {
+    super(`quality-report-not-durable: retry the quality report: ${String(cause)}`, { cause });
+    this.name = "RouteQualityNotDurableError";
+  }
+}
+
+/** Index an archived execution-owned receipt before source custody is discharged. */
+export function registerRouteQualityReceipt(file: string): void {
+  const receipt = readRouteQualityReceipt(file);
+  if (!receipt || receipt.decision.mode !== "live") return;
+  if (!readRouteRecords(safetyFile()).some(row => (row.type === "admission" || row.type === "receipt") &&
+    row.receiptFile === path.resolve(file) && row.decisionId === receipt.decision.decisionId)) {
+    appendRouteRecord(safetyFile(), { type: "receipt", receiptFile: path.resolve(file),
+      decisionId: receipt.decision.decisionId, runId: receipt.runId,
+      routeClass: receipt.decision.routeClass, reset: receipt.decision.revertReset ?? "", at: Date.now() });
+  }
+}
 interface PendingQuality extends RouteQualityReceipt { type: "pending"; receiptId: string; routeQuality: "pass" | "fail"; at: number }
 const qualityFile = () => path.join(resolveAgentDir(), "fabric", "model-routing-quality.jsonl");
 interface PendingRouteSave extends RouteQualityReceipt {
@@ -280,6 +310,19 @@ function commitRouteSave(intent: PendingRouteSave): void {
     appendRouteRecord(safetyFile(), { type: "committed", receiptId: intent.receiptId, at: Date.now() });
   }
   safetyObligations(safetyFile()).delete(intent.receiptId);
+  clearRouteReceiptFail(intent);
+}
+
+function clearRouteReceiptFail(intent: PendingRouteSave): void {
+  if (intent.receiptFile) {
+    try {
+      const receipt = readRouteQualityReceipt(intent.receiptFile);
+      if (receipt?.qualityFail?.receiptId === intent.receiptId) {
+        const { receiptFile: _location, qualityFail: _fail, ...stored } = receipt;
+        writeJsonAtomic(intent.receiptFile, stored, { durable: true, renameRetries: 1 });
+      }
+    } catch { /* State is durable; a retained marker safely replays idempotently. */ }
+  }
 }
 
 function replayRouteSaves(routeClass: string, reset: string): boolean {
@@ -287,15 +330,19 @@ function replayRouteSaves(routeClass: string, reset: string): boolean {
   // open/fsync checks for appendability: dispatch must append to safetyFile().
   const rows = [...readRouteRecords(safetyFile(), 2 * 64 * 1024), ...readRouteRecords(refusedFile(), 2 * 64 * 1024)];
   const pending = new Map<string, PendingRouteSave>();
+  const receiptLocations: Array<Record<string, unknown>> = [];
   const refused = new Set<string>();
   const committed = new Set<string>();
   for (const row of rows) {
-    if (row.type === "admission") {
+    if (row.type === "admission" || row.type === "receipt") {
       if (typeof row.decisionId !== "string" || !row.decisionId || typeof row.runId !== "string" || !row.runId ||
         typeof row.routeClass !== "string" || !ROUTABLE_CLASSES.includes(row.routeClass) ||
-        typeof row.reset !== "string" || row.reset.length > 128 || typeof row.at !== "number" || !Number.isFinite(row.at)) {
+        typeof row.reset !== "string" || row.reset.length > 128 || typeof row.at !== "number" || !Number.isFinite(row.at) ||
+        (row.receiptFile !== undefined && (typeof row.receiptFile !== "string" || !path.isAbsolute(row.receiptFile) || path.basename(row.receiptFile) !== "route-quality-receipt.json")) ||
+        (row.type === "receipt" && row.receiptFile === undefined)) {
         throw new Error("Malformed routing admission");
       }
+      if (row.receiptFile && row.routeClass === routeClass && row.reset === reset) receiptLocations.push(row);
       continue; // Admission is durable execution evidence, not a pending outcome.
     }
     if (typeof row.receiptId !== "string" || !row.receiptId || typeof row.at !== "number" || !Number.isFinite(row.at) ||
@@ -319,6 +366,23 @@ function replayRouteSaves(routeClass: string, reset: string): boolean {
         !["completed", "failed", "stopped", "timed_out"].includes(String(intent.result.status)) :
         intent.result.status !== undefined || intent.result.routeQuality === undefined)) throw new Error("Malformed routing safety intent");
     pending.set(intent.receiptId, intent);
+  }
+  // Admission/archival installed the locator before a later quality report. Read
+  // only matching host-owned, bounded receipts: never scan caller-selected trees.
+  for (const row of receiptLocations) {
+    const file = String(row.receiptFile);
+    try { fs.lstatSync(file); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    const receipt = readRouteQualityReceipt(file);
+    if (!receipt || receipt.runId !== row.runId || receipt.decision.decisionId !== row.decisionId ||
+      receipt.decision.mode !== "live" || receipt.decision.routeClass !== routeClass ||
+      (receipt.decision.revertReset ?? "") !== reset) throw new Error("Mismatched route quality receipt");
+    if (receipt.qualityFail && committed.has(receipt.qualityFail.receiptId)) {
+      clearRouteReceiptFail({ ...receipt, type: "pending", ...receipt.qualityFail, result: { routeQuality: "fail" } });
+    } else if (receipt.qualityFail && !pending.has(receipt.qualityFail.receiptId)) {
+      pending.set(receipt.qualityFail.receiptId, { ...receipt, type: "pending", ...receipt.qualityFail,
+        result: { routeQuality: "fail" } });
+    }
   }
   for (const [id, intent] of safetyObligations(safetyFile())) if (!pending.has(id)) pending.set(id, intent);
   let fenced = [...refused].some(id => !committed.has(id) && !pending.has(id));
@@ -346,23 +410,50 @@ export function reportRouteQualityReceipt(receipt: RouteQualityReceipt, quality:
       routeClass: receipt.decision.routeClass, routeQuality: quality, at: Date.now() });
     return; // Shadow/judgment feedback is audit-only, never a live safety obligation.
   }
-  const intent: PendingRouteSave = { ...receipt, type: "pending", receiptId: allocateDecisionId(),
-    result: { routeQuality: quality }, at: Date.now() };
-  beginRouteSave(intent); // Discoverable before the FIRST quality journal write can fail.
-  commitRouteSave(intent);
+  let marker = quality === "fail" ? receipt.qualityFail : undefined;
+  // A run receipt is an independent durable source, even if every shared sink
+  // rejects the report. Attempt it first; a failed receipt must not prevent the
+  // shared write-ahead sinks from retaining the assertion.
+  if (quality === "fail" && receipt.receiptFile) {
+    try {
+      const owned = readRouteQualityReceipt(receipt.receiptFile);
+      if (!owned || owned.runId !== receipt.runId || owned.decision.decisionId !== receipt.decision.decisionId) {
+        throw new Error("Mismatched route quality receipt");
+      }
+      marker = owned.qualityFail ?? marker ?? { receiptId: allocateDecisionId(), at: Date.now() };
+      const { receiptFile: _location, ...stored } = owned;
+      writeJsonAtomic(receipt.receiptFile, { ...stored, routeQuality: "fail", qualityFail: marker }, { durable: true, renameRetries: 1 });
+    } catch { /* Keep the in-process obligation and attempt all shared sinks below. */ }
+  }
+  const intent: PendingRouteSave = { ...receipt, type: "pending", receiptId: marker?.receiptId ?? allocateDecisionId(),
+    result: { routeQuality: quality }, at: marker?.at ?? Date.now() };
+  try {
+    beginRouteSave(intent); // Discoverable before the FIRST quality journal write can fail.
+    commitRouteSave(intent);
+  } catch (error) {
+    // Includes total pending/refused/bounded-fence refusal. Never turn the
+    // in-memory pin (or even a receipt-only save) into a success acknowledgement.
+    throw new RouteQualityNotDurableError(error);
+  }
 }
 
 /** A bounded, host-owned receipt survives successful actor handle cleanup. */
 export function readRouteQualityReceipt(file: string): RouteQualityReceipt | undefined {
-  const rows = readRouteRecords(file);
+  const rows = readRouteRecords(file, 64 * 1024 * 1024 - 64 * 1024);
   if (!rows.length) return undefined;
   if (rows.length !== 1) throw new Error("Malformed route quality receipt");
   const receipt = rows[0] as unknown as RouteQualityReceipt;
   if (typeof receipt.runId !== "string" || typeof receipt.ledger !== "string" ||
     !receipt.decision || typeof receipt.decision.decisionId !== "string" ||
     typeof receipt.decision.routeClass !== "string" || !/^[a-z][a-z0-9:-]{0,63}$/.test(receipt.decision.routeClass) ||
-    !["live", "shadow", "judgment"].includes(receipt.decision.mode)) throw new Error("Malformed route quality receipt");
-  return receipt;
+    !["live", "shadow", "judgment"].includes(receipt.decision.mode) ||
+    (receipt.routeQuality !== undefined && receipt.routeQuality !== "fail") ||
+    (receipt.decision.revertReset !== undefined && (typeof receipt.decision.revertReset !== "string" || receipt.decision.revertReset.length > 128)) ||
+    (receipt.qualityFail !== undefined && (!receipt.qualityFail || typeof receipt.qualityFail.receiptId !== "string" ||
+      !/^[a-f0-9]{32}$/.test(receipt.qualityFail.receiptId) || typeof receipt.qualityFail.at !== "number" || !Number.isFinite(receipt.qualityFail.at)))) {
+    throw new Error("Malformed route quality receipt");
+  }
+  return { ...receipt, receiptFile: path.resolve(file) };
 }
 
 export function isRouteClassReverted(routeClass: string, reset = ""): boolean {
@@ -427,6 +518,7 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
 } {
   const file = options.ledger ?? path.join(resolveAgentDir(), "fabric", "model-routing.jsonl");
   let sessionFile: string | undefined;
+  const receiptFile = path.resolve(runDirectory, "route-quality-receipt.json");
   // Record before admission; seed only once the run's final worktree is known.
   // A seed write failure must never fall back to a different working directory.
   const bindSession = (finalCwd: string): string => {
@@ -451,7 +543,7 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
           // This is the appendability test AND durable admission record. A shorter
           // decision ledger (including decisionRecorded callers) cannot bypass it.
           appendRouteRecord(safetyFile(), { type: "admission", decisionId: decision.decisionId,
-            runId: childId, routeClass: decision.routeClass, reset: decision.revertReset ?? "", at: Date.now() });
+            runId: childId, routeClass: decision.routeClass, reset: decision.revertReset ?? "", receiptFile, at: Date.now() });
         }
       } catch {
         // Any append/fsync failure denies LIVE for this dispatch. Still audit the
@@ -461,7 +553,7 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
       }
     }
     if (!options.decisionRecorded) appendRouteRecord(file, { type: "decision", ...decision, childSessionId: decision.actorId ? null : childId, childAgentId: childId, runId: childId, at: Date.now() });
-    writeJsonAtomic(path.join(runDirectory, "route-quality-receipt.json"), { decision, ledger: file, runId: childId }, { durable: true });
+    writeJsonAtomic(receiptFile, { decision, ledger: file, runId: childId }, { durable: true });
   } catch (error) {
     // Judgment dispatch is fail-closed; only shadow routing may fall back.
     if (decision.mode === "judgment") throw error;
@@ -479,7 +571,7 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
     header: routeHeader(decision), ...(sessionFile ? { sessionFile } : {}), bindSession,
     reportQuality(quality) {
       if (quality !== "pass" && quality !== "fail") throw new Error("Invalid routeQuality");
-      reportRouteQualityReceipt({ decision, ledger: file, runId: childId }, quality);
+      reportRouteQualityReceipt({ decision, ledger: file, runId: childId, receiptFile }, quality);
     },
     outcome(result) {
       if (appended) return;
@@ -494,15 +586,15 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
         // Sub-millisecond precision preserves same-tick results across owners.
         at: performance.timeOrigin + performance.now() };
       try {
+        if (result.routeQuality && !qualityCommitted) {
+          reportRouteQualityReceipt({ decision, ledger: file, runId: childId, receiptFile }, result.routeQuality);
+          qualityCommitted = true;
+        }
         if (decision.mode === "live") {
           safetyIntent ??= { type: "pending", receiptId: allocateDecisionId(), decision, ledger: file, runId: childId,
             result: { status: result.status, ...(result.routeQuality ? { routeQuality: result.routeQuality } : {}) },
             record: pendingRecord, at: Number(pendingRecord.at) };
           beginRouteSave(safetyIntent);
-        }
-        if (result.routeQuality && !qualityCommitted) {
-          reportRouteQualityReceipt({ decision, ledger: file, runId: childId }, result.routeQuality);
-          qualityCommitted = true;
         }
         if (safetyIntent) commitRouteSave(safetyIntent);
         else appendRouteRecord(file, pendingRecord);

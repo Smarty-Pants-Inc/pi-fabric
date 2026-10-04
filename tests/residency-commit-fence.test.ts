@@ -128,7 +128,9 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
     mainAgent: { id: rootId, local: true, matches: (id) => id === rootId, info: () => { throw new Error("unused"); },
       deliverAgent: () => ({ queued: true, messageId: "unused", routed: "main" }) },
   });
-  const nested = new ResidentActorClient(meshRoot, rootId, 500);
+  // Preserve short-deadline fence tests, but honor the longer exchange budget
+  // requested by idempotency/cache fixtures on the nested channel too.
+  const nested = new ResidentActorClient(meshRoot, rootId, commandTimeoutMs);
   const model = beforeCommit ? "test/slow" : "test/visible";
   return {
     root, residencyRoot, config, participants, client, nested, entered, release, model,
@@ -199,6 +201,10 @@ describe("resident creation idempotency", () => {
         await expect(first).resolves.toMatchObject({ name: "ResidentOutcomeUnknownError", id: firstId });
         state.release.resolve();
         await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        // The first request keeps its 500 ms uncertainty deadline. This retry
+        // tests identity/cache conservation, not another short durable-I/O race.
+        state.client.options.commandTimeoutMs = 5_000;
+        state.nested = new ResidentActorClient(state.config.meshRoot, state.config.rootId, 5_000);
         const retry = await create(state, "timeout-key");
         expect(retry.id).toBe(firstId);
         expect(held.calls()).toBe(1);
@@ -337,17 +343,17 @@ describe("resident creation cache boundaries", () => {
     } finally { clock?.mockRestore(); await state.close(); }
   });
 
-  it("retains only the last 256 completed results", { timeout: 60_000 }, async () => {
+  it("retains only the last 256 completed results", { timeout: 120_000 }, async () => {
     const state = await harness(false, undefined, 10_000);
     try {
       const first = await state.client.createActor(actorRequest("before-eviction", "oldest"));
       // Real client/host exchanges with fail-fast requests avoid 256 extra actors/workers.
-      // Cache capacity, not transport throughput, is the invariant: bounded batches
-      // keep format-3 acknowledgement I/O from exhausting a burst's client deadline.
-      for (let offset = 0; offset < 256; offset += 32) {
-        const rejected = await Promise.all(Array.from({ length: 32 }, (_, i) =>
-          state.client.createActor(actorRequest("", `bounded-${offset + i}`)).catch((error: Error) => error)));
-        for (const error of rejected) expect(error).toMatchObject({ message: expect.stringContaining("Invalid Fabric actor name") });
+      // Cache capacity, not burst throughput, is the invariant. Each real
+      // durable request/decision/response exchange must finish before the next
+      // one starts; filesystem latency must not spend later requests' deadlines.
+      for (let offset = 0; offset < 256; offset++) {
+        const error = await state.client.createActor(actorRequest("", `bounded-${offset}`)).catch((error: Error) => error);
+        expect(error).toMatchObject({ message: expect.stringContaining("Invalid Fabric actor name") });
       }
       const next = await state.client.createActor(actorRequest("after-eviction", "oldest"));
       expect(next.id).not.toBe(first.id);
@@ -527,11 +533,13 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   }
 
   it("cleanup that times out behind a real wait is fenced before file/worktree mutation", { timeout: 10_000 }, async () => {
-    const state = await harness(false);
+    // The short deadline belongs to held cleanup, not ordinary durable spawn setup.
+    const state = await harness(false, undefined, 5_000);
     const original = AgentManager.prototype.join;
     const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
     try {
       const handle = await state.client.spawnAgent({ task: "settle before cleanup", model: state.model });
+      state.client.options.commandTimeoutMs = 500;
       vi.spyOn(AgentManager.prototype, "join").mockImplementation(async function (this: AgentManager, ...args) {
         const result = await original.apply(this, args);
         state.entered.resolve(); await state.release.promise;
@@ -593,7 +601,8 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   });
 
   it("abandoned successor create does not remove its stopped predecessor before the fence", async () => {
-    const state = await harness(false);
+    // Establish the predecessor under an ordinary durable-exchange budget.
+    const state = await harness(false, undefined, 5_000);
     let owner!: ActorDirectory;
     const original = ActorDirectory.prototype.create;
     vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
@@ -603,6 +612,7 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
     try {
       const predecessor = await state.nested.createActor({ name: "fenced", instructions: "predecessor", residency: "durable", model: state.model });
       await owner.stop(predecessor.id);
+      state.nested = new ResidentActorClient(state.config.meshRoot, state.config.rootId, 500);
       const outcome = state.nested.createActor({ name: "fenced", instructions: "successor", residency: "durable", model: "test/slow" })
         .catch((error: Error) => error);
       await state.entered.promise;
@@ -661,14 +671,19 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   });
 
   it.each(["main spawn", "main create"] as const)("%s aborted during participant publication retains the confirmed ID", async (kind) => {
-    const state = await harness(false);
+    // Reach the held publication boundary before cancelling; request I/O is not
+    // the short-deadline fence under test here.
+    const state = await harness(false, undefined, 5_000);
     const original = state.participants.get.bind(state.participants);
     const get = vi.spyOn(state.participants, "get").mockImplementation((id) => id === state.config.rootId ? original(id) : undefined);
     const controller = new AbortController();
     try {
       const outcome = send(state, kind, controller.signal).catch((error: Error) => error);
+      // Atomic spawn response custody is retained until participant publication
+      // confirms the ID; aborting that observation must still report it unknown.
       await waitFor(() => entries(state.residencyRoot, "decisions").length === 1 &&
-        entries(state.residencyRoot, "processing").length === 0 && entries(state.residencyRoot, "responses").length === 0);
+        entries(state.residencyRoot, "processing").length === 0 &&
+        entries(state.residencyRoot, "responses").length === (kind === "main spawn" ? 1 : 0));
       controller.abort();
       const error = await outcome;
       expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", requestId: expect.any(String), id: expect.stringMatching(/^[0-9a-f]{32}$/) });
@@ -679,7 +694,9 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   });
 
   it("a committed cleanup failure remains unknown and cannot fall through to offline cleanup", async () => {
-    const state = await harness(false);
+    // Establish the real worker before injecting cleanup failure; do not time
+    // out the unrelated durable spawn setup first.
+    const state = await harness(false, undefined, 5_000);
     try {
       const handle = await state.client.spawnAgent({ task: "settle before cleanup", model: state.model });
       vi.spyOn(AgentManager.prototype, "cleanup").mockRejectedValue(new Error("Unknown Fabric agent after cleanup commit"));
@@ -978,6 +995,9 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       // 900 ms with a 250 ms client wait. Resident actorStatus now uses that same
       // serial exchange, so reconcile only after the held request finishes.
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      // The original 250 ms uncertainty deadline is unchanged. Fresh status and
+      // main's now-resident joined stop use an ordinary reconciliation budget.
+      state.client.options.commandTimeoutMs = 5_000;
       // Simulate the resumed wall clock for new reconciliation generations, not
       // the original execution deadline. The expiry watermark never rolls back.
       const realNow = Date.now.bind(Date);
@@ -1075,6 +1095,8 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
       const realNow = Date.now.bind(Date);
       const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000);
+      state.client.options.commandTimeoutMs = 5_000;
+      await state.participants.refresh();
       const status = await state.client.actorStatus(decisions[0]!.id);
       expect(status).toMatchObject({ id: decisions[0]!.id });
       clock.mockRestore();
@@ -1214,7 +1236,9 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
   ];
   for (const { engine, label, startupDelayMs, loopback } of cases)
   it(`${label} collects handled client-deadline receipts on normal completion, delivers priority output and reconciles without duplicates`, async () => {
-    const state = await harness(false, undefined, 700); const main = mainProvider(state);
+    // The success row is ordinary setup. Only the two injected post-commit
+    // stalls exercise the 700 ms client deadline (armed by probe.drain below).
+    const state = await harness(false, undefined, 5_000); const main = mainProvider(state);
     let admitted = false;
     let startClock = () => {};
     const original = ActorDirectory.prototype.create;
@@ -1230,7 +1254,11 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
       inputSchema: { type: "object", properties: {}, additionalProperties: false } };
     main.registry.register({ name: "probe", description: "resident exchange synchronization",
       async list() { return [descriptor]; }, async describe() { return descriptor; },
-      async invoke() { await waitFor(() => entries(state.residencyRoot, "processing").length === 0); return true; },
+      async invoke() {
+        await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        state.client.options.commandTimeoutMs = 700;
+        return true;
+      },
     });
     let artifactPath: string | undefined;
     try {
@@ -1253,7 +1281,7 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
         : `const mapped = []; ${calls.map(call => `mapped.push(...(await Promise.allSettled([${call.replace(/^await /, "")}])).map(result => result.status === "fulfilled" ? {ok:true,handle:result.value} : {ok:false,error:String(result.reason)})); await tools.call({ref:"probe.drain",args:{}});`).join("\n")}
           console.log("guest-logs-start" + "log line; ".repeat(3000) + "guest-logs-end");
           return {mapped,supplement:"result-start" + "result detail! ".repeat(2000) + "result-end"};`;
-      // This checks the resident client's 700 ms deadline, not interpreter
+      // The two held calls check the resident client's 700 ms deadline, not interpreter
       // startup. Keep the executor's 10 s budget, starting it at real creation
       // admission. A separate 20 s real guard also covers the slow-startup rows.
       const result = await executeAfterAdmission((signal, start) => {
@@ -1272,6 +1300,9 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
       expect(mapped).toEqual([expect.objectContaining({ ok: true, handle: expect.objectContaining({ id: expect.any(String) }) }),
         expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") }),
         expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") })]);
+      // The two handled-uncertainty calls keep their asserted 700 ms deadline;
+      // only the new status/joined-stop invocations use ordinary admission waits.
+      state.client.options.commandTimeoutMs = 5_000;
       const successful = decisions.find(decision => decision.id === mapped[0].handle.id)!;
       const uncertain = decisions.filter(decision => decision !== successful);
       const reconciled = [];
@@ -1604,11 +1635,15 @@ describe("invocation-local spawn receipts (#2947)", { timeout: 25_000 }, () => {
 });
 
 describe("round 2 public execution receipt contract", { timeout: 25_000 }, () => {
-  for (const engine of engines) {
-    it(`${engine} public Main ceiling retains committed resident receipts through normalized provider signals`, async () => {
+  for (const engine of engines) for (const startupDelayMs of engine === "cpython" ? [0, 1_700] : [0]) {
+    it(`${engine} public Main ceiling retains committed resident receipts through normalized provider signals${startupDelayMs ? " with slow startup" : ""}`, async () => {
       const state = await harness(false, undefined, 10_000);
       const main = mainProvider(state);
       const controller = new AbortController();
+      const execute = CPythonRuntime.prototype.execute;
+      const startup = startupDelayMs ? vi.spyOn(CPythonRuntime.prototype, "execute").mockImplementationOnce(async function (this: CPythonRuntime, ...args) {
+        await delay(startupDelayMs); return execute.apply(this, args);
+      }) : undefined;
       const original = ActorDirectory.prototype.create;
       vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
         const actor = await original.apply(this, args);
@@ -1616,9 +1651,16 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
       });
       try {
         const run = publicExecution(state, main, engine, 1_500, true);
-        const outcome = run(`return ${publicCall(engine, "create", requestArgs(state, "create"))}`, controller.signal);
-        await state.entered.promise;
-        const result = await outcome;
+        let admitted = false;
+        void state.entered.promise.then(() => { admitted = true; });
+        // Receipt conservation starts after commitment, not during Python startup
+        // or the PR's additional durable request/registry barriers on Windows.
+        // Preserve the 1500 ms Main ceiling and bound/observe pre-admission exits
+        // instead of waiting forever when execution settles before create runs.
+        const result = await executeAfterAdmission(
+          signal => run(`return ${publicCall(engine, "create", requestArgs(state, "create"))}`, AbortSignal.any([controller.signal, signal])),
+          () => admitted,
+        );
         expect(result.success).toBe(false);
         expect(result.trace.outcome).toBe("timed_out");
         expect(result.error).toContain("MainExecutionCeilingError");
@@ -1631,7 +1673,7 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
         state.release.resolve();
         await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
         expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
-      } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
+      } finally { startup?.mockRestore(); controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
     });
   }
   for (const engine of engines) for (const operation of ["spawn", "create"] as const) {
@@ -1725,7 +1767,9 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
           const reconcile = engine === "cpython" || engine === "monty"
             ? `return {"status": await agents.${operation === "spawn" ? "status" : "actorStatus"}(id="${id}"), "stop": await agents.stop(id="${id}")}`
             : `return {status:await agents.${operation === "spawn" ? "status" : "actorStatus"}({id:"${id}"}),stop:await agents.stop({id:"${id}"})}`;
-          const reconciled = await run(reconcile);
+          // The 1500ms cancellation budget belongs to the held mutation above,
+          // not fresh interpreter startup plus the durable reconciliation stop.
+          const reconciled = await publicExecution(state, main, engine, 5_000)(reconcile);
           expect(reconciled, reconciled.error).toMatchObject({ success: true, value: { status: { id } } });
         }
       } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
@@ -1847,9 +1891,15 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
         const python = engine === "cpython" || engine === "monty";
         const code = ending === "failure" ? `${first}${python ? '\nraise ValueError("guest failed")' : '; throw new Error("guest failed");'}`
           : `${first}${python ? '\nreturn ' : '; return '}${second}`;
-        const outcome = run(code, controller.signal);
-        if (ending !== "failure") { await state.entered.promise; if (ending === "abort") controller.abort(); }
-        const result = await outcome; expect(result.success).toBe(false);
+        // Exercise receipt conservation after actual commitment, not startup or
+        // two durable creates racing the same 1500ms guest deadline. Keep that
+        // deadline, with an independently bounded, early-exit-aware admission gate.
+        const result = await executeAfterAdmission(
+          signal => run(code, AbortSignal.any([controller.signal, signal])),
+          () => created >= (ending === "failure" ? 1 : 2),
+          () => { if (ending === "abort") controller.abort(); },
+        );
+        expect(result.success).toBe(false);
         const decisions = decisionsFor(state); expect(decisions).toHaveLength(ending === "failure" ? 1 : 2);
         assertReceipts(result.error, decisions);
         state.release.resolve(); await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
@@ -2008,7 +2058,9 @@ describe("round 1 public cancellation contract", () => {
   });
 
   it("durable create never enters activation compensation when committed removal would be unknown", async () => {
-    const state = await harness(false, undefined, 200); const main = mainProvider(state);
+    // This success-path request must cover core admission's durable registry/queue barriers.
+    // Timeout/abandonment cases above retain their intentionally short deadlines.
+    const state = await harness(false, undefined, 1_000); const main = mainProvider(state);
     const activationFailure = new Error("injected activation failure");
     const ensure = vi.spyOn(state.client, "ensureActor").mockImplementation(async (id) => {
       await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
@@ -2049,7 +2101,8 @@ describe("round 1 public cancellation contract", () => {
   });
 
   it("durable host still validates capability requirements before its fence", async () => {
-    const state = await harness(false);
+    // Validation, not a short transport deadline, is the refusal under test.
+    const state = await harness(false, undefined, 5_000);
     const main = mainProvider(state);
     try {
       await expect(main.invoke("agents.create", { ...requestArgs(state, "create"), requires: ["memory.get"] }))

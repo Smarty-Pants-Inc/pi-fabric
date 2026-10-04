@@ -307,7 +307,7 @@ export class ActorMeshMonitor {
     const firstAnchor = !this.#persistedEventAnchor && (this.#safeCursor.last?.sequence ?? 0) > 0;
     if (!immediate && !firstAnchor && this.#persistedCursor !== undefined && Date.now() - this.#lastCheckpointAt < CURSOR_CHECKPOINT_MS) return;
     try {
-      writeJsonAtomic(this.callbacks.cursorPath, { format: 1, ...this.#safeCursor }, { space: 2 });
+      writeJsonAtomic(this.callbacks.cursorPath, { format: 1, ...this.#safeCursor }, { space: 2, durable: true });
       this.#persistedCursor = serialized;
       this.#persistedEventAnchor = (this.#safeCursor.last?.sequence ?? 0) > 0;
       this.#lastCheckpointAt = Date.now();

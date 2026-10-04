@@ -377,11 +377,26 @@ describe("actor activation filter in ActorManager", () => {
     expect(again.messages(actor.id)).toContainEqual(expect.objectContaining({ reason: "activationFilter cleared: explicit" }));
   }, 30_000);
 
-  it("coalesces a burst of host skips into one soft registry write without fsync", async () => {
+  it("coalesces a burst of host skips into one registry write with file and supported namespace barriers", async () => {
     const { root, actors } = setup();
     const actor = await actors.create({ name: "burst", instructions: "x", events: ["tool_error"], activationFilter: BOTH });
     const writes = vi.spyOn(ActorRegistryStore.prototype, "write");
-    const syncs = vi.spyOn(fs, "fsyncSync");
+    const registry = path.join(root, "actors/actors.json");
+    const opened = new Map<number, string>();
+    const barriers: string[] = [];
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), rename = fs.renameSync.bind(fs);
+    const opens = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode); opened.set(fd, String(file)); return fd;
+    });
+    const syncs = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = opened.get(fd)!;
+      if (file.startsWith(registry + ".") && file.endsWith(".tmp")) barriers.push("file");
+      else if (fs.fstatSync(fd).isDirectory()) barriers.push(fs.realpathSync(file));
+      sync(fd);
+    });
+    const renames = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to); if (String(to) === registry) barriers.push("rename");
+    });
     try {
       for (let i = 0; i < 30; i++) actors.dispatchHostEvent("tool_error", envelope("host:tool_error").payload);
       expect(actors.status(actor.id).filterSkipped).toMatchObject({ count: 30, lastKey: "host:tool_error", lastTopic: "tool_error" });
@@ -392,8 +407,25 @@ describe("actor activation filter in ActorManager", () => {
       });
       expect(writes).toHaveBeenCalledTimes(1);
       expect(writes.mock.calls[0]?.[1]).toMatchObject({ durable: false });
+      // The caller still requests a batched soft save, but a changed registry
+      // inode carries authoritative definitions and therefore owes F36 barriers.
+      expect(barriers.slice(0, 2)).toEqual(["file", "rename"]);
+      const directories: string[] = [];
+      if (process.platform !== "win32") {
+        for (let dir = fs.realpathSync(path.dirname(registry)); ; dir = path.dirname(dir)) {
+          directories.push(dir);
+          if (path.dirname(dir) === dir) break;
+        }
+      }
+      expect(barriers.slice(2)).toEqual(directories);
+      expect(syncs).toHaveBeenCalledTimes(1 + directories.length);
+      // Idle polls with no telemetry change retain the unchanged-snapshot no-op.
+      writes.mockClear(); syncs.mockClear(); renames.mockClear();
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(writes).not.toHaveBeenCalled();
       expect(syncs).not.toHaveBeenCalled();
-    } finally { writes.mockRestore(); syncs.mockRestore(); }
+      expect(renames).not.toHaveBeenCalled();
+    } finally { writes.mockRestore(); opens.mockRestore(); syncs.mockRestore(); renames.mockRestore(); }
   });
 
   it("expires on the next host event, resets telemetry, and audits the clear", async () => {

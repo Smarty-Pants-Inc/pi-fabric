@@ -4,8 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { renameAtomic, syncDirectoryChain, syncPathNamespace, writeFileAtomic, writeJsonAtomic, writeJsonAtomicAsync } from "../src/core/atomic-write.js";
-import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 
 const directoryChain = (directory: string): string[] => {
   const chain: string[] = [];
@@ -308,7 +308,7 @@ describe("#169 round 4 new-directory durability and async contract", () => {
 });
 
 describe("#169 round 3 durable atomic writes", () => {
-  it.each(["file", "json"])("orders %s barriers, fences registry custody, and leaves soft updates and mesh puts unsynced", async (kind) => {
+  it.each(["file", "json"])("orders %s barriers, preserves registry definitions, and leaves confirmed no-ops and mesh puts unsynced", async (kind) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-durable-"));
     const target = path.join(root, "record.json");
     const events: string[] = [];
@@ -342,7 +342,11 @@ describe("#169 round 3 durable atomic writes", () => {
       registry.write([{ id: "actor" }]);
       expect(synced).toHaveBeenCalled(); // New ownership is a correctness fence.
       synced.mockClear();
-      registry.write([{ id: "actor", status: "idle" }]);
+      registry.write([{ id: "actor", status: "idle" }], { durable: false });
+      expect(synced).toHaveBeenCalled(); // A status replacement still carries the authoritative definition.
+      synced.mockClear();
+      registry.write([{ id: "actor", status: "idle" }], { durable: false });
+      expect(synced).not.toHaveBeenCalled(); // Confirmed unchanged image is a true no-op.
       const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
       await mesh.put({ key: "hot/path", value: "ordinary", identity: { id: "test", name: "main", kind: "main" } });
       expect(synced).not.toHaveBeenCalled();

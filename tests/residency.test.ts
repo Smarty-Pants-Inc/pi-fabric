@@ -4,6 +4,7 @@ import { beforeEach } from "vitest";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { retainedProcessStates, retainedProcessWorker } from "./helpers/retained-process-worker.js";
 import fs from "node:fs";
+import * as atomic from "../src/core/atomic-write.js";
 import { completionConsumed } from "../src/agents/completion-journal.js";
 import os from "node:os";
 import path from "node:path";
@@ -120,7 +121,7 @@ interface RootHarness {
   config: ResidentHostConfig;
 }
 
-const rootHarness = async (name: string): Promise<RootHarness> => {
+const rootHarness = async (name: string, leaseMs = 300): Promise<RootHarness> => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fabric-${name}-`));
   roots.push(root);
   const meshRoot = path.join(root, "mesh");
@@ -138,7 +139,7 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
     rootId: identity.id,
     identity,
     heartbeatMs: 50,
-    leaseMs: 300,
+    leaseMs,
   });
   participants.registerSource(() => [{
     format: 1,
@@ -547,7 +548,9 @@ describe("resident setter Main authorization", () => {
 
 describe("saturated durable spawn receipt consistency (#181 F2)", () => {
   it("revokes accepted queued work before reporting failure through the provider", { timeout: 15_000 }, async () => {
-    const state = await rootHarness("resident-saturated");
+    // This test joins real children; it tests queue revocation, not lease expiry.
+    // Keep its live caller valid while main checks the binding at effect time.
+    const state = await rootHarness("resident-saturated", 10_000);
     state.config.agents = { ...state.config.agents, maxConcurrent: 1 };
     fs.mkdirSync(state.config.residencyRoot, { recursive: true });
     const configPath = path.join(state.config.residencyRoot, "config.json");
@@ -568,6 +571,7 @@ describe("saturated durable spawn receipt consistency (#181 F2)", () => {
     const spawned = vi.spyOn(AgentManager.prototype, "spawn");
     try {
       await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
+      await state.participants.refresh();
       const blocker = await client.spawnAgent({ task: "HANG", residency: "durable", transport: "process" });
       await expect(provider.invoke("spawn", { task: "rejected durable activation", residency: "durable", transport: "process" }, context))
         .rejects.toThrow(/no run directory|cannot queue durable spawns/);
@@ -580,6 +584,9 @@ describe("saturated durable spawn receipt consistency (#181 F2)", () => {
       expect(client.hasAgent(queued.id)).toBe(false);
       expect(client.listAgents().map((run) => run.id)).toEqual([blocker.id]);
       await hostManager.stop(blocker.id);
+      // Renew the real caller after joining the old child, before effect-time admission.
+      await state.participants.refresh();
+      expect(state.participants.get(state.identity.id, Date.now(), { fresh: true })?.stale).toBe(false);
       const successor = await client.spawnAgent({ task: "accepted after pool release", residency: "durable", transport: "process" });
       await expect(client.waitAgent(successor.id)).resolves.toMatchObject({ status: "completed" });
       expect(hostManager.runDirectory(queued.id)).toBeUndefined();
@@ -734,6 +741,46 @@ describe("durable completion receipts", () => {
     });
     return { id, result, runDirectory, metadataPath, key };
   };
+
+  it.skipIf(process.platform === "win32").each([
+    { restart: false, retry: true }, { restart: true, retry: true },
+    { restart: false, retry: false }, { restart: true, retry: false },
+  ])("S4 reconfirms visible consumption before retry or source retirement (restart: $restart, retry: $retry)", async ({ restart, retry }) => {
+    const state = await rootHarness(`consumption-confirm-${restart}`), seeded = await seedCompletion(state);
+    const consumed = vi.fn(), completed = vi.fn();
+    const options = { config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, onBackgroundComplete: completed, onResultConsumed: consumed };
+    let client = new ResidencyClient(options);
+    const files = new Map<number, string>(), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let unavailable = true, failures = 0;
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); files.set(fd, String(file)); return fd; });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (unavailable && files.get(fd) === path.dirname(seeded.metadataPath)) { failures++; throw new Error("consumption namespace unavailable"); }
+      sync(fd);
+    });
+    try {
+      if (restart) {
+        const configFile = path.join(state.root, "consumption-producer.json");
+        fs.writeFileSync(configFile, JSON.stringify(state.config));
+        const child = spawn("bun", [path.resolve("tests/fixtures/atomic-consumption-crash.ts"), configFile, seeded.id], { stdio: ["ignore", "pipe", "pipe"] });
+        let output = "", errors = "";
+        child.stdout.on("data", chunk => { output += chunk.toString(); }); child.stderr.on("data", chunk => { errors += chunk.toString(); });
+        const code = await new Promise<number | null>(resolve => child.once("exit", resolve));
+        expect(code, errors).toBe(0); expect(output).toContain("consumption namespace unavailable");
+      } else await expect(client.waitAgent(seeded.id)).rejects.toThrow("consumption namespace unavailable");
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeGreaterThan(0);
+      expect(consumed).not.toHaveBeenCalled();
+      if (restart) { await client.close(); client = new ResidencyClient(options); }
+      if (retry) expect(() => client.acknowledgeCompletion(seeded.id)).toThrow("consumption namespace unavailable");
+      client.start(); await delay(180);
+      expect(state.mesh.get(seeded.key, { fresh: true })).toBeDefined();
+      expect(failures).toBeGreaterThan(restart ? 0 : 1);
+      expect(consumed).not.toHaveBeenCalled();
+      unavailable = false;
+      await expect(client.waitAgent(seeded.id)).resolves.toMatchObject({ text: seeded.result.text });
+      expect(consumed).toHaveBeenCalledOnce();
+      await waitFor(() => state.mesh.get(seeded.key, { fresh: true }) === undefined);
+    } finally { unavailable = false; await client.close(); synced.mockRestore(); opened.mockRestore(); await state.participants.close(); }
+  });
 
   it.each(["wait", "join", "status"])("keeps a durable completion unread when terminal %s publication is rejected", async action => {
     const state = await rootHarness(`rejected-durable-${action}`);

@@ -4,7 +4,7 @@ import type { FabricPrincipal } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { ResidentReleaseIntent, ResidentLauncherIdentity } from "./handover.js";
 import { recordResidentOutcome, registerCancellationEffect } from "../async-settlement.js";
-import { readFileRetrying } from "../core/atomic-write.js";
+import { readFileRetrying, syncPathNamespace } from "../core/atomic-write.js";
 import fs from "node:fs";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { assertResidentRequestNotExpired, newResidentRequestId, residentRequestGeneration, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
@@ -88,12 +88,25 @@ const decideResidentRequest = (residencyRoot: string, decision: ResidentRequestD
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    fs.writeFileSync(temporary, JSON.stringify(decision), { mode: 0o600, flag: "wx" });
+    const fd = fs.openSync(temporary, "wx", 0o600);
+    try { fs.writeFileSync(fd, JSON.stringify(decision)); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
     try {
       fs.linkSync(temporary, file);
+      syncPathNamespace(file); // Fence is durable before either side may mutate/acknowledge.
       return true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        // The winner may have linked its record but failed (or still be awaiting)
+        // namespace confirmation. Confirm that exact inode, not mere existence.
+        const winner = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
+        try {
+          const inode = fs.fstatSync(winner);
+          fs.fsyncSync(winner);
+          syncPathNamespace(file, inode);
+        } finally { fs.closeSync(winner); }
+        return false;
+      }
       throw error; // Fail closed if the filesystem cannot provide the fence.
     }
   } finally {

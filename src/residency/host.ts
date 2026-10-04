@@ -21,7 +21,7 @@ import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin, type PiModelRegistryView } from "../core/model-refresh.js";
@@ -126,8 +126,8 @@ const testResidentRequestDelay = async (stage: "before_commit" | "after_commit")
   if (Number.isInteger(ms) && ms > 0 && ms <= 10_000) await delay(ms);
 };
 
-const atomicWrite = (filePath: string, value: unknown): void => {
-  writeJsonAtomic(filePath, value, { space: 2 });
+const atomicWrite = (filePath: string, value: unknown, durable = true): void => {
+  writeJsonAtomic(filePath, value, { space: 2, durable });
 };
 
 const residentActorRoots = (config: ResidentHostConfig): { project: string; session: string } =>
@@ -221,6 +221,12 @@ export class ResidentHost {
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
+  /** Renamed by this host, but not yet safe to execute. Never replay already executing work. */
+  readonly #unconfirmedPickups = new Set<string>();
+  /** Executed requests owe storage only; never route these through mutation pickup again. */
+  readonly #pendingResponses = new Map<string, ResidentCommandResponse>();
+  /** Replacement custody: read/reconfirm receipts only, never replay processing. */
+  readonly #interruptedRequests = new Set<string>();
   // Boundary commands retain response custody without occupying serial admission.
   readonly #boundaryRequests = new Map<string, Promise<void>>();
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
@@ -596,7 +602,7 @@ export class ResidentHost {
           handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
           ...(this.launch.attempt ? { attempt: this.launch.attempt } : {}) } : {}),
       };
-      atomicWrite(this.#ownerPath, owner);
+      atomicWrite(this.#ownerPath, owner, false); // Live-host identity; never an authority after reboot.
       fs.rmSync(this.#errorPath, { force: true });
       // The originating client may cancel this owned attempt until it sees the
       // required receipt. Commit it BEFORE opening any business gate or resuming
@@ -615,6 +621,10 @@ export class ResidentHost {
         });
         void this.#retryDeliveries();
       }
+      // Readiness transfers response custody to this live host, including requests
+      // queued before startup. Storage-only failures retain the existing retry timer.
+      // Keep archive maintenance on normal ticks, outside startup readiness.
+      await this.#backgroundRequests.run(() => this.#pollRequests(false));
     } catch (error) {
       await this.close();
       throw error;
@@ -891,11 +901,28 @@ export class ResidentHost {
     }
   }
 
-  async #pollRequests(): Promise<void> {
+  async #pollRequests(maintenance = true): Promise<void> {
     if (!this.#ready || this.#pollingRequests || this.#closed) return;
-    if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
+    if (this.#staged) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
+      for (const file of [...this.#interruptedRequests].slice(0, 32)) this.#recoverInterruptedResponse(file);
+      for (const [file, response] of [...this.#pendingResponses].slice(0, 32)) this.#publishResponse(file, response);
+      if (this.#handover) return;
+      // Retry only pickups this running host renamed but never executed. Startup
+      // recovery settles older processing entries without executing their mutations.
+      for (const entry of [...this.#unconfirmedPickups].slice(0, 32)) {
+        // These pickups owe execution, not just storage settlement. The prior
+        // request may have closed admission while awaited; retain custody.
+        if (this.#handover || this.#closed) break;
+        const processing = path.join(this.#processingPath, entry);
+        try {
+          syncPathNamespace(processing);
+          syncPathNamespace(this.#requestsPath);
+        } catch { continue; }
+        this.#unconfirmedPickups.delete(entry);
+        await this.#admitRequest(processing);
+      }
       let entries: string[];
       try {
         entries = fs.readdirSync(this.#requestsPath).filter((entry) => entry.endsWith(".json"));
@@ -910,30 +937,39 @@ export class ResidentHost {
         if (this.#boundaryRequests.has(processing)) continue;
         try {
           fs.renameSync(source, processing);
+          this.#unconfirmedPickups.add(entry);
+          syncPathNamespace(processing);
+          syncPathNamespace(path.dirname(source));
         } catch {
           continue;
         }
-        let releaseAdmission!: () => void;
-        let boundary = false;
-        const admitted = new Promise<void>(resolve => { releaseAdmission = resolve; });
-        const response = this.#processRequest(processing, () => {
-          // ActorManager installed its commit fence and boundary waiter (or stop
-          // intent) synchronously. Only settlement/publication may now run aside.
-          boundary = true;
-          releaseAdmission();
-        });
-        await Promise.race([response, admitted]);
-        if (boundary) {
-          this.#boundaryRequests.set(processing, response);
-          // Shutdown/handover retains custody until the terminal response is durable.
-          this.#trackPublication(response);
-          void response.finally(() => this.#boundaryRequests.delete(processing)).catch(() => undefined);
-        }
+        this.#unconfirmedPickups.delete(entry);
+        await this.#admitRequest(processing);
       }
     } finally {
       this.#pollingRequests = false;
-      this.#maintainRequests();
+      if (maintenance) this.#maintainRequests();
       this.#checkIdle();
+      if (this.#handover) await this.#advanceRelease();
+    }
+  }
+
+  async #admitRequest(processing: string): Promise<void> {
+    let releaseAdmission!: () => void;
+    let boundary = false;
+    const admitted = new Promise<void>(resolve => { releaseAdmission = resolve; });
+    const response = this.#processRequest(processing, () => {
+      // ActorManager installed its commit fence and boundary waiter (or stop
+      // intent) synchronously. Only settlement/publication may now run aside.
+      boundary = true;
+      releaseAdmission();
+    });
+    await Promise.race([response, admitted]);
+    if (boundary) {
+      this.#boundaryRequests.set(processing, response);
+      // Shutdown/handover retains custody until the terminal response is durable.
+      this.#trackPublication(response);
+      void response.finally(() => this.#boundaryRequests.delete(processing)).catch(() => undefined);
     }
   }
 
@@ -1164,6 +1200,12 @@ export class ResidentHost {
           ? { errorCode: error.code } : {}), completedAt: Date.now() };
     }
     if (response.ok) await testResidentRequestDelay("after_commit");
+    this.#pendingResponses.set(filePath, response);
+    this.#publishResponse(filePath, response);
+  }
+
+  #publishResponse(filePath: string, response: ResidentCommandResponse): void {
+    const requestId = response.requestId;
     const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
     writeJsonAtomic(responsePath, response, { durable: true });
     // An abandoned caller already left; clean late responses as well as processing files.
@@ -1171,6 +1213,7 @@ export class ResidentHost {
       fs.rmSync(responsePath, { force: true });
     }
     fs.rmSync(filePath, { force: true });
+    this.#pendingResponses.delete(filePath);
     this.participants.scheduleRefresh();
   }
 
@@ -1419,7 +1462,7 @@ export class ResidentHost {
   #writeRemovals(): void {
     const removals = this.actors.pendingRemovals();
     if (removals.length === 0) fs.rmSync(this.#removalsPath, { force: true });
-    else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals });
+    else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals }, false); // Registry is authoritative.
   }
 
   #recoverInterruptedRequests(): void {
@@ -1429,23 +1472,42 @@ export class ResidentHost {
     } catch {
       return;
     }
-    for (const entry of entries) {
-      const requestId = path.basename(entry, ".json");
-      if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
-        fs.rmSync(path.join(this.#processingPath, entry), { force: true });
-        fs.rmSync(path.join(this.#responsesPath, entry), { force: true });
-        continue;
-      }
-      const response: ResidentCommandResponse = {
+    for (const entry of entries) this.#interruptedRequests.add(path.join(this.#processingPath, entry));
+  }
+
+  #recoverInterruptedResponse(filePath: string): void {
+    const requestId = path.basename(filePath, ".json");
+    const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
+    if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+      fs.rmSync(filePath, { force: true });
+      fs.rmSync(responsePath, { force: true });
+      this.#interruptedRequests.delete(filePath);
+      return;
+    }
+    let saved: ResidentCommandResponse | undefined;
+    try {
+      saved = JSON.parse(fs.readFileSync(responsePath, "utf8")) as ResidentCommandResponse;
+    } catch (error) {
+      // Unreadable is not absent: retain the read obligation instead of overwriting
+      // a potentially recoverable receipt when storage is temporarily unavailable.
+      if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const response: ResidentCommandResponse = saved?.format === RESIDENT_HOST_FORMAT &&
+      saved.requestId === requestId && typeof saved.ok === "boolean" &&
+      Number.isSafeInteger(saved.completedAt) && saved.completedAt >= 0 &&
+      (saved.pending === undefined || typeof saved.pending === "string")
+      ? saved : {
         format: RESIDENT_HOST_FORMAT,
         requestId,
         ok: false,
         error: "Fabric residency outcome is indeterminate after resident host restart",
         completedAt: Date.now(),
       };
-      atomicWrite(path.join(this.#responsesPath, entry), response);
-      fs.rmSync(path.join(this.#processingPath, entry), { force: true });
-    }
+    // Transfer custody BEFORE any throwing publication/retirement. The shared
+    // poll reconfirms this exact response durably, then retires processing; failure
+    // remains a storage-only retry on this host and on its next replacement.
+    this.#pendingResponses.set(filePath, response);
+    this.#interruptedRequests.delete(filePath);
   }
 
   async #acquireLock(): Promise<void> {
@@ -1623,7 +1685,7 @@ export const runResidentHostFromConfigPath = async (
         occurredAt: Date.now(),
         launcherPid: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? process.ppid : undefined,
         launcherBirth: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? processStartTime(process.ppid) : undefined,
-      });
+      }, false);
     } catch {
       // Startup diagnostics are best-effort.
     }

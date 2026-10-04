@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as recoveryPolicy from "../src/residency/handover.js";
+import * as atomic from "../src/core/atomic-write.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -20,7 +21,7 @@ import {
   type ResidentHandoverState, type ResidentLauncherIdentity,
 } from "../src/residency/handover.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
-import type { ResidentHostConfig, ResidentHostOwner } from "../src/residency/protocol.js";
+import { assertResidentTaskCaller, readResidentRequestDecision, type ResidentHostConfig, type ResidentHostOwner } from "../src/residency/protocol.js";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 async function until(predicate: () => boolean, timeout = 7_000): Promise<void> {
@@ -108,6 +109,81 @@ async function fixture(protocolOnly = true) {
 }
 
 describe.skipIf(process.platform !== "linux")("resident release plan and idle-point custody", () => {
+  it.each(["shutdown", "release"] as const)("S6 rechecks %s admission between two never-executed pickup retries", async gate => {
+    const f = await fixture();
+    const requests = path.join(f.config.residencyRoot, "requests"), processing = path.join(f.config.residencyRoot, "processing"), responses = path.join(f.config.residencyRoot, "responses");
+    const secondId = "z-after-admission-revoked", secondFile = path.join(processing, `${secondId}.json`);
+    const failed = new Set<string>();
+    let unavailable = true, firstHeld = false, releaseFirst!: () => void;
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const namespace = atomic.syncPathNamespace;
+    const barrier = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+      if (unavailable && path.dirname(file) === processing && file.endsWith(".json")) {
+        failed.add(path.basename(file, ".json")); throw new Error("S6 pickup namespace unavailable");
+      }
+      namespace(file, inode);
+    });
+    const create = f.host.actors.create.bind(f.host.actors);
+    const created = vi.spyOn(f.host.actors, "create").mockImplementation(async (...args) => {
+      const actor = await create(...args);
+      if (gate === "shutdown") { firstHeld = true; await firstGate; }
+      return actor;
+    });
+    const spawned = vi.spyOn(f.host.agents, "spawn"), launched = vi.spyOn(ProcessTransport.prototype, "launch");
+    let closing: Promise<void> | undefined, reconciling: Promise<void> | undefined;
+    try {
+      if (gate === "shutdown") {
+        fs.writeFileSync(path.join(requests, "a-first.json"), JSON.stringify({ format: 1, requestId: "a-first", rootId: f.config.rootId,
+          operation: "createActor", createdAt: Date.now(), request: { name: "first retry", instructions: "Work", residency: "durable" } }));
+      } else {
+        reconciling = f.client.reconcileRelease();
+      }
+      // Force insertion order in the live host's retry custody, not directory order.
+      await until(() => failed.size === 1);
+      const firstId = [...failed][0]!;
+      const self = f.participants.self();
+      const caller = { id: self.id, rootId: self.rootId, sessionId: self.sessionId!, ownerHostId: self.ownerHostId,
+        ownerIdentityId: self.ownerIdentityId, kind: self.kind, returnAddress: {
+          spawnerId: self.id, spawnerSessionId: self.sessionId!, ancestors: [f.config.rootId], escalationTargets: [],
+        } };
+      // This second request would pass the same live participant check used by spawnBound.
+      expect(() => assertResidentTaskCaller(caller, f.host.participants.get(self.id, Date.now(), { fresh: true }), f.config.rootId)).not.toThrow();
+      fs.writeFileSync(path.join(requests, `${secondId}.json`), JSON.stringify({ format: 1, requestId: secondId, rootId: f.config.rootId,
+        operation: "spawnBound", createdAt: Date.now(), caller, request: { task: "must not launch after admission revoked", transport: "process" } }));
+      await until(() => failed.has(secondId));
+      expect(fs.existsSync(path.join(processing, `${firstId}.json`))).toBe(true);
+      expect(fs.existsSync(secondFile)).toBe(true);
+      expect(created).not.toHaveBeenCalled(); expect(spawned).not.toHaveBeenCalled(); expect(launched).not.toHaveBeenCalled();
+      expect(readResidentRequestDecision(f.config.residencyRoot, secondId)).toBeUndefined();
+      unavailable = false;
+      if (gate === "shutdown") {
+        await until(() => firstHeld);
+        closing = f.host.close(); // Revokes host admission while the first retry owns the poll.
+        releaseFirst();
+        await closing;
+        expect(created).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(fs.readFileSync(path.join(responses, `${firstId}.json`), "utf8"))).toMatchObject({ ok: true });
+      } else {
+        await reconciling;
+        await until(() => !!f.state());
+        await sleep(150); // Includes later polls: handover must keep the second pickup parked.
+      }
+      expect(spawned).not.toHaveBeenCalled(); expect(launched).not.toHaveBeenCalled();
+      expect(readResidentRequestDecision(f.config.residencyRoot, secondId)).toBeUndefined();
+      expect(fs.existsSync(secondFile)).toBe(true);
+      expect(fs.existsSync(path.join(responses, `${secondId}.json`))).toBe(false);
+      expect(f.host.agents.listForUi()).toHaveLength(0);
+      if (gate === "release") expect(f.state()?.phase).toBe("preparing");
+    } finally {
+      unavailable = false; releaseFirst();
+      await closing;
+      // Dispose the release caller before joining its request if an earlier assertion failed.
+      await f.client.close(); await reconciling?.catch(() => undefined);
+      barrier.mockRestore(); created.mockRestore(); spawned.mockRestore(); launched.mockRestore();
+      await f.close();
+    }
+  }, 20_000);
+
   it.each(["broken-B", "disposed-Main"] as const)("defers %s before A exits and serves the same acknowledged queue on A", async kind => {
     const f = await fixture(false);
     try {

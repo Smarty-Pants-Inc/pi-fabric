@@ -17,6 +17,7 @@ import {
   runTreeResourceVeto,
   markUnresolvedWorker,
   pruneActorRunArchives,
+  pruneActorSessionBackups,
   compactTerminalRunEvents,
   RUN_ROOT_SWEEP_MARKER,
   sweepTempRunRoots,
@@ -43,6 +44,20 @@ const writeStatus = (
 afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
+
+it("preserves session backups until a pending archive receipt is retired", () => {
+  const root = temporaryDirectory(), session = path.join(root, "session.jsonl");
+  const backups = ["20260927T150000000Z", "20260927T150000001Z", "20260927T150000002Z"]
+    .map(stamp => `${session}.${stamp}.bak`);
+  for (const file of backups) fs.writeFileSync(file, "native transcript\n");
+  fs.writeFileSync(`${session}.archive-pending.json`, "unconfirmed archive receipt");
+  expect(pruneActorSessionBackups(session)).toEqual([]);
+  expect(backups.every(file => fs.existsSync(file))).toBe(true);
+  fs.rmSync(`${session}.archive-pending.json`);
+  expect(pruneActorSessionBackups(session)).toEqual(backups.slice(0, -1));
+  expect(backups.map(file => fs.existsSync(file))).toEqual([false, false, true]);
+});
+
 
 describe("persistent archive custody", () => {
   it("retains full terminal event sources until archive commit, then permits main compaction", () => {
@@ -618,7 +633,7 @@ describe("temporal retention", () => {
     expect(result).toEqual({ removedRoots: [], removedRuns: [] });
     expect(fs.existsSync(path.join(orphaned, "lost"))).toBe(true);
     expect(fs.existsSync(path.join(closed, "lost"))).toBe(true);
-    // Marker absence is not an external worker exit receipt. Preserve those trees.
+    // Marker absence is not an exit proof: its publication may have failed.
     for (const runRoot of [orphaned, closed]) fs.rmSync(path.join(runRoot, "lost", "unresolved-worker.json"));
     expect(sweep(tempRoot)).toEqual({ removedRoots: [], removedRuns: [] });
     for (const runRoot of [orphaned, closed]) {

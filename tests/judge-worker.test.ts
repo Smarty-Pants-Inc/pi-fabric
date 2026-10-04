@@ -92,7 +92,7 @@ describe("retained owned judgment receipts", () => {
     const recovered = fs.readFileSync(deps.ledger, "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(recovered.filter(row => row.type === "outcome")).toEqual([expect.objectContaining({ decisionId: result.decisionId, tokens: expect.objectContaining({ input: 1, output: 2 }) })]);
   });
-  it.each([true, false])("preserves an unconfirmed exit with marker write failure=%s", async markerFailure => {
+  it.each(["none", "open", "write", "sync", "rename"] as const)("preserves an unconfirmed exit with unresolved-worker marker failure=%s", async failure => {
     let owner!: AgentManager;
     const spawn = AgentManager.prototype.spawn;
     vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(function (this: AgentManager, ...args) { owner = this; return spawn.apply(this, args); });
@@ -101,10 +101,39 @@ describe("retained owned judgment receipts", () => {
       const handle = await launch.call(this, args);
       return { ...handle, lostContact: () => "probe: exit confirmation unavailable" };
     });
+    // Durable atomic writes use a descriptor, not a path, for writeFileSync.
+    // Bind faults to the marker's temporary file so the failure cannot silently
+    // disappear when the writer switches between path and descriptor APIs.
+    const markerDescriptors = new Set<number>();
+    const isMarker = (file: unknown) => typeof file === "string" && path.basename(file).startsWith("unresolved-worker.json.");
+    let failures = 0;
+    const fail = () => { failures++; throw new Error(`marker ${failure} failed`); };
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      if (isMarker(file) && failure === "open") fail();
+      const fd = open(file, flags, mode);
+      if (isMarker(file)) markerDescriptors.add(fd);
+      return fd;
+    });
+    const close = fs.closeSync;
+    vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+      markerDescriptors.delete(fd);
+      return close(fd);
+    });
     const write = fs.writeFileSync;
-    vi.spyOn(fs, "writeFileSync").mockImplementation((file: any, data: any, opts: any) => {
-      if (markerFailure && typeof file === "string" && file.includes("unresolved-worker")) throw new Error("marker write failed");
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, opts) => {
+      if (failure === "write" && (isMarker(file) || (typeof file === "number" && markerDescriptors.has(file)))) fail();
       return write(file, data, opts);
+    });
+    const sync = fs.fsyncSync;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (failure === "sync" && markerDescriptors.has(fd)) fail();
+      return sync(fd);
+    });
+    const rename = fs.renameSync;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (failure === "rename" && isMarker(from)) fail();
+      return rename(from, to);
     });
     deps.agent = (r, limits, signal) => runJudgmentAgent(r, limits, signal, { piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs") });
     const result = await judge(input(), deps);
@@ -113,7 +142,11 @@ describe("retained owned judgment receipts", () => {
     expect(attempt).toMatchObject({ childAgentId: expect.any(String), status: "failed", usage: { input: 1, output: 2 } });
     const run = owner.runDirectory(attempt.childAgentId)!;
     ownedRoots.push(path.dirname(path.dirname(run)));
-    expect(fs.existsSync(path.join(run, "unresolved-worker.json"))).toBe(!markerFailure);
+    if (failure === "none") expect(failures).toBe(0);
+    else expect(failures).toBeGreaterThan(0);
+    expect(markerDescriptors.size).toBe(0);
+    expect(fs.existsSync(path.join(run, "unresolved-worker.json"))).toBe(failure === "none");
+    expect(fs.readdirSync(run).some(file => file.startsWith("unresolved-worker.json."))).toBe(false);
     expect(result).toMatchObject({ verdict: "unknown", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 5 } });
     expect(fs.existsSync(path.join(run, "status.json"))).toBe(true);
     expect(fs.existsSync(path.join(run, "route-session.jsonl"))).toBe(true);
@@ -124,7 +157,9 @@ describe("retained owned judgment receipts", () => {
     await expect(owner.wait(attempt.childAgentId, { timeoutMs: 20 })).rejects.toThrow(/still running/);
     await expect(owner.stop(attempt.childAgentId)).rejects.toThrow(/execution exit unconfirmed/);
     await expect(owner.cleanup(attempt.childAgentId)).rejects.toThrow("running agent");
+    await expect(owner.cleanup(attempt.childAgentId, true)).rejects.toThrow("running agent");
     await expect(owner.close()).rejects.toThrow(/execution exit unconfirmed/);
+    expect(fs.existsSync(path.join(run, "status.json"))).toBe(true);
   });
   it("records unknown-launch custody even before a worker status receipt exists", async () => {
     let owner!: AgentManager;

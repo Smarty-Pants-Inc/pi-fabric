@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -38,6 +39,15 @@ function setup(cursor?: string) {
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 
 describe("ActorMeshMonitor", () => {
+  it("#2479 durably checkpoints replay progress", async () => {
+    const s = setup();
+    const write = vi.spyOn(atomic, "writeJsonAtomic");
+    s.monitor.start(); await flush(); s.monitor.close();
+    const calls = write.mock.calls.filter(([file]) => file === s.cursorPath);
+    expect(calls.length).toBeGreaterThan(0);
+    for (const [, , options] of calls) expect(options?.durable).toBe(true);
+  });
+
   it("3864 holds the event boundary when the lease is lost during dispatch", async () => {
     const s = setup('{"format":1,"cursor":3}');
     let leased = true;

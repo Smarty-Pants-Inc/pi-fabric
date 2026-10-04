@@ -4,6 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
+import { ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -18,8 +20,8 @@ import { lockFile } from "../src/residency/file-lock.js";
 import * as fileLock from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
-import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
+import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -648,6 +650,248 @@ describe("resident retention config reload", () => {
 });
 
 describe("resident tracked result preservation", () => {
+  it("#2479 R3 S5 startup retains the completed response custodian after a file barrier failure", async () => {
+    const { root, config, host } = fixture();
+    const requestId = "startup-response", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    fs.mkdirSync(path.join(config.residencyRoot, "requests"));
+    fs.writeFileSync(path.join(config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({ format: 1, requestId, operation: "createActor", rootId: config.rootId, createdAt: Date.now(), request: { name: "startup retry", instructions: "Work", residency: "durable" } }));
+    const files = new Map<number, string>(), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let unavailable = true, failures = 0, original: unknown;
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); files.set(fd, String(file)); return fd; });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = files.get(fd) ?? "";
+      if (unavailable && file.startsWith(response + ".") && file.endsWith(".tmp")) { original = JSON.parse(fs.readFileSync(file, "utf8")); failures++; throw new Error("startup response barrier unavailable"); }
+      sync(fd);
+    });
+    const create = vi.spyOn(ActorManager.prototype, "create"), close = vi.spyOn(host, "close");
+    try {
+      await expect(host.start()).resolves.toBeUndefined();
+      expect(failures).toBeGreaterThan(0); expect(create).toHaveBeenCalledTimes(1); expect(close).not.toHaveBeenCalled();
+      expect(fs.existsSync(processing)).toBe(true); expect(fs.existsSync(response)).toBe(false);
+      await delay(150); expect(create).toHaveBeenCalledTimes(1);
+      unavailable = false;
+      for (let n = 0; (!fs.existsSync(response) || fs.existsSync(processing)) && n < 500; n++) await delay(10);
+      expect(JSON.parse(fs.readFileSync(response, "utf8"))).toEqual(original);
+      expect(original).toMatchObject({ ok: true, requestId, actor: { id: host.actors.listOwned()[0]!.id } });
+      expect(fs.existsSync(processing)).toBe(false); expect(create).toHaveBeenCalledTimes(1); expect(close).not.toHaveBeenCalled();
+    } finally { unavailable = false; synced.mockRestore(); opened.mockRestore(); create.mockRestore(); close.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 15000);
+
+  it.each(["missing", "malformed", "wrong-format", "wrong-id", "wrong-ok", "wrong-time", "wrong-pending", "saved-error"] as const)("S7/F28 validates replacement receipt: %s", async (receipt) => {
+    const { root, config, host } = fixture();
+    const requestId = "recovery-receipt", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    fs.mkdirSync(path.dirname(processing)); fs.mkdirSync(path.dirname(response));
+    fs.writeFileSync(processing, JSON.stringify({ format: 1, requestId, rootId: config.rootId, operation: "createActor", createdAt: Date.now(), request: { name: "never replay", instructions: "Work" } }));
+    const saved = { format: 1, requestId, ok: false, error: "original refusal", completedAt: Date.now() - 100 };
+    if (receipt !== "missing") fs.writeFileSync(response, receipt === "malformed" ? "{" : JSON.stringify({ ...saved,
+      ...(receipt === "wrong-format" ? { format: 2 } : {}), ...(receipt === "wrong-id" ? { requestId: "other" } : {}),
+      ...(receipt === "wrong-ok" ? { ok: "false" } : {}), ...(receipt === "wrong-time" ? { completedAt: -1 } : {}),
+      ...(receipt === "wrong-pending" ? { pending: {} } : {}),
+    }));
+    const create = vi.spyOn(ActorManager.prototype, "create");
+    try {
+      await host.start();
+      const recovered = JSON.parse(fs.readFileSync(response, "utf8"));
+      if (receipt === "saved-error") expect(recovered).toEqual(saved);
+      else expect(recovered).toMatchObject({ format: 1, requestId, ok: false, error: "Fabric residency outcome is indeterminate after resident host restart" });
+      expect(fs.existsSync(processing)).toBe(false); expect(create).not.toHaveBeenCalled();
+    } finally { create.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("S7/F28 unreadable replacement receipt stays retryable without synthesizing indeterminate", async () => {
+    const { root, config, host } = fixture();
+    const requestId = "unreadable-receipt", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    fs.mkdirSync(path.dirname(processing)); fs.mkdirSync(path.dirname(response));
+    fs.writeFileSync(processing, JSON.stringify({ format: 1, requestId, rootId: config.rootId, operation: "createActor", createdAt: Date.now(), request: { name: "never replay", instructions: "Work" } }));
+    const saved = { format: 1, requestId, ok: false, error: "original refusal", completedAt: Date.now() - 100 };
+    fs.writeFileSync(response, JSON.stringify(saved));
+    const read = fs.readFileSync.bind(fs), create = vi.spyOn(ActorManager.prototype, "create");
+    let unavailable = true, failures = 0;
+    const reading = vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+      if (unavailable && String(args[0]) === response) { failures++; throw Object.assign(new Error("receipt read unavailable"), { code: "EIO" }); }
+      return read(...args);
+    });
+    try {
+      await expect(host.start()).resolves.toBeUndefined();
+      await delay(150);
+      expect(failures).toBeGreaterThan(1); expect(fs.existsSync(processing)).toBe(true);
+      expect(JSON.parse(read(response, "utf8"))).toEqual(saved); expect(create).not.toHaveBeenCalled();
+      unavailable = false;
+      for (let n = 0; fs.existsSync(processing) && n < 500; n++) await delay(10);
+      expect(fs.existsSync(processing)).toBe(false);
+      expect(JSON.parse(read(response, "utf8"))).toEqual(saved); expect(create).not.toHaveBeenCalled();
+    } finally { unavailable = false; reading.mockRestore(); create.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 15_000);
+
+  it.each([false, true])("S7/F28 process replacement preserves published success (reconfirmation unavailable: %s)", async (failConfirmation) => {
+    const { root, config } = fixture();
+    config.residencyRoot = residentRoot(config.meshRoot, config.rootId);
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    const configPath = path.join(config.residencyRoot, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify(config));
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/resident-response-retirement-crash.mjs"), configPath, root], { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = ""; child.stderr.on("data", chunk => { stderr += String(chunk); });
+    const exited = new Promise<{ code: number | null; signal: string | null }>((resolve, reject) => { child.once("error", reject); child.once("close", (code, signal) => resolve({ code, signal })); });
+    const replacement = new ResidentHost(config);
+    const create = vi.spyOn(ActorManager.prototype, "create");
+    const read = fs.readFileSync.bind(fs), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    const files = new Map<number, string>();
+    let holdCaller = true, unavailable = failConfirmation, failures = 0;
+    // Keep the original live caller from consuming before the replacement boundary.
+    // Only its response reads are gated; recovery reads the actual saved receipt.
+    const reading = vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+      if (holdCaller && String(args[0]).includes(`${path.sep}responses${path.sep}`) && new Error().stack?.includes("actor-client")) throw new Error("caller consumption held");
+      return read(...args);
+    });
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); files.set(fd, String(file)); return fd; });
+    const syncing = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = files.get(fd) ?? "";
+      if (unavailable && file.includes(`${path.sep}responses${path.sep}`) && file.endsWith(".tmp")) { failures++; throw new Error("replacement response confirmation unavailable"); }
+      sync(fd);
+    });
+    let result: Promise<unknown> | undefined;
+    try {
+      for (let n = 0; !fs.existsSync(path.join(root, "ready")) && n < 1000; n++) {
+        if (child.exitCode !== null) throw new Error(`producer exited: ${stderr}`);
+        await delay(10);
+      }
+      expect(fs.existsSync(path.join(root, "ready")), stderr).toBe(true);
+      result = new ResidentActorClient(config.meshRoot, config.rootId, 15_000).createActor({ name: "replacement receipt", instructions: "Work", residency: "durable" }).catch(error => error);
+      expect(await exited, stderr).toEqual({ code: 0, signal: null });
+      const original = JSON.parse(read(path.join(root, "original.json"), "utf8"));
+      expect(original).toMatchObject({ ok: true, actor: { name: "replacement receipt" } });
+      const processing = path.join(config.residencyRoot, "processing", `${original.requestId}.json`);
+      const response = path.join(config.residencyRoot, "responses", `${original.requestId}.json`);
+      expect(fs.existsSync(processing)).toBe(true);
+      await expect(replacement.start()).resolves.toBeUndefined();
+      if (failConfirmation) {
+        expect(failures).toBeGreaterThan(0);
+        await delay(150);
+        expect(fs.existsSync(processing)).toBe(true);
+        expect(JSON.parse(read(response, "utf8"))).toEqual(original);
+        unavailable = false;
+      }
+      for (let n = 0; fs.existsSync(processing) && n < 500; n++) await delay(10);
+      expect(fs.existsSync(processing)).toBe(false);
+      expect(JSON.parse(read(response, "utf8"))).toEqual(original);
+      holdCaller = false;
+      expect(await result).toEqual(original.actor);
+      expect(read(path.join(root, "mutations.txt"), "utf8").trim().split("\n")).toEqual(["createActor"]);
+      expect(create).not.toHaveBeenCalled();
+      expect(replacement.actors.listOwned().map(actor => actor.id)).toEqual([original.actor.id]);
+    } finally {
+      holdCaller = false; unavailable = false;
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      await exited; await replacement.close();
+      await result;
+      syncing.mockRestore(); opened.mockRestore(); reading.mockRestore(); create.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it.each(process.platform === "win32" ? ["file", "retirement"] as const : ["file", "namespace", "retirement"] as const)("S5 retries completed response %s storage without repeating the mutation", async fault => {
+    const { root, config, host } = fixture();
+    const requestId = "response-retry", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    const files = new Map<number, string>(), open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), rm = fs.rmSync.bind(fs);
+    let unavailable = true, failures = 0;
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); files.set(fd, String(file)); return fd; });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const file = files.get(fd) ?? "";
+      const target = fault === "file" ? file.startsWith(response + ".") && file.endsWith(".tmp") : fault === "namespace" && file === path.dirname(response);
+      if (unavailable && target) { failures++; throw new Error("response barrier unavailable"); }
+      sync(fd);
+    });
+    const removed = vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (unavailable && fault === "retirement" && String(file) === processing) { failures++; throw new Error("response retirement unavailable"); }
+      rm(file, options);
+    });
+    let create: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await host.start(); create = vi.spyOn(host.actors, "create");
+      fs.writeFileSync(path.join(config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({ format: 1, requestId, operation: "createActor", rootId: config.rootId, createdAt: Date.now(), request: { name: "response retry", instructions: "Work", residency: "durable" } }));
+      for (let n = 0; failures === 0 && n < 400; n++) await delay(10);
+      expect(failures).toBeGreaterThan(0); expect(create).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(processing)).toBe(true);
+      const created = host.actors.listOwned()[0]!.id;
+      await delay(250); expect(create).toHaveBeenCalledTimes(1);
+      unavailable = false;
+      for (let n = 0; (!fs.existsSync(response) || fs.existsSync(processing)) && n < 500; n++) await delay(10);
+      expect(fs.existsSync(response)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(response, "utf8"))).toMatchObject({ ok: true, requestId, actor: { id: created } });
+      expect(fs.existsSync(processing)).toBe(false); expect(create).toHaveBeenCalledTimes(1);
+    } finally { unavailable = false; removed.mockRestore(); synced.mockRestore(); opened.mockRestore(); create?.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 15_000);
+
+  it.each(["processing", "requests"] as const)("#2479 R3 F4 retries the failed %s pickup barrier in the same live host before mutation or ack", async (failedDirectory) => {
+    const { root, config, host } = fixture();
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    const requestId = "pickup-retry", processing = path.join(config.residencyRoot, "processing", `${requestId}.json`), response = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    let unavailable = true, failures = 0;
+    const actualNamespace = atomic.syncPathNamespace;
+    const barrier = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+      if (file === (failedDirectory === "processing" ? processing : path.join(config.residencyRoot, "requests"))) {
+        if (unavailable) { failures++; throw new Error("pickup barrier unavailable"); }
+      }
+      actualNamespace(file, inode);
+    });
+    let create: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await host.start();
+      create = vi.spyOn(host.actors, "create");
+      fs.writeFileSync(path.join(config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({ format: 1, requestId, operation: "createActor", rootId: config.rootId, createdAt: Date.now(), request: { name: "pickup retry", instructions: "Work", residency: "durable" } }));
+      for (let n = 0; failures === 0 && n < 100; n++) await delay(10);
+      expect(failures).toBeGreaterThan(0);
+      expect(fs.existsSync(processing)).toBe(true);
+      await delay(120);
+      expect(create).not.toHaveBeenCalled();
+      expect(fs.existsSync(response)).toBe(false);
+      unavailable = false;
+      for (let n = 0; !fs.existsSync(response) && n < 400; n++) await delay(10);
+      expect(fs.existsSync(response)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(response, "utf8"))).toMatchObject({ ok: true, requestId });
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(processing)).toBe(false);
+    } finally { barrier.mockRestore(); create?.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+  }, 15_000);
+  it("#2479 requests durable config, requests, metadata, responses, saved results and consumption receipts", async () => {
+    const { root, config } = fixture();
+    config.residencyRoot = residentRoot(config.meshRoot, config.rootId);
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.agents = { ...config.agents, budgetUsd: 0 };
+    config.piModels = { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" };
+    const host = new ResidentHost(config, vi.fn());
+    // Public spawn needs a live session caller, not the hidden resident executor.
+    const callerIdentity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+    const callerMesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    const callerParticipants = new ParticipantDirectory(callerMesh, {
+      enabled: true, hostId: config.rootId, rootId: config.rootId, identity: callerIdentity,
+    });
+    callerParticipants.registerSource(() => [{
+      format: 1, id: config.rootId, rootId: config.rootId, kind: "root", name: "Main", status: "idle",
+      ownerHostId: config.rootId, ownerIdentityId: config.rootId, sessionId: config.sessionId,
+      runner: "pi", transport: "host", capabilities: ["fabric"], controlProtocol: "v1",
+      startedAt: Date.now(), updatedAt: Date.now(),
+    }]);
+    let client: ResidencyClient | undefined;
+    const write = vi.spyOn(atomic, "writeJsonAtomic");
+    try {
+      await callerParticipants.start();
+      await host.start();
+      client = new ResidencyClient({ config, mesh: callerMesh, participants: callerParticipants, mainAgent: { local: false } as FabricMainAgentTarget });
+      await new ResidentActorClient(config.meshRoot, config.rootId).actors(AbortSignal.timeout(5_000));
+      const handle = await client.spawnAgent({ task: "audit", transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
+      await host.agents.wait(handle.id, { timeoutMs: 5_000 });
+      await client.waitAgent(handle.id, AbortSignal.timeout(5_000));
+      for (const name of ["config.json", "requests", "agents", "responses", "results"]) {
+        const calls = write.mock.calls.filter(([file]) => file.startsWith(config.residencyRoot) && (name.endsWith(".json") ? file.endsWith(name) : file.includes(`${path.sep}${name}${path.sep}`)));
+        expect(calls.length, name).toBeGreaterThan(0);
+        for (const [, , options] of calls) expect(options?.durable, name).toBe(true);
+      }
+      const receipts = write.mock.calls.filter(([, value]) => typeof value === "object" && value !== null && "completionConsumedAt" in value);
+      expect(receipts.length).toBeGreaterThan(0);
+    } finally { await client?.close(); await host.close(); await callerParticipants.close(); write.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 15_000);
   it.each(["native", "win32-injected"] as const)("releases the host fence and closes delivery/participant work even if agent close fails (%s)", async (platformCase) => {
     const { root, config, host } = fixture();
     const successor = new ResidentHost(config);

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -48,6 +49,7 @@ const setup = (options: {
   }, {
     actorRoot: path.join(root, "actors"),
     persistent: true,
+    preparationRetryMs: 25,
     ...(options.maxSessionBytes !== undefined ? { maxSessionBytes: options.maxSessionBytes } : {}),
     ...(options.canManageActor ? { canManageActor: options.canManageActor } : {}),
     ...(options.resolvePiModel ? { resolvePiModel: options.resolvePiModel } : {}),
@@ -95,6 +97,278 @@ afterEach(async () => {
 });
 
 describe("actor session rotation safety (smarty-dev#2847)", () => {
+  it.each(["archive", "registry"] as const)("#2479 R3 F26 finishes a Claude size reset after failed %s confirmation", async fault => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "claude-reset-")); roots.push(root);
+    const invocationLog = path.join(root, "claude.jsonl"), previousLog = process.env.FAKE_CLAUDE_LOG;
+    process.env.FAKE_CLAUDE_LOG = invocationLog;
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("src/worker.ts"), claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), runRoot: path.join(root, "runs"),
+    });
+    const actors = new ActorManager("claude-reset", { id: "session:claude-reset", name: "main", kind: "main" },
+      new MeshStore(path.join(root, "mesh"), 65536, 100), { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+      { actorRoot: path.join(root, "actors"), persistent: true, maxSessionBytes: 64, preparationRetryMs: 25 });
+    managers.push(actors, agents);
+    const launch = vi.spyOn(agents, "run"), namespace = atomic.syncPathNamespace, write = atomic.AtomicFileWriter.prototype.write;
+    let unavailable = true, failures = 0, archived: string | undefined;
+    try {
+      const actor = await actors.create({ name: "native size reset", instructions: "Work.", residency: "durable", runner: "claude", model: "claude/haiku", transport: "process" });
+      await actors.ask(actor.id, "first native context"); await waitFor(() => actors.inFlightCount() === 0, 15000);
+      const registry = path.join(root, "actors", "actors.json"), pending = `${actor.sessionFile}.archive-pending.json`;
+      expect(JSON.parse(fs.readFileSync(registry, "utf8")).actors[0].runnerSessionId).toBe("11111111-1111-4111-8111-111111111111");
+      expect(fs.statSync(actor.sessionFile!).size).toBeGreaterThan(64);
+      const contents = fs.readFileSync(actor.sessionFile!, "utf8");
+      const prior = ["20000101T000000000Z", "20000102T000000000Z", "20000103T000000000Z"].map(stamp => `${actor.sessionFile}.${stamp}.bak`);
+      for (const file of prior) fs.copyFileSync(actor.sessionFile!, file);
+      vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+        if (file.startsWith(`${actor.sessionFile}.`) && file.endsWith(".bak")) {
+          archived = file;
+          if (unavailable && fault === "archive") { failures++; throw new Error("archive reset confirmation unavailable"); }
+        }
+        namespace(file, inode);
+      });
+      vi.spyOn(atomic.AtomicFileWriter.prototype, "write").mockImplementation(function(this: atomic.AtomicFileWriter, contents, options) {
+        if (this.file === registry && archived && unavailable && fault === "registry") { failures++; throw new Error("reset registry unavailable"); }
+        return write.call(this, contents, options);
+      });
+      actors.tell(actor.id, "after native reset");
+      await waitFor(() => failures > 0, 15000); await new Promise(resolve => setTimeout(resolve, 150));
+      expect(launch).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(pending)).toBe(true);
+      expect(prior.every(file => fs.existsSync(file))).toBe(true);
+      unavailable = false;
+      await waitFor(() => launch.mock.calls.length === 2 && actors.inFlightCount() === 0, 15000);
+      expect(launch.mock.calls[1]![0].runnerSessionId).toBeUndefined();
+      const invocations = fs.readFileSync(invocationLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(invocations).toHaveLength(2); expect(invocations[1].argv).not.toContain("--resume");
+      expect(fs.existsSync(pending)).toBe(false);
+      expect(fs.readFileSync(archived!, "utf8")).toBe(contents);
+      expect(backups(actor.sessionFile!)).toHaveLength(1);
+    } finally { unavailable = false; if (previousLog === undefined) delete process.env.FAKE_CLAUDE_LOG; else process.env.FAKE_CLAUDE_LOG = previousLog; }
+  }, 40000);
+
+  it.each(["size", "requested"] as const)("#2479 R2 F6 blocks %s boundary continuation until the complete archive receipt is confirmed", async (trigger) => {
+    const { actors, runs, hold } = setup({ maxSessionBytes: trigger === "size" ? 64 : 0 });
+    const actor = await actors.create({ name: `receipt boundary ${trigger}`, instructions: "Work.", residency: "durable", transport: "process" });
+    await actors.ask(actor.id, "complete transcript first");
+    await waitFor(() => actors.inFlightCount() === 0);
+    const prior = ["20000101T000000000Z", "20000102T000000000Z", "20000103T000000000Z"].map(stamp => `${actor.sessionFile}.${stamp}.bak`);
+    for (const file of prior) fs.copyFileSync(actor.sessionFile!, file);
+    let release: (() => void) | undefined;
+    let active: Promise<unknown> | undefined;
+    if (trigger === "requested") {
+      release = hold();
+      active = actors.ask(actor.id, "complete transcript second");
+      await waitFor(() => runs.length === 2);
+    }
+    const namespace = atomic.syncPathNamespace, events: string[] = [];
+    let unavailable = true, failures = 0, archived: string | undefined;
+    const confirmation = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+      if (file.startsWith(`${actor.sessionFile}.`) && file.endsWith(".bak")) {
+        archived = file;
+        if (unavailable) { failures++; throw Object.assign(new Error("archive receipt unavailable"), { code: "ENOENT" }); }
+        namespace(file, inode); events.push("confirmed"); return;
+      }
+      namespace(file, inode);
+    });
+    const rename = fs.renameSync.bind(fs), rm = fs.rmSync.bind(fs), unlink = fs.unlinkSync.bind(fs);
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (trigger === "requested" && from === actor.sessionFile && String(to).endsWith(".bak")) {
+        // Main's settled-run retention may prune before a reset receipt exists.
+        // Seed the historical referents at the archive boundary being faulted.
+        for (const file of prior) fs.copyFileSync(from, file);
+        events.length = 0;
+      }
+      if (to === actor.sessionFile) events.push("replacement");
+      rename(from, to);
+    });
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => { if (prior.includes(String(file))) events.push("prune"); rm(file, options); });
+    vi.spyOn(fs, "unlinkSync").mockImplementation(file => { if (prior.includes(String(file))) events.push("prune"); unlink(file); });
+    const reset = trigger === "requested" ? actors.resetSession(actor.id).then(() => undefined, error => error) : undefined;
+    actors.tell(actor.id, "queued boundary continuation");
+    release?.();
+    if (active) await active;
+    let snapshot!: { exists: boolean; prior: boolean; runs: number; events: string[]; contents: string };
+    try {
+      await waitFor(() => failures > 0);
+      if (reset) expect(await reset).toBeInstanceOf(Error);
+      await new Promise(resolve => setTimeout(resolve, 150));
+      snapshot = { exists: fs.existsSync(actor.sessionFile!), prior: prior.every(file => fs.existsSync(file)), runs: runs.length,
+        events: [...events], contents: fs.readFileSync(archived!, "utf8") };
+    } finally { unavailable = false; }
+    await waitFor(() => runs.length === (trigger === "size" ? 2 : 3) && actors.inFlightCount() === 0);
+    confirmation.mockRestore();
+    expect(snapshot.exists).toBe(false);
+    expect(snapshot.prior).toBe(true);
+    expect(snapshot.runs).toBe(trigger === "size" ? 1 : 2);
+    expect(snapshot.events).toEqual([]);
+    expect(snapshot.contents).toContain("complete transcript first");
+    if (trigger === "requested") expect(snapshot.contents).toContain("complete transcript second");
+    expect(events[0]).toBe("confirmed");
+    expect(events).toContain("replacement");
+    expect(runs.at(-1)!.prior).toEqual([]);
+  });
+
+  it("#2479 R2 F6 retains the original archive obligation across immediate idle reset retry", async () => {
+    const { actors, runs } = setup();
+    const actor = await actors.create({ name: "receipt idle retry", instructions: "Work.", residency: "durable", transport: "process" });
+    await actors.ask(actor.id, "complete idle transcript");
+    await waitFor(() => actors.inFlightCount() === 0);
+    const contents = fs.readFileSync(actor.sessionFile!, "utf8");
+    const prior = ["20000101T000000000Z", "20000102T000000000Z", "20000103T000000000Z"].map(stamp => `${actor.sessionFile}.${stamp}.bak`);
+    for (const file of prior) fs.copyFileSync(actor.sessionFile!, file);
+    const namespace = atomic.syncPathNamespace, events: string[] = [];
+    let unavailable = true, archived: string | undefined;
+    const confirmation = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+      if (file.startsWith(`${actor.sessionFile}.`) && file.endsWith(".bak")) {
+        archived = file;
+        if (unavailable) throw new Error("archive receipt unavailable");
+        namespace(file, inode); events.push("confirmed"); return;
+      }
+      namespace(file, inode);
+    });
+    const rename = fs.renameSync.bind(fs), rm = fs.rmSync.bind(fs), unlink = fs.unlinkSync.bind(fs);
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { if (to === actor.sessionFile) events.push("replacement"); rename(from, to); });
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => { if (prior.includes(String(file))) events.push("prune"); rm(file, options); });
+    vi.spyOn(fs, "unlinkSync").mockImplementation(file => { if (prior.includes(String(file))) events.push("prune"); unlink(file); });
+    let retry: unknown, snapshot!: { exists: boolean; prior: boolean; events: string[] };
+    try {
+      await expect(actors.resetSession(actor.id)).rejects.toThrow("archive receipt unavailable");
+      retry = await actors.resetSession(actor.id).then(() => undefined, error => error);
+      snapshot = { exists: fs.existsSync(actor.sessionFile!), prior: prior.every(file => fs.existsSync(file)), events: [...events] };
+    } finally { unavailable = false; }
+    await actors.resetSession(actor.id);
+    confirmation.mockRestore();
+    expect(retry).toBeInstanceOf(Error);
+    expect(snapshot).toEqual({ exists: false, prior: true, events: [] });
+    expect(fs.readFileSync(archived!, "utf8")).toBe(contents);
+    expect(events[0]).toBe("confirmed");
+    expect(events.indexOf("confirmed")).toBeLessThan(events.indexOf("replacement"));
+    expect(events.indexOf("confirmed")).toBeLessThan(events.indexOf("prune"));
+    expect(runs).toHaveLength(1);
+    await actors.ask(actor.id, "after receipt recovery");
+    expect(runs.at(-1)!.prior).toEqual([]);
+  });
+  it.each(["intent", "retirement"] as const)("#2479 R2 F6 retains archive debt through a failed journal %s barrier", async (fault) => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: `receipt journal ${fault}`, instructions: "Work.", residency: "durable", transport: "process" });
+    await actors.ask(actor.id, "complete journal transcript");
+    await waitFor(() => actors.inFlightCount() === 0);
+    const contents = fs.readFileSync(actor.sessionFile!, "utf8"), pending = `${actor.sessionFile}.archive-pending.json`;
+    const write = atomic.writeJsonAtomic, namespace = atomic.syncDirectoryChain;
+    let unavailable = true, archive: string | undefined;
+    vi.spyOn(atomic, "writeJsonAtomic").mockImplementation((file, value, options) => {
+      if (file === pending && unavailable && fault === "intent") throw new Error("intent barrier unavailable");
+      write(file, value, options);
+    });
+    vi.spyOn(atomic, "syncDirectoryChain").mockImplementation(directory => {
+      if (directory === path.dirname(actor.sessionFile!) && unavailable && fault === "retirement") throw new Error("retirement barrier unavailable");
+      namespace(directory);
+    });
+    const rename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { rename(from, to); if (from === actor.sessionFile) archive = String(to); });
+    let retry: unknown;
+    try {
+      await expect(actors.resetSession(actor.id)).rejects.toThrow(`${fault} barrier unavailable`);
+      // Both injections leave no journal name. The live obligation must survive.
+      expect(fs.existsSync(pending)).toBe(false);
+      retry = await actors.resetSession(actor.id).then(() => undefined, error => error);
+      expect(retry).toBeInstanceOf(Error);
+      if (fault === "intent") expect(fs.readFileSync(actor.sessionFile!, "utf8")).toBe(contents);
+      else expect(fs.existsSync(actor.sessionFile!)).toBe(false);
+    } finally { unavailable = false; }
+    await actors.resetSession(actor.id);
+    expect(fs.readFileSync(archive!, "utf8")).toBe(contents);
+    expect(fs.existsSync(pending)).toBe(false);
+    expect(sessionHeader(actor.sessionFile!)).toMatchObject({ type: "session", version: 3 });
+  });
+
+  it("#2479 R2 F6 refuses an archive inode substitute and retries the original inode", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "receipt inode retry", instructions: "Work.", residency: "durable", transport: "process" });
+    await actors.ask(actor.id, "complete inode transcript");
+    await waitFor(() => actors.inFlightCount() === 0);
+    const contents = fs.readFileSync(actor.sessionFile!, "utf8");
+    const namespace = atomic.syncPathNamespace;
+    let archive: string | undefined;
+    const confirmation = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+      if (file.startsWith(`${actor.sessionFile}.`) && file.endsWith(".bak")) { archive = file; throw new Error("archive receipt unavailable"); }
+      namespace(file, inode);
+    });
+    await expect(actors.resetSession(actor.id)).rejects.toThrow("archive receipt unavailable");
+    confirmation.mockRestore();
+    const held = `${archive}.held`;
+    fs.renameSync(archive!, held);
+    fs.writeFileSync(archive!, contents); // Identical visible bytes, a different inode.
+    try {
+      await expect(actors.resetSession(actor.id)).rejects.toThrow("archive inode changed");
+      expect(fs.existsSync(actor.sessionFile!)).toBe(false);
+      expect(fs.existsSync(`${actor.sessionFile}.archive-pending.json`)).toBe(true);
+    } finally { fs.rmSync(archive!); fs.renameSync(held, archive!); }
+    await actors.resetSession(actor.id);
+    expect(fs.readFileSync(archive!, "utf8")).toBe(contents);
+    expect(fs.existsSync(`${actor.sessionFile}.archive-pending.json`)).toBe(false);
+  });
+
+  it("#2479 R3 F6 does not treat ENOENT from archive confirmation as an absent source", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "archive missing namespace", instructions: "Work.", residency: "durable" });
+    await actors.ask(actor.id, "first");
+    const prior = ["20000101T000000000Z", "20000102T000000000Z", "20000103T000000000Z"].map(stamp => `${actor.sessionFile}.${stamp}.bak`);
+    for (const file of prior) fs.copyFileSync(actor.sessionFile!, file);
+    const namespace = atomic.syncPathNamespace;
+    const confirmation = vi.spyOn(atomic, "syncPathNamespace").mockImplementation((file, inode) => {
+      if (file.startsWith(`${actor.sessionFile}.`) && file.endsWith(".bak")) throw Object.assign(new Error("archive namespace disappeared"), { code: "ENOENT" });
+      namespace(file, inode);
+    });
+    try {
+      await expect(actors.resetSession(actor.id)).rejects.toThrow("archive namespace disappeared");
+      expect(fs.existsSync(actor.sessionFile!)).toBe(false);
+      expect(prior.every(file => fs.existsSync(file))).toBe(true);
+    } finally { confirmation.mockRestore(); }
+  });
+  it.each(["reset", "repair"] as const)("#2479 R3 F6 confirms complete preserved session contents before %s replacement or pruning", async (kind) => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: `archive ${kind}`, instructions: "Work.", residency: "durable", transport: "process" });
+    await actors.ask(actor.id, "first");
+    if (kind === "repair") fs.writeFileSync(actor.sessionFile!, "headerless latest append\n");
+    const contents = fs.readFileSync(actor.sessionFile!, "utf8"), events: string[] = [], descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), rename = fs.renameSync.bind(fs), rm = fs.rmSync.bind(fs);
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { events.push(`sync:${descriptors.get(fd)}`); sync(fd); });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { events.push(`rename:${to}`); rename(from, to); });
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => { if (String(file).endsWith(".bak")) events.push(`prune:${file}`); rm(file, options); });
+    if (kind === "reset") await actors.resetSession(actor.id);
+    else await actors.ask(actor.id, "recover");
+    const archiveEvent = events.find(event => event.startsWith(`rename:${actor.sessionFile}.`) && event.endsWith(".bak"))!;
+    expect(archiveEvent).toBeDefined();
+    const archive = archiveEvent.slice("rename:".length), archiveAt = events.indexOf(archiveEvent), headerAt = events.indexOf(`rename:${actor.sessionFile}`);
+    const fileBarrier = events.findIndex(event => event === `sync:${actor.sessionFile}` || event === `sync:${archive}`);
+    expect(fileBarrier).toBeGreaterThanOrEqual(0);
+    expect(fileBarrier).toBeLessThan(headerAt);
+    const pruneAt = events.findIndex(event => event.startsWith("prune:"));
+    if (pruneAt >= 0) expect(fileBarrier).toBeLessThan(pruneAt);
+    if (process.platform !== "win32") expect(events.slice(archiveAt + 1, headerAt)).toContain(`sync:${path.dirname(actor.sessionFile!)}`);
+    expect(fs.readFileSync(archive, "utf8")).toBe(contents);
+  });
+  it("#2479 syncs the archived namespace before publishing a replacement session header", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "archive audit", instructions: "Work.", residency: "durable" });
+    await actors.ask(actor.id, "first");
+    const events: string[] = [], descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), rename = fs.renameSync.bind(fs);
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { events.push(`sync:${descriptors.get(fd)}`); sync(fd); });
+    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { events.push(`rename:${to}`); rename(from, to); });
+    const writer = vi.spyOn(atomic, "writeJsonAtomic");
+    try {
+      await actors.resetSession(actor.id);
+      const archive = events.findIndex(event => event.startsWith(`rename:${actor.sessionFile}.`) && event.endsWith(".bak"));
+      const header = events.indexOf(`rename:${actor.sessionFile}`);
+      expect(archive).toBeGreaterThanOrEqual(0);
+      if (process.platform !== "win32") expect(events.slice(archive + 1, header)).toContain(`sync:${path.dirname(actor.sessionFile!)}`);
+      expect(writer.mock.calls.find(([file]) => file === actor.sessionFile)?.[2]?.durable).toBe(true);
+    } finally { opened.mockRestore(); synced.mockRestore(); renamed.mockRestore(); writer.mockRestore(); }
+  });
   it("defers rotation during an in-flight run, preserves its appends, and atomically seeds the next session", async () => {
     const { actors, runs, hold } = setup();
     const actor = await actors.create({ name: "durable", instructions: "Work.", residency: "durable", transport: "process" });

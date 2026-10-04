@@ -62,7 +62,7 @@ interface RegistryFile {
 }
 
 const atomicWrite = (filePath: string, value: unknown): void => {
-  writeJsonAtomic(filePath, value, { space: 2 });
+  writeJsonAtomic(filePath, value, { space: 2, durable: true });
 };
 
 const clone = <T>(value: T): T => structuredClone(value);

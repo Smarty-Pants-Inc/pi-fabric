@@ -7,7 +7,7 @@ import { normalizeJevApprovalModel } from "./jev/model-key.js";
 export type { FabricJevConfig } from "./jev/config.js";
 import os from "node:os";
 import path from "node:path";
-import { renameAtomic } from "./core/atomic-write.js";
+import { renameAtomic, syncPathNamespace } from "./core/atomic-write.js";
 import { quarantineDamagedFile } from "./core/damaged-file.js";
 import { normalizeModelAliases, type FabricModelAliases } from "./core/model-resolution.js";
 import { PI_CORE_TOOL_NAME_SET } from "./core/pi-tools.js";
@@ -1549,6 +1549,7 @@ export const writeJsonAtomic = (
     descriptor = fs.openSync(temporaryPath, "wx", mode);
     fs.writeFileSync(descriptor, `${JSON.stringify(document, null, 2)}\n`, "utf8");
     fs.fsyncSync(descriptor);
+    const publishedInode = fs.fstatSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
     if (expectedSource === null) {
@@ -1567,17 +1568,10 @@ export const writeJsonAtomic = (
       }
     }
     renameAtomic(temporaryPath, resolvedPath);
-    try {
-      const directoryDescriptor = fs.openSync(directory, "r");
-      try {
-        fs.fsyncSync(directoryDescriptor);
-      } finally {
-        fs.closeSync(directoryDescriptor);
-      }
-    } catch (error) {
-      const code = error instanceof Error && "code" in error ? error.code : undefined;
-      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EISDIR" && code !== "EPERM") throw error;
-    }
+    // Confirm the actual publication directory even if the caller namespace was
+    // retargeted, then require that namespace to identify the inode we published.
+    syncPathNamespace(resolvedPath, publishedInode);
+    if (filePath !== resolvedPath) syncPathNamespace(filePath, publishedInode);
   } catch (error) {
     if (descriptor !== undefined) fs.closeSync(descriptor);
     fs.rmSync(temporaryPath, { force: true });

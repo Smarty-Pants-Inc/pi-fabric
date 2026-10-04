@@ -172,7 +172,7 @@ export class ActorBindingStore {
           .map(([actorId, binding]) => [actorId, { ...binding }]),
       ),
     };
-    writeJsonAtomic(this.filePath, value, { space: 2, newline: true });
+    writeJsonAtomic(this.filePath, value, { space: 2, newline: true, durable: true });
   }
 
   #currentFingerprint(): string | undefined {

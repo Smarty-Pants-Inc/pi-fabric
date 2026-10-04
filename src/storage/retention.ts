@@ -90,7 +90,7 @@ export const hasUnresolvedWorker = (runDirectory: string, depth = 0, expired: De
 };
 export const markUnresolvedWorker = (runDirectory: string, reason: string, details: Record<string, unknown> = {}): void => {
   fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
-  writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details });
+  writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details }, { durable: true });
 };
 /** A terminal record is not a worker exit receipt. Share this persistent,
  * tree-wide veto across tracked, recovered and offline cleanup before removing
@@ -132,7 +132,9 @@ const runTreeVeto = (
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (fs.existsSync(statusFile) && !record) return "worker exit is unconfirmed: unreadable run record";
     if (record?.cleanupPending !== undefined && record.cleanupPending !== false) return "worker cleanup is not joined";
-    if (record?.transport === "tmux" || record?.transport === "screen") {
+    // No durable Herdr exit proof is recorded. In particular, a lost pane may
+    // overwrite status.json after a failed unresolved-marker publication.
+    if (record?.transport === "herdr" || record?.transport === "tmux" || record?.transport === "screen") {
       return `${record.transport} transport has no checked worker exit receipt (${directory})`;
     }
     // Offline compaction/collection has no surviving transport handle. Require
@@ -561,6 +563,10 @@ export const pruneActorSessionBackups = (sessionFile: string, options: {
 } = {}): string[] => {
   const directory = path.dirname(sessionFile);
   if (!ownedStat(directory)?.isDirectory()) return [];
+  // An unconfirmed archive may still be the native resume journal's referent.
+  // The offline CLI shares this gate with the live actor's receipt retirement.
+  try { fs.lstatSync(`${sessionFile}.archive-pending.json`); return []; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return []; }
   const prefix = `${path.basename(sessionFile)}.`;
   try {
     const backups = fs.readdirSync(directory).flatMap(name => {

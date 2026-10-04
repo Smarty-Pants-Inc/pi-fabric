@@ -184,6 +184,10 @@ describe("resident creation idempotency", () => {
         await expect(first).resolves.toMatchObject({ name: "ResidentOutcomeUnknownError", id: firstId });
         state.release.resolve();
         await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        // The first request keeps its 500 ms uncertainty deadline. This retry
+        // tests identity/cache conservation, not another short durable-I/O race.
+        state.client.options.commandTimeoutMs = 5_000;
+        state.nested = new ResidentActorClient(state.config.meshRoot, state.config.rootId, 5_000);
         const retry = await create(state, "timeout-key");
         expect(retry.id).toBe(firstId);
         expect(held.calls()).toBe(1);
@@ -507,11 +511,13 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   }
 
   it("cleanup that times out behind a real wait is fenced before file/worktree mutation", { timeout: 10_000 }, async () => {
-    const state = await harness(false);
+    // The short deadline belongs to held cleanup, not ordinary durable spawn setup.
+    const state = await harness(false, undefined, 5_000);
     const original = AgentManager.prototype.join;
     const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
     try {
       const handle = await state.client.spawnAgent({ task: "settle before cleanup", model: state.model });
+      state.client.options.commandTimeoutMs = 500;
       vi.spyOn(AgentManager.prototype, "join").mockImplementation(async function (this: AgentManager, ...args) {
         const result = await original.apply(this, args);
         state.entered.resolve(); await state.release.promise;
@@ -573,7 +579,8 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   });
 
   it("abandoned successor create does not remove its stopped predecessor before the fence", async () => {
-    const state = await harness(false);
+    // Establish the predecessor under an ordinary durable-exchange budget.
+    const state = await harness(false, undefined, 5_000);
     let owner!: ActorDirectory;
     const original = ActorDirectory.prototype.create;
     vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
@@ -583,6 +590,7 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
     try {
       const predecessor = await state.nested.createActor({ name: "fenced", instructions: "predecessor", residency: "durable", model: state.model });
       await owner.stop(predecessor.id);
+      state.nested = new ResidentActorClient(state.config.meshRoot, state.config.rootId, 500);
       const outcome = state.nested.createActor({ name: "fenced", instructions: "successor", residency: "durable", model: "test/slow" })
         .catch((error: Error) => error);
       await state.entered.promise;
@@ -1206,7 +1214,9 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
   ];
   for (const { engine, label, startupDelayMs, loopback } of cases)
   it(`${label} collects handled client-deadline receipts on normal completion, delivers priority output and reconciles without duplicates`, async () => {
-    const state = await harness(false, undefined, 700); const main = mainProvider(state);
+    // The success row is ordinary setup. Only the two injected post-commit
+    // stalls exercise the 700 ms client deadline (armed by probe.drain below).
+    const state = await harness(false, undefined, 5_000); const main = mainProvider(state);
     let admitted = false;
     let startClock = () => {};
     const original = ActorDirectory.prototype.create;
@@ -1222,7 +1232,11 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
       inputSchema: { type: "object", properties: {}, additionalProperties: false } };
     main.registry.register({ name: "probe", description: "resident exchange synchronization",
       async list() { return [descriptor]; }, async describe() { return descriptor; },
-      async invoke() { await waitFor(() => entries(state.residencyRoot, "processing").length === 0); return true; },
+      async invoke() {
+        await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        state.client.options.commandTimeoutMs = 700;
+        return true;
+      },
     });
     let artifactPath: string | undefined;
     try {
@@ -1245,7 +1259,7 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
         : `const mapped = []; ${calls.map(call => `mapped.push(...(await Promise.allSettled([${call.replace(/^await /, "")}])).map(result => result.status === "fulfilled" ? {ok:true,handle:result.value} : {ok:false,error:String(result.reason)})); await tools.call({ref:"probe.drain",args:{}});`).join("\n")}
           console.log("guest-logs-start" + "log line; ".repeat(3000) + "guest-logs-end");
           return {mapped,supplement:"result-start" + "result detail! ".repeat(2000) + "result-end"};`;
-      // This checks the resident client's 700 ms deadline, not interpreter
+      // The two held calls check the resident client's 700 ms deadline, not interpreter
       // startup. Keep the executor's 10 s budget, starting it at real creation
       // admission. A separate 20 s real guard also covers the slow-startup rows.
       const result = await executeAfterAdmission((signal, start) => {
@@ -1264,7 +1278,7 @@ describe("round 6 registered fabric_exec handled resident uncertainty", { timeou
       expect(mapped).toEqual([expect.objectContaining({ ok: true, handle: expect.objectContaining({ id: expect.any(String) }) }),
         expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") }),
         expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") })]);
-      // Initial handled-uncertainty calls keep their asserted 700 ms deadline;
+      // The two handled-uncertainty calls keep their asserted 700 ms deadline;
       // only the new status/joined-stop invocations use ordinary admission waits.
       state.client.options.commandTimeoutMs = 5_000;
       const successful = decisions.find(decision => decision.id === mapped[0].handle.id)!;

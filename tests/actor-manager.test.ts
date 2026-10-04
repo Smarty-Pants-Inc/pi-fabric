@@ -14,6 +14,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { closeWithActors } from "../src/actors/close-order.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -378,18 +379,45 @@ describe("ActorManager presence under a stalled mesh lock", () => {
   // message, and each of those re-decided every actor's ownership.
   it("decides ownership once per matching mesh event too, with several subscribers and full queues", async () => {
     const decisions = vi.fn((_id: string) => true as boolean | undefined);
-    const { actors, mesh } = setup(false, decisions, undefined, undefined, { actorQueueLimit: 2 });
-    for (let index = 0; index < 8; index++) {
-      await actors.create({ name: `actor-${index}`, instructions: "Watch.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    decisions.mockClear();
-    const from: MeshIdentity = { id: "session:other", name: "main", kind: "main", sessionId: "other" };
-    for (let index = 0; index < 20; index++) await mesh.publish({ topic: "team.pulls", from, data: { index } });
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    // Before: each delivery re-decided all 8 actors 4 times (enqueue, drain, record twice).
-    expect(decisions.mock.calls.length).toBeGreaterThan(0);
-    expect(decisions.mock.calls.length).toBeLessThan(1_200);
+    const polls: number[] = [];
+    const deliveries: Array<{ decisions: number; accepted: boolean }> = [];
+    let measuring = false;
+    const start = ActorMeshMonitor.prototype.start;
+    const monitorStart = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
+      const beforePoll = this.callbacks.beforePoll, onEvent = this.callbacks.onEvent;
+      this.callbacks.beforePoll = () => {
+        const before = decisions.mock.calls.length;
+        const ready = beforePoll();
+        if (measuring && ready) polls.push(decisions.mock.calls.length - before);
+        return ready;
+      };
+      this.callbacks.onEvent = event => {
+        const before = decisions.mock.calls.length;
+        const result = onEvent(event);
+        if (measuring && event.topic === "team.pulls") deliveries.push({ decisions: decisions.mock.calls.length - before, accepted: result === true });
+        return result;
+      };
+      start.call(this);
+    });
+    try {
+      const { actors, mesh } = setup(false, decisions, undefined, undefined, { actorQueueLimit: 2 });
+      for (let index = 0; index < 8; index++) {
+        await actors.create({ name: `actor-${index}`, instructions: "Watch.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
+      }
+      decisions.mockClear(); measuring = true;
+      const from: MeshIdentity = { id: "session:other", name: "main", kind: "main", sessionId: "other" };
+      for (let index = 0; index < 20; index++) await mesh.publish({ topic: "team.pulls", from, data: { index } });
+      await waitFor(() => deliveries.length >= 20, 5_000);
+      // Measure the actual synchronous delivery slice, not a 400 ms window
+      // polluted by legitimate async launch/settlement rechecks (#446).
+      // Each poll reads all eight owners once; dispatch (including full queues)
+      // must reuse that snapshot and perform ZERO additional ownership reads.
+      expect(polls.length).toBeGreaterThan(0);
+      expect(polls.every(count => count === 8)).toBe(true);
+      expect(deliveries.some(sample => sample.accepted)).toBe(true);
+      expect(deliveries.every(sample => sample.decisions === 0)).toBe(true);
+      expect(actors.list().some(actor => actor.queued >= 2)).toBe(true);
+    } finally { measuring = false; monitorStart.mockRestore(); }
   });
 
   // smarty-dev#918: callers verify setInstructions by digest, without reading the registry file.

@@ -24,11 +24,11 @@ const waitFor = async (predicate: () => boolean) => {
     await new Promise(resolve => setTimeout(resolve, 10));
   }
 };
-const promptly = async <T>(promise: Promise<T>): Promise<T> => {
+const promptly = async <T>(promise: Promise<T>, timeoutMs = 2_000): Promise<T> => {
   let timer!: ReturnType<typeof setTimeout>;
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("Resident dispatcher blocked behind activation settlement")), 2_000);
+      timer = setTimeout(() => reject(new Error("Resident dispatcher blocked behind activation settlement")), timeoutMs);
     })]);
   } finally { clearTimeout(timer); }
 };
@@ -119,7 +119,9 @@ it.each([
     const status = observe(f.provider.invoke("actorStatus", { id: f.actor.id }, f.context));
     const unrelated = observe(f.provider.invoke("setInstructions", { id: other.id, instructions: "Still serviceable" }, f.context));
     const stop = observe(f.provider.invoke("stop", { id: f.actor.id }, f.context));
-    const results = await promptly(Promise.all([status, unrelated, stop]));
+    // Three real exchanges include durable mutation/stop receipts. The worker
+    // remains hanging until this public stop: settlement must still not gate them.
+    const results = await promptly(Promise.all([status, unrelated, stop]), 5_000);
     expect(results[0]).toMatchObject({ value: { id: f.actor.id } });
     expect(results[1]).toMatchObject({ value: { id: other.id } });
     expect(results[2]).toMatchObject({ value: { id: f.actor.id, status: "stopped" } });

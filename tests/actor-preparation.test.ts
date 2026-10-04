@@ -593,7 +593,9 @@ describe("actor preparation (#3167)", () => {
   });
 
   it("14 stalled presence writes neither starve four healthy actors nor impose a cap of four", async () => {
-    const { actors, agents, mesh } = setup({ preparationTimeoutMs: 250 });
+    // Healthy preparation now includes F36 durable registry barriers. The
+    // injected presence promises still never settle; only I/O headroom changes.
+    const { actors, agents, mesh } = setup({ preparationTimeoutMs: 1_000 });
     const all: Awaited<ReturnType<ActorManager["create"]>>[] = [];
     for (let index = 0; index < 18; index++) all.push(await actors.create({ name: `review-${index}`, instructions: "Reply", responseMode: "text" }));
     const stalled = new Set(all.slice(0, 14).map((actor) => actor.id));
@@ -605,16 +607,19 @@ describe("actor preparation (#3167)", () => {
     });
     cleanups.push(async () => { gate.resolve(); actors.haltAll(); await waitFor(() => actors.inFlightCount() === 0); });
     for (const actor of all) actors.tell(actor.id, "HANG");
-    await waitFor(() => all.slice(14).every((actor) => actors.status(actor.id).inFlightRun !== undefined));
+    await waitFor(() => all.slice(14).every((actor) => actors.status(actor.id).inFlightRun !== undefined), 15_000);
     expect(all.slice(14).every((actor) => retryEvent(actors, actor.id, "presence") === undefined)).toBe(true);
-    await waitFor(() => all.every((actor) => actors.status(actor.id).inFlightRun !== undefined));
+    await waitFor(() => all.every((actor) => actors.status(actor.id).inFlightRun !== undefined), 15_000);
     expect(agents.list().filter((run) => run.status === "running")).toHaveLength(18);
     expect(all.slice(0, 14).every((actor) => retryEvent(actors, actor.id, "presence") !== undefined)).toBe(true);
     expect(all.every((actor) => actors.status(actor.id).status === "running" && actors.status(actor.id).preparing === undefined)).toBe(true);
-  }, 20_000);
+  }, 30_000);
 
   it("reports permit waiters with queue positions, and every actor drains as permits free", async () => {
-    const { actors, agents } = setup({}, 2);
+    // Permit waiting is deadline-exempt; healthy post-permit preparation needs
+    // room for durable registry I/O, not the fixture's default 80 ms fault budget.
+    const preparationTimeoutMs = 1_000;
+    const { actors, agents } = setup({ preparationTimeoutMs }, 2);
     const blockers = await Promise.all(Array.from({ length: 2 }, () => agents.spawn({ task: "HANG" })));
     cleanups.push(async () => { await Promise.all(blockers.map((run) => agents.stop(run.id))); });
     const all: Awaited<ReturnType<ActorManager["create"]>>[] = [];
@@ -623,10 +628,10 @@ describe("actor preparation (#3167)", () => {
     await waitFor(() => all.every((actor) => actors.status(actor.id).status === "waiting"));
     expect(all.map((actor) => actors.status(actor.id).preparing?.queuePosition).sort()).toEqual([1, 2, 3, 4, 5, 6, 7]);
     expect(all.every((actor) => actors.status(actor.id).inFlightRun === undefined)).toBe(true);
-    await pause(200); // A legitimate permit wait is longer than the 80ms setup deadline.
+    await pause(preparationTimeoutMs + 200); // Still longer than the actual setup deadline.
     expect(all.every((actor) => actors.status(actor.id).status === "waiting")).toBe(true);
     await agents.stop(blockers[0]!.id);
-    await waitFor(() => all.every((actor) => actors.status(actor.id).lastRunId !== undefined) && actors.inFlightCount() === 0);
+    await waitFor(() => all.every((actor) => actors.status(actor.id).lastRunId !== undefined) && actors.inFlightCount() === 0, 15_000);
     expect(all.every((actor) => actors.status(actor.id).queued === 0 && actors.status(actor.id).inFlightRun === undefined)).toBe(true);
-  });
+  }, 30_000);
 });

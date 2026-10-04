@@ -8,7 +8,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
 import * as atomicWrite from "../src/core/atomic-write.js";
-import { CompletionJournal, completionConsumed, completionSuccessor, consumeCompletion, pendingCompletions, saveCompletion, saveWorkerCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
+import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, saveCompletion, saveWorkerCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
 import type { AgentRunResult, AgentHandleInfo } from "../src/agents/types.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -311,7 +311,8 @@ describe("round 5 spawn-time completion authority", () => {
   });
 });
 describe("round 4 completion fences", () => {
-  it.each([true, false])("Astra 3: quiet resident settlement survives a live supervisor; successor notices=%s", async notifyOnComplete => {
+  // #3178: quiet outcomes survive absence; only the exact root/session can recover them.
+  it.each([true, false])("Astra 3: quiet resident settlement survives a live supervisor; returning owner notices=%s", async notifyOnComplete => {
     const h = harness();
     const a = h.client("A", 100, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
@@ -351,10 +352,10 @@ describe("round 4 completion fences", () => {
       expect(a.completed).not.toHaveBeenCalled(); expect(a.sendMessage).not.toHaveBeenCalled();
       // A disappears, but its resident host remains alive and owns the unrelated long run.
       await callerParticipants.close();
-      h.setLive([h.participant("B", 200), h.participant("other-role", 300, { role: "other-lane" }),
+      h.setLive([h.participant("A", 100), h.participant("other-role", 300, { role: "other-lane" }),
         h.participant("other-cwd", 300, { cwd: path.join(h.root, "other") })]);
       expect(pendingCompletions(h.meshRoot, h.root).map(value => value.result.id)).toEqual([child.id]);
-      const b = h.client("B", 200, { agents: { ...DEFAULT_FABRIC_CONFIG.agents, notifyOnComplete } }); b.client.start();
+      const b = h.client("A", 100, { agents: { ...DEFAULT_FABRIC_CONFIG.agents, notifyOnComplete } }); b.client.start();
       await waitFor(() => b.client.listAgents().some(value => value.id === child.id && "text" in value));
       expect(b.client.listAgents().find(value => value.id === child.id)).toMatchObject({
         text: settled.text, completionDelivery: { status: "undelivered", addressedTo: "A" },
@@ -385,12 +386,13 @@ describe("round 4 completion fences", () => {
     }
   }, 15_000);
 
+  // #3178: replay-fence faults still block the exact owner; foreign roots never reach admission.
   it.each(legacyFenceFaults)("F4/journal: unknown legacy fence (%s) blocks claims, bodies and replacement receipts repeatedly", async fault => {
     if (fault === "dangling" && process.platform === "win32") return; // symlink privilege is not portable
     const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result);
     const damaged = damageLegacyFence(h, fault);
-    h.setLive([h.participant("B", 200)]); const delivered = vi.fn();
-    const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, h.participants, h.mesh, delivered);
+    h.setLive([h.participant("A", 100)]); const delivered = vi.fn();
+    const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:A", sessionId: "A", startedAt: 100 }, h.participants, h.mesh, delivered);
     for (let index = 0; index < 3; index++) {
       await expect(journal.drain()).rejects.toThrow(/legacy.*replay fence/i);
       expect(() => journal.result(h.result.id)).toThrow(/legacy.*replay fence/i);
@@ -508,6 +510,7 @@ describe("round 4 completion fences", () => {
 });
 
 describe("round 3 completion fences", () => {
+  // #3178: attempt fences remain; only the exact owner receives final settlement.
   it.each([
     { mode: "credential startup", scope: "session" }, { mode: "recoverable stop", scope: "session" },
     { mode: "credential startup", scope: "durable" }, { mode: "recoverable stop", scope: "durable" },
@@ -559,7 +562,7 @@ describe("round 3 completion fences", () => {
     fs.writeFileSync(statusFile, JSON.stringify(final)); saveWorkerCompletion(statusFile, final!);
     await manager.join(handle.id);
     expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
-    h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
+    h.setLive([h.participant("B", 200)]); const b = h.client("A", 100); b.client.start();
     await waitFor(() => b.completed.mock.calls.length === 1); b.turn();
     expect(b.sendMessage.mock.calls[0]![0].content).toContain("FINAL_SUCCESS_R3");
     expect(completionConsumed(h.meshRoot, handle.id)).toBe(true);
@@ -567,6 +570,7 @@ describe("round 3 completion fences", () => {
     await new Promise(resolve => setTimeout(resolve, 60)); expect(c.completed).not.toHaveBeenCalled();
   }, 15_000);
 
+  // #3178: settled durable outcomes go only to their bound owner.
   it.each(["failed", "stopped"] as const)("F2/provider durable: %s status cannot receipt a live supervisor's attempt", async status => {
     const h = harness(); const a = h.client("A", 100); const cfg = a.client.options.config;
     const runDirectory = path.join(cfg.residencyRoot, "runs", h.result.id);
@@ -584,30 +588,32 @@ describe("round 3 completion fences", () => {
     expect(JSON.parse(fs.readFileSync(metadataFile, "utf8"))).not.toHaveProperty("completionConsumedAt");
     expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false);
     fs.writeFileSync(statusFile, JSON.stringify(h.result)); a.client.enqueueCompletion(h.result);
-    h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
+    h.setLive([h.participant("B", 200)]); const b = h.client("A", 100); b.client.start();
     await waitFor(() => b.completed.mock.calls.length === 1); b.turn();
     expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
     await b.client.close(); h.setLive([h.participant("C", 300)]); const c = h.client("C", 300); c.client.start();
     await new Promise(resolve => setTimeout(resolve, 60)); expect(c.completed).not.toHaveBeenCalled();
   });
 
+  // #3178: a damaged fence blocks the exact owner, not another principal's drain.
   it.skipIf(process.platform === "win32")("F4: ENOENT through a dangling existing receipt is not proven absence", async () => {
     const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); consumeCompletion(h.meshRoot, h.result.id, "B");
     const dir = path.join(h.meshRoot, "agent-completions", "receipts"); const file = path.join(dir, fs.readdirSync(dir)[0]!);
     fs.unlinkSync(file); fs.symlinkSync(path.join(h.root, "missing-receipt"), file);
-    h.setLive([h.participant("C", 300)]); const delivered = vi.fn();
-    const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:C", sessionId: "C", startedAt: 300 }, h.participants, h.mesh, delivered);
+    h.setLive([h.participant("A", 100)]); const delivered = vi.fn();
+    const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:A", sessionId: "A", startedAt: 100 }, h.participants, h.mesh, delivered);
     await expect(journal.drain()).rejects.toThrow(/replay fence/);
     expect(() => consumeCompletion(h.meshRoot, h.result.id, "C")).toThrow(/replay fence/);
     expect(() => journal.result(h.result.id)).toThrow(/replay fence/);
     expect(fs.lstatSync(file).isSymbolicLink()).toBe(true); expect(delivered).not.toHaveBeenCalled();
   });
 
+  // #3178: storage diagnostics apply to the exact owner, not an inferred successor.
   it("F4/client: a blocked replay stays pending and surfaces a deduplicated storage diagnostic", async () => {
     const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); consumeCompletion(h.meshRoot, h.result.id, "B");
     const dir = path.join(h.meshRoot, "agent-completions", "receipts"); const file = path.join(dir, fs.readdirSync(dir)[0]!);
     fs.writeFileSync(file, "not a receipt"); const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
-    h.setLive([h.participant("C", 300)]); const c = h.client("C", 300); c.client.start();
+    h.setLive([h.participant("A", 100)]); const c = h.client("A", 100); c.client.start();
     await waitFor(() => warning.mock.calls.length > 0); await new Promise(resolve => setTimeout(resolve, 80));
     expect(warning).toHaveBeenCalledOnce(); expect(String(warning.mock.calls[0]![0])).toMatch(/remains pending.*replay fence/);
     expect(c.completed).not.toHaveBeenCalled(); expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
@@ -615,6 +621,7 @@ describe("round 3 completion fences", () => {
     expect(fs.readdirSync(path.join(h.meshRoot, "agent-completions")).filter(name => name.endsWith(".json"))).toHaveLength(1);
   });
 
+  // #3178: malformed fences still fail closed for the exact owner.
   it.each(["malformed", "identity mismatch", "unreadable"] as const)("F4: an existing %s fence fails closed repeatedly and is never overwritten", async fault => {
     const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); consumeCompletion(h.meshRoot, h.result.id, "B");
     const dir = path.join(h.meshRoot, "agent-completions", "receipts"); const file = path.join(dir, fs.readdirSync(dir)[0]!);
@@ -633,8 +640,8 @@ describe("round 3 completion fences", () => {
         return asyncRead(target, ...args);
       }) as typeof fs.promises.readFile);
     }
-    h.setLive([h.participant("C", 300)]); const delivered = vi.fn();
-    const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:C", sessionId: "C", startedAt: 300 }, h.participants, h.mesh, delivered);
+    h.setLive([h.participant("A", 100)]); const delivered = vi.fn();
+    const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:A", sessionId: "A", startedAt: 100 }, h.participants, h.mesh, delivered);
     for (let i = 0; i < 3; i++) {
       await expect(journal.drain()).rejects.toThrow(/replay fence/i);
       expect(() => consumeCompletion(h.meshRoot, h.result.id, "C")).toThrow(/replay fence/i);
@@ -662,10 +669,11 @@ describe("Astra round 3 legacy retirement ordering", () => {
     return claim;
   };
 
-  it.each(["B", "C"])("pre-commit lock timeout retains legacy evidence; next drain as %s reclaims capacity", async successor => {
+  // #3178: legacy CAS retries retain evidence; retirement retries remain exact-root/session.
+  it.each([false, true])("pre-commit lock timeout retains legacy evidence; fresh journal=%s reclaims capacity", async fresh => {
     const h = harness(true); const enqueue = vi.fn();
-    const b = new CompletionJournal(h.meshRoot, address(h, "B", 200), h.participants, h.mesh, enqueue);
-    const retry = new CompletionJournal(h.meshRoot, address(h, successor, successor === "B" ? 200 : 300), h.participants, h.mesh, enqueue);
+    const b = new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, enqueue);
+    const retry = fresh ? new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, enqueue) : b;
     for (let index = 1; index <= 12; index++) {
       const result = { ...h.result, id: index.toString(16).padStart(32, "0") };
       saveCompletion(h.meshRoot, h.recipient, result);
@@ -679,7 +687,7 @@ describe("Astra round 3 legacy retirement ordering", () => {
       expect(fs.existsSync(bodyPath(h, result.id))).toBe(true);
       expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
       fault.mockRestore();
-      h.setLive([h.participant(successor, successor === "B" ? 200 : 300)]);
+      h.setLive([h.participant("A", 100)]);
       await retry.drain();
       expect(h.mesh.get(claim.key, { fresh: true })).toBeUndefined();
       expect(fs.existsSync(bodyPath(h, result.id))).toBe(false);
@@ -687,14 +695,15 @@ describe("Astra round 3 legacy retirement ordering", () => {
       // New admission must succeed, not merely leave a consumed result fenced.
       const next = { ...h.result, id: (100 + index).toString(16).padStart(32, "0") };
       retry.save(next); await retry.drain(false);
-      expect(h.mesh.get(claimKey(next.id), { fresh: true })?.value).toMatchObject({ sessionId: successor });
-      consumeCompletion(h.meshRoot, next.id, successor); await retry.drain(false);
+      expect(h.mesh.get(claimKey(next.id), { fresh: true })?.value).toMatchObject({ sessionId: "A" });
+      consumeCompletion(h.meshRoot, next.id, "A"); await retry.drain(false);
       expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
       expect(fs.statSync(path.join(h.meshRoot, "state.json")).size).toBeLessThan(4096);
     }
   });
 
-  it("a crash after the legacy claim delete leaves a receipt-authorized envelope for the next Main to unlink", async () => {
+  // #3178: only the returning exact owner may finish an interrupted unlink.
+  it("a crash after the legacy claim delete leaves a receipt-authorized envelope for the same Main to unlink", async () => {
     const h = harness(true); saveCompletion(h.meshRoot, h.recipient, h.result);
     const claim = await legacyClaim(h, h.result.id); consumeCompletion(h.meshRoot, h.result.id, "B");
     h.setLive([h.participant("B", 200)]);
@@ -706,17 +715,18 @@ describe("Astra round 3 legacy retirement ordering", () => {
       }
       rm(target, options);
     });
-    const b = new CompletionJournal(h.meshRoot, address(h, "B", 200), h.participants, h.mesh, vi.fn());
+    const b = new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, vi.fn());
     await expect(b.drain()).rejects.toThrow("stop after committed delete, before unlink");
     expect(h.mesh.get(claim.key, { fresh: true })).toBeUndefined(); expect(fs.existsSync(body)).toBe(true);
     crash.mockRestore();
     const receipt = path.join(path.dirname(body), "receipts", path.basename(body));
     const open = vi.spyOn(fs.promises, "open"); const enqueue = vi.fn(); h.setLive([h.participant("C", 300)]);
-    await new CompletionJournal(h.meshRoot, address(h, "C", 300), h.participants, h.mesh, enqueue).drain();
+    await new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, enqueue).drain();
     expect(open.mock.calls.some(([file]) => String(file) === receipt)).toBe(true);
     expect(fs.existsSync(body)).toBe(false); expect(fs.existsSync(receipt)).toBe(true); expect(enqueue).not.toHaveBeenCalled();
   });
 
+  // #3178: process-death CAS coverage remains; cleanup recovery uses the same root/session.
   it.each(["acknowledge", "forget", "delivery"] as const)("%s: current owner process death before/after legacy CAS preserves recoverable evidence", async consumption => {
     for (const stage of ["before delete", "after delete"] as const) {
       const h = harness(true); saveCompletion(h.meshRoot, h.recipient, h.result);
@@ -745,12 +755,12 @@ describe("Astra round 3 legacy retirement ordering", () => {
       expect(fs.existsSync(body)).toBe(true); expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
       expect(h.mesh.get(claim.key, { fresh: true })).toEqual(stage === "before delete" ? claim : undefined);
       const enqueue = vi.fn(); h.setLive([h.participant("B", 200)]);
-      const b = new CompletionJournal(h.meshRoot, address(h, "B", 200), h.participants, h.mesh, enqueue);
+      const b = new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, enqueue);
       await b.drain();
       expect(h.mesh.get(claim.key, { fresh: true })).toBeUndefined(); expect(fs.existsSync(body)).toBe(false);
       expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true); expect(enqueue).not.toHaveBeenCalled();
       const next = { ...h.result, id: "b".repeat(32) }; b.save(next); await b.drain(false);
-      expect(h.mesh.get(claimKey(next.id), { fresh: true })?.value).toMatchObject({ sessionId: "B" });
+      expect(h.mesh.get(claimKey(next.id), { fresh: true })?.value).toMatchObject({ sessionId: "A" });
       consumeCompletion(h.meshRoot, next.id, "B"); await b.drain(false);
     }
   });
@@ -796,49 +806,61 @@ describe("round 2 completion security", () => {
     expect(x.client.statusAgent(h.result.id)).not.toHaveProperty("text");
   });
 
-  it("F1: exact-lane successor reads private result only after its claim (and receipt)", async () => {
+  // #3178: a claim/receipt from old inferred succession is not an adoption record.
+  it("same-lane different root cannot read or acknowledge even a forged successor claim/receipt", async () => {
     const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); h.setLive([h.participant("B", 200)]);
-    const b = h.client("B", 200);
-    expect(b.client.statusAgent(h.result.id)).not.toHaveProperty("text");
-    b.client.start(); await waitFor(() => b.completed.mock.calls.length === 1);
-    expect(b.client.statusAgent(h.result.id)).toMatchObject({ text: h.result.text });
-    b.turn(); await waitFor(() => completionConsumed(h.meshRoot, h.result.id));
-    expect(b.client.statusAgent(h.result.id)).toMatchObject({ text: h.result.text });
-    await waitFor(() => !fs.existsSync(path.join(h.meshRoot, "agent-completions", `${createHash("sha256").update(h.result.id).digest("hex")}.json`)));
-    const c = h.client("C", 300); h.setLive([h.participant("C", 300)]);
-    expect(() => c.client.statusAgent(h.result.id)).toThrow(/Unknown durable Fabric agent/); // Async retirement has pruned the consumed body.
+    const key = legacyClaimKey(h.result.id);
+    await h.mesh.put({ key, ifVersion: 0, identity: { id: "session:B", name: "main", kind: "main" },
+      value: { rootId: "session:B", sessionId: "B", recipient: { ...h.recipient, rootId: "session:B", sessionId: "B" } } });
+    const b = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, h.participants, h.mesh, vi.fn());
+    await b.drain(); expect(b.enqueue).not.toHaveBeenCalled();
+    expect(b.result(h.result.id)).not.toHaveProperty("text");
+    expect(b.acknowledge(h.result.id)).toBe(false); b.forget(h.result.id);
+    expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false);
+    // The bound owner can repair a foreign pre-fix claim, even while B is live.
+    const a = new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, (_value, delivered) => delivered());
+    await a.drain(); expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
+    await a.drain();
+    const another = { ...h.result, id: "b".repeat(32) };
+    saveCompletion(h.meshRoot, h.recipient, another); consumeCompletion(h.meshRoot, another.id, "B");
+    // A legacy B receipt is not explicit adoption either.
+    expect(b.result(another.id)).not.toHaveProperty("text"); expect(b.acknowledge(another.id)).toBe(false);
   });
 
-  it("F1: legacy predecessor envelope survives a live lease and retires after expiry", async () => {
+  // #3178: lease expiry cannot grant cleanup authority to the same-lane B.
+  it("legacy predecessor envelope survives lease expiry until the exact owner returns", async () => {
     const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); consumeCompletion(h.meshRoot, h.result.id, "A");
     const key = legacyClaimKey(h.result.id);
     await h.mesh.put({ key, ifVersion: 0, identity: { id: "session:A", name: "main", kind: "main" }, value: { rootId: "session:A", sessionId: "A" } });
-    h.setLive([h.participant("A", 100), h.participant("B", 200)]);
-    const b = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, h.participants, h.mesh, () => {});
-    await b.drain(false);
-    expect(fs.existsSync(path.join(h.meshRoot, "agent-completions", `${createHash("sha256").update(h.result.id).digest("hex")}.json`))).toBe(true);
-    expect(h.mesh.get(key)).toBeDefined();
-    h.setLive([h.participant("B", 200)]); await b.drain(false);
-    expect(h.mesh.get(key)).toBeUndefined(); expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(0);
+    const b = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, h.participants, h.mesh, vi.fn());
+    const body = path.join(h.meshRoot, "agent-completions", `${createHash("sha256").update(h.result.id).digest("hex")}.json`);
+    for (const live of [[h.participant("A", 100), h.participant("B", 200)], [h.participant("B", 200)]]) {
+      h.setLive(live); await b.drain(false); expect(h.mesh.get(key)).toBeDefined(); expect(fs.existsSync(body)).toBe(true);
+    }
+    await new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, vi.fn()).drain(false);
+    expect(h.mesh.get(key)).toBeUndefined(); expect(fs.existsSync(body)).toBe(false);
   });
 
-  it("F1: legacy A-addressed envelope with B-owned receipt is retired by C", async () => {
+  // #3178: even a legacy B receipt is not a completion-adoption record for C.
+  it("legacy A-addressed envelope with B-owned receipt is not retired by C", async () => {
     const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); consumeCompletion(h.meshRoot, h.result.id, "B");
     const key = legacyClaimKey(h.result.id);
     await h.mesh.put({ key, ifVersion: 0, identity: { id: "session:B", name: "main", kind: "main" }, value: { rootId: "session:B", sessionId: "B" } });
     h.setLive([h.participant("C", 300)]);
-    const c = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:C", sessionId: "C", startedAt: 300 }, h.participants, h.mesh, () => {});
-    await c.drain(false);
-    expect(h.mesh.get(key)).toBeUndefined(); expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(0);
+    const c = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:C", sessionId: "C", startedAt: 300 }, h.participants, h.mesh, vi.fn());
+    await c.drain(false); expect(h.mesh.get(key)).toBeDefined();
+    expect(fs.existsSync(path.join(h.meshRoot, "agent-completions", `${createHash("sha256").update(h.result.id).digest("hex")}.json`))).toBe(true);
+    expect(c.result(h.result.id)).not.toHaveProperty("text"); expect(c.acknowledge(h.result.id)).toBe(false);
   });
 
+  // #3178: promotion/attempt fencing is unchanged; final delivery remains exact-owner only.
   it.each(["failed", "stopped"] as const)("F2: retryable %s worker attempt is not a settled completion", async status => {
     const h = harness(); const run = path.join(h.root, "run"); fs.mkdirSync(run);
     const manifest = { meshRoot: h.meshRoot, recipient: h.recipient, supervisor: { pid: process.pid } };
     fs.writeFileSync(path.join(run, "completion-recipient.json"), JSON.stringify(manifest));
     const attempt = { ...h.result, status, text: "attempt only", error: status === "failed" ? "No API key found for openai-codex" : "worker stopped", turns: status === "failed" ? 0 : 2 };
     saveWorkerCompletion(path.join(run, "status.json"), attempt);
-    h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
+    h.setLive([h.participant("B", 200)]); const b = h.client("A", 100); b.client.start();
     await new Promise(resolve => setTimeout(resolve, 60));
     expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(0);
     expect(b.completed).not.toHaveBeenCalled(); expect(b.client.hasAgent(h.result.id)).toBe(false);
@@ -859,11 +881,12 @@ describe("round 2 completion security", () => {
     await new Promise(resolve => setTimeout(resolve, 60)); expect(b.completed).not.toHaveBeenCalled();
   });
 
+  // #3178: promotion/attempt fencing is unchanged; final delivery remains exact-owner only.
   it("F2: promotes an orphan attempt only after its supervisor can no longer retry", async () => {
     const h = harness(); const run = path.join(h.root, "run"); fs.mkdirSync(run);
     fs.writeFileSync(path.join(run, "completion-recipient.json"), JSON.stringify({ meshRoot: h.meshRoot, recipient: h.recipient, supervisor: { pid: 2147483647 } }));
     saveWorkerCompletion(path.join(run, "status.json"), h.result);
-    h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
+    h.setLive([h.participant("B", 200)]); const b = h.client("A", 100); b.client.start();
     await waitFor(() => b.completed.mock.calls.length === 1); b.turn();
     expect(b.sendMessage).toHaveBeenCalledOnce();
   });
@@ -883,7 +906,8 @@ describe("round 2 completion security", () => {
     expect(await a.client.waitAgent(h.result.id, AbortSignal.timeout(500))).toMatchObject({ status: "completed", text: h.result.text });
   });
 
-  it.each(["credential startup", "recoverable stop"] as const)("F2/manager: %s retries with journal enabled; successor receives final success only", async mode => {
+  // #3178: final retry settlement goes to the exact owner, not a same-lane Main.
+  it.each(["credential startup", "recoverable stop"] as const)("F2/manager: %s retries with journal enabled; owner receives final success only", async mode => {
     const h = harness(); const owner = h.client("A", 100); const manager = managerFor(h, owner);
     let launches = 0; let statusFile = ""; let final: AgentRunResult | undefined;
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
@@ -902,7 +926,7 @@ describe("round 2 completion security", () => {
       }
       return { kind: "process", isAlive: async () => launches > 1 && final !== undefined, stop: async () => {} };
     });
-    h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
+    h.setLive([h.participant("B", 200)]); const b = h.client("A", 100); b.client.start();
     const handle = await manager.spawn({ task: "retry me", transport: "process", nice: 19 });
     expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(0);
     await waitFor(() => launches === 2); expect(b.completed).not.toHaveBeenCalled();
@@ -950,15 +974,18 @@ describe("round 2 completion security", () => {
     await waitFor(() => h.mesh.listAll("residency/completion-claims/").length === 0);
   });
 
-  it("Astra 2/provider: a claimed successor cannot clean up its predecessor's run", async () => {
+  // #3178: same-lane roots cannot claim an outcome or clean its predecessor's run.
+  it("Astra 2/provider: a same-lane different root cannot claim or clean up its predecessor's run", async () => {
     const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); h.setLive([h.participant("B", 200)]);
-    const b = h.client("B", 200); b.client.start(); await waitFor(() => b.completed.mock.calls.length === 1);
+    const b = h.client("B", 200); b.client.start(); await new Promise(resolve => setTimeout(resolve, 80));
+    expect(b.completed).not.toHaveBeenCalled();
     const provider = providerFor(h, b.client);
     await expect(provider.invoke("cleanup", { id: h.result.id }, invocation)).rejects.toThrow(/Unknown .*agent/);
     expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
   });
 
-  it.each([true, false])("Astra P1-1: B retires A's consumed claim after a crash, body present=%s", async bodyPresent => {
+  // #3178: lease absence is not cleanup authority; only exact A can retire its claim.
+  it.each([true, false])("Astra P1-1: B retains A's consumed claim until exact A returns after a crash, body present=%s", async bodyPresent => {
     const h = harness(); h.setLive([h.participant("A", 100)]);
     const a = new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, vi.fn());
     a.save(h.result); await a.drain(false);
@@ -970,6 +997,9 @@ describe("round 2 completion security", () => {
     const enqueue = vi.fn();
     const b = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, h.participants, h.mesh, enqueue);
     await b.drain();
+    expect(h.mesh.listAll("residency/completion-claims/")).toEqual([claim]);
+    expect(fs.existsSync(body)).toBe(bodyPresent);
+    await new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, enqueue).drain();
     expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
     expect(fs.existsSync(body)).toBe(false); expect(enqueue).not.toHaveBeenCalled();
     expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
@@ -1014,14 +1044,15 @@ describe("round 2 completion security", () => {
     expect(confirmations).toBe(1); expect(sync).not.toHaveBeenCalled();
   });
 
-  it("Astra P1-1: reduced-capacity crash rounds change Main identity and reclaim bodyless predecessor claims", async () => {
+  // #3178: bounded reclamation is same-root crash recovery, not new-principal succession.
+  it("Astra P1-1: reduced-capacity crash rounds retain Main identity and reclaim bodyless owner claims", async () => {
     const h = harness(true);
-    const recipient = (index: number) => ({ ...h.recipient, rootId: `session:round-${index}`, sessionId: `round-${index}`, startedAt: 100 + index });
+    const recipient = (_index: number) => h.recipient;
     for (let index = 1; index <= 30; index++) {
       h.setLive([h.participant(`round-${index}`, 100 + index)]);
       const address = recipient(index);
       const journal = new CompletionJournal(h.meshRoot, address, h.participants, h.mesh, vi.fn());
-      await journal.drain(false); // This session cleans the preceding dead Main's claim.
+      await journal.drain(false); // The same root/session cleans its preceding crash-left claim.
       expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
       const result = { ...h.result, id: index.toString(16).padStart(32, "0") };
       journal.save(result); await journal.drain(false);
@@ -1150,25 +1181,60 @@ describe("round 2 completion security", () => {
     expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
   });
 });
-describe("dead Main completion succession", () => {
-  it("re-delivers an authenticated legacy resident result once; a second successor cannot replay it", async () => {
+describe("exact Main completion recipients", () => {
+  it("a live owner with a simulated 20 s stale lease receives once on return; same-lane B receives nothing", async () => {
+    const h = harness();
+    const directory = (session: string) => {
+      const value = new ParticipantDirectory(h.mesh, { enabled: true, hostId: `session:${session}`, rootId: `session:${session}`,
+        identity: { id: `session:${session}`, name: "main", kind: "main", sessionId: session } });
+      value.registerSource(() => [h.participant(session, session === "A" ? 100 : 200, { local: true })]);
+      return value;
+    };
+    const aDirectory = directory("A"), bDirectory = directory("B");
+    try {
+      await aDirectory.start(); await bDirectory.start();
+      expect(bDirectory.list({ scope: "project", kinds: ["root"], fresh: true }).some(root => root.id === h.recipient.rootId)).toBe(true);
+      let now = Date.now() + 20_000;
+      expect(bDirectory.list({ scope: "project", kinds: ["root"], fresh: true }, now).some(root => root.id === h.recipient.rootId)).toBe(false);
+      expect(bDirectory.list({ scope: "project", kinds: ["root"], includeStale: true, fresh: true }, now).find(root => root.id === h.recipient.rootId)?.stale).toBe(true);
+      const participants = { list: (options: Parameters<ParticipantDirectory["list"]>[0]) => bDirectory.list(options, now) } as unknown as FabricParticipantSource;
+      saveCompletion(h.meshRoot, h.recipient, h.result);
+      const b = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, participants, h.mesh, vi.fn());
+      await b.drain(); await b.drain();
+      expect(b.enqueue).not.toHaveBeenCalled(); expect(b.result(h.result.id)).not.toHaveProperty("text");
+      expect(b.acknowledge(h.result.id)).toBe(false); b.forget(h.result.id);
+      expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false);
+      expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
+      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
+      now = Date.now(); await aDirectory.refresh();
+      let delivered!: () => void;
+      const enqueue = vi.fn((_result: AgentRunResult, callback: () => void) => { delivered = callback; });
+      const a = new CompletionJournal(h.meshRoot, h.recipient, participants, h.mesh, enqueue);
+      await a.drain(); await a.drain(); expect(enqueue).toHaveBeenCalledOnce();
+      expect(enqueue.mock.calls[0]![0]).toMatchObject({ text: h.result.text }); delivered();
+      await a.drain(); await b.drain();
+      expect(enqueue).toHaveBeenCalledOnce(); expect(b.enqueue).not.toHaveBeenCalled();
+      expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
+    } finally { await bDirectory.close(); await aDirectory.close(); }
+  });
+  // #3178: dead Main without a completion adoption record means retained, not redirected.
+  it("retains an authenticated dead-owner resident result until exact A returns, then delivers once", async () => {
     const h = harness(); const key = await h.seedResident(); h.setLive([h.participant("B", 200)]);
     const b = h.client("B", 200); b.client.start();
-    await waitFor(() => b.completed.mock.calls.length > 0);
-    expect(b.client.statusAgent(h.result.id)).toMatchObject({ text: h.result.text, completionDelivery: { status: "undelivered", addressedTo: "A" } });
-    b.turn(); b.turn();
-    expect(b.sendMessage).toHaveBeenCalledOnce();
-    expect(b.sendMessage.mock.calls[0]![0].content).toContain("re-delivered from dead Main session A");
-    expect(b.sendMessage.mock.calls[0]![0].content).toContain(h.result.text);
+    await waitFor(() => b.client.listAgents().length === 1); b.turn();
+    expect(b.client.statusAgent(h.result.id)).not.toHaveProperty("text");
+    b.client.acknowledgeCompletion(h.result.id);
+    expect(b.completed).not.toHaveBeenCalled(); expect(b.sendMessage).not.toHaveBeenCalled();
+    expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false); expect(h.mesh.get(key)).toBeDefined();
+    expect(pendingCompletions(h.meshRoot, h.root)).toMatchObject([{ recipient: { rootId: "session:A", sessionId: "A" }, result: { text: h.result.text } }]);
+    expect(JSON.parse(fs.readFileSync(residentResultPath(residentRoot(h.meshRoot, h.recipient.rootId), h.result.id), "utf8"))).toMatchObject({ text: h.result.text });
+    h.setLive([h.participant("A", 100), h.participant("B", 200)]);
+    const a = h.client("A", 100); a.client.start(); await waitFor(() => a.completed.mock.calls.length === 1);
+    a.turn(); a.turn(); await waitFor(() => completionConsumed(h.meshRoot, h.result.id));
+    expect(a.sendMessage).toHaveBeenCalledOnce(); expect(a.sendMessage.mock.calls[0]![0].content).toContain(h.result.text);
+    expect(a.sendMessage.mock.calls[0]![0].content).not.toContain("re-delivered from dead Main");
     await waitFor(() => !h.mesh.get(key));
-    expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
-    expect(b.client.hasAgent(h.result.id)).toBe(true);
-    expect(b.client.statusAgent(h.result.id)).toMatchObject({ text: h.result.text });
-    expect((b.client.statusAgent(h.result.id) as AgentRunResult).completionDelivery).toBeUndefined();
-    await b.client.close(); b.inbox.close();
-    h.setLive([h.participant("C", 300)]); const c = h.client("C", 300); c.client.start();
-    await new Promise(resolve => setTimeout(resolve, 100)); c.turn();
-    expect(c.completed).not.toHaveBeenCalled(); expect(c.sendMessage).not.toHaveBeenCalled();
+    b.turn(); expect(b.completed).not.toHaveBeenCalled(); expect(b.sendMessage).not.toHaveBeenCalled();
   });
 
   it("keeps no-successor results pending and visible in list/status, even with notifications disabled", async () => {
@@ -1181,48 +1247,60 @@ describe("dead Main completion succession", () => {
     expect(h.mesh.get(key)).toBeDefined(); expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
   });
 
-  it("retains a session inbox outcome after the original Main dies, and reclaims an unconsumed successor", async () => {
+  // #3178: losing an inbox host does not transfer an unconsumed exact-root outcome.
+  it("retains an unconsumed inbox after owner death; only the same session can recover", async () => {
     const h = harness(); h.setLive([h.participant("A", 100)]); const a = h.client("A", 100);
-    a.client.enqueueCompletion(h.result); a.client.start(); await waitFor(() => a.completed.mock.calls.length > 0);
-    await a.client.close(); a.inbox.close(); h.setLive([h.participant("B", 200)]);
-    const b = h.client("B", 200); b.client.start(); await waitFor(() => b.completed.mock.calls.length > 0);
-    await b.client.close(); b.inbox.close(); h.setLive([h.participant("C", 300)]);
-    const c = h.client("C", 300); c.client.start(); await waitFor(() => c.completed.mock.calls.length > 0); c.turn();
-    expect(c.sendMessage).toHaveBeenCalledOnce(); expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
-  });
-
-  it("a newer concurrently live successor cannot duplicate an already claimed inbox result", async () => {
-    const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result);
-    h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
-    await waitFor(() => b.completed.mock.calls.length > 0);
-    h.setLive([h.participant("B", 200), h.participant("C", 300)]);
-    const c = h.client("C", 300); c.client.start(); await new Promise(resolve => setTimeout(resolve, 100));
-    c.turn(); expect(c.completed).not.toHaveBeenCalled();
-    expect(b.client.statusAgent(h.result.id)).toMatchObject({ text: h.result.text });
-    expect(c.client.statusAgent(h.result.id)).not.toHaveProperty("text"); b.turn();
-    expect(b.sendMessage).toHaveBeenCalledOnce();
-    await new Promise(resolve => setTimeout(resolve, 60)); expect(c.sendMessage).not.toHaveBeenCalled();
-  });
-
-  it("never steals from a live original, another cwd/name/role/project, older or non-interactive Main", () => {
-    const h = harness(); const b = h.participant("B", 200);
-    expect(completionSuccessor(h.recipient, [h.participant("A", 100), b])).toBeUndefined();
-    for (const extra of [{ cwd: path.join(h.root, "other") }, { name: "other" }, { role: "other" },
-      { startedAt: 99 }, { stale: true }, { interactive: false }, { remoteHost: "other-host" }, { capabilities: ["fabric"] }]) {
-      expect(completionSuccessor(h.recipient, [h.participant("B", 200, extra)])).toBeUndefined();
+    a.client.enqueueCompletion(h.result); a.client.start(); await waitFor(() => a.completed.mock.calls.length === 1);
+    await a.client.close(); a.inbox.close();
+    for (const [session, started] of [["B", 200], ["C", 300]] as const) {
+      h.setLive([h.participant(session, started)]); const x = h.client(session, started); x.client.start();
+      await new Promise(resolve => setTimeout(resolve, 80)); x.turn();
+      expect(x.completed).not.toHaveBeenCalled(); expect(x.sendMessage).not.toHaveBeenCalled();
+      expect(x.client.statusAgent(h.result.id)).not.toHaveProperty("text");
+      expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false);
     }
-    expect(completionSuccessor({ ...h.recipient, projectRoot: path.dirname(h.root) }, [b])).toBeUndefined();
-    expect(completionSuccessor(h.recipient, [b, h.participant("C", 300)])?.sessionId).toBe("C");
+    expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
+    const resumed = h.client("A", 100); resumed.client.start();
+    await waitFor(() => resumed.completed.mock.calls.length === 1); resumed.turn(); resumed.turn();
+    expect(resumed.sendMessage).toHaveBeenCalledOnce(); expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
   });
 
-  it("journals an orphan worker's terminal outcome via its host-owned launch return address", async () => {
+  // #3178: a newer same-lane root cannot duplicate the exact owner's admitted notice.
+  it("concurrently live same-lane root cannot duplicate an exact-owner inbox result", async () => {
+    const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result);
+    h.setLive([h.participant("A", 100)]); const a = h.client("A", 100); a.client.start();
+    await waitFor(() => a.completed.mock.calls.length === 1);
+    h.setLive([h.participant("A", 100), h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
+    await new Promise(resolve => setTimeout(resolve, 100)); b.turn(); expect(b.completed).not.toHaveBeenCalled();
+    expect(a.client.statusAgent(h.result.id)).toMatchObject({ text: h.result.text });
+    expect(b.client.statusAgent(h.result.id)).not.toHaveProperty("text"); a.turn(); a.turn();
+    expect(a.sendMessage).toHaveBeenCalledOnce(); await new Promise(resolve => setTimeout(resolve, 60));
+    expect(b.sendMessage).not.toHaveBeenCalled(); expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
+  });
+
+  // #3178: BOTH identity fields are required; name, role, age and missing lease grant no authority.
+  it.each([{ rootId: "session:B", sessionId: "B" }, { rootId: "session:A", sessionId: "B" }, { rootId: "session:B", sessionId: "A" }])("requires exact root/session, not $rootId / $sessionId", async identity => {
+    const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result);
+    h.setLive([h.participant("B", 200)]);
+    const x = new CompletionJournal(h.meshRoot, { ...h.recipient, ...identity, startedAt: 200 }, h.participants, h.mesh, vi.fn());
+    await x.drain(); expect(x.enqueue).not.toHaveBeenCalled(); expect(x.result(h.result.id)).not.toHaveProperty("text");
+    expect(x.acknowledge(h.result.id)).toBe(false); x.forget(h.result.id);
+    expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false); expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
+  });
+
+  // #3178: orphan promotion keeps its host-owned exact return address, never the observing lane.
+  it("journals an orphan worker's terminal outcome and retains it for its exact root", async () => {
     const h = harness(); const run = path.join(h.root, "run"); fs.mkdirSync(run);
     fs.writeFileSync(path.join(run, "completion-recipient.json"), JSON.stringify({ meshRoot: h.meshRoot, recipient: h.recipient, supervisor: { pid: 2147483647 } }));
+    fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(h.result));
     saveWorkerCompletion(path.join(run, "status.json"), h.result);
     h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
-    await waitFor(() => b.completed.mock.calls.length > 0); b.turn();
-    expect(b.sendMessage).toHaveBeenCalledOnce();
-    expect(await b.client.waitAgent(h.result.id)).toMatchObject({ text: h.result.text });
+    await waitFor(() => b.client.listAgents().length === 1); b.turn();
+    expect(b.sendMessage).not.toHaveBeenCalled(); expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false);
+    expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toMatchObject({ text: h.result.text });
+    const a = h.client("A", 100); a.client.start(); await waitFor(() => a.completed.mock.calls.length === 1); a.turn();
+    expect(a.sendMessage).toHaveBeenCalledOnce(); expect(await a.client.waitAgent(h.result.id)).toMatchObject({ text: h.result.text });
   });
 
   it("honors a legacy metadata receipt even when its host journaled the outcome", async () => {

@@ -349,6 +349,18 @@ export interface ResidentHostConfig {
   agents: FabricAgentConfig;
   mesh: FabricMeshConfig;
   retention: FabricRetentionConfig;
+  /** Launcher-owned recovery for a live child whose file lease stopped renewing. */
+  watchdog?: {
+    enabled?: boolean;
+    /** Lease age that identifies a wedge. Default 180000 ms. */
+    stallMs?: number;
+    /** Do not inspect for a wedge until the first lease write plus this allowance. Default 900000 ms. */
+    coldStartMs?: number;
+    /** Sampling interval. Default 30000 ms. */
+    intervalMs?: number;
+    /** Maximum watchdog restarts in a rolling hour. Default and hard cap 3. */
+    maxRestartsPerHour?: number;
+  };
   /** Absent in a config an older release wrote: the defaults apply. */
   actors?: FabricActorsConfig;
   /** Host-only shadow gates; old snapshots refuse optional inference. */

@@ -1,5 +1,7 @@
 import type { MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
-import { readHostLeases } from "../topology/host-leases.js";
+import { hostEntryLiveness, readHostLeases } from "../topology/host-leases.js";
+import { sessionLiveness } from "../topology/legacy-root-liveness.js";
+import { effectiveLiveness } from "../topology/liveness.js";
 
 /** A session counts as gone only when nothing has shown it alive for this long. */
 export const DEAD_SESSION_PRESENCE_MS = 24 * 60 * 60 * 1000;
@@ -35,18 +37,18 @@ export const deadSessionPresence = (
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_SESSION_PRESENCE_MS);
   const fresh = { fresh: true };
   const alive = new Set<string>([options.ownSessionId]);
+  const leases = typeof mesh.root === "string" ? readHostLeases(mesh.root) : new Map();
   for (const entry of mesh.listAll(HOST_PREFIX, fresh)) {
-    const expiresAt = record(entry.value)?.expiresAt;
-    if ((typeof expiresAt === "number" ? expiresAt : entry.updatedAt) <= cutoff) continue;
+    if (hostEntryLiveness(entry, leases).expiresAt <= cutoff) continue;
     for (const session of leaseSessions(entry.value)) alive.add(session);
   }
   for (const entry of mesh.listAll(LEGACY_SESSION_PREFIX, fresh)) {
-    if (entry.updatedAt > cutoff) alive.add(entry.key.slice(LEGACY_SESSION_PREFIX.length));
+    if (sessionLiveness(entry, mesh.root).updatedAt > cutoff) alive.add(entry.key.slice(LEGACY_SESSION_PREFIX.length));
   }
   // Hosts renew file leases outside the shared state (smarty-dev#816).
   if (typeof mesh.root === "string") {
-    for (const lease of readHostLeases(mesh.root).values()) {
-      if (lease.expiresAt <= cutoff) continue;
+    for (const lease of leases.values()) {
+      if (effectiveLiveness(undefined, lease).expiresAt <= cutoff) continue;
       for (const session of leaseSessions({ id: lease.id, rootId: lease.rootId, identity: { id: lease.identityId } })) {
         alive.add(session);
       }

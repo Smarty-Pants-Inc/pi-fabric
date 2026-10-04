@@ -369,6 +369,8 @@ export interface ResidentHostOwner {
   /** Linux /proc start ticks; absent for older hosts and on other platforms. */
   processStartTime?: string | undefined;
   token: string;
+  /** Binds ready custody transfer to the exact client-owned launch attempt. */
+  launchToken?: string;
   startedAt: number;
   readyAt: number;
   /** With v1, usable readiness additionally requires a same-token post-lease maintenance receipt. */

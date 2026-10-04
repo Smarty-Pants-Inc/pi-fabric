@@ -1,3 +1,5 @@
+import { beforeEach } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +18,8 @@ import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { residentRoot, type ResidentActorCaller, type ResidentActorMutation, type ResidentHostConfig } from "../src/residency/protocol.js";
+
+beforeEach(() => installInProcessResidentFence());
 
 const deferred = () => {
   let resolve!: () => void;

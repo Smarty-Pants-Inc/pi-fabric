@@ -9,6 +9,7 @@ import { FabricControlPlane, type FabricControlCommand, type FabricControlPlaneO
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricParticipantStaleError, participantLeaseGraceMs, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
+import type { FabricActorInfo } from "../src/actors/types.js";
 
 const roots: string[] = [];
 const directories: ParticipantDirectory[] = [];
@@ -51,12 +52,15 @@ const fixture = async (late = 2000, kind: "root" | "actor" = "root") => {
 };
 
 type Ports = ConstructorParameters<typeof AgentMessageRouter>;
-const router = (directory: ParticipantDirectory, request = vi.fn(async () => ({ queued: true, messageId: "only-once", routed: "mesh", acknowledged: true }))) => {
-  const actors = { identity: identity("session:reader"), status: (id: string) => { throw new Error(`Unknown Fabric actor: ${id}`); },
+const router = (directory: ParticipantDirectory, request = vi.fn(async () => ({ queued: true, messageId: "only-once", routed: "mesh", acknowledged: true })), retained?: FabricActorInfo, residency?: Ports[6]) => {
+  const actors = { identity: identity("session:reader"), status: (id: string) => {
+    if (retained && (id === retained.id || id === retained.name)) return retained;
+    throw new Error(`Unknown Fabric actor: ${id}`);
+  }, owns: () => false, resolveBinding: (_id: string, binding: unknown) => binding,
     validateDirectMessage: () => undefined } as unknown as Ports[1];
   const manager = { status: (id: string) => { throw new Error(`Unknown Fabric agent: ${id}`); } } as unknown as Ports[0];
   const main = { id: "session:reader", local: true, matches: (id: string) => id === "session:reader" } as unknown as Ports[2];
-  return { value: new AgentMessageRouter(manager, actors, main, directory, { request } as unknown as Ports[4], b => b), request };
+  return { value: new AgentMessageRouter(manager, actors, main, directory, { request } as unknown as Ports[4], b => b, residency), request };
 };
 
 describe("native route lease grace (#4383)", () => {
@@ -86,6 +90,38 @@ describe("native route lease grace (#4383)", () => {
     expect(send.request).not.toHaveBeenCalled();
   });
 
+  it.each(["followUp", "steer", "actor"] as const)("recovers a retained actor definition for %s, without replacing its exact owner", async action => {
+    const f = await fixture(2000, "actor"); f.renew();
+    const actor = { id: f.target, rootId: f.presence.rootId, name: "retained", residency: "durable", runner: "pi" } as FabricActorInfo;
+    const send = router(f.directory, undefined, actor);
+    const result = action === "actor" ? await send.value.resolveActorTargetFresh(actor.name)
+      : await send.value.routeMessage(actor.name, "unchanged", undefined, action, undefined, { idempotencyKey: "actor-retry" });
+    expect(f.sleep).toHaveBeenCalledTimes(3);
+    if (action === "actor") {
+      expect(result).toMatchObject({ actor, participant: { id: actor.id, ownerHostId: f.host.id, ownerIdentityId: f.host.identity.id } });
+      expect(send.request).not.toHaveBeenCalled();
+    } else {
+      expect(result).toMatchObject({ messageId: "only-once" });
+      expect(send.request).toHaveBeenCalledOnce();
+      expect(send.request.mock.calls[0]).toEqual([f.host.id, actor.id, action, expect.objectContaining({ message: "unchanged" }), f.host.identity.id,
+        expect.objectContaining({ idempotencyKey: "actor-retry" })]);
+    }
+  });
+
+  it.each(["followUp", "steer", "actor"] as const)("returns STALE for a retained unrenewed actor on %s before any activation/publication", async action => {
+    const f = await fixture(2000, "actor");
+    const actor = { id: f.target, rootId: "session:reader", name: "retained", residency: "durable", runner: "pi" } as FabricActorInfo;
+    const ensureActor = vi.fn(async () => undefined);
+    const resident = { hostId: f.host.id, options: { config: { rootId: actor.rootId, meshRoot: f.root } }, ensureActor } as unknown as Ports[6];
+    const send = router(f.directory, undefined, actor, resident);
+    const result = action === "actor" ? send.value.resolveActorTargetFresh(actor.name)
+      : send.value.routeMessage(actor.name, "unchanged", undefined, action, undefined, { idempotencyKey: "actor-retry" });
+    expect(await result.catch(error => error)).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", retryable: true,
+      ...(action === "actor" ? {} : { idempotencyKey: "actor-retry" }) });
+    expect(f.sleep).toHaveBeenCalledTimes(100);
+    expect(ensureActor).not.toHaveBeenCalled(); expect(send.request).not.toHaveBeenCalled();
+  });
+
   it("routes the exact renewed root once, with the original idempotency key", async () => {
     const f = await fixture(); f.renew(); const send = router(f.directory);
     await expect(send.value.routeMessage(f.target, "unchanged", undefined, "followUp", undefined, { idempotencyKey: "retry-once" }))
@@ -104,6 +140,23 @@ describe("native route lease grace (#4383)", () => {
     expect(f.sleep).toHaveBeenCalledTimes(3);
   });
 
+  it("never recovers/replays a published STALE for an own-root durable actor, even with dead-lock evidence", async () => {
+    const f = await fixture(2000, "actor");
+    writeHostLease(f.root, { ...f.lease, updatedAt: Date.now(), expiresAt: Date.now() + 60000 });
+    const lock = path.join(f.root, ".lock"); fs.mkdirSync(lock);
+    const old = new Date(Date.now() - 40000); fs.utimesSync(lock, old, old);
+    const actor = { id: f.target, rootId: "session:reader", name: "retained", residency: "durable", runner: "pi" } as FabricActorInfo;
+    const ensureActor = vi.fn(async () => undefined);
+    const resident = { hostId: f.host.id, options: { config: { rootId: actor.rootId, meshRoot: f.root } }, ensureActor } as unknown as Ports[6];
+    const published = new FabricParticipantStaleError(actor.id, 46000, "published-key");
+    const request = vi.fn().mockRejectedValue(published);
+    const send = router(f.directory, request, actor, resident);
+    await expect(send.value.routeMessage(actor.id, "unchanged", undefined, "followUp", undefined, { idempotencyKey: "published-key" }))
+      .rejects.toBe(published);
+    expect(request).toHaveBeenCalledOnce(); expect(ensureActor.mock.calls.length).toBeLessThanOrEqual(1);
+    expect(f.sleep).not.toHaveBeenCalled();
+  });
+
   it("keeps a 120s-lapsed exact target Unknown without polling or redirecting", async () => {
     const f = await fixture(120000), send = router(f.directory);
     await expect(send.value.routeMessage(f.target, "never redirect", undefined, "followUp")).rejects.toThrow(`Unknown Fabric participant: ${f.target}`);
@@ -117,6 +170,36 @@ describe("native route lease grace (#4383)", () => {
       { format: 1, rootId: f.target, ownerHostId: f.target, ownerIdentityId: f.target, closedAt: f.now() } });
     expect(await f.directory.resolveRoutingLease(f.target)).toBe(false);
     expect(f.sleep).not.toHaveBeenCalled();
+  });
+
+  it("normal Main exit leaves resident-owned durable actor/agent addressable to a peer, not the old Main", async () => {
+    const root = temp(), mainId = "session:ended", residentId = "runtime:resident", peerId = "session:reader";
+    const directory = (hostId: string, rootId: string) => {
+      const d = new ParticipantDirectory(new MeshStore(root, 65536, 1000), { enabled: true, hostId, rootId, identity: identity(hostId),
+        reapDeadHosts: false, heartbeatMs: 60000, leaseMs: 120000 });
+      directories.push(d); return d;
+    };
+    const main = directory(mainId, mainId), resident = directory(residentId, mainId), peer = directory(peerId, peerId);
+    const records = ["actor", "agent"].map(kind => ({ format: 1, id: `${kind}:survivor`, kind, rootId: mainId,
+      ownerHostId: residentId, ownerIdentityId: residentId, name: kind, status: "running", residency: "durable", runner: "pi", transport: "host",
+      capabilities: ["steer", "followUp"], controlProtocol: "v1", startedAt: 1, updatedAt: Date.now() } as FabricParticipantRecord));
+    main.registerSource(() => [{ ...records[0]!, id: mainId, kind: "root", rootId: mainId, ownerHostId: mainId, ownerIdentityId: mainId }]);
+    resident.registerSource(() => records);
+    await main.refresh(); await resident.refresh(); await peer.refresh();
+    await main.closeLineage(); // The normal lifecycle operation, not just a synthetic tombstone.
+    expect(peer.get(mainId, Date.now(), { fresh: true })).toBeUndefined();
+    const send = router(peer);
+    await expect(send.value.routeMessage(mainId, "must not reopen", undefined, "followUp")).rejects.toThrow(`Unknown Fabric participant: ${mainId}`);
+    for (const record of records) {
+      expect(peer.list({ scope: "project", fresh: true }).find(p => p.id === record.id)).toMatchObject({ stale: false });
+      expect(peer.get(record.id, Date.now(), { fresh: true })).toMatchObject({ ownerHostId: residentId, rootId: mainId, stale: false });
+      expect(peer.captureControlOwnerLease(residentId, residentId, record.id)?.()).toBeGreaterThan(Date.now());
+      expect(peer.retainedRouteAllowed(record.id)).toBe(true);
+      expect(await peer.resolveRoutingLease(record.id)).toBe(true);
+      await expect(send.value.routeMessage(record.id, "control survivor", undefined, "steer")).resolves.toMatchObject({ messageId: "only-once" });
+      expect(send.request.mock.calls.at(-1)?.slice(0, 3)).toEqual([residentId, record.id, "steer"]);
+    }
+    expect(send.request).toHaveBeenCalledTimes(2);
   });
 
   it("does not revive a replaced owner's incarnation", async () => {

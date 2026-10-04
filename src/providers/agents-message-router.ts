@@ -99,6 +99,9 @@ export class FabricRouteAuthorityError extends Error {
   }
 }
 
+/** Distinguishes a pre-publication lease wait from an uncertain published ACK. */
+class LeaseResolutionStale extends FabricParticipantStaleError {}
+
 /** Only lookup can request lease recovery; owner ACKs and handlers must never replay. */
 class LeaseResolutionRequired extends Error {
   constructor(readonly targetId: string, readonly original: Error) { super(original.message, { cause: original }); }
@@ -133,6 +136,16 @@ export class AgentMessageRouter {
       ? new LeaseResolutionRequired(id, error) : error;
   }
 
+  async #resolveRoutingLease(id: string): Promise<boolean | undefined> {
+    try { return await this.participants.resolveRoutingLease?.(id); }
+    catch (error) {
+      if (error instanceof FabricParticipantStaleError) {
+        throw new LeaseResolutionStale(error.targetId, error.lapsedMs, error.idempotencyKey);
+      }
+      throw error;
+    }
+  }
+
   #directoryRead<T>(read: () => T): T {
     try {
       const value = read();
@@ -154,7 +167,7 @@ export class AgentMessageRouter {
   async #withDirectory<T>(operation: () => Promise<T>, id?: string, recoverLease = true): Promise<T> {
     const reason = this.#directoryUnavailable();
     if (reason) {
-      if (recoverLease && id && await this.participants.resolveRoutingLease?.(id) === false) throw this.#unknownParticipant(id);
+      if (recoverLease && id && await this.#resolveRoutingLease(id) === false) throw this.#unknownParticipant(id);
       await this.#refreshDirectory(reason);
     }
     try {
@@ -162,13 +175,13 @@ export class AgentMessageRouter {
     } catch (error) {
       // Lease recovery is pre-publication only. A failed ACK is never replayed here.
       if (recoverLease && error instanceof LeaseResolutionRequired && this.participants.resolveRoutingLease) {
-        if (await this.participants.resolveRoutingLease(error.targetId)) return operation();
+        if (await this.#resolveRoutingLease(error.targetId)) return operation();
         throw error.original;
       }
       // A read can fail after the preflight. Retry resolution once, never delivery after
       // an ACK/control error: only pre-publication directory failures have this class.
       if (!(error instanceof FabricDirectoryUnavailableError) || reason || !this.participants.refreshRoutingView) throw error;
-      if (recoverLease && id && await this.participants.resolveRoutingLease?.(id) === false) throw this.#unknownParticipant(id);
+      if (recoverLease && id && await this.#resolveRoutingLease(id) === false) throw this.#unknownParticipant(id);
       await this.#refreshDirectory(error.message);
       return operation();
     }
@@ -340,7 +353,7 @@ export class AgentMessageRouter {
       result = provenLocal
         ? await this.#route(id, message, data, kind, context, options, true)
         : await this.#withDurableRecovery(id, recovering =>
-          this.#withDirectory(() => this.#route(id, message, data, kind, context, options), id, !recovering));
+          this.#withDirectory(() => this.#route(id, message, data, kind, context, options, false, !recovering), id, !recovering));
     } catch (error) {
       if (error instanceof FabricParticipantStaleError && !error.idempotencyKey) {
         throw new FabricParticipantStaleError(error.targetId, error.lapsedMs, options.idempotencyKey);
@@ -371,7 +384,7 @@ export class AgentMessageRouter {
       catch (error) {
         const lockError = error instanceof FabricDirectoryUnavailableError ? error.cause : error;
         const recoveryEvidence = (lockError instanceof Error && "code" in lockError && lockError.code === "FABRIC_MESH_LOCK_TIMEOUT") ||
-          error instanceof FabricParticipantStaleError;
+          error instanceof LeaseResolutionStale;
         if (!recoveryEvidence || !this.residency || !kernelFenceAvailable()) throw error;
         // Retained ownership proves only eligibility to wait for lock recovery,
         // never permission to publish. The retried operation revalidates routing.
@@ -442,6 +455,7 @@ export class AgentMessageRouter {
       idempotencyKey?: string;
     } = {},
     provenLocal = false,
+    recoverLease = true,
   ): Promise<FabricAgentMessageResult> {
     context?.signal?.throwIfAborted();
     const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
@@ -491,7 +505,7 @@ export class AgentMessageRouter {
         throw this.participants.writeStalled?.() ?? this.#unknownParticipant(this.mainAgent.id, "Fabric Main participant");
       }
       if (participant.stale && this.participants.resolveRoutingLease) {
-        if (!await this.participants.resolveRoutingLease(participant.id)) throw this.#unknownParticipant(participant.id);
+        if (!await this.#resolveRoutingLease(participant.id)) throw this.#unknownParticipant(participant.id);
         const refreshed = this.#rootRouteSnapshot(participant.id);
         if (!refreshed || refreshed.ownerHostId !== participant.ownerHostId || refreshed.ownerIdentityId !== participant.ownerIdentityId) {
           throw new FabricRouteAuthorityError(participant.id);
@@ -577,7 +591,7 @@ export class AgentMessageRouter {
     this.actorManager.validateDirectMessage(message, data);
     let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
     try {
-      target = await this.#resolveActorMessageTarget(id);
+      target = await this.#resolveActorMessageTarget(id, recoverLease);
     } catch (error) {
       if (error instanceof Error && /Unknown Fabric actor/.test(error.message)) {
         throw this.participants.writeStalled?.() ?? this.#unknownParticipant(id);
@@ -780,9 +794,9 @@ export class AgentMessageRouter {
     return this.#withDirectory(() => this.#resolveActorMessageTarget(id), id);
   }
 
-  async #resolveActorMessageTarget(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+  async #resolveActorMessageTarget(id: string, recoverLease = true): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
     if (id.trim().startsWith("session:")) throw this.#unknownParticipant(id, "Fabric Main participant");
-    const target = this.resolveActorTarget(id);
+    const target = this.resolveActorTarget(id, recoverLease);
     const { actor, participant } = target;
     if (this.residency && (actor?.residency ?? participant?.residency) === "durable" &&
         !(actor && (this.actorManager.owns?.(actor.id) ?? participant?.local)) &&
@@ -792,7 +806,7 @@ export class AgentMessageRouter {
         return target;
       }
       await this.#withDurableRecovery(id, () => this.residency!.ensureActor(actor?.id ?? participant!.id));
-      return this.resolveActorTarget(actor?.id ?? participant!.id);
+      return this.resolveActorTarget(actor?.id ?? participant!.id, recoverLease);
     }
     return target;
   }
@@ -802,7 +816,7 @@ export class AgentMessageRouter {
     return this.#withDirectory(async () => {
       const known = this.#get(id);
       if (known || !this.participants.resolveRoutingLease) return known;
-      if (!await this.participants.resolveRoutingLease(id)) throw this.#unknownParticipant(id);
+      if (!await this.#resolveRoutingLease(id)) throw this.#unknownParticipant(id);
       return this.#get(id);
     }, id);
   }
@@ -812,7 +826,7 @@ export class AgentMessageRouter {
     return this.#withDirectory(async () => this.resolveActorTarget(id), id);
   }
 
-  resolveActorTarget(id: string): {
+  resolveActorTarget(id: string, recoverLease = true): {
     actor?: FabricActorInfo;
     participant?: FabricParticipantInfo;
   } {
@@ -826,6 +840,16 @@ export class AgentMessageRouter {
     const participant = this.#get(actor?.id ?? id);
     if (!actor && (!participant || participant.kind !== "actor")) {
       throw this.#unknownParticipant(id, "Fabric actor");
+    }
+    // A passive/project definition is not execution ownership. A retained exact
+    // owner hidden by lease filtering must take the same pre-publication grace
+    // path as an unknown target, before resident activation/replacement is tried.
+    // Truly ownerless definitions keep their existing activation/status behavior.
+    if (recoverLease && actor && !participant && !(this.actorManager.owns?.(actor.id) ?? false) &&
+      this.participants.resolveRoutingLease &&
+      this.#directoryRead(() => this.participants.lastKnown?.(actor.id))?.participant.kind === "actor") {
+      // Preserve the exact resolved ID through #route's unknown-actor fallback.
+      throw this.#unknownParticipant(actor.id);
     }
     return {
       ...(actor ? { actor } : {}),

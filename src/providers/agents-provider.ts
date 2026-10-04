@@ -1342,6 +1342,9 @@ export class AgentsProvider implements FabricProvider {
           if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
         }
         if (actor && this.actorManager.owns(actor.id)) return actor;
+        // A retained definition is not a fresh execution snapshot. Recover its
+        // exact owner before a resident query or the synchronous live overlay.
+        await this.#resolveActorTarget(actor?.id ?? id);
         // Query a live root owner for authoritative bindings; otherwise keep the
         // fresh participant overlay (including unknown when execution is unavailable).
         const resident = this.#liveResidentActorClient() ? await this.#residentActorOwner(id) : undefined;

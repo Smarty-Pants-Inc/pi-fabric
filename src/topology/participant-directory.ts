@@ -838,11 +838,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
       typeof value.closedAt === "number" && Number.isFinite(value.closedAt));
   }
 
+  /** A Main's close certifies its own host, not an independently leased resident.
+   * The old root address stays closed even if another host retains its presence. */
+  #routeEnded(participant: FabricParticipantRecord, read: MeshReadOptions = {}): boolean {
+    return (participant.kind === "root" || participant.residency !== "durable" || participant.ownerHostId === participant.rootId) &&
+      this.#sessionEnded(participant.rootId, read);
+  }
+
   /** Capture owner authority once. Subsequent ACK checks only stat/read that owner's file. */
   captureControlOwnerLease(ownerHostId: string, ownerIdentityId: string, targetId: string): (() => number) | undefined {
     const record = this.#routingOwner(targetId);
     if (!record || record.owner.id !== ownerHostId || record.owner.identity.id !== ownerIdentityId ||
-      this.#sessionEnded(record.participant.rootId, record.read)) return undefined;
+      this.#routeEnded(record.participant, record.read)) return undefined;
     const { owner } = record;
     return () => {
       const lease = readHostLease(this.mesh.root, owner.id);
@@ -866,7 +873,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const { participant, owner } = record;
     const options = this.options.routingLease ?? {};
     const now = (options.now ?? Date.now)();
-    if (this.#sessionEnded(participant.rootId, record.read)) return false;
+    if (this.#routeEnded(participant, record.read)) return false;
     const snapshot = readHostLeaseSnapshot(this.mesh.root, owner.id);
     const lease = snapshot?.lease;
     const matching = lease && lease.rootId === owner.rootId && lease.identityId === owner.identity.id &&
@@ -891,7 +898,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return !!refreshed && refreshed.ownerHostId === owner.id && refreshed.ownerIdentityId === owner.identity.id &&
       refreshed.rootId === participant.rootId && !refreshed.remoteHost &&
       !["stopping", "reloading"].includes(refreshed.status) && currentOwner?.startedAt === owner.startedAt &&
-      currentOwner.identity.id === owner.identity.id && currentOwner.rootId === owner.rootId && !this.#sessionEnded(participant.rootId);
+      currentOwner.identity.id === owner.identity.id && currentOwner.rootId === owner.rootId && !this.#routeEnded(refreshed);
   }
 
   lastKnown(id: string, now = Date.now()): { participant: FabricParticipantInfo; lapsedMs: number } | undefined {
@@ -924,7 +931,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const read = { snapshot: this.mesh.stateToken({ fresh: options.fresh === true }) };
       const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, target), read);
       const participant = entry ? participantFromEntry(entry) : undefined;
-      if (participant && this.#sessionEnded(participant.rootId, read)) return undefined;
+      if ((participant && this.#routeEnded(participant, read)) ||
+        (target.startsWith("session:") && participant?.kind !== "root" && this.#sessionEnded(target, read))) return undefined;
       if (participant?.id === target && (
         participant.remoteHost === undefined ||
         !this.#collides(participant, this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read)))

@@ -358,7 +358,7 @@ export interface ResidentHostConfig {
     coldStartMs?: number;
     /** Sampling interval. Default 30000 ms. */
     intervalMs?: number;
-    /** Maximum watchdog restarts in a rolling hour. Default and hard cap 3. */
+    /** Reserved restart ceiling (default/hard cap 3). Automatic respawn is currently fail-closed without whole-attempt containment. */
     maxRestartsPerHour?: number;
   };
   /** Absent in a config an older release wrote: the defaults apply. */

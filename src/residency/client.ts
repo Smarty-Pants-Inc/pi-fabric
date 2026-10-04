@@ -24,6 +24,7 @@ import {
   mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
 } from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
+import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
@@ -300,6 +301,7 @@ export class ResidencyClient {
     atomicWrite(this.#configPath, this.options.config);
     const existing = this.#readyOwner();
     if (existing) return existing;
+    assertNoWatchdogCustody(this.options.config.residencyRoot);
     // The detached launcher already owns the exact attempt/fallback. Neither
     // ensureHost nor the watchdog may become a competing handover executor.
     const releaseDeadline = Date.now() + HANDOVER_WAIT_MS;
@@ -320,6 +322,9 @@ export class ResidencyClient {
       if (Date.now() >= attachDeadline) throw new Error("Timed out waiting for Fabric resident host maintenance readiness");
       await delay(STATUS_POLL_MS);
     }
+    // Recheck after the attachment wait: the old launcher may have entered
+    // destructive watchdog custody while we still saw its live owner.
+    assertNoWatchdogCustody(this.options.config.residencyRoot);
     fs.rmSync(this.#errorPath, { force: true });
     const launchToken = randomUUID();
     const launcher = await spawnDetached(

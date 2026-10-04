@@ -6,10 +6,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
-import { observeResidentOwner, captureDescendants, stopObservedDescendants, type OwnedProcess } from "./launcher-owner.js";
+import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
+import { assertNoWatchdogCustody, watchdogCustodyPath } from "./watchdog-custody.js";
 import {
   HANDOVER_STARTUP_MS, residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec, assertAutomaticReleaseRecovery,
   handoverPath, handoverActive, handoverCustodyPath, handoverOutcomePath,
@@ -18,7 +19,6 @@ import {
   type ResidentLaunchSpec, type ResidentLauncherIdentity, type ResidentHandoverPlan, type ResidentHandoverState,
 } from "./handover.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
-import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricHostLease } from "../topology/host-leases.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
@@ -53,7 +53,7 @@ interface Attempt {
   logFile: string;
   firstLeaseAt?: number;
   watchdogGivenUp?: boolean;
-  recovery?: { hostId: string; evidenceDir: string; restartCount: number };
+  watchdogDeferred?: { checks: number; nextCheckAt: number };
   native: ResidentChildLifetime;
   stop?: Promise<void>;
   seenOwner: boolean;
@@ -178,15 +178,18 @@ const signalChild = (attempt: Attempt, signal: NodeJS.Signals): void => {
   attempt.child.kill(signal);
 };
 
-async function terminateWedgedChild(attempt: Attempt, termMs: number, killMs: number): Promise<void> {
+async function terminateWedgedChild(attempt: Attempt, termMs: number, killMs: number, revalidate: (signal: NodeJS.Signals) => boolean): Promise<boolean> {
+  if (!revalidate("SIGTERM")) return false;
   signalChild(attempt, "SIGTERM");
   if (!attempt.native.exited) await waitForExit(attempt, termMs);
   if (!attempt.native.exited) {
+    if (!revalidate("SIGKILL")) return false;
     signalChild(attempt, "SIGKILL");
     await waitForExit(attempt, killMs);
   }
   if (!attempt.native.exited) throw new Error("Wedged resident child did not provide a native exit receipt; restart blocked");
   await stopObservedDescendants(attempt, attempt.child.pid);
+  return true;
 }
 
 /** Best-effort stop of birth-validated, observed attempt processes only.
@@ -206,7 +209,7 @@ function stopAttempt(attempt: Attempt): Promise<void> {
 }
 
 /** Timing injection is only for deterministic launcher tests; production uses fixed signal deadlines. */
-export async function supervise(configPath: string, options: { signal?: AbortSignal; reportWaitMs?: number; termMs?: number; killWaitMs?: number } = {}): Promise<void> {
+export async function supervise(configPath: string, options: { signal?: AbortSignal; reportWaitMs?: number; termMs?: number; killWaitMs?: number; proofRetryMs?: number; proofChecks?: number } = {}): Promise<void> {
   const root = path.dirname(configPath);
   const ownerPath = path.join(root, "owner.json");
   const trace = (event: string, extra: Record<string, unknown> = {}): void => {
@@ -216,6 +219,8 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   const readOwner = (): ResidentHostOwner | undefined => readHandoverJson<ResidentHostOwner>(ownerPath);
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   trace("launcher-started", { pid: process.pid, processStartTime: processStartTime(process.pid), configPath, platform: process.platform });
+  try { assertNoWatchdogCustody(root); }
+  catch (error) { trace("watchdog-deferred", { reason: String(error).slice(0, 500) }); return; }
   if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(root)))) {
     trace("launcher-deferred", { reason: "existing handover custody" }); return;
   }
@@ -245,7 +250,8 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     const runtime = spec?.runtime ?? launcher.runtime;
     const attemptInfo = plan && kind ? { id: plan.id, kind } : undefined;
     const reportDirectory = path.join(root, "wedges", "reports");
-    fs.mkdirSync(reportDirectory, { recursive: true, mode: 0o700 });
+    try { fs.mkdirSync(reportDirectory, { recursive: true, mode: 0o700 }); }
+    catch (error) { trace("watchdog-evidence-error", { stage: "report-directory", reason: String(error).slice(0, 500) }); }
     const args = ["--mode", "rpc", "--no-session", "--no-tools", "--no-extensions", "--no-skills",
       "--no-prompt-templates", "--no-context-files", "--extension", launchEntry];
     const nodeOptions = `${process.env.NODE_OPTIONS ?? ""} --report-on-signal --report-signal=SIGUSR2 --report-exclude-env --report-directory=${JSON.stringify(reportDirectory)}`;
@@ -316,81 +322,130 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     throw new Error(attempt.stderr.trim() || `Resident ${kind} did not prove worker startup`);
   };
   let attempt = start(initial);
-  const watchdogRestarts: number[] = [];
   let nextWatchdogAt = 0;
-  const restartIfWedged = async (candidate: Attempt): Promise<Attempt | undefined> => {
+  const evidenceError = (stage: string, error: unknown): void => {
+    trace("watchdog-evidence-error", { stage, reason: String(error).slice(0, 500) });
+  };
+  const retryExitProof = (candidate: Attempt): void => {
+    const deferred = candidate.watchdogDeferred!;
+    if (Date.now() < deferred.nextCheckAt || candidate.watchdogGivenUp) return;
+    deferred.checks++;
+    deferred.nextCheckAt = Date.now() + numberSetting(options.proofRetryMs, 1_000, 1);
+    const session = checkResidentSessionExit(candidate.child.pid);
+    let reason = session.reason;
+    if (session.empty) {
+      try { assertAutomaticReleaseRecovery(); }
+      catch (error) { reason = String(error); }
+    }
+    // A session can empty while a detached worker/pane/scope still executes.
+    // Until attempt-owned containment exists the shared recovery gate always
+    // refuses. Keep native custody; neither sampling nor a free fence authorizes
+    // another host, even after this necessary session check succeeds.
+    trace("watchdog-deferred", { pid: candidate.child.pid, reason, sessionEmpty: session.empty,
+      members: session.members.slice(0, 100), memberCount: session.members.length, proofCheck: deferred.checks });
+    if (deferred.checks >= Math.min(30, numberSetting(options.proofChecks, 30, 1))) {
+      candidate.watchdogGivenUp = true;
+      trace("watchdog-giving-up", { pid: candidate.child.pid, reason: "complete attempt exit remains unproven", proofChecks: deferred.checks });
+    }
+  };
+  const recoverIfWedged = async (candidate: Attempt): Promise<void> => {
     const launchConfig = candidate.spec?.config ?? config;
     const watchdog = launchConfig.watchdog;
-    if (watchdog?.enabled === false || candidate.watchdogGivenUp || Date.now() < nextWatchdogAt || candidate.native.exited) return undefined;
+    if (watchdog?.enabled === false || candidate.watchdogGivenUp || Date.now() < nextWatchdogAt || candidate.native.exited) return;
     nextWatchdogAt = Date.now() + numberSetting(watchdog?.intervalMs, 30_000, 1);
     const stallMs = numberSetting(watchdog?.stallMs, 180_000, 1);
     const coldStartMs = numberSetting(watchdog?.coldStartMs, 900_000);
-    const limit = Math.min(3, Math.floor(numberSetting(watchdog?.maxRestartsPerHour, 3, 1)));
     const owner = readOwner();
     if (typeof owner?.hostId !== "string" || owner.pid !== candidate.child.pid || candidate.closingInput || !candidate.child.pid ||
-        !residentProcessAlive(candidate.child.pid, owner.processStartTime)) return undefined;
+        !residentProcessAlive(candidate.child.pid, owner.processStartTime)) return;
     const lease = readOwnLease(launchConfig, owner.hostId);
-    if (!lease || lease.rootId !== launchConfig.rootId || lease.identityId !== owner.hostId) return undefined;
-    if (lease.updatedAt < candidate.startedAt) return undefined;
+    if (!lease || lease.updatedAt < candidate.startedAt) return;
     candidate.firstLeaseAt ??= lease.updatedAt;
-    if (Date.now() < candidate.firstLeaseAt + coldStartMs) return undefined;
+    if (Date.now() < candidate.firstLeaseAt + coldStartMs) return;
     const age = Math.max(0, Date.now() - lease.updatedAt);
-    if (age <= stallMs) return undefined;
-    const cpu = processCpu(candidate.child.pid);
-    const evidenceDir = await captureWedgeEvidence(root, launchConfig, candidate, owner);
-    const now = Date.now();
-    while (watchdogRestarts.length && watchdogRestarts[0]! <= now - 3_600_000) watchdogRestarts.shift();
-    if (watchdogRestarts.length >= limit) {
-      candidate.watchdogGivenUp = true;
-      trace("watchdog-giving-up", { hostId: owner.hostId, pid: candidate.child.pid, leaseAgeMs: age, cpu, evidenceDir, restartCount: watchdogRestarts.length });
-      return undefined;
+    if (age <= stallMs) return;
+    let evidenceDir: string;
+    try { evidenceDir = await captureWedgeEvidence(root, launchConfig, candidate, owner); }
+    catch (error) {
+      evidenceError("capture", error);
+      trace("watchdog-deferred", { pid: candidate.child.pid, reason: "required evidence unavailable" });
+      return; // Retry on the next interval, retaining shutdown handlers/custody.
     }
-    const restartCount = watchdogRestarts.length + 1;
-    const frozenConfigPath = path.join(root, `watchdog-config-${launcher.token}.json`);
-    if (!candidate.spec) writeHandoverImmutable(frozenConfigPath, config);
-    trace("watchdog-restart", { hostId: owner.hostId, pid: candidate.child.pid, leaseAgeMs: age, cpu, evidenceDir, restartCount });
-    if (!candidate.native.exited && process.platform !== "win32") {
-      signalChild(candidate, "SIGUSR2");
-      await delay(options.reportWaitMs ?? 5_000);
-      const reports = path.join(root, "wedges", "reports");
-      for (const name of fs.readdirSync(reports)) {
-        // Node's default report.<date>.<time>.<pid>.<sequence>.json naming.
-        if (!name.includes(`.${candidate.child.pid}.`) || !name.endsWith(".json")) continue;
-        try { fs.renameSync(path.join(reports, name), path.join(evidenceDir, name)); } catch { /* The report may still be writing. */ }
+    let custodyWritten = false;
+    const revalidate = (signal: NodeJS.Signals): boolean => {
+      if (stopping || candidate.native.exited) return false;
+      let reason: string | undefined;
+      try {
+        const currentOwner = readOwner();
+        const currentLease = readOwnLease(launchConfig, owner.hostId);
+        const birth = candidate.processes.get(candidate.child.pid!)?.processStartTime;
+        if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(root)))) reason = "release handover became active";
+        else if (candidate.closingInput || !currentOwner || currentOwner.pid !== owner.pid || currentOwner.token !== owner.token ||
+          currentOwner.hostId !== owner.hostId || currentOwner.processStartTime !== owner.processStartTime ||
+          currentOwner.startedAt !== owner.startedAt || !residentProcessAlive(owner.pid, owner.processStartTime) ||
+          (process.platform === "linux" && (!birth || processStartTime(owner.pid) !== birth))) reason = "owner generation or child incarnation changed";
+        else if (!currentLease || currentLease.updatedAt !== lease.updatedAt || currentLease.updatedAt < candidate.startedAt ||
+          Date.now() - currentLease.updatedAt <= stallMs) reason = "lease renewed, healthy or unavailable";
+      } catch (error) { reason = `revalidation unavailable: ${String(error).slice(0, 300)}`; }
+      if (reason) { trace("watchdog-aborted", { pid: candidate.child.pid, signal, reason }); return false; }
+      if (!custodyWritten) {
+        // Persist before even the report signal: an unexpected exit there must
+        // not reopen startup either. A different launcher or
+        // client must not recreate this dead host over an escaped live worker.
+        // Never expire custody on launcher/PID exit: that is not attempt exit.
+        writeHandoverImmutable(watchdogCustodyPath(root), { format: 1, launcher, owner });
+        custodyWritten = true;
+        return revalidate(signal); // Storage may take long enough for renewal.
       }
-    }
-
-    if (stopping) return undefined;
-    captureDescendants(candidate);
-    await terminateWedgedChild(candidate, options.termMs ?? 30_000, options.killWaitMs ?? 5_000);
-    if (stopping) return undefined;
-    const restarted = start(candidate.spec, undefined, undefined, frozenConfigPath);
-    watchdogRestarts.push(restarted.startedAt);
-    restarted.recovery = { hostId: owner.hostId, evidenceDir, restartCount };
-    return restarted;
+      return true;
+    };
+    // Share handover's transaction lock throughout the report/signal boundary.
+    // A busy/unavailable lock is not permission to recover a different owner.
+    let recoveryFd: number | undefined;
+    try {
+      recoveryFd = await lockFile(path.join(root, "handover.lock"), 0, true);
+      if (process.platform !== "win32") {
+        if (!revalidate("SIGUSR2")) return;
+        signalChild(candidate, "SIGUSR2");
+        await delay(options.reportWaitMs ?? 5_000);
+        try {
+          const reports = path.join(root, "wedges", "reports");
+          for (const name of fs.readdirSync(reports)) {
+            if (!name.includes(`.${candidate.child.pid}.`) || !name.endsWith(".json")) continue;
+            try { fs.renameSync(path.join(reports, name), path.join(evidenceDir, name)); }
+            catch (error) { evidenceError("report-move", error); }
+          }
+        } catch (error) { evidenceError("reports", error); }
+      }
+      if (stopping) return;
+      trace("watchdog-stopping", { hostId: owner.hostId, pid: candidate.child.pid, leaseAgeMs: age, cpu: processCpu(candidate.child.pid), evidenceDir });
+      captureDescendants(candidate);
+      const stopped = await terminateWedgedChild(candidate, options.termMs ?? 30_000, options.killWaitMs ?? 5_000, revalidate);
+      if (!stopped && !candidate.native.exited) return;
+      candidate.watchdogDeferred = { checks: 0, nextCheckAt: 0 };
+      retryExitProof(candidate);
+    } catch (error) {
+      trace("watchdog-deferred", { pid: candidate.child.pid, reason: String(error).slice(0, 500) });
+      // A native exit still does not release custody of an uncertain attempt.
+      if (candidate.native.exited) candidate.watchdogDeferred ??= { checks: 0, nextCheckAt: 0 };
+    } finally { if (recoveryFd !== undefined) fs.closeSync(recoveryFd); }
   };
   try {
     while (!stopping) {
       let plan: ResidentHandoverPlan | undefined;
       let custodyFd: number | undefined;
       let inode: fs.Stats | undefined;
-      while (!attempt.native.exited && !stopping) {
+      while ((!attempt.native.exited || attempt.watchdogDeferred) && !stopping) {
+        if (attempt.watchdogDeferred) {
+          retryExitProof(attempt);
+          await delay(50);
+          continue;
+        }
         observe(attempt);
         const state = readHandoverJson<ResidentHandoverState>(handoverPath(root));
-        if (attempt.recovery) {
-          const owner = readOwner();
-          const launchConfig = attempt.spec?.config ?? config;
-          const lease = readOwnLease(launchConfig, attempt.recovery.hostId);
-          if (owner?.pid === attempt.child.pid && lease && lease.updatedAt >= attempt.startedAt) {
-            writeJsonAtomic(path.join(root, "wedges", "latest.json"), {
-              topic: `fleet.residency.${attempt.recovery.hostId}`, kind: "wedge-recovered", ...attempt.recovery, createdAt: Date.now(),
-            });
-            delete attempt.recovery;
-          }
-        }
         if (!plan && !handoverActive(state)) {
-          const restarted = await restartIfWedged(attempt);
-          if (restarted) { attempt = restarted; continue; }
+          await recoverIfWedged(attempt);
+          if (attempt.watchdogDeferred) continue;
         }
         if (!plan && state?.phase === "custody" && ownHandoverPlan(state.plan, readOwner(), launcher, attempt.child.pid)) {
           try {

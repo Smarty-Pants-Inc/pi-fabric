@@ -181,6 +181,10 @@ setInterval(() => {
     expect(f.source).toContain("while (-not $owner.HasExited)");
     expect(f.source).toContain("SetAccessRuleProtection($true, $false)");
     expect(f.source).toContain("$prior.GetOwner");
+    expect(f.source).toContain("$adminOwner = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)");
+    expect(f.source).toContain("if ($adminOwner) { $allowedOwners += 'S-1-5-32-544' }");
+    expect(f.source).toContain("WindowsBuiltInRole]::Administrator");
+    expect(f.source).toContain("$prior.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -notin $allowedOwners");
     expect(f.source).not.toContain(chain);
     f.inspector.close(); f.inspector.close();
     expect(f.child.kill).toHaveBeenCalledOnce();

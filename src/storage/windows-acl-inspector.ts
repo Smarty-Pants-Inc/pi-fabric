@@ -42,7 +42,11 @@ $directory = $env:PI_FABRIC_ACL_MAILBOX
 $key = [Convert]::FromBase64String($env:PI_FABRIC_ACL_REPLY_KEY)
 $hmac = [System.Security.Cryptography.HMACSHA256]::new($key)
 $owner = [System.Diagnostics.Process]::GetProcessById([int]$env:PI_FABRIC_ACL_OWNER_PID)
-$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$user = $identity.User
+$principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+# IsInRole tests the enabled token role: UAC-filtered (non-elevated) admins return false.
+$adminOwner = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 $acl = [System.Security.AccessControl.DirectorySecurity]::new()
 $acl.SetOwner($user)
 $acl.SetAccessRuleProtection($true, $false)
@@ -51,8 +55,10 @@ foreach ($sid in @($user.Value, 'S-1-5-18', 'S-1-5-32-544')) {
 }
 $item = Get-Item -Force -LiteralPath $directory
 $prior = Get-Acl -LiteralPath $directory
+$allowedOwners = @($user.Value)
+if ($adminOwner) { $allowedOwners += 'S-1-5-32-544' }
 if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
-    $prior.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -notin @($user.Value, 'S-1-5-18', 'S-1-5-32-544')) { throw 'Unowned ACL mailbox' }
+    $prior.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -notin $allowedOwners) { throw 'Unowned ACL mailbox' }
 Set-Acl -LiteralPath $directory -AclObject $acl
 function Reply($nonce, $ok, $payload) {
   $status = if ($ok) { 'ok' } else { 'error' }

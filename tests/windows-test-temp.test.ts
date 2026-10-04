@@ -45,6 +45,10 @@ describe("private Windows test directory lifecycle", () => {
     expect(String(args![0])).toContain("SetAccessRuleProtection($true, $false)");
     expect(String(args![0])).toContain("ContainerInherit,ObjectInherit");
     expect(String(args![0])).toContain("Unowned test directory");
+    expect(String(args![0])).toContain("$adminOwner = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)");
+    expect(String(args![0])).toContain("if ($adminOwner) { $allowedOwners += 'S-1-5-32-544' }");
+    expect(String(args![0])).toContain("WindowsBuiltInRole]::Administrator");
+    expect(String(args![0])).toContain("$prior.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -notin $allowedOwners");
     expect(options!.env!.FABRIC_TEST_DIRECTORY).toBe(namespace.directory);
     expect(f.native.mock.calls.every(([file, args]) => !/diskpart|vdisk|format fs|assign letter/i.test(`${file} ${args}`))).toBe(true);
     expect(windowsDataRoot).toHaveBeenCalledExactlyOnceWith(namespace.directory, { private: true });

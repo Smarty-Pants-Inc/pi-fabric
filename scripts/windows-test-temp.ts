@@ -40,11 +40,17 @@ export const privateWindowsTestTemp = (): { directory: string; close(): void } =
   };
   try {
     if (fresh) native(String.raw`
-$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$user = $identity.User
+$principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+# IsInRole tests the enabled token role: UAC-filtered (non-elevated) admins return false.
+$adminOwner = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 $item = Get-Item -Force -LiteralPath $env:FABRIC_TEST_DIRECTORY
 $prior = Get-Acl -LiteralPath $env:FABRIC_TEST_DIRECTORY
+$allowedOwners = @($user.Value)
+if ($adminOwner) { $allowedOwners += 'S-1-5-32-544' }
 if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
-    $prior.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $user.Value) { throw 'Unowned test directory' }
+    $prior.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -notin $allowedOwners) { throw 'Unowned test directory' }
 $acl = [System.Security.AccessControl.DirectorySecurity]::new()
 $acl.SetOwner($user)
 $acl.SetAccessRuleProtection($true, $false)

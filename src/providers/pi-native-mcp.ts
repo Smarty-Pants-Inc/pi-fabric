@@ -166,9 +166,10 @@ export class PiNativeMcpTools {
     return this.#descriptor(this.#resolve(server, tool));
   }
 
-  async invoke(server: string, tool: string, args: Record<string, unknown>, context: FabricInvocationContext): Promise<unknown> {
+  async invoke(server: string, tool: string, args: Record<string, unknown>, context: FabricInvocationContext, canonicalOnly = false): Promise<unknown> {
     throwIfAborted(context.signal);
     const entry = this.#resolve(server, tool);
+    if (canonicalOnly && entry.tool !== tool) throw new Error("MCP $call canonical identity changed; refusing to retarget an approved call");
     const host = context.extensionContext as Partial<ExtensionToolContext>;
     const name = entry.registered.definition.name;
     if (!host.executeTool || !host.tools?.some(candidate => candidate.name === name)) {

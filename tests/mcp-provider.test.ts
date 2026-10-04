@@ -3,7 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import type { FabricMcpConfig } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, type FabricMcpConfig } from "../src/config.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import { ApprovalController } from "../src/core/approval-controller.js";
 import { McpDescriptorCacheStore } from "../src/providers/mcp-descriptor-cache.js";
 import { McpProvider } from "../src/providers/mcp-provider.js";
 import { PiNativeMcpTools } from "../src/providers/pi-native-mcp.js";
@@ -95,6 +97,21 @@ const countLines = (countFile: string): string[] =>
     : [];
 
 describe("McpProvider", () => {
+  it.each([false, true])("SR-3 authorizes canonical legacy $call identity for server/tool/mixed aliases (cache=%s)", async cache => {
+    const directory = temporaryDirectory();
+    const configPath = writeTwoServerConfig({ directory, countFile: path.join(directory, "listing.log") });
+    const provider = new McpProvider(directory, cache ? cacheConfig(configPath) : mcpConfig({ configPath }));
+    const registry = new ActionRegistry(); registry.register(provider);
+    const approvals = new ApprovalController({ ...DEFAULT_FABRIC_CONFIG.approvals, network: "allow",
+      actions: { "mcp.fal-ai.echo-value": "deny" } }, context.extensionContext);
+    try {
+      for (const [server, tool] of [["fal_ai", "echo-value"], ["fal-ai", "echo_value"], ["fal_ai", "echo_value"]]) {
+        await expect(registry.invoke("mcp.$call", { server, tool, args: { value: "x" } }, {
+          ...context, audits: [], maxResultChars: 100_000, approve: (action, args) => approvals.approve(action, args),
+        })).rejects.toThrow(/mcp.fal-ai.echo-value.*denied/);
+      }
+    } finally { await provider.close(); }
+  }, 30_000);
   it("preserves legacy cache entries while borrowed, but never resurrects removed definitions on opt-out", async () => {
     const directory = temporaryDirectory();
     const countFile = path.join(directory, "cache-ownership.log");

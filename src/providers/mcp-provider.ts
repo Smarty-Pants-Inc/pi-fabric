@@ -353,6 +353,35 @@ export class McpProvider implements FabricProvider {
     return tool ? this.#toolDescriptor(server, tool) : undefined;
   }
 
+  /** Pin $call's policy identity before the registry asks for approval. */
+  async prepareArguments(actionName: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (actionName !== "$call" || typeof args.server !== "string" || typeof args.tool !== "string") return args;
+    const nativeServer = this.#native ? await this.#nativeServer(args.server) : undefined;
+    if (nativeServer) {
+      const descriptor = this.#native!.describe(nativeServer, args.tool);
+      return { ...args, server: nativeServer, tool: descriptor.name.slice(nativeServer.length + 1) };
+    }
+    if (!this.#cacheOn) {
+      const runtime = await this.#getToolRuntime();
+      const server = this.#resolveServerName(runtime, args.server);
+      if (!server) throw new Error(`Unknown MCP server: ${args.server}`);
+      const tool = await this.#findToolLegacy(runtime, server, args.tool);
+      if (!tool) throw new Error(`Unknown MCP tool: ${args.server}.${args.tool}`);
+      return { ...args, server, tool: tool.name };
+    }
+    await this.#hydrate();
+    const server = await this.#resolveKnownServer(args.server);
+    if (!server) throw new Error(`Unknown MCP server: ${args.server}`);
+    let entry = this.#servers.get(server);
+    let tool = entry ? this.#resolveTool(entry.tools, args.tool) : undefined;
+    if (!tool) {
+      entry = await this.#fetchServerTools(server).catch(() => undefined);
+      tool = entry ? this.#resolveTool(entry.tools, args.tool) : undefined;
+    }
+    if (!tool) throw new Error(`Unknown MCP tool: ${args.server}.${args.tool}`);
+    return { ...args, server, tool: tool.name };
+  }
+
   async invoke(
     actionName: string,
     args: Record<string, unknown>,
@@ -431,8 +460,11 @@ export class McpProvider implements FabricProvider {
           ? (args.args as Record<string, unknown>)
           : {};
       const nativeServer = this.#native ? await this.#nativeServer(server) : undefined;
-      if (nativeServer) return this.#native!.invoke(nativeServer, tool, toolArgs, context);
-      return this.#call(server, tool, toolArgs, context.signal);
+      if (nativeServer) {
+        if (nativeServer !== server) throw new Error("MCP $call requires a prepared canonical identity");
+        return this.#native!.invoke(nativeServer, tool, toolArgs, context, true);
+      }
+      return this.#call(server, tool, toolArgs, context.signal, true);
     }
     const parsed = this.#parseToolName(actionName);
     if (!parsed) throw new Error(`Invalid MCP action: ${actionName}`);
@@ -497,8 +529,9 @@ export class McpProvider implements FabricProvider {
     toolName: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    canonicalOnly = false,
   ): Promise<unknown> {
-    if (!this.#cacheOn) return this.#callLegacy(serverName, toolName, args, signal);
+    if (!this.#cacheOn) return this.#callLegacy(serverName, toolName, args, signal, canonicalOnly);
     if (signal?.aborted) throw new Error("MCP call cancelled");
     await this.#hydrate();
     const server = await this.#resolveKnownServer(serverName);
@@ -511,6 +544,9 @@ export class McpProvider implements FabricProvider {
     }
     if (signal?.aborted) throw new Error("MCP call cancelled");
     if (!tool) throw new Error(`Unknown MCP tool: ${serverName}.${toolName}`);
+    if (canonicalOnly && (server !== serverName || tool.name !== toolName)) {
+      throw new Error("MCP $call canonical identity changed; refusing to retarget an approved call");
+    }
     const runtime = await this.#getRuntime();
     const firstContact = !this.#recontacted.has(server);
     if (firstContact) this.#recontacted.add(server);
@@ -1016,6 +1052,7 @@ export class McpProvider implements FabricProvider {
     toolName: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    canonicalOnly = false,
   ): Promise<unknown> {
     if (signal?.aborted) throw new Error("MCP call cancelled");
     const runtime = await this.#getToolRuntime();
@@ -1024,6 +1061,9 @@ export class McpProvider implements FabricProvider {
     const tool = await this.#findToolLegacy(runtime, server, toolName);
     if (signal?.aborted) throw new Error("MCP call cancelled");
     if (!tool) throw new Error(`Unknown MCP tool: ${serverName}.${toolName}`);
+    if (canonicalOnly && (server !== serverName || tool.name !== toolName)) {
+      throw new Error("MCP $call canonical identity changed; refusing to retarget an approved call");
+    }
     const operation = runtime.callTool(server, tool.name, {
       args,
       ...(this.#source && signal ? { signal } : {}),

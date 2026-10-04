@@ -6,6 +6,7 @@ import { FabricActivityStore } from "../src/activity/store.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
+import { ApprovalController } from "../src/core/approval-controller.js";
 import { isSelectedNativeMcpTool } from "../src/core/native-mcp-identity.js";
 import { FabricExecutionTraceRecorder } from "../src/audit/trace.js";
 import { clearActiveCompiledSurface, setActiveCompiledSurface } from "../src/entropy/active.js";
@@ -65,6 +66,20 @@ beforeEach(() => { ambient.createRuntime.mockClear(); });
 afterEach(() => { clearActiveCompiledSurface(); vi.unstubAllEnvs(); vi.useRealTimers(); });
 
 describe("Pi-owned MCP tools inside Fabric", () => {
+  it.each([
+    ["docs_api", "find.item"], ["docs-api", "find_item"], ["docs_api", "find_item"],
+  ])("SR-3 authorizes canonical Pi-native $call identity (%s, %s)", async (server, tool) => {
+    const f = fixture();
+    const approvals = new ApprovalController({ ...DEFAULT_FABRIC_CONFIG.approvals, network: "allow",
+      actions: { "mcp.docs-api.find.item": "deny" } }, f.context.extensionContext);
+    try {
+      await expect(f.registry.invoke("mcp.$call", { server, tool, args: { value: "x" } }, {
+        ...f.context, approve: (action, args) => approvals.approve(action, args),
+      })).rejects.toThrow(/mcp.docs-api.find.item.*denied/);
+      expect(f.executeTool).not.toHaveBeenCalled();
+      expect(f.direct).not.toHaveBeenCalled();
+    } finally { await f.provider.close(); }
+  });
   it("preserves raw names, descriptions, schemas, annotations and normalized results without ambient discovery", async () => {
     const f = fixture();
     const listed = await f.provider.list({ namespace: "docs-api" }, f.context);

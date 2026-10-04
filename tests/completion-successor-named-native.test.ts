@@ -84,6 +84,9 @@ describe("named lane succession in native Pi sessions", () => {
       faux.setResponses(Array.from({ length: 6 }, () => fauxAssistantMessage("ok")));
       await session.prompt("tick").catch(() => undefined);
       await waitFor(() => !session.isStreaming);
+      // Async journal reads need a real event-loop turn. Faux prompts can finish
+      // entirely in microtasks; spinning them starves I/O until the deadline.
+      await new Promise(resolve => setTimeout(resolve, 20));
     };
 
     const a = await open("probe-lane");

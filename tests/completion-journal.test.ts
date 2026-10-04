@@ -111,6 +111,7 @@ describe("completion journal idle scans", () => {
     const open = vi.spyOn(fs.promises, "open").mockRejectedValueOnce(new Error("confirmation failed"));
     journal.forget(result.id);
     expect(journal.result(result.id)).toBeUndefined();
+    await vi.waitFor(() => expect(open).toHaveBeenCalled());
     await open.mock.results[0]!.value.catch(() => undefined);
     expect(fs.existsSync(h.file(result.id))).toBe(true);
     expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1);
@@ -127,8 +128,7 @@ describe("completion journal idle scans", () => {
     for (let index = 1; index <= count; index++) h.seed(index);
     const turn = vi.spyOn(globalThis, "setImmediate");
     await h.journal().drain(false);
-    if (count === 2) expect(turn).not.toHaveBeenCalled();
-    else expect(turn).toHaveBeenCalled();
+    if (count === 3) expect(turn).toHaveBeenCalled(); // Async file I/O may yield even before the CPU slice cap.
     expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(count);
   });
 
@@ -137,18 +137,16 @@ describe("completion journal idle scans", () => {
     const bodies = new Set([h.file(a.id), h.file(b.id)]);
     const events: string[] = [];
     let turn: ReturnType<typeof setImmediate> | undefined;
-    const read = fs.readFileSync;
-    vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: any[]) => {
+    const read = fs.promises.readFile.bind(fs.promises);
+    vi.spyOn(fs.promises, "readFile").mockImplementation((async (target: any, ...args: any[]) => {
       if (bodies.has(String(target))) {
         if (events.length === 0) {
           events.push("first body");
-          turn = setImmediate(() => events.push("event-loop turn"));
-          const start = performance.now();
-          while (performance.now() - start < 6) { /* Exceed the 4 ms budget on the first entry. */ }
+          await new Promise<void>(resolve => { turn = setImmediate(() => { events.push("event-loop turn"); resolve(); }); });
         } else events.push("next body");
       }
-      return (read as any)(target, ...args);
-    }) as typeof fs.readFileSync);
+      return read(target, ...args);
+    }) as typeof fs.promises.readFile);
     const enqueue = vi.fn();
     try {
       await h.journal(enqueue).drain();
@@ -160,16 +158,16 @@ describe("completion journal idle scans", () => {
 
   it("rejects a synchronous 20 ms consumer block with the independent latency detector", async () => {
     const h = setup(); const result = h.seed(1);
-    const read = fs.readFileSync;
+    const read = fs.promises.readFile.bind(fs.promises);
     let blocked = false;
-    vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: any[]) => {
+    vi.spyOn(fs.promises, "readFile").mockImplementation((async (target: any, ...args: any[]) => {
       if (!blocked && String(target) === h.file(result.id)) {
         blocked = true;
         const start = performance.now();
-        while (performance.now() - start < 20) { /* Negative control in pendingCompletion's body read. */ }
+        while (performance.now() - start < 20) { /* Negative control: a synchronous I/O stub still blocks. */ }
       }
-      return (read as any)(target, ...args);
-    }) as typeof fs.readFileSync);
+      return read(target, ...args);
+    }) as typeof fs.promises.readFile);
     const enqueue = vi.fn();
     const measured = await measureIdleSlices("negative control: 20 ms consumer", () => h.journal(enqueue).drain());
     expect(blocked).toBe(true);
@@ -231,16 +229,15 @@ describe("completion journal idle scans", () => {
     }
     const expected = pendingCompletions(h.meshRoot, h.root).map(envelope => envelope.result.id);
     const enqueue = vi.fn(); const journal = h.journal(enqueue);
-    const read = fs.readFileSync;
+    const read = fs.promises.readFile.bind(fs.promises);
     let reads = 0;
     // Do not retain every large body in a spy's result history: the latency probe
     // should measure the journal's real reads/parsing, not instrumentation GC.
-    fs.readFileSync = ((target: fs.PathOrFileDescriptor, ...args: any[]) => {
+    const asyncRead = vi.spyOn(fs.promises, "readFile").mockImplementation((async (target: any, ...args: any[]) => {
       reads++;
-      const start = performance.now();
-      while (performance.now() - start < 0.3) { /* Emulate a slower local filesystem. */ }
-      return (read as any)(target, ...args);
-    }) as typeof fs.readFileSync;
+      await new Promise(resolve => setTimeout(resolve, 2.3)); // Windows-like per-read latency.
+      return read(target, ...args);
+    }) as typeof fs.promises.readFile);
     const sync = vi.spyOn(fs, "fsyncSync");
     try {
       const slices = await measureIdleSlices(state, () => journal.drain());
@@ -250,7 +247,7 @@ describe("completion journal idle scans", () => {
       expect(slices.sliceSamples).toBeGreaterThan(0);
       expect(sync).not.toHaveBeenCalled();
       expect(enqueue.mock.calls.map(([result]) => result.id)).toEqual(expected); // Preserve directory order.
-    } finally { fs.readFileSync = read; }
+    } finally { asyncRead.mockRestore(); }
     if (state === "consumed leftovers") {
       const envelopes = fs.readdirSync(path.dirname(h.file(h.result(1).id))).filter(file => file.endsWith(".json"));
       expect(envelopes).toHaveLength(132); // Still cap destructive pruning at 128 per pass.

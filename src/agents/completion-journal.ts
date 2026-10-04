@@ -37,13 +37,25 @@ export interface CompletionSummary extends AgentHandleInfo {
 const canonical = (value: string): string => {
   try { return fs.realpathSync.native(value); } catch { return path.resolve(value); }
 };
+const canonicalAsync = async (value: string): Promise<string> => {
+  try { return await fs.promises.realpath(value); } catch { return path.resolve(value); }
+};
 const sameRecipientLane = (a: CompletionRecipient, b: CompletionRecipient): boolean =>
   canonical(a.cwd) === canonical(b.cwd) && canonical(a.projectRoot) === canonical(b.projectRoot) &&
+  a.name === b.name && a.role === b.role;
+const sameRecipientLaneAsync = async (a: CompletionRecipient, b: CompletionRecipient): Promise<boolean> =>
+  await canonicalAsync(a.cwd) === await canonicalAsync(b.cwd) &&
+  await canonicalAsync(a.projectRoot) === await canonicalAsync(b.projectRoot) &&
   a.name === b.name && a.role === b.role;
 const sameLane = (recipient: CompletionRecipient, root: FabricParticipantInfo): boolean =>
   root.remoteHost === undefined && root.kind === "root" && root.cwd !== undefined &&
   canonical(root.cwd) === canonical(recipient.cwd) &&
   canonical(root.projectRoot ?? root.cwd) === canonical(recipient.projectRoot) &&
+  root.name === recipient.name && root.role === recipient.role;
+const sameLaneAsync = async (recipient: CompletionRecipient, root: FabricParticipantInfo): Promise<boolean> =>
+  root.remoteHost === undefined && root.kind === "root" && root.cwd !== undefined &&
+  await canonicalAsync(root.cwd) === await canonicalAsync(recipient.cwd) &&
+  await canonicalAsync(root.projectRoot ?? root.cwd) === await canonicalAsync(recipient.projectRoot) &&
   root.name === recipient.name && root.role === recipient.role;
 
 /** Fresh, live roots only. A reload lease is live, not permission to steal its results. */
@@ -56,6 +68,18 @@ export const completionSuccessor = (
     root.capabilities.includes("steer") && root.capabilities.includes("followUp"))
     .sort((a, b) => b.startedAt - a.startedAt || a.id.localeCompare(b.id))[0];
 };
+const completionSuccessorAsync = async (
+  recipient: CompletionRecipient, roots: readonly FabricParticipantInfo[],
+): Promise<FabricParticipantInfo | undefined> => {
+  if (!(recipient.startedAt > 0) || roots.some(root => root.id === recipient.rootId && !root.stale)) return undefined;
+  const eligible: FabricParticipantInfo[] = [];
+  for (const root of roots) {
+    if (!root.stale && root.sessionId !== recipient.sessionId && root.startedAt > recipient.startedAt &&
+      root.interactive !== false && root.capabilities.includes("steer") && root.capabilities.includes("followUp") &&
+      await sameLaneAsync(recipient, root)) eligible.push(root);
+  }
+  return eligible.sort((a, b) => b.startedAt - a.startedAt || a.id.localeCompare(b.id))[0];
+};
 const key = (id: string): string => createHash("sha256").update(id).digest("hex");
 const directory = (meshRoot: string): string => path.join(meshRoot, "agent-completions");
 const envelopePath = (meshRoot: string, id: string): string => path.join(directory(meshRoot), `${key(id)}.json`);
@@ -66,9 +90,15 @@ const claimKey = (id: string): string => `${claimPrefix}${key(id)}`;
 const read = <T>(file: string): T | undefined => {
   try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; } catch { return undefined; }
 };
+const readAsync = async <T>(file: string): Promise<T | undefined> => {
+  try { return JSON.parse(await fs.promises.readFile(file, "utf8")) as T; } catch { return undefined; }
+};
 const isJournalFile = (file: string): boolean => /^[a-f0-9]{64}\.json$/.test(file);
 const files = (dir: string): string[] => {
   try { return fs.readdirSync(dir).filter(isJournalFile); } catch { return []; }
+};
+const filesAsync = async (dir: string): Promise<string[]> => {
+  try { return (await fs.promises.readdir(dir)).filter(isJournalFile); } catch { return []; }
 };
 // Idle scans must yield on inspected entries, not just successful cleanup/delivery.
 // A setImmediate turn lets timers/IO run between slices without chaining microtasks.
@@ -106,9 +136,7 @@ async function* scanSlices<T>(entries: Iterable<T>): AsyncGenerator<T> {
 async function* scanTargets(dirs: readonly string[]): AsyncGenerator<string> {
   for (const dir of dirs) {
     let entries: string[];
-    // Keep directory snapshots synchronous, like the public query: small native
-    // prompt/idle reconciles must complete even before the next IO phase.
-    try { entries = fs.readdirSync(dir); } catch { continue; }
+    try { entries = await fs.promises.readdir(dir); } catch { continue; }
     for await (const file of scanSlices(entries.filter(isJournalFile))) {
       yield path.join(dir, file);
     }
@@ -161,6 +189,35 @@ const readRecipient = (file: string): CompletionRecipient | undefined => {
   finally { if (fd !== undefined) fs.closeSync(fd); }
   return undefined;
 };
+const readRecipientAsync = async (file: string): Promise<CompletionRecipient | undefined> => {
+  let handle: fs.promises.FileHandle | undefined;
+  try {
+    handle = await fs.promises.open(file, "r");
+    const buffer = Buffer.alloc(addressBuffer.length);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const prefix = buffer.toString("utf8", 0, bytesRead);
+    const start = /^\s*\{\s*"format"\s*:\s*1\s*,\s*"recipient"\s*:\s*/.exec(prefix)?.[0].length;
+    if (start === undefined || prefix[start] !== "{") return undefined;
+    let depth = 0, quoted = false, escaped = false;
+    for (let i = start; i < prefix.length; i++) {
+      const character = prefix[i];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') quoted = false;
+      } else if (character === '"') quoted = true;
+      else if (character === "{") depth++;
+      else if (character === "}" && --depth === 0) {
+        const address = JSON.parse(prefix.slice(start, i + 1)) as CompletionRecipient;
+        return typeof address.projectRoot === "string" && typeof address.cwd === "string" &&
+          typeof address.rootId === "string" && typeof address.sessionId === "string" &&
+          typeof address.name === "string" ? address : undefined;
+      }
+    }
+  } catch { /* Missing, torn or oversized addresses cannot authorize body/fence access. */ }
+  finally { await handle?.close(); }
+  return undefined;
+};
 /** Only proven absence authorizes delivery. An unknown replay fence is a storage fault. */
 const readReplayFence = <T>(file: string, label = "Completion"): T | undefined => {
   try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; }
@@ -168,6 +225,17 @@ const readReplayFence = <T>(file: string, label = "Completion"): T | undefined =
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       // A dangling receipt symlink exists but cannot be read: ENOENT alone is not absence.
       try { fs.lstatSync(file); } catch (absence) {
+        if ((absence as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      }
+    }
+    throw new Error(`${label} replay fence is unreadable at ${file}: ${String(error)}`);
+  }
+};
+const readReplayFenceAsync = async <T>(file: string, label = "Completion"): Promise<T | undefined> => {
+  try { return JSON.parse(await fs.promises.readFile(file, "utf8")) as T; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      try { await fs.promises.lstat(file); } catch (absence) {
         if ((absence as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       }
     }
@@ -188,6 +256,16 @@ const syncCompletionFile = (file: string, value: unknown): void => {
     syncPathNamespace(file, stat);
   } finally { fs.closeSync(fd); }
 };
+const readReceiptAsync = async (file: string, id?: string): Promise<CompletionReceipt | undefined> => {
+  const value = await readReplayFenceAsync<CompletionReceipt>(file);
+  if (value === undefined) return undefined;
+  if (!value || typeof value.id !== "string" || (id !== undefined && value.id !== id) ||
+    path.basename(file) !== `${key(value.id)}.json` || typeof value.sessionId !== "string" || !value.sessionId ||
+    typeof value.consumedAt !== "number" || !Number.isFinite(value.consumedAt) || value.consumedAt <= 0) {
+    throw new Error(`Completion replay fence is invalid at ${file}; retain the outcome for repair`);
+  }
+  return value;
+};
 const readReceipt = (file: string, id?: string): CompletionReceipt | undefined => {
   const value = readReplayFence<CompletionReceipt>(file);
   if (value === undefined) return undefined;
@@ -200,6 +278,8 @@ const readReceipt = (file: string, id?: string): CompletionReceipt | undefined =
 };
 export const completionConsumed = (meshRoot: string, id: string): boolean =>
   readReceipt(receiptPath(meshRoot, id), id) !== undefined;
+const completionConsumedAsync = async (meshRoot: string, id: string): Promise<boolean> =>
+  await readReceiptAsync(receiptPath(meshRoot, id), id) !== undefined;
 export const consumeCompletion = (meshRoot: string, id: string, sessionId: string): void => {
   const file = receiptPath(meshRoot, id);
   const receipt = readReceipt(file, id);
@@ -269,19 +349,19 @@ export const saveWorkerCompletion = (statusFile: string, result: AgentRunRecord)
     result.warnings = [...(result.warnings ?? []), `Completion remains in the worker status: journal save failed: ${String(error).slice(0, 500)}`];
   }
 };
-const promoteOrphan = (meshRoot: string, projectRoot: string, project: string, target: string,
-  accepts: (recipient: CompletionRecipient) => boolean): void => {
+const promoteOrphanAsync = async (meshRoot: string, projectRoot: string, project: string, target: string,
+  accepts: (recipient: CompletionRecipient) => Promise<boolean>): Promise<void> => {
   const file = path.basename(target);
-  const address = readRecipient(target);
-  if (!address || canonical(address.projectRoot) !== project || !accepts(address)) return;
+  const address = await readRecipientAsync(target);
+  if (!address || await canonicalAsync(address.projectRoot) !== project || !await accepts(address)) return;
   const fence = path.join(directory(meshRoot), "receipts", file);
-  if (readReceipt(fence)) return; // Consumed attempts join drain's bounded async cleanup.
-  const candidate = read<CompletionCandidate>(target);
+  if (await readReceiptAsync(fence)) return;
+  const candidate = await readAsync<CompletionCandidate>(target);
   if (candidate?.format !== 1 || !candidate.result || !candidate.recipient || !candidate.supervisor ||
     !Number.isSafeInteger(candidate.supervisor.pid) || candidate.supervisor.pid <= 0 ||
     typeof candidate.result.id !== "string" || file !== `${key(candidate.result.id)}.json` ||
-    typeof candidate.recipient.projectRoot !== "string" || canonical(candidate.recipient.projectRoot) !== canonical(projectRoot)) return;
-  if (!completionConsumed(meshRoot, candidate.result.id) &&
+    typeof candidate.recipient.projectRoot !== "string" || await canonicalAsync(candidate.recipient.projectRoot) !== await canonicalAsync(projectRoot)) return;
+  if (!await completionConsumedAsync(meshRoot, candidate.result.id) &&
     !residentProcessAlive(candidate.supervisor.pid, candidate.supervisor.processStartedAt)) {
     saveCompletion(meshRoot, candidate.recipient, candidate.result);
   }
@@ -290,7 +370,27 @@ const promoteOrphans = (meshRoot: string, projectRoot: string,
   accepts: (recipient: CompletionRecipient) => boolean = () => true): void => {
   const project = canonical(projectRoot);
   for (const file of files(path.join(directory(meshRoot), "attempts"))) {
-    promoteOrphan(meshRoot, projectRoot, project, path.join(directory(meshRoot), "attempts", file), accepts);
+    const address = readRecipient(path.join(directory(meshRoot), "attempts", file));
+    if (address && canonical(address.projectRoot) === project && accepts(address)) {
+      // Synchronous public queries retain their established behavior.
+      promoteOrphanSync(meshRoot, projectRoot, project, path.join(directory(meshRoot), "attempts", file), accepts);
+    }
+  }
+};
+const promoteOrphanSync = (meshRoot: string, projectRoot: string, project: string, target: string,
+  accepts: (recipient: CompletionRecipient) => boolean): void => {
+  const file = path.basename(target);
+  const address = readRecipient(target);
+  if (!address || canonical(address.projectRoot) !== project || !accepts(address)) return;
+  const fence = path.join(directory(meshRoot), "receipts", file);
+  if (readReceipt(fence)) return;
+  const candidate = read<CompletionCandidate>(target);
+  if (candidate?.format !== 1 || !candidate.result || !candidate.recipient || !candidate.supervisor ||
+    !Number.isSafeInteger(candidate.supervisor.pid) || candidate.supervisor.pid <= 0 ||
+    typeof candidate.result.id !== "string" || file !== `${key(candidate.result.id)}.json` ||
+    typeof candidate.recipient.projectRoot !== "string" || canonical(candidate.recipient.projectRoot) !== canonical(projectRoot)) return;
+  if (!completionConsumed(meshRoot, candidate.result.id) && !residentProcessAlive(candidate.supervisor.pid, candidate.supervisor.processStartedAt)) {
+    saveCompletion(meshRoot, candidate.recipient, candidate.result);
   }
 };
 const savedCompletion = (meshRoot: string, projectRoot: string, id: string): CompletionEnvelope | undefined => {
@@ -302,6 +402,17 @@ const savedCompletion = (meshRoot: string, projectRoot: string, id: string): Com
   if (value?.format !== 1 || value.result?.id !== id || typeof value.recipient?.projectRoot !== "string" ||
     canonical(value.recipient.projectRoot) !== canonical(projectRoot)) return undefined;
   return value;
+};
+const legacyCompletionConsumedAsync = async (meshRoot: string, rootId: string, id: string): Promise<boolean> => {
+  const file = path.join(meshRoot, "residency", key(rootId), "agents", `${id}.json`);
+  const metadata = await readReplayFenceAsync<{ rootId?: string; id?: string; completionConsumedAt?: number }>(file, "Legacy completion");
+  if (metadata === undefined) return false;
+  if (!metadata || metadata.rootId !== rootId || metadata.id !== id ||
+    (metadata.completionConsumedAt !== undefined && (typeof metadata.completionConsumedAt !== "number" ||
+      !Number.isFinite(metadata.completionConsumedAt) || metadata.completionConsumedAt <= 0))) {
+    throw new Error(`Legacy completion replay fence is invalid at ${file}; retain the outcome for repair`);
+  }
+  return metadata.completionConsumedAt !== undefined;
 };
 export const legacyCompletionConsumed = (meshRoot: string, rootId: string, id: string): boolean => {
   // A B72 Main may consume a newer host's result using only its existing metadata receipt.
@@ -315,9 +426,29 @@ export const legacyCompletionConsumed = (meshRoot: string, rootId: string, id: s
   }
   return metadata.completionConsumedAt !== undefined;
 };
+const pendingCompletionAsync = async (meshRoot: string, projectRoot: string, project: string, target: string,
+  accepts: (recipient: CompletionRecipient) => Promise<boolean>, consumed?: ReadonlySet<string>): Promise<CompletionEnvelope[]> => {
+  const file = path.basename(target);
+  if (consumed?.has(file)) return [];
+  const recipient = await readRecipientAsync(target);
+  if (!recipient || await canonicalAsync(recipient.projectRoot) !== project || !await accepts(recipient)) return [];
+  if (await readReceiptAsync(path.join(directory(meshRoot), "receipts", file))) return [];
+  const value = await readAsync<CompletionEnvelope>(target);
+  if (value?.format !== 1 || !value.recipient || !value.result ||
+    typeof value.recipient.rootId !== "string" || typeof value.recipient.sessionId !== "string" ||
+    typeof value.recipient.projectRoot !== "string" || typeof value.recipient.cwd !== "string" ||
+    typeof value.recipient.name !== "string" || typeof value.recipient.startedAt !== "number" ||
+    (value.recipient.role !== undefined && typeof value.recipient.role !== "string") ||
+    typeof value.result.id !== "string" || !/^[a-f0-9]{32}$/.test(value.result.id) ||
+    typeof value.result.name !== "string" || typeof value.result.text !== "string" || typeof value.result.startedAt !== "number" ||
+    file !== `${key(value.result.id)}.json` ||
+    !["completed", "failed", "stopped", "timed_out"].includes(value.result.status) ||
+    await canonicalAsync(value.recipient.projectRoot) !== await canonicalAsync(projectRoot) ||
+    await completionConsumedAsync(meshRoot, value.result.id)) return [];
+  return await legacyCompletionConsumedAsync(meshRoot, value.recipient.rootId, value.result.id) ? [] : [value];
+};
 const pendingCompletion = (meshRoot: string, projectRoot: string, project: string, target: string,
   accepts: (recipient: CompletionRecipient) => boolean, consumed?: ReadonlySet<string>): CompletionEnvelope[] => {
-  // The immutable address precedes the potentially huge body. Foreign lanes never touch fences.
   const file = path.basename(target);
   if (consumed?.has(file)) return [];
   const recipient = readRecipient(target);
@@ -346,15 +477,15 @@ const pendingCompletionsExcept = (meshRoot: string, projectRoot: string,
   return files(directory(meshRoot)).flatMap(file => pendingCompletion(meshRoot, projectRoot, project, path.join(directory(meshRoot), file), accepts, consumed));
 };
 const scanPendingCompletions = async (meshRoot: string, projectRoot: string,
-  accepts: (recipient: CompletionRecipient) => boolean, consumed?: ReadonlySet<string>): Promise<CompletionEnvelope[]> => {
-  const promotionProject = canonical(projectRoot);
+  accepts: (recipient: CompletionRecipient) => Promise<boolean>, consumed?: ReadonlySet<string>): Promise<CompletionEnvelope[]> => {
+  const promotionProject = await canonicalAsync(projectRoot);
   for await (const target of scanTargets([path.join(directory(meshRoot), "attempts")])) {
-    promoteOrphan(meshRoot, projectRoot, promotionProject, target, accepts);
+    await promoteOrphanAsync(meshRoot, projectRoot, promotionProject, target, accepts);
   }
-  const project = canonical(projectRoot);
+  const project = await canonicalAsync(projectRoot);
   const pending: CompletionEnvelope[] = [];
   for await (const target of scanTargets([directory(meshRoot)])) {
-    pending.push(...pendingCompletion(meshRoot, projectRoot, project, target, accepts, consumed));
+    pending.push(...await pendingCompletionAsync(meshRoot, projectRoot, project, target, accepts, consumed));
   }
   return pending;
 };
@@ -446,8 +577,8 @@ export class CompletionJournal {
     // its owner's lane so a dead Main's same-lane successor can reclaim bounded state.
     let retired = 0;
     for await (const claim of scanSlices(this.mesh.listAll(claimPrefix))) {
-      if (!this.#canRetireClaim(claim)) continue;
-      const receipt = readReceipt(path.join(directory(this.meshRoot), "receipts", `${claim.key.slice(claimPrefix.length)}.json`));
+      if (!await this.#canRetireClaimAsync(claim)) continue;
+      const receipt = await readReceiptAsync(path.join(directory(this.meshRoot), "receipts", `${claim.key.slice(claimPrefix.length)}.json`));
       if (typeof receipt?.id === "string" && claim.key === claimKey(receipt.id)) {
         // A failed CAS/delete must leave its evidence for the next pass, not retry
         // a replacement version through the envelope-pruning loop below.
@@ -456,24 +587,24 @@ export class CompletionJournal {
       }
     }
     const recipient = this.recipient;
-    const accepts = (address: CompletionRecipient) =>
-      (address.rootId === recipient.rootId && address.sessionId === recipient.sessionId) || sameRecipientLane(address, recipient);
+    const accepts = async (address: CompletionRecipient): Promise<boolean> =>
+      (address.rootId === recipient.rootId && address.sessionId === recipient.sessionId) || await sameRecipientLaneAsync(address, recipient);
     // Bound crash-left cleanup; receipt barriers use the async filesystem, never the UI thread.
     let pruned = 0;
-    const project = canonical(recipient.projectRoot);
+    const project = await canonicalAsync(recipient.projectRoot);
     for await (const target of scanTargets([directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts")])) {
       const file = path.basename(target);
-      const address = readRecipient(target);
-      if (!address || canonical(address.projectRoot) !== project || !accepts(address)) continue;
+      const address = await readRecipientAsync(target);
+      if (!address || await canonicalAsync(address.projectRoot) !== project || !await accepts(address)) continue;
       const fence = path.join(directory(this.meshRoot), "receipts", file);
-      const receipt = readReceipt(fence);
+      const receipt = await readReceiptAsync(fence);
       if (!receipt) continue;
       // A legacy claim has no address of its own: the envelope is its last lane
       // evidence. Do not unlink that evidence while an ineligible predecessor
       // still owns the claim; otherwise no later Main can authorize retirement.
       const claim = this.mesh.get(claimKey(receipt.id), { fresh: true });
       if (claim) {
-        if (!this.#canRetireClaim(claim)) continue;
+        if (!await this.#canRetireClaimAsync(claim)) continue;
         await this.#retireClaim(receipt.id, claim);
         if (this.mesh.get(claimKey(receipt.id), { fresh: true })) continue;
       } else {
@@ -486,7 +617,7 @@ export class CompletionJournal {
     if (!pending.length) return;
     const roots = this.participants.list({ scope: "project", kinds: ["root"], fresh: true });
     for await (const envelope of scanSlices(pending)) {
-      if (this.#enqueued.has(envelope.result.id) || !this.#canDeliver(envelope, roots)) continue;
+      if (this.#enqueued.has(envelope.result.id) || !await this.#canDeliverAsync(envelope, roots)) continue;
       const ck = claimKey(envelope.result.id);
       const claim = this.mesh.get(ck, { fresh: true });
       const owner = (claim?.value as { rootId?: string } | undefined)?.rootId;
@@ -498,7 +629,7 @@ export class CompletionJournal {
             value: { rootId: this.recipient.rootId, sessionId: this.recipient.sessionId, recipient: this.recipient } satisfies CompletionClaim });
         } catch { continue; } // Another live successor owns admission; leave the source pending.
       }
-      if (completionConsumed(this.meshRoot, envelope.result.id)) { await this.#retireClaim(envelope.result.id); continue; }
+      if (await completionConsumedAsync(this.meshRoot, envelope.result.id)) { await this.#retireClaim(envelope.result.id); continue; }
       // Notification policy suppresses only inbox enqueue, not exact-lane recovery ownership.
       // A quiet successor can still list and explicitly consume its settled result.
       if (!deliver) continue;
@@ -519,38 +650,39 @@ export class CompletionJournal {
       } catch { this.#enqueued.delete(envelope.result.id); } // Source stays pending if admission failed.
     }
   }
-  #canRetireClaim(snapshot: NonNullable<ReturnType<MeshStore["get"]>>): boolean {
+  async #canRetireClaimAsync(snapshot: NonNullable<ReturnType<MeshStore["get"]>>): Promise<boolean> {
     const owner = snapshot.value as Partial<CompletionClaim> | undefined;
     if (typeof owner?.rootId !== "string" || typeof owner.sessionId !== "string" || snapshot.updatedBy.id !== owner.rootId) return false;
     const recipient = this.recipient;
     if (owner.rootId === recipient.rootId && owner.sessionId === recipient.sessionId) return true;
     // Older claims can use the bounded envelope address; new claims retain this
     // address themselves, including after unlink. Never infer a lane from a session id.
-    const address = owner.recipient ?? readRecipient(path.join(directory(this.meshRoot), `${snapshot.key.slice(claimPrefix.length)}.json`));
+    const address = owner.recipient ?? await readRecipientAsync(path.join(directory(this.meshRoot), `${snapshot.key.slice(claimPrefix.length)}.json`));
     if (!address ||
       (owner.recipient && (address.rootId !== owner.rootId || address.sessionId !== owner.sessionId)) ||
       typeof address.cwd !== "string" || typeof address.projectRoot !== "string" || typeof address.name !== "string" ||
       typeof address.startedAt !== "number" || !Number.isFinite(address.startedAt) ||
-      (address.role !== undefined && typeof address.role !== "string") || !sameRecipientLane(address, recipient)) return false;
-    const successor = completionSuccessor(address, this.participants.list({ scope: "project", kinds: ["root"], fresh: true }));
-    return successor?.id === recipient.rootId && successor.sessionId === recipient.sessionId && sameLane(recipient, successor);
+      (address.role !== undefined && typeof address.role !== "string") || !await sameRecipientLaneAsync(address, recipient)) return false;
+    const successor = await completionSuccessorAsync(address, this.participants.list({ scope: "project", kinds: ["root"], fresh: true }));
+    return successor?.id === recipient.rootId && successor.sessionId === recipient.sessionId && await sameLaneAsync(recipient, successor);
   }
   async #retireClaim(id: string, snapshot = this.mesh.get(claimKey(id), { fresh: true })): Promise<boolean> {
-    if (snapshot && !this.#canRetireClaim(snapshot)) return false;
+    if (snapshot && !await this.#canRetireClaimAsync(snapshot)) return false;
     // The versioned delete cannot erase a replacement owner/version.
     const file = receiptPath(this.meshRoot, id);
-    const receipt = readReceipt(file, id);
+    const receipt = await readReceiptAsync(file, id);
     if (!receipt) return false;
     // One fresh confirmation authorizes this consumed outcome's cleanup batch.
     // Do not retire its claim and then owe a second barrier before body unlink:
     // that barrier could fail after the claim was already lost.
     const recipient = this.recipient;
-    const targets = [envelopePath(this.meshRoot, id), candidatePath(this.meshRoot, id)].filter(target => {
-      const address = readRecipient(target);
-      return address && canonical(address.projectRoot) === canonical(recipient.projectRoot) &&
-        ((address.rootId === recipient.rootId && address.sessionId === recipient.sessionId) || sameRecipientLane(address, recipient));
-    });
     await confirmReceipt(file, receipt);
+    const targets: string[] = [];
+    for (const target of [envelopePath(this.meshRoot, id), candidatePath(this.meshRoot, id)]) {
+      const address = await readRecipientAsync(target);
+      if (address && await canonicalAsync(address.projectRoot) === await canonicalAsync(recipient.projectRoot) &&
+        ((address.rootId === recipient.rootId && address.sessionId === recipient.sessionId) || await sameRecipientLaneAsync(address, recipient))) targets.push(target);
+    }
     // The envelope is the last lane evidence for legacy claims. Keep it until the
     // versioned deletion commits; a failed/interrupted delete is retried by drain.
     if (snapshot) {
@@ -576,10 +708,10 @@ export class CompletionJournal {
       !this.participants.list({ scope: "project", kinds: ["root"], fresh: true })
         .some(root => !root.stale && root.id === envelope.recipient.rootId);
   }
-  #canDeliver(envelope: CompletionEnvelope, roots?: FabricParticipantInfo[]): boolean {
+  async #canDeliverAsync(envelope: CompletionEnvelope, roots?: FabricParticipantInfo[]): Promise<boolean> {
     if (envelope.recipient.rootId === this.recipient.rootId && envelope.recipient.sessionId === this.recipient.sessionId) return true;
-    if (!sameRecipientLane(envelope.recipient, this.recipient)) return false;
-    return completionSuccessor(envelope.recipient, roots ??
-      this.participants.list({ scope: "project", kinds: ["root"], fresh: true }))?.id === this.recipient.rootId;
+    if (!await sameRecipientLaneAsync(envelope.recipient, this.recipient)) return false;
+    return (await completionSuccessorAsync(envelope.recipient, roots ??
+      this.participants.list({ scope: "project", kinds: ["root"], fresh: true })))?.id === this.recipient.rootId;
   }
 }

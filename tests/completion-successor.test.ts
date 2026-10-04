@@ -117,15 +117,21 @@ const damageLegacyFence = (h: ReturnType<typeof harness>, fault: typeof legacyFe
   if (fault === "invalid consumption") fs.writeFileSync(file, JSON.stringify({ ...consumed, completionConsumedAt: "unknown" }));
   if (fault === "dangling") { fs.unlinkSync(file); fs.symlinkSync(path.join(h.root, "missing-metadata"), file); }
   let readFault: ReturnType<typeof vi.spyOn> | undefined;
+  let asyncReadFault: ReturnType<typeof vi.spyOn> | undefined;
   if (fault === "unreadable") {
     const read = fs.readFileSync;
     readFault = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: any[]) => {
       if (String(target) === file) throw Object.assign(new Error("legacy metadata inaccessible"), { code: "EACCES" });
       return (read as any)(target, ...args);
     }) as typeof fs.readFileSync);
+    const asyncRead = fs.promises.readFile.bind(fs.promises);
+    asyncReadFault = vi.spyOn(fs.promises, "readFile").mockImplementation((async (target: any, ...args: any[]) => {
+      if (String(target) === file) throw Object.assign(new Error("legacy metadata inaccessible"), { code: "EACCES" });
+      return asyncRead(target, ...args);
+    }) as typeof fs.promises.readFile);
   }
   return { file, repair: () => {
-    readFault?.mockRestore();
+    readFault?.mockRestore(); asyncReadFault?.mockRestore();
     if (fault === "dangling") fs.unlinkSync(file);
     fs.writeFileSync(file, JSON.stringify(consumed));
   } };
@@ -621,6 +627,11 @@ describe("round 3 completion fences", () => {
         if (String(target) === file) throw Object.assign(new Error("receipt inaccessible"), { code: "EACCES" });
         return (read as any)(target, ...args);
       }) as typeof fs.readFileSync);
+      const asyncRead = fs.promises.readFile.bind(fs.promises);
+      vi.spyOn(fs.promises, "readFile").mockImplementation((async (target: any, ...args: any[]) => {
+        if (String(target) === file) throw Object.assign(new Error("receipt inaccessible"), { code: "EACCES" });
+        return asyncRead(target, ...args);
+      }) as typeof fs.promises.readFile);
     }
     h.setLive([h.participant("C", 300)]); const delivered = vi.fn();
     const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:C", sessionId: "C", startedAt: 300 }, h.participants, h.mesh, delivered);

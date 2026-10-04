@@ -2528,7 +2528,11 @@ export class ActorManager {
         ...(error instanceof ActorPreparationError ? { code: error.code, phase: error.phase } : {}),
         ...(item ? { itemId: item.id, attempts: item.preparationAttempts ?? 0 } : {}) },
     });
-    this.#noteFailedActivation(actor, message, undefined, false);
+    // A requeued item has not failed its activation yet. Its separate, durable
+    // preparation budget alarms at terminal exhaustion in #drain; counting the
+    // retries here would notify early and persist a consumed alarm across owners.
+    // Failures outside an item retry still need fail-loud host reporting.
+    if (!item) this.#noteFailedActivation(actor, message, undefined, false);
   }
 
   async #drain(actor: ManagedActor): Promise<void> {

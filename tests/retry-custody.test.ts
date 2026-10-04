@@ -7,7 +7,11 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
 // Inject the manager's platform branch, not native process-tree certification.
-describe.each(["linux", "win32"] as const)("retry execution custody (%s)", platform => {
+// The real filesystem still follows the host OS: Linux injection on Windows
+// would incorrectly enable POSIX directory-fsync barriers. Keep the Windows
+// branch on both hosts, but exercise the Linux branch only on a POSIX host.
+const platforms = (["linux", "win32"] as const).filter(platform => process.platform !== "win32" || platform === "win32");
+describe.each(platforms)("retry execution custody (%s)", platform => {
   it.each([
     { retry: "startup", operation: "stop" }, { retry: "resume", operation: "stop" },
     { retry: "startup", operation: "close" }, { retry: "resume", operation: "close" },

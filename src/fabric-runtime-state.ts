@@ -776,6 +776,11 @@ export class FabricRuntimeState {
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
       },
+      onFollowUpAlarm: (alarm) => {
+        this.pi.sendMessage({ customType: "pi-fabric-follow-up-alarm", content: alarm.message, display: true, details: alarm },
+          { deliverAs: "steer", triggerTurn: false });
+        this.pi.events.emit("fabric.followUp.deadline", alarm);
+      },
       onLifecycle: (event) => {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publishBackground(event);
@@ -796,11 +801,12 @@ export class FabricRuntimeState {
         // deferred post-delivery callback. Retry a transient receipt failure once;
         // persistent failure rejects the observation, making returned-but-unrecorded impossible.
         if (actorChildStore) {
-          try { actorChildStore.consume(id, { handoff: true }); } catch {
-            actorChildStore.consume(id, { handoff: true });
+          try { actorChildStore.consume(id, { handoff: true, publication: true }); } catch {
+            actorChildStore.consume(id, { handoff: true, publication: true });
           }
         }
       },
+      onResultAbandoned: (id) => actorChildStore?.abandonForeground(id),
       onResultConsumed: (id) => {
         completionInbox.acknowledge(id);
         // The manager certifies logical settlement: fence even a temporarily failed journal save.
@@ -810,7 +816,14 @@ export class FabricRuntimeState {
       },
       onStoppedAtClose: (results) => {
         if (actorChildStore && actorSpawner) {
-          for (const result of results) actorChildStore.enqueue(result, actorSpawner, agentConfig.notifyOnComplete);
+          const failures: unknown[] = [];
+          for (const result of results) {
+            for (let attempt = 0; attempt < 3; attempt++) {
+              try { actorChildStore.enqueue(result, actorSpawner, agentConfig.notifyOnComplete); break; }
+              catch (error) { if (attempt === 2) failures.push(error); }
+            }
+          }
+          if (failures.length) throw new AggregateError(failures, "Actor child shutdown archives remain uncommitted");
           return;
         }
         rememberStoppedAtClose(sessionId, results);

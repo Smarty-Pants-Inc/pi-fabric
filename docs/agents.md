@@ -470,6 +470,46 @@ Pi-runner `model` arguments on `agents.run`, `agents.spawn`, `agents.create`, an
 
 This is the host-level equivalent of the `pi-model-switch` extension's `switch_model` tool, with aliases moved into Fabric configuration so project and agent scopes behave like every other Fabric section.
 
+### Changing this session's own live Main
+
+`agents.setThinking` accepts this Main's exact `session:<id>`:
+
+```ts
+const main = await agents.main();
+const effort = await agents.setThinking({ id: main.id, thinking: "high" });
+```
+
+This call uses Pi's synchronous thinking setter: the in-flight inference stays
+unchanged, and the next model turn consumes the new effort. It returns Main's
+native read-back state plus `previous: { model?, thinking? }` and `caller` (the
+exact calling Main ID); Pi's capability clamp is reflected in `thinking`.
+Cancellation, deadline, authority and liveness are checked after the serialized
+queue wait, with no await between the final fence and native state/journal commit.
+Only session scope is supported; a Main thinking binding cannot be cleared.
+Actor IDs and names (including an actor named `main`) keep their existing binding
+behavior for both setters.
+
+**Main `agents.setModel` is deferred entirely**, for own and remote targets:
+`Main setModel is not supported yet (own or remote); see smarty-dev#4153`.
+It refuses before registry resolution, native authentication, publication or
+mutation. Pi's native model setter awaits authentication before mutation without
+a requester cancellation/commit guard; same-process execution does not close
+that window. The pre-existing `agents.switchModel` API is unchanged by this cut.
+
+Only this session's own live Main may change thinking. Cross-process thinking
+changes are refused, even for a recorded lead or org/product owner:
+`remote Main model changes are not supported yet; see smarty-dev#4153`.
+Nothing is queued or mutated. Follow-up support is tracked separately; this PR
+contains no Pi-core patch. Participant format-1 capabilities stay unchanged and
+`mainBindings` is false. Ordinary discovery and messaging remain compatible.
+
+Successful own-session changes write a `pi-fabric.main-binding-change` entry in
+this Main's native Pi journal with the action, caller, target and before/after
+model/effort; the public calls retain their ordinary Fabric execution audit.
+
+Native artifact proof (keyless, offline real Pi RPC; no external inference):
+`nice -n 19 node scripts/prove-main-bindings.mjs dist/index.js "$TASK_OUT"`.
+
 ### Transports
 
 | Transport   | Operation                                                     | Command to attach            |

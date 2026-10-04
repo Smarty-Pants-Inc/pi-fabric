@@ -645,8 +645,11 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
     const controller = new AbortController();
     try {
       const outcome = send(state, kind, controller.signal).catch((error: Error) => error);
+      // Atomic spawn response custody is retained until participant publication
+      // confirms the ID; aborting that observation must still report it unknown.
       await waitFor(() => entries(state.residencyRoot, "decisions").length === 1 &&
-        entries(state.residencyRoot, "processing").length === 0 && entries(state.residencyRoot, "responses").length === 0);
+        entries(state.residencyRoot, "processing").length === 0 &&
+        entries(state.residencyRoot, "responses").length === (kind === "main spawn" ? 1 : 0));
       controller.abort();
       const error = await outcome;
       expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", requestId: expect.any(String), id: expect.stringMatching(/^[0-9a-f]{32}$/) });

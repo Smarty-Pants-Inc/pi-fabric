@@ -7,6 +7,7 @@ import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../act
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
+import { MeshConsumptionPausedError, assertMeshConsumption } from "./mesh-consumption.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -38,7 +39,13 @@ const SHARED_SEEN_GRACE_MS = 10 * 60 * 1_000;
 /** Host-reserved policy key; { version: 1, sharedClaims: "expiry" } enables expiry reclamation. */
 export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
 
-export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel";
+// Legacy Main setter wire names remain parseable only so owners can refuse them clearly.
+export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel" | "setModel" | "setThinking";
+
+// Keep the reader free to deliver cancellation while asynchronous work waits at its
+// commit fence. These commands own their handler and outcome/ACK retries after the cursor.
+const detachedControlOperation = (operation: FabricControlOperation): boolean =>
+  operation === "ask";
 
 export interface FabricControlCommand {
   /** Hydrated from the admitted MeshEvent envelope, never event.data. */
@@ -172,7 +179,9 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
       data.operation !== "followUp" &&
       data.operation !== "stop" &&
       data.operation !== "ask" &&
-      data.operation !== "cancel") ||
+      data.operation !== "cancel" &&
+      data.operation !== "setModel" &&
+      data.operation !== "setThinking") ||
     typeof data.replyTo !== "string" ||
     typeof data.requestedAt !== "number" ||
     (data.deadlineAt !== undefined && typeof data.deadlineAt !== "number") ||
@@ -223,6 +232,7 @@ export interface FabricControlPlaneOptions {
   enabled: boolean;
   hostId: string;
   pollMs?: number;
+  canConsumeMesh?: () => boolean;
   acknowledgementTimeoutMs?: number;
   /** Remote-link command window; at least 30 s, also used for bridged cancellation. */
   bridgeTimeoutMs?: number;
@@ -293,6 +303,14 @@ interface PendingControlRequest {
   onAbort?: () => void;
 }
 
+interface OwnedControlCommand {
+  event: MeshEvent;
+  claimVersion: number;
+  acceptance?: FabricControlAcceptance;
+  saved?: boolean;
+  running?: boolean;
+}
+
 export class FabricControlPlane {
   readonly #pending = new Map<string, PendingControlRequest>();
   readonly #activeCommands = new Map<
@@ -300,12 +318,21 @@ export class FabricControlPlane {
     { controller: AbortController; requesterId: string; targetId: string }
   >();
   readonly #activeHandlers = new Set<Promise<void>>();
-  // smarty-dev#424: progress kept across a retried command, since a lock timeout can come
-  // between two of its writes. Shared claims this runtime won, by seen key; outcomes of
-  // commands that ran but whose acknowledgement is not yet published, by command id. Each
-  // entry expires with its command's answer window and is evicted on the next drain.
+  // Retain progress across lock timeout AND lease loss. Shared claims owned by
+  // this runtime precede local claim admission; owned commands retain the exact
+  // outcome until its sequence and ACK commit, never replaying a completed handler.
   readonly #sharedClaims = new Map<string, number>();
-  readonly #unpublished = new Map<string, { acceptance: FabricControlAcceptance; expiresAt: number }>();
+  readonly #ownedCommands = new Map<string, OwnedControlCommand>();
+
+  // Recheck under the actual store lock: checking only before an await is not admission.
+  async #putFenced(store: MeshStore, input: Parameters<MeshStore["put"]>[0]): Promise<{ version: number }> {
+    if (!this.options.canConsumeMesh) return store.put(input);
+    const results = await store.writeBatch({ identity: this.identity, ops: [], prepare: () => {
+      assertMeshConsumption(this.options.canConsumeMesh);
+      return [{ kind: "put", ...input }];
+    } });
+    return { version: results[0]!.version };
+  }
   readonly #pollMs: number;
   readonly #ackTimeoutMs: number;
   readonly #bridgeTimeoutMs: number;
@@ -315,7 +342,6 @@ export class FabricControlPlane {
   #mirrorWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
   readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll");
-  readonly #backgroundNotifications = new MeshBackgroundQueue("control detached ack");
   // Cancellation may become publishable after close, when an admitted command finally commits.
   // Its queue owns that final obligation until success/deadline; idle has no timer or resources.
   readonly #backgroundCancellations = new MeshBackgroundQueue("control cancellation");
@@ -702,9 +728,8 @@ export class FabricControlPlane {
     if (!this.#paused) throw new Error("Control release gate is not paused");
     await this.#polling;
     await Promise.all([...this.#activeHandlers]);
-    await this.#backgroundNotifications.checkpointForRelease();
     await this.#backgroundCancellations.checkpointForRelease();
-    if (this.#activeCommands.size || this.#pending.size || this.#unpublished.size || this.#releasePublicationFailed) {
+    if (this.#activeCommands.size || this.#pending.size || this.#sharedClaims.size || this.#ownedCommands.size || this.#releasePublicationFailed) {
       throw new Error("Control release has unsettled publication obligations");
     }
   }
@@ -717,7 +742,6 @@ export class FabricControlPlane {
     if (!this.#paused) await this.#drain().catch(() => undefined);
     this.#closed = true;
     this.#sharedClaims.clear();
-    this.#unpublished.clear();
     const cancellations: Promise<void>[] = [];
     for (const id of [...this.#pending.keys()]) {
       const pending = this.#clearPending(id);
@@ -728,17 +752,18 @@ export class FabricControlPlane {
     await Promise.allSettled(cancellations);
     for (const active of this.#activeCommands.values()) active.controller.abort();
     await Promise.allSettled([...this.#activeHandlers]);
-    await this.#backgroundNotifications.close();
     this.#handler = undefined;
   }
 
   async #poll(): Promise<void> {
-    if (this.#closed || this.#paused || !this.options.enabled) return;
+    if (this.#closed || this.#paused || !this.options.enabled || this.options.canConsumeMesh?.() === false) return;
     if (this.#polling) return this.#polling;
     const operation = this.#drain();
     this.#polling = operation;
     try {
       await operation;
+    } catch (error) {
+      if (!(error instanceof MeshConsumptionPausedError)) throw error;
     } finally {
       if (this.#polling === operation) this.#polling = undefined;
     }
@@ -747,11 +772,15 @@ export class FabricControlPlane {
   async #drain(): Promise<void> {
     const now = Date.now();
     for (const [key, expiresAt] of this.#sharedClaims) if (expiresAt < now) this.#sharedClaims.delete(key);
-    for (const [id, kept] of this.#unpublished) if (kept.expiresAt < now) this.#unpublished.delete(id);
-    while (true) {
+    // Detached asks may already be behind the log cursor. Resume their owned
+    // claims/outcomes too, without replaying a handler that completed.
+    for (const owned of this.#ownedCommands.values()) {
+      if (!owned.running) await this.#acceptCommand(owned.event);
+    }
+    while (this.options.canConsumeMesh?.() !== false) {
       const tail = this.mesh.tail(this.#offset, 100);
       for (const event of tail.events) {
-        if (this.#paused) return;
+        if (this.#paused || this.options.canConsumeMesh?.() === false) return;
         if (event.sequence <= this.#lastSequence) continue;
         // An event is consumed only once handled: a command that hit a lock timeout throws,
         // and the next poll reads this page again from it (smarty-dev#424). Each retry is
@@ -760,11 +789,13 @@ export class FabricControlPlane {
           if (event.topic === ACK_TOPIC) this.#acceptAcknowledgement(event);
           else if (event.topic === CONTROL_TOPIC) await this.#acceptCommand(event);
         }
+        if (this.options.canConsumeMesh?.() === false) return;
         this.#lastSequence = event.sequence;
       }
       this.#offset = tail.nextOffset;
       if (tail.events.length < 100) break;
     }
+    if (this.options.canConsumeMesh?.() === false) return;
     await this.#cleanupSeen(Date.now()).catch(rethrowMeshLockTimeout);
   }
 
@@ -816,8 +847,15 @@ export class FabricControlPlane {
   }
 
   async #acceptCommand(event: MeshEvent): Promise<void> {
+    assertMeshConsumption(this.options.canConsumeMesh);
     const command = commandFromEvent(event);
     if (!command) return;
+    const ownedKey = controlSeenKey(this.options.hostId, command.commandId);
+    const owned = this.#ownedCommands.get(ownedKey);
+    if (owned) {
+      if (!owned.running) await this.#runOwnedCommand(ownedKey, owned);
+      return;
+    }
     if (command.operation === "cancel") {
       this.#acceptCancellation(command, event.from);
       return;
@@ -829,14 +867,6 @@ export class FabricControlPlane {
     );
     const key = controlSeenKey(this.options.hostId, command.commandId);
     const answerable = now <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4;
-    const ran = this.#unpublished.get(command.commandId);
-    if (ran) {
-      // The command ran, and only its acknowledgement failed: send the real outcome.
-      if (answerable) await this.#publishAcknowledgement(command, ran.acceptance);
-      this.#unpublished.delete(command.commandId);
-      this.#sharedClaims.delete(key);
-      return;
-    }
     if (now > deadlineAt || command.requestedAt - now > this.#ackTimeoutMs) {
       this.#sharedClaims.delete(key);
       // A sender waits at most MAX_CONTROL_ACK_GRACE_MS past the deadline. An older command
@@ -861,7 +891,7 @@ export class FabricControlPlane {
       else {
         const expired = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true } as const;
         try {
-          await this.mesh.put({
+          await this.#putFenced(this.mesh, {
             key,
             value: {
               format: 1,
@@ -877,7 +907,7 @@ export class FabricControlPlane {
           });
           acceptance = expired;
         } catch (error) {
-          if (isLockTimeout(error)) throw error;
+          if (isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
           acceptance = ownRecord(controlSeenRecord(this.mesh.get(key, { fresh: true })?.value))?.acceptance ??
             indeterminate;
         }
@@ -912,7 +942,7 @@ export class FabricControlPlane {
       // One claim authority across versions (smarty-dev#643, phase 1): runtimes before this
       // change claim only the shared key, so this runtime claims it first and runs the command
       // only when that claim wins too. The outcome is kept only in this host's own store.
-      if (!this.#sharedClaims.has(key)) await this.mesh.put({
+      if (!this.#sharedClaims.has(key)) await this.#putFenced(this.mesh, {
         key,
         value: {
           format: 1,
@@ -926,7 +956,7 @@ export class FabricControlPlane {
         ifVersion: 0,
       });
       this.#sharedClaims.set(key, deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4);
-      claim = await this.#seen.put({
+      claim = await this.#putFenced(this.#seen, {
         key,
         value: {
           format: 1,
@@ -934,13 +964,12 @@ export class FabricControlPlane {
           commandId: command.commandId,
           targetId: command.targetId,
           expiresAt: deadlineAt + this.#ackTimeoutMs,
-          sequence: event.sequence,
         } satisfies FabricControlSeenRecord,
         identity: this.identity,
         ifVersion: 0,
       });
     } catch (error) {
-      if (isLockTimeout(error)) throw error;
+      if (isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
       this.#sharedClaims.delete(key);
       const raced = this.#seenRecord(key);
       if (
@@ -960,16 +989,19 @@ export class FabricControlPlane {
     }
 
     this.#sharedClaims.delete(key);
-    const execution = this.#executeClaimedCommand(
-      command,
-      event.from,
-      key,
-      claim.version,
-      deadlineAt,
-      event.sequence,
-      event.verification,
-    );
-    if (command.operation === "ask") {
+    const admitted = { event, claimVersion: claim.version };
+    this.#ownedCommands.set(key, admitted);
+    await this.#runOwnedCommand(key, admitted);
+  }
+
+  async #runOwnedCommand(key: string, owned: OwnedControlCommand): Promise<void> {
+    assertMeshConsumption(this.options.canConsumeMesh);
+    const command = commandFromEvent(owned.event)!;
+    const deadlineAt = Math.min(command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs, command.requestedAt + MAX_CONTROL_TIMEOUT_MS);
+    owned.running = true;
+    const execution = this.#executeClaimedCommand(command, owned.event.from, key, owned, deadlineAt, owned.event.sequence, owned.event.verification)
+      .finally(() => { owned.running = false; });
+    if (detachedControlOperation(command.operation)) {
       this.#activeHandlers.add(execution);
       void execution.finally(() => this.#activeHandlers.delete(execution)).catch(() => undefined);
       return;
@@ -993,7 +1025,7 @@ export class FabricControlPlane {
     command: FabricControlCommand,
     from: MeshIdentity,
     key: string,
-    claimVersion: number,
+    owned: OwnedControlCommand,
     deadlineAt: number,
     sequence: number,
     verification: MeshEvent["verification"],
@@ -1015,18 +1047,23 @@ export class FabricControlPlane {
         // The claim can wait for a lock, or this process can pause after it commits: the deadline
         // may have passed since admission. An expired command is recorded, not run: notRun, as
         // this runtime holds the claim and the handler did not run.
-        if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
+        assertMeshConsumption(this.options.canConsumeMesh);
+        if (owned.acceptance) acceptance = owned.acceptance;
+        else if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
         else acceptance = this.#handler
           ? await this.#handler(command, from, controller.signal, verification)
           : { accepted: false, error: "Fabric owner has no control handler" };
       } catch (error) {
+        if (error instanceof MeshConsumptionPausedError) throw error;
         acceptance = {
           accepted: false,
           error: error instanceof Error ? error.message : String(error),
         };
       }
       acceptance = this.#boundedAcceptance(acceptance);
-      const saveOutcome = () => this.#seen.put({
+      owned.acceptance = acceptance; // custody precedes any awaited sequence/ACK commit
+      assertMeshConsumption(this.options.canConsumeMesh);
+      const saveOutcome = () => this.#putFenced(this.#seen, {
           key,
           value: {
             format: 1,
@@ -1038,43 +1075,40 @@ export class FabricControlPlane {
             acceptance,
           } satisfies FabricControlSeenRecord,
           identity: this.identity,
-          ifVersion: claimVersion,
+          ifVersion: owned.claimVersion,
         });
       try {
-        await saveOutcome();
+        if (!owned.saved) { await saveOutcome(); owned.saved = true; }
       } catch (error) {
+        if (error instanceof MeshConsumptionPausedError) throw error;
         this.#releasePublicationFailed = true;
         // A conflict belongs to another owner; a timeout wrote nothing. Preserve the actual
         // result under the original version fence and retry it without running the handler.
-        if (!isLockTimeout(error)) return;
-        void this.#backgroundNotifications.retry(() => {
-          if (Date.now() <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) return saveOutcome();
-          return undefined;
-        }, error);
-      }
-      if (command.operation === "ask") {
-        // Detached asks have already left the poll cursor. Retain just their outcome, never
-        // execute the handler again, and retry the ACK on the owned notification tick.
-        await this.#backgroundNotifications.enqueue(() => {
-          if (Date.now() <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) {
-            return this.#publishAcknowledgement(command, acceptance);
-          }
-          return undefined;
-        });
-        return;
+        if (!isLockTimeout(error)) { this.#ownedCommands.delete(key); return; }
+        throw error; // the owned outcome is retried by the next confirmed drain
       }
       try {
         await this.#publishAcknowledgement(command, acceptance);
+        this.#ownedCommands.delete(key);
       } catch (error) {
-        this.#releasePublicationFailed = true;
-        // Non-detached commands remain at the poll cursor. Keep the actual outcome for
-        // its next pass, rather than executing a handler twice after an ACK lock timeout.
-        this.#unpublished.set(command.commandId, {
-          acceptance,
-          expiresAt: deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4,
-        });
-        throw error;
+        if (!(error instanceof MeshConsumptionPausedError)) this.#releasePublicationFailed = true;
+        throw error; // preserve the already-owned result, including detached asks
       }
+    } catch (error) {
+      if (error instanceof MeshConsumptionPausedError && owned.acceptance && !owned.saved) {
+        // Outcome custody is not a cursor commit. Keep the real completed result
+        // in our host-local claim WITHOUT a sequence even while consumption is
+        // fenced, so a restart can answer it rather than replaying the handler.
+        // The same CAS still owns it; shutdown retirement can veto the write.
+        try {
+          const retained = await this.#seen.put({ key, identity: this.identity, ifVersion: owned.claimVersion,
+            value: { format: 1, hostId: this.options.hostId, commandId: command.commandId,
+              targetId: command.targetId, expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
+              acceptance: owned.acceptance } satisfies FabricControlSeenRecord });
+          owned.claimVersion = retained.version;
+        } catch { /* The owned in-memory outcome and durable claim remain; never replay. */ }
+      }
+      throw error;
     } finally {
       clearTimeout(deadlineTimer);
       const active = this.#activeCommands.get(command.commandId);
@@ -1192,7 +1226,9 @@ export class FabricControlPlane {
         kind: acceptance.accepted ? "accepted" : "rejected",
         from: this.identity,
         to: command.replyTo,
-        data: {
+        data: () => {
+          assertMeshConsumption(this.options.canConsumeMesh);
+          return {
           version: 1,
           commandId: command.commandId,
           targetId: command.targetId,
@@ -1207,11 +1243,12 @@ export class FabricControlPlane {
             : {}),
           ...(acceptance.error ? { error: acceptance.error } : {}),
           ...(!acceptance.accepted && acceptance.notRun ? { notRun: true } : {}),
+          };
         },
       })
       .catch((error: unknown) => {
         // A lock timeout published nothing: the caller retries it (smarty-dev#424).
-        if (isLockTimeout(error)) throw error;
+        if (isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
       });
   }
 }

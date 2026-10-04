@@ -68,6 +68,7 @@ export interface FabricFollowUpQueueDepth {
 }
 
 export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDepth> {
+  deadlineAt?: number;
   /** Sender-only observation at task admission; delivery is unchanged. */
   warning?: AgentFollowUpRunningWarning;
   /** Advisory identifier provenance notice; appended to delivered text when admission permits. */
@@ -92,6 +93,15 @@ export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDep
   stalled?: true;
 }
 
+export interface FabricMainAgentBindingResult extends FabricMainAgentInfo {
+  caller: string;
+  previous: { model?: string; thinking?: string };
+}
+
+export type FabricMainAgentBindingChange =
+  | { operation: "setModel"; model: { provider: string; id: string } }
+  | { operation: "setThinking"; thinking: Parameters<ExtensionAPI["setThinkingLevel"]>[0] };
+
 export interface FabricMainModelSwitchResult {
   ok: boolean;
   error?: string;
@@ -111,6 +121,13 @@ export interface FabricMainAgentTarget {
     target: { provider: string; id: string },
     context: ExtensionContext,
   ): Promise<FabricMainModelSwitchResult>;
+  bindingContext?(): ExtensionContext | undefined;
+  setBinding?(
+    change: FabricMainAgentBindingChange,
+    caller: string,
+    context: ExtensionContext,
+    beforeCommit: () => void,
+  ): Promise<FabricMainAgentBindingResult>;
   // smarty-dev#2119: a capped Main wait returned; flush every held followUp at the next tool
   // boundary, whatever its age. Local Mains with a followUp drain only.
   flushHeldAtNextBoundary?(): void;
@@ -317,6 +334,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   #haltIndexUnknown = false;
   #closed = false;
   #reloading = false;
+  #bindingsLive = false;
+  #bindingMutation: Promise<unknown> = Promise.resolve();
   #wake: ReturnType<typeof setInterval> | undefined;
   #preflightWake: ReturnType<typeof setInterval> | undefined;
   #operation: AbortSignal | undefined;
@@ -377,6 +396,47 @@ export class MainAgentController implements FabricMainAgentTarget {
     return { ok: true };
   }
 
+  bindingContext(): ExtensionContext | undefined {
+    return this.local && this.#bindingsLive ? this.#context : undefined;
+  }
+
+  setBinding(
+    change: FabricMainAgentBindingChange,
+    caller: string,
+    context: ExtensionContext,
+    beforeCommit: () => void,
+  ): Promise<FabricMainAgentBindingResult> {
+    // Defense in depth for direct/local callers: native model auth has no
+    // cancellation-aware commit boundary. Keep the legacy switchModel separate.
+    if (change.operation === "setModel") {
+      return Promise.reject(new Error("Main setModel is not supported yet (own or remote); see smarty-dev#4153"));
+    }
+    const commit = (): FabricMainAgentBindingResult => {
+      beforeCommit();
+      if (!this.local || !this.#bindingsLive || context.sessionManager.getSessionId() !== this.sessionId) {
+        throw new Error(`Main ${this.id} is not live; no binding change was queued`);
+      }
+      const snapshot = (): { model?: string; thinking?: string } => {
+        const { model, thinking } = this.info(context);
+        return { ...(model ? { model } : {}), ...(thinking ? { thinking } : {}) };
+      };
+      const previous = snapshot();
+      // Pi's thinking setter synchronously clamps, mutates and journals: no await
+      // separates the invocation/liveness fence above from the native commit.
+      // Its async event notification happens only after the state is committed.
+      // The in-flight inference is unchanged; the next turn uses read-back state.
+      this.pi.setThinkingLevel(change.thinking);
+      const after = snapshot();
+      this.pi.appendEntry("pi-fabric.main-binding-change", {
+        action: `agents.${change.operation}`, target: this.id, caller, before: previous, after,
+      });
+      return { ...this.info(context), caller, previous };
+    };
+    const mutation = this.#bindingMutation.then(commit);
+    this.#bindingMutation = mutation.catch(() => {});
+    return mutation;
+  }
+
   supportsProvenance(): boolean { return fabricProvenanceSupported(this.pi); }
 
   deliverUser(
@@ -395,6 +455,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** No more Pi handoffs once reload starts; an already-admitted control command journals only. */
   prepareReload(): void {
+    this.#bindingsLive = false;
     this.#reloading = true;
     this.#stopWake();
   }
@@ -900,6 +961,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (!this.local) return;
     this.#stallS = stallSeconds;
     this.#context = context;
+    this.#bindingsLive = true;
     this.#closed = false;
     this.#reloading = false;
     this.#halted = false;
@@ -1069,6 +1131,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Stop holding; any held followUps go to Pi's own followUp queue, as before the drain. */
   closeFollowUpDrain(): void {
+    this.#bindingsLive = false;
     this.#stopWake();
     for (const off of this.#unsubscribe.splice(0)) off();
     this.#closed = true;

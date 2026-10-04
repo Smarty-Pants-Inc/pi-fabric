@@ -23,6 +23,33 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each(["spawn", "run", "wait", "join"])("types the optional observed Fabric release on agents.%s", method => {
+    const args = method === "spawn" || method === "run" ? '{ task: "work" }' : '{ id: "child" }';
+    for (const fullCodeMode of [false, true]) {
+      const code = `const result = await agents.${method}(${args});
+        const release: string | undefined = result.fabricRelease;
+        const omitted: Pick<typeof result, "fabricRelease"> = {};
+        return { release, omitted };`;
+      expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    }
+  });
+
+  it.each([false, true])("types Main before/after readback without regressing literal actor targets (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const main = await agents.setThinking({ id: "session:root", thinking: "high" });
+      const actor = await agents.setModel({ id: "actor", model: "probe/b" });
+      const caller: string = main.caller;
+      const previous: string | undefined = main.previous.model;
+      const scope: "session" | "project" = actor.scope;
+      const dynamic = await agents.setThinking({ id: (await agents.main()).id, thinking: "high" });
+      if ("previous" in dynamic) return dynamic.previous.thinking;
+      return { caller, previous, scope };`;
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    const refused = `const model = await agents.setModel({ id: "session:root", model: "probe/b" }); return model.previous;`;
+    expect(typeCheckFabricCode(refused, declarations, true).errors.map(error => error.message))
+      .toEqual([expect.stringContaining("does not exist on type 'never'")]);
+  });
+
   it.each([false, true])("#3819 types inline XOR verified file instructions (fullCodeMode=%s)", fullCodeMode => {
     const declarations = guestTypeDeclarations(fullCodeMode);
     for (const name of ["create", "createActor", "setInstructions"]) {

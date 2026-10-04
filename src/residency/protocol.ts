@@ -384,6 +384,8 @@ export interface ResidentHostOwner {
   token: string;
   startedAt: number;
   readyAt: number;
+  /** With v1, usable readiness additionally requires a same-token post-lease maintenance receipt. */
+  maintenanceReady?: 1;
   /** The immutable entry path this owner actually loaded, not the mutable config selector. */
   fabricExtensionPath?: string;
   /** Commands supported by this running binary; absent on pre-negotiation hosts. */

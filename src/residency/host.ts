@@ -860,16 +860,20 @@ export class ResidentHost {
       if (!record || record.format !== RESIDENT_HOST_FORMAT || `${record.id}.json` !== entry) {
         throw new Error(`Invalid resident delivery outbox item: ${file}`);
       }
-      const key = `${residentDeliveryPrefix(record.rootId)}${record.id}`;
+      // Actor output is owned by the host that produced it. Older hosts could have
+      // persisted an inferred successor root; never replay that stale target.
+      const ownerRoot = record.from.kind === "actor" ? this.config.rootId : record.rootId;
+      const publish = ownerRoot === record.rootId ? record : { ...record, rootId: ownerRoot };
+      const key = `${residentDeliveryPrefix(ownerRoot)}${record.id}`;
       try {
-        await this.mesh.put({ key, value: record, identity: this.identity, ifVersion: 0 });
+        await this.mesh.put({ key, value: publish, identity: this.identity, ifVersion: 0 });
       } catch (error) {
         // A restart after put but before unlink replays the SAME private UUID. A CAS
         // conflict (including a consumed tombstone) means it was handed off already.
         if (!(error instanceof Error && error.message.startsWith(`Mesh compare-and-swap failed for ${key}: expected version 0,`))) {
           if (isMeshLockTimeout(error)) throw error;
           await this.mesh.put({
-            key, value: { ...record, message: record.message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
+            key, value: { ...publish, message: publish.message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
             identity: this.identity, ifVersion: 0,
           });
         }

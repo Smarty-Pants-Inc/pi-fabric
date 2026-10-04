@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { launchLog, same, stopAllOwned } from '../tests/helpers/owned-processes.ts';
 
 const [cli, tmpdir, output] = process.argv.slice(2);
@@ -39,6 +39,9 @@ export default function(pi) {
   const faux = fauxProvider({ provider: 'recipient-proof', models: [{ id: 'offline' }], tokensPerSecond: 100000 });
   const respond = async (context, options) => {
     const run = process.env.PI_FABRIC_AGENT_RUN_DIR;
+    if (process.env.PI_FABRIC_ACTOR_ID) {
+      return fauxAssistantMessage([fauxToolCall('fabric_reply', { action: 'message', message: 'ACTOR_NATIVE_OUTPUT_3178', data: { native: true } }, { id: 'actor-reply-3178' })]);
+    }
     if (run) {
       fs.writeFileSync(${JSON.stringify(childReady)}, JSON.stringify({ pid: process.pid, run, nice: os.getPriority(0) }));
       while (!fs.existsSync(${JSON.stringify(gate)})) {
@@ -65,8 +68,8 @@ const wait = async (predicate, timeout = 60000) => {
   const deadline = Date.now() + timeout;
   while (!predicate()) { assert(Date.now() < deadline, 'proof observation timed out'); await sleep(25); }
 };
-function open(lane) {
-  const args = [path.resolve(cli), '--mode', 'rpc', '--offline', '--name', 'main', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--approve', '-e', path.join(repo, 'dist/index.js'), '-e', provider, '--provider', 'recipient-proof', '--model', 'offline', '--thinking', 'off', '--tools', 'fabric_exec', '--session-dir', path.join(scratch, 'sessions')];
+function open(lane, sessionFile) {
+  const args = [path.resolve(cli), '--mode', 'rpc', '--offline', '--name', 'main', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--approve', '-e', path.join(repo, 'dist/index.js'), '-e', provider, '--provider', 'recipient-proof', '--model', 'offline', '--thinking', 'off', '--tools', 'fabric_exec', '--session-dir', path.join(scratch, 'sessions'), ...(sessionFile ? ['--session', sessionFile] : [])];
   const env = { PATH: process.env.PATH, HOME: home, TMPDIR: scratch, PI_OFFLINE: '1', PI_CODING_AGENT_DIR: agentDir,
     PI_FABRIC_PI_BINARY: path.resolve(cli), PI_FABRIC_RUN_ROOT: runRoot, PI_FABRIC_MESH_ROOT: meshRoot,
     PI_FABRIC_PROJECT_ROOT: scratch, PI_FABRIC_ROLE: 'project-agent', PROOF_LANE: lane, ...launches.env };
@@ -175,8 +178,70 @@ try {
     const state = await client.request({ type: 'get_state' });
     if (state.sessionFile) fs.copyFileSync(state.sessionFile, path.join(out, `${client.lane}-session.jsonl`));
   }
+  // Real actor-output proof: the public agents.create/tell path starts a native Pi actor,
+  // whose model emits fabric_reply. First prove the live-owner control, then kill A while
+  // a second actor replies; B shares cwd/name but is never a receiver.
+  const actorBodies = (messages, marker) => messages.filter(message => message.role === 'custom' && (message.customType === 'pi-fabric-agent-message' || message.customType === 'pi-fabric-actor') && JSON.stringify(message).includes(marker));
+  const liveActor = await a.guest(`return await agents.create({ name: 'native-live-owner', instructions: 'Reply through fabric_reply.', runner: 'pi', model: 'recipient-proof/offline', residency: 'durable', responseMode: 'directive', delivery: 'followUp', triggerTurn: true, coalesce: false, extensions: true });`);
+  await a.guest(`return await agents.tell({ id: ${JSON.stringify(liveActor.id)}, message: 'CONTROL_ACTOR_OUTPUT_3178' });`);
+  const liveDeadline = Date.now() + 30000;
+  while (actorBodies(await contents(a), 'ACTOR_NATIVE_OUTPUT_3178').length < 1) { assert(Date.now() < liveDeadline, 'live actor output missing'); await a.tick(); await sleep(200); }
+  const liveA = await contents(a), liveB = await contents(b);
+  assert.equal(actorBodies(liveA, 'ACTOR_NATIVE_OUTPUT_3178').length, 1);
+  assert.equal(actorBodies(liveB, 'ACTOR_NATIVE_OUTPUT_3178').length, 0);
+  const deadActor = await a.guest(`return await agents.create({ name: 'native-dead-owner', instructions: 'Reply through fabric_reply.', runner: 'pi', model: 'recipient-proof/offline', residency: 'durable', responseMode: 'directive', delivery: 'followUp', triggerTurn: true, coalesce: false, extensions: true });`);
+  const ownerState = await a.request({ type: 'get_state' });
+  assert(ownerState.sessionFile, 'owner session must be persisted before death');
+  assert(same(ownedA), 'A PID/start still owned');
+  process.kill(ownedA.pid, 'SIGKILL');
+  const deadExit = await a.exit;
+  assert.equal(deadExit.signal, 'SIGKILL');
+  assert(!same(ownedA), 'owner Main must actually be dead');
+  record({ type: 'signal', lane: 'A', pid: ownedA.pid, started: ownedA.started, signal: 'SIGKILL', reason: 'actor-output-proof', exit: deadExit });
+  await sleep(20000);
+  const actorMembers = await b.guest("return await agents.members({ scope: 'project', kinds: ['root'] });");
+  const actorRoots = Array.isArray(actorMembers) ? actorMembers : actorMembers.members;
+  assert(!actorRoots.some(root => root.id === rootA.id && !root.stale), 'dead actor owner must be absent or stale');
+  record({ type: 'actor-owner-dead-members', members: actorRoots });
+  await b.guest(`return await agents.tell({ id: ${JSON.stringify(deadActor.id)}, message: 'DEAD_OWNER_ACTOR_OUTPUT_3178' });`);
+  const { MeshStore } = await import(pathToFileURL(path.join(repo, 'dist/mesh.js')).href);
+  const proofMesh = new MeshStore(meshRoot, 65536, 500);
+  const actorDeliveries = () => proofMesh.listAll('residency/deliveries/', { fresh: true }).filter(entry => JSON.stringify(entry.value).includes('ACTOR_NATIVE_OUTPUT_3178'));
+  await wait(() => actorDeliveries().length >= 1);
+  for (let tick = 0; tick < 3; tick++) { await b.tick(); await sleep(250); }
+  assert.equal(actorBodies(await contents(b), 'ACTOR_NATIVE_OUTPUT_3178').length, 0);
+  const retainedDead = actorDeliveries().map(entry => ({ key: entry.key, value: entry.value, updatedBy: entry.updatedBy }));
+  assert.equal(retainedDead.length, 1);
+  record({ type: 'actor-retained-while-owner-dead', actorId: deadActor.id, ownerRoot: rootA.rootId, foreignRoot: rootB.rootId, foreignDeliveryCount: 0, retainedDead });
+  const deadPid = ownedA.pid;
+  a = open('A', ownerState.sessionFile);
+  await wait(() => { assert(!a.exited, 'resumed A exited before ready'); const ready = path.join(scratch, 'ready-A.json'); return fs.existsSync(ready) && JSON.parse(fs.readFileSync(ready)).pid === a.child.pid; });
+  const resumedState = await a.request({ type: 'get_state' });
+  assert.equal(resumedState.sessionId, rootA.sessionId);
+  record({ type: 'actor-owner-resumed', deadPid, newPid: a.child.pid, state: resumedState });
+  const actorDeadline = Date.now() + 30000;
+  while (actorBodies(await contents(a), 'ACTOR_NATIVE_OUTPUT_3178').length < 2) { assert(Date.now() < actorDeadline, 'dead-owner actor output missing after resume'); await a.tick(); await sleep(200); }
+  for (let tick = 0; tick < 3; tick++) { await a.tick(); await b.tick(); await sleep(250); }
+  const actorA = await contents(a), actorB = await contents(b);
+  assert.equal(actorBodies(actorA, 'ACTOR_NATIVE_OUTPUT_3178').length, 2);
+  assert.equal(actorBodies(actorB, 'ACTOR_NATIVE_OUTPUT_3178').length, 0);
+  assert.equal(actorDeliveries().length, 0);
+  const byActor = (messages, actor) => actorBodies(messages, 'ACTOR_NATIVE_OUTPUT_3178').filter(message => message.details?.from?.id === actor.id);
+  assert.equal(byActor(actorA, liveActor).length, 1);
+  assert.equal(byActor(actorA, deadActor).length, 1);
+  const deadReceipt = byActor(actorA, deadActor)[0].details;
+  assert.equal(deadReceipt.deliveryId, `resident:${rootA.rootId}:${retainedDead[0].value.id}`);
+  const actorRows = { liveOwner: { actorId: liveActor.id, A: byActor(liveA, liveActor).length, B: byActor(liveB, liveActor).length,
+      receipt: byActor(liveA, liveActor)[0].details },
+    deadOwner: { actorId: deadActor.id, retained: retainedDead, A: byActor(actorA, deadActor).length, B: byActor(actorB, deadActor).length,
+      receipt: deadReceipt, deliveredExactlyOnceAfterResume: byActor(actorA, deadActor).length === 1 } };
+  fs.writeFileSync(path.join(out, 'actor-output.json'), JSON.stringify(actorRows, null, 2));
+  fs.writeFileSync(path.join(out, 'actor-A-messages.json'), JSON.stringify(actorA, null, 2));
+  fs.writeFileSync(path.join(out, 'actor-B-messages.json'), JSON.stringify(actorB, null, 2));
+  fs.copyFileSync(ownerState.sessionFile, path.join(out, 'actor-owner-session.jsonl'));
+  record({ type: 'actor-output-assertions', ...actorRows });
   summary = { result: 'PASS', sameCwdNameRole: true, rootA: rootA.rootId, rootB: rootB.rootId, resultId: handle.id,
-    stoppedForMs, completedWhileAStopped: true, retainedExactRecipient: true, ADeliveryCount: 1, BDeliveryCount: 0, receipt };
+    stoppedForMs, completedWhileAStopped: true, retainedExactRecipient: true, ADeliveryCount: 1, BDeliveryCount: 0, receipt, actorRows };
   record({ type: 'assertions', ...summary });
 } catch (error) { failure = error; record({ type: 'failure', error: String(error.stack ?? error) }); }
 finally {
@@ -195,6 +260,9 @@ finally {
   if (remaining.length) failure ??= new Error('owned proof processes still live: ' + remaining.map(value => value.pid).join(','));
   record({ type: 'cleanup', owned, remaining, scratchRemoved: true });
   if (fs.existsSync(launches.file)) fs.copyFileSync(launches.file, path.join(out, 'owned-processes.jsonl'));
+  // Preserve actual native actor fabric_reply frames, sessions, owner admission/receipt
+  // journals and retained mesh envelopes before deleting the isolated scratch roots.
+  for (const name of ['mesh', 'runs']) if (fs.existsSync(path.join(scratch, name))) fs.cpSync(path.join(scratch, name), path.join(out, name), { recursive: true });
   fs.rmSync(scratch, { recursive: true, force: true });
 }
 fs.writeFileSync(path.join(out, 'summary.json'), JSON.stringify({ ...summary, result: failure ? 'FAIL' : 'PASS', ...(failure ? { error: String(failure.stack ?? failure) } : {}) }, null, 2) + '\n');

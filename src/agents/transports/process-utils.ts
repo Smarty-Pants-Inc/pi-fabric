@@ -378,13 +378,16 @@ export const spawnDetached = async (
         // can publish a child-exit failure before the worker handles our TERM.
         if (ownedTree && treeOwner) treeOwner.captureDescendants(ownedTree);
         const results = await Promise.allSettled([stopNative()]);
-        // Native close alone is not tree exit. Join every captured survivor even
-        // if the bounded native stop failed; never let teardown reclassify stop.
+        // Native close alone is not tree exit. At the seven-second native
+        // deadline, custody is fenced but cleanup must still join every captured
+        // survivor, without awaiting the missing worker close again.
         if (ownedTree && treeOwner) results.push(...await Promise.allSettled([
           treeOwner.stopObservedDescendants(ownedTree, pid),
         ]));
         for (const result of results) if (result.status === "rejected") throw result.reason;
-        if (process.platform === "linux" && lost !== undefined) throw new Error(lost);
+        // A missing native close is custody debt, not a failed stop. Keep the
+        // immutable fence for release/admission/retention while allowing logical
+        // stop, run deadlines and shutdown to complete (including on Linux).
       })();
     },
     async isAlive() {

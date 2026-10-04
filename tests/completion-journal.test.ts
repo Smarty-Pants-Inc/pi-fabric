@@ -31,7 +31,7 @@ const setup = () => {
     fs.writeFileSync(file(value.id), JSON.stringify({ format: 1, recipient: address, result: value }));
     return value;
   };
-  return { root, meshRoot, recipient, result, file, receipt, journal, seed };
+  return { root, meshRoot, recipient, result, file, receipt, journal, seed, mesh };
 };
 
 // Observe the maximum event-loop slice, not the wall time of an async scan/pass.
@@ -52,6 +52,78 @@ const measureIdleSlices = async (operation: () => Promise<void>) => {
 };
 
 describe("completion journal idle scans", () => {
+  it.each([false, true])("forget hides the result immediately while claim retirement is held (refused: %s)", async refused => {
+    const h = setup(); const result = h.seed(1); const journal = h.journal();
+    await journal.drain(false); // Establish an authenticated claim before cleanup.
+    const remove = h.mesh.delete.bind(h.mesh);
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const deletion = vi.spyOn(h.mesh, "delete").mockImplementation(async args => {
+      await held;
+      if (refused) throw new Error("CAS refused");
+      return remove(args);
+    });
+    try {
+      journal.forget(result.id);
+      expect(journal.result(result.id)).toBeUndefined();
+      expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
+      expect(fs.existsSync(h.file(result.id))).toBe(true);
+      await vi.waitFor(() => expect(deletion).toHaveBeenCalledTimes(1));
+      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1);
+      expect(fs.existsSync(h.file(result.id))).toBe(true); // Never unlink before CAS.
+    } finally { release(); }
+    if (!refused) await vi.waitFor(() => expect(fs.existsSync(h.file(result.id))).toBe(false));
+    else {
+      // Wait for the held retirement to reject, then retry via the normal drain path.
+      await deletion.mock.results[0]!.value.catch(() => undefined);
+      expect(fs.existsSync(h.file(result.id))).toBe(true);
+      expect(journal.result(result.id)).toBeUndefined();
+    }
+    deletion.mockRestore();
+    await journal.drain();
+    expect(fs.existsSync(h.file(result.id))).toBe(false);
+    expect(fs.existsSync(h.receipt(result.id))).toBe(true);
+    expect(journal.result(result.id)).toBeUndefined();
+  });
+
+  it("forget remains logically absent when receipt confirmation fails, retaining durable recovery", async () => {
+    const h = setup(); const result = h.seed(1); const journal = h.journal();
+    await journal.drain(false);
+    const open = vi.spyOn(fs.promises, "open").mockRejectedValueOnce(new Error("confirmation failed"));
+    journal.forget(result.id);
+    expect(journal.result(result.id)).toBeUndefined();
+    await open.mock.results[0]!.value.catch(() => undefined);
+    expect(fs.existsSync(h.file(result.id))).toBe(true);
+    expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1);
+    expect(h.journal().result(result.id)).toMatchObject({ id: result.id });
+    open.mockRestore();
+    await journal.drain();
+    expect(fs.existsSync(h.file(result.id))).toBe(false);
+    expect(fs.existsSync(h.receipt(result.id))).toBe(true);
+    expect(journal.result(result.id)).toBeUndefined();
+  });
+
+  it.each([2, 3])("yields between two-entry slices but not after a small final slice (%s entries)", async count => {
+    const h = setup();
+    for (let index = 1; index <= count; index++) h.seed(index);
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    await h.journal().drain(false);
+    if (count === 2) expect(timer).not.toHaveBeenCalled();
+    else expect(timer).toHaveBeenCalled();
+    expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(count);
+  });
+
+  it("a queued delivery callback cannot restore a forgotten result", async () => {
+    const h = setup(); const result = h.seed(1);
+    let delivered!: () => void;
+    const journal = h.journal(vi.fn((_result: AgentRunResult, callback: () => void) => { delivered = callback; }));
+    await journal.drain();
+    journal.forget(result.id);
+    delivered();
+    await journal.drain();
+    expect(journal.result(result.id)).toBeUndefined();
+    expect(fs.existsSync(h.receipt(result.id))).toBe(true);
+  });
   it("drains 100 consumed large envelopes and two pending ones without synchronous fsync or a 16ms blocking scan", async () => {
     const h = setup();
     for (let index = 1; index <= 100; index++) {

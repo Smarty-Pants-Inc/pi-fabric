@@ -70,13 +70,19 @@ const files = (dir: string): string[] => {
   try { return fs.readdirSync(dir).filter(isJournalFile); } catch { return []; }
 };
 // Idle scans must yield on inspected entries, not just successful cleanup/delivery.
-// Four entries leave headroom for multiple plain fence/body reads per envelope
-// and adjacent immediate callbacks before the next timer/IO phase.
+// Two entries leave headroom for slower filesystems. A timer turn lets timers/IO
+// run between slices rather than chaining adjacent immediate callbacks.
+// Yield before the next entry, not after the last: small native reconciles must not
+// require a trailing timer turn before they can admit completion notifications.
 async function* scanSlices<T>(entries: Iterable<T>): AsyncGenerator<T> {
   let scanned = 0;
   for (const entry of entries) {
+    if (scanned === 2) {
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      scanned = 0;
+    }
+    scanned++;
     yield entry;
-    if (++scanned % 4 === 0) await new Promise<void>(resolve => setImmediate(resolve));
   }
 }
 async function* scanTargets(dirs: readonly string[]): AsyncGenerator<string> {
@@ -337,9 +343,13 @@ export const pendingCompletionResult = (envelope: CompletionEnvelope): AgentRunR
 
 export class CompletionJournal {
   readonly #enqueued = new Set<string>();
+  // Explicit cleanup is logically final for this client even while durable retirement
+  // is delayed/refused. Keep the receipt and envelope for crash-safe drain retries.
+  readonly #forgotten = new Set<string>();
   // Preserve same-session wait/status after unlink without retaining an unbounded disk journal.
   readonly #consumed = new Map<string, CompletionEnvelope>();
   #remember(envelope: CompletionEnvelope): void {
+    if (this.#forgotten.has(envelope.result.id)) return;
     this.#consumed.set(envelope.result.id, envelope);
     if (this.#consumed.size > 64) this.#consumed.delete(this.#consumed.keys().next().value!);
   }
@@ -367,12 +377,14 @@ export class CompletionJournal {
     const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id);
     if (envelope && !this.#canRead(envelope)) return;
     consumeCompletion(this.meshRoot, id, this.recipient.sessionId);
+    this.#forgotten.add(id);
     this.#enqueued.delete(id);
     this.#consumed.delete(id);
     void this.#retireClaim(id).catch(() => undefined); // A crash/failure is reconciled by drain.
   }
   pending(): CompletionEnvelope[] { return pendingCompletions(this.meshRoot, this.recipient.projectRoot); }
   result(id: string): AgentRunResult | CompletionSummary | undefined {
+    if (this.#forgotten.has(id)) return undefined;
     const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id) ?? this.#consumed.get(id);
     if (!envelope) return undefined;
     const consumed = completionConsumed(this.meshRoot, id) || legacyCompletionConsumed(this.meshRoot, envelope.recipient.rootId, id);

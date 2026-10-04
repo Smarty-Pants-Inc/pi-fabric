@@ -3049,7 +3049,11 @@ export class AgentManager {
     // Install the promise before stop can synchronously emit native events.
     void (async () => {
       try {
-        await this.#stopWorkerRunner(managed);
+        // Built-ins have no stop hook: do not yield before starting their
+        // captured tree stop. Native exit can otherwise overtake the helper.
+        if (managed.runnerAdapter.kind === "worker" && managed.runnerAdapter.stop) {
+          await this.#stopWorkerRunner(managed);
+        }
         await managed.transport.stop();
         await this.#noteUnconfirmedExit(managed);
         managed.processStopPending = false;

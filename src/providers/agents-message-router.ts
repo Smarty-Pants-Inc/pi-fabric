@@ -348,11 +348,17 @@ export class AgentMessageRouter {
       }
       if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
-      if (!this.control || participant.controlProtocol === "legacy") {
-        return context?.signal || options.principal
-          ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal, context?.signal)
-          : this.actorManager.steerRemote(participant.id, message, kind, data);
+      // Root controls are not actor relays. Only the authenticated v1 owner
+      // path may accept them; legacy/absent channels cannot borrow actor authority.
+      if (!this.control || participant.controlProtocol !== "v1") {
+        throw new Error(`Fabric participant ${participant.id} has no control channel`);
       }
+      // A native Main's inbox belongs to its immutable session, not one extension
+      // generation. The same host/identity and shared command claims carry its
+      // admitted messages across reload. Distinct runtime-owned roots stay pinned,
+      // as do every actor/task control below; physical bridge routing stays bound.
+      const nativeSessionRoot = participant.id === participant.rootId &&
+        participant.ownerHostId === participant.id && participant.ownerIdentityId === participant.id;
       return this.control.request(
         participant.ownerHostId,
         participant.id,
@@ -365,7 +371,7 @@ export class AgentMessageRouter {
           ...(kind === "followUp"
             ? { triggerTurn: options.triggerTurn ?? true }
             : typeof options.triggerTurn === "boolean" ? { triggerTurn: options.triggerTurn } : {}),
-          ...(participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {}),
+          ...(!nativeSessionRoot && participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {}),
         },
         participant.ownerIdentityId,
         {

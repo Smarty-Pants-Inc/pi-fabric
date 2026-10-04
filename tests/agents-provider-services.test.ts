@@ -582,6 +582,32 @@ describe("agents provider message routing service boundaries", () => {
     expect(actors.steerRemote).not.toHaveBeenCalled();
   });
 
+  it("keeps native Main messages session-scoped without losing physical owner routing", async () => {
+    const { router, participants, control } = routing();
+    const root = { ...participant(), id: "session:peer", rootId: "session:peer",
+      ownerHostId: "session:peer", ownerIdentityId: "session:peer",
+      ownerIncarnation: "22222222-2222-4222-8222-222222222222", remoteHost: "forge" };
+    participants.get.mockReturnValue(root);
+    await router.routeMessage(root.id, "survive reload", undefined, "followUp");
+    const call = control.request.mock.calls.at(-1)!;
+    expect(call[0]).toBe(root.ownerHostId);
+    expect(call[1]).toBe(root.id);
+    expect(call[3]).toMatchObject({ message: "survive reload", triggerTurn: true });
+    expect(call[3]).not.toHaveProperty("ownerIncarnation");
+    expect(call[4]).toBe(root.ownerIdentityId);
+    expect(call[5]).toEqual({ routedRemoteHost: "forge" });
+  });
+
+  it.each(["root", "agent", "actor"] as const)("keeps distinct runtime-owned %s controls generation-pinned", async kind => {
+    const { router, participants, control } = routing();
+    const target = { ...participant(), kind, id: `${kind === "root" ? "session" : kind}:peer`,
+      rootId: "session:peer", capabilities: ["steer", "followUp"],
+      ownerIncarnation: "22222222-2222-4222-8222-222222222222" };
+    participants.get.mockReturnValue(target);
+    await router.routeMessage(target.id, "pinned", undefined, "steer");
+    expect(control.request.mock.calls.at(-1)![3]).toMatchObject({ ownerIncarnation: target.ownerIncarnation });
+  });
+
   it("rejects a remote root when capability or v1 control is absent", async () => {
     const { router, participants, control, actors, agents, main } = routing();
     const remote: FabricParticipantInfo = { ...participant(), id: "session:peer", rootId: "session:peer", capabilities: [] };
@@ -639,15 +665,15 @@ describe("agents provider message routing service boundaries", () => {
       else expect(actors.tell).toHaveBeenLastCalledWith("child", "hello", undefined, options);
     };
     await expect(router.acceptControl(own, actors.identity, signal, "mesh")).resolves.toMatchObject({ accepted: true });
-    check({ overrides: own.binding, provenance: expect.objectContaining({ principal }) });
+    check({ overrides: own.binding, provenance: expect.objectContaining({ principal }), sender: null });
     const foreign = { ...actors.identity, id: "foreign" };
     await expect(router.acceptControl(own, foreign, signal, "mesh")).resolves.toMatchObject({ accepted: false, error: "Invalid actor owner-default binding provenance" });
     for (const binding of [undefined, {}, { thinking: "high" as const }]) {
       await expect(router.acceptControl({ ...command(operation), principal, ...(binding ? { binding } : {}) }, foreign, signal, "bridge")).resolves.toMatchObject({ accepted: true });
-      check({ binding: binding ?? {}, provenance: expect.objectContaining({ principal }) });
+      check({ binding: binding ?? {}, provenance: expect.objectContaining({ principal }), sender: null });
     }
     await expect(router.acceptControl({ ...command(operation), principal }, foreign, signal)).resolves.toMatchObject({ accepted: true });
-    check({ binding: {}, provenance: undefined });
+    check({ binding: {}, provenance: undefined, sender: null });
   });
 
   it("leaves cancel commands to the control plane and refreshes successful stops", async () => {

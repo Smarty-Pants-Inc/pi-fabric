@@ -712,6 +712,17 @@ describe("actor session reset (smarty-dev#1439)", () => {
     expect(backups(actor.sessionFile!)).not.toContain(`session.jsonl.${stamp}.bak`);
   });
 
+  it("preserves a native session tail published after terminal status before reset", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "tail", instructions: "Flush the session." });
+    await actors.ask(actor.id, "DELAY_SESSION_TAIL charlie");
+    await actors.resetSession(actor.id);
+    const [backup] = backups(actor.sessionFile!);
+    const archived = fs.readFileSync(path.join(path.dirname(actor.sessionFile!), backup!), "utf8");
+    expect(archived).toContain("charlie");
+    expect(archived).toContain("fake actor advice");
+  });
+
   // review/astra F1 on #101: a pruned name was reused, sorted oldest and deleted at once.
   it("keeps the newest backup when every reset lands in the same millisecond", async () => {
     const { actors } = setup();

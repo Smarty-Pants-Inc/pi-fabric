@@ -152,20 +152,20 @@ describe("checked agent release observations", () => {
     });
     let check: Promise<void> | undefined;
     try {
-      const info = await manager.spawn({ task: "HANG until stopped", transport: "process" });
-      const run = manager.runDirectory(info.id)!; const file = path.join(run, "status.json");
-      while (!fs.existsSync(file)) await sleep(10);
-      const record = JSON.parse(fs.readFileSync(file, "utf8"));
-      fs.writeFileSync(file, JSON.stringify({ ...record, status: "failed", error: "terminal UI failure", finishedAt: Date.now() }));
+      const info = await manager.spawn({ task: "complete parent", transport: "process" });
+      const run = manager.runDirectory(info.id)!;
+      // A terminal UI record cannot settle a still-live worker under custody.
+      // Settle its actual execution first, then inject a hung release re-observation.
       await manager.wait(info.id); hung = true;
       check = manager.checkpointForRelease(Date.now() + 80);
       const outcome = await Promise.race([check.then(() => "accepted", () => "vetoed"), sleep(400).then(() => "hung")]);
       expect(outcome).toBe("vetoed");
       expect(hasUnresolvedWorker(run)).toBe(true);
       finishQuery(); hung = false;
+      // Explicit close now joins execution custody, including terminal UI runs.
       await manager.close();
       expect(fs.existsSync(run)).toBe(true);
-      expect(await handle!.isAlive()).toBe(true);
+      expect(await handle!.isAlive()).toBe(false);
     } finally {
       finishQuery(); hung = false; await check?.catch(() => undefined);
       await handle?.stop();

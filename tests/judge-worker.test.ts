@@ -92,7 +92,7 @@ describe("retained owned judgment receipts", () => {
     const recovered = fs.readFileSync(deps.ledger, "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(recovered.filter(row => row.type === "outcome")).toEqual([expect.objectContaining({ decisionId: result.decisionId, tokens: expect.objectContaining({ input: 1, output: 2 }) })]);
   });
-  it.each(["open", "write", "sync", "rename"] as const)("preserves an unconfirmed exit even if writing its unresolved-worker marker fails at %s", async failure => {
+  it.each(["none", "open", "write", "sync", "rename"] as const)("preserves an unconfirmed exit with unresolved-worker marker failure=%s", async failure => {
     let owner!: AgentManager;
     const spawn = AgentManager.prototype.spawn;
     vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(function (this: AgentManager, ...args) { owner = this; return spawn.apply(this, args); });
@@ -137,22 +137,54 @@ describe("retained owned judgment receipts", () => {
     });
     deps.agent = (r, limits, signal) => runJudgmentAgent(r, limits, signal, { piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs") });
     const result = await judge(input(), deps);
-    const attempt = fs.readFileSync(deps.ledger, "utf8").trim().split("\n").map(line => JSON.parse(line)).find(row => row.backend === "pi-process");
+    const rows = fs.readFileSync(deps.ledger, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const attempt = rows.find(row => row.backend === "pi-process");
+    expect(attempt).toMatchObject({ childAgentId: expect.any(String), status: "failed", usage: { input: 1, output: 2 } });
     const run = owner.runDirectory(attempt.childAgentId)!;
     ownedRoots.push(path.dirname(path.dirname(run)));
-    expect(failures).toBeGreaterThan(0);
+    if (failure === "none") expect(failures).toBe(0);
+    else expect(failures).toBeGreaterThan(0);
     expect(markerDescriptors.size).toBe(0);
-    expect(fs.existsSync(path.join(run, "unresolved-worker.json"))).toBe(false);
+    expect(fs.existsSync(path.join(run, "unresolved-worker.json"))).toBe(failure === "none");
     expect(fs.readdirSync(run).some(file => file.startsWith("unresolved-worker.json."))).toBe(false);
-    expect(result).toMatchObject({ verdict: "unknown", reasonCode: "agent_cleanup_unresolved" });
+    expect(result).toMatchObject({ verdict: "unknown", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 5 } });
     expect(fs.existsSync(path.join(run, "status.json"))).toBe(true);
+    expect(fs.existsSync(path.join(run, "route-session.jsonl"))).toBe(true);
     expect(attempt.error).toContain(ownedRoots[0]);
-    // Marker publication failure is not exit proof, including forced cleanup
-    // and a second close after runJudgmentAgent has already closed its owner.
-    await expect(owner.cleanup(attempt.childAgentId)).rejects.toThrow("lost track of its worker");
-    await expect(owner.cleanup(attempt.childAgentId, true)).rejects.toThrow("lost track of its worker");
-    await owner.close();
+    expect(rows.at(-1)).toMatchObject({ type: "judgment-outcome", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 5 } });
+    // Returning a failed diagnostic receipt must not settle or discharge the
+    // exact execution fence, even when no persistent marker could be written.
+    await expect(owner.wait(attempt.childAgentId, { timeoutMs: 20 })).rejects.toThrow(/still running/);
+    await expect(owner.stop(attempt.childAgentId)).rejects.toThrow(/execution exit unconfirmed/);
+    await expect(owner.cleanup(attempt.childAgentId)).rejects.toThrow("running agent");
+    await expect(owner.cleanup(attempt.childAgentId, true)).rejects.toThrow("running agent");
+    await expect(owner.close()).rejects.toThrow(/execution exit unconfirmed/);
     expect(fs.existsSync(path.join(run, "status.json"))).toBe(true);
+  });
+  it("records unknown-launch custody even before a worker status receipt exists", async () => {
+    let owner!: AgentManager;
+    const spawn = AgentManager.prototype.spawn;
+    vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(function (this: AgentManager, ...args) { owner = this; return spawn.apply(this, args); });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockRejectedValueOnce(Object.assign(new Error("probe: launch outcome unknown"), { launchOutcome: "unknown" }));
+    deps.agent = (r, limits, signal) => runJudgmentAgent(r, limits, signal, { piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs") });
+    const request = input(); request.timeboxMs = 1500;
+    const result = await judge(request, deps);
+    const rows = fs.readFileSync(deps.ledger, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const attempt = rows.find(row => row.backend === "pi-process");
+    expect(attempt).toMatchObject({ childAgentId: expect.any(String), status: "failed", usage: { input: 0, output: 0 } });
+    const owned = path.dirname(owner.status(attempt.childAgentId).cwd);
+    ownedRoots.push(owned);
+    const run = path.join(owned, "runs", attempt.childAgentId);
+    expect(fs.existsSync(path.join(run, "status.json"))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(run, "unresolved-worker.json"), "utf8"))).toMatchObject({ runId: attempt.childAgentId });
+    expect(result).toMatchObject({ verdict: "unknown", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 2 } });
+    expect(attempt.error).toContain(owned);
+    expect(rows.at(-1)).toMatchObject({ type: "judgment-outcome", reasonCode: "agent_cleanup_unresolved" });
+    await expect(owner.wait(attempt.childAgentId, { timeoutMs: 20 })).rejects.toThrow(/still running/);
+    await expect(owner.stop(attempt.childAgentId)).rejects.toThrow(/execution exit unconfirmed/);
+    await expect(owner.close()).rejects.toThrow(/execution exit unconfirmed/);
+    expect(owner.status(attempt.childAgentId).status).toBe("queued");
+    expect(launch).toHaveBeenCalledTimes(1);
   });
 });
 

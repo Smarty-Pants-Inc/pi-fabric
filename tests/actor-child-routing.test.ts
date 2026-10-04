@@ -116,11 +116,13 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true, 
   const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), {
     paths: { worker: fixture, extension: fixture, residentHost: fixture, skills: root },
   });
-  await runtime.initialize(context, normalizeFabricConfig({
+  const config = normalizeFabricConfig({
     fullCodeMode: true, mesh: { enabled: true, actorPollMs: 20 },
     mcp: { enabled: false, cache: { enabled: false } }, memory: { enabled: false },
     agents: { notifyOnComplete, maxConcurrent: childMaxConcurrent }, residency: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false },
-  }));
+  });
+  const initialize = () => runtime.initialize(context, config);
+  await initialize();
   cleanups.push(() => runtime.shutdown());
   const boundary = () => {
     for (const handler of handlers.get("turn_end") ?? []) handler({ message: { role: "assistant", stopReason: "stop" } }, context);
@@ -128,7 +130,7 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true, 
   const spawn = (task = "private review sub-result") => runtime.registry.invoke("agents.spawn", {
     task, name: "review-subtask", transport: "process", model: "fixture/review",
   }, invocation) as Promise<AgentHandleInfo>;
-  return { actor, actorRunId, owner, ownerAgents, mesh, runtime, invocation, rootDeliveries, sendMessage, boundary, spawn, endActivation, makeOwner, resolveModel };
+  return { actor, actorRunId, owner, ownerAgents, mesh, runtime, invocation, rootDeliveries, sendMessage, boundary, spawn, endActivation, makeOwner, resolveModel, initialize };
 };
 
 // Windows omits unsupported directory fsync. Exercise the same uncertain writer
@@ -143,18 +145,6 @@ const failPostRenameOnWindows = (target: (file: string) => boolean, fail: () => 
 };
 
 describe.each(["session", "durable"] as const)("%s actor process children", (residency) => {
-  it("records the actor and activation run as spawner, never the root Main", async () => {
-    const h = await setup(residency);
-    const child = await h.spawn();
-    await vi.waitFor(() => expect(h.runtime.agents.status(child.id).status).toBe("completed"), { timeout: 5000 });
-    expect(h.runtime.agents.status(child.id)).toMatchObject({
-      spawner: { id: h.actor.id, kind: "actor", runId: h.actorRunId },
-    });
-    await vi.waitFor(() => { h.boundary(); expect(h.sendMessage).toHaveBeenCalledOnce(); }, { timeout: 5000 });
-    expect(h.sendMessage.mock.calls[0]![0].content).toContain("fake worker complete");
-    expect(h.rootDeliveries).not.toHaveBeenCalled();
-  });
-
   it("retains a failed child archive through ancestor cleanup and recovers it after both custodians close", async () => {
     const h = await setup(residency);
     const enqueue = ActorChildCompletionStore.prototype.enqueue;
@@ -185,6 +175,185 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     restarted.tell(h.actor.id, "resume after source recovery");
     await vi.waitFor(() => expect(restarted.messages(h.actor.id).filter(m => m.id === child.id && m.direction === "in")).toHaveLength(1), { timeout: 5000 });
     await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("Q4 recovers every unsent live notice exactly once after a post-rename barrier failure and worker close", async () => {
+    const h = await setup(residency);
+    const children = [await h.spawn("LARGE_RESULT"), await h.spawn("LARGE_RESULT")];
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(2), { timeout: 5000 });
+    const directory = fs.statSync(store.directory);
+    const rename = fs.renameSync;
+    const sync = fs.fsyncSync;
+    let markerRenamed = false;
+    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (String(to).endsWith(".live-receipt")) markerRenamed = true;
+    });
+    const failed = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const stat = fs.fstatSync(fd);
+      if (markerRenamed && stat.dev === directory.dev && stat.ino === directory.ino) throw new Error("live barrier after rename");
+      sync(fd);
+    });
+    const windowsFailure = failPostRenameOnWindows((file) => file.endsWith(".live-receipt"), () => { throw new Error("live barrier after rename"); });
+    h.boundary();
+    expect(markerRenamed).toBe(true);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    await h.runtime.shutdown();
+    const closing = h.owner.close();
+    h.endActivation();
+    await closing;
+    failed.mockRestore();
+    renamed.mockRestore();
+    windowsFailure?.mockRestore();
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "recover unsent notices");
+    await vi.waitFor(() => expect(restarted.messages(h.actor.id).filter((m) => m.source === "child-completion" && m.direction === "out" && !m.error)).toHaveLength(2), { timeout: 5000 });
+    for (const child of children) {
+      expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id && m.direction === "in")).toHaveLength(1);
+      await vi.waitFor(() => expect(fs.existsSync(store.resultFile(child.id))).toBe(false));
+    }
+    expect(store.pending()).toEqual([]);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("Q6 returns no foreground value until post-rename barriers complete and never replays after recovery", async () => {
+    const h = await setup(residency);
+    const child = await h.spawn();
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    const directory = fs.statSync(store.directory);
+    const rename = fs.renameSync;
+    const sync = fs.fsyncSync;
+    let receiptRenamed = false;
+    let blocked = true;
+    let failures = 0;
+    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (String(to) === path.join(store.directory, `${child.id}.receipt`)) receiptRenamed = true;
+    });
+    const failed = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const stat = fs.fstatSync(fd);
+      if (receiptRenamed && blocked && stat.dev === directory.dev && stat.ino === directory.ino) {
+        failures++;
+        throw new Error("foreground barrier after rename");
+      }
+      sync(fd);
+    });
+    failPostRenameOnWindows((file) => file === path.join(store.directory, `${child.id}.receipt`), () => {
+      if (blocked) { failures++; throw new Error("foreground barrier after rename"); }
+    });
+    const execution = await h.runtime.execution.execute({
+      code: `try { return await agents.wait({id:${JSON.stringify(child.id)}}); } catch { return "NO-FOREGROUND-VALUE"; }`,
+      context: h.invocation.extensionContext, signal: undefined, parentToolCallId: "barrier-fence", onPartial() {},
+    });
+    expect(execution.success, execution.error).toBe(true);
+    expect(execution.value).toBe("NO-FOREGROUND-VALUE");
+    expect(failures).toBeGreaterThanOrEqual(2);
+    blocked = false;
+    expect(await h.runtime.registry.invoke("agents.wait", { id: child.id }, h.invocation)).toMatchObject({ id: child.id, status: "completed" });
+    failed.mockRestore();
+    renamed.mockRestore();
+    await h.runtime.shutdown();
+    const closing = h.owner.close();
+    h.endActivation();
+    await closing;
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "after barrier recovery");
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id)).toEqual([]);
+    expect(store.pending()).toEqual([]);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+
+  it("records the actor and activation run as spawner, never the root Main", async () => {
+    const h = await setup(residency);
+    const child = await h.spawn();
+    await vi.waitFor(() => expect(h.runtime.agents.status(child.id).status).toBe("completed"), { timeout: 5000 });
+    expect(h.runtime.agents.status(child.id)).toMatchObject({
+      spawner: { id: h.actor.id, kind: "actor", runId: h.actorRunId },
+    });
+    await vi.waitFor(() => { h.boundary(); expect(h.sendMessage).toHaveBeenCalledOnce(); }, { timeout: 5000 });
+    expect(h.sendMessage.mock.calls[0]![0].content).toContain("fake worker complete");
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it.each(["shutdown", "reload"] as const)("%s preserves unread full archives through owner restart, without replaying consumed outcomes", async (reason) => {
+    const h = await setup(residency);
+    const unread = await h.spawn("LARGE_RESULT");
+    await h.runtime.agents.join(unread.id);
+    const consumed = await h.spawn("LARGE_RESULT");
+    await h.runtime.registry.invoke("agents.wait", { id: consumed.id }, h.invocation);
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    expect(store.pending().map(({ result }) => result.id)).toEqual([unread.id]);
+    expect(store.received(unread.id)).toBe(false);
+    expect(store.received(consumed.id)).toBe(true);
+    // Close must not turn execution exit into a durable consumption receipt.
+    await h.runtime.shutdown(reason);
+    if (reason === "reload") { await h.initialize(); await h.runtime.shutdown(); }
+    expect(store.received(unread.id)).toBe(false);
+    expect(store.pending().map(({ result }) => result.id)).toEqual([unread.id]);
+    const fullResult = () => JSON.parse(fs.readFileSync(store.resultFile(unread.id), "utf8")) as AgentRunResult;
+    expect(fullResult()).toMatchObject({ text: "x".repeat(100000), value: { output: "x".repeat(100000) } });
+    expect(fs.existsSync(store.resultFile(consumed.id))).toBe(false);
+    // End the activation only after its owner stops polling, so the unread
+    // outcome must survive an actual owner restart before delivery is possible.
+    const closing = h.owner.close();
+    h.endActivation();
+    await closing;
+    const inference = vi.fn();
+    vi.mocked(h.ownerAgents.run).mockRestore();
+    const run = h.ownerAgents.run.bind(h.ownerAgents);
+    vi.spyOn(h.ownerAgents, "run").mockImplementation(async (...args) => {
+      if (args[0].task.includes(JSON.stringify(store.resultFile(unread.id)))) inference(fullResult());
+      return run(...args);
+    });
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "next activation after owner restart");
+    await vi.waitFor(() => expect(inference).toHaveBeenCalledOnce(), { timeout: 5000 });
+    expect(inference.mock.calls[0]![0].value).toEqual({ output: "x".repeat(100000) });
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(restarted.messages(h.actor.id).filter((m) => m.id === unread.id && m.direction === "in")).toHaveLength(1);
+    expect(restarted.messages(h.actor.id).filter((m) => m.id === consumed.id)).toEqual([]);
+    expect(fs.existsSync(store.resultFile(unread.id))).toBe(false);
+    await restarted.close();
+    const again = h.makeOwner();
+    cleanups.push(() => again.close());
+    await again.ask(h.actor.id, "unrelated activation after consumption");
+    await vi.waitFor(() => expect(again.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(again.messages(h.actor.id).filter((m) => m.id === unread.id && m.direction === "in")).toHaveLength(1);
+    expect(again.messages(h.actor.id).filter((m) => m.id === consumed.id)).toEqual([]);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it.each(["shutdown", "reload"] as const)("%s leaves muted full text/value archived across owner restart and unrelated work", async (reason) => {
+    const h = await setup(residency, false);
+    const child = await h.spawn("LARGE_RESULT");
+    await h.runtime.agents.join(child.id);
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await h.runtime.shutdown(reason);
+    if (reason === "reload") { await h.initialize(); await h.runtime.shutdown(); }
+    const closing = h.owner.close();
+    h.endActivation();
+    await closing;
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    expect(store.received(child.id)).toBe(false);
+    expect(store.pending()).toEqual([]);
+    await restarted.ask(h.actor.id, "unrelated activation must not consume muted work");
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8"))).toMatchObject({
+      status: "completed", text: "x".repeat(100000), value: { output: "x".repeat(100000) },
+    });
+    expect(store.received(child.id)).toBe(false);
+    expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id)).toEqual([]);
+    expect(h.sendMessage).not.toHaveBeenCalled();
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 
@@ -684,97 +853,6 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
       // Outgoing messages precede asynchronous run-log retention and cleanup.
       await vi.waitFor(() => expect(fs.existsSync(store.resultFile(child.id))).toBe(false), { timeout: 5000 });
     }
-    expect(store.pending()).toEqual([]);
-    expect(h.rootDeliveries).not.toHaveBeenCalled();
-  });
-
-  it("Q4 recovers every unsent live notice exactly once after a post-rename barrier failure and worker close", async () => {
-    const h = await setup(residency);
-    const children = [await h.spawn("LARGE_RESULT"), await h.spawn("LARGE_RESULT")];
-    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
-    await vi.waitFor(() => expect(store.pending()).toHaveLength(2), { timeout: 5000 });
-    const directory = fs.statSync(store.directory);
-    const rename = fs.renameSync;
-    const sync = fs.fsyncSync;
-    let markerRenamed = false;
-    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      rename(from, to);
-      if (String(to).endsWith(".live-receipt")) markerRenamed = true;
-    });
-    const failed = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
-      const stat = fs.fstatSync(fd);
-      if (markerRenamed && stat.dev === directory.dev && stat.ino === directory.ino) throw new Error("live barrier after rename");
-      sync(fd);
-    });
-    const windowsFailure = failPostRenameOnWindows((file) => file.endsWith(".live-receipt"), () => { throw new Error("live barrier after rename"); });
-    h.boundary();
-    expect(markerRenamed).toBe(true);
-    expect(h.sendMessage).not.toHaveBeenCalled();
-    await h.runtime.shutdown();
-    const closing = h.owner.close();
-    h.endActivation();
-    await closing;
-    failed.mockRestore();
-    renamed.mockRestore();
-    windowsFailure?.mockRestore();
-    const restarted = h.makeOwner();
-    cleanups.push(() => restarted.close());
-    restarted.tell(h.actor.id, "recover unsent notices");
-    await vi.waitFor(() => expect(restarted.messages(h.actor.id).filter((m) => m.source === "child-completion" && m.direction === "out" && !m.error)).toHaveLength(2), { timeout: 5000 });
-    for (const child of children) {
-      expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id && m.direction === "in")).toHaveLength(1);
-      await vi.waitFor(() => expect(fs.existsSync(store.resultFile(child.id))).toBe(false));
-    }
-    expect(store.pending()).toEqual([]);
-    expect(h.rootDeliveries).not.toHaveBeenCalled();
-  });
-
-  it("Q6 returns no foreground value until post-rename barriers complete and never replays after recovery", async () => {
-    const h = await setup(residency);
-    const child = await h.spawn();
-    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
-    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
-    const directory = fs.statSync(store.directory);
-    const rename = fs.renameSync;
-    const sync = fs.fsyncSync;
-    let receiptRenamed = false;
-    let blocked = true;
-    let failures = 0;
-    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      rename(from, to);
-      if (String(to) === path.join(store.directory, `${child.id}.receipt`)) receiptRenamed = true;
-    });
-    const failed = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
-      const stat = fs.fstatSync(fd);
-      if (receiptRenamed && blocked && stat.dev === directory.dev && stat.ino === directory.ino) {
-        failures++;
-        throw new Error("foreground barrier after rename");
-      }
-      sync(fd);
-    });
-    failPostRenameOnWindows((file) => file === path.join(store.directory, `${child.id}.receipt`), () => {
-      if (blocked) { failures++; throw new Error("foreground barrier after rename"); }
-    });
-    const execution = await h.runtime.execution.execute({
-      code: `try { return await agents.wait({id:${JSON.stringify(child.id)}}); } catch { return "NO-FOREGROUND-VALUE"; }`,
-      context: h.invocation.extensionContext, signal: undefined, parentToolCallId: "barrier-fence", onPartial() {},
-    });
-    expect(execution.success, execution.error).toBe(true);
-    expect(execution.value).toBe("NO-FOREGROUND-VALUE");
-    expect(failures).toBeGreaterThanOrEqual(2);
-    blocked = false;
-    expect(await h.runtime.registry.invoke("agents.wait", { id: child.id }, h.invocation)).toMatchObject({ id: child.id, status: "completed" });
-    failed.mockRestore();
-    renamed.mockRestore();
-    await h.runtime.shutdown();
-    const closing = h.owner.close();
-    h.endActivation();
-    await closing;
-    const restarted = h.makeOwner();
-    cleanups.push(() => restarted.close());
-    restarted.tell(h.actor.id, "after barrier recovery");
-    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
-    expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id)).toEqual([]);
     expect(store.pending()).toEqual([]);
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });

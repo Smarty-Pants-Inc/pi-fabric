@@ -208,51 +208,19 @@ describe.skipIf(process.platform !== "linux")("resident release plan and idle-po
     } finally { await f.close(); }
   }, 20_000);
 
-  it.each([["tmux", "failed"], ["tmux", "hung"], ["screen", "failed"], ["screen", "hung"]] as const)("cancels release for terminal live %s on %s observation and preserves its files", async (kind, observation) => {
+  it.each(["tmux", "screen"] as const)("refuses %s before launch without an execution custody contract", async kind => {
     const f = await fixture(false);
     const adapter = kind === "tmux" ? TmuxTransport.prototype : ScreenTransport.prototype;
     const available = vi.spyOn(adapter, "available").mockResolvedValue(true);
-    let handle: Awaited<ReturnType<ProcessTransport["launch"]>> | undefined;
-    let fault: "none" | "failed" | "hung" = "none";
-    let check: Promise<void> | undefined;
-    let releaseQuery!: () => void;
-    const query = new Promise<boolean>(resolve => { releaseQuery = () => resolve(false); });
-    const launch = vi.spyOn(adapter, "launch").mockImplementation(async request => {
-      handle = await new ProcessTransport().launch(request);
-      return { ...handle, kind, relaunchable: false, livenessPollIntervalMs: 10,
-        isAlive: async () => fault === "hung" ? query : fault === "failed" ? false : handle!.isAlive() };
-    });
+    const launch = vi.spyOn(adapter, "launch");
     try {
-      const info = await f.host.agents.spawn({ task: "HANG until stopped", transport: kind });
-      const run = path.join(f.config.residencyRoot, "runs", info.id);
-      const status = path.join(run, "status.json");
-      await until(() => fs.existsSync(status));
-      const record = JSON.parse(fs.readFileSync(status, "utf8"));
-      fs.writeFileSync(status, JSON.stringify({ ...record, status: "failed", error: "terminal UI does not prove exit", finishedAt: Date.now() }));
-      await f.host.agents.wait(info.id);
-      expect(await handle!.isAlive()).toBe(true);
-      {
-        fault = observation;
-        check = f.host.agents.checkpointForRelease();
-        const outcome = await Promise.race([check.then(() => "accepted", () => "vetoed"), sleep(400).then(() => "hung")]);
-        expect(outcome).toBe("vetoed");
-        await f.client.reconcileRelease();
-        await until(() => ["cancelled", "custody"].includes(f.state()?.phase ?? ""));
-        expect(f.state()?.phase).toBe("cancelled");
-        expect(f.idle).not.toHaveBeenCalled();
-        expect(fs.existsSync(run)).toBe(true);
-        expect(await handle!.isAlive()).toBe(true);
-        // A's ordinary actor admission is resumed, not destructively closed.
-        const actor = await f.host.actors.create({ name: `served-${observation}`, instructions: "Reply", residency: "durable", tools: [], responseMode: "text" });
-        f.host.actors.tell(actor.id, "after cancellation");
-        await until(() => f.host.actors.messages(actor.id).some(m => m.direction === "out"));
-      }
-      releaseQuery(); fault = "failed";
-      await f.host.close();
-      expect(fs.existsSync(run)).toBe(true);
-      expect(await handle!.isAlive()).toBe(true);
-    } finally { releaseQuery(); fault = "none"; await check?.catch(() => undefined); await handle?.stop(); launch.mockRestore(); available.mockRestore(); await f.close(); }
-  }, 20_000);
+      await expect(f.host.agents.spawn({ task: "no untracked release obligation", transport: kind }))
+        .rejects.toThrow(/disabled: detached execution custody is not confirmed; use process/);
+      expect(launch).not.toHaveBeenCalled();
+      expect(f.host.agents.listForUi()).toEqual([]);
+      expect(f.idle).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); available.mockRestore(); await f.close(); }
+  });
 
   it("freezes a missing absolute optional binary even if it is later installed", async () => {
     const f = await fixture(false);
@@ -354,8 +322,9 @@ describe.skipIf(process.platform !== "linux")("resident release plan and idle-po
     const handles: Array<Awaited<ReturnType<typeof launch>>> = [];
     const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
       const handle = await launch.call(this, request); handles.push(handle);
-      return { ...handle, relaunchable: false, isAlive: async () => false, lostContact: () => "unreachable pane may still run" };
+      return { ...handle, relaunchable: false, isAlive: async () => lost ? false : handle.isAlive(), lostContact: () => lost ? "unreachable pane may still run" : undefined };
     });
+    let lost = true;
     const stop = vi.spyOn(f.host.agents, "stop");
     try {
       const result = await f.host.agents.run({ task: "HANG until stopped", transport: "process" });
@@ -369,7 +338,7 @@ describe.skipIf(process.platform !== "linux")("resident release plan and idle-po
       expect(fs.existsSync(handoverCustodyPath(f.config.residencyRoot, f.state()!.plan.id))).toBe(false);
       expect(stop).not.toHaveBeenCalled();
       expect(await handles[0]!.isAlive()).toBe(true);
-    } finally { stop.mockRestore(); spy.mockRestore(); for (const handle of handles) await handle.stop(); await f.close(); }
+    } finally { stop.mockRestore(); spy.mockRestore(); for (const handle of handles) await handle.stop(); lost = false; await f.close(); }
   }, 20_000);
 
   it("cancels release for a pending launch with no registered UI run", async () => {

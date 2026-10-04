@@ -132,6 +132,8 @@ interface ManagedActor {
   coalesce: boolean;
   coalesceKey?: string;
   activationFilter?: FabricActorActivationFilter;
+  activationFilterExpiresAt?: number;
+  filterSkipped?: FabricActorInfo["filterSkipped"];
   /** A stored filter that cannot be read: kept as stored and written back, never applied. */
   invalidActivationFilter?: { value: unknown; error: string };
   filteredCount?: number;
@@ -240,6 +242,19 @@ function loadedActivationFilter(
     }
     return { invalidActivationFilter: { value: structuredClone(value), error: reason } };
   }
+}
+// Old registries have no per-filter telemetry; never infer it from lifetime counters.
+function loadedFilterSkipped(value: unknown): FabricActorInfo["filterSkipped"] {
+  const empty = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return empty;
+  const row = value as Record<string, unknown>;
+  if (!Number.isSafeInteger(row.count) || (row.count as number) < 0) return empty;
+  return {
+    count: row.count as number,
+    lastKey: typeof row.lastKey === "string" ? row.lastKey : null,
+    lastTopic: typeof row.lastTopic === "string" ? row.lastTopic : null,
+    lastAt: typeof row.lastAt === "number" && Number.isFinite(row.lastAt) ? row.lastAt : null,
+  };
 }
 const COALESCE_KEY_LOAD_PATTERN = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/;
 
@@ -382,6 +397,8 @@ export class ActorManager {
   readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registry: ActorRegistryStore;
   readonly #persistent: boolean;
+  #filterStateDirty = false;
+  #filterStateSave: Promise<void> | undefined;
   readonly #bindings: ActorBindingStore;
   readonly #mainAgent: FabricMainAgentTarget | undefined;
   readonly #canManageActor: ((id: string) => boolean | undefined) | undefined;
@@ -560,6 +577,10 @@ export class ActorManager {
         if (this.#releasePaused || options.canConsumeMesh?.() === false) return false;
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();
+        for (const actor of this.#actors.values()) {
+          if (this.#canManageCached(actor.id)) this.#expireActivationFilter(actor);
+        }
+        this.#flushFilterState();
         // Preserve deferred events while halted; fencing remains manager-owned.
         if (!this.#halted) this.#reconcileChildCompletions();
         return !this.#halted;
@@ -988,15 +1009,20 @@ export class ActorManager {
 
   /**
    * Set or clear (null or []) the skip-only activation filter (smarty-dev#1579). It applies to
-   * queued work from the next item on; the filtered count is kept.
+   * queued work from the next item on. Per-filter telemetry resets; legacy lifetime count is kept.
    */
-  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
+  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void, expiresAt?: number): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
+    if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
     beforeCommit?.(actor.id);
     if (filter.length > 0) actor.activationFilter = filter;
     else delete actor.activationFilter;
     delete actor.invalidActivationFilter;
+    delete actor.activationFilterExpiresAt;
+    if (filter.length && expiresAt !== undefined) actor.activationFilterExpiresAt = expiresAt;
+    actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
+    if (!filter.length) this.#recordFilterClear(actor, "explicit");
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -1979,6 +2005,7 @@ export class ActorManager {
     return { id, scope: this.#actorScope, name: owner?.name ?? id,
       ...(owner ? { rootId: owner.rootId, residency: owner.residency } : {}), status: "stopped", runner: "pi", events: [], topics: [],
       delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false,
+      filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
       queued: 0, messages: 0, createdAt: requestedAt, updatedAt: requestedAt,
       removal: { requestedAt, state: cleanup.pending ?? "registry revoked; removal cleanup pending" } };
   }
@@ -2163,6 +2190,7 @@ export class ActorManager {
     await Promise.allSettled([...this.#adoptionPending.values()]);
     // Let presence writes already in flight finish before the runtime goes.
     await Promise.allSettled([...this.#presenceChains.values()]);
+    await this.#filterStateSave;
     await this.#notifications.close();
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
@@ -3117,6 +3145,7 @@ export class ActorManager {
 
   // Only callerless mesh and host events are filtered: a caller always hears its own run.
   #filteredBy(actor: ManagedActor, item: ActorQueueItem): string | undefined {
+    this.#expireActivationFilter(actor);
     if (!actor.activationFilter || item.resolve || item.reject) return undefined;
     if (!item.source.startsWith("mesh:") && !item.source.startsWith("host:")) return undefined;
     return activationFilterSkip(actor.activationFilter, item.source, item.payload);
@@ -3129,18 +3158,58 @@ export class ActorManager {
    * The drain checks again, for items queued before the filter was set.
    */
   #skipOnArrival(actor: ManagedActor, source: string, payload: unknown): boolean {
+    this.#expireActivationFilter(actor);
     if (!actor.activationFilter || actor.status === "stopped") return false;
     const ruleId = activationFilterSkip(actor.activationFilter, source, payload);
     if (!ruleId) return false;
-    this.#recordFiltered(actor, { id: randomUUID(), source }, ruleId);
-    // ponytail: save the count and log locally; no presence write, the skip changes no mesh state.
+    this.#recordFiltered(actor, { id: randomUUID(), source, payload }, ruleId);
+    // Persist soft telemetry once per poll, not once per event; no extra durable write.
     this.#emitChange();
-    void this.#saveActors().catch(() => undefined);
     return true;
   }
 
-  #recordFiltered(actor: ManagedActor, item: Pick<ActorQueueItem, "id" | "source">, ruleId: string): void {
+  #recordFilterClear(actor: ManagedActor, reason: "explicit" | "expired"): void {
+    this.#recordMessage(actor, {
+      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "in",
+      source: "actor:activation-filter", createdAt: Date.now(), reason: `activationFilter cleared: ${reason}`,
+    });
+  }
+
+  #expireActivationFilter(actor: ManagedActor): void {
+    if (actor.activationFilterExpiresAt === undefined || Date.now() < actor.activationFilterExpiresAt) return;
+    delete actor.activationFilter;
+    delete actor.invalidActivationFilter;
+    delete actor.activationFilterExpiresAt;
+    actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
+    actor.updatedAt = Date.now();
+    this.#recordFilterClear(actor, "expired");
+    this.#filterStateDirty = true;
+    this.#emitChange();
+  }
+
+  #flushFilterState(): void {
+    if (!this.#filterStateDirty || this.#filterStateSave || this.#closing) return;
+    this.#filterStateDirty = false;
+    this.#filterStateSave = this.#saveActors().catch(() => {
+      this.#filterStateDirty = true;
+    }).finally(() => { this.#filterStateSave = undefined; });
+  }
+
+  #recordFiltered(actor: ManagedActor, item: Pick<ActorQueueItem, "id" | "source" | "payload"> & { coalesceKey?: string }, ruleId: string): void {
     const now = Date.now();
+    const event = item.payload as { id?: unknown; topic?: unknown; data?: unknown } | null | undefined;
+    const mesh = item.source.startsWith("mesh:");
+    const value = mesh && actor.coalesceKey ? meshCoalesceValue(event?.data, actor.coalesceKey) : undefined;
+    const key = item.coalesceKey ?? (mesh
+      ? value === undefined ? undefined : JSON.stringify(["mesh", event?.topic, value])
+      : actor.coalesce ? item.source : undefined);
+    actor.filterSkipped = {
+      count: (actor.filterSkipped?.count ?? 0) + 1,
+      lastKey: key ?? (mesh && typeof event?.id === "string" ? event.id : item.id),
+      lastTopic: item.source.slice(item.source.indexOf(":") + 1),
+      lastAt: now,
+    };
+    this.#filterStateDirty = true;
     actor.filteredCount = (actor.filteredCount ?? 0) + 1;
     actor.lastFilteredAt = now;
     actor.updatedAt = now;
@@ -3499,6 +3568,9 @@ export class ActorManager {
         : actor.invalidActivationFilter
           ? { activationFilter: actor.invalidActivationFilter.value }
           : {}),
+      // Untouched actors need no new registry field; older rollback hosts omit it too.
+      ...(actor.filterSkipped ? { filterSkipped: { ...actor.filterSkipped } } : {}),
+      ...(actor.activationFilterExpiresAt !== undefined ? { activationFilterExpiresAt: actor.activationFilterExpiresAt } : {}),
       ...(actor.filteredCount ? { filteredCount: actor.filteredCount } : {}),
       ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
       requirements: actor.requirements,
@@ -3715,6 +3787,11 @@ export class ActorManager {
           ? { filteredCount: record.filteredCount }
           : {}),
         ...(typeof record.lastFilteredAt === "number" ? { lastFilteredAt: record.lastFilteredAt } : {}),
+        ...(typeof record.activationFilterExpiresAt === "number" && Number.isFinite(record.activationFilterExpiresAt)
+          ? { activationFilterExpiresAt: record.activationFilterExpiresAt } : {}),
+        ...(Object.hasOwn(record, "filterSkipped")
+          ? { filterSkipped: loadedFilterSkipped(record.filterSkipped) }
+          : {}),
         requirements,
         ...(typeof record.capabilityDigest === "string"
           ? { capabilityDigest: record.capabilityDigest }
@@ -4151,6 +4228,8 @@ export class ActorManager {
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
+      filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null, ...actor.filterSkipped },
+      ...(actor.activationFilterExpiresAt !== undefined ? { activationFilterExpiresAt: actor.activationFilterExpiresAt } : {}),
       ...(actor.filteredCount ? { filteredCount: actor.filteredCount } : {}),
       ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
       ...(actor.invalidActivationFilter ? { activationFilterError: actor.invalidActivationFilter.error } : {}),

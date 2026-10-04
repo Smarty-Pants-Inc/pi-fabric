@@ -66,6 +66,7 @@ const theme = {
 } as unknown as Theme;
 
 const stubActor: FabricActorInfo = {
+  filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
   id: "actor-1",
   scope: "project",
   name: "red queen",

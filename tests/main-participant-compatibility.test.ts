@@ -22,6 +22,48 @@ afterEach(async () => {
 });
 
 describe("mixed-generation Main discovery (#409)", () => {
+  it("an old native reader keeps both Mains live past the raw session TTL without shared renewals", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "main-native-lease-compatibility-")); roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const identity = (name: string): MeshIdentity => ({ id: `session:${name}`, sessionId: name, kind: "main", name });
+    const upgraded = identity("upgraded"), existing = identity("existing");
+    const mesh = () => new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const options = (id: MeshIdentity) => ({ enabled: true, hostId: id.id, rootId: id.id, identity: id,
+      heartbeatMs: 5_000, leaseMs: 15_000, reapDeadHosts: false as const });
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      await mesh().put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: existing });
+      const writer = new ParticipantDirectory(mesh(), options(upgraded));
+      const reader = new OldParticipantDirectory(mesh(), options(existing));
+      directories.push(writer, reader);
+      const info = (id: MeshIdentity) => ({ id: id.id, name: "Main", kind: "main", status: "idle", runner: "pi", transport: "host",
+        cwd: root, sessionId: id.sessionId, startedAt: now, updatedAt: now, pendingMessages: false, local: true } as FabricMainAgentInfo);
+      const newRecord = writer.root(info(upgraded), true);
+      const oldRecord = reader.root(info(existing), true);
+      writer.registerSource(() => [{ ...newRecord, updatedAt: now }]);
+      reader.registerSource(() => [{ ...oldRecord, updatedAt: now }]);
+      await reader.refresh(); await writer.refresh();
+      const before = fs.readFileSync(path.join(meshRoot, "state.json"), "utf8");
+      const oldRaw = mesh().get("sessions/existing")!;
+      expect(mesh().get("sessions/upgraded")).toBeUndefined();
+      const writes = vi.spyOn(MeshStore.prototype, "writeBatch");
+      for (let tick = 0; tick < 24; tick++) {
+        now += 5_000;
+        await reader.refresh(); await writer.refresh();
+        expect(reader.get(upgraded.id, now, { fresh: true })).toMatchObject({ id: upgraded.id, stale: false });
+        expect(reader.sessions(now).map(session => session.id)).toContain(upgraded.id);
+        expect(reader.peers(now).map(peer => peer.id)).toContain(upgraded.id);
+        expect(writer.get(existing.id, now, { fresh: true })).toMatchObject({ id: existing.id, stale: false });
+      }
+      expect(now - oldRaw.updatedAt).toBeGreaterThan(15_000);
+      expect(mesh().get("sessions/existing")).toEqual(oldRaw);
+      expect(writes).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(meshRoot, "state.json"), "utf8")).toBe(before);
+      writes.mockRestore();
+    } finally { clock.mockRestore(); }
+  });
+
   it("keeps upgraded Main discovery and ordinary messaging working for an existing reader in files-only mode", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "main-reader-compatibility-")); roots.push(root);
     const meshRoot = path.join(root, "mesh");

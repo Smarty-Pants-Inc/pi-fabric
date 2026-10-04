@@ -1366,6 +1366,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // Liveness stays in the matching per-host file, with the original TTL, every tick.
     // All-capable fleets renew ONLY the file. Any live unadvertised peer restores the legacy
     // session/host half-life cadence, even under the historical host-file policy.
+    // 6b15d905 used this same 7.5 s threshold (10 s on its default 5 s heartbeat),
+    // not a 26 s renewal: its session-only readers expire at the fixed 15 s TTL.
     // Real record/ownership changes above bypass this idle-only decision.
     if (!this.#quiescing || this.#reloadUntil !== undefined) {
       const leaseAt = this.#renewFileLease();

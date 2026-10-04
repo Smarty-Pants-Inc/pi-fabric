@@ -237,15 +237,50 @@ describe("#3752 participant heartbeat contention", () => {
     expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
   });
 
-  it("skips just before half-life and renews exactly at the legacy session half-life", async () => {
-    const { directory, mesh, writes, advance } = await setup(false, 120_000, "main", true);
+  it.each([false, true])("renews the legacy session and host together at the old half-life (policy: %s)", async files => {
+    const { directory, mesh, writes, advance } = await setup(files, 120_000, "main", true);
     advance(7_499);
     await directory.refresh();
     expect(writes).not.toHaveBeenCalled();
     advance(1);
     await directory.refresh();
     expect(writes).toHaveBeenCalledOnce();
+    expect(writes.mock.calls[0]?.[0].ops.map(operation => operation.key)).toEqual([
+      "sessions/live",
+      expect.stringContaining("topology/hosts/"),
+    ]);
     expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
+  });
+
+  it.each([false, true])("mixed idle renewal is six paired commits per minute on the default heartbeat (policy: %s)", async files => {
+    const { directory, mesh, writes, advance, hostKey, participantKey, now } = await setup(files, 15_000, "main", true);
+    const participant = mesh.get(participantKey)!;
+    const start = now();
+    const committedAt: number[] = [];
+    for (let tick = 1; tick <= 24; tick++) {
+      advance(5_000);
+      const before = writes.mock.calls.length;
+      await directory.refresh();
+      if (writes.mock.calls.length > before) committedAt.push(now() - start);
+      // This is the OLD session-only reader's check: no meshRoot/file-lease fallback.
+      expect(isLiveLegacyRootEntry(mesh.get("sessions/live")!, now())).toBe(true);
+    }
+    expect(committedAt).toEqual(Array.from({ length: 12 }, (_, index) => (index + 1) * 10_000));
+    expect(writes.mock.calls).toHaveLength(12);
+    for (const [batch] of writes.mock.calls) {
+      expect(batch.ops.map(operation => operation.key)).toEqual(["sessions/live", hostKey]);
+    }
+    expect(mesh.get(participantKey)).toEqual(participant);
+  });
+
+  it("session-only readers retain the fixed 15 s TTL, ignoring a stored expiry", async () => {
+    const { mesh, advance, now } = await setup(false);
+    const session = mesh.get("sessions/live")!;
+    const advertised = { ...session, value: { ...(session.value as Record<string, unknown>), expiresAt: now() + 120_000, ttl: 120_000 } };
+    advance(15_000);
+    expect(isLiveLegacyRootEntry(advertised, now())).toBe(true);
+    advance(1);
+    expect(isLiveLegacyRootEntry(advertised, now())).toBe(false);
   });
 
   it("uses a long host lease's own half-life when there is no legacy session lease", async () => {

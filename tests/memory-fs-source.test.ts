@@ -27,6 +27,8 @@ import {
 const rootDir = (prefix: string): string =>
   fs.mkdtempSync(path.join(os.tmpdir(), `pi-fabric-fs-source-${prefix}-`));
 
+const FS_SOURCE_DISABLED_ERROR = "Filesystem memory sources are disabled on non-Linux hosts: safe openat/O_NOFOLLOW component confinement is unavailable";
+
 const directories: string[] = [];
 afterEach(() => {
   while (directories.length > 0) fs.rmSync(directories.pop()!, { recursive: true, force: true });
@@ -63,7 +65,7 @@ const asArray = (
     : { sessions: listed, coverageReason: undefined };
 
 describe("filesystem memory source adapter", () => {
-  it("enumerates native agent trees and flat archives with opaque keys", async () => {
+  it.skipIf(process.platform === "win32")("enumerates native agent trees and flat archives with opaque keys", async () => {
     const root = track(rootDir("layouts"));
     const native = writeSessionFile(
       path.join(root, "--home-e41q-projects-archive--"),
@@ -91,7 +93,7 @@ describe("filesystem memory source adapter", () => {
     expect(sessions[0]!.metadata?.updatedAt).toBe(2_000);
   });
 
-  it("reports enumeration caps as incomplete coverage", async () => {
+  it.skipIf(process.platform === "win32")("reports enumeration caps as incomplete coverage", async () => {
     const root = track(rootDir("caps"));
     for (let index = 0; index < 3; index++) {
       const file = writeSessionFile(
@@ -116,7 +118,7 @@ describe("filesystem memory source adapter", () => {
     expect(complete.coverageReason).toBeUndefined();
   });
 
-  it("keeps revisions stable across mtime-only touches and invalidates on content change", async () => {
+  it.skipIf(process.platform === "win32")("keeps revisions stable across mtime-only touches and invalidates on content change", async () => {
     const root = track(rootDir("revisions"));
     const file = writeSessionFile(
       root,
@@ -138,7 +140,7 @@ describe("filesystem memory source adapter", () => {
     expect(afterAppend.sessions[0]!.revision).not.toBe(before.revision);
   });
 
-  it("rejects a parent replacement between validation and open without reading the escaped handle", async () => {
+  it.skipIf(process.platform === "win32")("rejects a parent replacement between validation and open without reading the escaped handle", async () => {
     const root = track(rootDir("race"));
     const outside = track(rootDir("race-outside"));
     const dir = path.join(root, "nested");
@@ -160,7 +162,7 @@ describe("filesystem memory source adapter", () => {
     } finally { spy.mockRestore(); read.mockRestore(); }
   });
 
-  it("SR-5 rejects non-Linux redirect-before-stat and restore-before-final-realpath parent swaps", async () => {
+  it.skipIf(process.platform === "win32")("SR-5 rejects non-Linux redirect-before-stat and restore-before-final-realpath parent swaps", async () => {
     const root = track(rootDir("late-race"));
     const outside = track(rootDir("late-race-outside"));
     const dir = path.join(root, "nested");
@@ -170,7 +172,7 @@ describe("filesystem memory source adapter", () => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     Object.defineProperty(process, "platform", { value: "darwin" });
     expect(() => createFileSystemMemorySource({ id: "disabled", root })).toThrow(
-      "Filesystem memory sources are disabled on non-Linux hosts",
+      FS_SOURCE_DISABLED_ERROR,
     );
     const stat = fs.statSync.bind(fs), open = fs.openSync.bind(fs), realpath = fs.realpathSync.bind(fs);
     let swapped = false, opened = false, restored = false;
@@ -205,7 +207,7 @@ describe("filesystem memory source adapter", () => {
     }
   });
 
-  it("loads sessions with normalizeSession-compatible parsing and no filesystem escape", async () => {
+  it.skipIf(process.platform === "win32")("loads sessions with normalizeSession-compatible parsing and no filesystem escape", async () => {
     const root = track(rootDir("loads"));
     const outside = track(rootDir("loads-outside"));
     writeSessionFile(
@@ -240,6 +242,10 @@ describe("filesystem memory source adapter", () => {
       expect(asArray(await source.listSessions({ limit: 20 })).sessions.map(session => session.sessionKey))
         .not.toEqual(expect.arrayContaining(["file-link.jsonl", "directory-link/secret.jsonl"]));
     }
+  });
+
+  it.skipIf(process.platform !== "win32")("fails closed clearly on Windows", () => {
+    expect(() => createFileSystemMemorySource({ id: "disabled", root: os.tmpdir() })).toThrow(FS_SOURCE_DISABLED_ERROR);
   });
 });
 
@@ -312,7 +318,7 @@ describe("runtime memory source wiring", () => {
     return created as MemoryProvider;
   };
 
-  it("routes source-qualified recall through the configured fs source", async () => {
+  it.skipIf(process.platform === "win32")("routes source-qualified recall through the configured fs source", async () => {
     const root = track(rootDir("wiring"));
     writeSessionFile(root, "exported.jsonl", recordsFor("wired-session", "/work", ["wired needle"]));
     const provider = await installMemoryProvider(normalizeFabricConfig({
@@ -337,7 +343,7 @@ describe("runtime memory source wiring", () => {
     expect(sessions.sessions[0]!.file.startsWith("memory-source:laptop/")).toBe(true);
   });
 
-  it("reports a missing configured archive as non-exhaustive recall", async () => {
+  it.skipIf(process.platform === "win32")("reports a missing configured archive as non-exhaustive recall", async () => {
     const root = path.join(track(rootDir("missing-recall")), "absent");
     const provider = await installMemoryProvider(normalizeFabricConfig({
       memory: { enabled: true, sources: [{ id: "laptop", kind: "fs", root }] },
@@ -365,7 +371,7 @@ describe("runtime memory source wiring", () => {
     expect(recalled.coverage.reasons).toContain("source_not_found");
   });
 
-  it("registers configured ids on one registry", () => {
+  it.skipIf(process.platform === "win32")("registers configured ids on one registry", () => {
     const registry = createMemorySourceRegistry();
     registry.register(createFileSystemMemorySource({ id: "one", root: "/tmp/one" }));
     registry.register(createFileSystemMemorySource({ id: "two", root: "/tmp/two" }));

@@ -9,14 +9,15 @@ afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.r
 const temp = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fs-coverage-")); roots.push(root); return root; };
 const list = (root: string) => createFileSystemMemorySource({ id: "archive", root }).listSessions({ limit: 10 });
 const unavailable = { sessions: [], coverage: { complete: false, reason: "fs_source_unavailable" } };
+const FS_SOURCE_DISABLED_ERROR = "Filesystem memory sources are disabled on non-Linux hosts: safe openat/O_NOFOLLOW component confinement is unavailable";
 
-it("distinguishes an empty archive from a missing configured archive", async () => {
+it.skipIf(process.platform === "win32")("distinguishes an empty archive from a missing configured archive", async () => {
   const root = temp();
   expect(await list(root)).toEqual([]);
   expect(await list(path.join(root, "missing"))).toEqual(unavailable);
 });
 
-it("sanitizes root scan failures as unavailable instead of complete", async () => {
+it.skipIf(process.platform === "win32")("sanitizes root scan failures as unavailable instead of complete", async () => {
   const root = temp();
   vi.spyOn(fs, "readdirSync").mockImplementation(() => { throw new Error("EACCES private archive " + root); });
   const result = await list(root);
@@ -24,7 +25,7 @@ it("sanitizes root scan failures as unavailable instead of complete", async () =
   expect(JSON.stringify(result)).not.toContain(root);
 });
 
-it("keeps accessible sessions but marks a failed subtree scan incomplete", async () => {
+it.skipIf(process.platform === "win32")("keeps accessible sessions but marks a failed subtree scan incomplete", async () => {
   const root = temp(); const privateDir = path.join(root, "private"); fs.mkdirSync(privateDir);
   fs.writeFileSync(path.join(root, "ok.jsonl"), '{"type":"session","id":"ok","cwd":"/work"}\n');
   const original = fs.readdirSync;
@@ -37,7 +38,7 @@ it("keeps accessible sessions but marks a failed subtree scan incomplete", async
   expect(JSON.stringify(result)).not.toContain(privateDir);
 });
 
-it("marks descriptor read and stat failures incomplete", async () => {
+it.skipIf(process.platform === "win32")("marks descriptor read and stat failures incomplete", async () => {
   const root = temp(); const file = path.join(root, "bad.jsonl"); fs.writeFileSync(file, "{}\n");
   const original = fs.readFileSync;
   vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, options: unknown) => {
@@ -53,4 +54,8 @@ it("marks descriptor read and stat failures incomplete", async () => {
     return stat(target, options as { bigint: false });
   }) as typeof fs.statSync);
   expect(await list(root)).toMatchObject({ coverage: { complete: false, reason: "fs_source_incomplete" } });
+});
+
+it.skipIf(process.platform !== "win32")("fails closed clearly on Windows", () => {
+  expect(() => createFileSystemMemorySource({ id: "disabled", root: os.tmpdir() })).toThrow(FS_SOURCE_DISABLED_ERROR);
 });

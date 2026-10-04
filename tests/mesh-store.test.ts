@@ -154,15 +154,18 @@ describe("MeshStore", () => {
 
     const readAfter = vi.spyOn(MeshArchive.prototype, "readAfter");
     const read = vi.spyOn(store, "read");
+    const liveRead = vi.spyOn(fs, "readFileSync");
+    const directoryRead = vi.spyOn(fs, "readdirSync");
     const published = await store.publish({ topic: "mesh.dedupe", from: identity, dedupeKey, text: "new" });
 
     expect(published.sequence).toBe(last.sequence + 1);
     expect(readAfter).not.toHaveBeenCalled();
-    expect(read.mock.calls[0]?.[0]?.after).toBe(last.sequence - 1);
-    expect(read.mock.calls.every(([input]) => (input?.after ?? 0) > 0)).toBe(true);
+    expect(read).not.toHaveBeenCalled(); // A new key has no intent and performs no history read.
+    expect(liveRead.mock.calls.some(([file]) => file === path.join(store.root, "events.jsonl"))).toBe(false);
+    expect(directoryRead.mock.calls.some(([directory]) => directory === path.join(store.root, "event-receipts"))).toBe(false);
   });
 
-  it("recovers a directly appended dedupe event with 4095 newer events", async () => {
+  it("does not recover a legacy append that has no intent (the documented migration residual)", async () => {
     const { store } = createArchivedStore();
     const seed = await store.publish({ topic: "mesh.dedupe", from: identity, text: "seed" });
     const older = Array.from({ length: 4_200 }, (_, index) => ({ ...seed, id: `older-${index}`, sequence: index + 2 }));
@@ -183,11 +186,210 @@ describe("MeshStore", () => {
 
     const recovered = await store.publish({ topic: "mesh.dedupe", from: identity, dedupeKey, text: "retry" });
 
-    expect(read.mock.calls[0]?.[0]?.after).toBe(crashed.sequence - 1);
-    expect(recovered).toEqual(crashed);
-    expect(JSON.parse(fs.readFileSync(receipt, "utf8"))).toEqual(crashed);
-    expect(await store.publish({ topic: "mesh.dedupe", from: identity, dedupeKey, text: "retry again" })).toEqual(crashed);
-    expect(fs.readFileSync(live, "utf8")).toBe(before); // Neither retry appends a duplicate.
+    expect(read).not.toHaveBeenCalled();
+    expect(recovered.id).not.toBe(crashed.id); // No intent exists for this legacy event.
+    expect(recovered.sequence).toBe(newer.at(-1)!.sequence + 1);
+    expect(JSON.parse(fs.readFileSync(receipt, "utf8"))).toEqual(recovered);
+    expect(await store.publish({ topic: "mesh.dedupe", from: identity, dedupeKey, text: "retry again" })).toEqual(recovered);
+    expect(fs.readFileSync(live, "utf8")).not.toBe(before); // The migration residual permits one duplicate.
+  });
+
+  it.each([false, true])("recovers a durable intent before append (archive=%s) without publishing twice", async archived => {
+    const store = archived ? createArchivedStore().store : createStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "intent-before-append", text: "once" };
+    const live = path.join(store.root, "events.jsonl");
+    const append = fs.appendFileSync.bind(fs);
+    const crash = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (file === live) throw new Error("crash before append");
+      return (append as (...args: unknown[]) => void)(file, ...rest);
+    }) as typeof fs.appendFileSync);
+    await expect(store.publish(packet)).rejects.toThrow("crash before append");
+    crash.mockRestore();
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const intent = JSON.parse(fs.readFileSync(base + ".pending.json", "utf8"));
+    expect(intent).toMatchObject({ dedupeKey: packet.dedupeKey, reservedSequence: 1, liveOffset: 0 });
+    const restarted = new MeshStore(store.root, store.maxEventBytes, store.maxReadEvents);
+    const event = await restarted.publish(packet);
+    expect(event.id).not.toBe(intent.eventId);
+    expect(event.sequence).toBe(2); // An abandoned reservation remains a gap.
+    expect(await restarted.publish(packet)).toEqual(event);
+    expect(restarted.read({ topic: packet.topic })).toEqual([event]);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+  });
+
+  it.each([false, true])("recovers the exact event after append before receipt (archive=%s)", async archived => {
+    const store = archived ? createArchivedStore().store : createStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "intent-after-append", text: "once" };
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs);
+    const crash = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (target === base + ".json") throw new Error("crash before receipt");
+      rename(source, target);
+    });
+    await expect(store.publish(packet)).rejects.toThrow("crash before receipt");
+    crash.mockRestore();
+    const live = path.join(store.root, "events.jsonl");
+    const event = JSON.parse(fs.readFileSync(live, "utf8"));
+    const before = fs.readFileSync(live, "utf8");
+    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    const readAfter = vi.spyOn(MeshArchive.prototype, "readAfter");
+    const restarted = new MeshStore(store.root, store.maxEventBytes, store.maxReadEvents);
+    const history = vi.spyOn(restarted, "read");
+    expect(await restarted.publish(packet)).toEqual(event);
+    expect(await restarted.publish(packet)).toEqual(event);
+    expect(history).not.toHaveBeenCalled();
+    expect(readAfter).not.toHaveBeenCalled();
+    expect(fs.readFileSync(live, "utf8")).toBe(before);
+    expect(JSON.parse(fs.readFileSync(base + ".json", "utf8"))).toEqual(event);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+  });
+
+  it("directly recovers an intent with more than 4096 newer events without reading their history", async () => {
+    const store = createStore({ maxEventLogBytes: 32 * 1024 * 1024 });
+    const seed = await store.publish({ topic: "mesh.dedupe", from: identity });
+    const live = path.join(store.root, "events.jsonl");
+    const offset = fs.statSync(live).size;
+    const dedupeKey = "far-back-intent";
+    const event = { ...seed, id: "pending-event", sequence: 2, dedupeKey };
+    const newer = Array.from({ length: 10_000 }, (_, index) => ({ ...seed, id: `newer-${index}`, sequence: index + 3 }));
+    fs.appendFileSync(live, [event, ...newer].map(e => `${JSON.stringify(e)}\n`).join(""));
+    fs.writeFileSync(path.join(store.root, "sequence"), "10002");
+    const pending = path.join(store.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + ".pending.json");
+    fs.mkdirSync(path.dirname(pending));
+    fs.writeFileSync(pending, JSON.stringify({ dedupeKey, reservedSequence: 2, eventId: event.id, liveOffset: offset }));
+    const history = vi.spyOn(store, "read");
+    const readSync = vi.spyOn(fs, "readSync");
+    expect(await store.publish({ topic: event.topic, from: identity, dedupeKey })).toEqual(event);
+    expect(history).not.toHaveBeenCalled();
+    expect(readSync.mock.calls.some(call => (call as readonly unknown[])[4] === offset)).toBe(true); // A direct seek.
+    expect(fs.statSync(live).size).toBeGreaterThan(offset);
+  });
+
+  it.each([false, true])("compaction settles a crashed intent before dropping its event (archive=%s)", async archived => {
+    const root = archived ? createArchivedStore().store.root : createStore().root;
+    const store = new MeshStore(root, 1024, 100, { maxEventLogBytes: 2800, retainedEventLogBytes: 1025 });
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "compact-crash", text: "first" };
+    const base = path.join(root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs);
+    const crash = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (target === base + ".json") throw new Error("receipt unavailable");
+      rename(source, target);
+    });
+    await expect(store.publish(packet)).rejects.toThrow("receipt unavailable");
+    crash.mockRestore();
+    const event = JSON.parse(fs.readFileSync(path.join(root, "events.jsonl"), "utf8"));
+    for (let index = 0; index < 7; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
+    expect(store.oldestSequence()).toBeGreaterThan(event.sequence);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+    expect(JSON.parse(fs.readFileSync(base + ".json", "utf8"))).toEqual(event);
+    expect(await new MeshStore(root, 1024, 100).publish(packet)).toEqual(event);
+  });
+
+  it.skipIf(process.platform === "win32")("does not append until the intent's final durability barrier succeeds", async () => {
+    const store = createStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "intent-barrier", text: "once" };
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let renamed = false;
+    const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      rename(source, target);
+      if (target === base + ".pending.json") renamed = true;
+    });
+    const barrier = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (renamed) { renamed = false; throw new Error("intent namespace barrier"); }
+      sync(fd);
+    });
+    await expect(store.publish(packet)).rejects.toThrow("intent namespace barrier");
+    barrier.mockRestore(); renameSpy.mockRestore();
+    expect(store.read()).toEqual([]);
+    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    const event = await store.publish(packet);
+    expect(await store.publish(packet)).toEqual(event);
+    expect(store.read()).toEqual([event]);
+  });
+
+  it.skipIf(process.platform === "win32")("re-confirms a visible receipt after its final barrier failed and clears its intent", async () => {
+    const store = createStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "receipt-barrier", text: "once" };
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    let renamed = false;
+    const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      rename(source, target);
+      if (target === base + ".json") renamed = true;
+    });
+    const barrier = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (renamed) { renamed = false; throw new Error("receipt namespace barrier"); }
+      sync(fd);
+    });
+    await expect(store.publish(packet)).rejects.toThrow("receipt namespace barrier");
+    barrier.mockRestore(); renameSpy.mockRestore();
+    const event = JSON.parse(fs.readFileSync(base + ".json", "utf8"));
+    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    const restarted = new MeshStore(store.root, store.maxEventBytes, store.maxReadEvents);
+    expect(await restarted.publish(packet)).toEqual(event);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+    expect(restarted.read()).toEqual([event]);
+  });
+
+  it("drops a torn append's intent and publishes one complete event on retry", async () => {
+    const store = createStore();
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "partial-append", text: "once" };
+    const live = path.join(store.root, "events.jsonl");
+    const append = fs.appendFileSync.bind(fs);
+    const crash = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (file === live) {
+        append(file, String(rest[0]).slice(0, 40));
+        throw new Error("partial append");
+      }
+      return (append as (...args: unknown[]) => void)(file, ...rest);
+    }) as typeof fs.appendFileSync);
+    await expect(store.publish(packet)).rejects.toThrow("partial append");
+    crash.mockRestore();
+    const event = await store.publish(packet);
+    expect(event.sequence).toBe(2);
+    expect(await store.publish(packet)).toEqual(event);
+    expect(store.read()).toEqual([event]);
+  });
+
+  it("compaction drops an intent whose append never happened before rewriting offsets", async () => {
+    const root = createStore().root;
+    const store = new MeshStore(root, 1024, 100, { maxEventLogBytes: 2800, retainedEventLogBytes: 1025 });
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "unappended-compaction", text: "once" };
+    const live = path.join(root, "events.jsonl");
+    const append = fs.appendFileSync.bind(fs);
+    const crash = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (file === live) throw new Error("before append");
+      return (append as (...args: unknown[]) => void)(file, ...rest);
+    }) as typeof fs.appendFileSync);
+    await expect(store.publish(packet)).rejects.toThrow("before append");
+    crash.mockRestore();
+    const base = path.join(root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    for (let index = 0; index < 7; index++) await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(500) });
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+    expect(fs.existsSync(base + ".json")).toBe(false);
+    const event = await store.publish(packet);
+    expect(await store.publish(packet)).toEqual(event);
+    expect(store.read().filter(e => e.dedupeKey === packet.dedupeKey)).toEqual([event]);
+  });
+
+  it("does not compact if settlement cannot durably write its receipt", async () => {
+    const store = createStore({ maxEventLogBytes: 70_000, retainedEventLogBytes: 65_537 });
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "blocked-settlement", text: "first" };
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    const rename = fs.renameSync.bind(fs);
+    const crash = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (target === base + ".json") throw new Error("receipt unavailable");
+      rename(source, target);
+    });
+    try {
+      await expect(store.publish(packet)).rejects.toThrow("receipt unavailable");
+      await store.publish({ topic: packet.topic, from: identity, text: "x".repeat(40_000) });
+      await expect(store.publish({ topic: packet.topic, from: identity, text: "y".repeat(40_000) })).rejects.toThrow("receipt unavailable");
+      expect(store.oldestSequence()).toBe(1);
+      expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    } finally { crash.mockRestore(); }
+    expect((await store.publish(packet)).sequence).toBe(1);
   });
 
   it("captures a coherent tail cursor without using reserved or partial sequences", async () => {

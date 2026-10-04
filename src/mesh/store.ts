@@ -528,8 +528,13 @@ export class MeshBatchConflictError extends Error {
   }
 }
 
-/** Events scanned for a publish whose dedupe receipt is missing (crash recovery). */
-const DEDUPE_RECOVERY_WINDOW = 4096;
+interface MeshDedupeIntent {
+  dedupeKey: string;
+  reservedSequence: number;
+  eventId: string;
+  /** Byte offset captured before the live append; it makes recovery a direct read. */
+  liveOffset: number;
+}
 
 export class MeshStore {
   readonly #eventsPath: string;
@@ -625,6 +630,91 @@ export class MeshStore {
     return this.#stateCache ? Math.max(0, this.readCacheMs - (Date.now() - this.#stateCache.parsedAt)) : 0;
   }
 
+  #dedupePath(dedupeKey: string, suffix: string): string {
+    return path.join(this.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + suffix);
+  }
+
+  #confirmEventFile(file: string): void {
+    const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
+    try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
+  }
+
+  #readDedupeReceipt(dedupeKey: string): MeshEvent | undefined {
+    const file = this.#dedupePath(dedupeKey, ".json");
+    let text: string;
+    try { text = fs.readFileSync(file, "utf8"); }
+    catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+    const event = JSON.parse(text) as MeshEvent;
+    if (event.dedupeKey !== dedupeKey || typeof event.id !== "string" || !Number.isSafeInteger(event.sequence)) {
+      throw new Error("Invalid event publication receipt");
+    }
+    // A visible rename whose final barrier failed is not yet a durable receipt.
+    this.#confirmEventFile(file);
+    return event;
+  }
+
+  #removeDedupeIntent(file: string): void {
+    fs.rmSync(file, { force: true });
+    syncPathNamespace(path.dirname(file));
+  }
+
+  /** Read the exact line named by an intent; never scans history or consults the archive. */
+  #readEventAtIntent(intent: MeshDedupeIntent): MeshEvent | undefined {
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(this.#eventsPath, "r");
+      const stat = fs.fstatSync(descriptor);
+      if (intent.liveOffset >= stat.size) return undefined;
+      const bytes = Buffer.allocUnsafe(Math.min(this.maxEventBytes + 1, stat.size - intent.liveOffset));
+      const count = fs.readSync(descriptor, bytes, 0, bytes.length, intent.liveOffset);
+      const newline = bytes.subarray(0, count).indexOf(0x0a);
+      if (newline < 0) return undefined; // A partial append never committed.
+      const event = JSON.parse(bytes.subarray(0, newline).toString("utf8")) as MeshEvent;
+      return event.sequence === intent.reservedSequence && event.id === intent.eventId &&
+        event.dedupeKey === intent.dedupeKey ? event : undefined;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT" || error instanceof SyntaxError) return undefined;
+      throw error;
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
+  }
+
+  #settleDedupeIntent(file: string, dedupeKey?: string): MeshEvent | undefined {
+    let text: string;
+    try { text = fs.readFileSync(file, "utf8"); }
+    catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+    const intent = JSON.parse(text) as MeshDedupeIntent;
+    if (typeof intent.dedupeKey !== "string" || !intent.dedupeKey ||
+        (dedupeKey !== undefined && intent.dedupeKey !== dedupeKey) ||
+        !Number.isSafeInteger(intent.reservedSequence) || intent.reservedSequence < 1 ||
+        typeof intent.eventId !== "string" || !intent.eventId ||
+        !Number.isSafeInteger(intent.liveOffset) || intent.liveOffset < 0 ||
+        file !== this.#dedupePath(intent.dedupeKey, ".pending.json")) {
+      throw new Error("Invalid event publication intent");
+    }
+    // A crash may also leave both the receipt and its intent. Never replace a receipt.
+    const prior = this.#readDedupeReceipt(intent.dedupeKey);
+    const event = prior ?? this.#readEventAtIntent(intent);
+    if (event && !prior) {
+      this.#confirmEventFile(this.#eventsPath);
+      writeFileAtomic(this.#dedupePath(intent.dedupeKey, ".json"), JSON.stringify(event), { durable: true });
+    }
+    this.#removeDedupeIntent(file);
+    return event;
+  }
+
+  /** Under the mesh lock, settle all intents before a rewrite can invalidate byte offsets. */
+  #settleDedupeIntents(): void {
+    const directory = path.join(this.root, "event-receipts");
+    let names: string[];
+    try { names = fs.readdirSync(directory); }
+    catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+    for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry))) {
+      this.#settleDedupeIntent(path.join(directory, name));
+    }
+  }
+
   async publish(input: {
     topic: string;
     /** Host-only durable publication receipt (alarms and inbox disposition receipts). */
@@ -647,43 +737,23 @@ export class MeshStore {
     const fixedData = stamp || input.data === undefined ? undefined : jsonClone(input.data);
     return this.#withLock(() => {
       input.signal?.throwIfAborted();
+      const receiptPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".json") : undefined;
+      const intentPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".pending.json") : undefined;
+      if (input.dedupeKey) {
+        const prior = this.#readDedupeReceipt(input.dedupeKey);
+        if (prior) {
+          // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
+          if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
+          return prior;
+        }
+      }
       this.#repairEventLog();
       const archive = MeshArchive.fromRoot(this.root);
       if (archive) this.#recoverArchive(archive);
-      const receiptPath = input.dedupeKey ? path.join(this.root, "event-receipts",
-        createHash("sha256").update(input.dedupeKey).digest("hex") + ".json") : undefined;
-      const confirmFile = (file: string): void => {
-        const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
-        try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
-      };
-      if (receiptPath) {
-        try {
-          const prior = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as MeshEvent;
-          if (prior.dedupeKey !== input.dedupeKey || typeof prior.id !== "string" || !Number.isSafeInteger(prior.sequence)) throw new Error("Invalid event publication receipt");
-          // A visible rename whose final barrier failed is not yet a durable receipt.
-          confirmFile(receiptPath);
-          return prior;
-        } catch (error) {
-          if (errorCode(error) !== "ENOENT") throw error;
-        }
-        // A crash after the append but before its receipt must not publish twice. The
-        // append and receipt share the existing mesh lock; compaction comes afterwards.
-        // ponytail: that crash window is the newest events, so scan only the live tail.
-        // Scanning from sequence 0 read the whole event archive under the lock and
-        // wedged the fleet mesh for minutes per fresh Pi (smarty-dev#4383).
-        // A short retained log must not route recovery through the archive.
-        const liveFloor = Math.max(0, (this.oldestSequence() ?? 1) - 1);
-        for (let after = Math.max(liveFloor, this.#readLastEventSequence() - DEDUPE_RECOVERY_WINDOW);;) {
-          const page = this.read({ after, limit: this.maxReadEvents });
-          const prior = page.find(event => event.dedupeKey === input.dedupeKey);
-          if (prior) {
-            confirmFile(this.#eventsPath);
-            writeFileAtomic(receiptPath, JSON.stringify(prior), { durable: true });
-            return prior;
-          }
-          if (!page.length) break;
-          after = page.at(-1)!.sequence;
-        }
+      // Neither receipt nor intent means NEW: no event-history read, regardless of its size.
+      if (input.dedupeKey) {
+        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey);
+        if (prior) return prior;
       }
       const createdAt = Date.now();
       const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
@@ -717,6 +787,15 @@ export class MeshStore {
       // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
       // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
       atomicWrite(this.#counterPath, sequence);
+      let liveOffset = 0;
+      try { liveOffset = fs.statSync(this.#eventsPath).size; }
+      catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+      if (intentPath) {
+        // This is the crash fence: the intent is durable before the live append begins.
+        writeFileAtomic(intentPath, JSON.stringify({
+          dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
+        } satisfies MeshDedupeIntent), { durable: true });
+      }
       const pending = archive?.begin({ event, line });
       try {
         fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
@@ -726,8 +805,9 @@ export class MeshStore {
       }
       if (pending) archive!.commit(pending);
       if (receiptPath) {
-        confirmFile(this.#eventsPath);
+        this.#confirmEventFile(this.#eventsPath);
         writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
+        if (intentPath) this.#removeDedupeIntent(intentPath);
       }
       this.#compactEventLog();
       return event;
@@ -1858,11 +1938,14 @@ export class MeshStore {
   }
 
   #compactEventLog(): void {
+    // Never rewrite away an event named by a durable intent. Resolve every intent while
+    // the publish lock is held, before taking the retained tail snapshot.
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#eventsPath, "r");
       const size = fs.fstatSync(descriptor).size;
       if (size <= this.#maxEventLogBytes) return;
+      this.#settleDedupeIntents();
       const readBytes = Math.min(
         size,
         this.#retainedEventLogBytes + this.maxEventBytes + 1,
@@ -1876,17 +1959,10 @@ export class MeshStore {
       const retained = captured.subarray(retainedStart);
       fs.closeSync(descriptor);
       descriptor = undefined;
-      const temporaryPath =
-        this.#eventsPath + "." + process.pid + "." + randomUUID() + ".tmp";
-      try {
-        fs.writeFileSync(temporaryPath, retained, { mode: 0o600 });
-        fs.renameSync(temporaryPath, this.#eventsPath);
-      } finally {
-        try { fs.rmSync(temporaryPath, { force: true }); } catch {}
-      }
+      // Persist both the retained bytes and the rename. Later intents may name offsets in
+      // this generation; a reboot must not resurrect its unsynced predecessor or lose bytes.
+      writeFileAtomic(this.#eventsPath, retained, { durable: true });
       atomicWrite(this.#generationPath, this.#readGeneration() + 1);
-    } catch (error) {
-      if (errorCode(error) !== "ENOENT") throw error;
     } finally {
       if (descriptor !== undefined) fs.closeSync(descriptor);
     }

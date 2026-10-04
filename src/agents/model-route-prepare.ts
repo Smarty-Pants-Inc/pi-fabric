@@ -1,7 +1,7 @@
 import { ModelRoutePinError, resolvePiRoutePin, type PiModelRegistryView } from "../core/model-refresh.js";
 import type { FabricModelAliases } from "../core/model-resolution.js";
 import { isFabricThinking } from "../thinking.js";
-import { decideModelRoute, isRouteClassReverted, ROUTABLE_CLASSES, type ModelRoutingConfig, type ModelRouteDecision, type RouteEvaluate } from "./model-route.js";
+import { decideModelRoute, isRouteAdmissionBlocked, ROUTABLE_CLASSES, type ModelRoutingConfig, type ModelRouteDecision, type RouteEvaluate } from "./model-route.js";
 
 /** Shared auto-task/actor preparation: exact pins, finite authenticated candidates, one shadow Choice. */
 export async function prepareModelRoute(input: {
@@ -48,15 +48,15 @@ export async function prepareModelRoute(input: {
   }
   const reset = input.config?.revertReset?.[input.routeClass] ?? "";
   let live = input.protected === false && ROUTABLE_CLASSES.includes(input.routeClass) && input.config?.liveClasses?.includes(input.routeClass) === true;
-  let revertReason: "class-reverted" | "revert-state-error" | undefined;
+  let admissionReason: "admission-blocked" | "admission-state-error" | undefined;
   if (live) {
-    try { if (isRouteClassReverted(input.routeClass, reset)) { live = false; revertReason = "class-reverted"; } }
-    catch { live = false; revertReason = "revert-state-error"; }
+    try { if (isRouteAdmissionBlocked(input.routeClass, reset)) { live = false; admissionReason = "admission-blocked"; } }
+    catch { live = false; admissionReason = "admission-state-error"; }
   }
   const decision = await decideModelRoute({ routeClass: input.routeClass, protected: input.protected, pin, candidates,
     candidatesValid, live, revertReset: reset, parentSessionId: input.parentSessionId,
     ...(input.modelReason !== undefined ? { modelReason: input.modelReason } : {}),
     ...(input.actorId ? { actorId: input.actorId } : {}), ...(input.activationId ? { activationId: input.activationId } : {}) }, input.evaluate, input.signal);
-  if (revertReason) { decision.mode = "shadow"; decision.reasonCode = revertReason; Object.assign(decision, pin); }
+  if (admissionReason) { decision.mode = "shadow"; decision.reasonCode = admissionReason; Object.assign(decision, pin); }
   return decision;
 }

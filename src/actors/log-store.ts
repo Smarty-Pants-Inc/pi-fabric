@@ -87,18 +87,14 @@ export class ActorLogStore {
     if (!runDirectory || !fs.existsSync(runDirectory)) return;
     const dest = path.join(path.dirname(actor.sessionFile), "runs", runId);
     fs.mkdirSync(dest, { recursive: true, mode: 0o700 });
-    const receipt = path.join(runDirectory, "route-quality-receipt.json");
+    const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
     if (fs.existsSync(receipt)) {
-      const archivedReceipt = path.join(dest, "route-quality-receipt.json");
-      const { readRouteQualityReceipt, registerRouteQualityReceipt } = await import("../agents/model-route.js");
-      const source = readRouteQualityReceipt(receipt);
-      const retained = fs.existsSync(archivedReceipt) ? readRouteQualityReceipt(archivedReceipt) : undefined;
-      // Re-archival must not overwrite feedback reported on the archived receipt.
-      const { receiptFile: _sourceLocation, ...stored } = source!;
-      writeJsonAtomic(archivedReceipt, { ...stored, ...(retained?.routeQuality ? { routeQuality: retained.routeQuality } : {}),
-        ...(retained?.qualityFail ? { qualityFail: retained.qualityFail } : {}) }, { durable: true });
-      // Index the archive before source cleanup can make its admission locator stale.
-      registerRouteQualityReceipt(archivedReceipt);
+      const archivedReceipt = path.join(dest, "route-dispatch-receipt.json");
+      const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
+      const source = readRouteDispatchReceipt(receipt);
+      if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
+      // Durable archive confirmation precedes source cleanup (F2 custody).
+      writeJsonAtomic(archivedReceipt, source, { durable: true });
     }
     for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
       const src = path.join(runDirectory, file);

@@ -159,21 +159,14 @@ describe("actor status-groom shadow routing", () => {
       expect(records().find(row => row.type === "outcome" && row.decisionId === decision.decisionId)).toMatchObject({ admittedModel: cheap.model, admittedEffort: cheap.effort });
     }
   });
-  it("propagates retryable total quality-write refusal through the public actor report", async () => {
+  it("has no actor quality reporter and leaves subsequent opted-in activations live", async () => {
     vi.spyOn(JevClient.prototype, "evaluate").mockImplementation(async () => answer());
     const { actors } = setup(policy(), { ...config, liveClasses: ["status-groom"] });
     const actor = await actors.create(actorSpec);
-    const first = await actors.ask(actor.id, "ECHO_MODEL", "test");
-    await vi.waitFor(async () => expect(await actors.routeQualityTarget(first.runId!)).toBeDefined());
-    const write = fs.writeFileSync;
-    const refusal = vi.spyOn(fs, "writeFileSync").mockImplementation((file, ...args) => {
-      if (typeof file === "number") throw Object.assign(new Error("EFBIG"), { code: "EFBIG" });
-      return write(file, ...args);
-    });
-    await expect(actors.reportRouteQuality(first.runId!, "fail")).rejects.toMatchObject({ code: "quality-report-not-durable", retryable: true });
-    refusal.mockRestore();
-    await expect(actors.reportRouteQuality(first.runId!, "fail")).resolves.toMatchObject({ id: actor.id });
-    expect((await actors.ask(actor.id, "ECHO_MODEL", "test")).text).toContain(pin.model);
+    expect((await actors.ask(actor.id, "ECHO_MODEL", "test")).text).toContain(cheap.model);
+    expect("reportRouteQuality" in actors).toBe(false);
+    expect("routeQualityTarget" in actors).toBe(false);
+    expect((await actors.ask(actor.id, "ECHO_MODEL", "test")).text).toContain(cheap.model);
   });
   it.each([[false, false], [true, false], [false, true], [true, true]])("preserves the effective exception in routed activation records and run.spawned (session override: %s, live: %s)", async (sessionOverride, live) => {
     const evaluate = vi.spyOn(JevClient.prototype, "evaluate").mockImplementation(async () => answer());

@@ -849,20 +849,6 @@ export class AgentsProvider implements FabricProvider {
         context.update(agentStartedMessage(handle));
         return request.routeDecision ? { ...handle, routeDecision: request.routeDecision } : handle;
       }
-      case "routeOutcome": {
-        if (args.routeQuality !== "pass" && args.routeQuality !== "fail") throw new Error("Invalid routeQuality");
-        const id = String(args.id);
-        if (this.manager.runDirectory(id)) {
-          this.manager.reportRouteQuality(id, args.routeQuality);
-        } else if (await this.actorManager.routeQualityTarget(id)) {
-          await this.actorManager.reportRouteQuality(id, args.routeQuality);
-        } else {
-          const client = this.residency ?? this.#liveResidentActorClient();
-          if (!client) throw new Error("Unknown locally owned routed run or actor activation");
-          await this.#setResidentActor({ id, client }, { operation: "routeQuality", id, routeQuality: args.routeQuality }, context);
-        }
-        return { id, routeQuality: args.routeQuality };
-      }
       case "join":
       case "wait": {
         const id = String(args.id);
@@ -1853,7 +1839,7 @@ export class AgentsProvider implements FabricProvider {
 
   #setResidentActor(
     resident: { id: string; client: Pick<ResidentActorClient, "setActor"> },
-    mutation: ResidentActorMutation | import("../residency/protocol.js").ResidentRouteQuality,
+    mutation: ResidentActorMutation,
     context: FabricInvocationContext,
   ): Promise<FabricActorInfo> {
     // mainAgent.id is inherited by actors/tasks. Native setters require local

@@ -23,19 +23,24 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
-  it.each([false, true])("types explicit task-auto pins and quality reports (fullCodeMode=%s)", fullCodeMode => {
-    const code = `const run = await agents.run({ task: "exact checks", model: "auto", routeClass: "task:exact-checks", protected: false, pinModel: "test/sol", pinThinking: "max" });
-      const quality = await agents.routeOutcome({ id: run.id, routeQuality: "fail" });
-      const checked: "pass" | "fail" = quality.routeQuality; return checked;`;
+  it.each([false, true])("types explicit task-auto pins but removes quality reporting (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const run = await agents.run({ task: "exact checks", model: "auto", routeClass: "task:exact-checks", protected: false, pinModel: "test/sol", pinThinking: "max" }); return run.id;`;
     expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    for (const method of ["routeOutcome", "reportRouteQuality"]) {
+      const invalid = `return await agents.${method}({ id: "run-1", routeQuality: "fail" });`;
+      expect(typeCheckFabricCode(invalid, guestTypeDeclarations(fullCodeMode), true).errors.map(error => error.message))
+        .toEqual([expect.stringContaining(`Property '${method}' does not exist`)]);
+    }
   });
-  it("routes quality assertions through the real guest bridge", async () => {
-    const calls: Array<{ ref: string; args: unknown }> = [];
-    const result = await new QuickJsRuntime().execute(`return await agents.routeOutcome({ id: "run-1", routeQuality: "fail" });`, async (ref, args) => {
-      calls.push({ ref, args }); return { id: "run-1", routeQuality: "fail" };
+  it("does not register or bridge the removed quality API", async () => {
+    expect(IMPLEMENTED).not.toContain("routeOutcome");
+    expect(GUEST_SETUP).not.toContain('agents.routeOutcome');
+    const calls: string[] = [];
+    const result = await new QuickJsRuntime().execute(`return typeof agents.routeOutcome;`, async ref => {
+      calls.push(ref); return null;
     }, { timeoutMs: 5000, memoryLimitBytes: 32 * 1024 * 1024 });
     expect(result.terminationReason).toBe("completed");
-    expect(calls).toEqual([{ ref: "agents.routeOutcome", args: { id: "run-1", routeQuality: "fail" } }]);
+    expect(calls).toEqual([]);
   });
   it.each([false, true])("types per-filter telemetry and expiry (fullCodeMode=%s)", fullCodeMode => {
     const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000 });

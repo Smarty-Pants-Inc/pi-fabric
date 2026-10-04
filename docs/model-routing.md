@@ -116,8 +116,8 @@ The handle includes `routeDecision` with `{ model, effort, confidence, probabili
 reasonCode, decisionId, ... }`. `model/effort` describes the accepted **would-be**
 choice (or pin on fallback); `shadowChoice` preserves Jev's raw finite choice even
 below threshold. For `mode: "live"`, `handle.model/thinking` and worker admission
-use this choice; for shadow they still use the pin. `live-choice`, `class-reverted`
-and `revert-state-error` distinguish live selection and revert fallbacks.
+use this choice; for shadow they still use the pin. `live-choice`, `admission-blocked`
+and `admission-state-error` distinguish live selection and admission safety fallbacks.
 
 ## Class-scoped live dispatch and automatic revert
 
@@ -161,82 +161,32 @@ The same `decisionId` remains in `X-Smarty-Route` and terminal outcomes, includi
 live candidate model/effort admission. A recording failure cannot launch an
 unlogged candidate. Unlisted classes retain shadow-only behavior under `live:false`.
 
-Terminal outcomes may contain `routeQuality: "fail" | "pass"`. A caller/actor
-can also report quality after reviewing a locally owned routed run:
+### Scope cut: manual revert only (smarty-dev#4521)
 
-```ts
-// Replace with the ID returned by agents.spawn/run for the locally owned routed run.
-const runId = "owned-run-id";
-await agents.routeOutcome({ id: runId, routeQuality: "fail" });
-```
+Automatic quality revert is not shipped in this PR. Quality reporting APIs,
+quality FAIL journals, receipt FAIL recovery, failure streaks and automatic
+class demotion are removed. Failed, stopped or timed-out outcomes are audit
+records, not routing policy. The removed `agents.routeOutcome` quality API is
+absent from the guest types and action registry. Quality reporting and automatic
+revert move to smarty-dev#4521; nothing here depends on quality-write durability.
 
-Report fail for review FAIL, red tests or a user retry; these signals are explicit
-assertions, **never inferred from task text or arbitrary output**. One quality
-failure or **two consecutive failed, stopped/aborted or timed-out runs** demotes
-only that live class to shadow. Completed runs reset the failure streak. A pass
-after a fail does not clear a demotion. Task and actor settlements share this
-path. Replayed/duplicate terminal receipts do not increment the streak twice.
-The API accepts an owned run ID, not an arbitrary class, decision or storage path;
-the owning Main can also report a completed durable actor activation by its run ID,
-after the successful worker handle has been cleaned up. The resident host authorizes
-the actual Main control identity and resolves its execution-owned archived decision
-receipt. Actor receipts follow the existing actor run archive retention window;
-foreign Mains, nested inherited identities and unknown activations are refused.
+**Manual rollback:** set `liveClasses: []` (or remove one class) in trusted config
+and refresh Main through its normal config reload path. The resident config
+refresh writes the overlay and reuses the ready host. New resident activations
+reread that same-release, root/session-fenced policy, including `revertReset`
+tokens; already-admitted model/effort pins do not change, and no resident restart
+is required. Re-add a class to opt it back in. A new trusted `revertReset` token
+can isolate older in-flight admission/terminal-repair obligations when deliberately
+starting a new policy generation; it is not an automatic quality switch. Neither
+reset nor opt-in overrides protection, network/Jev gates, candidate validation or
+Paul's floor rule.
 
-The append-only host file `<host Pi agent dir>/fabric/model-routing-state.jsonl`
-stores the per-class switch/streak and survives process restart; its trust boundary,
-permissions, no-link rules and size bound match the ledger. Each demotion also
-writes a `revert` row to `model-routing.jsonl`, with class, reset generation,
-triggering `decisionId` and `quality-fail` or `consecutive-failures`. Unsafe or
-corrupt state falls back to the pin with `revert-state-error`. Outcome storage
-failures retain the existing pending receipt/retry fence rather than claiming a
-durable save. Quality updates first fsync a `pending` receipt in
-`model-routing-quality.jsonl`, then confirm the ledger and state updates, then fsync
-a `committed` receipt before acknowledgement. An uncommitted receipt vetoes live
-admission across restart and is retried at the next activation; a readable but
-unwritable state journal cannot leave the class live. The decision/class/reset join
-is preserved, even after successful actor cleanup.
-
-### Quality reporting durability and the reporter-exit residual (smarty-dev#4521)
-
-A live report that cannot complete its shared write-ahead/state persistence throws
-`quality-report-not-durable` (`RouteQualityNotDurableError`, `retryable: true` in
-local calls). Public task, actor, and `agents.routeOutcome` callers propagate the
-failure; resident transport errors retain the same error token. The factory/owner
-must retain the run ID and FAIL assertion and retry after storage capacity or
-permissions recover. A process-local pin is **not** a successful quality report.
-
-Independently of shared pending/refused/bounded-fence writes, the reporter first
-attempts a durable update of the execution-owned `route-quality-receipt.json`:
-`routeQuality: "fail"` plus an unresolved `qualityFail` marker. Admission records
-index each run receipt; successful actor archival durably indexes the archived
-receipt before releasing its source. Every new admission reads bounded,
-host-owned receipts for its class and reset generation and replays unresolved
-FAILs into the shared switch. Pending receipt FAILs veto source collection and
-archive rotation. A PASS or repeated archival cannot erase an unresolved FAIL;
-only successful durable replay discharges its marker, retaining FAIL history.
-This recovery requires a surviving, indexed receipt; it does not scan arbitrary
-caller paths or infer quality from run text.
-
-**Documented residual:** if *all* durable writes refuse the FAIL (including the
-run receipt), the reporting process exits, and the factory/owner never retries,
-there is no persistent FAIL for a fresh owner to recover. Once capacity recovers,
-a fresh admission may be LIVE. This is explicitly a failed, retryable report—not
-acknowledged persistence or a guarantee against total storage loss. Receipt-only
-success survives reporter exit and pins the fresh owner; if no sink succeeded,
-the caller's retry records the FAIL and restores the durable pin.
-
-**Rollback:** set `liveClasses: []` in trusted config and refresh Main through its
-normal config reload path. The existing resident config refresh writes the overlay
-and reuses the ready host. New resident activations reread that same-release,
-root/session-fenced policy, including reset tokens; already-admitted model/effort
-pins do not change, and no resident restart is required. **Re-enable one reverted class:** keep it
-listed and change its trusted `revertReset` token, for example
-`"revertReset": { "status-groom": "approved-retry-2" }`. Tokens default to `""`;
-use a new, never-reused token for each reset. Old in-flight outcomes stay in their
-original generation and cannot undo a new reset. Emptying/re-adding `liveClasses`
-alone does not clear a durable revert. Neither reset nor opt-in overrides protection,
-network/Jev gates, candidate validation or Paul's floor rule.
+`model-routing-state.jsonl` retains terminal audit events with original timestamps,
+not a quality switch or failure counter. Unsafe/corrupt admission state launches
+the pin with `admission-state-error`; unresolved terminal saves use
+`admission-blocked` until repair succeeds. Append/fsync failure always denies LIVE
+for that dispatch. These are admission/recording safety fallbacks, not quality
+reverts.
 
 ## Per-activation actor routing
 
@@ -291,8 +241,8 @@ write a decision before launch and an outcome after settlement, joined by
 `decisionId` plus `actorId`/`activationId`/`runId`. Outcomes include completed,
 failed or stopped status, admitted pin when known and observed input/output/cache
 and cost counters (null when unknown). Failed activations retain the same evidence
-as task failures. There is no invented quality score: explicit `routeQuality` assertions drive
-reverts, not prompt-text heuristics. A later parity report must join outcomes to
+as task failures. There is no quality reporting or automatic revert in this release; terminal
+status never changes class opt-in. A later parity report must join outcomes to
 class and observed execution; shadow decisions alone cannot prove savings. Existing ledger write-failure behavior applies
 (`record-failed`, pinned launch, retained pending terminal receipt).
 
@@ -314,7 +264,7 @@ known and before launch; a failed bind settles preparation failure instead of
 launching against the parent checkout. Retries and resumes retain that session
 and child ID.
 Once the terminal join is durable and workers have exited, `route-session.jsonl`
-and `route-quality-receipt.json` are owned run artifacts collected by normal
+and `route-dispatch-receipt.json` are owned run artifacts collected by normal
 close/expiry retention (actor decision receipts are first durably archived with
 the actor run). Pending
 outcomes, unresolved workers, links and unknown content still veto collection.
@@ -327,24 +277,24 @@ manager's cleanup obligation rather than falsely reported as a completed child.
 Outcome writes use the manager's terminal-save retry/retention fence. Queued
 outcomes retry at most three times per settlement/cleanup/close attempt; persistent
 failure surfaces a warning and retains the full terminal receipt and run files.
-Before the first quality-intent or terminal write, a durable class/reset obligation
+Before the first LIVE terminal write, a durable class/reset obligation
 is appended to the shared host-owned `model-routing-pending.jsonl` write-ahead
 journal. Every Main/resident admission replays unresolved obligations with their
 original decision/run identity. While any save remains unresolved, that class
 uses the pin, including after restart; a journal that cannot accept write-ahead
 intents refuses live admission. Committed markers follow confirmed ledger/state
-saves, and terminal/quality retries deduplicate their original decision joins.
+saves, and terminal retries deduplicate their original decision joins.
 Every LIVE dispatch must first append and fsync an `admission` record to that
 same safety journal, even when its decision was already recorded elsewhere.
 Open/fstat/fsync probes and the size reserve alone cannot prove appendability:
-`EFBIG`, `ENOSPC`, `EIO`, or any append/fsync failure demotes that dispatch to the
+`EFBIG`, `ENOSPC`, `EIO`, or any append/fsync failure falls back for that dispatch to the
 pin with `record-failed`. Fresh Main and resident owners perform the same real
 append; a shorter separate decision ledger cannot grant LIVE authority.
 The exact pending ledger row is also kept in `pending-route-outcome.json` for
 reconciliation after close/reload; it is removed only after a successful append
 and deliberately remains outside the global sweeper's collectable-file allowlist.
 Cleanup refuses collection until the outcome has been written. Actor archive
-failures also retain the source run/quality receipt: subsequent activations retry
+failures also retain the source run/dispatch receipt: subsequent activations retry
 all failed archives, and only confirmed archival permits prior-run cleanup.
 A process crash before terminal settlement still requires a later outcome
 reconciler; PR1 does not invent missing terminal or quality/price estimates.
@@ -361,8 +311,9 @@ Each provider request in the child has:
 X-Smarty-Route: <class>/<percent-encoded-provider-model>-<effort>/<reasonCode>:<decisionId>
 ```
 
-This identifies the threshold-accepted choice (executed in live mode), or the pin on fallback.
-Actual model attribution comes from the provider/model row and the outcome, not
+This identifies the threshold-accepted choice (executed in LIVE, audit-only in
+shadow), or the pin on fallback. After manual revert a `shadow-choice` header can
+still name the cheaper audit choice while execution uses the pin. Actual model attribution comes from the provider/model row and the outcome, not
 from treating a shadow header as a live route. The header has no prompts or
 free-text reasons. A standalone explicit `-e` child hook mutates Pi's
 `before_provider_headers` map in place; it also loads for `extensions: false`.
@@ -384,22 +335,20 @@ through `-e`, private HOME/profile/mesh, and only model/provider-boundary mocks.
 Jev fetch is intercepted; native OpenAI model requests reach a loopback HTTP
 server that records the actual `X-Smarty-Route` header. No Fabric API, manager,
 resident host, worker, registry or header hook is substituted. The proof covers
-public auto task spawn/wait and run, live durable `status-groom`, completed actor
-cleanup, owning-Main quality fail with pending/committed durability, next pinned
-activation, another class remaining live, and Jev error fallback. `evidence.json`
-joins actual native model/effort, HTTP header and decision/outcome ledger by ID;
-`transcript.jsonl`, copied routing/resident state and `summary.json` retain the
-exact HEAD, bundle hash, installed Pi version and all-processes-exited receipt.
-The proof also covers two valid committed 8192-byte pending/refused journals
-whose appends (including the bounded refusal fence) fail with injected `EFBIG`.
-A fresh Main and resident dispatch pin while a shorter decision ledger remains
-writable. Every LIVE decision is joined to its shared durable admission record.
-`candidate-identity.json` records the exact head, bundle hash and installed Pi.
-The proof also injects first quality-intent, actor archive and terminal-state save
-failures: fresh Main and resident dispatch pin while shared saves are pending,
-A survives B until its archive retry succeeds, and terminal repair preserves the
-original failed/stopped decision joins without double-counting. The bundle manifest
-hashes every compiled JavaScript chunk, not just the entrypoint.
+LIVE opted-in auto tasks and durable actors, native session/model/effort/header
+joins, modelReason persistence, Jev error fallback and class isolation. Manual
+rollback empties `liveClasses` on a fresh Main and reaches the already-running
+resident without changing its PID/token; an explicit class-scoped re-enable and
+reset is also checked. No automatic quality revert row remains.
+
+`evidence.json`, `transcript.jsonl`, copied routing/resident state and `summary.json`
+retain exact HEAD, bundle hash, installed Pi version and all-processes-exited
+receipt. `candidate-identity.json` and the chunk manifest identify the candidate.
+The proof injects `EFBIG` on real admission appends to otherwise readable/writable
+journals, actor archive denial (F2 source custody through later successful runs),
+and failed terminal-state saves (F5 ordered/idempotent repair). Unresolved terminal
+saves temporarily deny LIVE; successful repair restores it, irrespective of
+terminal failure status. Every LIVE decision joins its durable admission record.
 These artifacts are exact-candidate isolated entrypoint evidence, not production
 model-quality, gateway metering or spending-parity acceptance. The owner must
 post the exact-head evidence and separately confirm those gates before live

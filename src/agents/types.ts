@@ -149,8 +149,6 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
-  /** Explicit quality assertion from the caller/actor; never inferred from task text. */
-  routeQuality?: "pass" | "fail";
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   /** Always populated for new runs; optional for legacy records. */

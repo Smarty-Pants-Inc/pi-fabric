@@ -10,13 +10,11 @@ import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { ResidencyClient } from "../src/residency/client.js";
-import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { JevClient } from "../src/jev/client.js";
-import { isRouteClassReverted } from "../src/agents/model-route.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import type { FabricActorInfo, FabricActorMessage } from "../src/actors/types.js";
@@ -82,56 +80,8 @@ const fixture = async () => {
   return { identity, config, configFile, host, client, actor, activate, provider, context, makeProvider, mainAgent };
 };
 
-describe("public resident route feedback and config rollback", () => {
-  it("authorizes an owning Main quality fail after completed durable activation cleanup and leaves other classes live", async () => {
-    const state = await fixture();
-    const first = await state.activate(); expect(first.text).toContain(cheap.model);
-    expect(state.host.agents.runDirectory(first.runId!)).toBeUndefined();
-    await expect(state.makeProvider({ ...state.mainAgent, id: "session:foreign" }).invoke("routeOutcome", { id: first.runId, routeQuality: "fail" }, state.context))
-      .rejects.toMatchObject({ code: "RESIDENT_ACTOR_FORBIDDEN" });
-    await expect(new ResidentActorClient(state.config.meshRoot, state.identity.id).setActor({ operation: "routeQuality", id: first.runId!, routeQuality: "fail" }))
-      .rejects.toMatchObject({ code: "RESIDENT_ACTOR_FORBIDDEN" });
-    await expect(state.provider.invoke("routeOutcome", { id: "a".repeat(32), routeQuality: "fail" }, state.context)).rejects.toMatchObject({ code: "RESIDENT_ACTOR_FORBIDDEN" });
-    await expect(state.provider.invoke("routeOutcome", { id: first.runId, routeQuality: "fail" }, state.context)).resolves.toEqual({ id: first.runId, routeQuality: "fail" });
-    const qualityDecisions = fs.readdirSync(path.join(state.config.residencyRoot, "decisions")).map(file =>
-      JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "decisions", file), "utf8")));
-    expect(qualityDecisions.find(row => row.operation === "routeQuality" && row.state === "committed")).toMatchObject({ id: state.actor.id });
-    const next = await state.activate(); expect(next.text).toContain(pin.model);
-    const decisions = rows().filter(row => row.type === "decision");
-    expect(decisions[0]).toMatchObject({ actorId: state.actor.id, mode: "live", reasonCode: "live-choice" });
-    expect(decisions[1]).toMatchObject({ actorId: state.actor.id, mode: "shadow", reasonCode: "class-reverted" });
-    expect(rows().find(row => row.type === "quality")).toMatchObject({ decisionId: decisions[0].decisionId, runId: first.runId, routeQuality: "fail" });
-    const other = await state.provider.invoke("spawn", { task: "ECHO_MODEL", model: "auto", routeClass: "task:exact-checks", protected: false }, state.context) as { id: string; routeDecision: { mode: string } };
-    expect(other.routeDecision.mode).toBe("live"); await state.provider.invoke("wait", { id: other.id }, state.context);
-    await state.host.close(); // Recovered host reads archived receipt, even with retainRuns:false.
-    const restored = new ResidentHost(state.config, () => {}, { getAvailable: () => available }); closers.push(() => restored.close()); await restored.start();
-    await expect(state.provider.invoke("routeOutcome", { id: first.runId, routeQuality: "fail" }, state.context)).resolves.toEqual({ id: first.runId, routeQuality: "fail" });
-  }, 20000);
-
-  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("uses the same pending/committed safety fence for resident quality feedback", async () => {
-    const state = await fixture(); const first = await state.activate();
-    const file = path.join(root, "profile/fabric/model-routing-state.jsonl"); fs.chmodSync(file, 0o400);
-    await expect(state.provider.invoke("routeOutcome", { id: first.runId, routeQuality: "fail" }, state.context)).rejects.toThrow();
-    expect((await state.activate()).text).toContain(pin.model);
-    fs.chmodSync(file, 0o600); expect(isRouteClassReverted("status-groom")).toBe(true);
-    const journal = fs.readFileSync(path.join(root, "profile/fabric/model-routing-quality.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-    expect(journal.map(row => row.type)).toEqual(["pending", "committed"]);
-  }, 20000);
-
-  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fences the first resident quality-intent write for both Main and resident dispatch", async () => {
-    const state = await fixture(); const first = await state.activate();
-    const journal = path.join(root, "profile/fabric/model-routing-quality.jsonl");
-    fs.writeFileSync(journal, "", { mode: 0o400 }); fs.chmodSync(journal, 0o400);
-    await expect(state.provider.invoke("routeOutcome", { id: first.runId, routeQuality: "fail" }, state.context)).rejects.toThrow();
-    expect(fs.readFileSync(journal, "utf8")).toBe("");
-    expect((await state.activate()).text).toContain(pin.model);
-    const main = await state.provider.invoke("spawn", { task: "ECHO_MODEL", model: "auto", routeClass: "status-groom", protected: false }, state.context) as { id: string };
-    expect(await state.provider.invoke("wait", { id: main.id }, state.context)).toMatchObject({ model: pin.model });
-    fs.chmodSync(journal, 0o600); expect(isRouteClassReverted("status-groom")).toBe(true);
-    expect(rows().find(row => row.type === "quality")).toMatchObject({ runId: first.runId, routeQuality: "fail" });
-  }, 20000);
-
-  it("retains A through B and C when its archive fails, accepts owning-Main feedback, and retries before cleanup", async () => {
+describe("resident LIVE custody and manual config rollback", () => {
+  it("retains A through B and C when its archive fails, and retries before cleanup", async () => {
     const retain = ActorLogStore.prototype.retainRun;
     let failedRun: string | undefined;
     const archive = vi.spyOn(ActorLogStore.prototype, "retainRun").mockImplementation(async function (this: ActorLogStore, actor, runId, directory) {
@@ -145,14 +95,12 @@ describe("public resident route feedback and config rollback", () => {
     await state.activate(); await state.activate();
     expect(archive.mock.calls.filter(([, runId]) => runId === first.runId)).toHaveLength(3);
     const source = state.host.agents.runDirectory(first.runId!)!;
-    expect(fs.existsSync(path.join(source, "route-quality-receipt.json"))).toBe(true);
-    await expect(state.provider.invoke("routeOutcome", { id: first.runId, routeQuality: "fail" }, state.context)).resolves.toEqual({ id: first.runId, routeQuality: "fail" });
-    expect((await state.activate()).text).toContain(pin.model);
+    expect(fs.existsSync(path.join(source, "route-dispatch-receipt.json"))).toBe(true);
+    expect((await state.activate()).text).toContain(cheap.model);
     expect(state.host.agents.runDirectory(first.runId!)).toBe(source);
-    archive.mockRestore(); expect((await state.activate()).text).toContain(pin.model);
+    archive.mockRestore(); expect((await state.activate()).text).toContain(cheap.model);
     expect(state.host.agents.runDirectory(first.runId!)).toBeUndefined();
-    expect(fs.existsSync(path.join(state.actor.logDir!, first.runId!, "route-quality-receipt.json"))).toBe(true);
-    expect(rows().find(row => row.type === "quality")).toMatchObject({ runId: first.runId, routeQuality: "fail" });
+    expect(fs.existsSync(path.join(state.actor.logDir!, first.runId!, "route-dispatch-receipt.json"))).toBe(true);
   }, 20000);
 
   it("keeps denied A archive custody through normal host close/restart and repairs before source collection", async () => {
@@ -171,64 +119,51 @@ describe("public resident route feedback and config rollback", () => {
     expect(fs.existsSync(marker)).toBe(true);
     await state.activate(); // B succeeds; A's only receipt remains in its source.
     await state.host.close();
-    expect(fs.existsSync(path.join(source, "route-quality-receipt.json"))).toBe(true);
+    expect(fs.existsSync(path.join(source, "route-dispatch-receipt.json"))).toBe(true);
     expect(fs.existsSync(marker)).toBe(true);
-    expect(fs.existsSync(path.join(state.actor.logDir!, a.runId!, "route-quality-receipt.json"))).toBe(false);
+    expect(fs.existsSync(path.join(state.actor.logDir!, a.runId!, "route-dispatch-receipt.json"))).toBe(false);
     const restored = new ResidentHost(state.config, () => {}, { getAvailable: () => available });
     closers.push(() => restored.close()); await restored.start();
     expect(restored.agents.runDirectory(a.runId!)).toBeUndefined(); // No old live handle/map.
     expect(restored.agents.actorArchiveSources(state.actor.id, state.actor.sessionFile!).get(a.runId!)).toBe(source);
     denied = false;
-    await expect(state.makeProvider({ ...state.mainAgent, id: "session:foreign" }).invoke("routeOutcome", { id: a.runId, routeQuality: "fail" }, state.context))
-      .rejects.toMatchObject({ code: "RESIDENT_ACTOR_FORBIDDEN" });
-    await expect(state.provider.invoke("routeOutcome", { id: a.runId, routeQuality: "fail" }, state.context))
-      .resolves.toEqual({ id: a.runId, routeQuality: "fail" });
-    expect(fs.existsSync(marker)).toBe(true); // Feedback commits before source collection.
-    const next = await restored.actors.ask(state.actor.id, "ECHO_MODEL", "test"); expect(next.text).toContain(pin.model);
+    const next = await restored.actors.ask(state.actor.id, "ECHO_MODEL", "test"); expect(next.text).toContain(cheap.model);
     await vi.waitFor(() => expect(restored.actors.status(state.actor.id).status).toBe("idle"));
-    expect(fs.existsSync(path.join(state.actor.logDir!, a.runId!, "route-quality-receipt.json"))).toBe(true);
+    expect(fs.existsSync(path.join(state.actor.logDir!, a.runId!, "route-dispatch-receipt.json"))).toBe(true);
     expect(fs.existsSync(source)).toBe(false);
-    expect(rows().filter(row => row.type === "quality" && row.runId === a.runId)).toHaveLength(1);
-    expect(rows().filter(row => row.type === "decision").at(-1)).toMatchObject({ mode: "shadow", reasonCode: "class-reverted" });
+    expect(rows().filter(row => row.type === "decision").at(-1)).toMatchObject({ mode: "live", reasonCode: "live-choice" });
   }, 20000);
 
-  it("pins fresh resident and Main admission after a full writable safety journal refuses public FAIL", async () => {
-    const state = await fixture(), first = await state.activate();
-    const journal = path.join(root, "profile/fabric/model-routing-pending.jsonl");
-    const prefix = JSON.stringify({ type: "committed", receiptId: "capacity-fixture", at: 1, padding: "" });
-    const row = prefix.slice(0, -2) + "x".repeat(64 * 1024 - Buffer.byteLength(prefix) - 1) + '"}\n';
-    fs.writeFileSync(journal, row.repeat(1024));
-    expect(fs.statSync(journal).size).toBe(64 * 1024 * 1024);
-    const fd = fs.openSync(journal, "a"); fs.fsyncSync(fd); fs.closeSync(fd);
-    await expect(state.provider.invoke("routeOutcome", { id: first.runId, routeQuality: "fail" }, state.context)).rejects.toThrow();
-    await state.host.close();
-    const restored = new ResidentHost(state.config, () => {}, { getAvailable: () => available });
-    closers.push(() => restored.close()); await restored.start();
-    expect((await restored.actors.ask(state.actor.id, "ECHO_MODEL", "test")).text).toContain(pin.model);
-    const main = await state.provider.invoke("spawn", { task: "ECHO_MODEL", model: "auto", routeClass: "status-groom", protected: false }, state.context) as { id: string };
-    expect(await state.provider.invoke("wait", { id: main.id }, state.context)).toMatchObject({ model: pin.model });
-    // Retire only committed fixture rows; durable refused FAIL must survive repair.
-    fs.truncateSync(journal, 0);
-    expect((await restored.actors.ask(state.actor.id, "ECHO_MODEL", "test")).text).toContain(pin.model);
-    expect(rows().filter(row => row.type === "quality" && row.runId === first.runId)).toHaveLength(1);
-    expect(isRouteClassReverted("status-groom")).toBe(true);
-  }, 30000);
-
-  it("rereads same-generation empty allowlist and fresh per-class reset on the next activation without replacing its host", async () => {
-    const state = await fixture(); const ownerPath = path.join(state.config.residencyRoot, "owner.json"); const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
-    const first = await state.activate(); expect(first.text).toContain(cheap.model);
+  it("manual empty liveClasses stops LIVE on Main and a running resident host, without replacing its owner", async () => {
+    const state = await fixture();
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+    const mainRun = async (routeClass = "status-groom") => {
+      const h = await state.provider.invoke("spawn", { task: "ECHO_MODEL", model: "auto", routeClass, protected: false }, state.context) as { id: string };
+      return state.provider.invoke("wait", { id: h.id }, state.context);
+    };
+    expect((await state.activate()).text).toContain(cheap.model);
+    expect(await mainRun()).toMatchObject({ model: cheap.model });
     const policy = state.config.agents.modelRouting!;
     state.config.agents.modelRouting = { ...policy, liveClasses: [] };
-    await state.client.ensureHost(); // Normal same-release refresh writes config and reuses ready owner.
+    await state.client.ensureHost(); // Normal same-release config refresh reuses ready owner.
     expect((await state.activate()).text).toContain(pin.model);
+    expect(await mainRun()).toMatchObject({ model: pin.model });
     expect(rows().filter(row => row.type === "decision").at(-1)).toMatchObject({ mode: "shadow", reasonCode: "shadow-choice" });
-    await state.provider.invoke("routeOutcome", { id: first.runId, routeQuality: "fail" }, state.context);
-    state.config.agents.modelRouting = policy; await state.client.ensureHost(); expect((await state.activate()).text).toContain(pin.model);
-    const reset = { ...state.config, agents: { ...state.config.agents, modelRouting: { ...policy, revertReset: { "status-groom": "approved-r2" } } } };
-    fs.writeFileSync(state.configFile, JSON.stringify({ ...reset, sessionId: "foreign-generation" }));
-    expect((await state.activate()).text).toContain(pin.model); // No foreign overlay authority.
-    state.config.agents = reset.agents; await state.client.ensureHost(); expect((await state.activate()).text).toContain(cheap.model);
-    expect(rows().filter(row => row.type === "decision").at(-1)).toMatchObject({ mode: "live", revertReset: "approved-r2" });
+    // Manual class-scoped rollback leaves unrelated task classes opted in.
+    state.config.agents.modelRouting = { ...policy, liveClasses: ["task:exact-checks"] };
+    await state.client.ensureHost();
+    expect((await state.activate()).text).toContain(pin.model);
+    expect(await mainRun("task:exact-checks")).toMatchObject({ model: cheap.model });
+    // Explicit trusted re-enable/reset propagates to the same running host.
+    state.config.agents.modelRouting = { ...policy, revertReset: { "status-groom": "manual-r2" } };
+    await state.client.ensureHost();
+    expect((await state.activate()).text).toContain(cheap.model);
+    expect(await mainRun()).toMatchObject({ model: cheap.model });
+    expect(rows().filter(row => row.type === "decision").at(-1)).toMatchObject({ mode: "live", revertReset: "manual-r2" });
+    // Foreign overlay has no authority: the original trusted LIVE policy applies.
+    fs.writeFileSync(state.configFile, JSON.stringify({ ...state.config, sessionId: "foreign-generation", agents: { ...state.config.agents, modelRouting: { ...policy, liveClasses: [] } } }));
+    expect((await state.activate()).text).toContain(cheap.model);
     expect(JSON.parse(fs.readFileSync(ownerPath, "utf8"))).toMatchObject({ pid: owner.pid, token: owner.token });
   }, 20000);
 });

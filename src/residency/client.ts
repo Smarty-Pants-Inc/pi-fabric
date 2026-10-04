@@ -437,7 +437,7 @@ export class ResidencyClient {
   }
 
   /** Setters/status use only an existing owner, never create hidden residency. */
-  async setActor(mutation: ResidentActorMutation | import("./protocol.js").ResidentRouteQuality, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<FabricActorInfo> {
+  async setActor(mutation: ResidentActorMutation, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<FabricActorInfo> {
     const self = this.options.participants.self();
     if (!this.options.mainAgent.local || this.options.mainAgent.id !== this.options.config.rootId ||
       self.kind !== "root" || self.id !== this.options.config.rootId || !self.sessionId) {

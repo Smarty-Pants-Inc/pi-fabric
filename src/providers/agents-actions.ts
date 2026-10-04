@@ -247,12 +247,6 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "agent",
   },
   {
-    name: "routeOutcome",
-    description: "Report explicit route quality for a locally owned routed run or an owning Main’s actor activation run ID, including completed durable resident activations. The authenticated resident control channel reaches the execution owner. Use fail for review FAIL, red tests or a user retry; acknowledgement requires the durable quality fence to commit. No task-text inference.",
-    inputSchema: { type: "object", properties: { id: { type: "string" }, routeQuality: { type: "string", enum: ["pass", "fail"] } }, required: ["id", "routeQuality"], additionalProperties: false },
-    risk: "agent",
-  },
-  {
     name: "wait",
     description: "Wait for a previously spawned child agent and acknowledge its result, suppressing a duplicate completion notification. Bounded by timeoutMs (default and at most 5 min): a child still running then keeps running, the wait throws, and its result arrives as a completion message after the turn",
     effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },

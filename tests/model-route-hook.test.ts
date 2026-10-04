@@ -16,7 +16,7 @@ describe("child routing header hook", () => {
     expect(headers).toEqual({ Authorization: "unmodified", "X-Session-Id": "unmodified", "X-Smarty-Route": header });
   });
   it.each(["status-groom", "task:merge-additive", "task:ci-test-fixture", "task:exact-checks"])("preserves the live decision join for %s", routeClass => {
-    for (const reason of ["live-choice", "class-reverted", "revert-state-error"]) {
+    for (const reason of ["live-choice", "admission-blocked", "admission-state-error"]) {
       const value = `${routeClass}/test%2Fluna-max/${reason}:0123456789abcdef0123456789abcdef`;
       vi.stubEnv("PI_FABRIC_ROUTE_HEADER", value);
       let hook: ((event: { headers: Record<string, string> }) => void) | undefined;

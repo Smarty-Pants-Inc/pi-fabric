@@ -174,34 +174,35 @@ const ownedPids = new Set();
 try {
   const state = await request({ type: 'get_state' }); assert.equal(state.model.provider + '/' + state.model.id, pin);
   const diagnostic = await guest(`try { return { evaluation: await tools.call({ref: 'jev.evaluate', args: {state: {routeClass: 'task:exact-checks', mode: 'shadow', protection: 'clear'}, questions: {route: {type: 'choice', instructions: 'Offline proof', criteria: {'candidate-0': {model: '${pin}', effort: 'high'}, 'candidate-1': {model: '${cheap}', effort: 'medium'}}}}}}) }; } catch(error) { return {error: String(error), stack: error.stack}; }`); record({type:'jev_diagnostic',diagnostic}); assert.ok(diagnostic.evaluation && !diagnostic.error, JSON.stringify(diagnostic));
-  const task = await guest(`const handle = await agents.spawn({ task: 'PROOF_TASK_LIVE', model: 'auto', routeClass: 'task:exact-checks', protected: false }); const result = await agents.wait({ id: handle.id }); return {handle,result};`);
-  assert.equal(task.handle.routeDecision.reasonCode, 'live-choice'); assert.equal(task.result.model, cheap); assert.equal(task.result.thinking, 'medium');
-  const actor = await guest(`const actor = await agents.create({ name: 'status-groom-proof', instructions: 'Bounded status checks only', residency: 'durable', runner: 'pi', transport: 'process', model: '${pin}', thinking: 'high', routeClass: 'status-groom', protected: false, tools: [], extensions: true, events: [], topics: [], delivery: 'mailbox', triggerTurn: false }); const first = await agents.ask({ id: actor.id, message: 'PROOF_ACTOR_LIVE' }); return {actor,first};`);
+  const task = await guest(`const handle = await agents.spawn({ task: 'PROOF_TASK_LIVE', modelReason: 'Round 8 task exception', model: 'auto', routeClass: 'task:exact-checks', protected: false }); const result = await agents.wait({ id: handle.id }); return {handle,result};`);
+  assert.equal(task.handle.routeDecision.reasonCode, 'live-choice'); assert.equal(task.result.model, cheap); assert.equal(task.result.thinking, 'medium'); assert.equal(task.result.modelReason, 'Round 8 task exception');
+  const actor = await guest(`const actor = await agents.create({ name: 'status-groom-proof', modelReason: 'Round 8 actor exception', instructions: 'Bounded status checks only', residency: 'durable', runner: 'pi', transport: 'process', model: '${pin}', thinking: 'high', routeClass: 'status-groom', protected: false, tools: [], extensions: true, events: [], topics: [], delivery: 'mailbox', triggerTurn: false }); const first = await agents.ask({ id: actor.id, message: 'PROOF_ACTOR_LIVE' }); return {actor,first};`);
   assert.ok(actor.first.runId); assert.match(actor.first.text, /gpt-5-cheap/);
-  await wait(() => fs.existsSync(path.join(actor.actor.logDir, actor.first.runId, 'route-quality-receipt.json')));
+  await wait(() => fs.existsSync(path.join(actor.actor.logDir, actor.first.runId, 'route-dispatch-receipt.json')));
   const nativeFirst = fs.readFileSync(transcript, 'utf8').trim().split('\n').map(line => JSON.parse(line)).find(row => row.type === 'native_activation' && row.runId === actor.first.runId);
   assert.ok(nativeFirst?.runDirectory, 'No native resident activation process');
   await wait(() => !fs.existsSync(nativeFirst.runDirectory) && !live(nativeFirst.pid));
-  record({type:'cleaned_resident_activation', nativeFirst, archivedReceipt: path.join(actor.actor.logDir, actor.first.runId, 'route-quality-receipt.json')});
-  const beforeQuality = owners(); assert.ok(beforeQuality.length > 0, 'No real resident owner');
-  const quality = await guest(`return await agents.routeOutcome({ id: '${actor.first.runId}', routeQuality: 'fail' });`);
-  assert.equal(quality.routeQuality, 'fail');
-  const qualityRows = fs.readFileSync(path.join(profile, 'fabric/model-routing-quality.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
-  assert.deepEqual(qualityRows.map(row => row.type), ['pending', 'committed']);
-  const next = await guest(`return await agents.ask({ id: '${actor.actor.id}', message: 'PROOF_ACTOR_PINNED' });`); assert.match(next.text, /gpt-5-pin/);
+  record({type:'cleaned_resident_activation', nativeFirst, archivedReceipt: path.join(actor.actor.logDir, actor.first.runId, 'route-dispatch-receipt.json')});
+  const residentOwner = owners(); assert.ok(residentOwner.length > 0, 'No real resident owner');
   const stillLive = await guest(`const h = await agents.spawn({ task: 'PROOF_TASK_OTHER_CLASS', model: 'auto', routeClass: 'task:exact-checks', protected: false }); return await agents.wait({id:h.id});`);
   assert.equal(stillLive.model, cheap);
   fs.writeFileSync(failJev, 'inject only a Jev provider-boundary failure');
   const fallback = await guest(`const h = await agents.spawn({ task: 'PROOF_TASK_ERROR_FALLBACK', model: 'auto', routeClass: 'task:exact-checks', protected: false }); return await agents.wait({id:h.id});`);
   assert.equal(fallback.model, pin); fs.rmSync(failJev);
   assert.ok(!fs.readFileSync(transcript, 'utf8').includes('blocked_external_network'), 'Proof attempted external networking');
-  const afterQuality = owners(); assert.equal(afterQuality[0].owner.token, beforeQuality[0].owner.token);
+  assert.equal(owners()[0].owner.token, residentOwner[0].owner.token);
   const restartMain = async reset => {
+    // Reopen the same native Main session: a foreign root cannot publish policy
+    // to the existing resident. Keep F4 on the owning-Main refresh path.
+    const mainSession = fs.readFileSync(transcript, 'utf8').trim().split('\n').map(line=>JSON.parse(line))
+      .find(row=>row.type==='native_activation' && row.pid===child.pid && row.actorId===null && row.sessionFile);
+    assert.ok(mainSession?.sessionFile && fs.existsSync(mainSession.sessionFile));
+    if (!args.includes('--session')) args.push('--session',mainSession.sessionFile);
     child.stdin.end();
     const exit = await exited; mainExits.push(exit); assert.equal(exit.code, 0);
     if (reset) config.agents.modelRouting.revertReset = { 'status-groom': reset };
     fs.writeFileSync(path.join(profile, 'fabric.json'), JSON.stringify(config));
-    record({type:'fresh_main',reset:config.agents.modelRouting.revertReset,pid:exit.pid});
+    record({type:'fresh_main',reset:config.agents.modelRouting.revertReset,liveClasses:config.agents.modelRouting.liveClasses,pid:exit.pid,args,sessionId:mainSession.sessionId});
     buffer = ''; launchMain();
     const state = await request({type:'get_state'}); assert.equal(state.model.provider + '/' + state.model.id, pin);
   };
@@ -212,31 +213,30 @@ try {
   const safetyJournal = path.join(profile,'fabric/model-routing-pending.jsonl');
   const safetyRows = () => fs.readFileSync(safetyJournal,'utf8').trim().split('\n').map(line=>JSON.parse(line));
 
-  // F1: the very first quality-intent append fails. No in-memory map is shared
-  // with the new Main; the real resident execution owner must see the same fence.
-  await restartMain('astra-r3-F1');
-  const f1Actor = await createActor('status-groom-f1');
-  const f1First = await ask(f1Actor.id,'PROOF_F1_LIVE'); assert.match(f1First.text,/gpt-5-cheap/);
-  await wait(()=>fs.existsSync(path.join(f1Actor.logDir,f1First.runId,'route-quality-receipt.json')));
-  const qualityJournal = path.join(profile,'fabric/model-routing-quality.jsonl');
-  fs.copyFileSync(qualityJournal,path.join(out,'quality-before-f1.jsonl'));
-  fs.writeFileSync(qualityJournal,''); fs.chmodSync(qualityJournal,0o400);
-  const f1Report = await guest(`try { await agents.routeOutcome({id:'${f1First.runId}',routeQuality:'fail'}); return {acknowledged:true}; } catch(error) {return {acknowledged:false,error:String(error)};}`, true);
-  assert.equal(f1Report.acknowledged,false); assert.equal(fs.readFileSync(qualityJournal,'utf8'),'');
-  const f1Intent = safetyRows().find(row=>row.type==='pending' && row.runId===f1First.runId && row.result.routeQuality==='fail'); assert.ok(f1Intent);
-  await restartMain();
-  const f1Main = await mainRun('PROOF_F1_MAIN_PIN'), f1Resident = await ask(f1Actor.id,'PROOF_F1_RESIDENT_PIN'); checkPin(f1Main); checkPin(f1Resident);
-  assert.equal(fs.readFileSync(qualityJournal,'utf8'),'');
-  fs.chmodSync(qualityJournal,0o600); checkPin(await ask(f1Actor.id,'PROOF_F1_REPAIRED_PIN'));
-  assert.ok(safetyRows().some(row=>row.type==='committed' && row.receiptId===f1Intent.receiptId));
-  safetyScenarios.push({finding:'F1',passed:true,report:f1Report,pendingIntent:f1Intent,mainRunId:f1Main.handle.id,residentRunId:f1Resident.runId,freshMain:true});
+  // F4/manual rollback: a fresh Main publishes empty liveClasses to the already
+  // running resident. Neither PID nor owner token may change.
+  config.agents.modelRouting.liveClasses = [];
+  await restartMain('round8-manual-revert');
+  const manualMain = await mainRun('PROOF_MANUAL_MAIN_PIN'); checkPin(manualMain);
+  const manualResident = await ask(actor.actor.id,'PROOF_MANUAL_RESIDENT_PIN'); checkPin(manualResident);
+  const rollbackOwner = owners(); assert.equal(rollbackOwner[0].owner.pid,residentOwner[0].owner.pid);
+  assert.equal(rollbackOwner[0].owner.token,residentOwner[0].owner.token);
+  // Class isolation: opting tasks back in does not restore the actor class.
+  config.agents.modelRouting.liveClasses = ['task:exact-checks']; await restartMain();
+  const isolatedTask = await guest(`const h=await agents.spawn({task:'PROOF_ISOLATED_TASK',model:'auto',routeClass:'task:exact-checks',protected:false});return await agents.wait({id:h.id});`);
+  assert.equal(isolatedTask.model,cheap); checkPin(await ask(actor.actor.id,'PROOF_ISOLATED_ACTOR_PIN'));
+  config.agents.modelRouting.liveClasses = ['status-groom','task:exact-checks'];
+  await restartMain('round8-live-again');
+  assert.match((await ask(actor.actor.id,'PROOF_MANUAL_REENABLE')).text,/gpt-5-cheap/);
+  assert.equal(owners()[0].owner.token,residentOwner[0].owner.token);
+  safetyScenarios.push({finding:'F4-manual-revert',passed:true,liveClasses:[],mainRunId:manualMain.handle.id,
+    residentRunId:manualResident.runId,unchangedResidentOwner:rollbackOwner[0].owner,classIsolation:true});
 
-  // Residual F1: both pending and refused (including the bounded refusal)
-  // appends fail. Fresh Main has no in-memory obligation and must still pin.
+  // Admission safety: writable journals whose real appends fail cannot grant LIVE.
   await restartMain('astra-r6-F1-full-journals');
   const fullActor = await createActor('status-groom-f1-full');
   const fullFirst = await ask(fullActor.id,'PROOF_F1_FULL_LIVE'); assert.match(fullFirst.text,/gpt-5-cheap/);
-  await wait(()=>fs.existsSync(path.join(fullActor.logDir,fullFirst.runId,'route-quality-receipt.json')));
+  await wait(()=>fs.existsSync(path.join(fullActor.logDir,fullFirst.runId,'route-dispatch-receipt.json')));
   const refusedJournal = path.join(profile,'fabric/model-routing-refused.jsonl');
   const backups = [safetyJournal, refusedJournal].map(file => ({file,text:fs.existsSync(file)?fs.readFileSync(file,'utf8'):''}));
   const prefix = JSON.stringify({type:'committed',receiptId:'full-fixture',at:1,padding:''});
@@ -248,8 +248,6 @@ try {
     fs.copyFileSync(file,path.join(out,'f1-full-'+path.basename(file)));
   }
   fs.writeFileSync(fullJournals,'Inject only journal append EFBIG; open/fstat/fsync and the decision ledger stay writable');
-  const fullReport = await guest(`try { await agents.routeOutcome({id:'${fullFirst.runId}',routeQuality:'fail'}); return {acknowledged:true}; } catch(error) {return {acknowledged:false,error:String(error)};}`,true);
-  assert.equal(fullReport.acknowledged,false); assert.match(fullReport.error,/EFBIG/);
   for (const {file} of backups) assert.equal(fs.readFileSync(file,'utf8'),full);
   // A new, shorter decision ledger must not bypass the two full journals.
   const ledgerBackup = fs.readFileSync(ledgerPath,'utf8'); fs.writeFileSync(ledgerPath,'');
@@ -262,10 +260,9 @@ try {
   fs.copyFileSync(ledgerPath,path.join(out,'f1-short-decision-ledger.jsonl'));
   for (const {file} of backups) assert.equal(fs.readFileSync(file,'utf8'),full);
   const appendFaults = fs.readFileSync(transcript,'utf8').trim().split('\n').map(line=>JSON.parse(line)).filter(row=>row.type==='injected_journal_append_efbig');
-  assert.ok(appendFaults.some(row=>row.record.type==='pending'));
-  assert.ok(appendFaults.some(row=>row.record.type==='refused'));
   assert.ok(appendFaults.some(row=>row.pid===child.pid && row.record.type==='admission'),'Fresh Main bypassed shared admission append');
-  safetyScenarios.push({finding:'F1-residual',passed:true,journalBytes:8192,report:fullReport,freshMain:true,
+  assert.ok(appendFaults.some(row=>row.pid!==child.pid && row.record.type==='admission'),'Resident bypassed shared admission append');
+  safetyScenarios.push({finding:'admission-append-safety',passed:true,journalBytes:8192,freshMain:true,
     mainPid:child.pid,mainRunId:fullMain.handle.id,residentRunId:fullResident.runId,shortLedgerBytes,appendFaults});
   fs.writeFileSync(ledgerPath,ledgerBackup+fs.readFileSync(ledgerPath,'utf8'));
   fs.rmSync(fullJournals);
@@ -279,39 +276,53 @@ try {
   const nativeA = fs.readFileSync(transcript,'utf8').trim().split('\n').map(line=>JSON.parse(line)).find(row=>row.type==='native_activation' && row.runId===f2A.runId);
   assert.ok(nativeA); await wait(()=>!live(nativeA.pid));
   const f2B = await ask(archiveActor.id,'PROOF_ARCHIVE_OK_B'); assert.match(f2B.text,/gpt-5-cheap/);
-  await wait(()=>fs.existsSync(path.join(archiveActor.logDir,f2B.runId,'route-quality-receipt.json')));
-  assert.ok(fs.existsSync(path.join(nativeA.runDirectory,'route-quality-receipt.json')),'A receipt was deleted after B despite failed archive');
-  assert.ok(!fs.existsSync(path.join(archiveFailureDirectory,'route-quality-receipt.json')));
-  const f2Report = await guest(`return await agents.routeOutcome({id:'${f2A.runId}',routeQuality:'fail'});`); assert.equal(f2Report.routeQuality,'fail');
-  const f2Pinned = await ask(archiveActor.id,'PROOF_F2_NEXT_PIN'); checkPin(f2Pinned);
-  assert.ok(fs.existsSync(path.join(nativeA.runDirectory,'route-quality-receipt.json')));
-  fs.chmodSync(archiveFailureDirectory,0o700); checkPin(await ask(archiveActor.id,'PROOF_F2_ARCHIVE_RETRY_PIN'));
-  await wait(()=>fs.existsSync(path.join(archiveFailureDirectory,'route-quality-receipt.json')) && !fs.existsSync(nativeA.runDirectory));
-  safetyScenarios.push({finding:'F2',passed:true,failedArchiveRunId:f2A.runId,successfulNextRunId:f2B.runId,retainedReceipt:path.join(nativeA.runDirectory,'route-quality-receipt.json'),quality:f2Report,pinnedRunId:f2Pinned.runId,confirmedArchive:path.join(archiveFailureDirectory,'route-quality-receipt.json')});
+  await wait(()=>fs.existsSync(path.join(archiveActor.logDir,f2B.runId,'route-dispatch-receipt.json')));
+  assert.ok(fs.existsSync(path.join(nativeA.runDirectory,'route-dispatch-receipt.json')),'A receipt was deleted after B despite failed archive');
+  assert.ok(!fs.existsSync(path.join(archiveFailureDirectory,'route-dispatch-receipt.json')));
+  const f2C = await ask(archiveActor.id,'PROOF_F2_NEXT_LIVE'); assert.match(f2C.text,/gpt-5-cheap/);
+  assert.ok(fs.existsSync(path.join(nativeA.runDirectory,'route-dispatch-receipt.json')));
+  fs.chmodSync(archiveFailureDirectory,0o700);
+  assert.match((await ask(archiveActor.id,'PROOF_F2_ARCHIVE_RETRY_LIVE')).text,/gpt-5-cheap/);
+  await wait(()=>fs.existsSync(path.join(archiveFailureDirectory,'route-dispatch-receipt.json')) && !fs.existsSync(nativeA.runDirectory));
+  safetyScenarios.push({finding:'F2',passed:true,failedArchiveRunId:f2A.runId,successfulNextRunId:f2B.runId,
+    retainedReceipt:path.join(nativeA.runDirectory,'route-dispatch-receipt.json'),nextLiveRunId:f2C.runId,
+    confirmedArchive:path.join(archiveFailureDirectory,'route-dispatch-receipt.json')});
 
-  // F5: two native live runs are admitted before their failed/stopped outcomes.
-  // Their state saves fail, then a new Main and the resident both dispatch pins.
-  await restartMain('astra-r3-F5');
+  // F5: B/C are pre-admitted, A-success save is denied, B-failure commits,
+  // then C-stop save is denied. Repair must retain original A/B/C timestamps
+  // despite physical B/A/C append order and must not cause a quality revert.
+  await restartMain('round8-F5');
   const f5Actor = await createActor('status-groom-f5');
   const f5Failed = await guest(`return await agents.spawn({task:'PROOF_TERMINAL_FAILED',model:'auto',routeClass:'status-groom',protected:false});`);
   const f5Stopped = await guest(`return await agents.spawn({task:'PROOF_TERMINAL_STOPPED',model:'auto',routeClass:'status-groom',protected:false});`);
   await wait(()=>failedResponse && stoppedResponse);
   const stateJournal = path.join(profile,'fabric/model-routing-state.jsonl'); fs.chmodSync(stateJournal,0o400);
+  const f5Success = await mainRun('PROOF_TERMINAL_SUCCESS_A'); assert.equal(f5Success.result.model,cheap);
+  fs.chmodSync(stateJournal,0o600);
   failedResponse.writeHead(400,{'Content-Type':'application/json'}); failedResponse.end(JSON.stringify({error:{message:'Offline proof injected nonretryable invalid request',type:'invalid_request_error',code:'invalid_request'}}));
   const f5FailedResult = await guest(`return await agents.wait({id:'${f5Failed.id}'});`); assert.equal(f5FailedResult.status,'failed');
+  fs.chmodSync(stateJournal,0o400);
   const f5StoppedResult = await guest(`await agents.stop({id:'${f5Stopped.id}'}); return await agents.wait({id:'${f5Stopped.id}'});`); assert.equal(f5StoppedResult.status,'stopped');
   if (!stoppedResponse.destroyed) stoppedResponse.end();
-  const f5Pending = safetyRows().filter(row=>row.type==='pending' && [f5Failed.id,f5Stopped.id].includes(row.runId)); assert.equal(f5Pending.length,2);
+  const f5DecisionIds = [f5Success.handle.routeDecision.decisionId,f5Failed.routeDecision.decisionId,f5Stopped.routeDecision.decisionId];
+  const committed = new Set(safetyRows().filter(row=>row.type==='committed').map(row=>row.receiptId));
+  const f5Pending = safetyRows().filter(row=>row.type==='pending' && f5DecisionIds.includes(row.decision.decisionId) && !committed.has(row.receiptId));
+  assert.equal(f5Pending.length,2); assert.deepEqual(f5Pending.map(row=>row.result.status),['completed','stopped']);
   const stateBefore = fs.readFileSync(stateJournal,'utf8');
   const f5Same = await mainRun('PROOF_F5_SAME_MAIN_PIN'); checkPin(f5Same);
   await restartMain();
   const f5Main = await mainRun('PROOF_F5_FRESH_MAIN_PIN'), f5Resident = await ask(f5Actor.id,'PROOF_F5_RESIDENT_PIN'); checkPin(f5Main); checkPin(f5Resident);
   assert.equal(fs.readFileSync(stateJournal,'utf8'),stateBefore);
-  fs.chmodSync(stateJournal,0o600); checkPin(await ask(f5Actor.id,'PROOF_F5_REPAIRED_PIN'));
-  const repaired = fs.readFileSync(stateJournal,'utf8').trim().split('\n').map(line=>JSON.parse(line)).filter(row=>row.type==='result' && row.reset==='astra-r3-F5');
-  assert.deepEqual(repaired.map(row=>[row.decisionId,row.status]),[[f5Failed.routeDecision.decisionId,'failed'],[f5Stopped.routeDecision.decisionId,'stopped']]);
-  checkPin(await mainRun('PROOF_F5_RETRY_NO_DOUBLE_COUNT')); assert.equal(fs.readFileSync(stateJournal,'utf8').trim().split('\n').map(line=>JSON.parse(line)).filter(row=>row.type==='result' && row.reset==='astra-r3-F5').length,2);
-  safetyScenarios.push({finding:'F5',passed:true,failedRunId:f5Failed.id,stoppedRunId:f5Stopped.id,pending:f5Pending,sameMainRunId:f5Same.handle.id,mainRunId:f5Main.handle.id,residentRunId:f5Resident.runId,repairedResults:repaired,freshMain:true});
+  fs.chmodSync(stateJournal,0o600); assert.match((await ask(f5Actor.id,'PROOF_F5_REPAIRED_LIVE')).text,/gpt-5-cheap/);
+  const savedResults = () => fs.readFileSync(stateJournal,'utf8').trim().split('\n').map(line=>JSON.parse(line)).filter(row=>f5DecisionIds.includes(row.decisionId));
+  const repaired = savedResults();
+  assert.deepEqual(repaired.map(row=>row.status),['failed','completed','stopped']);
+  assert.deepEqual([...repaired].sort((a,b)=>a.at-b.at).map(row=>row.status),['completed','failed','stopped']);
+  assert.equal(new Set(repaired.map(row=>row.decisionId)).size,3);
+  assert.equal((await mainRun('PROOF_F5_RETRY_NO_DOUBLE_COUNT')).result.model,cheap); assert.equal(savedResults().length,3);
+  safetyScenarios.push({finding:'F5',passed:true,successRunId:f5Success.handle.id,failedRunId:f5Failed.id,stoppedRunId:f5Stopped.id,pending:f5Pending,
+    sameMainRunId:f5Same.handle.id,mainRunId:f5Main.handle.id,residentRunId:f5Resident.runId,repairedResults:repaired,
+    originalOrder:['completed','failed','stopped'],physicalAppendOrder:['failed','completed','stopped'],freshMain:true,idempotent:true,liveRestoredAfterRepair:true});
   assert.ok(!fs.readFileSync(transcript,'utf8').includes('blocked_external_network'),'Proof attempted external networking');
   const rows = ledger(), decisions = rows.filter(row => row.type === 'decision');
   assert.ok(decisions.length >= 5);
@@ -322,25 +333,34 @@ try {
     assert.equal(outcome.admittedModel, 'router-proof/' + http.model); assert.equal(outcome.admittedEffort, http.effort);
     const selected = decision.mode === 'live' ? decision : decision.pin;
     assert.equal(outcome.admittedModel, selected.model); assert.equal(outcome.admittedEffort, selected.effort);
-    assert.equal(http.routeHeader, `${decision.routeClass}/${encodeURIComponent(selected.model)}-${selected.effort}/${decision.reasonCode}:${decision.decisionId}`);
+    assert.equal(http.routeHeader, `${decision.routeClass}/${encodeURIComponent(decision.model)}-${decision.effort}/${decision.reasonCode}:${decision.decisionId}`);
     const admission = safetyRows().find(row => row.type === 'admission' && row.decisionId === decision.decisionId && row.runId === decision.runId);
     if (decision.mode === 'live') assert.ok(admission, 'LIVE dispatch bypassed the shared durable admission journal');
     const nativeRun = fs.readFileSync(transcript, 'utf8').trim().split('\n').map(line => JSON.parse(line)).find(row => row.type === 'native_activation' && row.runId === decision.runId);
     assert.ok(nativeRun, 'Missing native Pi worker activation'); assert.equal(nativeRun.mode, 'rpc');
     assert.equal(nativeRun.model, outcome.admittedModel); assert.equal(nativeRun.thinking, outcome.admittedEffort);
     return { runId: decision.runId, decisionId: decision.decisionId, actorId: decision.actorId ?? null, routeClass: decision.routeClass,
-      mode: decision.mode, reason: decision.reasonCode, model: outcome.admittedModel, effort: outcome.admittedEffort, actualHttpHeader: http.routeHeader, status: outcome.status, safetyAdmission: admission ?? null };
+      mode: decision.mode, reason: decision.reasonCode, pin: decision.pin, shadowChoice: decision.shadowChoice, model: outcome.admittedModel, effort: outcome.admittedEffort, actualHttpHeader: http.routeHeader, status: outcome.status, safetyAdmission: admission ?? null };
   });
   assert.equal(evidence[0].reason, 'live-choice'); assert.equal(evidence[1].reason, 'live-choice');
-  assert.equal(evidence[2].reason, 'class-reverted'); assert.equal(evidence[3].reason, 'live-choice'); assert.equal(evidence[4].reason, 'jev-error');
-  assert.ok(rows.some(row => row.type === 'revert' && row.decisionId === evidence[1].decisionId && row.reason === 'quality-fail'));
-  proof = { passed: true, head, installedCli: path.resolve(cli), candidate, evidence, quality, actorId: actor.actor.id,
-    cleanedResidentActivation: nativeFirst, realResidentOwner: beforeQuality, durableQualityFence: qualityRows, safetyScenarios,
+  assert.ok(evidence.some(row=>row.reason==='jev-error'));
+  assert.ok(!rows.some(row=>row.type==='quality' || row.type==='revert'),'Automatic quality revert remains');
+  assert.ok(!fs.existsSync(path.join(profile,'fabric/model-routing-quality.jsonl')),'Quality-only journal remains');
+  const reasonEvidence = [task.handle.id,actor.first.runId].map(runId => {
+    const decision = rows.find(row=>row.type==='decision' && row.runId===runId);
+    const outcome = rows.find(row=>row.type==='outcome' && row.runId===runId);
+    const expected = runId===task.handle.id ? 'Round 8 task exception' : 'Round 8 actor exception';
+    assert.equal(decision.modelReason,expected); assert.equal(outcome.modelReason,expected);
+    return {runId,decisionId:decision.decisionId,modelReason:expected};
+  });
+  proof = { passed: true, head, installedCli: path.resolve(cli), candidate, evidence, actorId: actor.actor.id,
+    scope:'LIVE opted-in task/actor classes; manual revert only; automatic quality revert deferred to smarty-dev#4521',
+    cleanedResidentActivation: nativeFirst, realResidentOwner: residentOwner, safetyScenarios, modelReason:reasonEvidence,
     candidateSha256: createHash('sha256').update(fs.readFileSync(candidate)).digest('hex'),
     mocks: ['Jev fetch boundary', 'loopback OpenAI model/provider HTTP boundary'],
-    faultInjection: ['0400 quality journal', 'EFBIG append on two valid 8192-byte safety journals', '0500 actor A archive directory', '0400 terminal state journal'] };
+    faultInjection: ['EFBIG append on two valid 8192-byte admission journals', '0500 actor A archive directory', '0400 terminal state journal'] };
   fs.writeFileSync(path.join(out, 'evidence.json'), JSON.stringify(proof, null, 2));
-  console.log('PASS: installed Pi RPC + built Fabric; public live task/actor, durable quality demotion/pin, class isolation, Jev error fallback, actual HTTP X-Smarty-Route joins.');
+  console.log('PASS: installed Pi RPC + built Fabric; LIVE task/actor, manual Main/resident rollback, class isolation, Jev fallback, F2 custody, F5 repair, modelReason and native HTTP joins.');
 } catch (error) { failure = error; record({ type: 'proof_failure', error: String(error), stack: error.stack }); console.error(error); }
 finally {
   const native = fs.readFileSync(transcript, 'utf8').trim().split('\n').map(line => JSON.parse(line));

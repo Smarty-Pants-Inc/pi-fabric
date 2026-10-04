@@ -4,7 +4,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { prepareModelRoute } from "../src/agents/model-route-prepare.js";
-import { decideModelRoute, isRouteClassReverted, prepareRouteDispatch, ROUTE_DEADLINE_MS, routeLaunchCandidate, type ModelRoutingConfig } from "../src/agents/model-route.js";
+import { decideModelRoute, isRouteAdmissionBlocked, prepareRouteDispatch, ROUTE_DEADLINE_MS, routeLaunchCandidate, type ModelRoutingConfig } from "../src/agents/model-route.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG, loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
@@ -31,16 +31,16 @@ const manager = () => { const m = new AgentManager(root, { ...DEFAULT_FABRIC_CON
 const dispatch = async () => { const decision = await prepareModelRoute(input); return { decision,
   dispatch: prepareRouteDispatch(decision, undefined, path.join(root, decision.decisionId), decision.decisionId) }; };
 
-// This is a fresh process with no module/cache state: the host journal alone restores the switch.
-const restartedSwitch = () => {
-  const probe = spawnSync("bun", ["-e", `import { isRouteClassReverted } from ${JSON.stringify(path.resolve("src/agents/model-route.ts"))};
+// This is a fresh process with no module/cache state: the host journal alone restores admission safety.
+const restartedSwitch = (blocked = true) => {
+  const probe = spawnSync("bun", ["-e", `import { isRouteAdmissionBlocked } from ${JSON.stringify(path.resolve("src/agents/model-route.ts"))};
     import { prepareModelRoute } from ${JSON.stringify(path.resolve("src/agents/model-route-prepare.ts"))};
-    const reverted = isRouteClassReverted("status-groom");
+    const reverted = isRouteAdmissionBlocked("status-groom");
     const decision = await prepareModelRoute({routeClass:"status-groom",protected:false,pinModel:"test/sol",pinThinking:"high",parentSessionId:"fresh-main",
       registry:{getAvailable:()=>[{provider:"test",id:"sol"},{provider:"test",id:"luna"}]},aliases:{},config:${JSON.stringify(config)},assertModelAllowed(){},evaluate:async()=>(${JSON.stringify(answer())})});
     console.log(JSON.stringify({reverted,decision}));`], { encoding: "utf8", env: process.env });
   expect(probe.status, probe.stderr).toBe(0);
-  expect(JSON.parse(probe.stdout.trim())).toMatchObject({ reverted: true, decision: { ...pin, mode: "shadow", reasonCode: "class-reverted" } });
+  expect(JSON.parse(probe.stdout.trim())).toMatchObject({ reverted: blocked, decision: blocked ? { ...pin, mode: "shadow", reasonCode: "admission-blocked" } : { ...candidate, mode: "live", reasonCode: "live-choice" } });
 };
 
 describe("live model routing", () => {
@@ -131,84 +131,53 @@ describe("live model routing", () => {
     expect(await prepareModelRoute({ ...input, evaluate, registry: noReasoning })).toMatchObject({ ...pin, reasonCode: "invalid-candidates" });
     expect(evaluate).not.toHaveBeenCalled();
   });
-  it("reverts immediately on outcome quality fail and survives restart", async () => {
-    const run = await dispatch(); run.dispatch.outcome({ status: "completed", routeQuality: "fail" });
-    expect(isRouteClassReverted("status-groom")).toBe(true); restartedSwitch();
-    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "class-reverted" });
-    expect(rows().find(row => row.type === "revert")).toMatchObject({ routeClass: "status-groom", reason: "quality-fail", decisionId: run.decision.decisionId });
-  });
-  it("lets the caller report a review FAIL after settlement through owned run identity", async () => {
-    const m = manager(); const decision = await prepareModelRoute(input); const run = await m.spawn({ task: "ECHO_MODEL", routeDecision: decision });
-    await m.wait(run.id); m.reportRouteQuality(run.id, "fail");
-    expect(await prepareModelRoute(input)).toMatchObject({ mode: "shadow", reasonCode: "class-reverted" });
-    expect(rows().find(row => row.type === "quality")).toMatchObject({ decisionId: decision.decisionId, runId: run.id, routeQuality: "fail" });
-    expect(() => m.reportRouteQuality("foreign-run", "fail")).toThrow();
-  });
-  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fences a quality fail with readable unwritable state across restart and retries without losing its join", async () => {
-    const run = await dispatch();
-    fs.writeFileSync(state(), "", { mode: 0o400 }); fs.chmodSync(state(), 0o400);
-    expect(fs.readFileSync(state(), "utf8")).toBe("");
-    expect(() => run.dispatch.reportQuality("fail")).toThrow();
-    expect(rows().find(row => row.type === "quality")).toMatchObject({ decisionId: run.decision.decisionId, routeQuality: "fail" });
-    const journal = path.join(path.dirname(state()), "model-routing-quality.jsonl");
-    const receipts = () => fs.readFileSync(journal, "utf8").trim().split("\n").map(line => JSON.parse(line));
-    expect(receipts().map(row => row.type)).toEqual(["pending"]);
-    restartedSwitch(); // Fresh process still sees pending receipt, not the empty safety state.
-    const next = await prepareModelRoute(input);
-    expect(next).toMatchObject({ ...pin, mode: "shadow", reasonCode: "class-reverted" });
-    const m = manager(); const handle = await m.spawn({ task: "ECHO_MODEL", routeDecision: next });
-    expect(await m.wait(handle.id)).toMatchObject({ model: pin.model, thinking: pin.effort });
-    expect(fs.readFileSync(state(), "utf8")).toBe("");
-    fs.chmodSync(state(), 0o600);
-    expect(isRouteClassReverted("status-groom")).toBe(true);
-    expect(receipts().map(row => row.type)).toEqual(["pending", "committed"]);
-    expect(rows().filter(row => row.type === "quality")).toHaveLength(1);
-    expect(JSON.parse(fs.readFileSync(state(), "utf8").trim())).toMatchObject({ decisionId: run.decision.decisionId, routeQuality: "fail" });
-    restartedSwitch();
-  });
-  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fences the FIRST quality intent failure through the public report in a fresh process", async () => {
-    const m = manager(); const decision = await prepareModelRoute(input);
-    const run = await m.spawn({ task: "ECHO_MODEL", routeDecision: decision }); await m.wait(run.id);
-    const journal = path.join(path.dirname(state()), "model-routing-quality.jsonl");
-    fs.writeFileSync(journal, "", { mode: 0o400 }); fs.chmodSync(journal, 0o400);
-    expect(() => m.reportRouteQuality(run.id, "fail")).toThrow();
-    expect(fs.readFileSync(journal, "utf8")).toBe("");
-    const safety = fs.readFileSync(path.join(path.dirname(state()), "model-routing-pending.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-    expect(safety.at(-1)).toMatchObject({ type: "pending", decision: { decisionId: decision.decisionId }, result: { routeQuality: "fail" } });
-    restartedSwitch();
-    const next = await prepareModelRoute(input);
-    expect(next).toMatchObject({ ...pin, mode: "shadow", reasonCode: "class-reverted" });
-    const pinned = await m.spawn({ task: "ECHO_MODEL", routeDecision: next });
+  it("reverts manually with an empty allowlist and keeps other opted-in classes live", async () => {
+    const m = manager();
+    const live = await m.spawn({ task: "ECHO_MODEL", routeDecision: await prepareModelRoute(input) });
+    expect(await m.wait(live.id)).toMatchObject({ model: candidate.model, thinking: candidate.effort });
+    const reverted = await prepareModelRoute({ ...input, config: { ...config, liveClasses: [] } });
+    expect(reverted.mode).toBe("shadow");
+    const pinned = await m.spawn({ task: "ECHO_MODEL", routeDecision: reverted });
     expect(await m.wait(pinned.id)).toMatchObject({ model: pin.model, thinking: pin.effort });
-    expect(await prepareModelRoute({ ...input, routeClass: "bounded-lookup", config: { ...config, liveClasses: ["bounded-lookup"] } })).toMatchObject({ mode: "live" });
-    fs.chmodSync(journal, 0o600); expect(isRouteClassReverted("status-groom")).toBe(true); restartedSwitch();
-    expect(rows().filter(row => row.type === "quality")).toHaveLength(1);
-    expect(rows().find(row => row.type === "quality")).toMatchObject({ decisionId: decision.decisionId, runId: run.id, routeQuality: "fail" });
+    expect((await prepareModelRoute({ ...input, routeClass: "bounded-lookup", config: { ...config, liveClasses: ["bounded-lookup"] } })).mode).toBe("live");
   });
-  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fences failed/stopped terminal saves across restart and repairs the original streak exactly once", async () => {
+  it("never automatically reverts after failed, stopped or timed-out runs or untyped quality assertions", async () => {
+    for (const status of ["failed", "stopped", "timed_out", "completed"] as const) {
+      const run = await dispatch();
+      run.dispatch.outcome({ status, ...{ routeQuality: "fail" } });
+      run.dispatch.outcome({ status });
+      expect(isRouteAdmissionBlocked("status-groom")).toBe(false);
+      expect(await prepareModelRoute(input)).toMatchObject({ mode: "live", reasonCode: "live-choice" });
+    }
+    restartedSwitch(false);
+    expect(rows().filter(row => row.type === "outcome")).toHaveLength(4);
+    expect(rows().some(row => row.type === "revert" || row.type === "quality")).toBe(false);
+    expect(rows().filter(row => row.type === "outcome").every(row => !("routeQuality" in row))).toBe(true);
+    expect(fs.existsSync(path.join(path.dirname(state()), "model-routing-quality.jsonl"))).toBe(false);
+  });
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fences failed/stopped terminal saves across restart and repairs the original joins exactly once", async () => {
     // Both runs were admitted before the first terminal save failed.
     const first = await dispatch(), second = await dispatch();
     fs.writeFileSync(state(), "", { mode: 0o400 }); fs.chmodSync(state(), 0o400);
     expect(() => first.dispatch.outcome({ status: "failed" })).toThrow();
     expect(() => second.dispatch.outcome({ status: "stopped" })).toThrow();
     restartedSwitch();
-    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "class-reverted" });
+    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "admission-blocked" });
     expect(fs.readFileSync(state(), "utf8")).toBe("");
-    fs.chmodSync(state(), 0o600); expect(isRouteClassReverted("status-groom")).toBe(true);
+    fs.chmodSync(state(), 0o600); expect(isRouteAdmissionBlocked("status-groom")).toBe(false);
     first.dispatch.outcome({ status: "failed" }); second.dispatch.outcome({ status: "stopped" });
     const saved = fs.readFileSync(state(), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(saved).toHaveLength(2);
     expect(saved.map(row => [row.decisionId, row.status])).toEqual([[first.decision.decisionId, "failed"], [second.decision.decisionId, "stopped"]]);
     expect(rows().filter(row => row.type === "outcome")).toHaveLength(2);
-    expect(rows().filter(row => row.type === "revert")).toHaveLength(1);
-    expect(rows().find(row => row.type === "revert")).toMatchObject({ reason: "consecutive-failures", decisionId: second.decision.decisionId });
-    restartedSwitch();
+    expect(rows().filter(row => row.type === "revert")).toHaveLength(0);
+    restartedSwitch(false);
   });
   it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("pins even one pending successful terminal save and resumes only after repair", async () => {
     const run = await dispatch(); fs.writeFileSync(state(), "", { mode: 0o400 }); fs.chmodSync(state(), 0o400);
     expect(() => run.dispatch.outcome({ status: "completed" })).toThrow(); restartedSwitch();
-    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, reasonCode: "class-reverted" });
-    fs.chmodSync(state(), 0o600); expect(isRouteClassReverted("status-groom")).toBe(false);
+    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, reasonCode: "admission-blocked" });
+    fs.chmodSync(state(), 0o600); expect(isRouteAdmissionBlocked("status-groom")).toBe(false);
     expect(await prepareModelRoute(input)).toMatchObject({ mode: "live", reasonCode: "live-choice" });
     run.dispatch.outcome({ status: "completed" }); expect(rows().filter(row => row.type === "outcome")).toHaveLength(1);
   });
@@ -227,7 +196,7 @@ describe("live model routing", () => {
       if (typeof file === "number" && fs.fstatSync(file).size === 8192) throw Object.assign(new Error(code), { code });
       return write(file, ...args);
     });
-    expect(() => run.dispatch.reportQuality("fail")).toThrow(code);
+    expect(() => run.dispatch.outcome({ status: "failed" })).toThrow(code);
     fault.mockRestore();
     for (const journal of journals) expect(fs.readFileSync(journal, "utf8")).toBe(full); // No durable failure fence at all.
     const fresh = spawnSync("bun", ["-e", `import fs from "node:fs";
@@ -279,40 +248,6 @@ describe("live model routing", () => {
     expect(JSON.parse(fs.readFileSync(journal, "utf8").trim())).toMatchObject({ type: "admission", decisionId: decision.decisionId });
   });
 
-  it.each([0, 128])("fails closed across fresh owners when the writable safety journal has only %s bytes left", async remaining => {
-    const decision = await prepareModelRoute(input), m = manager();
-    const run = await m.spawn({ task: "ECHO_MODEL", routeDecision: decision }); await m.wait(run.id);
-    const journal = path.join(path.dirname(state()), "model-routing-pending.jsonl");
-    const prefix = JSON.stringify({ type: "committed", receiptId: "capacity-fixture", at: 1, padding: "" });
-    const row = prefix.slice(0, -2) + "x".repeat(64 * 1024 - Buffer.byteLength(prefix) - 1) + '"}\n';
-    expect(Buffer.byteLength(row)).toBe(64 * 1024);
-    // Safe committed rows; append-open/fsync succeeds, an actual intent cannot.
-    fs.writeFileSync(journal, row.repeat(1024));
-    if (remaining) fs.truncateSync(journal, 64 * 1024 * 1024 - 64 * 1024);
-    if (remaining) {
-      const tail = JSON.stringify({ type: "committed", receiptId: "tail", at: 1, padding: "" });
-      fs.appendFileSync(journal, tail.slice(0, -2) + "x".repeat(64 * 1024 - remaining - Buffer.byteLength(tail) - 1) + '"}\n');
-    }
-    const fd = fs.openSync(journal, "a"); fs.fsyncSync(fd); fs.closeSync(fd);
-    expect(fs.statSync(journal).size).toBe(64 * 1024 * 1024 - remaining);
-    expect(() => m.reportRouteQuality(run.id, "fail")).toThrow(/oversized/);
-    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "revert-state-error" });
-    const fresh = spawnSync("bun", ["-e", `import {prepareModelRoute} from ${JSON.stringify(path.resolve("src/agents/model-route-prepare.ts"))};
-      console.log(JSON.stringify(await prepareModelRoute({routeClass:"status-groom",protected:false,pinModel:"test/sol",pinThinking:"high",parentSessionId:"fresh-main",
-        registry:{getAvailable:()=>[{provider:"test",id:"sol"},{provider:"test",id:"luna"}]},aliases:{},config:${JSON.stringify(config)},assertModelAllowed(){},evaluate:async()=>(${JSON.stringify(answer())})})));`], { encoding: "utf8", env: process.env });
-    expect(fresh.status, fresh.stderr).toBe(0);
-    expect(JSON.parse(fresh.stdout.trim())).toMatchObject({ ...pin, mode: "shadow", reasonCode: "revert-state-error" });
-    const refused = path.join(path.dirname(state()), "model-routing-refused.jsonl");
-    expect(JSON.parse(fs.readFileSync(refused, "utf8").trim())).toMatchObject({ decision: { decisionId: decision.decisionId }, result: { routeQuality: "fail" } });
-    // Explicit reconciliation retires ONLY these committed capacity-fixture rows.
-    // The refused assertion must replay from disk in a fresh owner, not be erased.
-    fs.truncateSync(journal, 0); restartedSwitch();
-    expect(rows().filter(row => row.type === "quality")).toHaveLength(1);
-    expect(rows().find(row => row.type === "quality")).toMatchObject({ runId: run.id, routeQuality: "fail" });
-    expect(isRouteClassReverted("status-groom")).toBe(true); restartedSwitch();
-    expect(rows().filter(row => row.type === "quality")).toHaveLength(1);
-  }, 30000);
-
   it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("orders repaired A-success before B-failure and C-stop from three pre-admitted runs", async () => {
     const a = await dispatch(), b = await dispatch(), c = await dispatch();
     for (const run of [a, b, c]) expect(run.decision.mode).toBe("live");
@@ -321,50 +256,25 @@ describe("live model routing", () => {
     fs.chmodSync(state(), 0o600); b.dispatch.outcome({ status: "failed" });
     fs.chmodSync(state(), 0o400); expect(() => c.dispatch.outcome({ status: "stopped" })).toThrow();
     restartedSwitch();
-    fs.chmodSync(state(), 0o600); restartedSwitch(); // Fresh owner repairs, in physical B/A/C order.
+    fs.chmodSync(state(), 0o600); restartedSwitch(false); // Fresh owner repairs, in physical B/A/C order.
     const saved = fs.readFileSync(state(), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(saved.map(row => row.decisionId)).toEqual([b.decision.decisionId, a.decision.decisionId, c.decision.decisionId]);
     expect([...saved].sort((x, y) => x.at - y.at).map(row => row.status)).toEqual(["completed", "failed", "stopped"]);
-    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "class-reverted" });
+    expect(await prepareModelRoute(input)).toMatchObject({ ...candidate, mode: "live", reasonCode: "live-choice" });
     a.dispatch.outcome({ status: "completed" }); b.dispatch.outcome({ status: "failed" }); c.dispatch.outcome({ status: "stopped" });
-    restartedSwitch();
+    restartedSwitch(false);
     expect(fs.readFileSync(state(), "utf8").trim().split("\n")).toHaveLength(3);
     expect(rows().filter(row => row.type === "outcome")).toHaveLength(3);
-    expect(rows().filter(row => row.type === "revert")).toHaveLength(1);
+    expect(rows().filter(row => row.type === "revert")).toHaveLength(0);
   });
 
-  it("keeps non-live quality feedback audit-only without poisoning live admission", async () => {
-    const shadow = await prepareModelRoute({ ...input, routeClass: "critical-read", protected: true });
-    const report = prepareRouteDispatch(shadow, undefined, path.join(root, shadow.decisionId), shadow.decisionId);
-    report.reportQuality("fail");
-    expect(rows().find(row => row.type === "quality")).toMatchObject({ routeClass: "critical-read", routeQuality: "fail" });
-    expect(await prepareModelRoute(input)).toMatchObject({ mode: "live", reasonCode: "live-choice" });
-  });
-  it("reverts after two consecutive failed/aborted runs, not after one or duplicate settlement", async () => {
-    const first = await dispatch(); first.dispatch.outcome({ status: "failed" }); first.dispatch.outcome({ status: "failed" });
-    expect(isRouteClassReverted("status-groom")).toBe(false);
-    const second = await dispatch(); second.dispatch.outcome({ status: "stopped" });
-    restartedSwitch(); expect((await prepareModelRoute(input)).reasonCode).toBe("class-reverted");
-    expect(rows().filter(row => row.type === "revert")).toHaveLength(1);
-    expect(rows().find(row => row.type === "revert")).toMatchObject({ reason: "consecutive-failures", decisionId: second.decision.decisionId });
-  });
-  it("resets the failure streak on success, isolates classes, and reverses with a new config generation", async () => {
-    for (const status of ["failed", "completed", "timed_out"] as const) (await dispatch()).dispatch.outcome({ status });
-    expect(isRouteClassReverted("status-groom")).toBe(false);
-    const old = await dispatch(); old.dispatch.outcome({ status: "failed" });
-    const resetConfig = { ...config, revertReset: { "status-groom": "approved-retry-2" } };
-    expect(await prepareModelRoute({ ...input, config: resetConfig })).toMatchObject({ mode: "live", revertReset: "approved-retry-2" });
-    old.dispatch.reportQuality("fail");
-    expect((await prepareModelRoute({ ...input, config: resetConfig })).mode).toBe("live");
-    expect((await prepareModelRoute({ ...input, routeClass: "bounded-lookup", config: { ...config, liveClasses: ["bounded-lookup"] } })).mode).toBe("live");
-  });
   it("fails closed on corrupt, linked or unsafe durable state", async () => {
     fs.mkdirSync(path.dirname(state()), { recursive: true, mode: 0o700 });
     fs.writeFileSync(state(), "not-json\n", { mode: 0o600 });
-    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "revert-state-error" });
+    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "admission-state-error" });
     fs.writeFileSync(state(), "{}\n");
-    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "revert-state-error" });
+    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "admission-state-error" });
     fs.unlinkSync(state()); const target = path.join(root, "state-target"); fs.writeFileSync(target, "", { mode: 0o600 }); fs.symlinkSync(target, state());
-    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "revert-state-error" });
+    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "admission-state-error" });
   });
 });

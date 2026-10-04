@@ -1328,15 +1328,6 @@ export class ResidentHost {
           actors: this.actors.listOwned().filter((actor) => actor.rootId === this.config.rootId),
           completedAt: Date.now(),
         };
-      } else if (command.operation === "routeQuality") {
-        this.#authorizeResidentSetter(command.caller);
-        const target = await this.actors.routeQualityTarget(command.id);
-        if (!target || target.actor.rootId !== this.config.rootId || !this.actors.owns(target.actor.id)) {
-          throw new ResidentActorAuthorizationError("Resident host does not own this actor activation");
-        }
-        commit(target.actor.id);
-        const actor = await this.actors.reportRouteQuality(command.id, command.routeQuality);
-        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, completedAt: Date.now() };
       } else if (command.operation !== "removeActor") {
         if (command.operation === "setInstructions" || command.operation === "setModel" ||
           command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools" ||

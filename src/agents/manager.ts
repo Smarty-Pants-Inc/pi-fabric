@@ -333,7 +333,6 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   modelReason?: string;
   thinking?: AgentRunRequest["thinking"];
   routeOutcome?: (result: AgentRunResult) => void;
-  routeQualityReport?: (quality: "pass" | "fail") => void;
   /** Original authority for every attempt, never a prepared/observed replacement label. */
   routePin?: Readonly<NonNullable<AgentRunRequest["routeDecision"]>["pin"]>;
   actorId?: string;
@@ -1456,7 +1455,7 @@ export class AgentManager {
           ...(model ? { model } : {}),
           ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
           ...(thinking ? { thinking } : {}),
-          ...(routeDispatch ? { routeOutcome: routeDispatch.outcome, routeQualityReport: routeDispatch.reportQuality } : {}),
+          ...(routeDispatch ? { routeOutcome: routeDispatch.outcome } : {}),
           ...(routePin ? { routePin } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
           ...(request.actorName ? { actorName: request.actorName } : {}),
@@ -1693,12 +1692,6 @@ export class AgentManager {
   }
 
   /** Caller/actor quality assertion, joined to a locally owned routed run only. */
-  reportRouteQuality(id: string, quality: "pass" | "fail"): void {
-    if (quality !== "pass" && quality !== "fail") throw new Error("Invalid routeQuality");
-    const run = this.#requireRun(id);
-    if (!run.routeQualityReport) throw new Error("Run has no model route decision");
-    run.routeQualityReport(quality);
-  }
 
   /** Side-effect-free settlement join for preparation before a durable mutation fence. */
   async join(id: string): Promise<void> {

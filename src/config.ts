@@ -1077,6 +1077,21 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
             if (routing.live !== undefined && routing.live !== false) throw new Error("Live model routing requires measured parity and Paul's floor approval (#2236); unavailable in shadow mode");
             return {
               live: false as const,
+              liveClasses: (() => {
+                if (routing.liveClasses === undefined) return [];
+                if (!Array.isArray(routing.liveClasses) || !routing.liveClasses.every(value => typeof value === "string" && /^[a-z][a-z0-9:-]{0,63}$/.test(value))) {
+                  throw new Error("Invalid agents.modelRouting.liveClasses");
+                }
+                return [...new Set(routing.liveClasses as string[])];
+              })(),
+              revertReset: (() => {
+                if (routing.revertReset === undefined) return {};
+                if (!routing.revertReset || typeof routing.revertReset !== "object" || Array.isArray(routing.revertReset) ||
+                  !Object.values(routing.revertReset).every(value => typeof value === "string" && value.length <= 128)) {
+                  throw new Error("Invalid agents.modelRouting.revertReset");
+                }
+                return { ...routing.revertReset as Record<string, string> };
+              })(),
               ...(typeof routing.pinModel === "string" ? { pinModel: routing.pinModel } : {}),
               ...(isFabricThinking(routing.pinThinking) ? { pinThinking: routing.pinThinking } : {}),
               shadowCandidates: Array.isArray(routing.shadowCandidates)

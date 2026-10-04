@@ -41,11 +41,11 @@ afterEach(async () => {
 const actorSpec = { name: "supervisor", instructions: "Status only or no-op.", residency: "durable" as const,
   runner: "pi" as const, transport: "process" as const, extensions: false, model: pin.model, thinking: pin.effort,
   routeClass: "status-groom" as const, protected: false };
-const setup = (routePolicy = policy()) => {
+const setup = (routePolicy = policy(), routeConfig = { ...config, liveClasses: [] as string[] }) => {
   const dir = root();
   const mesh = new MeshStore(path.join(dir, "mesh"), 64 * 1024, 100);
   const lifecycle: FabricLifecyclePublishRequest[] = [];
-  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, modelRouting: config, retainRuns: true }, {
+  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, modelRouting: routeConfig, retainRuns: true }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"),
     onLifecycle: event => lifecycle.push(event),
     preparePiModel: async (model, requiredPin) => {
@@ -63,7 +63,7 @@ const setup = (routePolicy = policy()) => {
       return `${exact.provider}/${exact.id}`;
     },
     prepareModelRoute: (input: ActorModelRouteInput, signal: AbortSignal) =>
-      prepareModelRoute({ ...input, signal, registry, aliases: {}, config, assertModelAllowed: model => agents.assertModelAllowed(model, "pi"),
+      prepareModelRoute({ ...input, signal, registry, aliases: {}, config: routeConfig, assertModelAllowed: model => agents.assertModelAllowed(model, "pi"),
         evaluate: (input, routeSignal) => owner.evaluate(input, routeSignal) }),
   };
   const identity = { id: "session:owner", name: "main", kind: "main" as const, sessionId: "owner" };
@@ -137,18 +137,50 @@ describe("actor status-groom shadow routing", () => {
     expect(actors.definition(actor.id)).toMatchObject({ routeClass: "status-groom", protected: false });
     expect(actors.status(actor.id)).toMatchObject({ routeClass: "status-groom", protected: false });
   });
-  it.each([false, true])("preserves the effective exception in routed activation records and run.spawned (session override: %s)", async sessionOverride => {
+  it("launches the live finite candidate per activation, preserves session and joins actual outcome", async () => {
+    vi.spyOn(JevClient.prototype, "evaluate").mockImplementation(async () => answer());
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const { actors } = setup(policy(), { ...config, liveClasses: ["status-groom"] });
+    const actor = await actors.create(actorSpec);
+    const first = await actors.ask(actor.id, "ECHO_MODEL", "test");
+    const session = actors.status(actor.id).sessionFile!;
+    const header = fs.readFileSync(session, "utf8").split("\n")[0];
+    const second = await actors.ask(actor.id, "ECHO_MODEL", "test");
+    expect(first.text).toContain(cheap.model); expect(second.text).toContain(cheap.model);
+    expect(fs.readFileSync(session, "utf8").split("\n")[0]).toBe(header);
+    for (const [dispatch] of launch.mock.calls) {
+      expect(flag(dispatch.workerArguments, "--model")).toBe(cheap.model);
+      expect(flag(dispatch.workerArguments, "--thinking")).toBe(cheap.effort);
+      expect(flag(dispatch.workerArguments, "--session-file")).toBe(session);
+      expect(flag(dispatch.workerArguments, "--route-header")).toContain("live-choice:");
+    }
+    for (const decision of records().filter(row => row.type === "decision")) {
+      expect(decision).toMatchObject({ mode: "live", actorId: actor.id });
+      expect(records().find(row => row.type === "outcome" && row.decisionId === decision.decisionId)).toMatchObject({ admittedModel: cheap.model, admittedEffort: cheap.effort });
+    }
+  });
+  it("has no actor quality reporter and leaves subsequent opted-in activations live", async () => {
+    vi.spyOn(JevClient.prototype, "evaluate").mockImplementation(async () => answer());
+    const { actors } = setup(policy(), { ...config, liveClasses: ["status-groom"] });
+    const actor = await actors.create(actorSpec);
+    expect((await actors.ask(actor.id, "ECHO_MODEL", "test")).text).toContain(cheap.model);
+    expect("reportRouteQuality" in actors).toBe(false);
+    expect("routeQualityTarget" in actors).toBe(false);
+    expect((await actors.ask(actor.id, "ECHO_MODEL", "test")).text).toContain(cheap.model);
+  });
+  it.each([[false, false], [true, false], [false, true], [true, true]])("preserves the effective exception in routed activation records and run.spawned (session override: %s, live: %s)", async (sessionOverride, live) => {
     const evaluate = vi.spyOn(JevClient.prototype, "evaluate").mockImplementation(async () => answer());
-    const { actors, agents, dir, lifecycle } = setup();
+    const { actors, agents, dir, lifecycle } = setup(policy(), { ...config, liveClasses: live ? ["status-groom"] : [] });
     const creationReason = "  Named creation exception  ";
     const sessionReason = "  Named session binding exception  ";
     const actor = await actors.create({ ...actorSpec, modelReason: creationReason });
     if (sessionOverride) await actors.setModel(actor.id, cheap.model, "session", undefined, sessionReason);
     const modelReason = sessionOverride ? sessionReason : creationReason;
-    const model = sessionOverride ? cheap.model : pin.model;
+    const pinModel = sessionOverride ? cheap.model : pin.model;
+    const model = live ? cheap.model : pinModel;
     await actors.ask(actor.id, "ECHO_MODEL", "test");
     const decision = records().find(row => row.type === "decision")!;
-    expect(decision).toMatchObject({ modelReason, pin: { model, effort: pin.effort } });
+    expect(decision).toMatchObject({ modelReason, mode: live ? "live" : "shadow", pin: { model: pinModel, effort: pin.effort } });
     expect(records().find(row => row.type === "outcome")).toMatchObject({ modelReason });
     expect(agents.status(decision.runId)).toMatchObject({ model, modelReason, status: "completed" });
     expect(lifecycle.find(event => event.event === "run.spawned")).toMatchObject({
@@ -161,6 +193,7 @@ describe("actor status-groom shadow routing", () => {
     }
     expect(actors.definition(actor.id).modelReason).toBe(creationReason);
     expect(JSON.stringify(evaluate.mock.calls)).not.toContain(modelReason.trim());
+
   });
   it.each([true, undefined])("does not route protected or unknown actor state: %s", async protectedFlag => {
     const evaluate = vi.spyOn(JevClient.prototype, "evaluate").mockImplementation(async () => answer());
@@ -177,7 +210,7 @@ describe("actor status-groom shadow routing", () => {
     if (blocked === "disabled") routePolicy.jev.enabled = false;
     if (blocked === "network") routePolicy.networkAllowed = false;
     if (blocked === "schema") routePolicy.schemaEnforced = true;
-    const { actors } = setup(routePolicy);
+    const { actors } = setup(routePolicy, { ...config, liveClasses: ["status-groom"] });
     const actor = await actors.create(actorSpec);
     expect((await actors.ask(actor.id, "ECHO_MODEL", "test")).text).toContain(pin.model);
     expect(evaluate).not.toHaveBeenCalled();

@@ -306,12 +306,25 @@ export class ResidentHost {
     const currentConfig = (): Partial<ResidentHostConfig> => {
       const desired = readJson<Partial<ResidentHostConfig>>(guidanceConfigPath);
       // Desired B/C is NOT an effective A overlay or an A rollback snapshot.
+      // Once accepted, however, the snapshot is authoritative: omission of an
+      // optional policy is an explicit revocation, not permission to fall back
+      // to the constructor's startup policy.
       return desired?.fabricExtensionPath === config.fabricExtensionPath && desired.workerPath === config.workerPath &&
         desired.rootId === config.rootId && desired.sessionId === config.sessionId ? desired : config;
     };
+    const currentModelRouting = (): ResidentHostConfig["agents"]["modelRouting"] => {
+      const overlay = currentConfig();
+      return overlay === config ? config.agents.modelRouting : overlay.agents?.modelRouting;
+    };
     this.#effectiveConfig = () => {
       const overlay = currentConfig();
+      const acceptedAgents = { ...config.agents };
+      if (overlay.agents?.modelRouting) acceptedAgents.modelRouting = overlay.agents.modelRouting;
+      else delete acceptedAgents.modelRouting;
       return { ...config,
+        // An accepted snapshot that omits modelRouting must clear the startup
+        // value. Invalid/unavailable snapshots still use the startup config.
+        ...(overlay === config ? {} : { agents: acceptedAgents }),
         ...(overlay.piModels ? { piModels: overlay.piModels } : {}),
         ...(overlay.modelGuidance ? { modelGuidance: overlay.modelGuidance } : {}),
         ...(overlay.kernel ? { kernel: overlay.kernel } : {}),
@@ -497,8 +510,9 @@ export class ResidentHost {
         resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
         prepareModelRoute: async (input, signal) => {
           const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
-          return prepareModelRoute({ ...input, signal, config: config.agents.modelRouting,
-            registry: residentRouteRegistry(), aliases: normalizeModelAliases((currentConfig().piModels ?? config.piModels)?.aliases),
+          const overlay = currentConfig();
+          return prepareModelRoute({ ...input, signal, config: currentModelRouting(),
+            registry: residentRouteRegistry(), aliases: normalizeModelAliases((overlay.piModels ?? config.piModels)?.aliases),
             assertModelAllowed: model => this.agents.assertModelAllowed(model, "pi"),
             evaluate: (request, routeSignal) => this.#routeOwner!.evaluate(request, routeSignal) });
         },

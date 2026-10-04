@@ -278,11 +278,17 @@ describe.skipIf(!availablePythonBackends.monty)("fabric-graph Python skill progr
     expect(seeded.value).toMatchObject({ run: "r1", key: "runs/r1/graph", actor: "actor-1" });
     expect(seeded.calls).toEqual(["mesh.put", "agents.create", "agents.tell"]);
     let graph: Record<string, unknown> = { node: "approve", status: "ready", results: {} };
+    let version = 3;
+    let decisionWaits = 0;
     const node = (ref: string, args: Record<string, unknown>) => {
-      if (ref === "mesh.get") return { key: "runs/r1/graph", value: graph, version: 3 };
-      if (ref === "mesh.put") { graph = args.value as Record<string, unknown>; return { version: 4 }; }
+      if (ref === "mesh.get") return { key: "runs/r1/graph", value: graph, version };
+      if (ref === "mesh.put") {
+        expect(args.ifVersion).toBe(version);
+        graph = args.value as Record<string, unknown>;
+        return { key: "runs/r1/graph", value: graph, version: ++version };
+      }
       if (ref === "decisions.raise") return { id: "dec_00000001" };
-      if (ref === "decisions.wait") return { status: "answered", answer: { optionId: "yes" } };
+      if (ref === "decisions.wait") return ++decisionWaits === 1 ? { status: "open" } : { status: "answered", answer: { optionId: "yes" } };
       if (ref === "mesh.self") return { id: "actor-1" };
       if (ref === "programs.run") return { ok: true };
       return { queued: true };

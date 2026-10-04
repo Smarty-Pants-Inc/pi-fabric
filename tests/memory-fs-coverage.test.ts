@@ -41,7 +41,8 @@ it("marks descriptor read and stat failures incomplete", async () => {
   const root = temp(); const file = path.join(root, "bad.jsonl"); fs.writeFileSync(file, "{}\n");
   const original = fs.readFileSync;
   vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, options: unknown) => {
-    if (String(target) === file) throw new Error("EIO " + file);
+    // Secure loading reads the already-validated descriptor, not the path.
+    if (typeof target === "number" || String(target) === file) throw new Error("EIO " + file);
     return original(target, options as BufferEncoding);
   }) as typeof fs.readFileSync);
   expect(await list(root)).toEqual({ sessions: [], coverage: { complete: false, reason: "fs_source_incomplete" } });

@@ -132,6 +132,75 @@ describe("ActorManager idle observer versus canonical authority (#4383)", () => 
     expect(actors.status(actor.id).queued).toBe(0);
     expect(agents.list()).toEqual([]);
   });
+
+  // Astra #468 F1: fresh-positive delivery can replace ALL persistent actor objects
+  // while the idle view is stale-negative. Outstanding preparation retries then
+  // drain only the new objects, so accepting work on old queues loses it forever.
+  it("re-resolves every subscriber after persistent ownership reacquisition", async () => {
+    let dispatch!: ActorMeshMonitor["callbacks"]["onEvent"];
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
+      dispatch = this.callbacks.onEvent;
+    });
+    const schedule = vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
+    const read = vi.spyOn(ActorRegistryStore.prototype, "read");
+    let observed = true;
+    const ids: string[] = [];
+    const snapshot = vi.fn((fresh = true) => new Map(ids.map(id => [id, fresh || observed])));
+    let failures = 2;
+    const acquire = vi.fn(async (): Promise<FabricCapabilityViewLease> => {
+      if (failures-- > 0) throw new Error("transient preparation");
+      return {
+        satisfied: true, missing: [], optionalMissing: [],
+        view: {
+          id: "view-reacquisition", digest: "digest-reacquisition", semanticDigest: "semantic-reacquisition",
+          bindings: { "demo.echo": { ref: "demo.echo", provider: "demo", providerBindingId: "binding-reacquisition", generation: 1, descriptorHash: "descriptor-reacquisition" } },
+        },
+        release: async () => {},
+      };
+    });
+    try {
+      const { actors, mesh, root, identity, agents } = setup(true, () => true, acquire,
+        undefined, {}, {}, snapshot);
+      for (const name of ["first-subscriber", "second-subscriber"]) {
+        ids.push((await actors.create({ name, instructions: "Review.", requires: ["demo.echo"],
+          topics: ["owner.work"], responseMode: "text", coalesce: false })).id);
+      }
+      const runs = recordRuns(agents);
+      const seed = await mesh.publish({ topic: "owner.work", from: identity, text: "retry seed" });
+      expect(dispatch(seed)).toBe(true);
+      await waitFor(() => acquire.mock.calls.length === 2 && actors.inFlightCount() === 0);
+      expect(ids.map(id => actors.status(id).queued)).toEqual([1, 1]);
+      expect(runs).toHaveLength(0); // preparation retries, not worker attempts
+      const registry = path.join(root, "actors", "actors.json");
+      const unchanged = fs.readFileSync(registry, "utf8");
+      observed = false;
+      expect(actors.listOwned()).toEqual([]); // stale-negative observer parks seeds
+      expect(fs.readFileSync(registry, "utf8")).toBe(unchanged);
+      const event = await mesh.publish({ topic: "owner.work", from: identity, text: "reacquired event" });
+      read.mockClear(); snapshot.mockClear();
+      expect(dispatch(event)).toBe(true);
+      expect(read).toHaveBeenCalledTimes(1); // proves the replacement branch ran
+      expect(snapshot).toHaveBeenCalledTimes(1);
+      expect(snapshot).toHaveBeenCalledWith(true); // one canonical snapshot for both
+      for (const id of ids) {
+        expect(actors.status(id).queued).toBe(1); // NEW registered object's queue
+        const pending = queueFiles(root, id).flatMap(({ text }) => JSON.parse(text).items ?? []);
+        expect(pending.filter((item: { payload?: { id?: string } }) => item.payload?.id === event.id)).toHaveLength(1);
+      }
+      snapshot.mockClear();
+      expect(dispatch(event)).toBe("ignored");
+      expect(snapshot).not.toHaveBeenCalled(); // accepted delivery IDs stay deduplicated
+      observed = true;
+      await waitFor(() => ids.every(id => actors.messages(id).filter(message =>
+        message.direction === "out" && message.runId && !message.error).length === 2), 15_000);
+      expect(runs).toHaveLength(4); // each seed + reacquired event runs once per subscriber
+      for (const id of ids) {
+        expect(actors.messages(id).filter(message => message.direction === "in" &&
+          (message.data as { id?: string } | undefined)?.id === event.id)).toHaveLength(1);
+        expect(actors.status(id).queued).toBe(0);
+      }
+    } finally { start.mockRestore(); schedule.mockRestore(); read.mockRestore(); }
+  }, 30_000);
 });
 
 describe("ActorManager idle registry writes (#4383)", () => {

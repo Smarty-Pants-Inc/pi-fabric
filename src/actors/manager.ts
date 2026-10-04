@@ -3377,27 +3377,36 @@ export class ActorManager {
   }
 
   #deliverMeshEvent(event: MeshEvent): boolean | "ignored" {
+    // Keep stable IDs across ownership refreshes: persistent reacquisition can replace
+    // every ManagedActor object before the synchronous delivery loop enqueues work.
     const targets = [...this.#actors.values()].filter((actor) => {
       if (actor.status === "stopped") return false;
       const addressed = event.to === actor.id || event.to === actor.name;
       return (addressed || actor.topics.includes(event.topic)) &&
         (event.from.id !== actor.id || addressed) &&
         !this.#delivered.has(`${actor.id}\0${event.id}`);
-    });
+    }).map((actor) => actor.id);
     if (targets.length === 0) return "ignored";
     // One canonical directory snapshot per matching event, shared only by its
     // synchronous deliveries. Activation/presence continuations still read fresh.
     return this.#withOwnershipRead(() => this.#deliverMeshTargets(event, targets));
   }
 
-  #deliverMeshTargets(event: MeshEvent, targets: ManagedActor[]): boolean | "ignored" {
+  #deliverMeshTargets(event: MeshEvent, targets: readonly string[]): boolean | "ignored" {
     let full = false;
     let handedOn = false;
-    for (const actor of targets) {
+    for (const actorId of targets) {
+      this.#refreshOwnership(actorId);
+      // Ownership reacquisition may have reloaded the registry. Never enqueue on
+      // the captured object; resolve the current actor and recheck its filters.
+      const actor = this.#actors.get(actorId);
+      if (!actor || actor.status === "stopped") continue;
       const addressed = event.to === actor.id || event.to === actor.name;
-      this.#refreshOwnership(actor.id);
+      if (!(addressed || actor.topics.includes(event.topic)) ||
+        (event.from.id === actor.id && !addressed)) continue;
       if (!this.#canManageCached(actor.id)) continue;
       const delivery = `${actor.id}\0${event.id}`;
+      if (this.#delivered.has(delivery)) continue;
       try {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
           this.#acceptRelayedHostEvent(actor, event);

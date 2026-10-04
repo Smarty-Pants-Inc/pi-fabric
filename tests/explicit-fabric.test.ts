@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
-import { explicitFabricRoots, yieldsToExplicitFabric } from "../src/core/explicit-fabric.js";
+import { claimFabricRegistration, explicitFabricRoots, yieldsToExplicitFabric } from "../src/core/explicit-fabric.js";
 import piFabric from "../src/index.js";
 
 const roots: string[] = [];
@@ -12,10 +12,11 @@ afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursiv
 const fabricPackage = (name = "pi-fabric") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-pkg-"));
   roots.push(root);
-  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name, pi: { extensions: ["./dist/index.js"] } }));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name, pi: { extensions: ["./dist/extension-bootstrap.js"] } }));
   fs.mkdirSync(path.join(root, "dist", "worker"), { recursive: true });
   const entry = path.join(root, "dist", "index.js");
   fs.writeFileSync(entry, "export default () => {};");
+  fs.writeFileSync(path.join(root, "dist", "extension-bootstrap.js"), "export default () => {};");
   // The worker loads this hook with -e for every activation-context actor run.
   const hook = path.join(root, "dist", "worker", "activation-window.js");
   fs.writeFileSync(hook, "export default () => {};");
@@ -32,6 +33,33 @@ describe("explicit Fabric preference", () => {
     const argv = ["node", "cli.js", "--mode", "rpc", "-e", "/hooks/activation-window.js",
       "--extension", other.entry, "--extension", parent.entry, "-e", byDirectory.root];
     expect(explicitFabricRoots(argv, "/")).toEqual([parent.root, byDirectory.root]);
+  });
+
+  it("recognizes both supported compiled aliases with the bootstrap manifest", () => {
+    const fabric = fabricPackage();
+    expect(explicitFabricRoots(["node", "cli.js", "-e", fabric.entry, "-e", path.join(fabric.root, "dist", "extension-bootstrap.js")], "/")).toEqual([fabric.root]);
+  });
+
+  it("deduplicates aliases only on the same host and releases the claim on reload", () => {
+    const fabric = fabricPackage();
+    const host = () => {
+      const listeners = new Set<(data: unknown) => void>();
+      const shutdown: Array<() => void> = [];
+      // Each alias receives a different API wrapper for the same host bus.
+      const api = () => ({ events: {
+        emit: (_channel: string, data: unknown) => { for (const listener of listeners) listener(data); },
+        on: (_channel: string, listener: (data: unknown) => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+      }, on: (_event: string, handler: () => void) => { shutdown.push(handler); return () => {}; } }) as unknown as ExtensionAPI;
+      return { api, shutdown: () => { for (const handler of shutdown) handler(); } };
+    };
+    const first = host(), second = host();
+    expect(claimFabricRegistration(fabric.entry, first.api())).toBe(true);
+    expect(claimFabricRegistration(path.join(fabric.root, "dist", "extension-bootstrap.js"), first.api())).toBe(false);
+    expect(claimFabricRegistration(fabric.entry, second.api())).toBe(true);
+    first.shutdown();
+    expect(claimFabricRegistration(fabric.entry, first.api())).toBe(true);
+    expect(claimFabricRegistration(fabric.entry, second.api())).toBe(false);
+    first.shutdown(); second.shutdown();
   });
 
   it("ignores Fabric's own hook files and the --extension= form Pi does not load", () => {

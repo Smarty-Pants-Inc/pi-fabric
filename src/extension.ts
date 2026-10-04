@@ -4,7 +4,7 @@ import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSup
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
 import { registerFabricFixture } from "./guards/fixture-mode.js";
 import { registerJevAuth } from "./jev/auth.js";
-import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
+import { claimFabricRegistration, yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -246,6 +246,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
+  if (!options.managedHost && !claimFabricRegistration(FABRIC_EXTENSION_ENTRY_PATH, pi)) return;
   registerFabricPrincipalCapture(pi);
   if (!options.managedHost) registerJevAuth(pi);
   const codePreviewSettings = defaultCodePreviewSettings();

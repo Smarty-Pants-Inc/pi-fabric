@@ -253,7 +253,7 @@ export class AgentMessageRouter {
   }
 
   /** Exact process-owned targets need no shared-directory authority or freshness. */
-  #provenLocalTarget(id: string): boolean {
+  isProcessOwnedTarget(id: string): boolean {
     if (this.mainAgent.local && this.mainAgent.matches(id)) return true;
     // UUID aliases and published names still require directory selector precedence.
     if (id.trim().startsWith("session:") || SESSION_UUID.test(id.trim())) return false;
@@ -261,6 +261,16 @@ export class AgentMessageRouter {
     // A name/prefix ambiguity is not local proof: preserve directory selector
     // precedence, then let ordinary task resolution report its original error.
     catch { return false; }
+  }
+
+  /** Stop shares delivery's exact local proof; actors and selectors retain directory admission. */
+  withStopDirectory<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    return this.isProcessOwnedTarget(id) ? operation() : this.#withDirectory(operation);
+  }
+
+  /** Normalize late stop-route reads just like message-route reads. */
+  resolveStopParticipant(id: string): FabricParticipantInfo | undefined {
+    return this.#get(id);
   }
 
   #localMainNonInteractive(): boolean {
@@ -303,7 +313,7 @@ export class AgentMessageRouter {
     options = { ...options, principal: context ? invocationFabricPrincipal(context) : undefined };
     // Task-local `main` remains its immutable immediate return address.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
-    const provenLocal = this.#provenLocalTarget(id);
+    const provenLocal = this.isProcessOwnedTarget(id);
     const result = provenLocal
       ? await this.#route(id, message, data, kind, context, options, true)
       : await this.#withDirectory(() =>

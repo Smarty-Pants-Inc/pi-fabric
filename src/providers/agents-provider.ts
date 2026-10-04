@@ -1159,22 +1159,26 @@ export class AgentsProvider implements FabricProvider {
       }
       case "stop": {
         const id = String(args.id);
-        // Agent/task stop keeps its existing control route; actor lifecycle uses
-        // the same root identity and resident request fence as native setters.
-        let actorTarget = false;
-        try { if (!id.trim().startsWith("session:")) { this.#resolveActorTarget(id); actorTarget = true; } } catch (error) {
-          if (!(error instanceof Error) || !/Unknown Fabric actor/.test(error.message)) throw error;
-        }
-        if (actorTarget) {
-          const target = this.#resolveActorTarget(id);
-          if ((target.actor?.residency ?? target.participant?.residency) === "durable" &&
-              (target.actor?.rootId ?? target.participant?.rootId) !== this.mainAgent.id) {
-            throw new ResidentActorAuthorizationError();
+        return this.#router.withStopDirectory(id, async () => {
+          // Only canonical process-owned tasks/Main bypass actor classification.
+          // Resident and foreign actors retain the root identity and request fence.
+          if (!this.#router.isProcessOwnedTarget(id)) {
+            let actorTarget = false;
+            try { if (!id.trim().startsWith("session:")) { this.#resolveActorTarget(id); actorTarget = true; } } catch (error) {
+              if (!(error instanceof Error) || !/Unknown Fabric actor/.test(error.message)) throw error;
+            }
+            if (actorTarget) {
+              const target = this.#resolveActorTarget(id);
+              if ((target.actor?.residency ?? target.participant?.residency) === "durable" &&
+                  (target.actor?.rootId ?? target.participant?.rootId) !== this.mainAgent.id) {
+                throw new ResidentActorAuthorizationError();
+              }
+              const resident = this.#residentActorOwner(id);
+              if (resident) return this.#setResidentActor(resident, { operation: "stop", id: resident.id }, context);
+            }
           }
-          const resident = this.#residentActorOwner(id);
-          if (resident) return this.#setResidentActor(resident, { operation: "stop", id: resident.id }, context);
-        }
-        return this.stopParticipant(id);
+          return this.#stopParticipant(id);
+        });
       }
       case "cleanup": {
         const id = String(args.id);
@@ -1908,6 +1912,14 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async stopParticipant(id: string): Promise<unknown> {
+    return this.#router.withStopDirectory(id, () => this.#stopParticipant(id));
+  }
+
+  async #stopParticipant(id: string): Promise<unknown> {
+    if (this.mainAgent.local && this.mainAgent.matches(id)) {
+      if (!this.mainAgent.stop) throw new Error("Local Main stop is unavailable");
+      return this.mainAgent.stop();
+    }
     try {
       const result = await this.manager.stop(id);
       this.participants.scheduleRefresh();
@@ -1917,7 +1929,7 @@ export class AgentsProvider implements FabricProvider {
     }
     try {
       const actor = this.actorManager.status(id);
-      const ownership = this.participants.get(actor.id);
+      const ownership = this.#router.resolveStopParticipant(actor.id);
       if (!ownership || ownership.local) {
         const result = await this.actorManager.stop(actor.id);
         this.participants.scheduleRefresh();
@@ -1933,8 +1945,8 @@ export class AgentsProvider implements FabricProvider {
       this.residency!.acknowledgeCompletion(id);
       return settled;
     }
-    const participant = this.participants.get(id);
-    if (!participant) throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, id);
+    const participant = this.#router.resolveStopParticipant(id);
+    if (!participant) throw unknownParticipant(this.participants, id);
     if (!participant.capabilities.includes("stop")) {
       throw new Error(`Fabric participant ${id} cannot be stopped`);
     }

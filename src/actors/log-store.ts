@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
@@ -86,6 +87,15 @@ export class ActorLogStore {
     if (!runDirectory || !fs.existsSync(runDirectory)) return;
     const dest = path.join(path.dirname(actor.sessionFile), "runs", runId);
     fs.mkdirSync(dest, { recursive: true, mode: 0o700 });
+    const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
+    if (fs.existsSync(receipt)) {
+      const archivedReceipt = path.join(dest, "route-dispatch-receipt.json");
+      const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
+      const source = readRouteDispatchReceipt(receipt);
+      if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
+      // Durable archive confirmation precedes source cleanup (F2 custody).
+      writeJsonAtomic(archivedReceipt, source, { durable: true });
+    }
     for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
       const src = path.join(runDirectory, file);
       if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dest, file));

@@ -596,7 +596,7 @@ export class AgentsProvider implements FabricProvider {
       args.actorId !== undefined || args.actorName !== undefined) {
       throw new Error('model: "auto" requires a session-owned process/Pi task, not an actor');
     }
-    if (typeof args.routeClass !== "string" || !/^[a-z][a-z0-9-]{0,63}$/.test(args.routeClass)) {
+    if (typeof args.routeClass !== "string" || !/^[a-z][a-z0-9:-]{0,63}$/.test(args.routeClass)) {
       throw new Error('model: "auto" requires a bounded routeClass identifier');
     }
     const config = this.manager.config.modelRouting;
@@ -609,8 +609,9 @@ export class AgentsProvider implements FabricProvider {
       parentSessionId: context.extensionContext.sessionManager?.getSessionId() ?? this.participants.self().sessionId ?? "unknown",
       assertModelAllowed: model => this.manager.assertModelAllowed(model, "pi"),
       evaluate: (request, signal) => this.routeEvaluate(request, signal, context), signal: context.signal });
-    // Shadow invariant: the choice is recorded, but dispatch ALWAYS uses the role pin.
-    return { ...await this.#runRequest({ ...args, model: routeDecision.pin.model, thinking: routeDecision.pin.effort }, context, false), routeDecision };
+    const { routeLaunchCandidate } = await import("../agents/model-route.js");
+    const selected = routeLaunchCandidate(routeDecision);
+    return { ...await this.#runRequest({ ...args, model: selected.model, thinking: selected.effort }, context, false), routeDecision };
   }
 
   async #resolvePiRunBinding(
@@ -806,7 +807,10 @@ export class AgentsProvider implements FabricProvider {
     switch (actionName) {
       case "run": {
         const main = isInteractiveMain(context.extensionContext);
-        const request = this.#applySeed(args, await this.#runRequest(args, context), context);
+        const request = this.#applySeed(args,
+          args.model === "auto" && ["task:merge-additive", "task:ci-test-fixture", "task:exact-checks"].includes(String(args.routeClass))
+            ? await this.#prepareSpawnRequest(args, context) : await this.#runRequest(args, context),
+          context);
         const handle = await this.manager.spawn(
           request,
           // Main's observation ceiling never cancels admitted child work.

@@ -978,7 +978,7 @@ interface FabricMessageDelivery {
   replacedMessageId?: string;
 }
 interface FabricAgentsApi {
-  run(args: FabricAgentRequest): Promise<FabricAgentResult>;
+  run(args: FabricAgentRequest & { pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentResult>;
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;

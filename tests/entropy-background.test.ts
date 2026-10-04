@@ -169,6 +169,32 @@ const mockRetryIO = () => {
 };
 
 describe("entropy background scheduler", () => {
+  it("unrefs and cancels a pending coalescing timer at shutdown without late logs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-entropy-background-"));
+    tempRoots.push(root);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    const harness = createHarness();
+    await piFabric(harness.pi);
+    const context = {
+      mode: "code", cwd: root, hasUI: false, isProjectTrusted: () => true,
+      ui: { setStatus: vi.fn(), notify: vi.fn() },
+      sessionManager: { getBranch: () => [], getSessionId: () => "pending-timer" },
+    } as unknown as ExtensionContext;
+    await harness.command()("repairs", context);
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    const clear = vi.spyOn(globalThis, "clearTimeout");
+    const warn = vi.spyOn(console, "warn");
+    await emit(harness.handlers, "tool_execution_end", { toolName: "fabric_exec", isError: false }, context);
+    await emit(harness.handlers, "turn_end", {}, context);
+    const timer = timeout.mock.results.find((_, index) => timeout.mock.calls[index]?.[1] === 250)?.value as NodeJS.Timeout;
+    expect(timer).toBeDefined();
+    expect(timer.hasRef()).toBe(false);
+    await emit(harness.handlers, "session_shutdown", {}, context);
+    expect(clear).toHaveBeenCalledWith(timer);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(scanControl.calls).toBe(0);
+    expect(warn).not.toHaveBeenCalled();
+  });
   it("compiles despite a live pool lock and retries without another user turn", async () => {
     const harness = await retryHarness();
     const lock = installLiveLock(harness.agentDir, "observation-pool.lock");

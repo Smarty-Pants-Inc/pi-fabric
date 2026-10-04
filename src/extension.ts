@@ -701,7 +701,17 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const task = (async () => {
       try {
         if (request.delayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, request.delayMs));
+          await new Promise<void>((resolve) => {
+            const finish = (): void => {
+              clearTimeout(timer);
+              request.signal.removeEventListener("abort", finish);
+              resolve();
+            };
+            const timer = setTimeout(finish, request.delayMs);
+            timer.unref();
+            request.signal.addEventListener("abort", finish, { once: true });
+            if (request.signal.aborted) finish();
+          });
         }
         retry = await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {

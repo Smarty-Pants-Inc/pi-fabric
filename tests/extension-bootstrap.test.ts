@@ -42,6 +42,7 @@ const fixture = (kernel = "typescript") => {
   } as unknown as ExtensionAPI;
   const context = {
     cwd, hasUI: false, isProjectTrusted: () => true,
+    isIdle: () => true, hasPendingMessages: () => false,
     sessionManager: { getSessionId: () => cwd, getBranch: () => [], getSessionFile: () => undefined },
     ui: { setStatus: vi.fn(), notify: vi.fn() },
   } as unknown as ExtensionContext;

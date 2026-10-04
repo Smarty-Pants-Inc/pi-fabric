@@ -113,6 +113,14 @@ describe("host-only processSlice (#4383)", () => {
   });
 });
 
+it("normalizes the reader-only idle coalescing window", () => {
+  expect(normalizeFabricConfig({}).mesh.idleReadCoalesceMs).toBe(5_000);
+  expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: 0 } }).mesh.idleReadCoalesceMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: 3_000 } }).mesh.idleReadCoalesceMs).toBe(3_000);
+  expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: -1 } }).mesh.idleReadCoalesceMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: 60_000 } }).mesh.idleReadCoalesceMs).toBe(10_000);
+});
+
 describe("Fabric configuration", () => {
   it("defaults automatic per-host reload concurrency to six and preserves explicit unlimited mode", () => {
     expect(DEFAULT_FABRIC_CONFIG.selfReloadConcurrency).toBe(6);

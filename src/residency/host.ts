@@ -335,7 +335,7 @@ export class ResidentHost {
   #initialize(): void {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
+      { readCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
     this.control = new FabricControlPlane(this.mesh, this.identity, {
       enabled: true, hostId: this.hostId, pollMs: config.mesh.actorPollMs,
       bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
@@ -488,12 +488,12 @@ export class ResidentHost {
         ));
       },
     });
-    const canManageActor = (id: string): boolean | undefined => {
-      const participant = this.participants.get(id);
+    const canManageActor = (id: string, fresh = true): boolean | undefined => {
+      const participant = this.participants.get(id, undefined, { fresh });
       return participant ? participant.ownerHostId === this.hostId : undefined;
     };
-    const snapshotActorOwnership = (): ReadonlyMap<string, boolean> => new Map(
-      this.participants.list({ scope: "project", fresh: true })
+    const snapshotActorOwnership = (fresh = true): ReadonlyMap<string, boolean> => new Map(
+      this.participants.list({ scope: "project", fresh })
         .map((participant) => [participant.id, participant.ownerHostId === this.hostId]),
     );
     const lineageAlive = (rootId: string): boolean =>

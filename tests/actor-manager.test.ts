@@ -13,6 +13,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { createMeshGrant, postWithMeshGrant } from "../src/mesh/grants.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { closeWithActors } from "../src/actors/close-order.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
@@ -48,6 +49,7 @@ const setup = (
   },
   meshOverrides: Partial<typeof DEFAULT_FABRIC_CONFIG.mesh> = {},
   agentOverrides: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {},
+  snapshotActorOwnership?: (fresh?: boolean) => ReadonlyMap<string, boolean>,
 ) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-test-"));
   roots.push(root);
@@ -81,6 +83,7 @@ const setup = (
       actorRoot: path.join(root, "actors"),
       persistent,
       ...(canManageActor ? { canManageActor } : {}),
+      ...(snapshotActorOwnership ? { snapshotActorOwnership } : {}),
       ...(acquireCapabilityView ? { acquireCapabilityView } : {}),
       ...(modelValidation?.resolvePiModel
         ? { resolvePiModel: modelValidation.resolvePiModel }
@@ -95,6 +98,110 @@ afterEach(async () => {
   await Promise.all(actorManagers.splice(0).map((manager) => manager.close()));
   await Promise.all(agentManagers.splice(0).map((manager) => manager.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("ActorManager idle observer versus canonical authority (#4383)", () => {
+  it("coalesces an ownership view but refuses tell after canonical ownership moved", async () => {
+    let canonical = true;
+    const decision = vi.fn((_id: string, fresh = true) => fresh ? canonical : true);
+    const { actors, agents } = setup(false, decision);
+    const actor = await actors.create({ name: "authority", instructions: "Remain idle." });
+    decision.mockClear();
+    canonical = false;
+    expect(actors.listOwned().map(row => row.id)).toContain(actor.id); // Observer can still show the old owner.
+    expect(decision.mock.calls.some(([, fresh]) => fresh === false)).toBe(true);
+    expect(() => actors.tell(actor.id, "must not be delivered")).toThrow("owned by another host");
+    expect(decision.mock.calls.some(([, fresh]) => fresh !== false)).toBe(true);
+    expect(actors.status(actor.id).queued).toBe(0);
+    expect(agents.list()).toEqual([]);
+  });
+
+  it("does not use a cached owner for matched mesh delivery, or revalidate unrelated traffic", async () => {
+    let canonical = true;
+    const decision = vi.fn((_id: string, fresh = true) => fresh ? canonical : true);
+    const { actors, mesh, agents, identity } = setup(false, decision);
+    const actor = await actors.create({ name: "authority", instructions: "Remain idle.", topics: ["owner.work"] });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    decision.mockClear(); canonical = false;
+    await mesh.publish({ topic: "unrelated", from: identity });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(decision.mock.calls.every(([, fresh]) => fresh === false)).toBe(true); // Empty/no-match observation only.
+    decision.mockClear();
+    await mesh.publish({ topic: "owner.work", from: identity, text: "must not be delivered" });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(decision.mock.calls.some(([, fresh]) => fresh !== false)).toBe(true);
+    expect(actors.status(actor.id).queued).toBe(0);
+    expect(agents.list()).toEqual([]);
+  });
+
+  // Astra #468 F1: fresh-positive delivery can replace ALL persistent actor objects
+  // while the idle view is stale-negative. Outstanding preparation retries then
+  // drain only the new objects, so accepting work on old queues loses it forever.
+  it("re-resolves every subscriber after persistent ownership reacquisition", async () => {
+    let dispatch!: ActorMeshMonitor["callbacks"]["onEvent"];
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
+      dispatch = this.callbacks.onEvent;
+    });
+    const schedule = vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
+    const read = vi.spyOn(ActorRegistryStore.prototype, "read");
+    let observed = true;
+    const ids: string[] = [];
+    const snapshot = vi.fn((fresh = true) => new Map(ids.map(id => [id, fresh || observed])));
+    let failures = 2;
+    const acquire = vi.fn(async (): Promise<FabricCapabilityViewLease> => {
+      if (failures-- > 0) throw new Error("transient preparation");
+      return {
+        satisfied: true, missing: [], optionalMissing: [],
+        view: {
+          id: "view-reacquisition", digest: "digest-reacquisition", semanticDigest: "semantic-reacquisition",
+          bindings: { "demo.echo": { ref: "demo.echo", provider: "demo", providerBindingId: "binding-reacquisition", generation: 1, descriptorHash: "descriptor-reacquisition" } },
+        },
+        release: async () => {},
+      };
+    });
+    try {
+      const { actors, mesh, root, identity, agents } = setup(true, () => true, acquire,
+        undefined, {}, {}, snapshot);
+      for (const name of ["first-subscriber", "second-subscriber"]) {
+        ids.push((await actors.create({ name, instructions: "Review.", requires: ["demo.echo"],
+          topics: ["owner.work"], responseMode: "text", coalesce: false })).id);
+      }
+      const runs = recordRuns(agents);
+      const seed = await mesh.publish({ topic: "owner.work", from: identity, text: "retry seed" });
+      expect(dispatch(seed)).toBe(true);
+      await waitFor(() => acquire.mock.calls.length === 2 && actors.inFlightCount() === 0);
+      expect(ids.map(id => actors.status(id).queued)).toEqual([1, 1]);
+      expect(runs).toHaveLength(0); // preparation retries, not worker attempts
+      const registry = path.join(root, "actors", "actors.json");
+      const unchanged = fs.readFileSync(registry, "utf8");
+      observed = false;
+      expect(actors.listOwned()).toEqual([]); // stale-negative observer parks seeds
+      expect(fs.readFileSync(registry, "utf8")).toBe(unchanged);
+      const event = await mesh.publish({ topic: "owner.work", from: identity, text: "reacquired event" });
+      read.mockClear(); snapshot.mockClear();
+      expect(dispatch(event)).toBe(true);
+      expect(read).toHaveBeenCalledTimes(1); // proves the replacement branch ran
+      expect(snapshot).toHaveBeenCalledTimes(1);
+      expect(snapshot).toHaveBeenCalledWith(true); // one canonical snapshot for both
+      for (const id of ids) {
+        expect(actors.status(id).queued).toBe(1); // NEW registered object's queue
+        const pending = queueFiles(root, id).flatMap(({ text }) => JSON.parse(text).items ?? []);
+        expect(pending.filter((item: { payload?: { id?: string } }) => item.payload?.id === event.id)).toHaveLength(1);
+      }
+      snapshot.mockClear();
+      expect(dispatch(event)).toBe("ignored");
+      expect(snapshot).not.toHaveBeenCalled(); // accepted delivery IDs stay deduplicated
+      observed = true;
+      await waitFor(() => ids.every(id => actors.messages(id).filter(message =>
+        message.direction === "out" && message.runId && !message.error).length === 2), 15_000);
+      expect(runs).toHaveLength(4); // each seed + reacquired event runs once per subscriber
+      for (const id of ids) {
+        expect(actors.messages(id).filter(message => message.direction === "in" &&
+          (message.data as { id?: string } | undefined)?.id === event.id)).toHaveLength(1);
+        expect(actors.status(id).queued).toBe(0);
+      }
+    } finally { start.mockRestore(); schedule.mockRestore(); read.mockRestore(); }
+  }, 30_000);
 });
 
 describe("ActorManager idle registry writes (#4383)", () => {
@@ -377,20 +484,37 @@ describe("ActorManager presence under a stalled mesh lock", () => {
 
   // review/astra F1 on #72: a matching event also enqueued, started a drain and recorded the
   // message, and each of those re-decided every actor's ownership.
-  it("decides ownership once per matching mesh event too, with several subscribers and full queues", async () => {
+  it.each([false, true])("decides ownership once per matching mesh event too, with several subscribers and full queues (snapshot %s)", async (batched) => {
+    let dispatch!: ActorMeshMonitor["callbacks"]["onEvent"];
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
+      dispatch = this.callbacks.onEvent;
+    });
     const decisions = vi.fn((_id: string) => true as boolean | undefined);
-    const { actors, mesh } = setup(false, decisions, undefined, undefined, { actorQueueLimit: 2 });
-    for (let index = 0; index < 8; index++) {
-      await actors.create({ name: `actor-${index}`, instructions: "Watch.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    decisions.mockClear();
-    const from: MeshIdentity = { id: "session:other", name: "main", kind: "main", sessionId: "other" };
-    for (let index = 0; index < 20; index++) await mesh.publish({ topic: "team.pulls", from, data: { index } });
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    // Before: each delivery re-decided all 8 actors 4 times (enqueue, drain, record twice).
-    expect(decisions.mock.calls.length).toBeGreaterThan(0);
-    expect(decisions.mock.calls.length).toBeLessThan(1_200);
+    const schedule = vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
+    const ids: string[] = [];
+    const snapshot = vi.fn((_fresh = true) => new Map(ids.map(id => [id, true])));
+    try {
+      const { actors, mesh } = setup(false, decisions, undefined, undefined, { actorQueueLimit: 2 }, {}, batched ? snapshot : undefined);
+      for (let index = 0; index < 8; index++) {
+        ids.push((await actors.create({ name: `actor-${index}`, instructions: "Watch.", topics: ["team.pulls"], responseMode: "text", coalesce: false })).id);
+      }
+      const from: MeshIdentity = { id: "session:other", name: "main", kind: "main", sessionId: "other" };
+      for (let index = 0; index < 20; index++) {
+        const event = await mesh.publish({ topic: "team.pulls", from, data: { index } });
+        decisions.mockClear(); snapshot.mockClear();
+        dispatch(event);
+        // Measure this synchronous event, not async activation/presence checks
+        // (which must revalidate after awaits) or platform-dependent idle polls.
+        expect(decisions).toHaveBeenCalledTimes(batched ? 0 : 8);
+        expect(snapshot).toHaveBeenCalledTimes(batched ? 1 : 0);
+        if (batched) expect(snapshot).toHaveBeenCalledWith(true);
+        for (const call of decisions.mock.calls) expect(call).toHaveLength(1); // fresh authority
+        decisions.mockClear(); snapshot.mockClear();
+        dispatch(event);
+        expect(snapshot).not.toHaveBeenCalled();
+        expect(decisions).not.toHaveBeenCalled(); // already-delivered subscribers
+      }
+    } finally { start.mockRestore(); schedule.mockRestore(); }
   });
 
   // smarty-dev#918: callers verify setInstructions by digest, without reading the registry file.

@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
+import { effectiveLiveness, type Liveness } from "./liveness.js";
+import type { MeshStateEntry } from "../mesh/store.js";
 
 // Host lease renewals outside the shared state (smarty-dev#816). Every heartbeat rewrote the
 // whole shared state under the one mesh lock, and heartbeats were 78% of all locked writes. Each
@@ -9,13 +11,14 @@ import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 // the lock; one host writes each file.
 
 /**
- * Host-reserved policy key. With { version: 1, hostLeases: "files" }, set by the fleet owner once
- * every runtime reads file leases, a renewal that changes nothing writes only the file.
+ * Host-reserved historical policy key (also used for participant-file migration).
+ * Directory liveness now negotiates file-only renewals through livenessLeaseFiles: 1;
+ * a live older peer always restores half-life state renewal, without an operator switch.
  */
 export const LIVENESS_POLICY_KEY = "topology/liveness";
 /**
- * Under that policy a host still renews its shared-state record this often, so no reaper of any
- * version (they remove hosts gone for hours) takes a live host for a dead one.
+ * Historical compatibility interval, still used by the bridge for mirrored state records.
+ * Native all-capable directories need no periodic state renewal: reapers read file liveness.
  */
 export const STATE_LEASE_RENEW_MS = 10 * 60 * 1000;
 
@@ -27,6 +30,10 @@ export interface FabricHostLease {
   identityId: string;
   updatedAt: number;
   expiresAt: number;
+  /** Incarnation fence; absent on pre-lease-capability writers. */
+  startedAt?: number;
+  /** Main session has a fixed 15 s TTL, independent of the host TTL. */
+  session?: Liveness & { id: string; startedAt: number };
 }
 
 const fileName = (hostId: string): string =>
@@ -59,12 +66,15 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       fileName(value.id) !== name ||
       typeof value.rootId !== "string" ||
       typeof value.identityId !== "string" ||
-      typeof value.updatedAt !== "number" ||
-      typeof value.expiresAt !== "number"
+      typeof value.updatedAt !== "number" || !Number.isFinite(value.updatedAt) ||
+      typeof value.expiresAt !== "number" || !Number.isFinite(value.expiresAt) ||
+      (value.startedAt !== undefined && (typeof value.startedAt !== "number" || !Number.isFinite(value.startedAt)))
     ) return undefined;
     return {
       id: value.id, rootId: value.rootId, identityId: value.identityId,
       updatedAt: value.updatedAt, expiresAt: value.expiresAt,
+      ...(typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? { startedAt: value.startedAt } : {}),
+      ...(validSession(value.session) ? { session: value.session } : {}),
     };
   } catch {
     return undefined;
@@ -103,6 +113,19 @@ export const readHostLeases = (meshRoot: string): Map<string, FabricHostLease> =
   return leases;
 };
 
+/** Cheap topology-cache invalidation; freshness itself always uses effectiveLiveness. */
+export const hostLeasesStamp = (meshRoot: string): string | undefined => {
+  try {
+    // Windows directory mtimes need not move on replacement: inspect the small leases there.
+    if (process.platform === "win32") return [...readHostLeases(meshRoot).values()]
+      .map(lease => `${lease.id}:${lease.updatedAt}:${lease.expiresAt}`).sort().join("|");
+    const stat = fs.statSync(path.join(meshRoot, LEASE_DIR), { bigint: true });
+    return `${stat.ino}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  } catch {
+    return undefined;
+  }
+};
+
 /** One host's file lease, from the same cache; for a single-participant lookup. */
 export const readHostLease = (meshRoot: string, hostId: string): FabricHostLease | undefined => {
   const dir = path.join(meshRoot, LEASE_DIR);
@@ -137,16 +160,42 @@ const cachedLease = (known: LeaseSlots, dir: string, name: string, stat: fs.Stat
   return parsed.lease;
 };
 
-/** A host lease's effective expiry: the later of its shared-state lease and its file lease. */
+const validSession = (value: unknown): value is NonNullable<FabricHostLease["session"]> => {
+  if (typeof value !== "object" || value === null) return false;
+  const session = value as Record<string, unknown>;
+  return typeof session.id === "string" &&
+    [session.startedAt, session.updatedAt, session.expiresAt].every(n => typeof n === "number" && Number.isFinite(n));
+};
+
+/** Matching identity and incarnation only; an old file cannot revive a takeover. */
+export const hostLiveness = (
+  leases: ReadonlyMap<string, FabricHostLease>,
+  host: { id: string; rootId: string; identity: { id: string }; startedAt?: number; updatedAt?: number; expiresAt: number },
+): Liveness => {
+  const lease = leases.get(host.id);
+  const matching = lease && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
+    (lease.startedAt === undefined || host.startedAt === undefined || lease.startedAt === host.startedAt);
+  return effectiveLiveness({ updatedAt: host.updatedAt ?? 0, expiresAt: host.expiresAt }, matching ? lease : undefined);
+};
+
+/** Reapers also accept incomplete historical records, retaining them conservatively. */
+export const hostEntryLiveness = (entry: MeshStateEntry, leases: ReadonlyMap<string, FabricHostLease>): Liveness => {
+  const value = typeof entry.value === "object" && entry.value !== null ? entry.value as Record<string, unknown> : {};
+  const identity = typeof value.identity === "object" && value.identity !== null ? value.identity as Record<string, unknown> : {};
+  const stored = { updatedAt: entry.updatedAt, expiresAt: typeof value.expiresAt === "number" ? value.expiresAt : entry.updatedAt };
+  if (typeof value.id !== "string") return stored;
+  if (typeof value.rootId === "string" && typeof identity.id === "string") return hostLiveness(leases, {
+    id: value.id, rootId: value.rootId, identity: { id: identity.id },
+    ...(typeof value.startedAt === "number" ? { startedAt: value.startedAt } : {}), ...stored,
+  });
+  return effectiveLiveness(stored, leases.get(value.id));
+};
+
+/** Compatibility alias: every host reader uses the same effective-liveness rule. */
 export const hostLeaseExpiry = (
   leases: ReadonlyMap<string, FabricHostLease>,
-  host: { id: string; rootId: string; identity: { id: string }; expiresAt: number },
-): number => {
-  const lease = leases.get(host.id);
-  return lease && lease.rootId === host.rootId && lease.identityId === host.identity.id
-    ? Math.max(host.expiresAt, lease.expiresAt)
-    : host.expiresAt;
-};
+  host: { id: string; rootId: string; identity: { id: string }; startedAt?: number; updatedAt?: number; expiresAt: number },
+): number => hostLiveness(leases, host).expiresAt;
 
 /** Whether the fleet owner has moved lease renewals to files (see LIVENESS_POLICY_KEY). */
 export const fileLeasesOnly = (policy: unknown): boolean =>

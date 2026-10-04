@@ -34,6 +34,22 @@ afterEach(() => {
   }
 });
 
+describe("host-only explicit model exceptions (#3134)", () => {
+  it("defaults to Astra and supports an empty rollback or normalized override", () => {
+    expect(normalizeFabricConfig({}).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+    expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [] } } }).agents.modelPolicy.requireReason).toEqual([]);
+    expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [" CLIPROXYAPI/GPT-6-ASTRA ", "cliproxyapi/gpt-6-astra"] } } }).agents.modelPolicy.requireReason).toEqual(["cliproxyapi/gpt-6-astra"]);
+  });
+  it.each([true, false])("project cannot disable the host reason gate (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: ["provider/expensive"] } } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: [] } } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["provider/expensive"]);
+    fs.unlinkSync(path.join(agentDir, "fabric.json"));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+  });
+});
 describe("fleet model policy configuration (#2490)", () => {
   it("normalizes and registers host policy keys", () => {
     expect(DEFAULT_FABRIC_CONFIG.agents.deniedModels).toEqual([]);

@@ -298,6 +298,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     exitCode: 0,
     usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 },
     ...(args.has("model") ? { model: args.get("model") } : {}),
+    ...(args.has("model-reason") ? { modelReason: args.get("model-reason") } : {}),
     ...(args.has("thinking") ? { thinking: args.get("thinking") } : {}),
     ...(args.has("system-prompt") ? { systemPrompt: args.get("system-prompt") } : {}),
   };

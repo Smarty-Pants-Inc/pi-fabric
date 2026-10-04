@@ -70,6 +70,7 @@ const agent = (
 });
 
 const actor = (overrides: Partial<FabricUiActor> = {}): FabricUiActor => ({
+  filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
   id: "actor-1",
   scope: "project",
   name: "advisor",

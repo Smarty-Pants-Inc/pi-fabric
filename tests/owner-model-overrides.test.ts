@@ -168,9 +168,7 @@ for (const kind of owners) describe(`${kind} execution-owner activation models (
       expect(state.getAvailable).toHaveBeenCalled();
       expect(state.senderAvailable).not.toHaveBeenCalled();
     }, { sol: "dest/gpt-6-sol" });
-    // #369 adds fresh native root/scratch ACL checks and joined retirement
-    // for three sequential owner activations plus resident close on Windows.
-  }, process.platform === "win32" ? 45_000 : 15_000);
+  });
 
   it.each(["ask", "tell"] as const)("refreshes once for an exact just-added agents.%s override", async action => {
     await withOwner(kind, async state => {

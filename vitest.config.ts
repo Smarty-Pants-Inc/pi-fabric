@@ -3,7 +3,7 @@ import { isolatedTestTemp, isolateTestFleetEnvironment } from "./scripts/test-te
 import { privateWindowsTestTemp } from "./scripts/windows-test-temp.js";
 
 // Process-launch fixtures must satisfy the production ancestor/DACL contract.
-// Native VHD setup failure is a failing Windows gate, not a skipped launch test.
+// Native owner-only directory setup failure is a failing Windows gate, not a skip.
 if (process.platform === "win32") {
   const namespace = privateWindowsTestTemp();
   Object.assign(process.env, { TMPDIR: namespace.directory, TMP: namespace.directory, TEMP: namespace.directory });

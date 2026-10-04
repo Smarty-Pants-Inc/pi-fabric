@@ -589,10 +589,7 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     await h.owner.ask(h.actor.id, "no context remains");
     expect(tasks.at(-1)).not.toContain("context only, not current activation facts");
     expect(h.rootDeliveries).not.toHaveBeenCalled();
-    // #369 adds fresh native ancestor/DACL checks at admission and scratch
-    // disposal. The byte-bound case runs up to 20 sequential real activations;
-    // keep every per-snapshot assertion, but budget their cumulative Windows I/O.
-  }, process.platform === "win32" ? 90_000 : 30_000);
+  }, 30000);
 
   it("terminal agents.status consumption deletes the full result and envelope", async () => {
     const h = await setup(residency);

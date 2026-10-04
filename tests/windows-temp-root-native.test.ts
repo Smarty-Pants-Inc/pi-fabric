@@ -10,10 +10,9 @@ import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
 import { windowsDataRoot } from "../src/storage/windows-temp-root.js";
 
-// A normal Windows drive root may allow Users to create directories. Do not weaken
-// ancestor checks or rewrite the runner's C:/D: ACLs to get a positive control.
-// windows-latest runs elevated: use an isolated, disposable 64 MiB NTFS VHD instead.
-// Setup failure on Windows is a failure, never a silent skip of native ACL evidence.
+// Use a private directory on the normal temp filesystem, not a mounted volume.
+// Keep every native hostile-ACL assertion; no shared drive ACL is rewritten.
+// Foreign-owner evidence still requires the elevated Windows runner.
 const native = (source: string, values: Record<string, string | number> = {}): string => {
   const command = windowsSecurityPowerShell(`
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -74,23 +73,7 @@ Set-Acl -LiteralPath $p.path -AclObject $acl
 (Get-Acl -LiteralPath $p.path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 `;
 
-let backing = "";
 let volume = "";
-let letter = "";
-let diskpartSequence = 0;
-const diskpart = (commands: string[]) => {
-  const script = path.join(backing, `diskpart-${diskpartSequence++}.txt`);
-  fs.writeFileSync(script, commands.join("\r\n") + "\r\nexit\r\n");
-  return childProcess.execFileSync(path.join(process.env.SystemRoot!, "System32", "diskpart.exe"), ["/s", script], { encoding: "utf8", timeout: 90_000, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-};
-const detach = () => {
-  if (!backing) return;
-  const vhd = path.join(backing, "acl-fixture.vhd");
-  // Setup may already have detached the fixture. Ignore that diskpart error,
-  // but still fail below if the volume remains mounted after the command.
-  if (fs.existsSync(vhd)) diskpart([`select vdisk file="${vhd}"`, "detach vdisk noerr"]);
-  if (volume && fs.existsSync(volume)) throw new Error(`Native ACL test VHD did not detach: ${volume}`);
-};
 const privateDirectory = (name = "private") => {
   const directory = fs.mkdtempSync(path.join(volume, name + "-"));
   native(PRIVATE_ACL, { path: directory });
@@ -107,38 +90,21 @@ Set-Acl -LiteralPath $p.path -AclObject $acl
 
 describe.skipIf(process.platform !== "win32")("native Windows temp-root ACL contract (requires elevated Windows runner)", () => {
   beforeAll(() => {
-    backing = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-acl-"));
-    if (/["\r\n]/.test(backing)) throw new Error("Unsafe diskpart fixture path");
-    const drives = JSON.parse(native("ConvertTo-Json -Compress -InputObject @([System.IO.Directory]::GetLogicalDrives())")) as string[];
-    letter = [..."ZYXWVUTSRQPONMLKJIHGFE"].find(candidate => !drives.some(drive => drive[0]!.toUpperCase() === candidate))!;
-    if (!letter) throw new Error("No unused drive letter for native ACL fixture");
-    volume = `${letter}:\\`;
-    const vhd = path.join(backing, "acl-fixture.vhd");
-    try {
-      const output = diskpart([
-        `create vdisk file="${vhd}" maximum=64 type=expandable`, `select vdisk file="${vhd}"`,
-        "attach vdisk", "create partition primary", 'format fs=ntfs label="fabric-acl-test" quick', `assign letter=${letter}`,
-      ]);
-      // diskpart can exit 0 on a command failure, so prove the actual fixture exists.
-      if (!fs.existsSync(volume)) throw new Error(`Native NTFS fixture setup failed: ${output}`);
-      native(PRIVATE_ACL, { path: volume });
-      vi.stubEnv("PI_FABRIC_TMPDIR", volume);
-      expect(fabricDataRoot()).toBe(volume);
-    } catch (error) {
-      detach();
-      throw error;
-    } finally { vi.unstubAllEnvs(); }
-  }, 120_000);
+    volume = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-acl-"));
+    native(PRIVATE_ACL, { path: volume });
+    vi.stubEnv("PI_FABRIC_TMPDIR", volume);
+    try { expect(fabricDataRoot()).toBe(volume); }
+    finally { vi.unstubAllEnvs(); }
+  });
 
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
   afterAll(() => {
-    detach();
-    if (backing) fs.rmSync(backing, { recursive: true, force: true });
-  }, 120_000);
+    if (volume) fs.rmSync(volume, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
 
   it("D5 launcher fixtures use a natively accepted private OS-temp namespace", () => {
     // This is the namespace inherited by worker-e2e/process-utils/actor tests,
-    // not this suite's separate adversarial ACL volume.
+    // not this suite's separate adversarial ACL directory.
     expect(windowsDataRoot(os.tmpdir(), { private: true })).toBe(path.resolve(os.tmpdir()));
   }, 30_000);
 
@@ -233,7 +199,7 @@ fs.writeFileSync(${JSON.stringify(path.join(directory, "environment.json"))}, JS
     expect(fs.existsSync(missing)).toBe(false);
   }, 30_000);
 
-  it("rejects an untrusted writable volume root even with a private descendant", () => {
+  it("rejects an untrusted writable fixture root even with a private descendant", () => {
     const directory = privateDirectory();
     try {
       grant(volume, "S-1-1-0", 0x2);

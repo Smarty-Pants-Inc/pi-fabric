@@ -201,10 +201,7 @@ describe("AgentManager close storage", () => {
       expect(processAlive(pid)).toBe(false);
       expect(readBudgetLedger(budget.file).cost, "descendant can still append its final accounting after parent close").toBeGreaterThan(before.cost);
     }
-    // #369 validates each pressure admission's private root natively, even
-    // with a substituted transport. 1,000 fresh Windows ACL snapshots are real
-    // I/O, unlike main's mkdir-only pressure loop; do not reduce eviction pressure.
-  }, process.platform === "win32" ? 180_000 : 30_000);
+  }, 30_000);
 
   it("cancels queued admissions on close instead of launching after shutdown", async () => {
     const { manager, root } = setup(false);

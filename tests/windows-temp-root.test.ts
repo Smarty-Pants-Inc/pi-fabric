@@ -28,13 +28,15 @@ const root = "R:\\private\\data";
 const paths = ["R:\\", "R:\\private", root];
 const allow = (sid = userSid, mask = 0x1f01ff, flags = 0): Ace => ({ type: 0, flags, sid, mask });
 let directories: Directory[];
+let normalTemp: string | undefined;
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 
 beforeEach(() => {
+  normalTemp = undefined;
   directories = paths.map(path => ({ path, attributes: 0x10, owner: userSid, dacl: [allow()] }));
   vi.stubEnv("SystemRoot", "C:\\Windows");
   vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
-  vi.spyOn(childProcess, "execFileSync").mockImplementation(() => JSON.stringify({ userSid, device: "\\Device\\HarddiskVolume7", directories }));
+  vi.spyOn(childProcess, "execFileSync").mockImplementation(() => JSON.stringify({ userSid, device: "\\Device\\HarddiskVolume7", normalTemp, directories }));
 });
 afterEach(() => {
   Object.defineProperty(process, "platform", platform);
@@ -89,6 +91,40 @@ describe("Windows file-data namespace ACL policy", () => {
     expect(() => windowsDataRoot(root)).toThrow(/untrusted principal/);
   });
 
+  it("permits sibling creation and inherit-only grants only above native normal temp", () => {
+    normalTemp = paths[1];
+    directories[0]!.dacl!.push(allow(users, 0x06), allow("S-1-3-0", 0x1f01ff, 0x0b));
+    expect(windowsDataRoot(root, { private: true })).toBe(root);
+    directories[1]!.dacl!.push(allow(users, 0x04));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/untrusted principal/);
+  });
+
+  it.each([0x10, 0x40, 0x100, 0x10000, 0x40000, 0x80000, 0x40000000])("rejects ancestor mutation/replacement above normal temp (%s)", mask => {
+    normalTemp = paths[1]; directories[0]!.dacl!.push(allow(users, mask));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/untrusted principal/);
+  });
+
+  it.each([0, 1, 2])("keeps ownership and reparse checks above/at/below normal temp (%s)", index => {
+    normalTemp = paths[1]; directories[index]!.owner = users;
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/owned by another user/);
+    directories[index]!.owner = userSid; directories[index]!.attributes |= 0x400;
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/not a real directory/);
+  });
+
+  it("does not infer normal temp from caller-controlled environment paths", () => {
+    normalTemp = "R:\\unrelated";
+    vi.stubEnv("TMP", paths[1]); vi.stubEnv("TEMP", paths[1]);
+    directories[0]!.dacl!.push(allow(users, 0x04));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/untrusted principal/);
+  });
+
+  it("checks inherited grants at/below normal temp despite harmless grants above it", () => {
+    normalTemp = paths[1]; directories[0]!.dacl!.push(allow(users, 0x1f01ff, 0x0b));
+    directories[1]!.dacl!.push(allow(users, 0x2, 0x0b));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/untrusted principal/);
+    directories[1]!.dacl!.pop(); directories[2]!.dacl!.push(allow(users, 0x1, 0x0b));
+    expect(() => windowsDataRoot(root, { private: true })).toThrow(/not private/);
+  });
   it("fails closed even when a deny could cancel an unsafe allow", () => {
     directories[1]!.dacl!.unshift({ ...allow(everyone), type: 1 });
     directories[1]!.dacl!.push(allow(everyone));

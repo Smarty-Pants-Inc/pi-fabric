@@ -65,7 +65,8 @@ public static class FabricTempRootDevice {
     }
     @{ path = $directory; attributes = $attributes; owner = $raw.Owner.Value; dacl = $dacl }
   })
-  @{ userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; device = $device; directories = $directories } | ConvertTo-Json -Compress -Depth 8
+  $normalTemp = [System.IO.Path]::Combine([Environment]::GetFolderPath('LocalApplicationData'), 'Temp')
+  @{ userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; device = $device; normalTemp = $normalTemp; directories = $directories } | ConvertTo-Json -Compress -Depth 8
 } catch {
   [Console]::Error.WriteLine($_.Exception.Message)
   throw
@@ -102,6 +103,13 @@ export const windowsDataRoot = (root: string, options: { private?: boolean } = {
   }
   if (typeof snapshot.device !== "string" || !/^\\Device\\HarddiskVolume[0-9]+$/i.test(snapshot.device)) return fail(directory, "is not a proven direct local volume");
   const trusted = (sid: string) => sid === snapshot.userSid || SYSTEM_SIDS.has(sid);
+  // Directory-only Windows isolation uses the native per-user normal temp
+  // hierarchy. Above it, sibling creation cannot mutate an existing directory,
+  // and inherit-only grants do not apply to those ancestors. Every owner and
+  // reparse check still applies; every ACL at/below normal temp stays strict.
+  // Never infer this boundary from TMP/TEMP or a caller-selected override.
+  const normalTempIndex = typeof snapshot.normalTemp === "string"
+    ? chain.findIndex(current => current.toLowerCase() === (snapshot.normalTemp as string).toLowerCase()) : -1;
   for (const [index, current] of chain.entries()) {
     const entry: unknown = snapshot.directories[index];
     if (!record(entry) || entry.path !== current || !uint32(entry.attributes)) fail(current, "has an invalid native Windows directory snapshot");
@@ -114,11 +122,13 @@ export const windowsDataRoot = (root: string, options: { private?: boolean } = {
       if (!record(ace) || (ace.type !== 0 && ace.type !== 1) || !uint32(ace.flags) || (ace.flags & ~0x1f) !== 0 || typeof ace.sid !== "string" || !SID.test(ace.sid) || !uint32(ace.mask)) {
         fail(current, "has an unsupported or unproven ACE");
       }
-      const rule = ace as { type: number; sid: string; mask: number };
-      // Include inherited/inherit-only grants: later scratch children must be private
-      // too. Rejecting a deny+allow pair is deliberate conservative fail-closed policy.
+      const rule = ace as { type: number; flags: number; sid: string; mask: number };
+      // Rejecting a deny+allow pair is deliberate conservative fail-closed policy.
       if (rule.type === 0 && !trusted(rule.sid)) {
-        if ((rule.mask & ~READ_ONLY_RIGHTS) !== 0) fail(current, "is writable or replaceable by an untrusted principal");
+        const aboveNormalTemp = normalTempIndex > index;
+        if (aboveNormalTemp && (rule.flags & 0x08) !== 0) continue; // INHERIT_ONLY_ACE
+        const allowed = READ_ONLY_RIGHTS | (aboveNormalTemp ? 0x06 : 0);
+        if ((rule.mask & ~allowed) !== 0) fail(current, "is writable or replaceable by an untrusted principal");
         // Read/list/traverse grants are harmless for ancestor custody, but not
         // for a namespace exported as private TMPDIR/TMP/TEMP. Include
         // inherit-only grants so newly allocated files cannot leak either.

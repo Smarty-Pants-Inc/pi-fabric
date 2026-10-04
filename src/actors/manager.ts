@@ -56,7 +56,7 @@ import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore } from "./registry-store.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { ModelRoutePinError } from "../core/model-refresh.js";
 
@@ -461,6 +461,7 @@ export class ActorManager {
   /** Orphan deletes, fenced to the entry version seen when it was found. */
   readonly #orphanPresence = new Map<string, number>();
   #presenceTimer: NodeJS.Timeout | undefined;
+  #orphanPresenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
@@ -616,7 +617,11 @@ export class ActorManager {
     this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
     // Presence entries this runtime wrote for actors it no longer knows (a remove whose
     // delete never landed) are orphans: reap them once at start.
-    setTimeout(() => this.#reapOrphanPresence(), 0).unref();
+    this.#orphanPresenceTimer = setTimeout(() => {
+      this.#orphanPresenceTimer = undefined;
+      this.#reapOrphanPresence();
+    }, 0);
+    this.#orphanPresenceTimer.unref();
   }
 
   subscribe(listener: () => void): () => void {
@@ -2210,6 +2215,10 @@ export class ActorManager {
     this.#drainRearms.clear();
     if (this.#presenceTimer) clearTimeout(this.#presenceTimer);
     this.#presenceTimer = undefined;
+    if (this.#orphanPresenceTimer) clearTimeout(this.#orphanPresenceTimer);
+    this.#orphanPresenceTimer = undefined;
+    if (this.#retentionTimer) clearInterval(this.#retentionTimer);
+    this.#retentionTimer = undefined;
     // Cancellation is monotonic: pending claims must settle before the enclosing
     // runtime releases host custody or certifies terminal lineage closure.
     await Promise.allSettled([...this.#adoptionPending.values()]);
@@ -2217,8 +2226,6 @@ export class ActorManager {
     await Promise.allSettled([...this.#presenceChains.values()]);
     await this.#filterStateSave;
     await this.#notifications.close();
-    if (this.#retentionTimer) clearInterval(this.#retentionTimer);
-    this.#retentionTimer = undefined;
     await this.#retentionSweep;
     this.#listeners.clear();
     if (this.#persistent) {
@@ -2238,10 +2245,11 @@ export class ActorManager {
       // turn, keeping the session from exiting. Past the grace, stop it: while closing, no queue
       // file is written, so its item stays there and the next session runs it again (#79).
       const drains = Promise.allSettled(owned.map((actor) => actor.drain ?? Promise.resolve()));
-      const timer = (ms: number) => new Promise<"late">((resolve) => setTimeout(resolve, ms, "late").unref?.());
-      if (await Promise.race([drains.then(() => "done" as const), timer(this.#closeGraceMs)]) === "late") {
+      // A losing race deadline is still a live old-generation timer. The shared
+      // bounded-settlement helper clears it when drains finish first (#4383).
+      if (!await settleWithin([drains], this.#closeGraceMs)) {
         await this.agents.close();
-        await Promise.race([drains, timer(this.#closeGraceMs)]);
+        await settleWithin([drains], this.#closeGraceMs);
       }
       for (const actor of owned) {
         if (actor.status !== "stopped") actor.status = "idle";

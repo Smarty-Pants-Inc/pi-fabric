@@ -143,7 +143,7 @@ describe("mesh schedules", () => {
     const events: string[] = [];
     const monitor = new ActorMeshMonitor(store, { enabled: true, actorPollMs: 60_000, maxReadEvents: 100 }, {
       beforePoll: () => true,
-      onEvent: (event) => events.push(String(event.text)),
+      onEvent: (event) => { events.push(String(event.text)); return true; },
     });
     try {
       monitor.start();

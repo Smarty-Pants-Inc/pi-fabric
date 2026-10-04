@@ -48,7 +48,7 @@ describe("Pi host compatibility", () => {
   ])("requires a known shell-safe fixture host %j: %j", (version, supported) => {
     expect(MINIMUM_FIXTURE_PI_HOST_VERSION).toBe("0.86.0");
     expect(fixturePiHostSupported(version)).toBe(supported);
-    expect(MINIMUM_PI_HOST_VERSION).toBe("0.80.6");
+    expect(MINIMUM_PI_HOST_VERSION).toBe("1.0.0");
   });
 
   it("detects the host package from the CLI path", () => {

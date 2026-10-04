@@ -270,7 +270,7 @@ export const spawnDetached = async (
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
   scope?: ScopedScratchLaunch,
-): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
   let runtime: string;
   try {
     runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
@@ -324,6 +324,7 @@ exec "$@"
   child.unref();
   return {
     pid,
+    closed,
     lostContact: () => lost,
     async waitForClose() {
       let deadline: ReturnType<typeof setTimeout> | undefined;

@@ -136,6 +136,13 @@ interface FabricMainAgentInfo {
   pendingMessages: boolean;
   local: boolean;
 }
+interface FabricMainAgentBindingResult extends FabricMainAgentInfo {
+  caller: string;
+  previous: { model?: string; thinking?: string };
+}
+type FabricBindingTargetResult<Id extends string> = string extends Id
+  ? FabricActorInfo | FabricMainAgentBindingResult
+  : Id extends \`session:\${string}\` ? FabricMainAgentBindingResult : FabricActorInfo;
 interface FabricPeerInfo {
   id: string;
   /** The root's fleet role, for example "project-agent". */
@@ -177,6 +184,8 @@ interface FabricParticipantInfo {
   repository?: string;
   /** False for print/JSON roots, which cannot receive messages or become project leads. */
   interactive?: boolean;
+  /** Reserved remote Main setter advertisement; currently false/absent. */
+  mainBindings?: boolean;
   kind: FabricParticipantKind;
   rootId: string;
   ownerHostId: string;
@@ -266,6 +275,9 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  /** Canonical Fabric release actually selected for this process child. */
+  fabricRelease?: string;
+  followUpDeliveries?: FabricFollowUpDelivery[];
   routeClass?: string;
   routeClassSource?: "explicit" | "derived";
   protected?: boolean;
@@ -332,6 +344,8 @@ interface FabricAgentResult extends FabricAgentHandle {
   error?: string;
   usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
   pendingMessages?: { steering: string[]; followUp: string[] };
+  currentToolStartedAt?: number;
+  followUpDeliveries?: FabricFollowUpDelivery[];
 }
 interface FabricModelInfo {
   runner?: FabricAgentRunner;
@@ -881,7 +895,27 @@ type FabricSessionIdHint = "sessionId is not a field: use id: 'session:<sessionI
 interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
 type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
+interface FabricFollowUpAlarm {
+  code: "FABRIC_FOLLOW_UP_DEADLINE";
+  messageId: string;
+  targetId: string;
+  targetName: string;
+  deadlineAt: number;
+  status: string;
+  currentTool?: string;
+  currentToolStartedAt?: number;
+  options: ["wait", "steer", "cancel"];
+  message: string;
+}
+interface FabricFollowUpDelivery {
+  messageId: string;
+  deadlineAt: number;
+  state: "queued" | "settling" | "delivered" | "cancelled";
+  alarm?: FabricFollowUpAlarm;
+}
 interface FabricMessageDelivery {
+  /** Local Pi task: absolute delivery deadline; expiry alarms but does not dequeue. */
+  deadlineAt?: number;
   /** Sender-only: owner observed a running task when it admitted this followUp. Delivery is unchanged. */
   warning?: {
     code: "FABRIC_FOLLOW_UP_RUNNING_TASK";
@@ -945,9 +979,13 @@ interface FabricAgentsApi {
   create(args: FabricActorRequest): Promise<FabricActorInfo>;
   /** Alias of create; file paths are resolved by the owning host. */
   createActor(args: FabricActorRequest): Promise<FabricActorInfo>;
-  setModel(args: { id: string; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<FabricActorInfo>;
+  /** Main setModel (own or remote) is refused; deferred to smarty-dev#4153. Actor bindings are unchanged. */
+  setModel(args: { id: \`session:\${string}\`; model?: string; scope?: "session" }): Promise<never>;
+  setModel<Id extends string>(args: { id: Id; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
-  setThinking(args: { id: string; thinking?: FabricThinking; scope?: FabricActorBindingScope | "global" }): Promise<FabricActorInfo>;
+  /** Only this session's own Main is supported; remote Main targets are refused. */
+  setThinking(args: { id: \`session:\${string}\`; thinking: FabricThinking; scope?: "session" }): Promise<FabricMainAgentBindingResult>;
+  setThinking<Id extends string>(args: { id: Id; thinking?: FabricThinking; scope?: FabricActorBindingScope | "global" }): Promise<FabricBindingTargetResult<Id>>;
   setTools(args: { id: string; tools: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setNice(args: { id: string; nice: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
@@ -972,7 +1010,8 @@ interface FabricAgentsApi {
   tell(id: string, message: string): Promise<FabricMessageDelivery>;
   steer(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
-  followUp(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
+  followUp(args: FabricMessageArgs & { deadlineMs?: number }): Promise<FabricMessageDelivery>;
+  cancelFollowUp(args: { id: string; messageId: string }): Promise<FabricFollowUpDelivery>;
   followUp(id: string, message: string): Promise<FabricMessageDelivery>;
   setSteeringMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   setFollowUpMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
-import { compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
+import { canRemoveTerminalRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
 import { isResidentCommandOperation, readResidentRequestDecision, type ResidentCommandResponse, type ResidentResponseAcknowledgement } from "./protocol.js";
@@ -66,7 +66,8 @@ export class ResidentRequestRetention {
   constructor(
     readonly root: string,
     readonly actorRoots: readonly string[] = [],
-    readonly retention: TerminalRunEventsRetention = {},
+    readonly retention: TerminalRunEventsRetention & { retainRuns?: boolean } = {},
+    readonly recoverRunArchives?: (directory: string) => void,
   ) {}
 
   due(now = Date.now()): boolean { return this.#scanning || now >= this.#nextSample; }
@@ -120,6 +121,10 @@ export class ResidentRequestRetention {
       if (kind === "runs") {
         // The request-proof wildcard is not an exit receipt for any particular run.
         const retainedRuns = this.#runReferences!.ids;
+        // Replay one untracked run (and its nested sources) under the host fence,
+        // before any compaction/deletion. Never walk the archive during startup
+        // or discharge the custody of a live manager's in-memory settlement.
+        if (entry.isDirectory() && !liveIds.has(entry.name)) this.recoverRunArchives?.(file);
         if (entry.isDirectory() && !liveIds.has(entry.name) &&
             !retainedRuns.has("*") && !retainedRuns.has(entry.name)) {
           // One complete safety-check + atomic replacement is the progress unit.
@@ -127,6 +132,16 @@ export class ResidentRequestRetention {
           // read: stop BETWEEN runs, not midway through every retry of a large
           // tree. Never cache worker-exit proofs or skip either fresh safety walk.
           const fingerprint = this.#runReferences!.fingerprint;
+          // Same exit/result fences as the former startup sweep, now streaming
+          // after the lease is up. A terminal marker alone is never exit evidence.
+          const stat = ownedStat(file);
+          if (this.retention.retainRuns === false && stat && now - stat.mtimeMs > 24 * 60 * 60 * 1_000 &&
+              !runTreeExitVeto(file, 0, undefined, true) && canRemoveTerminalRun(file) &&
+              hasPreservedResidentResult(directory, entry.name) &&
+              actorReferenceFingerprint(this.actorRoots) === fingerprint) {
+            try { fs.rmSync(file, { recursive: true, force: true }); } catch { /* retry next scan */ }
+            continue;
+          }
           compactTerminalRunEvents(file, { ...this.retention, now,
             // Another owner can publish a new latest run during a long safety
             // walk. Recheck the registry generation immediately before replace.

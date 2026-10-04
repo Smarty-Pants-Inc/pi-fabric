@@ -24,6 +24,7 @@ import type {
 import type {
   FabricAgentMessageResult,
   FabricMainAgentTarget,
+  FabricMainAgentBindingResult,
 } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
@@ -905,9 +906,9 @@ export class AgentsProvider implements FabricProvider {
           }
           // Model-facing terminal status returns the result; UI polling must not acknowledge it.
           if (terminalAgentStatuses.has(result.status) && this.manager.isSettled(id)) {
+            if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.abandonForeground(id));
             this.manager.prepareForeground(id);
-            if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.detachSignal(id));
-            else this.manager.markForeground(id);
+            if (!context.deferResultConsumption) this.manager.markForeground(id);
           }
           return result;
         } catch (error) {
@@ -1173,7 +1174,7 @@ export class AgentsProvider implements FabricProvider {
           const resident = this.#residentActorOwner(id);
           if (resident) return this.#setResidentActor(resident, { operation: "stop", id: resident.id }, context);
         }
-        return this.stopParticipant(id);
+        return this.stopParticipant(id, context);
       }
       case "cleanup": {
         const id = String(args.id);
@@ -1282,6 +1283,8 @@ export class AgentsProvider implements FabricProvider {
           "steer",
           context,
         );
+      case "cancelFollowUp":
+        return this.manager.cancelFollowUp(String(args.id), String(args.messageId));
       case "followUp":
         return this.routeMessage(
           String(args.id),
@@ -1289,6 +1292,7 @@ export class AgentsProvider implements FabricProvider {
           args.data,
           "followUp",
           context,
+          { ...(typeof args.deadlineMs === "number" ? { deadlineMs: args.deadlineMs } : {}) },
         );
       case "setSteeringMode":
         return this.manager.setSteeringMode(String(args.id), this.#steeringMode(args.mode));
@@ -1365,6 +1369,7 @@ export class AgentsProvider implements FabricProvider {
       }
       case "setModel": {
         const id = String(args.id);
+        if (id.startsWith("session:")) return this.#setMainBinding("setModel", id, args, context);
         const model = typeof args.model === "string" ? args.model.trim() : "";
         this.manager.assertModelAllowed(model);
         if (args.scope === "global") {
@@ -1404,6 +1409,7 @@ export class AgentsProvider implements FabricProvider {
       }
       case "setThinking": {
         const id = String(args.id);
+        if (id.startsWith("session:")) return this.#setMainBinding("setThinking", id, args, context);
         const thinking = typeof args.thinking === "string" ? args.thinking.trim() : "";
         if (thinking && !isFabricThinking(thinking)) throw new Error(`Invalid Fabric actor thinking level: ${thinking}`);
         if (args.scope === "global") {
@@ -1609,6 +1615,7 @@ export class AgentsProvider implements FabricProvider {
       from?: MeshIdentity;
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
+      deadlineMs?: number;
     } = {},
   ): Promise<FabricAgentMessageResult> {
     // Host-authored lifecycle routing has no sender invocation/history. Check
@@ -1636,12 +1643,67 @@ export class AgentsProvider implements FabricProvider {
     this.#lifecycleScheduler.schedule(subscription.to, { subscription, event });
   }
 
+  #assertMainBindingCaller(from: MeshIdentity): void {
+    const caller = from.id === this.actorManager.identity.id
+      ? this.participants.self() : this.participants.get(from.id, undefined, { fresh: true });
+    if (from.kind !== "main" || !caller || caller.kind !== "root" || caller.stale ||
+      caller.id !== from.id || caller.rootId !== from.id || caller.ownerIdentityId !== from.id ||
+      from.id !== this.mainAgent.id) {
+      throw new Error(`Unauthorized Main binding change by ${from.id} on ${this.mainAgent.id}; only this session's own Main may change it`);
+    }
+  }
+
+  async #applyMainBinding(
+    operation: "setThinking",
+    args: Record<string, unknown>,
+    from: MeshIdentity,
+    checkCommit: () => void,
+    context = this.mainAgent.bindingContext?.(),
+  ): Promise<FabricMainAgentBindingResult> {
+    this.#assertMainBindingCaller(from);
+    if (!context || !this.mainAgent.local || this.mainAgent.interactive === false || !this.mainAgent.setBinding) {
+      throw new Error(`Main ${this.mainAgent.id} is not live; no binding change was queued`);
+    }
+    checkCommit();
+    const thinking = typeof args.thinking === "string" ? args.thinking.trim() : "";
+    if (!isFabricThinking(thinking)) throw new Error(`Invalid Main thinking level: ${thinking || "(missing)"}`);
+    return this.mainAgent.setBinding({ operation, thinking }, from.id, context, () => {
+      checkCommit(); this.#assertMainBindingCaller(from);
+    });
+  }
+
+  async #setMainBinding(
+    operation: "setModel" | "setThinking", id: string, args: Record<string, unknown>, context: FabricInvocationContext,
+  ): Promise<FabricMainAgentBindingResult> {
+    // Pi authenticates asynchronously before setModel mutates, without a requester
+    // commit guard. Defer every Main target before resolution or native entry.
+    if (operation === "setModel") {
+      throw new Error("Main setModel is not supported yet (own or remote); see smarty-dev#4153");
+    }
+    if (args.scope !== undefined && args.scope !== "session") throw new Error("Main bindings support only session scope");
+    const checkCommit = (): void => throwIfExecutionExpired(context);
+    checkCommit();
+    // Refuse before lookup, resolution, publication or native mutation. Even a live,
+    // enrolled peer cannot safely commit until Pi offers an after-auth commit guard.
+    if (id !== this.mainAgent.id || !this.mainAgent.local) {
+      throw new Error("remote Main model changes are not supported yet; see smarty-dev#4153");
+    }
+    const from = this.actorManager.identity;
+    if (from.kind !== "main") {
+      throw new Error(`Unauthorized Main binding change by ${from.id}; task/actor lineage is not Main authority`);
+    }
+    const result = await this.#applyMainBinding(operation, args, from, checkCommit, context.extensionContext);
+    this.participants.scheduleRefresh();
+    return result;
+  }
+
   async acceptControl(
     command: FabricControlCommand,
     from: MeshIdentity,
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
+    // The router retains legacy wire names only to give old senders a clear refusal.
     return this.#router.acceptControl(command, from, signal, verification);
   }
 
@@ -1845,9 +1907,15 @@ export class AgentsProvider implements FabricProvider {
     return value === "local" || value === "lineage" || value === "project" ? value : fallback;
   }
 
-  async stopParticipant(id: string): Promise<unknown> {
+  async stopParticipant(id: string, context?: FabricInvocationContext): Promise<unknown> {
     try {
-      const result = await this.manager.stop(id);
+      const result = await this.manager.stop(id, { consume: !context });
+      // Host shutdown also stops children; only a guest observation consumes one.
+      if (context && terminalAgentStatuses.has(result.status)) {
+        if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.abandonForeground(id));
+        this.manager.prepareForeground(id);
+        if (!context.deferResultConsumption) this.manager.markForeground(id);
+      }
       this.participants.scheduleRefresh();
       return result;
     } catch (error) {

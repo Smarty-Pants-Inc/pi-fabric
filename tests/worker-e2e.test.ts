@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -25,6 +25,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
 
   afterEach(async () => {
     await Promise.all(managers.splice(0).map((m) => m.close()));
+    vi.unstubAllEnvs();
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -112,6 +113,31 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(fs.existsSync(report.scratch)).toBe(!scoped);
     await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track|still be running/);
   });
+  it("persists the spawn-selected compatible installed release in the real worker record", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-installed-e2e-"));
+    roots.push(root);
+    const installed = path.join(root, "installed");
+    fs.mkdirSync(installed);
+    fs.cpSync(path.resolve("dist"), path.join(installed, "dist"), { recursive: true });
+    fs.writeFileSync(path.join(installed, "package.json"), JSON.stringify({ name: "pi-fabric", type: "module" }));
+    fs.symlinkSync(path.resolve("node_modules"), path.join(installed, "node_modules"), "junction");
+    const profile = path.join(root, "profile");
+    fs.mkdirSync(profile);
+    fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify({ packages: [installed] }));
+    vi.stubEnv("PI_CODING_AGENT_DIR", profile);
+    vi.stubEnv("FAKE_PI_BEHAVIOR", "success");
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 8_000 }, {
+      workerPath, piBinary, fullCodeMode: true, runRoot: path.join(root, "runs"),
+    });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "installed worker evidence", transport: "process" });
+    expect(handle.fabricRelease).toBe(installed);
+    const result = await manager.wait(handle.id);
+    expect(result.status, result.error).toBe("completed");
+    expect(result.fabricRelease).toBe(installed);
+    const record = JSON.parse(fs.readFileSync(path.join(root, "runs", handle.id, "status.json"), "utf8"));
+    expect(record.fabricRelease).toBe(installed); // On disk, not manager-only enrichment.
+  }, 15_000);
 
   it.each(["reject", "error-only-turn", "success", "terminated-recover"])("records actual inference consumption, not startup/error-only turns (%s)", async (behavior) => {
     const previous = process.env.FAKE_PI_BEHAVIOR;

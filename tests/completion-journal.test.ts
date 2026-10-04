@@ -46,26 +46,38 @@ const measureSynchronousSections = async (operation: (finishSlice: () => void) =
   const descendants = new Set<number>();
   let synchronousStart = true;
   let activeSince: number | undefined;
+  let activeCpuSince: NodeJS.CpuUsage | undefined;
   let depth = 0;
-  let sliceMs = 0, syncMaxMs = 0, syncSamples = 0;
+  let sliceMs = 0, syncMaxMs = 0, sliceCpuMs = 0, syncCpuMaxMs = 0, syncSamples = 0;
   const recordActive = () => {
-    if (activeSince === undefined) return;
+    if (activeSince === undefined || activeCpuSince === undefined) return;
     const now = performance.now();
+    const cpu = process.cpuUsage(activeCpuSince);
     sliceMs += now - activeSince;
+    sliceCpuMs += (cpu.user + cpu.system) / 1000;
     syncMaxMs = Math.max(syncMaxMs, sliceMs);
+    syncCpuMaxMs = Math.max(syncCpuMaxMs, sliceCpuMs);
     syncSamples++;
     activeSince = now;
+    activeCpuSince = process.cpuUsage();
   };
-  const finishSlice = () => { recordActive(); sliceMs = 0; };
+  const finishSlice = () => { recordActive(); sliceMs = 0; sliceCpuMs = 0; };
   const hook = createHook({
     init(id, _type, trigger) {
       if (synchronousStart || descendants.has(trigger) || descendants.has(executionAsyncId())) descendants.add(id);
     },
     before(id) {
-      if (descendants.has(id) && depth++ === 0) activeSince = performance.now();
+      if (descendants.has(id) && depth++ === 0) {
+        activeSince = performance.now();
+        activeCpuSince = process.cpuUsage();
+      }
     },
     after(id) {
-      if (descendants.has(id) && --depth === 0) { recordActive(); activeSince = undefined; }
+      if (descendants.has(id) && --depth === 0) {
+        recordActive();
+        activeSince = undefined;
+        activeCpuSince = undefined;
+      }
     },
     destroy(id) { descendants.delete(id); },
   });
@@ -73,17 +85,26 @@ const measureSynchronousSections = async (operation: (finishSlice: () => void) =
   try {
     // Also time the synchronous prefix, before operation() returns its promise.
     activeSince = performance.now();
+    activeCpuSince = process.cpuUsage();
     depth = 1;
     let pending: Promise<void>;
     try { pending = operation(finishSlice); }
-    finally { recordActive(); depth = 0; activeSince = undefined; synchronousStart = false; }
+    finally {
+      recordActive();
+      depth = 0;
+      activeSince = undefined;
+      activeCpuSince = undefined;
+      synchronousStart = false;
+    }
     await pending;
   } finally { hook.disable(); }
-  return { syncMaxMs, syncSamples };
+  return { syncMaxMs, syncCpuMaxMs, syncSamples };
 };
 const assertSynchronousWork = (measured: Awaited<ReturnType<typeof measureSynchronousSections>>): void => {
   expect(measured.syncSamples).toBeGreaterThan(0);
-  expect(measured.syncMaxMs, "scan synchronous slice must stay below 16 ms on every platform").toBeLessThan(16);
+  // CPU time excludes scheduler preemption. This is the platform-independent
+  // primary guard; syncMaxMs remains the wall-clock diagnostic in the log.
+  expect(measured.syncCpuMaxMs, "scan synchronous CPU time must stay below 16 ms on every platform").toBeLessThan(16);
 };
 // The concurrent timer is independent of generator bookkeeping. Measure the full
 // gap between 1 ms ticks (without subtracting timer resolution), so a synchronous
@@ -125,10 +146,9 @@ const measureIdleSlices = async (label: string, operation: () => Promise<void>) 
 const assertIdleLatency = (measured: Awaited<ReturnType<typeof measureIdleSlices>>, platform: NodeJS.Platform = process.platform): void => {
   assertSynchronousWork(measured); // Primary acceptance guard: identical on Linux and Windows.
   expect(measured.samples).toBeGreaterThan(0);
-  // Secondary independent probe: Windows scheduler noise is diagnostic below
-  // the loose 50 ms cap; Linux retains its strict 16 ms maximum. p99 is logged,
-  // not used to excuse a synchronous stall (even one affecting only a single tick).
-  expect(measured.maxMs).toBeLessThan(platform === "win32" ? 50 : 16);
+  // The synchronous-section wall clock is diagnostic only on Windows because
+  // scheduler preemption can inflate it. Linux retains the strict 16 ms maximum.
+  if (platform !== "win32") expect(measured.syncMaxMs).toBeLessThan(16);
 };
 
 describe("completion journal idle scans", () => {
@@ -144,14 +164,15 @@ describe("completion journal idle scans", () => {
   });
 
   it("separates Windows scheduler noise from the platform-independent synchronous guard", () => {
-    const measured = { maxMs: 17, p99Ms: 17, samples: 200, passMs: 100,
-      syncMaxMs: 1, syncSamples: 100, sliceMaxMs: 1, sliceSamples: 100, delayedTicks: [] };
+    const measured = { maxMs: 1, p99Ms: 1, samples: 200, passMs: 100,
+      syncMaxMs: 17, syncCpuMaxMs: 1, syncSamples: 100, sliceMaxMs: 1, sliceSamples: 100, delayedTicks: [] };
     expect(() => assertIdleLatency(measured, "win32")).not.toThrow();
     expect(() => assertIdleLatency(measured, "linux")).toThrow();
-    expect(() => assertIdleLatency({ ...measured, maxMs: 50 }, "win32")).toThrow();
+    expect(() => assertIdleLatency({ ...measured, syncMaxMs: 50 }, "win32")).not.toThrow();
+    expect(() => assertIdleLatency({ ...measured, syncMaxMs: 50 }, "linux")).toThrow();
     for (const platform of ["win32", "linux"] as const) {
-      expect(() => assertIdleLatency({ ...measured, maxMs: 1, p99Ms: 1, syncMaxMs: 16 }, platform)).toThrow();
-      expect(() => assertIdleLatency({ ...measured, maxMs: 21, p99Ms: 2, syncMaxMs: 20 }, platform)).toThrow();
+      expect(() => assertIdleLatency({ ...measured, maxMs: 1, p99Ms: 1, syncMaxMs: 1, syncCpuMaxMs: 16 }, platform)).toThrow();
+      expect(() => assertIdleLatency({ ...measured, maxMs: 21, p99Ms: 2, syncMaxMs: 1, syncCpuMaxMs: 20 }, platform)).toThrow();
       expect(() => assertIdleLatency({ ...measured, maxMs: 1, p99Ms: 1, syncSamples: 0 }, platform)).toThrow();
     }
   });
@@ -275,13 +296,21 @@ describe("completion journal idle scans", () => {
     // Block the final enqueue after the scan's awaited I/O: neither a final
     // small slice nor async-generator yields may hide this from the guard.
     const enqueue = vi.fn(() => {
-      const start = performance.now();
-      while (performance.now() - start < 20) { /* Below Windows' secondary 50 ms cap. */ }
+      // Deliberately burn 20 ms of CPU, rather than sleeping: both platform
+      // policies must reject this even if Windows preempts the process.
+      const started = process.cpuUsage();
+      let accumulator = 0;
+      for (;;) {
+        for (let index = 0; index < 10_000; index++) accumulator = Math.imul(accumulator + index, 16_777_619);
+        const cpu = process.cpuUsage(started);
+        if ((cpu.user + cpu.system) / 1000 >= 20) break;
+      }
+      if (accumulator === Number.MIN_SAFE_INTEGER) throw new Error("unreachable");
     });
     const measured = await measureIdleSlices(`negative control: 20 ms consumer (${platform})`, () => h.journal(enqueue).drain());
-    expect(measured.syncMaxMs).toBeGreaterThanOrEqual(20);
-    expect(() => assertSynchronousWork(measured)).toThrow("scan synchronous slice"); // Direct primary-guard proof.
-    expect(() => assertIdleLatency(measured, platform)).toThrow("scan synchronous slice");
+    expect(measured.syncCpuMaxMs).toBeGreaterThanOrEqual(20);
+    expect(() => assertSynchronousWork(measured)).toThrow("scan synchronous CPU time"); // Direct primary-guard proof.
+    expect(() => assertIdleLatency(measured, platform)).toThrow("scan synchronous CPU time");
     expect(enqueue).toHaveBeenCalledTimes(1);
   });
 

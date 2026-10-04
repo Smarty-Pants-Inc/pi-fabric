@@ -10,6 +10,53 @@ const descriptor = { name: "write", description: "requires approval", risk: "wri
 const action = { ...descriptor, ref: "demo.write", provider: "demo" };
 
 describe("headless approval cancellation", () => {
+  it.each((["provider", "view"] as const).flatMap(source => (["entered", "queued"] as const).map(stage => [source, stage] as const)))(
+    "A9 propagates %s revocation to an %s approval while the guest catches and continues", async (source, stage) => {
+      const registry = new ActionRegistry();
+      const invoke = vi.fn(async () => "approved");
+      for (const name of ["demo", "next"]) registry.register({ name, description: "test", async list() { return [descriptor]; }, async describe() { return descriptor; }, invoke });
+      let caught!: () => void;
+      const caughtPromise = new Promise<void>(resolve => { caught = resolve; });
+      const stop = new AbortController();
+      const lease = await registry.acquireCapabilityView(["demo.write"], { cwd: context.cwd, signal: undefined, parentToolCallId: "view", nestedToolCallId: "view", update() {}, extensionContext: context });
+      const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+      config.executor.timeoutMs = 3000; config.approvals.write = "ask"; config.approvals.headless = "decision";
+      const service = new FabricExecutionService(registry, config);
+      if (source === "view") service.setCapabilityView(lease.view);
+      let releaseQueue: (() => void) | undefined;
+      const held = stage === "queued" ? service.sessionApprovals.serialize(() => new Promise<void>(resolve => { releaseQueue = resolve; })) : Promise.resolve();
+      await Promise.resolve();
+      const serialize = vi.spyOn(service.sessionApprovals, "serialize");
+      const signals: Array<AbortSignal | undefined> = [];
+      let releaseDecision: (() => void) | undefined;
+      service.setHeadlessApproval(async (action, _reason, signal) => {
+        signals.push(signal);
+        if (action.provider === "next") return true;
+        return new Promise<boolean>(resolve => {
+          releaseDecision = () => resolve(false);
+          if (signal?.aborted) resolve(false);
+          else signal?.addEventListener("abort", () => resolve(false), { once: true });
+        });
+      });
+      const run = (code: string, id: string, signal?: AbortSignal) => service.execute({ code, context, signal, parentToolCallId: id, onPartial(partial) { if (partial.progress === "caught") caught(); } });
+      let settled = false;
+      const guest = run('try { await tools.call({ref:"demo.write",args:{}}); } catch {} await tools.progress({message:"caught"}); return await new Promise(() => {});', "revoked-guest", stop.signal).finally(() => { settled = true; });
+      try {
+        await vi.waitFor(() => expect(stage === "queued" ? serialize.mock.calls.length : signals.length).toBe(1));
+        if (source === "provider") registry.revokeProvider("demo"); else await lease.release();
+        await caughtPromise;
+        expect(settled).toBe(false);
+        if (stage === "entered") expect(signals[0]?.aborted).toBe(true);
+        releaseQueue?.(); await held;
+        service.setCapabilityView(undefined);
+        expect((await run('return await tools.call({ref:"next.write",args:{}});', "next-guest")).value).toBe("approved");
+        if (stage === "entered") expect(signals[0]?.aborted).toBe(true);
+        else expect(signals).toHaveLength(1); // Only next.write, never the obsolete demo decision.
+        expect(invoke).toHaveBeenCalledOnce();
+      } finally {
+        stop.abort(); releaseQueue?.(); releaseDecision?.(); await held; await guest; await lease.release(); await registry.close();
+      }
+    });
   it("A9 cancels the effective timed-out wait and releases the next execution's approval slot", async () => {
     const registry = new ActionRegistry();
     const invoke = vi.fn(async () => "approved");

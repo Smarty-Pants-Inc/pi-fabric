@@ -710,13 +710,13 @@ export class FabricExecutionService {
                 this.authorizer!.authorize(action.ref, options.parentToolCallId),
             }
           : {}),
-        approve: async (action, preparedArgs) => {
+        approve: async (action, preparedArgs, effectiveSignal) => {
           if (action.ref === "schema.commit") {
-            await approval.approve({ ...action, risk: "write" }, preparedArgs, callContext.signal);
-            await approval.approve({ ...action, risk: "execute" }, preparedArgs, callContext.signal);
+            await approval.approve({ ...action, risk: "write" }, preparedArgs, effectiveSignal);
+            await approval.approve({ ...action, risk: "execute" }, preparedArgs, effectiveSignal);
             return;
           }
-          await approval.approve(action, preparedArgs, callContext.signal);
+          await approval.approve(action, preparedArgs, effectiveSignal);
         },
         audits,
         maxResultChars: this.config.executor.maxNestedResultChars,

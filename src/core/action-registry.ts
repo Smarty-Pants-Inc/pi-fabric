@@ -147,6 +147,8 @@ export interface FabricRegistryInvocationContext extends FabricInvocationContext
   approve(
     action: ResolvedFabricAction,
     args: Record<string, unknown>,
+    /** Effective cancellation includes registry view, binding and shutdown revocation. */
+    signal?: AbortSignal,
   ): Promise<void>;
   audits: FabricCallAudit[];
   maxResultChars: number;
@@ -827,7 +829,7 @@ export class ActionRegistry {
       );
       if (catalog.invalid) throw new Error(`Invalid arguments for ${ref}: ${catalog.invalid}`);
       if (context.approve) {
-        await runAbortable(context.signal, () => context.approve!(structuredClone(action), snapshotArguments(catalog.args)));
+        await runAbortable(context.signal, () => context.approve!(structuredClone(action), snapshotArguments(catalog.args), context.signal));
       }
       throwIfExecutionExpired(context);
       const acquired = await runAbortable(context.signal, () =>
@@ -989,7 +991,7 @@ export class ActionRegistry {
       }
 
       failureStage = "approve";
-      await runAbortable(context.signal, () => context.approve(structuredClone(action), snapshotArguments(catalog.args)));
+      await runAbortable(context.signal, () => context.approve(structuredClone(action), snapshotArguments(catalog.args), context.signal));
 
       failureStage = "invoke";
       throwIfExecutionExpired(context);

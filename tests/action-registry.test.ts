@@ -993,7 +993,7 @@ describe("compiled entropy capability preservation", () => {
     expect(value).toBe("sensitive payload");
     expect(raw).toEqual({ VALUE: "sensitive payload" });
     expect(invoke).toHaveBeenCalledOnce();
-    expect(approve).toHaveBeenCalledWith(expect.anything(), { value: "sensitive payload" });
+    expect(approve).toHaveBeenCalledWith(expect.anything(), { value: "sensitive payload" }, expect.any(AbortSignal));
     const trace = recorder.seal("succeeded", []);
     expect(readFabricExecutionTraceV1(trace)).toBe(trace);
     const witness = trace.operations[0]!.normalization!;

@@ -60,11 +60,12 @@ await compact.request({
   instructions: "Keep the failing test name and the file map; drop the rest.",
   preserve: ["Auth regression is still open", "tests/auth.test.ts"], // optional
   requestedBy: "model", // optional, default "model"
+  resume: "Run tests/auth.test.ts, then fix the failing case", // optional next step
 });
 
 // Read the pending intent and the last committed/failed compaction info.
 const status = await compact.status();
-// { pending?: { reason?, instructions?, preserve?, requestedBy, requestedAt },
+// { pending?: { reason?, instructions?, preserve?, resume?, resumeId?, requestedBy, requestedAt },
 //   last?:   { at, requestedBy, status: "committed"|"cancelled"|"failed",
 //             summary?, tokensBefore?, estimatedTokensAfter?, error? } }
 
@@ -72,8 +73,35 @@ const status = await compact.status();
 await compact.cancel();
 ```
 
-Risk classes: `request` is `write` (it mutates host session state). `status`
-and `cancel` are `read`.
+Risk classes: `request` and `cancel` are `write` (they mutate host session
+state). `status` is `read`.
+
+#### Resume unfinished work
+
+`resume` is optional bounded text (up to 16,384 characters), separate from
+`instructions` and `preserve`: those guide the summary, while `resume` starts
+one follow-up **user turn** after successful compaction. Use it for the agent's
+own next step when self-requesting compaction. An empty `resume` explicitly
+opts out. When omitted, the provider infers the follow-on part of the latest
+user message (including admitted steer/followUp messages) for an explicit
+compound directive such as `Compact first, then start item X`. It does not
+reuse arbitrary old tasks or plain compaction instructions. For more complex
+wording, pass the next step explicitly.
+
+Fabric records a non-context continuation entry immediately before compaction.
+The compaction entry witnesses success; the generated user message, including
+its unique continuation ID, witnesses delivery. Pi defers the user turn until
+all settled handlers finish. The one-shot RPC worker observes that journal
+entry and keeps stdin open across the public settled event and its idle timer
+until the continuation is admitted and its turn settles. Duplicate callbacks
+and settled notifications do not queue another turn. On session restart/reload, a committed continuation
+without a recorded user message is recovered once. A scheduled but not yet
+admitted message is **not** treated as a durable receipt, so a crash in that
+gap does not lose the continuation. Recovery reads the active branch, not
+abandoned histories. Failed/cancelled compactions do not resume. Plain manual
+`/compact`, threshold compaction, and programmatic compaction without pending
+work remain idle. This behavior covers host `compact.request`, not the separate
+peer `agents.compact` RPC control.
 
 With only `instructions` present, Fabric forwards it as ordinary Pi
 `customInstructions`. Manual `/compact` text and programmatic requests then
@@ -211,9 +239,11 @@ safety needs no configuration.
 | File | Role |
 | --- | --- |
 | `src/core/compact-controller.ts` | Pending-intent controller with `request`, `cancel`, `status`, and `maybeCommit`. Uses a single replaceable slot, typed preserve encoding, an in-flight guard, and a quiet clear on benign no-op outcomes (cancelled, already compacted, or session too small). |
-| `src/providers/compact-provider.ts` | Fabric provider that exposes a bounded TypeBox-validated `request` (write, including optional `preserve: string[]`), `status` (read), and `cancel` (read). Registered always, with activity audit. |
+| `src/providers/compact-provider.ts` | Fabric provider that exposes a bounded TypeBox-validated `request` (write, including optional `preserve: string[]`), `status` (read), and `cancel` (write). Registered always, with activity audit. |
 | `src/fabric-state.ts` | Constructs the controller with mesh-publish hooks, registers the provider, and resets on re-init or shutdown. |
-| `src/index.ts` | Invokes `state.compact.maybeCommit(context)` in the existing `agent_settled` handler. |
+| `src/index.ts` | Invokes `state.compact.maybeCommit(context)` in the existing `agent_settled` handler and recovers undelivered continuations on `session_start`. |
+| `src/core/compact-resume.ts` | Infers compound compact directives and journals/replays the one-shot follow-up user turn. |
+| `src/compaction/resume-delivery.ts` | Host-free journal/message wire contract and worker shutdown fence. |
 | `src/agents/types.ts` | Extends `AgentSteerEntry["type"]` with `"compact"` and adds the optional `instructions` field. |
 | `src/agents/manager.ts` | `compact(id, instructions?)` appends a compact entry through the steer channel and rejects Claude-runner children. |
 | `src/worker.ts` | Feeds compact controls into the child boundary coordinator and observes Pi RPC lifecycle events. |

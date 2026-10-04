@@ -11,6 +11,29 @@ import { FABRIC_PROVIDER_REGISTER_EVENT } from "../src/protocol.js";
 
 const entry = path.resolve("dist/index.js");
 
+function stackIncludesDirectory(stack: string, directory: string): boolean {
+  // Native Windows paths use backslashes, but Node ESM stack frames use file:///D:/... URLs.
+  // Normalize both spellings before attributing timers; an empty owned list is not evidence
+  // that a headless Windows runner never started the dashboard poller.
+  return stack.replaceAll("\\", "/").includes(`${directory.replaceAll("\\", "/")}/`);
+}
+
+describe("reload timer stack attribution", () => {
+  it.each([
+    ["D:\\a\\pi-fabric\\dist", "at poll (file:///D:/a/pi-fabric/dist/index.js:1:2)"],
+    ["D:\\a\\pi-fabric\\dist", "at poll (D:\\a\\pi-fabric\\dist\\index.js:1:2)"],
+    ["/repo/dist", "at poll (file:///repo/dist/chunks/poll.js:1:2)"],
+    ["/repo/dist", "at poll (/repo/dist/index.js:1:2)"],
+  ])("attributes timers in %s from %s", (directory, stack) => {
+    expect(stackIncludesDirectory(stack, directory)).toBe(true);
+  });
+
+  it("does not attribute a sibling directory or a host timer to Fabric", () => {
+    expect(stackIncludesDirectory("at poll (file:///D:/a/pi-fabric/dist-other/index.js:1:2)", "D:\\a\\pi-fabric\\dist")).toBe(false);
+    expect(stackIncludesDirectory("at poll (node:internal/timers:1:2)", "/repo/dist")).toBe(false);
+  });
+});
+
 async function waitUntil(condition: () => boolean, description: string): Promise<void> {
   const deadline = performance.now() + 5_000;
   while (!condition()) {
@@ -22,7 +45,7 @@ async function waitUntil(condition: () => boolean, description: string): Promise
 }
 
 describe.skipIf(!fs.existsSync(entry))("real Pi reload poll guard (smarty-dev#4383)", () => {
-  it("clears the old generation's timers across ten reload windows with asynchronous disposal", async () => {
+  it.each(["native", "win32"] as const)("clears the old generation's timers across ten reload windows with asynchronous disposal (%s paths)", async (pathStyle) => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-reload-poll-")));
     const agentDir = path.join(root, "agent");
     fs.mkdirSync(agentDir);
@@ -39,9 +62,11 @@ describe.skipIf(!fs.existsSync(entry))("real Pi reload poll guard (smarty-dev#43
     process.on("uncaughtException", onFault);
     process.on("unhandledRejection", onFault);
     const owned: Array<{ timer: NodeJS.Timeout; stack: string }> = [];
+    // Exercise Windows-native directory spelling against real ESM stack frames on every OS.
+    const directory = pathStyle === "win32" ? path.dirname(entry).replaceAll("/", "\\") : path.dirname(entry);
     const track = (timer: NodeJS.Timeout) => {
       const stack = new Error().stack ?? "";
-      if (stack.includes(path.dirname(entry))) owned.push({ timer, stack });
+      if (stackIncludesDirectory(stack, directory)) owned.push({ timer, stack });
       return timer;
     };
     const timeout = globalThis.setTimeout;
@@ -85,7 +110,7 @@ describe.skipIf(!fs.existsSync(entry))("real Pi reload poll guard (smarty-dev#43
         await waitUntil(
           // Activation can already own a widget poll; also wait for the dashboard's custom UI.
           () => doneCallbacks.length > 0 &&
-            owned.some(({ timer, stack }) => !destroyed(timer) && stack.includes("#schedulePoll")),
+            owned.some(({ timer, stack }) => !destroyed(timer) && stack.includes("FabricUiController.#schedulePoll")),
           "the dashboard poll timer to exist before opening a reload window",
         );
       };

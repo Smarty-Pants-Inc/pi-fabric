@@ -35,6 +35,46 @@ const setup = () => {
 };
 
 describe("idle reader coalescing (smarty-dev#4383)", () => {
+  it("snapshot get batches observations without sliding expiry or overriding explicit freshness", () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const s = setup(); s.replace("before");
+    const snapshot = s.reader.stateToken();
+    const initial = s.count();
+    vi.setSystemTime(1_005_000); s.replace("after");
+    expect(s.reader.get("status", { snapshot })?.value).toBe("before");
+    expect(s.count()).toBe(initial);
+    expect(s.reader.readCacheRemainingMs).toBe(0);
+    expect(s.reader.get("status", { snapshot, fresh: true })?.value).toBe("after");
+    expect(s.count()).toBe(initial + 1);
+    expect(s.reader.get("status")?.value).toBe("after");
+    expect(s.count()).toBe(initial + 1);
+  });
+  it("two directory consumers and a UI observer share ONE canonical parse per fixed window", () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const s = setup(); s.replace("before");
+    const options = { enabled: true, hostId: "observer", rootId: "observer", identity,
+      heartbeatMs: 60_000, leaseMs: 120_000, reapDeadHosts: false as const };
+    const first = new ParticipantDirectory(s.reader, options);
+    const second = new ParticipantDirectory(s.reader, options);
+    const parse = vi.spyOn(JSON, "parse");
+    const fullParses = () => parse.mock.calls.filter(([text]) => text.includes('"entries":')).length;
+    first.list();
+    const token = s.reader.stateToken();
+    expect(fullParses()).toBe(1);
+    s.replace("after");
+    for (const elapsed of [1, 1_000, 4_999]) {
+      vi.setSystemTime(1_000_000 + elapsed);
+      first.list(); second.list(); s.reader.cachedStateStamp(true);
+      expect(s.reader.get("status")?.value).toBe("before");
+      expect(s.reader.stateToken()).toBe(token);
+      expect(fullParses()).toBe(1);
+    }
+    vi.setSystemTime(1_005_000);
+    second.list(); first.list(); s.reader.cachedStateStamp(true);
+    expect(s.reader.get("status")?.value).toBe("after");
+    expect(s.reader.stateToken()).not.toBe(token);
+    expect(fullParses()).toBe(2);
+  });
   it.each(["minted", "legacy", "copied"])("coalesces 3.6 Hz %s replacements without sliding the 5 s bound", format => {
     vi.useFakeTimers({ now: 1_000_000 });
     const s = setup();

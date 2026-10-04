@@ -1103,7 +1103,10 @@ export class MeshStore {
   // decides a protocol step rather than a listing.
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
-    const entries = this.#readCachedState(options.fresh === true).entries;
+    const state = options.fresh === true || options.snapshot === undefined
+      ? this.#readCachedState(options.fresh === true)
+      : options.snapshot as MeshStateFile;
+    const entries = state.entries;
     return Object.hasOwn(entries, key) ? jsonClone(entries[key]) : undefined;
   }
 

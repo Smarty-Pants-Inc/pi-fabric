@@ -152,8 +152,9 @@ describe("headless approvals", () => {
       .rejects.toThrow(/no interactive UI/);
     expect(headless).not.toHaveBeenCalled();
     const decisionPolicies = { ...policies, headless: "decision" as const };
-    await new ApprovalController(decisionPolicies, noUi, undefined, undefined, undefined, undefined, headless).approve(action);
-    expect(headless).toHaveBeenCalledWith(action, undefined);
+    const signal = new AbortController().signal;
+    await new ApprovalController(decisionPolicies, noUi, undefined, undefined, undefined, undefined, headless).approve(action, {}, signal);
+    expect(headless).toHaveBeenCalledWith(action, undefined, signal);
     const denying = vi.fn(async () => false);
     await expect(new ApprovalController(decisionPolicies, noUi, undefined, undefined, undefined, undefined, denying).approve(action))
       .rejects.toThrow(/denied, cancelled, or expired/);

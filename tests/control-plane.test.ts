@@ -605,10 +605,14 @@ describe("FabricControlPlane", () => {
         const outcome = settle(f.sender.request("host:owner", "agent:target", operation, {}, "identity:owner"));
         // Messages retain their existing single notRun retry; stop never retries.
         const attempts = operation === "stop" ? 1 : 2;
+        vi.spyOn(Math, "random").mockReturnValue(0.5);
         for (let attempt = 0; attempt < attempts; attempt++) {
-          await vi.advanceTimersByTimeAsync(0);
+          // The sole proven-notRun resend draws 50ms, not an immediate lockstep retry.
+          await vi.advanceTimersByTimeAsync(attempt === 0 ? 0 : 50);
           const command = f.commands().filter((event) => event.kind !== "cancel")[attempt]!.data as FabricControlCommand;
-          expect(command.deadlineAt).toBe(command.requestedAt + 30_000);
+          // The retry draw is charged after the bridge floor, so jitter never
+          // adds time to the original second-attempt admission/ACK budget.
+          expect(command.deadlineAt).toBe(command.requestedAt + 30_000 - (attempt === 0 ? 0 : 50));
           await vi.advanceTimersByTimeAsync(30_001);
           await f.sender.mesh.publish({
             topic: "fabric.control.ack", kind: "rejected", from: identity("identity:owner"), to: "host:sender",
@@ -625,6 +629,34 @@ describe("FabricControlPlane", () => {
         await f.sender.close();
         expect(vi.getTimerCount()).toBe(0);
       } finally { await f.dispose(); }
+    });
+
+    it.each(["steer", "followUp"] as const)("close owns a pending jittered %s resend", async (operation) => {
+      const f = await setup();
+      const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
+      try {
+        const outcome = settle(f.sender.request("host:owner", "agent:target", operation, {}, "identity:owner"));
+        await vi.advanceTimersByTimeAsync(0);
+        const command = f.commands()[0]!.data as FabricControlCommand;
+        await f.sender.mesh.publish({
+          topic: "fabric.control.ack", kind: "rejected", from: identity("identity:owner"), to: "host:sender",
+          data: { version: 1, commandId: command.commandId, targetId: "agent:target", accepted: false,
+            error: "Fabric control command expired", notRun: true, bridge: { from: "forge" } },
+        });
+        await vi.advanceTimersByTimeAsync(20);
+        expect(random).toHaveBeenCalled(); // Forced 50ms draw, still pending at close.
+        expect(f.commands()).toHaveLength(1);
+        await f.sender.close();
+        expect(vi.getTimerCount()).toBe(0);
+        const { error } = await outcome;
+        expect(error?.message).toBe("Fabric control plane closed");
+        await vi.advanceTimersByTimeAsync(100_000);
+        expect(f.commands()).toHaveLength(1);
+        await expect(f.sender.request("host:owner", "agent:target", operation)).rejects.toThrow("Fabric control plane closed");
+      } finally {
+        random.mockRestore();
+        await f.dispose();
+      }
     });
 
     it.each([[1, 30_000], [60_000, 60_000]])("uses configured bridge window %i, floored to %i ms", async (configured, expected) => {

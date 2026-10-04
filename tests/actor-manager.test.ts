@@ -96,6 +96,31 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("ActorManager idle registry writes (#4383)", () => {
+  it("reloads and polls unchanged actors without saving observational timestamps back to the registry", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "idle-reload", instructions: "Remain idle." });
+    await state.actors.close();
+    const file = path.join(state.root, "actors", "actors.json");
+    const before = fs.readFileSync(file, "utf8");
+    const saves = vi.spyOn(ActorRegistryStore.prototype, "write");
+    try {
+      const reloaded = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+        actorRoot: path.join(state.root, "actors"), persistent: true,
+      });
+      actorManagers.push(reloaded);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      for (let i = 0; i < 100; i++) { reloaded.list(); reloaded.resumeQueued(); }
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(saves).not.toHaveBeenCalled();
+      expect(reloaded.status(actor.id).updatedAt).toBe(JSON.parse(before).actors[0].updatedAt);
+      expect(fs.readFileSync(file, "utf8")).toBe(before);
+      await reloaded.setTools(actor.id, ["read"]);
+      expect(saves).toHaveBeenCalledTimes(1);
+    } finally { saves.mockRestore(); }
+  });
+});
+
 describe("ActorManager fleet model policy (#2490)", () => {
   it("F6 #3115 registers the actual ID synchronously before local creation effects", async () => {
     const { actors, root, mesh } = setup(true);
@@ -4404,7 +4429,9 @@ describe("ActorManager removal behind an in-flight run", () => {
         replacements.length = 0;
         await actors.setNice(other.id, 7);
       } else {
-        expect(replacements.filter((replacement) => replacement.pending).length).toBeGreaterThanOrEqual(2);
+        // Acceptance already fenced this inode; the unchanged presence save must not
+        // replace it again. All actual replacements below still owe their own barriers.
+        expect(replacements.filter((replacement) => replacement.pending)).toHaveLength(1);
       }
       const pending = replacements.filter((replacement) => replacement.pending);
       expect(pending.length).toBeGreaterThan(0);

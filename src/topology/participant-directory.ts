@@ -1189,7 +1189,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const legacySessionKey = this.#legacySessionKey();
     let legacyPut: MeshBatchOperation | undefined;
     let legacyChanged = false;
-    if (legacySessionKey && (this.#quiescing || filesOnly)) {
+    // 6b15d905's sessions()/peers() prefer native participants and their host file lease.
+    // Its raw sessions/ fallback has a fixed 15 s TTL, but is not needed under this policy.
+    if (legacySessionKey && (this.#quiescing || filesOnly || hostPolicyFilesOnly)) {
       const legacy = this.mesh.get(legacySessionKey, read);
       if (legacy?.updatedBy.id === this.options.identity.id) {
         ops.push({ kind: "delete", key: legacy.key, ifVersion: legacy.version, onConflict: "skip" });
@@ -1372,11 +1374,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     if (activity && now - this.#recordsWrittenAt >= ACTIVITY_REFRESH_MS) changed = true;
     if (!full && !changed) return false;                       // nothing to publish
-    // Liveness stays in the matching per-host file, with the original TTL, every tick.
-    // All-capable fleets renew ONLY the file. Any live unadvertised peer restores the legacy
-    // session cadence, while the host record retains the configured host-file policy cadence.
-    // 6b15d905 used this same 7.5 s threshold (10 s on its default 5 s heartbeat),
-    // not a 26 s renewal: its session-only readers expire at the fixed 15 s TTL.
+    // Liveness stays in the matching per-host file on every tick. Old directory readers
+    // already use that host lease for native sessions, so the explicit policy never
+    // renews a legacy session. Without the policy, retain the fixed 7.5 s fallback
+    // threshold (10 s on the default 5 s heartbeat) for genuinely state-only readers.
     // Real record/ownership changes above bypass this idle-only decision.
     let renewHost = changed;
     let renewSession = changed || legacyChanged;
@@ -1393,12 +1394,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (!hostValid) return { skip: false, host: true, session: false };
         if (!this.#legacyRenewalsRequired(leaseAt, snapshot)) return { skip: true, host: false, session: false };
         const legacy = root && legacySessionKey ? this.mesh.get(legacySessionKey, read) : undefined;
-        // Compatibility keeps old session readers live at their fixed 15 s TTL, while the
-        // legacy host record follows the configured policy (10 min under hostLeases: files).
+        // The host retains its configured policy cadence (10 min under hostLeases: files).
         const hostDue = hostPolicyFilesOnly
           ? leaseAt - host.updatedAt >= STATE_LEASE_RENEW_MS
           : host.expiresAt - leaseAt <= this.#leaseMs / 2;
-        const sessionDue = !!legacyPut && (!legacy || legacy.updatedAt + PARTICIPANT_LEASE_MS - leaseAt <= PARTICIPANT_LEASE_MS / 2);
+        const sessionDue = !hostPolicyFilesOnly && !!legacyPut &&
+          (!legacy || legacy.updatedAt + PARTICIPANT_LEASE_MS - leaseAt <= PARTICIPANT_LEASE_MS / 2);
         return { skip: !hostDue && !sessionDue, host: hostDue, session: sessionDue };
       };
       if (!changed) {

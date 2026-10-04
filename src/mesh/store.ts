@@ -1,3 +1,4 @@
+import { createCommitStats } from "./commit-stats.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import type { MeshLockProtocol } from "../config.js";
@@ -92,6 +93,11 @@ export interface MeshStoreOptions {
   /** A live turn/pending operation bypasses the idle reuse window on demand. */
   readActive?: () => boolean;
 }
+
+// Capture the opt-in once at process startup/module load: no timer, key classification,
+// counters, extra serialization, filesystem work or per-commit environment lookup when off.
+const commitStats = process.env.PI_FABRIC_COMMIT_STATS
+  ? createCommitStats(process.env.PI_FABRIC_COMMIT_STATS) : undefined;
 
 // Opt-in commit diagnostics: no values or stacks are collected on the normal path.
 // Capture before entering the async lock so the actual writer survives the await boundary.
@@ -1277,6 +1283,7 @@ export class MeshStore {
       throw new Error(`Fabric mesh state exceeds ${this.#maxStateBytes} bytes`);
     }
     writeFileAtomic(this.#statePath, encoded.serialized);
+    commitStats?.record(encoded.serialized.byteLength, keys);
     const stamp = statStamp(this.#statePath);
     if (stamp !== undefined) this.#writeSignal(encoded.entries, stamp, generation);
     if (stamp === undefined || !this.#cacheState(stamped, stamp)) this.#stateCache = undefined;

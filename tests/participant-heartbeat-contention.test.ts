@@ -56,26 +56,28 @@ const setup = async (files: boolean, leaseMs = 15_000, kind: MeshIdentity["kind"
 
 describe("#3752 participant heartbeat contention", () => {
   it.each([false, true])("all-new fleet renews both TTLs only in the small file (policy: %s)", async files => {
-    const { root, directory, mesh, writes, advance, hostKey, participantKey } = await setup(files, 120_000);
+    const { root, directory, mesh, writes, advance, hostKey, participantKey, identity } = await setup(files, 120_000);
     const before = fs.readFileSync(path.join(root, "state.json"), "utf8");
-    const session = mesh.get("sessions/live")!;
+    const session = mesh.get("sessions/live");
     const host = mesh.get(hostKey)!;
     const participant = mesh.get(participantKey)!;
     expect(participant.value).toMatchObject({ livenessLeaseFiles: 1 });
     for (let tick = 0; tick < 24; tick++) {
       advance(5_000);
       await directory.refresh();
-      expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(true);
-      expect(sessionLiveness(session, root)).toEqual({ updatedAt: Date.now(), expiresAt: Date.now() + 15_000 });
+      if (session) {
+        expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(true);
+        expect(sessionLiveness(session, root)).toEqual({ updatedAt: Date.now(), expiresAt: Date.now() + 15_000 });
+      } else expect(readHostLeases(root).get(identity.id)?.session?.updatedAt).toBe(Date.now());
     }
     expect(writes).not.toHaveBeenCalled();
     expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(before);
     expect(mesh.get(hostKey)).toEqual(host);
     expect(mesh.get(participantKey)).toEqual(participant);
     advance(15_001); // a crashed Main's session still lapses at the original fixed TTL
-    expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(false);
+    if (session) expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(false);
     await directory.refresh(); // lock-confirmed re-acquisition, without another identity rewrite
-    expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(true);
+    if (session) expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(true);
     expect(writes).not.toHaveBeenCalled();
   });
 
@@ -148,11 +150,11 @@ describe("#3752 participant heartbeat contention", () => {
       id: peer.id, sessionId: "legacy", cwd: "/tmp/legacy", status: "idle", startedAt: Date.now(),
     } });
     await directory.refresh();
-    expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
+    expect(mesh.get("sessions/live")).toBeUndefined();
     expect(mesh.get(participantKey)?.value).toMatchObject({ livenessLeaseFiles: 1 });
     advance(10_000);
     await directory.refresh();
-    expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
+    expect(mesh.get("sessions/live")).toBeUndefined();
     advance(10_000);
     await directory.refresh();
     expect(mesh.get("sessions/live")).toBeUndefined();
@@ -237,8 +239,8 @@ describe("#3752 participant heartbeat contention", () => {
     expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
   });
 
-  it.each([false, true])("compat renews legacy sessions at the fixed 7.5 s threshold without pulling host policy forward (policy: %s)", async files => {
-    const { directory, mesh, writes, advance, hostKey } = await setup(files, 120_000, "main", true);
+  it("default-policy compat renews legacy sessions at the fixed 7.5 s threshold", async () => {
+    const { directory, mesh, writes, advance, hostKey } = await setup(false, 120_000, "main", true);
     const host = mesh.get(hostKey)!;
     advance(7_499);
     await directory.refresh();
@@ -269,30 +271,52 @@ describe("#3752 participant heartbeat contention", () => {
     expect(mesh.get(participantKey)).toEqual(participant);
   });
 
-  it("explicit host policy keeps session readers live without renewing the host early", async () => {
-    const { directory, mesh, writes, advance, hostKey, now } = await setup(true, 120_000, "main", true);
+  it("explicit host policy keeps native sessions live with no legacy session commits", async () => {
+    const { root, directory, mesh, writes, advance, hostKey, identity, now } = await setup(true, 120_000, "main", true);
     const host = mesh.get(hostKey)!;
+    const observerId: MeshIdentity = { id: "session:observer", name: "main", kind: "main", sessionId: "observer" };
+    const observer = new ParticipantDirectory(new MeshStore(root, 64 * 1024, 100), {
+      enabled: true, identity: observerId, hostId: observerId.id, rootId: observerId.id, reapDeadHosts: false,
+    });
+    directories.push(observer);
     for (let tick = 1; tick <= 24; tick++) {
       advance(5_000);
       await directory.refresh();
-      expect(isLiveLegacyRootEntry(mesh.get("sessions/live")!, now())).toBe(true);
+      expect(observer.sessions(now()).find(session => session.id === identity.id)).toMatchObject({ stale: false });
+      expect(mesh.get("sessions/live")).toBeUndefined();
     }
-    expect(writes).toHaveBeenCalledTimes(12);
+    expect(writes).not.toHaveBeenCalled();
     expect(mesh.get(hostKey)).toEqual(host);
-    expect(writes.mock.calls.every(([batch]) => batch.ops.map(operation => operation.key).every(key => key === "sessions/live"))).toBe(true);
   });
 
-  it("explicit host and session renewals share one commit when both are due", async () => {
-    const { directory, mesh, writes, advance, hostKey, now } = await setup(true, 120_000, "main", true);
+  it("explicit policy retains the old ten-minute host cadence, never a session renewal", async () => {
+    const { directory, mesh, writes, advance, hostKey } = await setup(true, 120_000, "main", true);
     for (let tick = 1; tick <= 120; tick++) {
       advance(5_000);
       await directory.refresh();
-      expect(isLiveLegacyRootEntry(mesh.get("sessions/live")!, now())).toBe(true);
+      expect(mesh.get("sessions/live")).toBeUndefined();
     }
-    expect(writes).toHaveBeenCalledTimes(60);
-    const paired = writes.mock.calls.filter(([batch]) => batch.ops.map(operation => operation.key).join(",") === "sessions/live," + hostKey);
-    expect(paired).toHaveLength(1);
-    expect(writes.mock.calls.at(-1)?.[0].ops.map(operation => operation.key)).toEqual(["sessions/live", hostKey]);
+    expect(writes).toHaveBeenCalledOnce();
+    expect(writes.mock.calls[0]?.[0].ops.map(operation => operation.key)).toEqual([hostKey]);
+  });
+
+  it("switching to explicit host policy removes only the owned legacy session once", async () => {
+    const { directory, mesh, identity, writes, advance } = await setup(false, 15_000, "main", true);
+    expect(mesh.get("sessions/live")).toBeDefined();
+    await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity });
+    await directory.refresh();
+    expect(mesh.get("sessions/live")).toBeUndefined();
+    writes.mockClear();
+    for (let tick = 0; tick < 24; tick++) { advance(5_000); await directory.refresh(); }
+    expect(writes).not.toHaveBeenCalled();
+    await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1 }, identity });
+    await directory.refresh();
+    expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
+    writes.mockClear();
+    advance(10_000);
+    await directory.refresh();
+    expect(writes).toHaveBeenCalledOnce();
+    expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
   });
 
   it("session-only readers retain the fixed 15 s TTL, ignoring a stored expiry", async () => {

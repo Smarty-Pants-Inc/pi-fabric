@@ -619,7 +619,7 @@ describe("ParticipantDirectory host leases", () => {
       const legacyAfter = mesh.get("sessions/delayed", { fresh: true })!;
       if (legacy) {
         const hostDue = policy ? delayMs >= STATE_LEASE_RENEW_MS : delayMs >= leaseMs / 2;
-        const sessionDue = delayMs >= 7_500;
+        const sessionDue = !policy && delayMs >= 7_500;
         expect(writes).toHaveBeenCalledTimes(hostDue || sessionDue ? 1 : 0);
         if (hostDue) {
           expect(hostAfter.version).toBeGreaterThan(hostBefore.version);
@@ -636,7 +636,8 @@ describe("ParticipantDirectory host leases", () => {
         expect(legacyAfter).toEqual(legacyBefore);
       }
       expect(readHostLeases(mesh.root).get(identity.id)).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
-      expect(sessionLiveness(legacyAfter, mesh.root)).toEqual({ updatedAt: now, expiresAt: now + 15_000 });
+      if (policy) expect(legacyAfter).toBeUndefined();
+      else expect(sessionLiveness(legacyAfter, mesh.root)).toEqual({ updatedAt: now, expiresAt: now + 15_000 });
       expect(mesh.listAll("topology/participants/", { fresh: true })[0]).toEqual(participantBefore);
       expect(directory.confirmedAt()).toBe(now);
     } finally {

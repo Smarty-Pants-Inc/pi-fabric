@@ -321,13 +321,10 @@ export const writeFileAtomic = (
   }
 };
 
-/** A single-owner writer (or used under its protocol lock). Never treat equal bytes
- * recovered from disk as a durability receipt: only this writer's successful barriers
- * on the same inode/stamp authorize skipping a durable replacement.
+/** A single-owner writer (or used under its protocol lock). Equal bytes may skip
+ * only a soft-state replacement; durable writes always establish fresh barriers.
  */
 export class AtomicFileWriter {
-  #durableStamp: string | undefined;
-
   constructor(readonly file: string) {}
 
   #stamp(): string {
@@ -337,20 +334,18 @@ export class AtomicFileWriter {
 
   write(contents: string, options?: AtomicWriteOptions): boolean {
     let unchanged = false;
-    let stamp: string | undefined;
     try {
       const before = this.#stamp();
       const current = readFileRetrying(this.file);
-      stamp = this.#stamp();
-      unchanged = before === stamp && current === contents;
+      const after = this.#stamp();
+      unchanged = before === after && current === contents;
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
     }
-    if (unchanged && (!options?.durable || stamp === this.#durableStamp)) return false;
-    // A failed post-rename barrier must not leave a cached acceptance receipt.
-    this.#durableStamp = undefined;
+    // The retained equal-bytes cache is a soft-state optimization only. Durable
+    // writes are receipts: always replace, fsync, and re-confirm the namespace.
+    if (unchanged && !options?.durable) return false;
     writeFileAtomic(this.file, contents, options);
-    if (options?.durable) this.#durableStamp = this.#stamp();
     return true;
   }
 }

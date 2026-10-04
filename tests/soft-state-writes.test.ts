@@ -22,27 +22,27 @@ const presence = (): MeshStateEntry => ({ key, version: 1, updatedAt: 1, updated
 } satisfies FabricParticipantRecord });
 
 describe("unchanged atomic bytes", () => {
-  it.each([false, true])("an idle loop writes and syncs nothing (durable=%s); one changed field writes once", durable => {
+  it("soft-state writes skip unchanged bytes, while durable writes always replace and sync", () => {
     const file = path.join(root(), "state.json"), writer = new AtomicFileWriter(file);
-    writer.write('{"status":"idle"}', { durable });
+    writer.write('{"status":"idle"}');
     const writes = vi.spyOn(fs, "writeFileSync"), renames = vi.spyOn(fs, "renameSync"), syncs = vi.spyOn(fs, "fsyncSync");
-    for (let i = 0; i < 100; i++) expect(writer.write('{"status":"idle"}', { durable })).toBe(false);
+    for (let i = 0; i < 100; i++) expect(writer.write('{"status":"idle"}')).toBe(false);
     expect(writes).not.toHaveBeenCalled(); expect(renames).not.toHaveBeenCalled(); expect(syncs).not.toHaveBeenCalled();
-    expect(writer.write('{"status":"running"}', { durable })).toBe(true);
-    expect(writes).toHaveBeenCalledTimes(1); expect(renames).toHaveBeenCalledTimes(1);
-    if (durable) expect(syncs).toHaveBeenCalled(); else expect(syncs).not.toHaveBeenCalled();
+    expect(writer.write('{"status":"running"}')).toBe(true);
+    expect(writes).toHaveBeenCalledTimes(1); expect(renames).toHaveBeenCalledTimes(1); expect(syncs).not.toHaveBeenCalled();
+    writes.mockClear(); renames.mockClear(); syncs.mockClear();
+    expect(writer.write('{"status":"running"}', { durable: true })).toBe(true);
+    expect(writes).toHaveBeenCalledTimes(1); expect(renames).toHaveBeenCalledTimes(1); expect(syncs).toHaveBeenCalled();
   });
 
-  it("re-establishes fenced bytes after recovery or an external same-content replacement", () => {
+  it("durable equal bytes are never accepted as an existing durability receipt", () => {
     const file = path.join(root(), "fence.json"), writer = new AtomicFileWriter(file);
     writer.write("accepted", { durable: true });
     const syncs = vi.spyOn(fs, "fsyncSync");
-    expect(new AtomicFileWriter(file).write("accepted", { durable: true })).toBe(true);
-    expect(syncs).toHaveBeenCalled(); syncs.mockClear();
     expect(writer.write("accepted", { durable: true })).toBe(true);
-    expect(syncs).toHaveBeenCalled(); syncs.mockClear();
-    expect(writer.write("accepted", { durable: true })).toBe(false); expect(syncs).not.toHaveBeenCalled();
+    expect(syncs).toHaveBeenCalled();
     fs.rmSync(file);
+    syncs.mockClear();
     expect(writer.write("accepted", { durable: true })).toBe(true); expect(syncs).toHaveBeenCalled();
   });
 

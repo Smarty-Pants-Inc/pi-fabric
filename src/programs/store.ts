@@ -245,20 +245,25 @@ export class ProgramStore {
         if (existing.name !== candidate.name) {
           throw new Error(`Identical program content is already saved as ${programRef(existing)}; reuse that ref`);
         }
-        return { record: existing, created: false };
       }
+      const record = existing ?? candidate;
       const index = this.#readIndex();
-      const versions = index.names[candidate.name] ?? [];
+      const versions = index.names[record.name] ?? [];
+      // A prior save may have committed the record but not its discovery index.
+      // Reconcile under the same lock without changing its original metadata.
+      if (existing && versions.some((entry) => entry.digest === record.digest)) {
+        return { record, created: false };
+      }
       if (!index.names[candidate.name] && Object.keys(index.names).length >= MAX_PROGRAM_NAMES) {
         throw new Error(`Program store holds the maximum of ${MAX_PROGRAM_NAMES} names`);
       }
       if (versions.length >= MAX_PROGRAM_VERSIONS) {
         throw new Error(`Program ${candidate.name} holds the maximum of ${MAX_PROGRAM_VERSIONS} versions`);
       }
-      await writeJsonAtomicAsync(this.#file(candidate.digest), candidate, { space: 2, newline: true });
-      index.names[candidate.name] = [...versions, { digest: candidate.digest, createdAt: candidate.createdAt }];
+      if (!existing) await writeJsonAtomicAsync(this.#file(record.digest), record, { space: 2, newline: true });
+      index.names[record.name] = [...versions, { digest: record.digest, createdAt: record.createdAt }];
       await this.#writeIndex(index);
-      return { record: candidate, created: true };
+      return { record, created: !existing };
     });
   }
 

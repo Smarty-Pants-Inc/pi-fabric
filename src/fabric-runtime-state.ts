@@ -635,14 +635,18 @@ export class FabricRuntimeState {
     // Resumption must invalidate an earlier terminal proof before actors/control
     // can activate, not merely as part of the later participant publication batch.
     await this.#participants.resumeLineage();
+    // Install this exact activation under the custody lock BEFORE either succession
+    // path publishes it. A competing drainer must never see B -> resumed C while
+    // C still carries a historical retired owner/successor (for example C -> D).
+    // Registration resets root activation only; per-carrier replay fences survive.
+    const inboxActivation = this.#config.mesh.enabled && mainAgent.local ? await this.#mesh.exclusive(() =>
+      registerMainInbox(meshRoot, identity, sessionId, context.sessionManager.getSessionFile?.())) : undefined;
     if (this.#config.mesh.enabled && mainAgent.local && predecessor && predecessor.id !== mainAgentId &&
       predecessor.meshRoot === meshRoot && predecessor.cwd === context.cwd) {
       await recordMainSuccessor(this.#mesh, predecessor.id, predecessor.sessionId, mainAgentId);
     }
     const recordedRotation = this.#config.mesh.enabled && mainAgent.local
       ? await confirmMainSuccessor(this.#mesh, mainAgentId, context.sessionManager.getSessionFile?.()) : false;
-    const inboxActivation = this.#config.mesh.enabled && mainAgent.local ? await this.#mesh.exclusive(() =>
-      registerMainInbox(meshRoot, identity, sessionId, context.sessionManager.getSessionFile?.())) : undefined;
     // No Main admission/drain starts while a prior-generation death proof survives.
     mainAgent.attachFollowUpDrain(
       context,

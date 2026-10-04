@@ -4,6 +4,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
+import { createHook, executionAsyncId } from "node:async_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, saveCompletion, setCompletionJournalSliceObserver, type CompletionRecipient } from "../src/agents/completion-journal.js";
 import type { AgentRunResult } from "../src/agents/types.js";
@@ -34,6 +35,56 @@ const setup = () => {
   return { root, meshRoot, recipient, result, file, receipt, journal, seed, mesh };
 };
 
+// Test-only async_hooks seam: before/after delimit each uninterrupted synchronous
+// execution section descended from the scan, including async-generator consumers.
+// Unlike the journal's wall-clock slice observer, this excludes awaited file I/O,
+// timer delays and scheduling gaps BETWEEN callbacks. Accumulate those sections
+// until the existing journal slice observer checkpoints them: a chain of cheap
+// microtasks must not turn into an unbounded synchronous slice. The probe timer
+// is created before this hook, so its callbacks are not scan descendants.
+const measureSynchronousSections = async (operation: (finishSlice: () => void) => Promise<void>) => {
+  const descendants = new Set<number>();
+  let synchronousStart = true;
+  let activeSince: number | undefined;
+  let depth = 0;
+  let sliceMs = 0, syncMaxMs = 0, syncSamples = 0;
+  const recordActive = () => {
+    if (activeSince === undefined) return;
+    const now = performance.now();
+    sliceMs += now - activeSince;
+    syncMaxMs = Math.max(syncMaxMs, sliceMs);
+    syncSamples++;
+    activeSince = now;
+  };
+  const finishSlice = () => { recordActive(); sliceMs = 0; };
+  const hook = createHook({
+    init(id, _type, trigger) {
+      if (synchronousStart || descendants.has(trigger) || descendants.has(executionAsyncId())) descendants.add(id);
+    },
+    before(id) {
+      if (descendants.has(id) && depth++ === 0) activeSince = performance.now();
+    },
+    after(id) {
+      if (descendants.has(id) && --depth === 0) { recordActive(); activeSince = undefined; }
+    },
+    destroy(id) { descendants.delete(id); },
+  });
+  hook.enable();
+  try {
+    // Also time the synchronous prefix, before operation() returns its promise.
+    activeSince = performance.now();
+    depth = 1;
+    let pending: Promise<void>;
+    try { pending = operation(finishSlice); }
+    finally { recordActive(); depth = 0; activeSince = undefined; synchronousStart = false; }
+    await pending;
+  } finally { hook.disable(); }
+  return { syncMaxMs, syncSamples };
+};
+const assertSynchronousWork = (measured: Awaited<ReturnType<typeof measureSynchronousSections>>): void => {
+  expect(measured.syncSamples).toBeGreaterThan(0);
+  expect(measured.syncMaxMs, "scan synchronous slice must stay below 16 ms on every platform").toBeLessThan(16);
+};
 // The concurrent timer is independent of generator bookkeeping. Measure the full
 // gap between 1 ms ticks (without subtracting timer resolution), so a synchronous
 // consumer block cannot disappear behind an async-generator/microtask yield.
@@ -52,29 +103,32 @@ const measureIdleSlices = async (label: string, operation: () => Promise<void>) 
     lastTick = now;
     const resolve = onTick; onTick = undefined; resolve?.();
   }, 1);
-  setCompletionJournalSliceObserver(durationMs => { slices.push(durationMs); lastSliceAt = performance.now(); });
   try {
     await nextTick(); // Arm the probe before any scan work starts.
     const start = performance.now();
-    await operation();
+    const synchronous = await measureSynchronousSections(async finishSlice => {
+      setCompletionJournalSliceObserver(durationMs => {
+        finishSlice(); // Sum ONLY directly timed synchronous sections within this journal slice.
+        slices.push(durationMs); lastSliceAt = performance.now();
+      });
+      await operation();
+    });
     const passMs = performance.now() - start;
     await nextTick(); // Include a block in the final consumer/final small slice.
     const ordered = [...gaps].sort((a, b) => a - b);
     const measured = { maxMs: Math.max(...gaps), p99Ms: ordered[Math.ceil(ordered.length * 0.99) - 1]!, samples: gaps.length, passMs,
-      sliceMaxMs: Math.max(0, ...slices), sliceSamples: slices.length, delayedTicks };
+      ...synchronous, sliceMaxMs: Math.max(0, ...slices), sliceSamples: slices.length, delayedTicks };
     console.info("[completion-journal latency]", JSON.stringify({ label, ...measured }));
     return measured;
   } finally { clearInterval(timer); setCompletionJournalSliceObserver(undefined); }
 };
-const assertIdleLatency = (measured: Awaited<ReturnType<typeof measureIdleSlices>>, windows = process.platform === "win32"): void => {
+const assertIdleLatency = (measured: Awaited<ReturnType<typeof measureIdleSlices>>, platform: NodeJS.Platform = process.platform): void => {
+  assertSynchronousWork(measured); // Primary acceptance guard: identical on Linux and Windows.
   expect(measured.samples).toBeGreaterThan(0);
-  // ponytail: shared Windows runners add rare 16–17 ms timer gaps even between
-  // slices (see delayedTicks); p99 keeps the 16 ms budget, max caps noise at 50 ms.
-  // Linux retains the strict maximum. Both use independent ticks, NOT sliceObserver.
-  if (windows) {
-    expect(measured.p99Ms).toBeLessThan(16);
-    expect(measured.maxMs).toBeLessThan(50);
-  } else expect(measured.maxMs).toBeLessThan(16);
+  // Secondary independent probe: Windows scheduler noise is diagnostic below
+  // the loose 50 ms cap; Linux retains its strict 16 ms maximum. p99 is logged,
+  // not used to excuse a synchronous stall (even one affecting only a single tick).
+  expect(measured.maxMs).toBeLessThan(platform === "win32" ? 50 : 16);
 };
 
 describe("completion journal idle scans", () => {
@@ -89,13 +143,47 @@ describe("completion journal idle scans", () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it("keeps the Windows p99 budget and absolute cap distinct from the strict Linux maximum", () => {
-    const measured = { maxMs: 17, p99Ms: 2, samples: 200, passMs: 100,
-      sliceMaxMs: 1, sliceSamples: 100, delayedTicks: [] };
-    expect(() => assertIdleLatency(measured, true)).not.toThrow();
-    expect(() => assertIdleLatency(measured, false)).toThrow();
-    expect(() => assertIdleLatency({ ...measured, p99Ms: 16 }, true)).toThrow();
-    expect(() => assertIdleLatency({ ...measured, maxMs: 50 }, true)).toThrow();
+  it("separates Windows scheduler noise from the platform-independent synchronous guard", () => {
+    const measured = { maxMs: 17, p99Ms: 17, samples: 200, passMs: 100,
+      syncMaxMs: 1, syncSamples: 100, sliceMaxMs: 1, sliceSamples: 100, delayedTicks: [] };
+    expect(() => assertIdleLatency(measured, "win32")).not.toThrow();
+    expect(() => assertIdleLatency(measured, "linux")).toThrow();
+    expect(() => assertIdleLatency({ ...measured, maxMs: 50 }, "win32")).toThrow();
+    for (const platform of ["win32", "linux"] as const) {
+      expect(() => assertIdleLatency({ ...measured, maxMs: 1, p99Ms: 1, syncMaxMs: 16 }, platform)).toThrow();
+      expect(() => assertIdleLatency({ ...measured, maxMs: 21, p99Ms: 2, syncMaxMs: 20 }, platform)).toThrow();
+      expect(() => assertIdleLatency({ ...measured, maxMs: 1, p99Ms: 1, syncSamples: 0 }, platform)).toThrow();
+    }
+  });
+
+  it("times the synchronous prefix and resumed work, but not an awaited 30 ms timer", async () => {
+    const measured = await measureSynchronousSections(async () => {
+      await new Promise<void>(resolve => setTimeout(resolve, 30));
+    });
+    expect(measured.syncSamples).toBeGreaterThan(1);
+    assertSynchronousWork(measured);
+    for (const resumed of [false, true]) {
+      const blocked = await measureSynchronousSections(async () => {
+        if (resumed) await new Promise<void>(resolve => setImmediate(resolve));
+        const start = performance.now();
+        while (performance.now() - start < 20) { /* Verify both instrumentation paths. */ }
+      });
+      expect(blocked.syncMaxMs).toBeGreaterThanOrEqual(20);
+      expect(() => assertSynchronousWork(blocked)).toThrow();
+    }
+  });
+
+  it("accumulates synchronous microtasks within a slice instead of budgeting each callback separately", async () => {
+    const measured = await measureSynchronousSections(async finishSlice => {
+      for (let index = 0; index < 6; index++) {
+        await Promise.resolve(); // Not an event-loop turn or a new journal slice.
+        const start = performance.now();
+        while (performance.now() - start < 4) { /* Individually cheap, collectively over budget. */ }
+      }
+      finishSlice();
+    });
+    expect(measured.syncMaxMs).toBeGreaterThanOrEqual(24);
+    expect(() => assertSynchronousWork(measured)).toThrow();
   });
   it.each([false, true])("forget hides the result immediately while claim retirement is held (refused: %s)", async refused => {
     const h = setup(); const result = h.seed(1); const journal = h.journal();
@@ -182,25 +270,18 @@ describe("completion journal idle scans", () => {
     } finally { clearImmediate(turn); }
   });
 
-  it("rejects a synchronous 60 ms consumer block with both platform latency detectors", async () => {
-    const h = setup(); const result = h.seed(1);
-    const read = fs.promises.readFile.bind(fs.promises);
-    let blocked = false;
-    vi.spyOn(fs.promises, "readFile").mockImplementation((async (target: any, ...args: any[]) => {
-      if (!blocked && String(target) === h.file(result.id)) {
-        blocked = true;
-        const start = performance.now();
-        while (performance.now() - start < 60) { /* Exceed even the Windows 50 ms absolute cap. */ }
-      }
-      return read(target, ...args);
-    }) as typeof fs.promises.readFile);
-    const enqueue = vi.fn();
-    const measured = await measureIdleSlices("negative control: 60 ms consumer", () => h.journal(enqueue).drain());
-    expect(blocked).toBe(true);
-    expect(measured.maxMs).toBeGreaterThanOrEqual(60);
-    expect(() => assertIdleLatency(measured, false)).toThrow();
-    expect(() => assertIdleLatency(measured, true)).toThrow(); // Same Windows policy rejects the synchronous control, too.
-    expect(measured.sliceMaxMs).toBeGreaterThanOrEqual(60); // Also covers the final slice's observer.
+  it.each(["linux", "win32"] as const)("rejects a synchronous 20 ms final consumer block under the %s policy", async platform => {
+    const h = setup(); h.seed(1);
+    // Block the final enqueue after the scan's awaited I/O: neither a final
+    // small slice nor async-generator yields may hide this from the guard.
+    const enqueue = vi.fn(() => {
+      const start = performance.now();
+      while (performance.now() - start < 20) { /* Below Windows' secondary 50 ms cap. */ }
+    });
+    const measured = await measureIdleSlices(`negative control: 20 ms consumer (${platform})`, () => h.journal(enqueue).drain());
+    expect(measured.syncMaxMs).toBeGreaterThanOrEqual(20);
+    expect(() => assertSynchronousWork(measured)).toThrow("scan synchronous slice"); // Direct primary-guard proof.
+    expect(() => assertIdleLatency(measured, platform)).toThrow("scan synchronous slice");
     expect(enqueue).toHaveBeenCalledTimes(1);
   });
 

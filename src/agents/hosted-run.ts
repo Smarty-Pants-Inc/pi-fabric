@@ -198,8 +198,14 @@ export class HostedRun {
   /** Submit once. A failed submission may still have started remote work. */
   async start(): Promise<void> {
     try {
-      await withTimeout(() => this.adapter.start(this.locator, this.context, this.reporter), `${this.adapter.id}.start`);
+      const remainingMs = this.context.deadlineAt - Date.now();
+      if (remainingMs <= 0) { await this.stop(); return; }
+      await withTimeout(() => this.adapter.start(this.locator, this.context, this.reporter), `${this.adapter.id}.start`, Math.min(ADAPTER_CALL_TIMEOUT_MS, remainingMs));
     } catch (error) {
+      if (Date.now() >= this.context.deadlineAt) {
+        await this.stop();
+        return;
+      }
       this.#settle({ status: "failed", error: `Hosted runner start failed: ${message(error)}`, outcome: "indeterminate" });
     }
   }

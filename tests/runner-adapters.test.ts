@@ -232,6 +232,28 @@ describe("custom worker runners", () => {
 });
 
 describe("hosted runners", () => {
+  it("A7 uses the persisted absolute deadline after slow successful submission", async () => {
+    let stoppedAt = 0;
+    const fake = fakeHosted("slow-submit", { onStart: async () => { await new Promise(resolve => setTimeout(resolve, 800)); } });
+    fake.adapter.stop = () => { stoppedAt = Date.now(); return { confirmed: true }; };
+    register(fake.adapter);
+    const manager = managerFor(tempRoot(), { timeoutMs: 1000 });
+    const result = await manager.run({ task: "Slow submit", runner: "slow-submit", timeoutMs: 1000 });
+    expect(result.status).toBe("timed_out");
+    expect(stoppedAt).toBeLessThan(fake.contexts[0]!.deadlineAt + 400);
+  });
+  it("A7 supervises submission itself against the absolute deadline", async () => {
+    const fake = fakeHosted("blocked-submit", { onStart: async () => { await new Promise(resolve => setTimeout(resolve, 1600)); } });
+    let stoppedAt = 0;
+    fake.adapter.stop = () => { stoppedAt = Date.now(); return { confirmed: true }; };
+    register(fake.adapter);
+    const manager = managerFor(tempRoot(), { timeoutMs: 1000 });
+    const result = await manager.run({ task: "Blocked submit", runner: "blocked-submit", timeoutMs: 1000 });
+    expect(result.status).toBe("timed_out");
+    expect(stoppedAt).toBeLessThan(fake.contexts[0]!.deadlineAt + 400);
+    // Join the fixture submission even though Fabric stopped waiting for it.
+    await new Promise(resolve => setTimeout(resolve, 650));
+  });
   it("A6 sends explicit stop after an indeterminate submission failure and retains its outcome", async () => {
     const fake = fakeHosted("failed-submit", { onStart: () => { throw new Error("remote started, reply lost"); }, stopConfirmed: false });
     let confirmed = false;

@@ -2005,7 +2005,7 @@ export class AgentManager {
     managed.outputPrincipal = copyFabricPrincipal(launch.request.provenance?.principal);
     managed.onOutputPrincipalDowngrade = launch.onOutputPrincipalDowngrade;
     await hosted.start();
-    void this.#monitor(managed, launch.timeoutMs);
+    void this.#monitor(managed, Math.max(0, context.deadlineAt - Date.now()));
     return this.#handleInfo(managed, "running");
   }
 
@@ -3483,7 +3483,7 @@ export class AgentManager {
   }
 
   async #monitor(managed: ManagedAgent, timeoutMs: number): Promise<void> {
-    const deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS;
+    const deadline = managed.hosted?.context.deadlineAt ?? (Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS);
     let firstObservedDeadAt: number | undefined;
     let watchedTransport: AgentTransportHandle | undefined;
     let nativeClosePending = false;
@@ -3641,7 +3641,7 @@ export class AgentManager {
       }
       if (nativeClosePending) { nativeClosePending = false; continue; }
       await new Promise<void>(resolve => {
-        const timer = setTimeout(() => { wake = undefined; resolve(); }, AGENT_STATUS_POLL_INTERVAL_MS);
+        const timer = setTimeout(() => { wake = undefined; resolve(); }, Math.max(0, Math.min(AGENT_STATUS_POLL_INTERVAL_MS, deadline - Date.now())));
         wake = () => { clearTimeout(timer); wake = undefined; nativeClosePending = false; resolve(); };
       });
     }

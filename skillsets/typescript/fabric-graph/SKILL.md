@@ -71,18 +71,21 @@ const key = `runs/${π.run}/graph`;
 type Graph = { node: string; status: string; results: Record<string, unknown>; decisionId?: string };
 const entry = await mesh.get<Graph>({ key });
 if (!entry || entry.value.status === "done" || entry.value.status === "failed") return { status: entry?.value.status ?? "missing" };
-const graph = entry.value;
+let graph = entry.value;
+let version = entry.version;
 const advance = async (node: string, result: unknown, status = "ready") => {
-  await mesh.put({ key, value: { ...graph, node, status, results: { ...graph.results, [graph.node]: result } }, ifVersion: entry.version });
+  await mesh.put({ key, value: { ...graph, node, status, results: { ...graph.results, [graph.node]: result } }, ifVersion: version });
   if (status === "ready") await agents.tell({ id: (await mesh.self()).id, message: `Continue ${key}.` });
 };
 if (graph.node === "approve") {
   let decisionId = graph.decisionId;
   if (!decisionId) {
     decisionId = (await decisions.raise({ title: `Release ${π.run}?`, input: "confirm" })).id;
-    await mesh.put({ key, value: { ...graph, decisionId }, ifVersion: entry.version });
-    return { status: "waiting", decisionId };
+    const checkpoint = await mesh.put({ key, value: { ...graph, decisionId }, ifVersion: version });
+    graph = checkpoint.value;
+    version = checkpoint.version; // advance must use the checkpoint's new CAS version
   }
+  // Wait on the first approval too; an open wait arms the next graph tick.
   const decision = await decisions.wait({ id: decisionId, timeoutMs: 60_000 });
   if (decision.status === "open") {
     await mesh.publish({ topic: `graph.${π.run}`, kind: "graph.tick", afterMs: 600_000, key: `graph-${π.run}` });

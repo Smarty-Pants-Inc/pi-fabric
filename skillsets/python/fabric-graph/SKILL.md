@@ -79,8 +79,10 @@ if graph["node"] == "approve":
         raised = await tools.call(ref="decisions.raise", args={"title": "Release " + run + "?", "input": "confirm"})
         waiting = dict(graph)
         waiting["decisionId"] = raised["id"]
-        await mesh.put(key=key, value=waiting, ifVersion=entry["version"])
-        return {"status": "waiting", "decisionId": raised["id"]}
+        entry = await mesh.put(key=key, value=waiting, ifVersion=entry["version"])
+        graph = entry["value"]  # advance uses the checkpoint's new CAS version
+        decision_id = raised["id"]
+    # Wait on the first approval too; an open wait arms the next graph tick.
     decision = await decisions.wait(id=decision_id, timeoutMs=60000)
     if decision["status"] == "open":
         await mesh.publish(topic="graph." + run, kind="graph.tick", afterMs=600000, key="graph-" + run)

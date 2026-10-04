@@ -2,6 +2,7 @@ import "./fixtures/conversation-host.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeConversationReader, type NativeConversationTranscript } from "../src/ui/conversation-native-reader.js";
 import { NativeReaderCheckpoint } from "../src/ui/conversation-native-reader-checkpoint.js";
@@ -197,9 +198,22 @@ describe("native reader initial recovery suspension", () => {
     fs.appendFileSync(file, jsonl([{ type: "message_end", message: canonical }]));
     const inode = fileIdentity(file);
     retainCompactionGeneration(file);
-    const compacted = compactTerminalRunLog(file, "failed");
+    // This fixture requires real compaction/replacement, not its elapsed-work
+    // fallback. A scheduler pause or slow fsync can legitimately exhaust the
+    // production 500ms budget even for this tiny log. Control only that clock;
+    // keep all IO, generation checks and reader recovery/resume paths real.
+    // worker-run-log's clock-driven tests cover budget exhaustion separately.
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    let compacted: ReturnType<typeof compactTerminalRunLog>;
+    try {
+      compacted = compactTerminalRunLog(file, "failed");
+      expect(clock).toHaveBeenCalled();
+    } finally {
+      clock.mockRestore();
+    }
     expect(compacted).toMatchObject({ compacted: 1 });
     expect(compacted.error).toBeUndefined();
+    expect(compacted.compactionSkipped).toBeUndefined();
     expect(fileIdentity(file)).not.toBe(inode);
     const bytes = fs.readFileSync(file);
     const lines = bytes.toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line));

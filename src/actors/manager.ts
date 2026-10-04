@@ -2896,7 +2896,10 @@ export class ActorManager {
     actor.failureStreak = streak;
     // Worker stderr can prefix the terminal failure with compatibility warnings.
     // Report the last actual error line, never the legacy-provenance warning.
+    // A V8 stack frame can contain "Error" in a Windows or POSIX path; it is
+    // context for the error above it, not a later terminal activation failure.
     const lines = error.split("\n").map(line => line.trim()).filter(line => line &&
+      !/^at\s/.test(line) &&
       !/^\s*(?:\[pi-fabric\]\s*)?(?:warning\b|Pi does not advertise\b)/i.test(line));
     const lastError = lines.filter(line => /\berror\b|\bfailed\b|\bexited\b|Context exceeds window/i.test(line)).at(-1)
       ?? lines.at(-1) ?? "Unknown activation failure";

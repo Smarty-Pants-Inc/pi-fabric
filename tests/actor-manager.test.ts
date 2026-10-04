@@ -2834,6 +2834,8 @@ describe("ActorManager", () => {
     ["[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.\nFabric activation window failed: Error: Activation window lost current activation messages",
       "activation-window-lost", "Fabric activation window failed: Error: Activation window lost current activation messages"],
     ["Error: earlier failure\nError: Context exceeds window: 100 > 80", "context-overflow", "Error: Context exceeds window: 100 > 80"],
+    ["[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; legacy behavior\r\nError: Activation window lost current activation messages\r\n    at activate (C:\\Users\\fleet bot\\Error\\worker.js:42:7)\r\n", "activation-window-lost", "Error: Activation window lost current activation messages"],
+    ["Error: Context exceeds window: 100 > 80\n    at activate (/home/fleet/Error/worker.js:42:7)", "context-overflow", "Error: Context exceeds window: 100 > 80"],
     ["Child Pi exited before requested model admission completed; task was not sent", "child-exit-before-admission", "Child Pi exited before requested model admission completed; task was not sent"],
     ["Error: Activation window lost current activation messages\nError: unrelated terminal failure\nWarning: turnProvenance is unavailable", "unknown", "Error: unrelated terminal failure"],
     ["[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; legacy behavior", "unknown", "Unknown activation failure"],

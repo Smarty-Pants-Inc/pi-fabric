@@ -449,7 +449,9 @@ export class FabricState {
     const runtime = this.#runtime;
     this.#runtime = undefined;
     try {
-      await runtime?.shutdown(reason, targetSessionFile);
+      // Preserve the existing one-argument shutdown contract unless a native rotation supplies a target.
+      if (targetSessionFile === undefined) await runtime?.shutdown(reason);
+      else await runtime?.shutdown(reason, targetSessionFile);
       await this.#managedHost?.close();
     } finally {
       if (generation === this.#generation) {

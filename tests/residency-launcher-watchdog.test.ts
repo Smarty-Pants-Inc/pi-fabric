@@ -96,7 +96,38 @@ const fixture = (settings: ResidentHostConfig["watchdog"] = {}, alwaysStall = fa
 afterEach(() => { vi.useRealTimers(); mocks.spawn.mockReset(); mocks.alive.clear(); mocks.births.clear(); mocks.lockHook = undefined; mocks.sessionEmpty = true; });
 
 const clock = () => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-01-01T00:00:00Z")); };
-describe("launcher live-child lease watchdog", () => {
+
+describe("launcher watchdog Windows contract", () => {
+  it.each([{}, { enabled: true }, { enabled: false }])("disables watchdog on win32 regardless of configuration %j, logging once", async settings => {
+    clock();
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const lock = vi.fn(); mocks.lockHook = lock;
+    let f: ReturnType<typeof fixture> | undefined;
+    try {
+      f = fixture(settings, true);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(f.children).toHaveLength(1);
+      expect(f.children[0]!.signals).toEqual([]);
+      expect(f.children[0]!.stdin.end).not.toHaveBeenCalled();
+      expect(lock).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(f.root, "wedges"))).toBe(false);
+      expect(fs.existsSync(path.join(f.root, "watchdog-custody.json"))).toBe(false);
+      expect(f.events().filter(row => row.event.startsWith("watchdog-"))).toEqual([
+        expect.objectContaining({ event: "watchdog-unsupported", message: "watchdog unsupported on win32" }),
+      ]);
+      const spawnOptions = mocks.spawn.mock.calls[0]![2];
+      expect(spawnOptions.detached).toBe(false);
+      expect(spawnOptions.env.NODE_OPTIONS).toBe(process.env.NODE_OPTIONS);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(f.events().filter(row => row.event === "watchdog-unsupported")).toHaveLength(1);
+    } finally {
+      try { await f?.close(); } finally { Object.defineProperty(process, "platform", platform); }
+    }
+  });
+});
+// These signal, incarnation and session-evidence contracts require POSIX.
+describe.skipIf(process.platform === "win32")("launcher live-child lease watchdog", () => {
   it("F1 captures evidence and stops the wedged child but never authorizes replacement from an empty session or sampled descendants", async () => {
     clock(); const f = fixture({}, true);
     try {

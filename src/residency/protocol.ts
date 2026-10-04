@@ -349,7 +349,7 @@ export interface ResidentHostConfig {
   agents: FabricAgentConfig;
   mesh: FabricMeshConfig;
   retention: FabricRetentionConfig;
-  /** Launcher-owned recovery for a live child whose file lease stopped renewing. */
+  /** Launcher-owned recovery for a live child whose file lease stopped renewing. Unsupported (always disabled) on win32. */
   watchdog?: {
     enabled?: boolean;
     /** Lease age that identifies a wedge. Default 180000 ms. */

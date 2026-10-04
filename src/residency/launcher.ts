@@ -225,6 +225,10 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     trace("launcher-deferred", { reason: "existing handover custody" }); return;
   }
   const config = readConfig(configPath);
+  // Windows has no POSIX birth/session evidence or report-signal recovery.
+  // Keep ordinary native child supervision/shutdown, but never enter watchdog custody.
+  const watchdogSupported = process.platform !== "win32";
+  if (!watchdogSupported) trace("watchdog-unsupported", { message: "watchdog unsupported on win32" });
   const entry = fileURLToPath(new URL("./pi-entry.js", import.meta.url));
   const launcher: ResidentLauncherIdentity = { pid: process.pid, processStartTime: processStartTime(process.pid) ?? "",
     token: randomUUID(), entry, runtime: fs.realpathSync(process.execPath) };
@@ -250,11 +254,15 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     const runtime = spec?.runtime ?? launcher.runtime;
     const attemptInfo = plan && kind ? { id: plan.id, kind } : undefined;
     const reportDirectory = path.join(root, "wedges", "reports");
-    try { fs.mkdirSync(reportDirectory, { recursive: true, mode: 0o700 }); }
-    catch (error) { trace("watchdog-evidence-error", { stage: "report-directory", reason: String(error).slice(0, 500) }); }
+    if (watchdogSupported) {
+      try { fs.mkdirSync(reportDirectory, { recursive: true, mode: 0o700 }); }
+      catch (error) { trace("watchdog-evidence-error", { stage: "report-directory", reason: String(error).slice(0, 500) }); }
+    }
     const args = ["--mode", "rpc", "--no-session", "--no-tools", "--no-extensions", "--no-skills",
       "--no-prompt-templates", "--no-context-files", "--extension", launchEntry];
-    const nodeOptions = `${process.env.NODE_OPTIONS ?? ""} --report-on-signal --report-signal=SIGUSR2 --report-exclude-env --report-directory=${JSON.stringify(reportDirectory)}`;
+    const nodeOptions = watchdogSupported
+      ? `${process.env.NODE_OPTIONS ?? ""} --report-on-signal --report-signal=SIGUSR2 --report-exclude-env --report-directory=${JSON.stringify(reportDirectory)}`
+      : process.env.NODE_OPTIONS;
 
     // No shell/string argv. Runtime, entry and binary were resolved in the immutable snapshot.
     const script = NODE_SCRIPT_EXTENSIONS.has(path.extname(launchConfig.piBinary).toLowerCase());
@@ -351,7 +359,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   const recoverIfWedged = async (candidate: Attempt): Promise<void> => {
     const launchConfig = candidate.spec?.config ?? config;
     const watchdog = launchConfig.watchdog;
-    if (watchdog?.enabled === false || candidate.watchdogGivenUp || Date.now() < nextWatchdogAt || candidate.native.exited) return;
+    if (!watchdogSupported || watchdog?.enabled === false || candidate.watchdogGivenUp || Date.now() < nextWatchdogAt || candidate.native.exited) return;
     nextWatchdogAt = Date.now() + numberSetting(watchdog?.intervalMs, 30_000, 1);
     const stallMs = numberSetting(watchdog?.stallMs, 180_000, 1);
     const coldStartMs = numberSetting(watchdog?.coldStartMs, 900_000);

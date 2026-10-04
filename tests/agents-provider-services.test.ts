@@ -600,7 +600,7 @@ describe("agents provider message routing service boundaries", () => {
 
   it.each(["root", "agent", "actor"] as const)("keeps distinct runtime-owned %s controls generation-pinned", async kind => {
     const { router, participants, control } = routing();
-    const target = { ...participant(), kind, id: `${kind === "root" ? "session" : kind}:peer`,
+    const target: FabricParticipantInfo = { ...participant(), kind, id: `${kind === "root" ? "session" : kind}:peer`,
       rootId: "session:peer", capabilities: ["steer", "followUp"],
       ownerIncarnation: "22222222-2222-4222-8222-222222222222" };
     participants.get.mockReturnValue(target);

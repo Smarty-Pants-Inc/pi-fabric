@@ -58,6 +58,11 @@ describe("published build artifact guards", () => {
     fs.rmSync(path.join(dir, "dist/worker/result.js"));
     rejected(dir, "worker/result.js");
   });
+  it("rejects an omitted private worker first-use entry", () => {
+    const dir = fixture();
+    fs.rmSync(path.join(dir, "dist/worker/tool-call-stream-guard.js"));
+    rejected(dir, "Missing worker first-use entry: ./worker/tool-call-stream-guard.js");
+  });
   it("rejects external dependencies in the worker bootstrap", () => {
     const dir = fixture();
     fs.appendFileSync(path.join(dir, "dist/worker.js"), '\nimport "typebox/value";\n');

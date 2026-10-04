@@ -298,10 +298,14 @@ export const spawnDetached = async (
   // Retain the existing sixth-argument scratch seam for direct callers.
   if (scope && "directory" in scope) { scratchScope = scope; scope = undefined; }
   if (typeof termGraceMs !== "number") { scratchScope = termGraceMs; termGraceMs = STOP_TERM_MS; }
+  // The new tree-custody protocol is unsupported on Windows. Even an internal
+  // caller requesting it must get only the legacy native worker-exit contract.
   const tracksExecution = executionCustodian && process.platform !== "win32";
   let runtime: string;
+  let treeOwner: typeof import("../../residency/launcher-owner.js") | undefined;
   try {
     runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
+    treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
     assertTransportLaunchAllowed(authority);
     // No loader may run before the fixed scratch attachment gate.
     if (scratchScope && SCRATCH_GATE_LOADER_HOOKS.some(key => (environment ?? process.env)[key]?.trim())) {
@@ -389,6 +393,11 @@ exec "$@"
   let birth: LinuxGroupMember | undefined;
   let birthUnknown = false;
   try { birth = process.platform === "linux" ? linuxGroupMember(pid) : undefined; } catch { birthUnknown = true; }
+  // Share the original birth anchor with sampled cleanup. A second observation
+  // must not adopt a replacement process when the captured worker was absent.
+  const ownedTree = treeOwner ? { processes: new Map<number, import("../../residency/launcher-owner.js").OwnedProcess>(
+    birth ? [[pid, { pid, processStartTime: birth.started, ppid: birth.parent, state: birth.state }]] : [],
+  ) } : undefined;
   const owned = new Map<number, string>();
   if (birth) owned.set(pid, birth.started);
   const groups = new Set([pid]);
@@ -539,6 +548,8 @@ exec "$@"
       if (stopping) return stopping;
       stopFailed = false;
       const pending = (async () => {
+        // Retain the PR's observed detached descendants before TERM can reparent them.
+        if (ownedTree && treeOwner) treeOwner.captureDescendants(ownedTree);
         if (process.platform !== "win32") {
           if (process.platform === "linux" && !birth) {
             // A captured native handle can lag /proc absence. Bound its close
@@ -586,6 +597,9 @@ exec "$@"
               }, 7_000);
             }),
           ]);
+          // Sampling cleanup supplements, but never replaces, the confirmed-exit
+          // custody and birth-checked group drain above. Native-close debt stays latched.
+          if (ownedTree && treeOwner) await treeOwner.stopObservedDescendants(ownedTree, pid);
           stopped = true;
         } finally { clearTimeout(force); clearTimeout(deadline); }
       })();

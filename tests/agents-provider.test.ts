@@ -1968,6 +1968,35 @@ const lifecycleSubscription = (
   });
 
   describe("AgentsProvider lifecycle coalescing", () => {
+    it.each(["main", "session:test"])("delivers exactly one local completion notification to %s during a directory outage", async (to) => {
+      const request = vi.fn();
+      const { provider, participants, mainAgent, mainDeliveries } = setup([], [], { request } as unknown as FabricControlPlane);
+      const refreshRoutingView = vi.fn(async () => { throw new Error("probe failed"); });
+      Object.assign(participants, {
+        routingUnavailable: () => "heartbeat failed",
+        refreshRoutingView,
+        get: vi.fn(() => { throw new Error("directory read failed"); }),
+      });
+      // Exercise the provider's local-Main grouping path as well as its router.
+      Object.assign(mainAgent, { supportsProvenance: () => true });
+      const errors = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const event = lifecycleEvent({ status: "completed" });
+      try {
+        await provider.deliverLifecycle(lifecycleSubscription({ to }), event);
+        await provider.flushLifecycleDeliveries();
+        await provider.flushLifecycleDeliveries();
+        expect(mainDeliveries).toHaveLength(1);
+        expect(mainDeliveries[0]).toMatchObject({ delivery: "followUp", data: event, triggerTurn: true });
+        expect(errors).not.toHaveBeenCalled();
+        expect(refreshRoutingView).not.toHaveBeenCalled();
+        await expect(provider.routeMessage("session:remote", "do not publish", undefined, "followUp"))
+          .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+        expect(refreshRoutingView).toHaveBeenCalledOnce();
+        expect(request).not.toHaveBeenCalled();
+        expect(mainDeliveries).toHaveLength(1);
+      } finally { errors.mockRestore(); }
+    });
     it("coalesces a burst of followUp lifecycle events into one wake delivery", async () => {
       const { provider, mainDeliveries } = setup();
       for (let index = 0; index < 5; index += 1) {
@@ -2274,6 +2303,16 @@ describe("AgentsProvider runner support", () => {
     expect((await provider.describe("peers", context))?.risk).toBe("read");
   });
 
+  it("keeps session: stop targets out of actor classification (#2386)", async () => {
+    const { provider, actors, agents } = setup();
+    const status = vi.spyOn(actors, "status");
+    const failure = new Error("stop dispatch reached");
+    const stop = vi.spyOn(agents, "stop").mockRejectedValue(failure);
+    await expect(provider.invoke("stop", { id: "session:peer" }, context)).rejects.toBe(failure);
+    expect(stop).toHaveBeenCalledWith("session:peer", { consume: false });
+    expect(status).not.toHaveBeenCalled();
+  });
+
   it.each(["followUp", "steer", "tell"])("%s refreshes an exact-id negative lookup using the same peers directory", async (action) => {
     const id = "session:remote-root";
     const peer = { id, host: "forge" } as FabricPeerInfo;
@@ -2298,6 +2337,7 @@ describe("AgentsProvider runner support", () => {
   });
 
   it.each([
+    ["directory-unavailable", "FabricDirectoryUnavailableError", "FABRIC_DIRECTORY_UNAVAILABLE"],
     ["not-yet-mirrored", "FabricParticipantNotYetMirroredError", "FABRIC_PARTICIPANT_NOT_YET_MIRRORED"],
     ["non-interactive", "FabricParticipantNonInteractiveError", "FABRIC_PARTICIPANT_NON_INTERACTIVE"],
     ["ambiguous", "FabricProjectAgentAmbiguousError", "FABRIC_PROJECT_AGENT_AMBIGUOUS"],
@@ -2313,7 +2353,11 @@ describe("AgentsProvider runner support", () => {
     const members = scenario === "non-interactive" ? [{ ...base, interactive: false }]
       : scenario === "ambiguous" ? [base, { ...base, id: "session:22222222-2222-4222-8222-222222222222" }] : [];
     const peers = scenario === "not-yet-mirrored" ? [{ id, host: "forge" } as FabricPeerInfo] : [];
-    const { provider } = setup(peers, members, undefined, { cwd: lane });
+    const { provider, participants } = setup(peers, members, undefined, { cwd: lane });
+    if (scenario === "directory-unavailable") {
+      participants.routingUnavailable = () => "Timed out waiting for the Fabric mesh lock";
+      participants.refreshRoutingView = vi.fn().mockRejectedValue(new Error("Timed out waiting for the Fabric mesh lock"));
+    }
     const registry = new ActionRegistry();
     registry.register(provider);
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
@@ -2332,7 +2376,7 @@ describe("AgentsProvider runner support", () => {
       });
       expect(result.success, result.error).toBe(true);
       expect(result.value).toEqual({ isError: true, name, code,
-        ...(scenario === "not-yet-mirrored" ? { retryable: true } : {}) });
+        ...(["not-yet-mirrored", "directory-unavailable"].includes(scenario) ? { retryable: true } : {}) });
     } finally {
       await registry.close();
     }

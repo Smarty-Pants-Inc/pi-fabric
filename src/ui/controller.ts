@@ -17,6 +17,7 @@ import type { FabricState } from "../fabric-state.js";
 import type { FabricThinking } from "../thinking.js";
 import type { MeshEvent } from "../mesh/store.js";
 import { participantFilesCachedStamp, participantFilesStamp, readParticipantFiles } from "../topology/participant-files.js";
+import { hostLeasesStamp } from "../topology/host-leases.js";
 import type { FabricDashboardMessageTarget } from "./dashboard.js";
 import type { ModelSource } from "./model-picker.js";
 import { createDashboardSnapshot, FabricDashboardSnapshotCache } from "./snapshot.js";
@@ -782,8 +783,12 @@ export class FabricUiController {
       // the one of the listing the snapshot consumed (review/astra F3 on #142).
       const participantsRoot = this.state.config.mesh.enabled && typeof this.state.mesh.root === "string"
         ? this.state.mesh.root : undefined;
+      // Lease-only renewal/re-acquisition also changes topology, without moving state.json.
+      // Keep the pre-build stamp: a lease replaced during snapshot construction must leave
+      // the gate open, not falsely mark a newer file as already consumed.
+      const leasesStamp = participantsRoot ? hostLeasesStamp(participantsRoot) : undefined;
       const remoteOf = (meshStamp: string | undefined, participantsStamp: string | undefined): string =>
-        JSON.stringify([this.#meshOffset, meshStamp, participantsStamp, this.state.globalActors.stamp?.()]);
+        JSON.stringify([this.#meshOffset, meshStamp, participantsStamp, leasesStamp, this.state.globalActors.stamp?.()]);
       const remote = remoteOf(
         this.state.config.mesh.enabled ? this.state.mesh.stateStamp?.() : undefined,
         participantsRoot ? participantFilesStamp(participantsRoot) : undefined,

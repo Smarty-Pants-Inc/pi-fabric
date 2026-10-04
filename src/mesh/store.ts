@@ -144,6 +144,11 @@ export interface MeshStoreOptions {
   readCacheMs?: number;
 }
 
+// Opt-in commit diagnostics: no values or stacks are collected on the normal path.
+// Capture before entering the async lock so the actual writer survives the await boundary.
+const commitTraceCaller = (): string[] | undefined => process.env.PI_FABRIC_COMMIT_TRACE
+  ? new Error().stack?.split("\n").slice(2, 10).map(line => line.trim()) : undefined;
+
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
 
@@ -1545,7 +1550,7 @@ export class MeshStore {
   // The commit's new readGeneration is serialized FIRST and atomically with the payload (the
   // previous one is dropped from the copy), so the canonical header alone identifies the commit
   // whether or not the optional signal is published afterwards. The stamped copy is cached.
-  #commitState(state: MeshStateFile, reuse?: Map<string, EncodedStateEntry>): void {
+  #commitState(state: MeshStateFile, reuse?: Map<string, EncodedStateEntry>, keys: string[] = [], caller?: string[]): void {
     const payload: MeshStateFile = { ...state };
     delete payload.readGeneration;
     const generation = randomUUID();
@@ -1559,6 +1564,13 @@ export class MeshStore {
     if (stamp !== undefined) this.#writeSignal(encoded.entries, stamp, generation);
     if (stamp === undefined || !this.#cacheState(stamped, stamp)) this.#stateCache = undefined;
     this.#writeEncodings = { serialized: encoded.serialized.toString("utf8"), entries: encoded.entries };
+    const trace = process.env.PI_FABRIC_COMMIT_TRACE;
+    if (trace) {
+      try {
+        fs.appendFileSync(trace, JSON.stringify({ at: Date.now(), pid: process.pid, statePath: this.#statePath,
+          generation, bytes: encoded.serialized.byteLength, keys: [...new Set(keys)], caller }) + "\n");
+      } catch { /* Diagnostics must never fail a durable commit. */ }
+    }
   }
 
   // Best effort, after a commit: a failure leaves an older signal whose generation no longer
@@ -1596,6 +1608,7 @@ export class MeshStore {
     ifVersion?: number;
   }): Promise<MeshStateEntry> {
     const { key, value, identity, ifVersion } = input;
+    const caller = commitTraceCaller();
     this.#validateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
     return this.#withLock(() => {
@@ -1620,7 +1633,7 @@ export class MeshStore {
       state.highWater = plan.highWater;
       state.tombstoneOrder = (state.tombstoneOrder ?? []).filter((key) => key !== plan.key);
       compactStateTombstones(state, this.#maxStateTombstones);
-      this.#commitState(state, reuse);
+      this.#commitState(state, reuse, [plan.key], caller);
       return jsonClone(entry);
     });
   }
@@ -1650,6 +1663,7 @@ export class MeshStore {
     ifVersion?: number;
   }): Promise<{ deleted: boolean; version?: number }> {
     const { key, ifVersion } = input;
+    const caller = commitTraceCaller();
     this.#validateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
     return this.#withLock(() => {
@@ -1676,7 +1690,7 @@ export class MeshStore {
         plan.key,
       ];
       compactStateTombstones(state, this.#maxStateTombstones);
-      this.#commitState(state, reuse);
+      this.#commitState(state, reuse, [plan.key], caller);
       return { deleted: true, version: plan.version };
     });
   }
@@ -1697,6 +1711,7 @@ export class MeshStore {
     prepare?: (view: MeshBatchView) => MeshBatchOperation[];
     afterCommit?: (view: MeshBatchView) => void;
   }): Promise<MeshBatchResult[]> {
+    const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit) return [];
     return this.#withLock(() => {
@@ -1771,7 +1786,7 @@ export class MeshStore {
       } else {
         state.tombstoneOrder = [...tombstones];
         compactStateTombstones(state, this.#maxStateTombstones);
-        this.#commitState(state, reuse);
+        this.#commitState(state, reuse, results.filter(result => result.applied).map(result => result.key), caller);
       }
       input.afterCommit?.(view);
       return results;

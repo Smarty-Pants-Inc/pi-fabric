@@ -235,7 +235,7 @@ describe("Astra resident lease delivery fence", () => {
 
 describe("#3662 resident actor delivery routing", () => {
   it.each(["read-denied", "stat-denied", "invalid-json", "invalid-envelope", "invalid-participant"] as const)(
-    "S1 keeps file-only %s lineage at its mailbox until confirmed withdrawal", async (fault) => {
+    "S1 keeps file-only %s lineage at its mailbox through Main withdrawal while its resident lives", async (fault) => {
       const { root, config, host } = fixture();
       const integratorId = "session:11111111-1111-4111-8111-111111111111";
       config.cwd = root;
@@ -310,7 +310,8 @@ describe("#3662 resident actor delivery routing", () => {
         await send("after repair", 2);
         expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
         expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
-        // Confirmed withdrawal, not a parsing omission, finally permits exact-bound inheritance.
+        // Main withdrawal is explicit, but the live resident still protects this
+        // lineage (#4313): a close receipt cannot transfer a running durable host.
         expect(await removeParticipantFileIf(host.mesh, original.key, () => true)).toBe(true);
         expect(host.participants.lineageAlive(config.rootId)).toBe(true); // Removal is not positive proof.
         await host.mesh.put({
@@ -318,10 +319,10 @@ describe("#3662 resident actor delivery routing", () => {
           identity: { id: config.rootId, name: "main", kind: "main" },
           value: { format: 1, rootId: config.rootId, ownerHostId: config.rootId, ownerIdentityId: config.rootId, closedAt: Date.now() },
         });
-        expect(host.participants.lineageAlive(config.rootId)).toBe(false);
+        expect(host.participants.lineageAlive(config.rootId)).toBe(true);
         await send("after withdrawal", 3);
-        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
-        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(1);
+        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(3);
+        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
       } finally {
         readFault?.mockRestore();
         statFault?.mockRestore();
@@ -334,15 +335,15 @@ describe("#3662 resident actor delivery routing", () => {
   it.each([
     ["expired lease with live lineage", true, true, "root"],
     ["dead root without bound integrator", false, false, "root"],
-    ["dead root with exact bound integrator", false, true, "integrator"],
-    ["dead root with actor repository different from host cwd", false, true, "integrator"],
+    ["closed Main with live resident and exact bound integrator", false, true, "root"],
+    ["closed Main with live resident and actor repository different from host cwd", false, true, "root"],
   ] as const)("routes %s through the host mailbox path", async (_case, rootPresent, bound, target) => {
     const { root, config, host } = fixture();
     const integratorId = "session:11111111-1111-4111-8111-111111111111";
     config.cwd = root;
     config.projectRoot = root;
     let actorProject = root;
-    if (_case === "dead root with actor repository different from host cwd") {
+    if (_case === "closed Main with live resident and actor repository different from host cwd") {
       actorProject = path.join(root, "actor-project");
       fs.mkdirSync(actorProject);
       for (const [cwd, origin] of [[root, "https://forge.test/team/host.git"], [actorProject, "https://forge.test/team/actors.git"]]) {
@@ -391,7 +392,8 @@ describe("#3662 resident actor delivery routing", () => {
         delivery: "steer", triggerTurn: true,
       });
       await vi.waitFor(() => expect(host.mesh.listAll("residency/deliveries/").length).toBe(1));
-      const expected = target === "integrator" ? integratorId : config.rootId;
+      // A live resident preserves the original lineage regardless of Main closure.
+      const expected = config.rootId;
       const deliveries = host.mesh.listAll(residentDeliveryPrefix(expected));
       expect(deliveries).toHaveLength(1);
       expect(deliveries[0]?.value).toMatchObject({ rootId: expected, message: "directive", delivery: "steer" });

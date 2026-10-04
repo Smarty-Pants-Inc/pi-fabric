@@ -40,8 +40,8 @@ const PARTICIPANT_PREFIX = "topology/participants/";
 /** Project-scoped monotonic counter backing Linear-style peer labels. Never shrinks. */
 const PEER_SEQ_KEY = "topology/peer-seq";
 const HOST_PREFIX = "topology/hosts/";
-// Root-owned clean-close receipts survive record cleanup. Absence alone (including a
-// lease-based reaper's cleanup) is not positive evidence that a lineage ended.
+// Root-owned clean-close receipts survive record cleanup. Without one, absence
+// needs aged retained actor evidence plus the no-live-lineage-host proof below.
 const LINEAGE_CLOSURE_PREFIX = "topology/lineage-closures/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
@@ -378,6 +378,8 @@ export interface ParticipantDirectoryOptions {
   selfOwnerIdentityId?: string;
   heartbeatMs?: number;
   leaseMs?: number;
+  /** Test seam; production defaults to at least ten minutes and twice every observed TTL. */
+  lineageDeathGraceMs?: number;
   /**
    * Sweep records of hosts gone for this long (default 6 h), at most every sweepMs (default
    * 15 min, the first sweep waiting as long). false disables it (secondary directories, tests).
@@ -849,36 +851,109 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   /**
-   * Shared by adoption and delivery. Live, stale and unknown all veto inheritance.
-   * Never combine lease-filtered get/lastKnown snapshots: a renewal between them
-   * can make both omit the same live root. Raw presence is lease-independent.
-   * Only a root-owned clean-close receipt, with no conflicting presence, proves death.
+   * Raw Main presence (even stale/invalid) vetoes inheritance. An absent Main needs
+   * either its clean-close receipt or aged actor presence, AND no live lineage host.
+   * Never infer death from lease-filtered get/lastKnown snapshots (#4623).
    */
-  lineageAlive(rootId: string, _now = Date.now()): boolean {
-    if (!this.options.enabled) return true;
+  lineageAlive(rootId: string, now = Date.now()): boolean {
+    if (!this.options.enabled || !Number.isFinite(now)) return true;
     const target = rootId === "main" ? this.options.rootId : rootId;
-    const key = keyFor(PARTICIPANT_PREFIX, target);
     try {
-      // true unless ENOENT: suppressed read/stat errors and invalid files veto inheritance.
-      if (participantFilePresent(this.mesh.root, key)) return true;
-      if (this.mesh.get(key, { fresh: true }) !== undefined) return true;
-      // Retained legacy sessions also count regardless of lease or parse validity.
-      if (target.startsWith("session:") && this.mesh.get(`${LEGACY_SESSION_PREFIX}${target.slice(8)}`, { fresh: true }) !== undefined) return true;
-      const entry = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, target), { fresh: true });
-      const receipt = entry?.value;
+      // Read the entire proof twice: file-only publishers can renew without the mesh
+      // lock. The final adoption decision still runs under registry + mesh custody.
+      return this.#absentLineageMayBeAlive(target, now) || this.#absentLineageMayBeAlive(target, now);
+    } catch {
+      return true; // Unknown/unreadable/malformed is never positive proof.
+    }
+  }
+
+  #absentLineageMayBeAlive(target: string, now: number): boolean {
+    const key = keyFor(PARTICIPANT_PREFIX, target);
+    // Same stable id as residency/protocol.residentHostId, without importing its
+    // runtime protocol graph into directory startup.
+    const residentId = `resident:${createHash("sha256").update(target).digest("hex").slice(0, 24)}`;
+    if (participantFilePresent(this.mesh.root, key) || this.mesh.get(key, { fresh: true }) !== undefined) return true;
+    if (target.startsWith("session:") && this.mesh.get(`${LEGACY_SESSION_PREFIX}${target.slice(8)}`, { fresh: true }) !== undefined) return true;
+
+    let longestTtl = Math.max(this.#leaseMs, MAIN_RELOAD_LEASE_MS, PARTICIPANT_LEASE_MS);
+    let lastSeen = Number.NEGATIVE_INFINITY;
+    const grace = (): number => {
+      // Deliberately unavailable in production. Native offline proofs can shorten
+      // only the ten-minute floor, never the two-TTL protection.
+      const testGrace = process.env.NODE_ENV === "test" ? Number(process.env.PI_FABRIC_TEST_LINEAGE_DEATH_GRACE_MS) : NaN;
+      const requested = this.options.lineageDeathGraceMs ?? testGrace;
+      const floor = process.env.NODE_ENV === "test" && Number.isFinite(requested) && requested > 0
+        ? requested : 10 * 60 * 1_000;
+      return Math.max(2 * longestTtl, floor);
+    };
+    const remember = (at: number): void => {
+      if (!Number.isFinite(at)) throw new Error("Invalid lineage presence time");
+      lastSeen = Math.max(lastSeen, at);
+    };
+    const leaseEvidence = (updatedAt: number, expiresAt: number): boolean => {
+      if (!Number.isFinite(updatedAt) || !Number.isFinite(expiresAt) || expiresAt < updatedAt) throw new Error("Invalid lineage lease");
+      longestTtl = Math.max(longestTtl, expiresAt - updatedAt);
+      // Even a recently lapsed host is not dead. Count expiry, not just renewal,
+      // so the grace begins AFTER its advertised liveness window.
+      remember(expiresAt);
+      return expiresAt >= now;
+    };
+    // Scan all lineage hosts, including residentHostId(target), and file-only leases
+    // with no shared host record. A fresh resident lease protects an absent Main.
+    for (const entry of this.mesh.listAll(HOST_PREFIX, { fresh: true })) {
+      if (!isObject(entry.value)) throw new Error("Invalid host record");
+      if (entry.value.rootId !== target && entry.value.id !== target && entry.value.id !== residentId && entry.key !== keyFor(HOST_PREFIX, residentId)) continue;
+      const host = hostFromEntry(entry);
+      if (!host || entry.key !== keyFor(HOST_PREFIX, host.id)) return true;
+      remember(entry.updatedAt);
+      if (leaseEvidence(host.updatedAt, host.expiresAt)) return true;
+    }
+    for (const lease of readHostLeases(this.mesh.root, { strict: true }).values()) {
+      if (lease.rootId !== target && lease.id !== target && lease.id !== residentId) continue;
+      if (leaseEvidence(lease.updatedAt, lease.expiresAt)) return true;
+    }
+
+    const closure = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, target), { fresh: true });
+    const receipt = closure?.value;
+    if (closure !== undefined) {
       if (!(isObject(receipt) && receipt.format === 1 && receipt.rootId === target &&
         receipt.ownerHostId === target && receipt.ownerIdentityId === target &&
-        entry?.updatedBy.id === target && entry.updatedBy.kind === "main" &&
+        closure.updatedBy.id === target && closure.updatedBy.kind === "main" &&
         typeof receipt.closedAt === "number" && Number.isFinite(receipt.closedAt))) return true;
-      // Recheck after reading the proof: a file-only publisher may have appeared
-      // since the first absence read. Cross-root commits additionally hold the
-      // mesh custody lock, which serializes this decision with resumeLineage().
-      if (participantFilePresent(this.mesh.root, key) || this.mesh.get(key, { fresh: true }) !== undefined) return true;
-      if (target.startsWith("session:") && this.mesh.get(`${LEGACY_SESSION_PREFIX}${target.slice(8)}`, { fresh: true }) !== undefined) return true;
-      return this.mesh.get(entry.key, { fresh: true })?.version !== entry.version;
-    } catch {
-      return true; // Unknown is not positive proof, even if a close receipt exists.
+      // Preserve the stronger, explicit clean-close proof. Host liveness above still
+      // vetoes it: Main closing does not terminate its durable resident host.
+      return now - lastSeen <= grace();
     }
+
+    let knownPresence = false;
+    const participants = [...this.mesh.listAll(PARTICIPANT_PREFIX, { fresh: true }),
+      ...readParticipantFiles(this.mesh.root, { strict: true })];
+    for (const entry of participants) {
+      if (!isObject(entry.value)) return true;
+      if (entry.value.rootId !== target) continue;
+      const participant = participantFromEntry(entry);
+      if (!participant || participant.remoteHost !== undefined || entry.key !== keyFor(PARTICIPANT_PREFIX, participant.id)) return true;
+      // A root advertised under another key is conflicting evidence, not death.
+      if (participant.kind === "root") return true;
+      remember(Math.max(entry.updatedAt, participant.updatedAt));
+      // Child/host presence can veto death, but only actor presence supplies
+      // the required retained history when the Main record itself is absent.
+      if (participant.kind === "actor") knownPresence = true;
+    }
+    for (const entry of this.mesh.listAll(LEGACY_ACTOR_PREFIX, { fresh: true })) {
+      if (entry.updatedBy.id !== target && !(isObject(entry.value) && entry.value.rootId === target)) continue;
+      const actor = entry.value;
+      if (!isObject(actor) || typeof actor.id !== "string" || typeof actor.name !== "string" ||
+        typeof actor.status !== "string" || (actor.runner !== "pi" && actor.runner !== "claude" && actor.runner !== "veda") ||
+        actor.rootId !== target || !target.startsWith("session:") ||
+        entry.key !== `${LEGACY_ACTOR_PREFIX}${target.slice(8)}/${actor.id}` ||
+        (entry.updatedBy.id !== target && entry.updatedBy.id !== residentId)) return true;
+      remember(entry.updatedAt); // presence commit time, NOT the actor's creation time
+      knownPresence = true;
+    }
+    // Nothing retained about this lineage is unknown forever, not an old death proof.
+    if (!knownPresence) return true;
+    return now - lastSeen <= grace();
   }
 
   // A stalled mesh writer (for example a signal-stopped lock holder, smarty-dev#266)
@@ -1060,6 +1135,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async resumeLineage(): Promise<void> {
     if (!this.options.enabled || this.options.hostId !== this.options.rootId ||
       this.options.identity.id !== this.options.rootId || this.options.identity.kind !== "main") return;
+    // Absence proof has no receipt to delete. Publish a fresh veto under the SAME
+    // custody lock as adoption before any root/actor activation or file publication.
+    const rootKey = keyFor(PARTICIPANT_PREFIX, this.options.rootId);
+    if (!this.#localRecords.has(this.options.rootId) ||
+      (!participantFilePresent(this.mesh.root, rootKey) && this.mesh.get(rootKey, { fresh: true }) === undefined)) {
+      await this.mesh.writeBatch({ identity: this.options.identity, ops: [], afterCommit: () => { this.#renewFileLease(); } });
+    }
     const closure = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), { fresh: true });
     if (closure) await this.mesh.delete({ key: closure.key, ifVersion: closure.version });
   }

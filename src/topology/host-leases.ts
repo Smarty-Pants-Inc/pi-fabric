@@ -74,13 +74,14 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
 // Parsed files by directory and name, reused while a file's identity and timestamps are unchanged.
 const cache = new Map<string, LeaseSlots>();
 
-/** Every host's file lease, by host id. Unreadable or misnamed files are skipped. */
-export const readHostLeases = (meshRoot: string): Map<string, FabricHostLease> => {
+/** Every host's file lease, by host id. Strict death-proof scans reject unreadable/invalid files. */
+export const readHostLeases = (meshRoot: string, options: { strict?: boolean } = {}): Map<string, FabricHostLease> => {
   const dir = path.join(meshRoot, LEASE_DIR);
   let names: string[];
   try {
     names = fs.readdirSync(dir);
-  } catch {
+  } catch (error) {
+    if (options.strict && (error as { code?: unknown }).code !== "ENOENT") throw error;
     return new Map();
   }
   const known = cache.get(dir) ?? new Map();
@@ -93,10 +94,13 @@ export const readHostLeases = (meshRoot: string): Map<string, FabricHostLease> =
     let stat: fs.Stats;
     try {
       stat = fs.statSync(path.join(dir, name));
-    } catch {
+    } catch (error) {
+      if (options.strict && (error as { code?: unknown }).code !== "ENOENT") throw error;
       continue;
     }
-    const lease = cachedLease(known, dir, name, stat);
+    const parsed = options.strict ? parseLease(path.join(dir, name), name) : undefined;
+    if (options.strict && (!parsed?.read || !parsed.lease)) throw new Error("Unreadable or invalid host lease");
+    const lease = options.strict ? parsed!.lease : cachedLease(known, dir, name, stat);
     if (lease) leases.set(lease.id, lease);
   }
   for (const name of known.keys()) if (!present.has(name)) known.delete(name);

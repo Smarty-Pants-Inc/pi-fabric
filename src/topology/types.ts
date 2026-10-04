@@ -137,7 +137,7 @@ export interface FabricParticipantSource {
    * False means get(id) is not local, so a caller can pass over the id without a mesh read.
    */
   publishes?(id: string): boolean;
-  /** Lease-independent lineage test shared by adoption and delivery; only positive closure proves death. */
+  /** Conservative lineage test: clean closure or aged absence with no live host/presence proves death. */
   lineageAlive?(rootId: string, now?: number): boolean;
   self(now?: number): FabricParticipantInfo;
   /** All live root Pi session agents, including the current lineage root. */

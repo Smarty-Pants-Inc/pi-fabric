@@ -249,33 +249,36 @@ const readSlot = (
 /**
  * Every participant file's entry. Callers must not mutate the entries: they are shared with the
  * cache (the shared-state reads return clones; these are read far more often).
+ * Strict death-proof scans bypass cached slots and reject incomplete/invalid reads.
  */
 export const readParticipantFiles = (
   meshRoot: string,
-  options: { maxAgeMs?: number } = {},
+  options: { maxAgeMs?: number; strict?: boolean } = {},
 ): readonly MeshStateEntry[] => {
   const dir = path.join(meshRoot, DIR);
   // A listing may reuse a scan this recent even if files changed since, like the shared state's
   // read cache (RUNTIME_MESH_READ_CACHE_MS): a busy fleet changes some record several times a second.
   const recent = cache.get(dir);
-  if (recent?.complete && options.maxAgeMs && Date.now() - recent.scannedAt < options.maxAgeMs) return recent.entries;
+  if (!options.strict && recent?.complete && options.maxAgeMs && Date.now() - recent.scannedAt < options.maxAgeMs) return recent.entries;
   let dirStat: fs.Stats;
   try {
     dirStat = fs.statSync(dir);
-  } catch {
+  } catch (error) {
     cache.delete(dir);
+    if (options.strict && (error as { code?: unknown }).code !== "ENOENT") throw error;
     return [];
   }
   const known = cache.get(dir);
   if (
-    known?.complete && process.platform !== "win32" && known.ino === dirStat.ino && known.mtimeMs === dirStat.mtimeMs &&
+    !options.strict && known?.complete && process.platform !== "win32" && known.ino === dirStat.ino && known.mtimeMs === dirStat.mtimeMs &&
     known.scannedAt - known.mtimeMs >= DIR_TICK_MS
   ) return known.entries;
   const scannedAt = Date.now();
   let names: string[];
   try {
     names = fs.readdirSync(dir);
-  } catch {
+  } catch (error) {
+    if (options.strict) throw error;
     return known?.entries ?? [];
   }
   const slots = new Map<string, Slot>();
@@ -290,12 +293,13 @@ export const readParticipantFiles = (
       if ((error as { code?: unknown }).code !== "ENOENT") complete = false;   // else removed since the listing
       continue;
     }
-    const { slot, read } = readSlot(dir, name, stat, known?.slots.get(name));
+    const { slot, read } = readSlot(dir, name, stat, options.strict ? undefined : known?.slots.get(name));
     complete &&= read;
     if (!slot) continue;
     slots.set(name, slot);
     if (slot.entry) entries.push(slot.entry);
   }
+  if (options.strict && (!complete || slots.size !== entries.length)) throw new Error("Incomplete participant file scan");
   // An unchanged listing keeps its array, so callers can key their own caches on it.
   const same = known !== undefined && known.entries.length === entries.length &&
     known.entries.every((entry, index) => entry === entries[index]);

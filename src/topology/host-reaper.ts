@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
-import { type FabricHostLease, readHostLeases, removeHostLease } from "./host-leases.js";
+import { type FabricHostLease, hostEntryLiveness, readHostLeases, removeHostLease } from "./host-leases.js";
 import { participantFilePresent, readParticipantFiles, removeParticipantFileIf, sweepParticipantLockLeftovers } from "./participant-files.js";
 import { isLiveLegacyRootEntry } from "./legacy-root-liveness.js";
+import { effectiveLiveness } from "./liveness.js";
 
 /** A host's records are removed when its lease expired this long ago (smarty-dev#367). */
 export const DEAD_HOST_RECORDS_MS = 6 * 60 * 60 * 1000;
@@ -25,10 +26,7 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
 // A host lease entry that is gone for the window: its lease (or, without one, its last write)
 // is older than the cutoff, and so is the host's file lease (smarty-dev#816).
 const leaseGone = (entry: MeshStateEntry, cutoff: number, leases: ReadonlyMap<string, FabricHostLease>): boolean => {
-  const value = record(entry.value);
-  const expiresAt = value?.expiresAt;
-  const file = typeof value?.id === "string" ? leases.get(value.id)?.expiresAt : undefined;
-  return (typeof expiresAt === "number" ? expiresAt : entry.updatedAt) <= cutoff && (file === undefined || file <= cutoff);
+  return hostEntryLiveness(entry, leases).expiresAt <= cutoff;
 };
 
 // Hosts' file leases, when the store has a root to read them from.
@@ -85,20 +83,20 @@ const liveRootCursorKeys = (
     if (typeof id === "string") keys.add(INBOX_PREFIX + createHash("sha256").update(id).digest("hex").slice(0, 32));
   };
   for (const entry of view.listAll(SESSION_PREFIX)) {
-    if (isLiveLegacyRootEntry(entry, now)) keep(entry.value.id);
+    if (isLiveLegacyRootEntry(entry, now, mesh.root)) keep(entry.value.id);
   }
   const leases = fileLeases(mesh);
   for (const entry of view.listAll(HOST_PREFIX)) {
     const host = record(entry.value);
     if (typeof host?.id !== "string" || entry.key !== hostKey(host.id)) continue;
-    if (typeof host.expiresAt === "number" && host.expiresAt >= now) {
+    if (hostEntryLiveness(entry, leases).expiresAt >= now) {
       keep(host.rootId);
       keep(record(host.identity)?.id);
     }
   }
   // A file-only host lease can outlive a shared-state publication gap too.
   for (const lease of leases.values()) {
-    if (lease.expiresAt >= now) {
+    if (effectiveLiveness(undefined, lease).expiresAt >= now) {
       keep(lease.rootId);
       keep(lease.identityId);
     }
@@ -207,7 +205,7 @@ export const reapDeadHostRecords = async (
     const leases = readHostLeases(mesh.root);
     for (const hostId of new Set(found.map((item) => item.hostId))) {
       const lease = leases.get(hostId);
-      if (lease && lease.expiresAt <= cutoff) removeHostLease(mesh.root, hostId);
+      if (lease && effectiveLiveness(undefined, lease).expiresAt <= cutoff) removeHostLease(mesh.root, hostId);
     }
   }
   return removed;

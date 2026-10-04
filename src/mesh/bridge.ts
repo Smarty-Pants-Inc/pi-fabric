@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
-import { hostLeaseExpiry, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { hostLeaseExpiry, hostLiveness, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
@@ -263,14 +263,10 @@ export class StoreBridgeSide implements BridgeSide {
       }
       reserved.add(host.id).add(host.identity.id).add(host.rootId);
       if (mark !== undefined || entry.updatedBy.id !== host.identity.id) continue;
-      const expiresAt = hostLeaseExpiry(leases, host);
-      // File-only heartbeats leave the state record old. Carry the effective lease's
-      // renewal time too, so the peer measures its TTL rather than the state's age.
-      const lease = leases.get(host.id);
-      const record = lease && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
-        lease.expiresAt >= host.expiresAt
-        ? { ...host, updatedAt: lease.updatedAt, expiresAt }
-        : host;
+      const liveness = hostLiveness(leases, host);
+      const expiresAt = liveness.expiresAt;
+      // Carry effective renewal time as well as expiry, with the same incarnation fence.
+      const record = { ...host, ...liveness };
       if (expiresAt > now) hosts.push({ record, expiresAt });
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
@@ -400,7 +396,7 @@ export class StoreBridgeSide implements BridgeSide {
       const host = hostOf(entry.key, entry.value);
       if (!host || entry.updatedBy.id !== host.identity.id) continue;
       const expiresAt = hostLeaseExpiry(leases, host);
-      if (expiresAt > now) hosts.push({ record: host, expiresAt });
+      if (expiresAt > now) hosts.push({ record: { ...host, ...hostLiveness(leases, host) }, expiresAt });
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants: FabricParticipantRecord[] = [];

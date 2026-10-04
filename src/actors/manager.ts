@@ -56,7 +56,7 @@ import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore } from "./registry-store.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { ModelRoutePinError } from "../core/model-refresh.js";
 
@@ -422,6 +422,9 @@ export class ActorManager {
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
   readonly #logs: ActorLogStore;
+  // Failed archives outlive lastRunId changes. Retry every retained join, not just
+  // the immediately previous activation; cleanup follows confirmed archival.
+  readonly #pendingRunArchives = new Map<string, Set<string>>();
   readonly #childCompletionStores = new Map<string, ActorChildCompletionStore>();
   readonly #acquireCapabilityView:
     | ((
@@ -461,6 +464,7 @@ export class ActorManager {
   /** Orphan deletes, fenced to the entry version seen when it was found. */
   readonly #orphanPresence = new Map<string, number>();
   #presenceTimer: NodeJS.Timeout | undefined;
+  #orphanPresenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
@@ -616,7 +620,11 @@ export class ActorManager {
     this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
     // Presence entries this runtime wrote for actors it no longer knows (a remove whose
     // delete never landed) are orphans: reap them once at start.
-    setTimeout(() => this.#reapOrphanPresence(), 0).unref();
+    this.#orphanPresenceTimer = setTimeout(() => {
+      this.#orphanPresenceTimer = undefined;
+      this.#reapOrphanPresence();
+    }, 0);
+    this.#orphanPresenceTimer.unref();
   }
 
   subscribe(listener: () => void): () => void {
@@ -2210,6 +2218,10 @@ export class ActorManager {
     this.#drainRearms.clear();
     if (this.#presenceTimer) clearTimeout(this.#presenceTimer);
     this.#presenceTimer = undefined;
+    if (this.#orphanPresenceTimer) clearTimeout(this.#orphanPresenceTimer);
+    this.#orphanPresenceTimer = undefined;
+    if (this.#retentionTimer) clearInterval(this.#retentionTimer);
+    this.#retentionTimer = undefined;
     // Cancellation is monotonic: pending claims must settle before the enclosing
     // runtime releases host custody or certifies terminal lineage closure.
     await Promise.allSettled([...this.#adoptionPending.values()]);
@@ -2217,8 +2229,6 @@ export class ActorManager {
     await Promise.allSettled([...this.#presenceChains.values()]);
     await this.#filterStateSave;
     await this.#notifications.close();
-    if (this.#retentionTimer) clearInterval(this.#retentionTimer);
-    this.#retentionTimer = undefined;
     await this.#retentionSweep;
     this.#listeners.clear();
     if (this.#persistent) {
@@ -2238,10 +2248,18 @@ export class ActorManager {
       // turn, keeping the session from exiting. Past the grace, stop it: while closing, no queue
       // file is written, so its item stays there and the next session runs it again (#79).
       const drains = Promise.allSettled(owned.map((actor) => actor.drain ?? Promise.resolve()));
-      const timer = (ms: number) => new Promise<"late">((resolve) => setTimeout(resolve, ms, "late").unref?.());
-      if (await Promise.race([drains.then(() => "done" as const), timer(this.#closeGraceMs)]) === "late") {
+      // A losing race deadline is still a live old-generation timer. The shared
+      // bounded-settlement helper clears it when drains finish first (#4383).
+      if (!await settleWithin([drains], this.#closeGraceMs)) {
         await this.agents.close();
-        await Promise.race([drains, timer(this.#closeGraceMs)]);
+        await settleWithin([drains], this.#closeGraceMs);
+      }
+      // Retry every durable join before AgentManager.close. Failed sinks keep
+      // their source veto on disk for the next execution owner.
+      for (const actor of owned) {
+        const pending = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
+          ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
+        for (const runId of pending) await this.#retainRunLog(actor, runId).catch(() => undefined);
       }
       for (const actor of owned) {
         if (actor.status !== "stopped") actor.status = "idle";
@@ -2671,7 +2689,9 @@ export class ActorManager {
                 actorId: actor.id, activationId: item.id }, abortController.signal);
             })
             : undefined;
-          const launchBinding = routeDecision ? { ...binding, model: routeDecision.pin.model, thinking: routeDecision.pin.effort }
+          const launchBinding = routeDecision ? { ...binding,
+            model: routeDecision.mode === "live" ? routeDecision.model : routeDecision.pin.model,
+            thinking: routeDecision.mode === "live" ? routeDecision.effort : routeDecision.pin.effort }
             : await this.#prepare(actor, "binding", () => this.#resolvedRunBinding(actor, binding));
           // Admission is held, but no child writer has launched yet. Repair/create
           // the native session before handing its path to the process.
@@ -2887,15 +2907,21 @@ export class ActorManager {
           // actor sent to and received from its model, even after a successful
           // run cleans up the in-memory handle and tmp run directory. Failed
           // runs stay in the agent registry for agents.status(lastRunId).
+          let archived = false;
           if (runId) {
-            await this.#retainRunLog(actor, runId).catch(() => undefined);
+            archived = await this.#retainRunLog(actor, runId).then(() => true, () => false);
           }
           // Release the in-memory handle and tmp run dir for completed runs;
           // failed runs are retained for agents.status(actor.lastRunId).
-          if (previousRunId && previousRunId !== runId) {
-            await this.agents.cleanup(previousRunId).catch(() => ({ cleaned: false }));
+          const priorArchives = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
+            ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
+          if (previousRunId && previousRunId !== runId) priorArchives.add(previousRunId);
+          for (const priorRunId of priorArchives) {
+            if (priorRunId === runId) continue;
+            const priorArchived = await this.#retainRunLog(actor, priorRunId).then(() => true, () => false);
+            if (priorArchived) await this.agents.cleanup(priorRunId).catch(() => ({ cleaned: false }));
           }
-          if (runId && runCompleted) {
+          if (runId && runCompleted && archived) {
             await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
           }
           delete actor.abortController;
@@ -3437,7 +3463,14 @@ export class ActorManager {
   }
 
   async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {
-    await this.#logs.retainRun(actor, runId, this.agents.runDirectory(runId));
+    let pending = this.#pendingRunArchives.get(actor.id);
+    if (!pending) this.#pendingRunArchives.set(actor.id, pending = new Set());
+    pending.add(runId);
+    const source = this.agents.runDirectory(runId) ?? this.agents.actorArchiveSources(actor.id, actor.sessionFile).get(runId);
+    await this.#logs.retainRun(actor, runId, source);
+    if (source) await this.agents.commitActorArchive(runId, actor.id, actor.sessionFile);
+    pending.delete(runId);
+    if (!pending.size) this.#pendingRunArchives.delete(actor.id);
   }
 
   #startRetentionSweep(): void {

@@ -64,6 +64,48 @@ const createState = (loader: never): FabricState => new FabricState(
 );
 
 describe("FabricState lazy bootstrap", () => {
+  it.each(["reload", "initialize", "session-switch"] as const)(
+    "stops activation timers before %s invalidates the runtime", async (boundary) => {
+      vi.useFakeTimers();
+      const cwd = project({ mesh: { enabled: false } });
+      const harness = runtimeHarness();
+      const state = createState(harness.loader);
+      const context = contextAt(cwd);
+      let poll: ReturnType<typeof setInterval> | undefined;
+      let refresh: ReturnType<typeof setTimeout> | undefined;
+      const tick = vi.fn(() => { void state.mesh; });
+      const cleanup = vi.fn(() => {
+        // The old runtime is still usable when presentation stops.
+        expect(state.initialized).toBe(true);
+        clearInterval(poll); clearTimeout(refresh);
+      });
+      state.setActivationHook(() => {
+        poll = setInterval(tick, 10);
+        refresh = setTimeout(tick, 25);
+      }, undefined, cleanup);
+      try {
+        await state.bootstrap(context);
+        await state.ensure(context);
+        expect(vi.getTimerCount()).toBe(2);
+        harness.block();
+        const pending = boundary === "reload" ? state.shutdown("reload") :
+          boundary === "initialize" ? state.initialize(context) : state.bootstrap(contextAt(cwd, "session-2"));
+        expect(cleanup).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(tick).not.toHaveBeenCalled();
+        harness.release();
+        await pending;
+        expect(state.initialized).toBe(boundary !== "reload");
+        expect(vi.getTimerCount()).toBe(boundary === "reload" ? 0 : 2);
+      } finally {
+        // Remove the assertion on repeated no-runtime shutdown cleanup.
+        state.setActivationHook(() => {}, undefined, () => { clearInterval(poll); clearTimeout(refresh); });
+        harness.release(); await state.shutdown();
+        fs.rmSync(cwd, { recursive: true, force: true }); vi.useRealTimers();
+      }
+    },
+  );
   it("rereads component configuration at first use without activating the runtime while idle", async () => {
     const cwd = project({ components: [] });
     const harness = runtimeHarness();

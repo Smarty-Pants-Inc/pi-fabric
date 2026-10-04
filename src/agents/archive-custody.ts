@@ -5,6 +5,7 @@ import type { AgentRunResult } from "./types.js";
 import type { CompletionRecipient } from "./completion-journal.js";
 
 export const ARCHIVE_PENDING_FILE = "archive-pending.json";
+export const ACTOR_RUN_ARCHIVE_PENDING_FILE = "actor-run-archive-pending.json";
 export interface PendingRunArchive {
   format: 1;
   kind: "settlement" | "shutdown";

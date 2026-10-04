@@ -317,7 +317,8 @@ describe("#3662 resident actor delivery routing", () => {
         await send("after repair", 2);
         expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
         expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
-        // Confirmed withdrawal, not a parsing omission, finally permits exact-bound inheritance.
+        // Confirmed withdrawal still does not permit actor-output succession: the owner root
+        // remains the only custody address, even when its recorded lineage is closed.
         expect(await removeParticipantFileIf(host.mesh, original.key, () => true)).toBe(true);
         expect(host.participants.lineageAlive(config.rootId)).toBe(true); // Removal is not positive proof.
         await host.mesh.put({
@@ -327,8 +328,8 @@ describe("#3662 resident actor delivery routing", () => {
         });
         expect(host.participants.lineageAlive(config.rootId)).toBe(false);
         await send("after withdrawal", 3);
-        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(2);
-        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(1);
+        expect(host.mesh.listAll(residentDeliveryPrefix(config.rootId))).toHaveLength(3);
+        expect(host.mesh.listAll(residentDeliveryPrefix(integratorId))).toHaveLength(0);
       } finally {
         readFault?.mockRestore();
         statFault?.mockRestore();
@@ -341,9 +342,9 @@ describe("#3662 resident actor delivery routing", () => {
   it.each([
     ["expired lease with live lineage", true, true, "root"],
     ["dead root without bound integrator", false, false, "root"],
-    ["dead root with exact bound integrator", false, true, "integrator"],
-    ["dead root with actor repository different from host cwd", false, true, "integrator"],
-  ] as const)("routes %s through the host mailbox path", async (_case, rootPresent, bound, target) => {
+    ["dead root with exact bound integrator", false, true, "root"],
+    ["dead root with actor repository different from host cwd", false, true, "root"],
+  ] as const)("keeps %s at the exact actor-owner mailbox", async (_case, rootPresent, bound, target) => {
     const { root, config, host } = fixture();
     const integratorId = "session:11111111-1111-4111-8111-111111111111";
     config.cwd = root;
@@ -398,7 +399,7 @@ describe("#3662 resident actor delivery routing", () => {
         delivery: "steer", triggerTurn: true,
       });
       await vi.waitFor(() => expect(host.mesh.listAll("residency/deliveries/").length).toBe(1));
-      const expected = target === "integrator" ? integratorId : config.rootId;
+      const expected = config.rootId;
       const deliveries = host.mesh.listAll(residentDeliveryPrefix(expected));
       expect(deliveries).toHaveLength(1);
       expect(deliveries[0]?.value).toMatchObject({ rootId: expected, message: "directive", delivery: "steer" });

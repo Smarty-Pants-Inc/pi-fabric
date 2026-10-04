@@ -438,6 +438,11 @@ Selecting this remote classifier authorizes sending that evidence to TypeSafe; i
 
 Authentication uses `/login jev`/`TYPESAFE_API_KEY` on the TypeSafe route, the existing `openrouter` credential (`/login openrouter`, `OPENROUTER_API_KEY`, or `TYPESAFE_OPENROUTER_API_KEY`) on the OpenRouter route, and the existing `vercel-ai-gateway` credential (`/login vercel-ai-gateway` or `AI_GATEWAY_API_KEY`) on the Vercel AI Gateway route, then trusted `jev.credentialCommand`; the command is resolved per classification and not cached across decisions. `jev.maxRequestBytes` and `jev.requestTimeoutMs` apply, with a 30-second classifier timeout ceiling and no automatic retries. Typed token usage is included in approval accounting. TypeSafe does not return prices: cost fields are zero/unpriced, **not evidence that inference is free**.
 
+## Run temporary-directory scope
+
+- **POSIX:** Each task or actor run receives `<run>/tmp` with mode `0700` and exports it as `TMPDIR`; the parent Main environment is unchanged. Unscoped collection removes scratch on worker, PID, birth, and namespace custody. The deferred 24-hour grace and complete-holder policy do not ship here. A detached writer that outlives the worker is a known limit tracked in [smarty-dev#4800](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4800) or [smarty-dev#4786](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4786).
+- **Windows:** Runs inherit the caller's `TMPDIR`, `TMP`, and `TEMP`. There is no per-run allocation and no deletion; see [smarty-dev#4800](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4800).
+
 ## Temporal retention
 
 Fabric clears inactive run artifacts by age. It never truncates active JSONL files. The defaults are:

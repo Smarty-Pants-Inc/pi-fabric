@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomicWrite from "../src/core/atomic-write.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -19,9 +20,6 @@ const temp = (): string => {
   roots.push(root);
   return root;
 };
-
-const stateReadCount = (spy: { mock: { calls: unknown[][] } }): number =>
-  spy.mock.calls.filter((args) => typeof args[0] === "string" && args[0].endsWith("/state.json")).length;
 
 describe("actor registry and participant snapshot caches", () => {
   it("reuses an unchanged actor registry and reloads its replacement", () => {
@@ -90,15 +88,15 @@ describe("actor registry and participant snapshot caches", () => {
       }
       return result;
     });
-    const reads = vi.spyOn(fs, "readFileSync");
+    const reads = vi.spyOn(atomicWrite, "readFileRetrying");
     expect(directory.list({ fresh: true, includeStale: true }).find((p) => p.id === "p")?.name).toBe("before");
-    expect(stateReadCount(reads)).toBe(1);
+    expect(reads).toHaveBeenCalledTimes(1);
     expect(selections).toHaveBeenCalledTimes(4);
     const snapshot = selections.mock.calls[0]![1]!.snapshot;
     expect(snapshot).toBeDefined();
     expect(selections.mock.calls.every(([, options]) => options?.snapshot === snapshot)).toBe(true);
     expect(directory.list({ fresh: true, includeStale: true }).find((p) => p.id === "p")?.name).toBe("after");
-    expect(stateReadCount(reads)).toBe(2);
+    expect(reads).toHaveBeenCalledTimes(2);
     expect(selections.mock.calls[4]![1]!.snapshot).not.toBe(snapshot);
   });
 
@@ -116,11 +114,11 @@ describe("actor registry and participant snapshot caches", () => {
       },
     }));
     const mesh = new MeshStore(meshRoot, 64 * 1024, 0);
-    const spy = vi.spyOn(fs, "readFileSync");
+    const spy = vi.spyOn(atomicWrite, "readFileRetrying");
     const snapshot = mesh.stateToken({ fresh: true });
     for (const prefix of ["topology/hosts/", "topology/participants/", "topology/legacy/", "topology/actors/"]) {
       mesh.listAllShared(prefix, { snapshot });
     }
-    expect(stateReadCount(spy)).toBe(1);
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 });

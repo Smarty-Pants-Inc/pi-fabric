@@ -2622,6 +2622,64 @@ describe("ActorManager", () => {
     ]);
   });
 
+  it("preserves foreign disk history after loading it with smaller message limits", async () => {
+    let localId: string | undefined;
+    const state = setup(true, (id) => localId === undefined || id === localId);
+    const local = await state.actors.create({ name: "local", instructions: "Local." });
+    const foreign = await state.actors.create({ name: "foreign", instructions: "Foreign." });
+    localId = local.id;
+    await state.actors.close();
+    const actorRoot = path.join(state.root, "actors");
+    const registryPath = path.join(actorRoot, "actors.json");
+    // A different owner persists history valid under its larger context limit.
+    const writer = new ActorRegistryStore(actorRoot);
+    const rows = writer.records();
+    const foreignRow = rows.find((row) => row.id === foreign.id)!;
+    foreignRow.rootId = "session:foreign-owner";
+    foreignRow.messages = [{
+      id: "foreign:long-message", actorId: foreign.id, actorName: "foreign",
+      direction: "out", source: "direct", createdAt: 1,
+      text: "Foreign history must remain intact. ".repeat(100),
+      data: { nested: { evidence: ["original", "foreign"] } },
+    }];
+    await writer.withLock(() => writer.write(rows));
+    const diskBefore = fs.readFileSync(registryPath, "utf8");
+    const expectedForeign = JSON.parse(diskBefore).actors.find((row: { id: string }) => row.id === foreign.id);
+
+    let loadedStore: ActorRegistryStore | undefined;
+    const read = ActorRegistryStore.prototype.read;
+    const loaderRead = vi.spyOn(ActorRegistryStore.prototype, "read").mockImplementation(function (this: ActorRegistryStore) {
+      loadedStore = this;
+      return read.call(this);
+    });
+    let bounded: ActorManager;
+    let boundedOwnsLocal = false;
+    try {
+      bounded = new ActorManager("test", state.identity, state.mesh,
+        { ...state.meshConfig, eventContextChars: 32 }, state.agents, () => {}, {
+          actorRoot, persistent: true, canManageActor: (id) => boundedOwnsLocal && id === local.id,
+        });
+      actorManagers.push(bounded);
+    } finally {
+      loaderRead.mockRestore();
+    }
+    expect(bounded.messages(foreign.id)[0]?.text).toContain("[actor message truncated]");
+    expect(bounded.messages(foreign.id)[0]?.text).not.toBe(expectedForeign.messages[0].text);
+    expect(fs.readFileSync(registryPath, "utf8")).toBe(diskBefore);
+    expect(loadedStore).toBeDefined();
+    // This reuses the unchanged-stamp cache, not a fresh disk parse.
+    const diskReads = vi.spyOn(fs, "readFileSync");
+    expect(loadedStore!.read()).toEqual(JSON.parse(diskBefore));
+    expect(diskReads).not.toHaveBeenCalled();
+    diskReads.mockRestore();
+
+    boundedOwnsLocal = true;
+    await bounded.setModel(local.id, "provider/local", "project");
+    const diskAfter = fs.readFileSync(registryPath, "utf8");
+    expect(JSON.parse(diskAfter).actors.find((row: { id: string }) => row.id === foreign.id)).toEqual(expectedForeign);
+    expect(loadedStore!.read()).toEqual(JSON.parse(diskAfter));
+  });
+
   it("discovers the first actor created after an empty standby starts", async () => {
     let ownerOwns = true;
     let standbyOwns = false;

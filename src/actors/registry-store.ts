@@ -46,7 +46,7 @@ export class ActorRegistryStore {
 
   records(): Array<Record<string, unknown> & { id: string }> {
     try {
-      const parsed = this.#readCached() as { actors?: unknown };
+      const parsed = this.read() as { actors?: unknown };
       if (!Array.isArray(parsed.actors)) return [];
       return parsed.actors.flatMap((record) =>
         typeof record === "object" &&
@@ -139,8 +139,9 @@ export class ActorRegistryStore {
     }
   }
 
+  /** Return caller-owned data: load-time message bounding must not mutate the disk snapshot. */
   read(): unknown {
-    return this.#readCached();
+    return structuredClone(this.#readCached());
   }
 
   #readCached(): unknown {

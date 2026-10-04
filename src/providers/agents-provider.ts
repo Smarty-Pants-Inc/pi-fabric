@@ -677,6 +677,32 @@ export class AgentsProvider implements FabricProvider {
     sessionSeed: AgentSessionSeed,
   ): Promise<Record<string, unknown>> {
     context = snapshotFabricInvocation(context);
+    if (!process.env.PI_FABRIC_HOST_ACTIVATION_LIMIT) {
+      return this.#executeHandoff(args, context, sessionSeed);
+    }
+    // Scheduling agents.handoff yields only until fabric_exec returns. The
+    // actual dependency starts later, at Pi's native message_end boundary (also
+    // used by automatic trajectory handoffs). Give that wait its own custody
+    // owner: no executor admission may depend on a slot held by its caller.
+    const custody = await import("../agents/transports/host-activation-yield.js");
+    const caller = `handoff:${context.parentToolCallId}`;
+    custody.beginHostActivationProgram(caller);
+    try {
+      throwIfExecutionExpired(context);
+      await custody.yieldHostActivation(caller);
+      return await this.#executeHandoff(args, context, sessionSeed);
+    } finally {
+      // Admission is restored even when preparation, spawn or wait fails or is
+      // cancelled. This fence must finish before Pi can infer again.
+      await custody.resumeHostActivation(caller);
+    }
+  }
+
+  async #executeHandoff(
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+    sessionSeed: AgentSessionSeed,
+  ): Promise<Record<string, unknown>> {
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
     const request = runRequest(

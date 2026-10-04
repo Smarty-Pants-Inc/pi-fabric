@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { acquireHostActivation } from "../../src/agents/transports/host-activation.js";
+import { heldHostTokenLocks } from "./host-activation-lock-snapshot.js";
 
 interface Entry { child: ChildProcess; closed: Promise<number | null>; settled: number; output: string; stderr: string }
 interface Event { type: string; runId?: string; workerPid: number; pid: number; held?: boolean; event?: { isError?: boolean; toolName?: string }; [key: string]: unknown }
@@ -13,10 +14,11 @@ const alive = (pid: number): boolean => {
   try { const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); return !["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]!); } catch { return false; }
 };
 export const runRealPiHostProof = async (root: string, limit: number, tasks: number, nested = false,
-  piBinary = process.env.PI_FABRIC_TEST_PI_BINARY ?? path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js")) => {
+  piBinary = process.env.PI_FABRIC_TEST_PI_BINARY ?? path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"), handoff = false) => {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const home = path.join(root, "home"); const log = path.join(root, "native-events.jsonl");
   const tokens = path.join(home, ".local/share/smarty-dev/fabric-host-tokens");
+  fs.mkdirSync(tokens, { recursive: true, mode: 0o700 });
   const extension = path.resolve("dist/index.js");
   if (!fs.existsSync(extension)) throw new Error("Build Fabric before real-Pi acceptance");
   const entries: Entry[] = []; const blockers: number[] = [];
@@ -35,8 +37,13 @@ export const runRealPiHostProof = async (root: string, limit: number, tasks: num
     }
     const workers = [...new Set([...discovered, ...readEvents(log).filter(event => event.runId && event.type === "session-start").map(event => event.workerPid)])].filter(alive);
     const held = workers.filter(pid => { try { return fs.readFileSync(`/proc/${pid}/fdinfo/3`, "utf8").includes("lock:"); } catch { return false; } });
-    maxLive = Math.max(maxLive, workers.length); maxHeldSlots = Math.max(maxHeldSlots, held.length); observations++;
-    fs.appendFileSync(path.join(root, "concurrency.jsonl"), JSON.stringify({ at: Date.now(), workers, held }) + "\n");
+    // PID fdinfo reads are sequential: a parent can release and a child
+    // acquire between reads, falsely appearing as two concurrent holders.
+    // Measure occupied slots from one kernel lock-table read instead. Keep
+    // the non-atomic PID observations only as diagnostics.
+    const heldSlots = heldHostTokenLocks(tokens);
+    maxLive = Math.max(maxLive, workers.length); maxHeldSlots = Math.max(maxHeldSlots, heldSlots.length); observations++;
+    fs.appendFileSync(path.join(root, "concurrency.jsonl"), JSON.stringify({ at: Date.now(), workers, held, heldSlots }) + "\n");
   };
   let timer: ReturnType<typeof setInterval> | undefined;
   const wait = async (predicate: () => boolean, label: string) => {
@@ -63,7 +70,7 @@ export const runRealPiHostProof = async (root: string, limit: number, tasks: num
       fs.writeFileSync(path.join(profile, "fabric.json"), JSON.stringify({ fullCodeMode: true, executor: { timeoutMs: 90_000 },
         agents: { hostActivationLimit: limit, hostActivationLimitScope: "all", maxConcurrent: 16, maxDepth: 8, timeoutMs: 60_000,
           budgetUsd: 0, deniedModels: [], extensions: true, sessionExport: false, retainRuns: true, nice: 19 },
-        residency: { enabled: false }, memory: { enabled: false }, entropy: { enabled: false }, prewalk: { enabled: false }, mcp: { enabled: false }, mesh: { actorPollMs: 25 } }));
+        residency: { enabled: false }, memory: { enabled: false }, entropy: { enabled: false }, prewalk: { enabled: handoff, alwaysRearm: false }, mcp: { enabled: false }, mesh: { actorPollMs: 25 } }));
       const child = spawn(piBinary, ["--mode", "rpc", "--session-dir", path.join(cwd, "sessions"), "--model", "host-cap-proof/offline", "--thinking", "off", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files"], {
         cwd, stdio: ["pipe", "pipe", "pipe"], env: { PATH: process.env.PATH, HOME: home, TMPDIR: process.env.TMPDIR,
           PI_CODING_AGENT_DIR: profile, PI_OFFLINE: "1", PI_FABRIC_PI_BINARY: piBinary, PI_FABRIC_MESH_ROOT: path.join(root, "mesh"),
@@ -91,12 +98,17 @@ if(results.some(r=>r.status!=="completed")||message.error)throw new Error(JSON.s
     await wait(() => [0,1,2].every(index => fs.existsSync(outputFile(index, "ready.json"))), "root startup");
     if (nested) {
       await wait(() => entries.every(entry => entry.settled >= 1), "setup settlement");
-      const target = JSON.parse(fs.readFileSync(outputFile(1, "ready.json"), "utf8")).id;
-      prompt(entries[0]!, `const parent=await agents.create({scope:"session",name:"proof-parent",instructions:"Parent awaits cross-root actor.",model:"host-cap-proof/offline",responseMode:"text"});
+      if (handoff) {
+        prompt(entries[0]!, `const parent=await agents.run({task:"HOST_CAP_PARENT_HANDOFF",model:"host-cap-proof/offline",transport:"process"});
+if(parent.status!=="completed")throw new Error(JSON.stringify(parent)); ${write(outputFile(0, "nested.json"), "{parent}")}`);
+      } else {
+        const target = JSON.parse(fs.readFileSync(outputFile(1, "ready.json"), "utf8")).id;
+        prompt(entries[0]!, `const parent=await agents.create({scope:"session",name:"proof-parent",instructions:"Parent awaits cross-root actor.",model:"host-cap-proof/offline",responseMode:"text"});
 const actor=await agents.ask({id:parent.id,message:${JSON.stringify("HOST_CAP_PARENT_ASK:" + target)}});
 const joined=await agents.run({task:"HOST_CAP_PARENT_JOIN",model:"host-cap-proof/offline",transport:"process"});
 const run=await agents.run({task:"HOST_CAP_PARENT_RUN",model:"host-cap-proof/offline",transport:"process"});
 if(actor.error||joined.status!=="completed"||run.status!=="completed")throw new Error(JSON.stringify({actor,joined,run})); ${write(outputFile(0, "nested.json"), "{actor,joined,run}")}`);
+      }
       await wait(() => fs.existsSync(outputFile(0, "nested.json")) && entries[0]!.settled >= 2, "cap-one nested completion");
     } else {
       await wait(() => [0,1,2].every(index => fs.existsSync(outputFile(index, "queued.json"))), "public actorStatus queue");
@@ -108,14 +120,15 @@ if(actor.error||joined.status!=="completed"||run.status!=="completed")throw new 
     const codes = await Promise.all(entries.map(entry => entry.closed));
     if (codes.some(code => code !== 0)) throw new Error(`Real Pi shutdown failed: ${JSON.stringify(codes)}`);
     const events = readEvents(log); const runs = new Set(events.filter(event => event.type === "session-start" && event.runId).map(event => event.runId));
-    const completed = nested ? 3 : [0,1,2].reduce((sum,index) => sum + JSON.parse(fs.readFileSync(outputFile(index,"results.json"),"utf8")).results.length, 0);
+    const completed = nested ? (handoff ? 1 : 3) : [0,1,2].reduce((sum,index) => sum + JSON.parse(fs.readFileSync(outputFile(index,"results.json"),"utf8")).results.length, 0);
     const builtArtifacts = Object.fromEntries(["dist/index.js", "dist/worker.js", "dist/agents/transports/host-activation-yield.js"].map(file => [file, createHash("sha256").update(fs.readFileSync(file)).digest("hex")]));
     const result = { piBinary: fs.realpathSync(piBinary), extension, builtArtifacts, roots: 3, limit, tasks, completed, activations: runs.size, maxLive,
-      maxHeldSlots, observations, queuedActorStatuses: nested ? 0 : 3, nested, shutdownCodes: codes,
+      maxHeldSlots, observations, queuedActorStatuses: nested ? 0 : 3, nested, handoff,
+      completedHandoffs: events.filter(event => event.type === "handoff-result" && event.completed === true).length, shutdownCodes: codes,
       nativeToolCalls: events.filter(event => event.type === "tool-call" && event.event?.toolName === "fabric_exec").length,
       inferenceAlwaysAdmitted: events.filter(event => event.type === "provider-call" && event.runId).every(event => event.held),
       errors: events.filter(event => event.type === "tool-result" && event.event?.isError) };
-    if (result.errors.length || !result.inferenceAlwaysAdmitted || maxHeldSlots > limit || (!nested && (maxLive > limit || completed !== tasks))) throw new Error(`Real Pi oracle failed: ${JSON.stringify(result)}`);
+    if (result.errors.length || !result.inferenceAlwaysAdmitted || maxHeldSlots > limit || (handoff && (result.completedHandoffs < 1 || runs.size !== 2)) || (!nested && (maxLive > limit || completed !== tasks))) throw new Error(`Real Pi oracle failed: ${JSON.stringify(result)}`);
     fs.writeFileSync(path.join(root, "proof.json"), JSON.stringify(result, null, 2));
     return result;
   } finally {

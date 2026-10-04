@@ -8,19 +8,33 @@ const record = (value: object) => fs.appendFileSync(process.env.HOST_CAP_PROOF_L
 export default function(pi: ExtensionAPI) {
   const model: Model<Api> = { provider: "host-cap-proof", id: "offline", name: "Keyless host activation proof", api: "host-cap-proof-api", baseUrl: "http://invalid.local",
     reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 16384 };
+  let handoffScheduled = false;
   const stream = (selected: Model<Api>, context: TranscriptContext) => {
     const events = createAssistantMessageEventStream();
     const content = context.messages.filter(m => m.role === "user").at(-1)?.content;
     const prompt = typeof content === "string" ? content : Array.isArray(content) ? content.filter(p => p.type === "text").map(p => p.text).join("\n") : "";
     const afterTool = context.messages.at(-1)?.role === "toolResult";
+    // Read the finalized native boundary result, not the earlier scheduling
+    // tool_result event. The parent must see a successful executor receipt.
+    for (const message of context.messages) if (message.role === "toolResult") {
+      const text = message.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+      try {
+        const result = JSON.parse(text);
+        if (result.handedOff === true) record({ type: "handoff-result", completed: result.completed === true, result });
+      } catch { /* Other tool results are not handoff JSON. */ }
+    }
     let code: string | undefined;
     if (!afterTool) {
-      if (prompt.startsWith("HOST_CAP_MAIN_CODE:\n")) code = prompt.slice("HOST_CAP_MAIN_CODE:\n".length);
+      if (prompt.includes("HOST_CAP_HANDOFF_EXECUTOR")) code = 'return {executor:"completed"};';
+      else if (prompt.startsWith("HOST_CAP_MAIN_CODE:\n")) code = prompt.slice("HOST_CAP_MAIN_CODE:\n".length);
       else if (prompt.includes("HOST_CAP_PARENT_ASK:")) {
         const target = prompt.match(/HOST_CAP_PARENT_ASK:([a-f0-9]{32})/)![1]!;
         code = `const result = await agents.ask({id:${JSON.stringify(target)},message:"HOST_CAP_LEAF cross-root"}); if(result.error) throw new Error(result.error); return {parent:"completed",child:result};`;
+      } else if (prompt.includes("HOST_CAP_PARENT_HANDOFF") && !handoffScheduled) {
+        handoffScheduled = true;
+        code = 'return await agents.handoff({model:"host-cap-proof/offline",task:"HOST_CAP_HANDOFF_EXECUTOR",transport:"process"});';
       } else if (prompt.includes("HOST_CAP_PARENT_JOIN")) {
-        code = 'const child = await agents.spawn({task:"HOST_CAP_LEAF joined",model:"host-cap-proof/offline",transport:"process"}); const result = await agents.wait({id:child.id}); if(result.status !== "completed") throw new Error(JSON.stringify(result)); return {parent:"completed",child:result};';
+        code = 'const child = await agents.spawn({task:"HOST_CAP_LEAF joined",model:"host-cap-proof/offline",transport:"process"}); const result = await agents.join({id:child.id}); if(result.status !== "completed") throw new Error(JSON.stringify(result)); return {parent:"completed",child:result};';
       } else if (prompt.includes("HOST_CAP_PARENT_RUN")) {
         code = 'const result = await agents.run({task:"HOST_CAP_LEAF run",model:"host-cap-proof/offline",transport:"process"}); if(result.status !== "completed") throw new Error(JSON.stringify(result)); return {parent:"completed",child:result};';
       }

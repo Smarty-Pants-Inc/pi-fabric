@@ -2743,6 +2743,51 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("list", {}, context)).resolves.toBeInstanceOf(Array);
   });
 
+  it.each(["completed", "preparation error", "spawn error", "cancelled wait"] as const)(
+    "restores native handoff custody before returning after %s", async outcome => {
+      const { provider, root, agents } = setup();
+      const source = SessionManager.create(process.cwd(), path.join(root, "custody-source"));
+      source.appendMessage({ role: "user", content: "Bounded handoff", timestamp: 1 });
+      source.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: context.parentToolCallId,
+        name: "fabric_exec", arguments: { code: "return await agents.handoff(...);" } }],
+        api: "anthropic", provider: "anthropic", model: "frontier", usage, stopReason: "toolUse", timestamp: 2 });
+      const seed = snapshotHandoffSession(source, { provider: "anthropic", id: "frontier" }, {
+        role: "toolResult", toolCallId: context.parentToolCallId, toolName: "fabric_exec",
+        content: [{ type: "text", text: "scheduled" }], isError: false, timestamp: 3,
+      }, context.parentToolCallId);
+      const custody = await import("../src/agents/transports/host-activation-yield.js");
+      const events: string[] = [];
+      let restore!: () => void;
+      const restored = new Promise<void>(resolve => { restore = resolve; });
+      vi.spyOn(custody, "beginHostActivationProgram").mockImplementation(() => { events.push("begin"); });
+      vi.spyOn(custody, "yieldHostActivation").mockImplementation(async () => { events.push("yield"); });
+      const resume = vi.spyOn(custody, "resumeHostActivation").mockImplementation(async () => {
+        events.push("resume"); await restored; events.push("restored");
+      });
+      const abort = new AbortController();
+      if (outcome === "spawn error") vi.spyOn(agents, "spawn").mockRejectedValue(new Error("spawn refused"));
+      if (outcome === "cancelled wait") vi.spyOn(agents, "wait").mockImplementation(async () => {
+        abort.abort(); throw new Error("handoff wait cancelled");
+      });
+      vi.stubEnv("PI_FABRIC_HOST_ACTIVATION_LIMIT", "1");
+      try {
+        let returned = false;
+        const result = provider.executeHandoff({ model: outcome === "preparation error" ? "" : "anthropic/executor",
+          transport: "process", protected: true }, { ...context, signal: abort.signal }, seed)
+          .then(value => { returned = true; return value; }, error => { returned = true; return error as Error; });
+        await waitFor(() => events.includes("resume"), PROCESS_WORKER_EVENT_TIMEOUT_MS);
+        expect(events).toEqual(["begin", "yield", "resume"]);
+        expect(returned).toBe(false);
+        expect(resume).toHaveBeenCalledWith(`handoff:${context.parentToolCallId}`);
+        restore();
+        if (outcome === "completed") expect(await result).toMatchObject({ completed: true, status: "completed" });
+        else expect(await result).toBeInstanceOf(Error);
+        expect(events.at(-1)).toBe("restored");
+        if (outcome === "cancelled wait") expect(abort.signal.aborted).toBe(true);
+      } finally { restore(); vi.unstubAllEnvs(); vi.restoreAllMocks(); }
+    },
+  );
+
   it.each([undefined, "handoff-review"])("defers handoff until the finalized outer Fabric result and records its class: %s", async routeClass => {
     const { provider, root, agents } = setup();
     const source = SessionManager.create(process.cwd(), path.join(root, "source-session"));

@@ -6,12 +6,12 @@ const scratch = fs.mkdtempSync(path.join(process.env.TMPDIR, "real-pi-"));
 const output = path.join(process.env.TASK_OUT, "real-pi"); fs.mkdirSync(output, { recursive: true });
 try {
   const rows = [];
-  for (const [name, limit, tasks, nested] of [["n-plus-two",2,4,false],["three-roots-eight",4,8,false],["parent-child",1,0,true]] as const) {
+  for (const [name, limit, tasks, nested, handoff] of [["n-plus-two",2,4,false,false],["three-roots-eight",4,8,false,false],["parent-child",1,0,true,false],["deferred-handoff",1,0,true,true]] as const) {
     if (process.argv.includes("--nested-only") && !nested) {
       rows.push({name,...JSON.parse(fs.readFileSync(path.join(output,name,"proof.json"),"utf8"))}); continue;
     }
     const root = path.join(scratch,name);
-    try { rows.push({ name, ...await runRealPiHostProof(root,limit,tasks,nested) }); }
+    try { rows.push({ name, ...await runRealPiHostProof(root,limit,tasks,nested,process.env.PI_FABRIC_TEST_PI_BINARY,handoff) }); }
     finally { fs.cpSync(root,path.join(output,name),{recursive:true}); }
   }
   fs.writeFileSync(path.join(output,"summary.json"),JSON.stringify(rows,null,2)); console.log(JSON.stringify(rows,null,2));

@@ -60,8 +60,12 @@ the entire Fabric program, so spawn-then-message-then-join cannot reclaim the
 slot prematurely. At the outer execution fence (including errors/cancellation),
 Pi reacquires the **same open description** through FIFO admission before any
 subsequent inference. Parallel programs share one yield and all fence their
-return on resumption. Failure to restore custody terminates that Pi execution
-host rather than allowing slotless inference; the worker owns tree teardown.
+return on resumption. Deferred explicit and automatic trajectory handoffs take
+a new custody fence around the actual native-boundary executor preparation,
+spawn and wait, not just the earlier scheduling call. This fence also restores
+admission on failure/cancellation before the caller resumes inference.
+Failure to restore custody terminates that Pi execution host rather than
+allowing slotless inference; the worker owns tree teardown.
 Host-engine dependencies without an enclosing Fabric execution fence are
 rejected before admission instead of releasing a slot with no resumption owner.
 Suspended parents remain live processes but do not occupy execution capacity.
@@ -108,11 +112,14 @@ service, credential, live mesh, or live token directory is used.
 
 Rows cover cap 2 with four `agents.run` tasks (N+2), cap 4 with eight tasks across
 three roots, and cap 1 with an actor awaiting another root's actor, a task using
-`agents.run`, and a task using `spawn` then `wait`. Independent rows also queue
-three actors and retain real public `agents.actorStatus` host-queue snapshots.
+`agents.run`, a task using `spawn` then `join`, and a deferred native handoff
+whose capped executor and waiting parent both complete. Independent rows also
+queue three actors and retain real public `agents.actorStatus` host-queue snapshots.
 The controller temporarily holds scratch tokens only to make queuing observable.
-It observes actual native worker PIDs and their token FD lock state, including
-worker startup before Pi's `session_start`. Independent cases have at most N
+It observes actual native worker PIDs and a single `/proc/locks` token-inode
+snapshot for occupied slots; sequential per-PID FD lock reads remain diagnostics
+only (a slot transfer between those reads can falsely look concurrent). This
+includes worker startup before Pi's `session_start`. Independent cases have at most N
 live workers; nested cases may have a live but slotless waiting parent. Every
 worker inference call must hold a slot. All native Main processes close with
 exit code zero. Evidence (RPC output, native events, PID/slot samples, results,

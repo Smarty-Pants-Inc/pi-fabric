@@ -65,6 +65,7 @@ const run = async (message) => {
   const sandbox = {
     __fabricHostCall: hostCall,
     __fabricTokenBudget: message.tokenBudget ?? Number.POSITIVE_INFINITY,
+    __fabricWorkflowSpentTokens: message.workflowSpentTokens,
     // Native-module bridge for guests whose vm lacks the dynamic-import
     // callback. Bun >= 1.4 honors importModuleDynamically on runInContext
     // (natural import() works there), so this is mostly a fallback and an

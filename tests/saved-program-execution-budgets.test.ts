@@ -31,11 +31,40 @@ const fixture = () => {
   const store = new ProgramStore(path.join(root, "programs"));
   registry.register(new ProgramsProvider(store, () => "typescript", id => service.nestedProgramRunner(id)));
   const context = { cwd: root, mode: "print", hasUI: false, sessionManager: { getSessionId: () => "saved-budget" } } as unknown as ExtensionContext;
-  const run = (code: string, signal?: AbortSignal, tokenBudget?: number) => service.execute({ code, context, signal, tokenBudget, parentToolCallId: "saved-budget", onPartial() {} });
+  const run = (code: string, signal?: AbortSignal, tokenBudget?: number) => service.execute({ code, context, signal, ...(tokenBudget !== undefined ? { tokenBudget } : {}), parentToolCallId: "saved-budget", onPartial() {} });
   return { config, service, store, registry, context, run, ask };
 };
 
 describe("saved program enclosing budgets", () => {
+  it.each(["quickjs", "node-process"] as const)("A11 shares sequential saved-program spending and observations in %s", async runtime => {
+    const f = fixture(); f.config.executor.runtime = runtime; f.config.executor.timeoutMs = 3000; f.config.agents.timeoutMs = 3000;
+    const run = vi.fn(async () => ({ status: "completed", text: "ok", usage: { input: 3, output: 2 } }));
+    const descriptor = { name: "run", description: "fake agent", risk: "agent" as const, inputSchema: { type: "object", additionalProperties: true } };
+    f.registry.register({ name: "agents", description: "agents", async list() { return [descriptor]; }, async describe() { return descriptor; }, invoke: run });
+    await f.store.save({ name: "agent", code: 'await workflow.agent("nested"); return workflow.budget.spent();' }, "typescript");
+    const result = await f.run('await workflow.agent("outer"); const nested = await programs.run({ ref: "agent" }); const spent = workflow.budget.spent(); const remaining = workflow.budget.remaining(); let denied = false; try { await programs.run({ ref: "agent" }); } catch { denied = true; } return { nested, spent, remaining, denied };', undefined, 10);
+    expect(result.success, result.error).toBe(true);
+    expect(result.value).toEqual({ nested: 10, spent: 10, remaining: 0, denied: true });
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+  it("A11 accounts spending from a nested program even when that program fails", async () => {
+    const f = fixture();
+    const descriptor = { name: "run", description: "fake agent", risk: "agent" as const, inputSchema: { type: "object", additionalProperties: true } };
+    f.registry.register({ name: "agents", description: "agents", async list() { return [descriptor]; }, async describe() { return descriptor; }, async invoke() { return { status: "completed", text: "ok", usage: { input: 3, output: 2 } }; } });
+    await f.store.save({ name: "failed", code: 'await workflow.agent("nested"); throw new Error("after spending");' }, "typescript");
+    const result = await f.run('try { await programs.run({ ref: "failed" }); } catch {} return workflow.budget.spent();', undefined, 5);
+    expect(result.success, result.error).toBe(true); expect(result.value).toBe(5);
+  });
+  it("A11 refuses a first nested workflow agent after the caller exhausts its token budget", async () => {
+    const f = fixture();
+    const run = vi.fn(async () => ({ status: "completed", text: "ok", usage: { input: 4, output: 1 } }));
+    const descriptor = { name: "run", description: "fake agent", risk: "agent" as const, inputSchema: { type: "object", additionalProperties: true } };
+    f.registry.register({ name: "agents", description: "agents", async list() { return [descriptor]; }, async describe() { return descriptor; }, invoke: run });
+    await f.store.save({ name: "agent", code: 'return await workflow.agent("nested");' }, "typescript");
+    const result = await f.run('await workflow.agent("outer"); return await programs.run({ ref: "agent" });', undefined, 5);
+    expect(result.success).toBe(false); expect(result.error).toMatch(/token budget exhausted/);
+    expect(run).toHaveBeenCalledOnce();
+  });
   it("A10 pauses every enclosing deadline during nested questions", async () => {
     const f = fixture();
     await f.store.save({ name: "question", code: 'return await tools.call({ ref: "demo.ask", args: {} });' }, "typescript");

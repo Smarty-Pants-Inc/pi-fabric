@@ -322,6 +322,7 @@ export class NodeProcessRuntime {
         code: guestBundle.code,
         strings: options.strings ?? {},
         tokenBudget: options.tokenBudget,
+        workflowSpentTokens: options.workflowSpentTokens,
         maxLogChars: options.maxLogChars ?? 100_000,
       });
     });

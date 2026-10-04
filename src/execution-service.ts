@@ -456,6 +456,8 @@ export class FabricExecutionService {
       { kind: "parallel" | "pipeline"; operation: FabricExecutionTraceOperationHandle }
     >();
     let agentCalls = 0;
+    let workflowSpentTokens = 0;
+    const workflowTokenBudget = typeof options.tokenBudget === "number" && Number.isFinite(options.tokenBudget) ? Math.max(0, options.tokenBudget) : Infinity;
     let handoffRequest: Record<string, unknown> | undefined;
     const maxAgentCalls = Math.max(
       1,
@@ -582,7 +584,7 @@ export class FabricExecutionService {
       args: Record<string, unknown>,
     ): number | undefined => {
       const targetRef =
-        ref === "fabric.$call" && typeof args.ref === "string" ? args.ref : ref;
+        ref === "fabric.$workflowRun" ? "agents.run" : ref === "fabric.$call" && typeof args.ref === "string" ? args.ref : ref;
       const targetArgs =
         ref === "fabric.$call" &&
         typeof args.args === "object" &&
@@ -820,6 +822,7 @@ export class FabricExecutionService {
       maxLogChars: this.config.executor.maxOutputChars,
       minimumTimeoutMsForHostCall,
       registerHumanWaitPause(pause: HumanWaitDeadlinePause) { rootHumanWaitPause = pause; },
+      workflowSpentTokens: 0,
       ...(humanWaitRefs.size > 0 ? { isHumanWaitHostCall } : {}),
       ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt, maximumDeadlineReason: mainCeilingReason! } : {}),
       onHostResultDelivered(args: Record<string, unknown>) {
@@ -914,6 +917,7 @@ export class FabricExecutionService {
             timeoutMs: nestedTimeoutMs,
             executionDeadline: nestedDeadline,
             registerHumanWaitPause(pause: HumanWaitDeadlinePause) { nestedPause = pause; },
+            workflowSpentTokens,
             ...(prepared.javascript ? { transpiledCode: prepared.javascript } : {}),
             ...(prepared.sourceMap ? { transpiledSourceMap: prepared.sourceMap } : {}),
             signal: runSignal,
@@ -975,6 +979,17 @@ export class FabricExecutionService {
             ...(mainDeadlineAt !== undefined ? { mainDeadlineAt, checkExecutionBudget: checkMainDeadline } : {}),
           };
           switch (ref) {
+            case "fabric.$workflowBudget":
+              return workflowSpentTokens;
+            case "fabric.$workflowRun": {
+              if (workflowSpentTokens >= workflowTokenBudget) throw new FabricTraceSafeError("Fabric workflow token budget exhausted");
+              const result = await invokeAction("agents.run", args, callContext);
+              const usage = result && typeof result === "object" ? (result as { usage?: { input?: number; output?: number } }).usage : undefined;
+              for (const tokens of [usage?.input, usage?.output]) {
+                if (typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0) workflowSpentTokens += tokens;
+              }
+              return result;
+            }
             case "fabric.$providers":
               return traceAttempt(
                 "fabric.discovery.providers",

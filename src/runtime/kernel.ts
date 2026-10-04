@@ -138,6 +138,8 @@ export interface FabricSandboxOptions {
   maxLogChars?: number;
   strings?: Record<string, string>;
   tokenBudget?: number;
+  /** Host-owned initial shared workflow spending; subsequent snapshots use the internal bridge. */
+  workflowSpentTokens?: number;
   signal?: AbortSignal;
   cwd?: string;
   /** Host-only receipt callback after serialization and final deadline admission. */

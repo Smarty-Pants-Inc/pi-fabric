@@ -17,6 +17,7 @@ interface ResidentHostLaunchContext {
   attempt?: { id: string; kind: "target" | "fallback" };
 }
 import { lockFile, FileLockBusy } from "./file-lock.js";
+import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -525,6 +526,19 @@ export class ResidentHost {
     await this.#acquireLock();
     this.#started = true;
     try {
+      // The launcher's preflight cannot admit this host: its native child may
+      // arrive after the watchdog stopped the previous owner. Check only AFTER
+      // taking the host fence and serialize with custody publication using the
+      // watchdog's root transaction lock. A busy/broken transaction fails closed.
+      // Once admitted, our host fence excludes the old watchdog's live owner;
+      // its under-transaction revalidation cannot publish for that dead owner.
+      let admissionFd: number | undefined;
+      try {
+        if (process.platform !== "win32") {
+          admissionFd = await lockFile(path.join(this.config.residencyRoot, "handover.lock"), 0, process.platform === "linux");
+        }
+        assertNoWatchdogCustody(this.config.residencyRoot);
+      } finally { if (admissionFd !== undefined) fs.closeSync(admissionFd); }
       // Archived runs are read on demand, never walked before the host lease is up.
       // The streaming request collector replays pending full archives before
       // terminal retention after readiness. Failed sinks retain their sources.

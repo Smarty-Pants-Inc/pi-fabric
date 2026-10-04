@@ -27,7 +27,7 @@ const until = async (test: () => boolean, ms = 30_000) => {
 };
 
 describe.skipIf(process.platform !== "linux")("serving resident watchdog with real native Pi", () => {
-  it("F1 real CLI/native host with in-flight actor, acknowledged queue and escaped helper cannot automatically replay work into another host", async () => {
+  it("F1 an already-admitted launcher with delayed native Pi refuses custody before serving or replaying escaped work", async () => {
     const launcherPath = path.resolve("dist/residency/launcher.js");
     const piBinary = fs.realpathSync(path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
     expect(fs.existsSync(launcherPath), "fresh build required").toBe(true);
@@ -61,6 +61,17 @@ if(process.argv.includes(${JSON.stringify(path.resolve("dist/residency/pi-entry.
   const wait=new Int32Array(new SharedArrayBuffer(4));
   while(!fs.existsSync(${JSON.stringify(resumeFlag)}))Atomics.wait(wait,0,0,100);
  },20);
+}`);
+    const delayedReceipt = path.join(root, "delayed-native-child.json");
+    const releaseDelayed = path.join(root, "release-delayed-child");
+    const delayPreload = path.join(root, "delay-native-child.mjs");
+    // Pause only the second launcher's actual native Pi, after CLI preflight and
+    // spawn but before extension loading. No production admission seam is used.
+    fs.writeFileSync(delayPreload, `import fs from 'node:fs';
+if(process.argv.includes(${JSON.stringify(path.resolve("dist/residency/pi-entry.js"))})) {
+ fs.writeFileSync(${JSON.stringify(delayedReceipt)},JSON.stringify({pid:process.pid}));
+ const wait=new Int32Array(new SharedArrayBuffer(4));
+ while(!fs.existsSync(${JSON.stringify(releaseDelayed)}))Atomics.wait(wait,0,0,100);
 }`);
     let inferences = 0;
     const pending: http.ServerResponse[] = [];
@@ -110,6 +121,8 @@ if(process.argv.includes(${JSON.stringify(path.resolve("dist/residency/pi-entry.
       catch { return []; }
     };
     const ownerFile = path.join(config.residencyRoot, "owner.json");
+    let delayedLifetime: ReturnType<typeof watchResidentChild> | undefined;
+    let delayedPid: number | undefined;
     try {
       await until(() => fs.existsSync(ownerFile) && fs.existsSync(path.join(config.residencyRoot, "maintenance-ready.json")));
       const owner: ResidentHostOwner = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
@@ -131,13 +144,41 @@ if(process.argv.includes(${JSON.stringify(path.resolve("dist/residency/pi-entry.
       const queued = await control.request(owner.hostId, actor.id, "followUp", { message: "queued work must not be replayed by a second host" }, owner.hostId);
       expect(queued.acknowledged).toBe(true);
       await until(() => participants.get(actor.id, Date.now(), { fresh: true })?.actorQueued === 1);
+      // Admit a second real launcher while custody is absent and A still owns
+      // host.lock. Its native child must not reach admission until A has exited.
+      expect(fs.existsSync(path.join(config.residencyRoot, "watchdog-custody.json"))).toBe(false);
+      const delayed = spawn(process.execPath, [launcherPath, "--config", configPath], { stdio: "ignore", env: {
+        ...process.env, ...owned.env, NODE_OPTIONS: `${owned.env.NODE_OPTIONS} --import=${pathToFileURL(delayPreload).href}`,
+        PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir, PI_FABRIC_MESH_ROOT: meshRoot,
+        PI_FABRIC_PROJECT_ROOT: root, PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_AGENT_DIR: path.join(root, "exports"),
+      } });
+      delayedLifetime = watchResidentChild(delayed); delayed.on("error", () => {});
+      await until(() => fs.existsSync(delayedReceipt) && traces().filter(row => row.event === "child-spawned").length === 2);
+      delayedPid = JSON.parse(fs.readFileSync(delayedReceipt, "utf8")).pid;
+      expect(live(delayedPid!)).toBe(true);
+      expect(fs.existsSync(path.join(config.residencyRoot, "watchdog-custody.json"))).toBe(false);
       fs.writeFileSync(stallFlag, "stall");
       await until(() => fs.existsSync(stalledReceipt));
       expect(JSON.parse(fs.readFileSync(stalledReceipt, "utf8")).pid).toBe(owner.pid);
       await until(() => traces().some(row => row.event === "watchdog-deferred" && row.proofCheck), 65_000);
       expect(live(owner.pid)).toBe(false); expect(live(helper.pid)).toBe(true);
-      expect(traces().filter(row => row.event === "child-spawned")).toHaveLength(1);
+      expect(traces().filter(row => row.event === "child-spawned")).toHaveLength(2);
       expect(inferences).toBe(1); expect(lifetime.exited).toBe(false);
+      const readyBefore = fs.readFileSync(path.join(config.residencyRoot, "maintenance-ready.json"), "utf8");
+      // A is dead, custody is published, and the escaped helper is still live.
+      // Release the child which passed the old unfenced preflight before custody.
+      fs.writeFileSync(releaseDelayed, "release");
+      await until(() => delayedLifetime!.exited);
+      await delayedLifetime.exit;
+      expect(live(delayedPid!)).toBe(false); expect(live(helper.pid)).toBe(true);
+      // Prove it reached the actual host fence, not an earlier launcher refusal.
+      expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "host.lock"), "utf8")).pid).toBe(delayedPid);
+      expect(fs.readFileSync(path.join(config.residencyRoot, "maintenance-ready.json"), "utf8"), "delayed child must not publish readiness").toBe(readyBefore);
+      expect(inferences, "delayed child must not replay acknowledged work").toBe(1);
+      expect(JSON.parse(fs.readFileSync(ownerFile, "utf8")).token).toBe(owner.token);
+      const refusal = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "error.json"), "utf8"));
+      expect(refusal.error).toContain("watchdog custody");
+      expect(refusal.launcherPid).toBe(delayed.pid);
       expect(fs.existsSync(path.join(config.residencyRoot, "watchdog-custody.json"))).toBe(true);
       const restartingClient = new ResidencyClient({ config, mesh, participants,
         mainAgent: { id: identity.id, local: true } as FabricMainAgentTarget });
@@ -147,19 +188,19 @@ if(process.argv.includes(${JSON.stringify(path.resolve("dist/residency/pi-entry.
       const duplicate = spawn(process.execPath, [launcherPath, "--config", configPath], { stdio: "ignore", env: { ...process.env, ...owned.env } });
       const duplicateLifetime = watchResidentChild(duplicate); duplicate.on("error", () => {});
       await duplicateLifetime.exit;
-      expect(traces().filter(row => row.event === "child-spawned")).toHaveLength(1); expect(inferences).toBe(1);
+      expect(traces().filter(row => row.event === "child-spawned")).toHaveLength(2); expect(inferences).toBe(1);
       await sleep(1100);
-      expect(traces().filter(row => row.event === "child-spawned")).toHaveLength(1); expect(inferences).toBe(1);
+      expect(traces().filter(row => row.event === "child-spawned")).toHaveLength(2); expect(inferences).toBe(1);
       fs.writeFileSync(releaseHelper, "release"); await until(() => !live(helper.pid)); await sleep(1100);
-      expect(traces().filter(row => row.event === "child-spawned")).toHaveLength(1); expect(inferences).toBe(1);
+      expect(traces().filter(row => row.event === "child-spawned")).toHaveLength(2); expect(inferences).toBe(1);
       expect(fs.existsSync(path.join(config.residencyRoot, "wedges", "latest.json"))).toBe(false);
       console.info("F1 real serving watchdog proof", JSON.stringify({ nativePi: piBinary, launcher: launcher.pid, oldHost: owner.pid,
-        escapedHelper: helper.pid, actor: actor.id, queuedMessage: queued.messageId, inferences, servingAttempts: 1, automaticRespawn: "deferred" }));
+        escapedHelper: helper.pid, delayedHost: delayedPid, delayedChildRefused: true, actor: actor.id, queuedMessage: queued.messageId, inferences, servingAttempts: 1, nativeAttempts: 2, automaticRespawn: "deferred" }));
     } catch (error) {
       let childLog = ""; try { childLog = fs.readFileSync(path.join(config.residencyRoot, "child-stderr.log"), "utf8").slice(-10000); } catch { /* not started */ }
       throw new Error(`${error instanceof Error ? error.stack : error}\nlauncher: ${stderr}\nchild: ${childLog}\ntraces: ${JSON.stringify(traces().slice(-8))}`);
     } finally {
-      fs.writeFileSync(resumeFlag, "resume"); fs.writeFileSync(releaseHelper, "release");
+      fs.writeFileSync(resumeFlag, "resume"); fs.writeFileSync(releaseHelper, "release"); fs.writeFileSync(releaseDelayed, "release");
       for (const response of pending) response.end();
       await control.close(); await participants.close();
       if (!lifetime.exited) launcher.kill("SIGTERM");
@@ -167,6 +208,7 @@ if(process.argv.includes(${JSON.stringify(path.resolve("dist/residency/pi-entry.
         try { process.kill(record.pid, "SIGKILL"); } catch { /* owned process exited */ }
       }
       await lifetime.exit;
+      if (delayedLifetime) await delayedLifetime.exit;
       await until(() => owned.owned().every(record => !same(record) || !live(record.pid)));
       await new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()); });
       fs.rmSync(root, { recursive: true, force: true });

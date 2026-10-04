@@ -11,31 +11,16 @@ const DEFAULT_LOCK_ATTEMPTS = 50;
 const DEFAULT_LOCK_DELAY_MS = 5;
 const DEFAULT_STALE_LOCK_MS = 30_000;
 
-export interface ExclusiveLockOptions {
-  directory: string;
-  lockName: string;
-  /** Error message when acquisition times out. */
-  timeoutMessage: string;
-  staleMs?: number;
-  attempts?: number;
-  delayMs?: number;
-}
+import type { ExclusiveLockOptions } from "./atomic-write.js";
+export type { ExclusiveLockOptions } from "./atomic-write.js";
+export { withExclusiveFileLock } from "./atomic-write.js";
 
 const errorCode = (error: unknown): string | undefined =>
   typeof error === "object" && error !== null && "code" in error
     ? String((error as { code?: unknown }).code)
     : undefined;
 
-const sleepSync = (() => {
-  try {
-    const buffer = new Int32Array(new SharedArrayBuffer(4));
-    return (ms: number): void => {
-      Atomics.wait(buffer, 0, 0, ms);
-    };
-  } catch {
-    return (): void => undefined;
-  }
-})();
+
 
 const processAlive = (pid: number): boolean => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
@@ -154,125 +139,6 @@ export const withExclusiveFileLockAsync = async <T>(
       const owner = await fs.promises.readFile(ownerPath, "utf8");
       if (owner.startsWith(`${token}\n`)) {
         await fs.promises.rm(lock, { recursive: true, force: true });
-      }
-    } catch {
-      // A recovering process already removed this lock.
-    }
-  }
-};
-
-// Stale-lock recovery must be an exclusive claim. Stat-then-delete is
-// TOCTOU: two reapers (or a reaper and a fresh writer that recreated the
-// lock in between) can both pass their checks, and the slower rm then
-// deletes a lock the faster one already replaced. rename() is the claim —
-// only one process can move the directory, and removal targets the claimed
-// path, never the live lock path. A claim that turns out to hold a live
-// lock is renamed back before any destructive step; a live lock is never
-// deleted, even if the rename-back races a fresh writer.
-const reapStaleLock = (lock: string, verify: (claimed: string) => boolean): boolean => {
-  const claim = `${lock}.reap-${process.pid}-${randomUUID()}`;
-  try {
-    fs.renameSync(lock, claim);
-  } catch {
-    return false;
-  }
-  if (!verify(claim)) {
-    try {
-      fs.renameSync(claim, lock);
-    } catch {
-      // `lock` was recreated after the claim. Re-verify before any
-      // destructive step so a claimed live lock is only ever abandoned as
-      // garbage, never deleted.
-      if (verify(claim)) fs.rmSync(claim, { recursive: true, force: true });
-    }
-    return false;
-  }
-  fs.rmSync(claim, { recursive: true, force: true });
-  return true;
-};
-
-export const withExclusiveFileLock = <T>(
-  options: ExclusiveLockOptions,
-  operation: () => T,
-): T => {
-  const attempts = options.attempts ?? DEFAULT_LOCK_ATTEMPTS;
-  const delayMs = options.delayMs ?? DEFAULT_LOCK_DELAY_MS;
-  const staleMs = options.staleMs ?? DEFAULT_STALE_LOCK_MS;
-  fs.mkdirSync(options.directory, { recursive: true, mode: 0o700 });
-  const lock = path.join(options.directory, options.lockName);
-  const ownerPath = path.join(lock, "owner");
-  const token = randomUUID();
-  let acquired = false;
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    try {
-      fs.mkdirSync(lock, { mode: 0o700 });
-      try {
-        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
-          encoding: "utf-8",
-          mode: 0o600,
-        });
-      } catch (error) {
-        fs.rmSync(lock, { recursive: true, force: true });
-        throw error;
-      }
-      acquired = true;
-      break;
-    } catch (error) {
-      if (errorCode(error) !== "EEXIST") throw error;
-      try {
-        const firstOwner = fs.readFileSync(ownerPath, "utf8");
-        const [, pidText, createdText] = firstOwner.trim().split("\n");
-        const stale = Date.now() - Number(createdText) > staleMs;
-        if (stale && !processAlive(Number(pidText))) {
-          const secondOwner = fs.readFileSync(ownerPath, "utf8");
-          if (
-            secondOwner === firstOwner &&
-            reapStaleLock(lock, (claimed) => {
-              try {
-                const owner = fs.readFileSync(path.join(claimed, "owner"), "utf8");
-                const [, pid, created] = owner.trim().split("\n");
-                return Date.now() - Number(created) > staleMs && !processAlive(Number(pid));
-              } catch {
-                return false;
-              }
-            })
-          ) {
-            continue;
-          }
-        }
-      } catch {
-        try {
-          // Ownerless lock (crash between mkdir and the owner write): age is
-          // the only signal, and the claim re-verifies it after the rename.
-          const first = fs.statSync(lock);
-          if (
-            Date.now() - first.mtimeMs > staleMs &&
-            reapStaleLock(lock, (claimed) => {
-              try {
-                return Date.now() - fs.statSync(claimed).mtimeMs > staleMs;
-              } catch {
-                return false;
-              }
-            })
-          ) {
-            continue;
-          }
-        } catch {
-          // Lock creation or stale recovery raced; retry the bounded acquisition.
-        }
-      }
-      if (attempt === attempts - 1) break;
-      sleepSync(delayMs);
-    }
-  }
-  if (!acquired) throw new Error(options.timeoutMessage);
-  try {
-    return operation();
-  } finally {
-    try {
-      const owner = fs.readFileSync(ownerPath, "utf8");
-      if (owner.startsWith(`${token}\n`)) {
-        fs.rmSync(lock, { recursive: true, force: true });
       }
     } catch {
       // A recovering process already removed this lock.

@@ -67,10 +67,11 @@ const run = await jev.spawn({
         await tools.call({ref: "sessions.write", args: {id: bridge.id, text: JSON.stringify(message) + "\\n"}});
         for (let buffered = "";;) {
           const page = await tools.call({ref: "sessions.read", args: {id: bridge.id, offset, waitMs: 5000}});
-          if (page.eof) throw new Error("bridge exited");
+          if (page.omittedBytes > 0) throw new Error("bridge output gap: " + page.omittedBytes + " bytes omitted");
           offset = page.next; buffered += page.text;
           const end = buffered.indexOf("\\n");
           if (end >= 0) return JSON.parse(buffered.slice(0, end));
+          if (page.eof) throw new Error("bridge exited before a complete response");
         }
       };
       for (let tick = 0; tick < 1000; tick++) {

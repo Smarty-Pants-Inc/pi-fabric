@@ -125,6 +125,7 @@ export class CapturedToolsProvider implements FabricProvider {
   ): Promise<FabricActionDescriptor | undefined> {
     if (this.#allowedTools && !this.#allowedTools.has(actionName)) return undefined;
     const entry = this.catalog.get(actionName);
+    if (entry && this.omitFromDiscovery(entry)) return undefined;
     return entry ? descriptorFrom(entry) : undefined;
   }
 
@@ -146,6 +147,9 @@ export class CapturedToolsProvider implements FabricProvider {
   ): Promise<CapturedToolInvocationResult> {
     this.#assertAllowed(actionName);
     const entry = this.catalog.require(actionName);
+    if (this.omitFromDiscovery(entry)) {
+      throw new Error(`Captured tool ${actionName} is unavailable through the extensions alias`);
+    }
     return this.#scheduler.run(entry.definition.executionMode, () =>
       runAbortable(context.signal, () => this.#invokeCaptured(entry, args, context)),
     );

@@ -157,13 +157,13 @@ describe("Pi-owned MCP tools inside Fabric", () => {
     expect(await f.provider.describe("docs-api.find-item", f.context)).toMatchObject({ name: "docs-api.find-item" });
   });
 
-  it("keeps extension aliases callable but advertises only the canonical MCP surface", async () => {
+  it("refuses selected native MCP aliases outside the canonical MCP surface", async () => {
     const f = fixture();
     const extensions = new CapturedToolsProvider(f.catalog, entry => isSelectedNativeMcpTool(entry.definition, f.config.nativeServers));
     expect(await extensions.list({}, f.context)).toEqual([]);
-    expect(await extensions.describe("mcp__hashed_0", f.context)).toMatchObject({ name: "mcp__hashed_0" });
-    await extensions.invoke("mcp__hashed_0", { value: "x" }, f.context);
-    expect(f.executeTool).toHaveBeenCalledOnce();
+    expect(await extensions.describe("mcp__hashed_0", f.context)).toBeUndefined();
+    await expect(extensions.invoke("mcp__hashed_0", { value: "x" }, f.context)).rejects.toThrow(/unavailable through the extensions alias/);
+    expect(f.executeTool).not.toHaveBeenCalled();
   });
 
   it("observes withdrawal, late registration, direct activation and capture-disabled mode without a TTL", async () => {

@@ -90,10 +90,16 @@ export class ApprovalController {
     action: ResolvedFabricAction,
     args: Record<string, unknown> = {},
   ): Promise<void> {
-    const override = actionApprovalOverride(this.config.actions, action.ref);
+    // Alternate MCP routes (notably mcp.$call) must be judged by the same
+    // canonical tool ref as direct dispatch, never by their management ref.
+    const canonicalRef = action.ref === "mcp.$call" && typeof args.server === "string" && typeof args.tool === "string"
+      ? `mcp.${args.server}.${args.tool}`
+      : action.ref;
+    const override = actionApprovalOverride(this.config.actions, canonicalRef)
+      ?? (canonicalRef === action.ref ? undefined : actionApprovalOverride(this.config.actions, action.ref));
     // An action-level deny is absolute: no inherited or session risk grant lifts it.
     if (override === "deny") {
-      throw new FabricTraceSafeError(`${action.ref} is denied by the Fabric approvals.actions policy`);
+      throw new FabricTraceSafeError(`${canonicalRef} is denied by the Fabric approvals.actions policy`);
     }
     // This is an immutable host capability, not a model/configurable network grant.
     if (action.risk === "network" && this.brokeredNetwork?.(action.provider) === true) return;

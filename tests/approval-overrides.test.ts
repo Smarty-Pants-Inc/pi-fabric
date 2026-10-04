@@ -100,6 +100,12 @@ describe("ApprovalController per-action overrides", () => {
     await expect(controller.approve(action("pi.write"))).resolves.toBeUndefined();
   });
 
+  it("applies an MCP tool deny to the mcp.$call alias", async () => {
+    const controller = new ApprovalController(policy({ "mcp.docs.search": "deny" }, "allow"), { hasUI: false } as ExtensionContext);
+    await expect(controller.approve(action("mcp.$call", "network"), { server: "docs", tool: "search", args: {} }))
+      .rejects.toThrow("mcp.docs.search is denied");
+  });
+
   it("lets an action allow lift a denied risk class", async () => {
     const controller = new ApprovalController(policy({ "mcp.docs.search": "allow" }, "deny"), { hasUI: false } as ExtensionContext);
     await expect(controller.approve(action("mcp.docs.search", "network"))).resolves.toBeUndefined();

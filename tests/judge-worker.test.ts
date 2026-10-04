@@ -62,6 +62,62 @@ describe.skipIf(!fs.existsSync("dist/worker.js"))("built judgment worker isolati
     expect(launch).toHaveBeenCalledTimes(1);
   });
 });
+describe("owned judgment wrapper cleanup", () => {
+  it.skipIf(!fs.existsSync("dist/worker.js"))("accepts a healthy fallback with its original usage and removes the owned empty allocation", async () => {
+    const scenario = path.join(root, "scenario"); fs.writeFileSync(scenario, "judge-reply"); vi.stubEnv("FAKE_MODEL_SCENARIO", scenario);
+    let owned!: string;
+    const spawn = AgentManager.prototype.spawn;
+    vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(function (this: AgentManager, ...args) {
+      const pending = spawn.apply(this, args);
+      owned = path.dirname(this.cwd); ownedRoots.push(owned);
+      return pending;
+    });
+    const remove = vi.spyOn(fs, "rmdirSync");
+    deps.agent = (r, limits, signal) => runJudgmentAgent(r, limits, signal, { piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), workerPath: path.resolve("dist/worker.js") });
+    expect(await judge(input(), deps)).toMatchObject({ verdict: "dependency", status: "completed", reasonCode: "agent_accepted", cost: { tokens: 7, evaluations: 1, agents: 1 } });
+    const rows = fs.readFileSync(deps.ledger, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows.find(row => row.backend === "pi-process")).toMatchObject({ status: "completed", error: null, usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0 } });
+    expect(remove).toHaveBeenCalledWith(path.join(owned, "runs"));
+    expect(fs.existsSync(owned)).toBe(false);
+  });
+  it.each(["empty", "absent", "retained", "remove-failed"])("never claims release when close/cleanup is %s", async scenario => {
+    let owned!: string;
+    const spawn = AgentManager.prototype.spawn;
+    vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(function (this: AgentManager, ...args) {
+      const pending = spawn.apply(this, args);
+      owned = path.dirname(this.cwd); ownedRoots.push(owned);
+      return pending;
+    });
+    const close = AgentManager.prototype.close;
+    vi.spyOn(AgentManager.prototype, "close").mockImplementation(async function (this: AgentManager) {
+      await close.call(this); // Join the actual worker before injecting the caller-boundary fault.
+      const runs = path.join(owned, "runs");
+      expect(fs.readdirSync(runs)).toEqual([]);
+      if (scenario === "retained") {
+        fs.writeFileSync(path.join(runs, "retained-receipt.json"), '{"custody":"retain"}');
+        return; // Even a successful close cannot authorize deleting retained contents.
+      }
+      if (scenario === "remove-failed") return;
+      if (scenario === "absent") fs.rmdirSync(runs);
+      throw new Error("probe: close did not confirm release");
+    });
+    if (scenario === "remove-failed") {
+      const remove = fs.rmdirSync;
+      vi.spyOn(fs, "rmdirSync").mockImplementation(directory => {
+        if (directory === path.join(owned, "runs")) throw Object.assign(new Error("probe: removal unavailable"), { code: "EACCES" });
+        return remove(directory);
+      });
+    }
+    deps.agent = (r, limits, signal) => runJudgmentAgent(r, limits, signal, { piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs") });
+    expect(await judge(input(), deps)).toMatchObject({ verdict: "unknown", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 5 } });
+    const rows = fs.readFileSync(deps.ledger, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows.find(row => row.backend === "pi-process")).toMatchObject({ status: "failed", usage: { input: 1, output: 2 }, error: expect.stringContaining(owned) });
+    expect(fs.existsSync(owned)).toBe(true);
+    expect(fs.existsSync(path.join(owned, "runs"))).toBe(scenario !== "absent");
+    if (scenario === "retained") expect(fs.readFileSync(path.join(owned, "runs/retained-receipt.json"), "utf8")).toBe('{"custody":"retain"}');
+  });
+});
+
 describe("retained owned judgment receipts", () => {
   it("preserves a persistently unsaved child outcome through close, fails closed, and permits recovery", async () => {
     let owner!: AgentManager;

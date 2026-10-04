@@ -61,6 +61,16 @@ process.stdin.on("data", chunk => {
       const message = { role: "assistant", provider: actual.provider, model: actual.id, content: [{ type: "text", text: behavior === "refusal" ? "I refuse this judgment." : "correct model ran" }], stopReason: "stop", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0 } };
       emit({ type: "message_start", message });
       emit({ type: "message_end", message });
+      if (behavior === "judge-reply") {
+        // Simulate the host reply hook's durable tool receipt, not final-text JSON.
+        const packet = JSON.parse(frame.message.split("\n")[1]);
+        const value = { verdict: "dependency", confidence: .8, evidenceLinks: packet.evidenceRefs.map(ref => ref.url),
+          nextAction: { kind: "wait_dependency", owner: "dev-lead", targetRef: packet.itemRef } };
+        fs.writeFileSync(process.env.PI_FABRIC_REPLY_FILE, JSON.stringify(value));
+        emit({ type: "tool_execution_end", toolName: "fabric_reply", result: { content: [{ type: "text", text: "Reply delivered." }] } });
+        if (process.env.FAKE_JUDGE_LAUNCH_FILE) fs.appendFileSync(process.env.FAKE_JUDGE_LAUNCH_FILE,
+          JSON.stringify({ cwd: process.cwd(), replyFile: process.env.PI_FABRIC_REPLY_FILE }) + "\n");
+      }
       // Late events must never erase the model mismatch failure.
       emit({ type: "agent_start" });
       emit({ type: "agent_end" });

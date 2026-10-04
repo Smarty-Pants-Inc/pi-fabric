@@ -33,9 +33,9 @@ const main = (mesh: MeshStore, who: MeshIdentity, idle = false, file?: string) =
   } } as unknown as ExtensionContext;
   const controller = new MainAgentController(pi, who.id, true, mesh.root, who.sessionId);
   controllers.push(controller);
-  registerMainInbox(mesh.root, who, who.sessionId!, file);
+  const activation = registerMainInbox(mesh.root, who, who.sessionId!, file);
   controller.attachFollowUpDrain(ctx, 60_000, path.join(mesh.root, "main-followups", `${who.sessionId}.json`), 600,
-    { owns: id => mainInboxOwns(mesh.root, who.id, id), active: () => mainInboxActive(mesh.root, who.id) });
+    { owns: id => mainInboxOwns(mesh.root, who.id, id), active: () => mainInboxActive(mesh.root, who.id, activation) });
   return { controller, sent, entries, emit: (name: string, event: any) => { for (const fn of handlers.get(name) ?? []) fn(event, ctx); } };
 };
 
@@ -92,6 +92,7 @@ it("age alarm goes once per message to sender and target owner, never for a nati
 it("rotation moves original carrier once, fences predecessor replay and gives sender reroute receipt", async () => {
   const { mesh } = setup(); const old = main(mesh, B);
   const message = old.controller.deliverAgent({ from: A, message: "follow-up", delivery: "followUp", deliveryId: "original" });
+  const original = JSON.parse(fs.readFileSync(path.join(mesh.root, "main-followups", "B.json"), "utf8")).items[0];
   old.controller.closeFollowUpDrain();
   await recordMainSuccessor(mesh, B.id, "B", C.id);
   const next = main(mesh, C, true);
@@ -102,9 +103,61 @@ it("rotation moves original carrier once, fences predecessor replay and gives se
   expect(JSON.parse(fs.readFileSync(path.join(mesh.root, "main-followups", "B.json"), "utf8")).items).toHaveLength(0);
   const resumed = main(mesh, B, true);
   expect(resumed.sent).toHaveLength(0);
-  expect(() => resumed.controller.deliverAgent({ from: A, message: "retry", delivery: "followUp", deliveryId: "original" })).toThrow("rotated");
+  expect(() => resumed.controller.receiveInboxItem(original)).toThrow("claim belongs elsewhere");
+  expect(resumed.sent).toHaveLength(0);
+  resumed.controller.deliverAgent({ from: A, message: "fresh after resume", delivery: "steer", deliveryId: "fresh" });
+  expect(resumed.sent).toHaveLength(1);
   const receipts = mesh.read({ topic: "fleet.work.inbox-receipts" });
   expect(receipts).toHaveLength(1); expect(receipts[0]).toMatchObject({ to: A.id, text: `rerouted: ${B.id} -> ${C.id}` });
+});
+
+it("native new/resume/new scopes succession to each activation, never a moved carrier or old runtime", async () => {
+  const { mesh } = setup();
+  const aFile = path.join(mesh.root, "A.jsonl"), bFile = path.join(mesh.root, "B.jsonl"), cFile = path.join(mesh.root, "C.jsonl");
+  const oldA = main(mesh, A, false, aFile);
+  const carrier = oldA.controller.deliverAgent({ from: C, message: "moved once", delivery: "followUp", deliveryId: "move" });
+  oldA.controller.closeFollowUpDrain();
+  await stageMainSuccessor(mesh, A.id, "A", bFile);
+  expect(await confirmMainSuccessor(mesh, B.id, bFile)).toBe(true);
+  const b = main(mesh, B, true, bFile);
+  await new MainInboxMaintenance(mesh, B, source([]), b.controller, options).run();
+  expect(b.sent.map(packet => packet.message.details.id)).toEqual([carrier.messageId]);
+  b.controller.closeFollowUpDrain();
+  await stageMainSuccessor(mesh, B.id, "B", aFile);
+  expect(await confirmMainSuccessor(mesh, A.id, aFile)).toBe(true);
+  const resumedA = main(mesh, A, true, aFile);
+  expect(mainInboxActive(mesh.root, A.id)).toBe(true);
+  expect(resumedA.sent).toHaveLength(0);
+  expect(mainInboxOwns(mesh.root, A.id, carrier.messageId)).toBe(false);
+  expect(() => oldA.controller.deliverAgent({ from: C, message: "old runtime", delivery: "steer" })).toThrow("rotated");
+  const fresh = resumedA.controller.deliverAgent({ from: C, message: "fresh to resumed A", delivery: "steer" });
+  expect(resumedA.sent.map(packet => packet.message.details.id)).toEqual([fresh.messageId]);
+  resumedA.controller.closeFollowUpDrain();
+  await stageMainSuccessor(mesh, A.id, "A", cFile);
+  expect(await confirmMainSuccessor(mesh, C.id, cFile)).toBe(true);
+  main(mesh, C, true, cFile);
+  expect(mainInboxActive(mesh.root, A.id)).toBe(false);
+  // Consumed intents cannot re-confirm a historical B -> A on a later reload.
+  expect(await confirmMainSuccessor(mesh, A.id, aFile)).toBe(false);
+});
+
+it("an interrupted switch intent cannot retire or block a newer native activation", async () => {
+  const { mesh } = setup(); const b = main(mesh, B);
+  const target = path.join(mesh.root, "A.jsonl");
+  b.controller.closeFollowUpDrain(); await stageMainSuccessor(mesh, B.id, "B", target);
+  main(mesh, B); // Explicit reload/resume after the switch did not complete.
+  expect(await confirmMainSuccessor(mesh, A.id, target)).toBe(false);
+  const a = main(mesh, A, true, target);
+  a.controller.deliverAgent({ from: C, message: "fresh", delivery: "steer" });
+  expect(a.sent).toHaveLength(1);
+});
+
+it("reload activation fences an older runtime with the same native root", () => {
+  const { mesh } = setup();
+  const old = main(mesh, A), reloaded = main(mesh, A, true);
+  expect(() => old.controller.deliverAgent({ from: B, message: "stale", delivery: "steer" })).toThrow("rotated");
+  reloaded.controller.deliverAgent({ from: B, message: "current", delivery: "steer" });
+  expect(reloaded.sent).toHaveLength(1);
 });
 
 it("native pre-switch abort/settle does not deliver to old inbox; canceled switch reopens on owner input", () => {
@@ -203,6 +256,75 @@ it("stall thresholds are registered and configurable in mesh config", () => {
   const config = loadFabricConfig({ cwd: dir, agentDir, projectTrusted: false });
   expect(config.mesh).toMatchObject({ rootPresenceAlarmMs: 123, undeliveredAlarmMs: 456, rootGoneTtlMs: 789 });
   expect(DEFAULT_FABRIC_CONFIG.mesh).toMatchObject(options);
+});
+
+it("pending claim follows an authoritative onward successor, not a lapsed live lease", async () => {
+  const { mesh } = setup(); const b = main(mesh, B);
+  const packet = b.controller.deliverAgent({ from: A, message: "custody carrier", delivery: "followUp" });
+  b.controller.closeFollowUpDrain(); await recordMainSuccessor(mesh, B.id, "B", C.id);
+  const c = main(mesh, C), a = main(mesh, A, true);
+  const maintenance = new MainInboxMaintenance(mesh, A, source([]), a.controller, options);
+  const now = Date.now();
+  await maintenance.run(now);
+  expect(JSON.parse(fs.readFileSync(path.join(mesh.root, "main-followups", "B.json"), "utf8")).items).toEqual([]);
+  expect(fs.existsSync(path.join(mesh.root, "main-followups", "C.json"))).toBe(false);
+  await maintenance.run(now + options.rootGoneTtlMs + 1);
+  expect(mesh.read({ topic: "fleet.work.inbox-receipts" })).toHaveLength(0);
+  c.controller.closeFollowUpDrain(); await recordMainSuccessor(mesh, C.id, "C", A.id);
+  await maintenance.run(now + options.rootGoneTtlMs + 2);
+  await maintenance.run(now + options.rootGoneTtlMs + 3);
+  expect(a.sent.map(entry => entry.message.details.id)).toEqual([packet.messageId]);
+  expect(mainInboxOwns(mesh.root, B.id, packet.messageId)).toBe(false);
+  expect(mainInboxOwns(mesh.root, C.id, packet.messageId)).toBe(false);
+  expect(mesh.read({ topic: "fleet.work.inbox-receipts" })).toMatchObject([{ to: A.id, text: `rerouted: ${B.id} -> ${A.id}`, data: { messageId: packet.messageId } }]);
+});
+
+it("a pending claim with a canonical successor receipt never alarms or moves again", async () => {
+  const { mesh } = setup(); const b = main(mesh, B);
+  const packet = b.controller.deliverAgent({ from: A, message: "persisted before receipt", delivery: "followUp" });
+  const original = JSON.parse(fs.readFileSync(path.join(mesh.root, "main-followups", "B.json"), "utf8")).items[0];
+  b.controller.closeFollowUpDrain(); await recordMainSuccessor(mesh, B.id, "B", C.id);
+  const cFile = path.join(mesh.root, "C-native.jsonl"), c = main(mesh, C, false, cFile), a = main(mesh, A, true);
+  const maintenance = new MainInboxMaintenance(mesh, A, source([]), a.controller, options);
+  await maintenance.run(); // Saves claim for C, without successor journal admission.
+  c.controller.receiveInboxItem(original);
+  fs.writeFileSync(cFile, [JSON.stringify({ type: "session", id: "C" }), JSON.stringify({ type: "custom_message", customType: "pi-fabric-agent-message", details: { id: packet.messageId } }), ""].join("\n"));
+  c.controller.closeFollowUpDrain(); await recordMainSuccessor(mesh, C.id, "C", A.id);
+  await maintenance.run(Date.now() + options.rootGoneTtlMs + 1);
+  expect(a.sent).toHaveLength(0);
+  expect(mesh.read({ topic: "ops.owner" })).toHaveLength(0);
+  expect(mesh.read({ topic: "fleet.work.inbox-receipts" })).toMatchObject([{ to: A.id, text: `rerouted: ${B.id} -> ${C.id}` }]);
+});
+
+it.skipIf(process.platform === "win32")("SIGKILL before successor journal admission: other live Mains recover custody after TTL exactly once", async () => {
+  const { mesh } = setup(); const b = main(mesh, B);
+  const packet = b.controller.deliverAgent({ from: A, message: "pre-admission crash", delivery: "followUp", deliveryId: "pre-admission" });
+  b.controller.closeFollowUpDrain(); await recordMainSuccessor(mesh, B.id, "B", C.id);
+  const worker = spawnSync("nice", ["-n", "19", "bun", "run", path.resolve("tests/fixtures/stall-inbox-crash.ts"), mesh.root, "before-admission"], { encoding: "utf8", timeout: 20_000 });
+  expect(worker.signal).toBe("SIGKILL");
+  expect(fs.existsSync(path.join(mesh.root, "main-followups", "C.json"))).toBe(false);
+  expect(JSON.parse(fs.readFileSync(path.join(mesh.root, "main-followups", "B.json"), "utf8")).items).toEqual([]);
+  const routeFile = path.join(mesh.root, "main-followups", "routes", `${createHash("sha256").update(packet.messageId).digest("hex")}.json`);
+  expect(JSON.parse(fs.readFileSync(routeFile, "utf8"))).toMatchObject({ newRoot: C.id, messageId: packet.messageId, item: { id: packet.messageId } });
+  const d = identity("D"), a = main(mesh, A, true), other = main(mesh, d, true);
+  const roots = source([participant(A.id, "root"), participant(d.id, "root")]);
+  const recover = new MainInboxMaintenance(mesh, A, roots, a.controller, options);
+  const competing = new MainInboxMaintenance(mesh, d, roots, other.controller, options);
+  const firstAbsent = (mesh.get(`topology/root-absence/${createHash("sha256").update(C.id).digest("hex")}`, { fresh: true })!.value as { firstAbsentAt: number }).firstAbsentAt;
+  const now = firstAbsent + options.undeliveredAlarmMs + 1;
+  await recover.run(now);
+  expect(mesh.read({ topic: "ops.owner" }).some(event => event.to === A.id && (event.data as any).messageId === packet.messageId)).toBe(true);
+  await recover.run(firstAbsent + options.rootGoneTtlMs);
+  expect(mesh.read({ topic: "fleet.work.inbox-receipts" })).toHaveLength(0);
+  await Promise.all([recover.run(firstAbsent + options.rootGoneTtlMs + 1), competing.run(firstAbsent + options.rootGoneTtlMs + 1)]);
+  await recover.run(firstAbsent + options.rootGoneTtlMs + 2);
+  expect(mesh.read({ topic: "fleet.work.inbox-receipts" })).toMatchObject([{ to: A.id, text: "undeliverable: root gone", data: { messageId: packet.messageId } }]);
+  expect(JSON.parse(fs.readFileSync(routeFile, "utf8"))).toMatchObject({ done: true, messageId: packet.messageId });
+  expect(JSON.parse(fs.readFileSync(routeFile, "utf8")).item).toBeUndefined();
+  expect(mainInboxOwns(mesh.root, B.id, packet.messageId)).toBe(false);
+  expect(mainInboxOwns(mesh.root, C.id, packet.messageId)).toBe(false);
+  expect(a.sent).toHaveLength(0); expect(other.sent).toHaveLength(0);
+  expect(main(mesh, C, true).sent).toHaveLength(0);
 });
 
 it.skipIf(process.platform === "win32")("SIGKILL between successor admission and sender receipt recovers once from journal/claim", async () => {

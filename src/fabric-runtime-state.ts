@@ -641,8 +641,8 @@ export class FabricRuntimeState {
     }
     const recordedRotation = this.#config.mesh.enabled && mainAgent.local
       ? await confirmMainSuccessor(this.#mesh, mainAgentId, context.sessionManager.getSessionFile?.()) : false;
-    if (this.#config.mesh.enabled && mainAgent.local) await this.#mesh.exclusive(() =>
-      registerMainInbox(meshRoot, identity, sessionId, context.sessionManager.getSessionFile?.()));
+    const inboxActivation = this.#config.mesh.enabled && mainAgent.local ? await this.#mesh.exclusive(() =>
+      registerMainInbox(meshRoot, identity, sessionId, context.sessionManager.getSessionFile?.())) : undefined;
     // No Main admission/drain starts while a prior-generation death proof survives.
     mainAgent.attachFollowUpDrain(
       context,
@@ -651,7 +651,7 @@ export class FabricRuntimeState {
       this.#config.mesh.followUpStallSeconds,
       this.#config.mesh.enabled && mainAgent.local ? {
         owns: id => mainInboxOwns(meshRoot, mainAgentId, id),
-        active: () => mainInboxActive(meshRoot, mainAgentId),
+        active: () => mainInboxActive(meshRoot, mainAgentId, inboxActivation),
       } : undefined,
     );
     if (this.#config.mesh.enabled && mainAgent.local) {

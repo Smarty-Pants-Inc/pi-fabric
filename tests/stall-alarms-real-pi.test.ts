@@ -8,7 +8,7 @@ import { expect, it, vi } from "vitest";
 
 type Event = Parameters<Parameters<RpcClient["onEvent"]>[0]>[0];
 const repo = path.resolve(".");
-it.runIf(process.env.FABRIC_4313_REAL_PI === "1")("installed Pi: A followUp -> B native rotation -> B' once and A reroute receipt", async () => {
+it.runIf(process.env.FABRIC_4313_REAL_PI === "1")("installed Pi: native new/resume/new keeps fresh delivery and fences previously moved carriers", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-real-4313-"));
   const evidence = process.env.FABRIC_4313_EVIDENCE_DIR!;
   const cli = process.env.FABRIC_4313_PI_CLI!;
@@ -79,14 +79,45 @@ it.runIf(process.env.FABRIC_4313_REAL_PI === "1")("installed Pi: A followUp -> B
     const after = (await B.getEntries()).entries.filter((entry: any) => entry.type === "custom_message" && entry.customType === "pi-fabric-agent-message");
     expect(after).toHaveLength(before);
     expect(fs.readFileSync(old.sessionFile, "utf8")).not.toContain(carrierText);
+    const successorEntries = await B.getEntries();
+    const resumedResult = await B.switchSession(old.sessionFile);
+    expect(resumedResult.cancelled).toBe(false);
+    await wait(() => ready("B").id === old.id && ready("B").reason === "resume");
+    const resumed = ready("B"); identities.resumed = resumed;
+    expect((await B.getEntries()).entries.some((entry: any) => JSON.stringify(entry).includes(carrierText))).toBe(false);
+    const sendFresh = async (target: string, message: string): Promise<string> => {
+      const result = await A.promptAndWait(`SEND ${JSON.stringify({ id: target, message })}`, undefined, 30_000);
+      const ended = result.find(event => event.type === "tool_execution_end" && event.toolName === "fabric_exec") as any;
+      expect(ended).toMatchObject({ isError: false });
+      const receipt = ended.result.details.audits[0].result;
+      expect(receipt).toMatchObject({ queued: true, acknowledged: true });
+      return receipt.messageId;
+    };
+    const nativeIds = async (): Promise<string[]> => (await B.getEntries()).entries
+      .filter((entry: any) => entry.type === "custom_message" && entry.customType === "pi-fabric-agent-message")
+      .flatMap((entry: any) => (entry.details.items ?? [entry.details]).map((item: any) => item.id));
+    const freshText = "smarty-dev#4313 FRESH after native resume";
+    const freshId = await sendFresh(resumed.id, freshText);
+    await wait(async () => (await nativeIds()).includes(freshId), 40_000);
+    expect(await nativeIds()).toEqual([freshId]);
+    expect(fs.readFileSync(resumed.sessionFile, "utf8")).not.toContain(carrierText);
+    fs.writeFileSync(path.join(evidence, "resumed-entries.json"), JSON.stringify(await B.getEntries(), null, 2));
+    const nextReplacement = await B.newSession(); expect(nextReplacement.cancelled).toBe(false);
+    await wait(() => ready("B").id !== resumed.id && ready("B").id !== successor.id);
+    const final = ready("B"); identities.final = final;
+    const finalId = await sendFresh(final.id, "smarty-dev#4313 FRESH after second native new");
+    await wait(async () => (await nativeIds()).includes(finalId), 40_000);
+    await B.promptAndWait("verify native new/resume/new no replay", undefined, 30_000);
+    expect(await nativeIds()).toEqual([finalId]);
     const files = (fs.readdirSync(path.join(repo, "dist"), { recursive: true }) as string[]).filter(file => /\.(js|mjs)$/.test(file)).sort();
     outcome = { passed: true, messageId: publicResult.messageId, sender: ready("A").id, oldRoot: old.id, successorRoot: successor.id,
-      nativeCarrierCount: items.length, senderReceipt: text, installedCli: fs.realpathSync(cli),
+      nativeCarrierCount: items.length, senderReceipt: text, resumedRoot: resumed.id, finalRoot: final.id, freshMessageIds: [freshId, finalId], installedCli: fs.realpathSync(cli),
       head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim(),
       bundleHashes: Object.fromEntries(files.map(file => [file, createHash("sha256").update(fs.readFileSync(path.join(repo, "dist", file))).digest("hex")])),
     };
     fs.writeFileSync(path.join(evidence, "A-entries.json"), JSON.stringify(await A.getEntries(), null, 2));
-    fs.writeFileSync(path.join(evidence, "successor-entries.json"), JSON.stringify(await B.getEntries(), null, 2));
+    fs.writeFileSync(path.join(evidence, "successor-entries.json"), JSON.stringify(successorEntries, null, 2));
+    fs.writeFileSync(path.join(evidence, "final-entries.json"), JSON.stringify(await B.getEntries(), null, 2));
   } finally {
     await Promise.all(clients.map(client => client.abort().catch(() => undefined)));
     await hold?.catch(() => undefined);
@@ -106,4 +137,4 @@ it.runIf(process.env.FABRIC_4313_REAL_PI === "1")("installed Pi: A followUp -> B
     }
     fs.rmSync(root, { recursive: true, force: true });
   }
-}, 180_000);
+}, 240_000);

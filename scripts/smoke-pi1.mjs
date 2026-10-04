@@ -128,7 +128,7 @@ try {
       api.setActiveTools(["read", "fixture_echo", "fixture_late", "codemode", "tool_search", "mcp__fixture__echo", ...(!fullCodeMode && schemaMode !== "enforce" ? ["fabric_exec"] : [])]);
       await session.prompt("Verify explicit replacement without fabric_exec is repaired.");
       if (fullCodeMode) {
-        nextCode = 'const a = await extensions.fixture_echo({value:"rewrite"}); const b = await extensions.fixture_deferred({value:"deferred"}); const c = await extensions.mcp__fixture__echo({value:"native"}); const d = await extensions.tool_search({query:"fixture_deferred"}); const e = await extensions.codemode({code:"return 42;"}); return {a,b,c,d,e};';
+        nextCode = `const a = await extensions.fixture_echo({value:"rewrite"}); const b = await extensions.fixture_deferred({value:"deferred"}); const c = await ${nativeMcp ? "mcp.fixture.echo" : "extensions.mcp__fixture__echo"}({value:"native"}); const d = await extensions.tool_search({query:"fixture_deferred"}); const e = await extensions.codemode({code:"return 42;"}); return {a,b,c,d,e};`;
         await session.prompt("Exercise captured tools through fabric_exec.");
         const result = session.messages.findLast((m) => m.role === "toolResult" && m.toolName === "fabric_exec");
         assert.equal(result?.isError, false, JSON.stringify(result));
@@ -178,6 +178,14 @@ try {
         const invocation = events.findLast(event => event.type === "tool_call" && event.toolName === "fabric_exec");
         assert.deepEqual(invocation.input.display, { name: "Verify compatibility", description: "Preserve Fabric invocation contracts" });
         assert.equal(result.details.trace.operations.filter(operation => operation.ref === "mcp.fixture.echo").length, 1);
+        if (fullCodeMode) {
+          nextCode = 'return await extensions.mcp__fixture__echo({value:"alias-must-not-run"});';
+          await session.prompt("Selected native MCP aliases must be inaccessible outside canonical authorization.");
+          const rejected = session.messages.findLast(m => m.role === "toolResult" && m.toolName === "fabric_exec");
+          assert.equal(rejected?.isError, true);
+          assert.match(JSON.stringify(rejected.content), /Unknown Fabric action|unavailable through the extensions alias/);
+          assert.ok(!events.some(event => event.toolName === "mcp__fixture__echo" && event.input?.value === "alias-must-not-run"));
+        }
         nextCode = 'return await mcp.fixture.echo({value:"native-redact"});';
         await session.prompt("Native content-only redaction must drop the original structured envelope.");
         const redacted = session.messages.findLast(m => m.role === "toolResult" && m.toolName === "fabric_exec");

@@ -53,12 +53,13 @@ const fixture = async () => {
   expect(mesh.get(key("topology/participants/", oldRoot))).toBeUndefined();
   expect(mesh.get(key("topology/lineage-closures/", oldRoot))).toBeUndefined();
   const deliveries: string[] = [];
-  const candidate = async (name: string, project = root, role = "project-agent") => {
+  const candidate = async (name: string, project = root, role = "project-agent", beforeManager?: () => void) => {
     const rootId = "session:" + name, hostId = residentHostId(rootId);
     const hostIdentity: MeshIdentity = { id: hostId, kind: "agent", name: "resident" };
     const hostDirectory = new ParticipantDirectory(mesh, { enabled: true, hostId, rootId, identity: hostIdentity, reapDeadHosts: false });
     cleanups.push(() => hostDirectory.close());
     await hostDirectory.refresh();
+    beforeManager?.();
     const manager = new ActorManager(name, hostIdentity, mesh, config, agents, ({ message }) => { if (message.text) deliveries.push(message.text); }, {
       actorRoot: path.join(root, "actors"), persistent: true, rootId, project, role, claimResidency: "durable", adoptionGraceMs: 0,
       canManageActor: id => { const participant = directory.get(id, Date.now(), { fresh: true }); return participant ? participant.ownerHostId === hostId : undefined; },
@@ -70,6 +71,18 @@ const fixture = async () => {
   };
   return { root, mesh, actor, directory, candidate, deliveries, agents };
 };
+
+const retainActorFile = (f: Awaited<ReturnType<typeof fixture>>) => {
+  const old = Date.now() - 20 * 60_000;
+  writeParticipantFile(f.mesh.root, {
+    key: key("topology/participants/", f.actor.id), version: 1, updatedBy: identity(oldRoot), updatedAt: old,
+    value: { format: 1, id: f.actor.id, rootId: oldRoot, kind: "actor", name: "retained", status: "idle", runner: "pi",
+      transport: "host", ownerHostId: oldRoot, ownerIdentityId: oldRoot, capabilities: ["fabric"], startedAt: old - 1000,
+      updatedAt: old, controlProtocol: "v1" },
+  });
+};
+const damagedStates = ["{truncated", "", " \n\t", "{}", '{"format":1,"entries":{"hidden":{"key":"other"}}}',
+  '{"format":1,"entries":{}}\n{"format":1,"entries":{}}'] as const;
 
 describe("F3059 aged absent-root adoption", () => {
   it("reaps the root, then two same-project project-agent hosts adopt and run one event exactly once", async () => {
@@ -90,6 +103,73 @@ describe("F3059 aged absent-root adoption", () => {
     expect(messages.filter(message => message.direction === "out")).toEqual([expect.objectContaining({ text: "fake worker complete", runId: expect.any(String) })]);
     expect(JSON.parse(fs.readFileSync(path.join(f.root, "actors", "actors.json"), "utf8")).actors).toHaveLength(1);
   });
+
+  it.each(damagedStates)("vetoes damaged shared state %j despite retained old actor-file evidence", async damaged => {
+    const f = await fixture();
+    retainActorFile(f);
+    expect(f.directory.lineageAdoptable(oldRoot)).toBe(true);
+    const state = path.join(f.mesh.root, "state.json");
+    let original = "";
+    const writes = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const next = await f.candidate("damaged-candidate", f.root, "project-agent", () => {
+      original = fs.readFileSync(state, "utf8");
+      fs.writeFileSync(state, damaged);
+    });
+    try {
+      expect(f.directory.lineageAlive(oldRoot)).toBe(true);
+      expect(f.directory.lineageAdoptable(oldRoot)).toBe(false);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(next.owns(f.actor.id)).toBe(false);
+      expect(next.status(f.actor.id).rootId).toBe(oldRoot);
+      expect(writes.mock.calls.flatMap(([rows]) => rows).filter(row => row.id === f.actor.id && row.adoptedAt !== undefined)).toHaveLength(0);
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "actors", "actors.json"), "utf8")).actors.find((row: { id: string }) => row.id === f.actor.id).rootId).toBe(oldRoot);
+    } finally { await next.close(); fs.writeFileSync(state, original); }
+  });
+
+  it.each(["{truncated", "", " \n\t"])("vetoes state damage %j first appearing under registry + mesh custody", async damaged => {
+    const f = await fixture();
+    retainActorFile(f);
+    const state = path.join(f.mesh.root, "state.json");
+    let original = "", calls = 0;
+    const guard = f.directory.lineageAdoptable.bind(f.directory);
+    const writes = vi.spyOn(ActorRegistryStore.prototype, "write");
+    vi.spyOn(f.directory, "lineageAdoptable").mockImplementation(id => {
+      if (id === oldRoot && ++calls === 2) {
+        expect(fs.existsSync(path.join(f.root, "actors", "actors.json.lock", "owner"))).toBe(true);
+        expect(fs.existsSync(path.join(f.mesh.root, ".lock", "owner"))).toBe(true);
+        original = fs.readFileSync(state, "utf8");
+        fs.writeFileSync(state, damaged);
+      }
+      return guard(id);
+    });
+    const next = await f.candidate("locked-damage-candidate");
+    try {
+      await wait(() => calls >= 2);
+      expect(f.directory.lineageAdoptable(oldRoot)).toBe(false);
+      expect(next.owns(f.actor.id)).toBe(false);
+      expect(next.status(f.actor.id).rootId).toBe(oldRoot);
+      expect(writes.mock.calls.flatMap(([rows]) => rows).filter(row => row.id === f.actor.id && row.adoptedAt !== undefined)).toHaveLength(0);
+    } finally { await next.close(); if (original) fs.writeFileSync(state, original); }
+  });
+
+  it.each([oldRoot, residentHostId(oldRoot)].flatMap(hostId => ["missing", "wrong-id", "wrong-root"].map(mode => [hostId, mode] as const)))
+    ("vetoes %s canonical host with %s attribution before filtering relevance", async (hostId, mode) => {
+      const f = await fixture();
+      const old = Date.now() - 20 * 60_000;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(old);
+      try {
+        await f.mesh.put({ key: key("topology/hosts/", hostId), identity: identity(hostId), value: mode === "missing" ? { format: 1 } : {
+          format: 1, id: mode === "wrong-id" ? "session:other" : hostId, rootId: "session:other", identity: identity(hostId),
+          startedAt: old - 1000, updatedAt: old, expiresAt: old + 15_000,
+        } });
+      } finally { clock.mockRestore(); }
+      expect(f.directory.lineageAdoptable(oldRoot)).toBe(false);
+      const next = await f.candidate("bad-host-candidate");
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(next.owns(f.actor.id)).toBe(false);
+      expect(next.status(f.actor.id).rootId).toBe(oldRoot);
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "actors", "actors.json"), "utf8")).actors.find((row: { id: string }) => row.id === f.actor.id).rootId).toBe(oldRoot);
+    });
 
   it.each(["fresh", "20-second-lapse"])("does not adopt with absent Main and %s resident file-only lease", async mode => {
     const f = await fixture();

@@ -895,8 +895,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // Same stable id as residency/protocol.residentHostId, without importing its
     // runtime protocol graph into directory startup.
     const residentId = `resident:${createHash("sha256").update(target).digest("hex").slice(0, 24)}`;
-    if (participantFilePresent(this.mesh.root, key) || this.mesh.get(key, { fresh: true }) !== undefined) return true;
-    if (target.startsWith("session:") && this.mesh.get(`${LEGACY_SESSION_PREFIX}${target.slice(8)}`, { fresh: true }) !== undefined) return true;
+    // Freshness alone permits tolerant damage recovery. Every absence read must
+    // validate the complete canonical payload, including the locked adoption pass.
+    const read = { strict: true };
+    if (participantFilePresent(this.mesh.root, key) || this.mesh.get(key, read) !== undefined) return true;
+    if (target.startsWith("session:") && this.mesh.get(`${LEGACY_SESSION_PREFIX}${target.slice(8)}`, read) !== undefined) return true;
 
     let longestTtl = Math.max(this.#leaseMs, MAIN_RELOAD_LEASE_MS, PARTICIPANT_LEASE_MS);
     let lastSeen = Number.NEGATIVE_INFINITY;
@@ -923,11 +926,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
     };
     // Scan all lineage hosts, including residentHostId(target), and file-only leases
     // with no shared host record. A fresh resident lease protects an absent Main.
-    for (const entry of this.mesh.listAll(HOST_PREFIX, { fresh: true })) {
+    for (const entry of this.mesh.listAll(HOST_PREFIX, read)) {
       if (!isObject(entry.value)) throw new Error("Invalid host record");
-      if (entry.value.rootId !== target && entry.value.id !== target && entry.value.id !== residentId && entry.key !== keyFor(HOST_PREFIX, residentId)) continue;
+      // These keys identify the lineage even when value attribution is absent or
+      // conflicting. Validate them before filtering hosts by their value fields.
+      const canonical = entry.key === keyFor(HOST_PREFIX, target) || entry.key === keyFor(HOST_PREFIX, residentId);
+      if (!canonical && entry.value.rootId !== target && entry.value.id !== target && entry.value.id !== residentId) continue;
       const host = hostFromEntry(entry);
-      if (!host || entry.key !== keyFor(HOST_PREFIX, host.id)) return true;
+      if (!host || entry.key !== keyFor(HOST_PREFIX, host.id) || (canonical && host.rootId !== target)) return true;
       remember(entry.updatedAt);
       if (leaseEvidence(host.updatedAt, host.expiresAt)) return true;
     }
@@ -936,7 +942,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (leaseEvidence(lease.updatedAt, lease.expiresAt)) return true;
     }
 
-    const closure = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, target), { fresh: true });
+    const closure = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, target), read);
     const receipt = closure?.value;
     if (closure !== undefined) {
       if (!(isObject(receipt) && receipt.format === 1 && receipt.rootId === target &&
@@ -949,7 +955,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
 
     let knownPresence = false;
-    const participants = [...this.mesh.listAll(PARTICIPANT_PREFIX, { fresh: true }),
+    const participants = [...this.mesh.listAll(PARTICIPANT_PREFIX, read),
       ...readParticipantFiles(this.mesh.root, { strict: true })];
     for (const entry of participants) {
       if (!isObject(entry.value)) return true;
@@ -963,7 +969,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // the required retained history when the Main record itself is absent.
       if (participant.kind === "actor") knownPresence = true;
     }
-    for (const entry of this.mesh.listAll(LEGACY_ACTOR_PREFIX, { fresh: true })) {
+    for (const entry of this.mesh.listAll(LEGACY_ACTOR_PREFIX, read)) {
       if (entry.updatedBy.id !== target && !(isObject(entry.value) && entry.value.rootId === target)) continue;
       const actor = entry.value;
       if (!isObject(actor) || typeof actor.id !== "string" || typeof actor.name !== "string" ||

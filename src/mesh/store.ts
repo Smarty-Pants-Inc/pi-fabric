@@ -68,6 +68,8 @@ interface MeshStateFile {
 export interface MeshReadOptions {
   /** Read and parse the canonical file on every call, without reusing a cached snapshot. */
   fresh?: boolean;
+  /** Non-recovering canonical read with full envelope validation. Ignores caches and snapshot hints; throws on unreadable/missing state. */
+  strict?: boolean;
   /** Reuse one already-captured canonical state for a multi-namespace scan. */
   snapshot?: object;
 }
@@ -194,6 +196,31 @@ const isMeshStateFile = (value: unknown): value is MeshStateFile => {
   return typeof entries === "object" && entries !== null && !Array.isArray(entries);
 };
 
+// A syntactically valid envelope can still hide records from namespace scans:
+// validate every member's attribution before a strict reader infers absence.
+const validateAuthoritativeState = (state: MeshStateFile): void => {
+  const object = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+  const revision = (value: unknown): boolean => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  if ((state.revisionFormat !== undefined && state.revisionFormat !== 2) ||
+    (state.highWater !== undefined && !revision(state.highWater)) ||
+    (state.readGeneration !== undefined && typeof state.readGeneration !== "string") ||
+    (state.versions !== undefined && (!object(state.versions) || !Object.values(state.versions).every(revision))) ||
+    (state.tombstoneOrder !== undefined && (!Array.isArray(state.tombstoneOrder) || !state.tombstoneOrder.every(key => typeof key === "string" && KEY_PATTERN.test(key))))) {
+    throw new Error("Invalid mesh state metadata");
+  }
+  for (const [key, entry] of Object.entries(state.entries)) {
+    if (!KEY_PATTERN.test(key) || !object(entry) || entry.key !== key || !Object.hasOwn(entry, "value") ||
+      !revision(entry.version) || entry.version === 0 || typeof entry.updatedAt !== "number" || !Number.isFinite(entry.updatedAt) ||
+      !object(entry.updatedBy) || typeof entry.updatedBy.id !== "string" || typeof entry.updatedBy.name !== "string" ||
+      !["main", "actor", "agent"].includes(String(entry.updatedBy.kind)) ||
+      (entry.updatedBy.sessionId !== undefined && typeof entry.updatedBy.sessionId !== "string") ||
+      (entry.updatedBy.verified !== undefined && entry.updatedBy.verified !== "bridge")) {
+      throw new Error("Invalid mesh state entry");
+    }
+  }
+};
+
 const recoverConcatenatedState = (serialized: string): MeshStateFile | undefined => {
   const snapshots: MeshStateFile[] = [];
   let documents = 0;
@@ -239,7 +266,7 @@ const recoverConcatenatedState = (serialized: string): MeshStateFile | undefined
 const emptyState = (): MeshStateFile => ({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 });
 
 const readState = (
-  filePath: string, maxBytes: number, recoverDamage = true, observed?: (serialized: string) => void,
+  filePath: string, maxBytes: number, recoverDamage = true, observed?: (serialized: string) => void, strict = false,
 ): MeshStateFile => {
   let serialized: string;
   try {
@@ -248,7 +275,7 @@ const readState = (
     if (stat.size === 0 && recoverDamage) return emptyState();
     serialized = readFileRetrying(filePath);            // a lock-free read can meet a replace on Windows
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return emptyState();
+    if (errorCode(error) === "ENOENT" && !strict) return emptyState();
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to read Fabric mesh state: ${message}`);
   }
@@ -256,6 +283,7 @@ const readState = (
   try {
     const parsed: unknown = JSON.parse(serialized);
     if (isMeshStateFile(parsed)) {
+      if (strict) validateAuthoritativeState(parsed);
       observed?.(serialized);
       return parsed;
     }
@@ -263,7 +291,7 @@ const readState = (
   } catch (error) {
     // Failed parsing must not silently erase the allocation clock. Read-only
     // startup can tolerate damage, but mutations require a repaired snapshot.
-    const recovered = recoverConcatenatedState(serialized);
+    const recovered = !strict && recoverConcatenatedState(serialized);
     if (recovered) return recovered;
     if (!recoverDamage) throw new Error("Failed to read Fabric mesh state: invalid state format");
     // Preserve the original bytes at this path as a barrier to clock reset.
@@ -1092,7 +1120,7 @@ export class MeshStore {
   // decides a protocol step rather than a listing.
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
-    const entries = this.#readCachedState(options.fresh === true).entries;
+    const entries = this.#readStateForRead(options).entries;
     return Object.hasOwn(entries, key) ? jsonClone(entries[key]) : undefined;
   }
 
@@ -1114,7 +1142,7 @@ export class MeshStore {
    * while the token is unchanged (smarty-dev#557).
    */
   stateToken(options: MeshReadOptions = {}): object {
-    return this.#readCachedState(options.fresh === true);
+    return this.#readStateForRead(options);
   }
 
   /**
@@ -1129,7 +1157,9 @@ export class MeshStore {
   #select(prefix: string, options: MeshReadOptions): MeshStateEntry[] {
     if (prefix) this.#validateKey(prefix);
     const fresh = options.fresh === true;
-    const state = options.snapshot !== undefined
+    const state = options.strict === true
+      ? this.#readStateForRead(options)
+      : options.snapshot !== undefined
       ? options.snapshot as MeshStateFile
       : (!fresh && this.#signalledState(prefix)) || this.#readCachedState(fresh);
     const memo = this.#memoOf(state);
@@ -1519,6 +1549,14 @@ export class MeshStore {
     }
     const cached = this.#stateCache;
     return cached ? `${cached.device}:${cached.inode}:${cached.size}:${cached.modifiedAt}` : undefined;
+  }
+
+  #readStateForRead(options: MeshReadOptions): MeshStateFile {
+    // Proof reads must neither reuse a tolerant parse nor salvage only part of the
+    // canonical payload. Keep normal listing/startup recovery behavior unchanged.
+    return options.strict === true
+      ? readState(this.#statePath, this.#maxStateBytes, false, undefined, true)
+      : this.#readCachedState(options.fresh === true);
   }
 
   #readCachedState(fresh = false, canonical = fresh): MeshStateFile {

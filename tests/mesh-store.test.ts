@@ -186,6 +186,30 @@ describe("MeshStore", () => {
     expect(store.get("shared/value")?.value).toEqual({ revision: 1 });
   });
 
+  it.each(["", " \n\t", "{truncated", "{}", '{"format":1,"entries":{"hidden":{"key":"other"}}}', '{"format":1,"entries":{},"highWater":"invalid"}', '{"format":1,"entries":{}}\n{"format":1,"entries":{}}'])
+    ("strict reads reject damaged state %j instead of cached or recovered absence", async damaged => {
+      const store = createStore({ readCacheMs: 60_000 });
+      await store.put({ key: "shared/value", value: true, identity });
+      const snapshot = store.stateToken();
+      fs.writeFileSync(path.join(store.root, "state.json"), damaged);
+      expect(() => store.get("shared/missing", { strict: true })).toThrow("Failed to read Fabric mesh state");
+      expect(() => store.listAll("shared/", { strict: true, snapshot })).toThrow("Failed to read Fabric mesh state");
+      expect(() => store.listAllShared("shared/", { strict: true })).toThrow("Failed to read Fabric mesh state");
+      expect(() => store.stateToken({ strict: true })).toThrow("Failed to read Fabric mesh state");
+    });
+
+  it("strict reads bypass warm caches and fail closed on missing canonical state", async () => {
+    const store = createStore({ readCacheMs: 60_000 });
+    await store.put({ key: "shared/value", value: true, identity });
+    const writer = new MeshStore(store.root, 64 * 1024, 100);
+    await writer.put({ key: "shared/value", value: false, identity });
+    expect(store.get("shared/value")?.value).toBe(true);
+    expect(store.get("shared/value", { strict: true })?.value).toBe(false);
+    expect(store.listAll("shared/", { strict: true })[0]?.value).toBe(false);
+    fs.unlinkSync(path.join(store.root, "state.json"));
+    expect(() => store.get("shared/value", { strict: true })).toThrow("Failed to read Fabric mesh state");
+  });
+
   it("treats an empty state file as a missing table", () => {
     const store = createStore();
     const statePath = path.join(store.root, "state.json");

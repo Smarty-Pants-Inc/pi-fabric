@@ -96,8 +96,7 @@ export interface MeshStoreOptions {
 
 // Capture the opt-in once at process startup/module load: no timer, key classification,
 // counters, extra serialization, filesystem work or per-commit environment lookup when off.
-const commitStats = process.env.PI_FABRIC_COMMIT_STATS
-  ? createCommitStats(process.env.PI_FABRIC_COMMIT_STATS) : undefined;
+const commitStats = createCommitStats();
 
 // Opt-in commit diagnostics: no values or stacks are collected on the normal path.
 // Capture before entering the async lock so the actual writer survives the await boundary.

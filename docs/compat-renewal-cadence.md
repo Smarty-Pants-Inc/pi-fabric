@@ -82,7 +82,8 @@ roots were used and the scratch checkout is not part of the commit.
 ## Per-process counter for Light
 
 Set `PI_FABRIC_COMMIT_STATS=/existing/private/directory/commits.jsonl` **before starting**
-the Pi process. The opt-in is captured on module load; changing it later does not turn
+the Pi process. The opt-in (including disabled) is captured at the first store module
+load for the whole process; changing it later or loading another release does not turn
 collection on or redirect the sink. No credentials, strace, or fleet topology change
 is needed. Use a distinct path per process, or share a JSONL file and distinguish `pid`.
 
@@ -98,7 +99,12 @@ successful append.
 Accounting is at the one MeshStore state commit boundary immediately after successful
 atomic replacement. Failed writes/CAS, absent deletes, empty/no-op batches, events,
 file leases, signal files, and `confirmWritable()` are not state.json commits. Multiple
-MeshStore instances in the process share the counter. Off by default: no timer,
+MeshStore instances and release/module generations in the process share the counter
+through `globalThis[Symbol.for("pi-fabric.mesh.commit-stats")]`. The versioned registry
+keeps a stable record API: an older or newer compatible generation reuses the original
+owner, sink, aggregates and minute boundary. There is exactly one unref'd timer; process
+exit clears it without a final partial row. Session shutdown/reload does not retire it.
+Off by default: no timer,
 counters, key classification, stack capture, extra serialization, filesystem work, or
 per-commit environment lookup; only the disabled optional hook remains.
 

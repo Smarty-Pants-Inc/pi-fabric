@@ -1,7 +1,7 @@
 import { ModelRoutePinError, resolvePiRoutePin, type PiModelRegistryView } from "../core/model-refresh.js";
 import type { FabricModelAliases } from "../core/model-resolution.js";
 import { isFabricThinking } from "../thinking.js";
-import { decideModelRoute, type ModelRoutingConfig, type ModelRouteDecision, type RouteEvaluate } from "./model-route.js";
+import { decideModelRoute, isRouteAdmissionBlocked, ROUTABLE_CLASSES, type ModelRoutingConfig, type ModelRouteDecision, type RouteEvaluate } from "./model-route.js";
 
 /** Shared auto-task/actor preparation: exact pins, finite authenticated candidates, one shadow Choice. */
 export async function prepareModelRoute(input: {
@@ -31,10 +31,32 @@ export async function prepareModelRoute(input: {
     }
   }
   const candidates = input.config?.shadowCandidates ?? [];
-  const candidatesValid = candidates.length <= 16 && candidates.every(candidate =>
+  let candidatesValid = candidates.length <= 16 && candidates.every(candidate =>
     isFabricThinking(candidate.effort) && available.some(model => `${model.provider}/${model.id}` === candidate.model));
-  return decideModelRoute({ routeClass: input.routeClass, protected: input.protected, pin, candidates,
-    candidatesValid, parentSessionId: input.parentSessionId,
+  // Live execution must honor the same deny policy and supported effort floor as its pin.
+  if (candidatesValid) {
+    try {
+      for (const candidate of candidates) {
+        input.assertModelAllowed(candidate.model);
+        const model = available.find(model => `${model.provider}/${model.id}` === candidate.model)!;
+        if (typeof (model as { reasoning?: unknown }).reasoning === "boolean") {
+          const { getSupportedThinkingLevels } = await import("@earendil-works/pi-ai");
+          if (!getSupportedThinkingLevels(model as Parameters<typeof getSupportedThinkingLevels>[0]).includes(candidate.effort)) candidatesValid = false;
+        }
+      }
+    } catch { candidatesValid = false; }
+  }
+  const reset = input.config?.revertReset?.[input.routeClass] ?? "";
+  let live = input.protected === false && ROUTABLE_CLASSES.includes(input.routeClass) && input.config?.liveClasses?.includes(input.routeClass) === true;
+  let admissionReason: "admission-blocked" | "admission-state-error" | undefined;
+  if (live) {
+    try { if (isRouteAdmissionBlocked(input.routeClass, reset)) { live = false; admissionReason = "admission-blocked"; } }
+    catch { live = false; admissionReason = "admission-state-error"; }
+  }
+  const decision = await decideModelRoute({ routeClass: input.routeClass, protected: input.protected, pin, candidates,
+    candidatesValid, live, revertReset: reset, parentSessionId: input.parentSessionId,
     ...(input.modelReason !== undefined ? { modelReason: input.modelReason } : {}),
     ...(input.actorId ? { actorId: input.actorId } : {}), ...(input.activationId ? { activationId: input.activationId } : {}) }, input.evaluate, input.signal);
+  if (admissionReason) { decision.mode = "shadow"; decision.reasonCode = admissionReason; Object.assign(decision, pin); }
+  return decision;
 }

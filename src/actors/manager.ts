@@ -422,6 +422,9 @@ export class ActorManager {
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
   readonly #logs: ActorLogStore;
+  // Failed archives outlive lastRunId changes. Retry every retained join, not just
+  // the immediately previous activation; cleanup follows confirmed archival.
+  readonly #pendingRunArchives = new Map<string, Set<string>>();
   readonly #childCompletionStores = new Map<string, ActorChildCompletionStore>();
   readonly #acquireCapabilityView:
     | ((
@@ -2251,6 +2254,13 @@ export class ActorManager {
         await this.agents.close();
         await settleWithin([drains], this.#closeGraceMs);
       }
+      // Retry every durable join before AgentManager.close. Failed sinks keep
+      // their source veto on disk for the next execution owner.
+      for (const actor of owned) {
+        const pending = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
+          ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
+        for (const runId of pending) await this.#retainRunLog(actor, runId).catch(() => undefined);
+      }
       for (const actor of owned) {
         if (actor.status !== "stopped") actor.status = "idle";
         actor.updatedAt = Date.now();
@@ -2679,7 +2689,9 @@ export class ActorManager {
                 actorId: actor.id, activationId: item.id }, abortController.signal);
             })
             : undefined;
-          const launchBinding = routeDecision ? { ...binding, model: routeDecision.pin.model, thinking: routeDecision.pin.effort }
+          const launchBinding = routeDecision ? { ...binding,
+            model: routeDecision.mode === "live" ? routeDecision.model : routeDecision.pin.model,
+            thinking: routeDecision.mode === "live" ? routeDecision.effort : routeDecision.pin.effort }
             : await this.#prepare(actor, "binding", () => this.#resolvedRunBinding(actor, binding));
           // Admission is held, but no child writer has launched yet. Repair/create
           // the native session before handing its path to the process.
@@ -2895,15 +2907,21 @@ export class ActorManager {
           // actor sent to and received from its model, even after a successful
           // run cleans up the in-memory handle and tmp run directory. Failed
           // runs stay in the agent registry for agents.status(lastRunId).
+          let archived = false;
           if (runId) {
-            await this.#retainRunLog(actor, runId).catch(() => undefined);
+            archived = await this.#retainRunLog(actor, runId).then(() => true, () => false);
           }
           // Release the in-memory handle and tmp run dir for completed runs;
           // failed runs are retained for agents.status(actor.lastRunId).
-          if (previousRunId && previousRunId !== runId) {
-            await this.agents.cleanup(previousRunId).catch(() => ({ cleaned: false }));
+          const priorArchives = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
+            ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
+          if (previousRunId && previousRunId !== runId) priorArchives.add(previousRunId);
+          for (const priorRunId of priorArchives) {
+            if (priorRunId === runId) continue;
+            const priorArchived = await this.#retainRunLog(actor, priorRunId).then(() => true, () => false);
+            if (priorArchived) await this.agents.cleanup(priorRunId).catch(() => ({ cleaned: false }));
           }
-          if (runId && runCompleted) {
+          if (runId && runCompleted && archived) {
             await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
           }
           delete actor.abortController;
@@ -3445,7 +3463,14 @@ export class ActorManager {
   }
 
   async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {
-    await this.#logs.retainRun(actor, runId, this.agents.runDirectory(runId));
+    let pending = this.#pendingRunArchives.get(actor.id);
+    if (!pending) this.#pendingRunArchives.set(actor.id, pending = new Set());
+    pending.add(runId);
+    const source = this.agents.runDirectory(runId) ?? this.agents.actorArchiveSources(actor.id, actor.sessionFile).get(runId);
+    await this.#logs.retainRun(actor, runId, source);
+    if (source) await this.agents.commitActorArchive(runId, actor.id, actor.sessionFile);
+    pending.delete(runId);
+    if (!pending.size) this.#pendingRunArchives.delete(actor.id);
   }
 
   #startRetentionSweep(): void {

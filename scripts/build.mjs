@@ -55,6 +55,7 @@ const lazyEntryPoints = [
   "src/core/file-lock.ts",
   "src/ui/fabric-model-selector.ts",
   "src/topology/peer-settle.ts",
+  "src/residency/launcher-owner.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
   "src/core/pattern-kill.ts",

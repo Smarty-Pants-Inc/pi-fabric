@@ -29,6 +29,15 @@ export class FabricParticipantNotYetMirroredError extends Error {
   }
 }
 
+export class FabricDirectoryUnavailableError extends Error {
+  override readonly name = "FabricDirectoryUnavailableError";
+  readonly code = "FABRIC_DIRECTORY_UNAVAILABLE";
+  readonly retryable = true;
+  constructor(reason: string, cause?: unknown) {
+    super(`Fabric directory unavailable (retry): ${reason}`, { cause });
+  }
+}
+
 export class FabricParticipantNonInteractiveError extends Error {
   override readonly name = "FabricParticipantNonInteractiveError";
   readonly code = "FABRIC_PARTICIPANT_NON_INTERACTIVE";
@@ -94,7 +103,7 @@ export class AgentMessageRouter {
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
-    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive">>,
+    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
@@ -104,38 +113,90 @@ export class AgentMessageRouter {
     // Discovery and admission share this directory/root. A cached negative may predate the
     // bridge's first presence refresh: re-read its files + state before declaring it unknown.
     // lastKnown also reads fresh, but deliberately discards newly live records (smarty-dev#2377).
-    return this.participants.get(id) ?? this.participants.get(id, undefined, { fresh: true });
+    const participant = this.#directoryRead(() =>
+      this.participants.get(id) ?? this.participants.get(id, undefined, { fresh: true }));
+    const reason = !participant ? this.#directoryUnavailable() : undefined;
+    if (reason) throw new FabricDirectoryUnavailableError(reason);
+    return participant;
+  }
+
+  #unknownParticipant(id: string, label?: string): Error {
+    return this.#directoryRead(() => unknownParticipant(this.participants, id, label));
+  }
+
+  #directoryRead<T>(read: () => T): T {
+    try {
+      const value = read();
+      const reason = this.#directoryUnavailable();
+      if (reason) throw new FabricDirectoryUnavailableError(reason);
+      return value;
+    } catch (error) {
+      if (error instanceof FabricDirectoryUnavailableError) throw error;
+      throw new FabricDirectoryUnavailableError(error instanceof Error ? error.message : String(error), error);
+    }
+  }
+
+  #directoryUnavailable(): string | undefined {
+    return this.participants.routingUnavailable
+      ? this.participants.routingUnavailable()
+      : this.participants.writeStalled?.()?.message;
+  }
+
+  async #withDirectory<T>(operation: () => Promise<T>): Promise<T> {
+    const reason = this.#directoryUnavailable();
+    if (reason) await this.#refreshDirectory(reason);
+    try {
+      return await operation();
+    } catch (error) {
+      // A read can fail after the preflight. Retry resolution once, never delivery after
+      // an ACK/control error: only pre-publication directory failures have this class.
+      if (!(error instanceof FabricDirectoryUnavailableError) || reason || !this.participants.refreshRoutingView) throw error;
+      await this.#refreshDirectory(error.message);
+      return operation();
+    }
+  }
+
+  async #refreshDirectory(reason: string): Promise<void> {
+    if (!this.participants.refreshRoutingView) throw new FabricDirectoryUnavailableError(reason);
+    try {
+      await this.participants.refreshRoutingView();
+      const unavailable = this.#directoryUnavailable();
+      if (unavailable) throw new Error(unavailable);
+    } catch (error) {
+      throw new FabricDirectoryUnavailableError(error instanceof Error ? error.message : String(error), error);
+    }
   }
 
   #lapsedRoot(id: string): FabricParticipantInfo | undefined {
     // A write-stalled mesh explains the lapse, and delivery needs the mesh: report the stall.
-    if (this.participants.writeStalled?.()) return undefined;
+    const reason = this.#directoryUnavailable();
+    if (reason) throw new FabricDirectoryUnavailableError(reason);
     // A busy Main can miss its heartbeat without losing its durable control mailbox (smarty-dev#3686).
     // Read presence without filtering leases: get() and lastKnown() can both omit a root
     // when its lease renews between those reads. Unknown lineage is not proof of death.
     const root = this.participants.list
-      ? this.participants.list({ scope: "project", kinds: ["root"], includeStale: true, fresh: true })
+      ? this.#directoryRead(() => this.participants.list!({ scope: "project", kinds: ["root"], includeStale: true, fresh: true }))
         .find((participant) => participant.id === id)
-      : this.participants.lastKnown?.(id)?.participant;
+      : this.#directoryRead(() => this.participants.lastKnown?.(id)?.participant);
     return root && this.#eligibleRetainedRoot(root) ? root : undefined;
   }
 
   #eligibleRetainedRoot(root: FabricParticipantInfo): boolean {
     // Names and exact ids share the same lease-independent native eligibility. A stalled
     // writer, reload/exit, dead lineage or lapsed bridge must never gain a new route by name.
-    if (this.participants.writeStalled?.() || root.kind !== "root") return false;
+    if (this.#directoryUnavailable() || root.kind !== "root") return false;
     // Reload leases are a hard bound, not an ordinary heartbeat flap; an exit is never routable.
     if (["reloading", "stopping"].includes(root.status)) return false;
     // A mirrored lease lapses when the mesh bridge stops: nothing would carry the reply, so the
     // sender gets the lapse error at once instead of an acknowledgement timeout (smarty-dev#2004).
-    return !root.remoteHost && this.participants.lineageAlive?.(root.rootId) !== false;
+    return !root.remoteHost && this.#directoryRead(() => this.participants.lineageAlive?.(root.rootId)) !== false;
   }
 
   #rootRouteSnapshot(id: string): FabricParticipantInfo | undefined {
-    const cached = this.participants.get(id);
+    const cached = this.#directoryRead(() => this.participants.get(id));
     // Keep a mirrored root's original bridge for the control plane's fresh admission check.
     if (cached?.kind === "root" && cached.remoteHost) return cached;
-    const fresh = this.participants.get(id, undefined, { fresh: true }) ?? this.#lapsedRoot(id);
+    const fresh = this.#directoryRead(() => this.participants.get(id, undefined, { fresh: true })) ?? this.#lapsedRoot(id);
     if (cached?.kind === "root") {
       // Refresh native lifecycle state only under the same authority. A replacement mirror
       // with the same id must never turn a private native delivery into bridge publication.
@@ -163,12 +224,14 @@ export class AgentMessageRouter {
   // ownership and capabilities. Exact ids, UUID aliases and local `main` keep precedence.
   #messageTarget(id: string): string {
     const target = this.#sessionTarget(id);
-    if (this.mainAgent.matches(target) || this.#get(target) || this.#lapsedRoot(target)) return target;
+    if (this.mainAgent.matches(target) || this.#get(target) || this.#lapsedRoot(target) || target.trim().startsWith("session:")) return target;
     // A published name survives an ordinary lease lapse just like its exact session id.
     // Use fresh raw presence, but add only eligible retained native roots to the live set.
-    const matches = this.participants.list?.({ scope: "project", kinds: ["root"], includeStale: true, fresh: true })
+    const matches = this.participants.list
+      ? this.#directoryRead(() => this.participants.list!({ scope: "project", kinds: ["root"], includeStale: true, fresh: true }))
       .filter((participant) => participant.name === target &&
-        (!participant.stale || this.#eligibleRetainedRoot(participant))) ?? [];
+        (!participant.stale || this.#eligibleRetainedRoot(participant)))
+      : [];
     if (matches.length > 1) {
       throw new Error(`Ambiguous Fabric participant: ${id} (${matches.map((participant) => participant.id).sort().join(", ")}); use an exact id`);
     }
@@ -189,9 +252,40 @@ export class AgentMessageRouter {
     return root.id;
   }
 
+  /** Exact process-owned targets need no shared-directory authority or freshness. */
+  isProcessOwnedTarget(id: string): boolean {
+    if (this.mainAgent.local && this.mainAgent.matches(id)) return true;
+    // UUID aliases and published names still require directory selector precedence.
+    if (id.trim().startsWith("session:") || SESSION_UUID.test(id.trim())) return false;
+    try { return this.manager.status(id).id === id; }
+    // A name/prefix ambiguity is not local proof: preserve directory selector
+    // precedence, then let ordinary task resolution report its original error.
+    catch { return false; }
+  }
+
+  /** Stop shares delivery's exact local proof; actors and selectors retain directory admission. */
+  withStopDirectory<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    return this.isProcessOwnedTarget(id) ? operation() : this.#withDirectory(operation);
+  }
+
+  /** Normalize late stop-route reads just like message-route reads. */
+  resolveStopParticipant(id: string): FabricParticipantInfo | undefined {
+    return this.#get(id);
+  }
+
+  #localMainNonInteractive(): boolean {
+    if (this.mainAgent.interactive === false) return true;
+    // Preserve legacy directory-only non-interactive flags when readable, but never
+    // probe shared writability to deliver to the process's own Main controller.
+    try {
+      return (this.participants.get(this.mainAgent.id) ??
+        this.participants.get(this.mainAgent.id, undefined, { fresh: true }))?.interactive === false;
+    } catch { return false; }
+  }
+
   /** Use the same target resolution as delivery when grouping lifecycle sources. */
   isLocalMainTarget(id: string): boolean {
-    return this.mainAgent.local && this.mainAgent.matches(this.#messageTarget(id));
+    return this.mainAgent.local && (this.mainAgent.matches(id) || this.mainAgent.matches(this.#messageTarget(id)));
   }
 
   async routeMessage(
@@ -217,7 +311,13 @@ export class AgentMessageRouter {
     // Capture before routing yields; a queued incoming turn cannot change this send.
     if (context) context = snapshotFabricInvocation(context);
     options = { ...options, principal: context ? invocationFabricPrincipal(context) : undefined };
-    const result = await this.#withDurableRecovery(id, () => this.#route(id, message, data, kind, context, options));
+    // Task-local `main` remains its immutable immediate return address.
+    if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
+    const provenLocal = this.isProcessOwnedTarget(id);
+    const result = provenLocal
+      ? await this.#route(id, message, data, kind, context, options, true)
+      : await this.#withDurableRecovery(id, () =>
+        this.#withDirectory(() => this.#route(id, message, data, kind, context, options)));
     // smarty-dev#1826: an ack alone hid a Main whose held followUps no boundary would release.
     // Older owners never report `stalled`, so their results pass unchanged.
     if (kind === "followUp" && result?.stalled) {
@@ -239,9 +339,17 @@ export class AgentMessageRouter {
     for (;;) {
       try { return await operation(); }
       catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "FABRIC_MESH_LOCK_TIMEOUT") ||
+        const lockError = error instanceof FabricDirectoryUnavailableError ? error.cause : error;
+        if (!(lockError instanceof Error && "code" in lockError && lockError.code === "FABRIC_MESH_LOCK_TIMEOUT") ||
             !this.residency || !kernelFenceAvailable()) throw error;
-        const { actor, participant } = this.resolveActorTarget(id);
+        // Retained ownership proves only eligibility to wait for lock recovery,
+        // never permission to publish. The retried operation revalidates routing.
+        let actor: FabricActorInfo | undefined;
+        try { actor = this.actorManager.status(id); }
+        catch (lookupError) {
+          if (!(lookupError instanceof Error && /Unknown Fabric actor/.test(lookupError.message))) throw error;
+        }
+        const participant = this.participants.get(actor?.id ?? id);
         if ((actor?.residency ?? participant?.residency) !== "durable" ||
             (actor && (this.actorManager.owns?.(actor.id) ?? participant?.local)) ||
             !(actor?.rootId === this.residency.options.config.rootId || participant?.ownerHostId === this.residency.hostId)) throw error;
@@ -298,12 +406,13 @@ export class AgentMessageRouter {
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
     } = {},
+    provenLocal = false,
   ): Promise<FabricAgentMessageResult> {
     context?.signal?.throwIfAborted();
     const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
     // In a task child, main is the immutable immediate return address, not a role lookup.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
-    id = this.#messageTarget(id);
+    if (!provenLocal) id = this.#messageTarget(id);
     if (options.deadlineMs !== undefined) {
       // Do not silently lose the requested guarantee on a Main/actor/remote route.
       let task: ReturnType<typeof this.manager.status> | undefined;
@@ -313,7 +422,7 @@ export class AgentMessageRouter {
       if (!task || task.runner !== "pi") throw new Error("Delivery deadlines require a local Pi task agent");
     }
     const isMain = this.mainAgent.matches(id);
-    const remoteRoot = isMain ? undefined : this.#rootRouteSnapshot(id);
+    const remoteRoot = isMain || provenLocal ? undefined : this.#rootRouteSnapshot(id);
     // Project members include peer roots, not just this host's Main and actors.
     // Resolve their current owner through the same capability/control path.
     if (isMain || remoteRoot?.kind === "root") {
@@ -321,7 +430,7 @@ export class AgentMessageRouter {
       if (remoteRoot?.interactive === false) throw new FabricParticipantNonInteractiveError(remoteRoot.id);
       if (isMain && this.mainAgent.local) {
         // Local delivery needs no remote authority snapshot, but print/JSON Main is never interactive.
-        if (this.mainAgent.interactive === false || this.#get(this.mainAgent.id)?.interactive === false) {
+        if (this.#localMainNonInteractive()) {
           throw new FabricParticipantNonInteractiveError(this.mainAgent.id);
         }
         context?.activity?.({
@@ -344,7 +453,7 @@ export class AgentMessageRouter {
       }
       const participant = remoteRoot ?? this.#rootRouteSnapshot(this.mainAgent.id);
       if (!participant) {
-        throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, this.mainAgent.id, "Fabric Main participant");
+        throw this.participants.writeStalled?.() ?? this.#unknownParticipant(this.mainAgent.id, "Fabric Main participant");
       }
       if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
@@ -383,6 +492,11 @@ export class AgentMessageRouter {
       );
     }
 
+    // Explicit Main addresses never reach task/actor resolution, even when absent.
+    if (id.trim().startsWith("session:")) {
+      throw this.#unknownParticipant(id);
+    }
+
     // Local one-shot agent: forward between its turns via the worker's
     // steer.jsonl channel, preserving the child's accumulated context.
     try {
@@ -400,6 +514,10 @@ export class AgentMessageRouter {
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
     }
+
+    // A process-owned task that disappeared during delivery must not fall through
+    // into directory-backed publication outside the availability wrapper.
+    if (provenLocal) throw new Error(`Unknown Fabric agent: ${id}`);
 
     // Peer roots were resolved above with Main escalation and bridge fences.
     // Remote task agents use the same validated execution owner.
@@ -422,10 +540,10 @@ export class AgentMessageRouter {
     this.actorManager.validateDirectMessage(message, data);
     let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
     try {
-      target = await this.resolveActorMessageTarget(id);
+      target = await this.#resolveActorMessageTarget(id);
     } catch (error) {
       if (error instanceof Error && /Unknown Fabric actor/.test(error.message)) {
-        throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, id);
+        throw this.participants.writeStalled?.() ?? this.#unknownParticipant(id);
       }
       throw error;
     }
@@ -555,7 +673,7 @@ export class AgentMessageRouter {
       }
     }
     if (this.mainAgent.local && this.mainAgent.matches(command.targetId)) {
-      if (this.mainAgent.interactive === false || this.#get(this.mainAgent.id)?.interactive === false) {
+      if (this.#localMainNonInteractive()) {
         return { accepted: false, error: new FabricParticipantNonInteractiveError(this.mainAgent.id).message };
       }
       let result: FabricAgentMessageResult;
@@ -622,6 +740,11 @@ export class AgentMessageRouter {
   /** A lease can still look fresh after SIGKILL. For this root's non-owned durable
    * actors, check the real owner before delivery, not just participant freshness. */
   async resolveActorMessageTarget(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+    return this.#withDirectory(() => this.#resolveActorMessageTarget(id));
+  }
+
+  async #resolveActorMessageTarget(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+    if (id.trim().startsWith("session:")) throw this.#unknownParticipant(id, "Fabric Main participant");
     const target = this.resolveActorTarget(id);
     const { actor, participant } = target;
     if (this.residency && (actor?.residency ?? participant?.residency) === "durable" &&
@@ -637,10 +760,16 @@ export class AgentMessageRouter {
     return target;
   }
 
+  /** Async callers revalidate an overdue/uninitialized view before resolving ownership. */
+  async resolveActorTargetFresh(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+    return this.#withDirectory(async () => this.resolveActorTarget(id));
+  }
+
   resolveActorTarget(id: string): {
     actor?: FabricActorInfo;
     participant?: FabricParticipantInfo;
   } {
+    if (id.trim().startsWith("session:")) throw new Error(`Fabric Main participant ${id} is not an actor`);
     let actor: FabricActorInfo | undefined;
     try {
       actor = this.actorManager.status(id);

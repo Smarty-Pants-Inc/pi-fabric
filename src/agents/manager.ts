@@ -131,19 +131,24 @@ import {
 } from "../storage/retention.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
 
-const removeManagedRunRoot = async (root: string): Promise<void> => {
-  const deadline = Date.now() + (process.platform === "win32" ? 2_000 : 250);
+const removeManagedRunRoot = async (root: string, managed: boolean): Promise<void> => {
+  const deadline = Date.now() + (managed || process.platform === "win32" ? 2_000 : 250);
+  let emptyChecked = false;
   while (true) {
     try {
-      const entries = fs.readdirSync(root);
-      if (!entries.every((name) => name === ".fabric-owner.json")) return;
-      if (entries.includes(".fabric-owner.json")) fs.unlinkSync(path.join(root, ".fabric-owner.json"));
+      if (!emptyChecked) {
+        const entries = fs.readdirSync(root);
+        if (!entries.every((name) => name === ".fabric-owner.json")) return;
+        if (entries.includes(".fabric-owner.json")) fs.unlinkSync(path.join(root, ".fabric-owner.json"));
+        emptyChecked = true;
+      }
+      // rmdir itself protects contents appearing after the initial empty check.
       fs.rmdirSync(root);
       return;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException | undefined)?.code;
-      if ((code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY") || Date.now() >= deadline) return;
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      if ((code !== "EBUSY" && code !== "EPERM" && (managed || code !== "ENOTEMPTY")) || Date.now() >= deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(managed ? 50 : 25, deadline - Date.now())));
     }
   }
 };
@@ -3123,9 +3128,9 @@ export class AgentManager {
             .filter(queued => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
               !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
             .map(queued => removeTree(path.join(this.#runRoot, queued.info.id)).catch(() => undefined)));
-          // Windows can retain the just-closed worker directory briefly. Retry
-          // only the owned empty root; never recursively remove unknown contents.
-          await removeManagedRunRoot(this.#runRoot);
+          // Independently collectible tracked runs were removed above. Retry only
+          // the owned empty root; never recursively remove unknown contents.
+          await removeManagedRunRoot(this.#runRoot, this.#managedTempRoot);
         }
       } else if (this.#managedTempRoot) {
         try { markRunRootClosed(this.#runRoot, Date.now(), true); } catch {}

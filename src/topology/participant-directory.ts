@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, participantRole, repositoryOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
-import { MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { assertMeshStateReadable, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type {
   FabricHostRecord,
   FabricParticipantInfo,
@@ -431,6 +431,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshedAt = Date.now();
   #refreshStartedAt: number | undefined;
   #refreshError: unknown;
+  /** A bounded routing read is not a heartbeat/admission receipt. */
+  #routingReadAt = 0;
+  #routingError: unknown;
   #leaseConfirmed = false;
   #deadHostSweepAt = Date.now();
   #quiescing = false;
@@ -462,6 +465,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#closed) this.#localRecords.delete(this.options.rootId);
     this.#closed = false;
     this.#refreshError = undefined;
+    this.#routingReadAt = 0;
     this.#leaseConfirmed = false;
     this.#refreshedAt = Date.now();
     if (this.options.enabled) {
@@ -476,6 +480,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           if (this.#refreshing && this.#fileWork > 0 && !this.#quiescing) this.#renewFileLease();
         } catch (error) {
           this.#refreshError = error;
+          this.#routingReadAt = 0;
           this.#backgroundRefresh.failure(error);
           return;
         }
@@ -548,9 +553,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#refreshedAt = committed;
       this.#leaseConfirmed = true;
       this.#refreshError = undefined;
+      this.#routingError = undefined;
       if (full) this.#sweepDeadHosts();
     } catch (error) {
       this.#refreshError = error;
+      this.#routingReadAt = 0;
       throw error;
     } finally {
       this.#refreshing = undefined;
@@ -933,6 +940,43 @@ export class ParticipantDirectory implements FabricParticipantSource {
       `Fabric mesh is write-stalled: ${lapsed} peer lease${lapsed === 1 ? "" : "s"} lapsed while this host's ` +
         `heartbeat has not committed for ${((now - confirmed) / 1000).toFixed(1)} s, so peer visibility is unknown, not empty.`,
     );
+  }
+
+  /** A cached negative is evidence of absence only while the directory is confirmed fresh. */
+  routingUnavailable(now = Date.now()): string | undefined {
+    if (!this.options.enabled) return undefined;
+    if (this.#closed) return "participant directory is closed";
+    if (this.#routingError !== undefined) return this.#routingError instanceof Error
+      ? this.#routingError.message : String(this.#routingError);
+    const confirmed = Math.max(this.#routingReadAt,
+      this.#leaseConfirmed && this.#refreshError === undefined ? this.#refreshedAt : 0);
+    if (confirmed > 0 && now - confirmed < this.#heartbeatMs * 2) return undefined;
+    if (this.#refreshError !== undefined) {
+      return this.#refreshError instanceof Error ? this.#refreshError.message : String(this.#refreshError);
+    }
+    return confirmed === 0 ? "participant directory has no confirmed view"
+      : `participant directory view is overdue (${now - confirmed} ms old)`;
+  }
+
+  /** Revalidate once under the ordinary mesh lock, without waiting for a long heartbeat write.
+   * Never promote this read to confirmedAt/canConsumeMesh: it renews no ownership lease. */
+  async refreshRoutingView(): Promise<void> {
+    if (this.#closed) throw new Error("participant directory is closed");
+    if (!this.options.enabled) return;
+    this.#routingReadAt = 0;
+    try {
+      await this.mesh.exclusive(() => {
+        // MeshStore reads are intentionally tolerant for dashboards. Routing absence is
+        // stronger: a damaged canonical state must never be confirmed as an empty view.
+        assertMeshStateReadable(this.mesh.root);
+        this.list({ scope: "project", includeStale: true, fresh: true });
+        this.#routingReadAt = Date.now();
+        this.#routingError = undefined;
+      }, 250);
+    } catch (error) {
+      this.#routingError = error;
+      throw error;
+    }
   }
 
   /** Resident consumers fail closed on failed/overdue renewal, not just peer visibility.

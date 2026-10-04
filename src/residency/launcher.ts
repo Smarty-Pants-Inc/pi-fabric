@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
-import { liveOwnerPid, observeResidentOwner } from "./launcher-owner.js";
+import { liveOwnerPid, observeResidentOwner, captureDescendants, stopObservedDescendants, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
@@ -44,7 +44,6 @@ const writeFailure = (root: string, error: unknown): void => {
   } catch { /* Diagnostics can never suppress owned recovery. */ }
 };
 
-interface OwnedProcess { pid: number; processStartTime: string; ppid: number; state: string; }
 interface Attempt {
   spec?: ResidentLaunchSpec;
   child: ChildProcess;
@@ -56,32 +55,6 @@ interface Attempt {
   processes: Map<number, OwnedProcess>;
   stderr: string;
 }
-function processRows(): OwnedProcess[] {
-  const rows: OwnedProcess[] = [];
-  for (const name of fs.readdirSync("/proc")) {
-    if (!/^\d+$/.test(name)) continue;
-    try {
-      const stat = fs.readFileSync(`/proc/${name}/stat`, "utf8");
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
-      rows.push({ pid: Number(name), ppid: Number(fields[1]), state: fields[0]!, processStartTime: fields[19]! });
-    } catch { /* Exited during observation. */ }
-  }
-  return rows;
-}
-function captureDescendants(attempt: Attempt): void {
-  if (process.platform !== "linux") return;
-  const rows = processRows();
-  const selected = new Set(rows.filter((row) => attempt.processes.get(row.pid)?.processStartTime === row.processStartTime).map((row) => row.pid));
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const row of rows) if (selected.has(row.ppid) && !selected.has(row.pid)) { selected.add(row.pid); changed = true; }
-  }
-  for (const row of rows) if (selected.has(row.pid)) attempt.processes.set(row.pid, row);
-}
-function ownedAlive(attempt: Attempt): OwnedProcess[] {
-  return processRows().filter((row) => row.state !== "Z" && attempt.processes.get(row.pid)?.processStartTime === row.processStartTime);
-}
 /** Best-effort stop of birth-validated, observed attempt processes only.
  * Neither sampling nor a free host fence proves complete membership/exit.
  * This cleanup must never authorize a fallback after a spawned target.
@@ -91,21 +64,7 @@ function stopAttempt(attempt: Attempt): Promise<void> {
     // Sampling is only best-effort descendant cleanup. The direct child must
     // also be stopped through its native handle, even when its birth could not
     // be observed. Exclude it from PID-based cleanup and join both operations.
-    const observed = (async () => {
-      if (process.platform !== "linux") return;
-      captureDescendants(attempt);
-      const descendantsAlive = () => ownedAlive(attempt).filter(row => row.pid !== attempt.child.pid);
-      for (const signal of ["SIGTERM", "SIGKILL"] as const) {
-        for (const row of descendantsAlive().reverse()) {
-          if (processStartTime(row.pid) !== row.processStartTime) throw new Error("Owned successor birth became uncertain");
-          try { process.kill(row.pid, signal); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
-        }
-        const deadline = Date.now() + 5_000;
-        while (descendantsAlive().length && Date.now() < deadline) { captureDescendants(attempt); await delay(50); }
-        if (!descendantsAlive().length) return;
-      }
-      throw new Error("Observed resident processes did not exit; fallback is blocked");
-    })();
+    const observed = stopObservedDescendants(attempt, attempt.child.pid);
     const results = await Promise.allSettled([attempt.native.stop(), observed]);
     // All cleanup has settled before an error is reported to the supervisor.
     for (const result of results) if (result.status === "rejected") throw result.reason;

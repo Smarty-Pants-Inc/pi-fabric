@@ -35,6 +35,7 @@ const stable = [
   "cli/index.js",
 ];
 const lazy = [
+  "residency/launcher-owner.js",
   "judge/agent.js",
   "core/landlock.js",
   "core/pattern-kill.js",

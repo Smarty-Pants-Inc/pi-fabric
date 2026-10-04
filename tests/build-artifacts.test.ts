@@ -73,6 +73,11 @@ describe("published build artifact guards", () => {
     fs.appendFileSync(path.join(dir, "dist/worker/result.js"), '\nimport "typebox/value";\n');
     rejected(dir, "Worker validator must be self-contained");
   });
+  it("rejects a missing lazy process-tree owner entry", () => {
+    const dir = fixture();
+    fs.rmSync(path.join(dir, "dist/residency/launcher-owner.js"));
+    rejected(dir, "residency/launcher-owner.js");
+  });
   it("rejects a missing lazy Bend grammar entry", () => {
     const dir = fixture();
     fs.rmSync(path.join(dir, "dist/ui/languages/bend.js"));

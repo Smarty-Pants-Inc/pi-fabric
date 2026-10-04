@@ -90,6 +90,60 @@ const stubState = () =>
   }) as unknown as FabricState;
 
 describe("FabricUiController dashboard wiring", () => {
+  it.each(["poll", "coalesced-refresh"] as const)("contains %s during an activation gap and clears old timers", async (kind) => {
+    vi.useFakeTimers();
+    const state = stubState();
+    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    let changed = () => {};
+    vi.mocked(state.actors.subscribe).mockImplementation(listener => { changed = listener; return () => {}; });
+    Object.assign(state, { peerInfos: () => [{ id: "peer", name: "peer", status: "idle" }] });
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      if (kind === "coalesced-refresh") changed();
+      expect(vi.getTimerCount()).toBe(kind === "poll" ? 1 : 2);
+      Object.assign(state, { initialized: false });
+      // The RC2 mesh getter throws synchronously, before a Promise can catch it.
+      Object.defineProperty(state, "mesh", { configurable: true, get() { throw new Error("Pi Fabric has not activated"); } });
+      state.config.mesh.enabled = true;
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(context.ui.notify).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+      controller.stop();
+      Object.assign(state, { initialized: true });
+      state.config.mesh.enabled = false;
+      controller.start(context);
+      expect(vi.getTimerCount()).toBe(1);
+      controller.stop();
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { controller.stop(); vi.useRealTimers(); }
+  });
+
+  it("contains a poll scheduling failure even when its host warning throws", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    let meshReads = 0;
+    const mesh = state.mesh;
+    Object.assign(state, { peerInfos: () => [{ id: "peer", name: "peer", status: "idle" }] });
+    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn(() => { throw new Error("stale UI"); }) } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      Object.defineProperty(state, "mesh", { configurable: true, get() {
+        meshReads++; throw new Error("poll mesh read failed");
+      } });
+      state.config.mesh.enabled = true;
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(meshReads).toBeGreaterThan(0);
+      expect(context.ui.notify).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      Object.defineProperty(state, "mesh", { value: mesh, configurable: true });
+      controller.stop(); vi.useRealTimers();
+    }
+  });
   it("uses incremental views, skips duplicate progress refreshes, and releases readers on stop", async () => {
     vi.useFakeTimers();
     const state = stubState();

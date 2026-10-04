@@ -1163,7 +1163,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const rootKey = keyFor(PARTICIPANT_PREFIX, this.options.rootId);
     if (!this.#localRecords.has(this.options.rootId) ||
       (!participantFilePresent(this.mesh.root, rootKey) && this.mesh.get(rootKey, { fresh: true }) === undefined)) {
-      await this.mesh.exclusive(() => { this.#renewFileLease(); });
+      await this.mesh.confirmWritable(() => { this.#renewFileLease(); });
     }
     const closure = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), { fresh: true });
     if (closure) await this.mesh.delete({ key: closure.key, ifVersion: closure.version });

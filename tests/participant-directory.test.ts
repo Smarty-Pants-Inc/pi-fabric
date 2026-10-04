@@ -263,7 +263,7 @@ describe("F3059 absent lineage death proof", () => {
     const resumed = new ParticipantDirectory(directory.mesh, { enabled: true, hostId: id, rootId: id, identity: { id, name: "main", kind: "main" } });
     directories.push(resumed);
     expect(directory.lineageAdoptable(id, at + 700_000)).toBe(true);
-    const custody = vi.spyOn(directory.mesh, "exclusive");
+    const custody = vi.spyOn(directory.mesh, "confirmWritable");
     const batch = vi.spyOn(directory.mesh, "writeBatch");
     await resumed.resumeLineage();
     expect(custody).toHaveBeenCalledTimes(1);

@@ -373,12 +373,16 @@ export const spawnDetached = async (
     },
     stop() {
       return stopping ??= (async () => {
-        // Capture descendants before native TERM can reparent detached shells.
-        // Reuse the launcher's birth-validated cleanup and join it independently
-        // of the direct child's existing native-close receipt.
-        const descendants = ownedTree && treeOwner
-          ? treeOwner.stopObservedDescendants(ownedTree, pid) : Promise.resolve();
-        const results = await Promise.allSettled([descendants, stopNative()]);
+        // Snapshot before native TERM can reparent detached shells, but let the
+        // worker handle stop and join its child first. Signalling Pi concurrently
+        // can publish a child-exit failure before the worker handles our TERM.
+        if (ownedTree && treeOwner) treeOwner.captureDescendants(ownedTree);
+        const results = await Promise.allSettled([stopNative()]);
+        // Native close alone is not tree exit. Join every captured survivor even
+        // if the bounded native stop failed; never let teardown reclassify stop.
+        if (ownedTree && treeOwner) results.push(...await Promise.allSettled([
+          treeOwner.stopObservedDescendants(ownedTree, pid),
+        ]));
         for (const result of results) if (result.status === "rejected") throw result.reason;
         if (process.platform === "linux" && lost !== undefined) throw new Error(lost);
       })();

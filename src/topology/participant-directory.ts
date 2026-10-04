@@ -1590,11 +1590,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   // Participant entries from their files and the shared state, the later of each key's two.
-  #participantEntries(read: { fresh?: boolean } = {}): MeshStateEntry[] {
+  #participantEntries(read: { fresh?: boolean; snapshot?: object } = {}): MeshStateEntry[] {
     return this.#mergedEntries(read).entries;
   }
 
-  #mergedEntries(read: { fresh?: boolean } = {}): ReturnType<typeof mergeParticipantEntries> {
+  #mergedEntries(read: { fresh?: boolean; snapshot?: object } = {}): ReturnType<typeof mergeParticipantEntries> {
     return mergeParticipantEntries(this.#participantFiles(read), this.mesh.listAll(PARTICIPANT_PREFIX, read));
   }
 

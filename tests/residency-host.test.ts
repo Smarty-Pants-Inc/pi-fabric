@@ -2,11 +2,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorLogStore } from "../src/actors/log-store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { projectOf, repositoryOf } from "../src/topology/project-identity.js";
-import { residentDeliveryPrefix } from "../src/residency/protocol.js";
+import { residentDeliveryPrefix, residentRoot } from "../src/residency/protocol.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { removeParticipantFileIf, writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
@@ -14,6 +16,7 @@ import { lockFile } from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
 import { ResidencyClient } from "../src/residency/client.js";
+import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -24,23 +27,132 @@ import { processStartTime, residentProcessAlive } from "../src/residency/process
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}) => {
+const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}, canonicalRoot = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-host-review-"));
   const config: ResidentHostConfig = {
     format: RESIDENT_HOST_FORMAT, rootId: "session:review", sessionId: "review",
     cwd: process.cwd(), projectRoot: process.cwd(), meshRoot: path.join(root, "mesh"),
-    actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
+    actorRoot: path.join(root, "actors"), residencyRoot: canonicalRoot ? residentRoot(path.join(root, "mesh"), "session:review") : path.join(root, "resident"),
     fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh,
     retention: { ...DEFAULT_FABRIC_CONFIG.retention, ...retention }, workerPath: path.resolve("dist/agents/worker.js"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
-  fs.mkdirSync(config.residencyRoot);
+  fs.mkdirSync(config.residencyRoot, { recursive: true });
   const configPath = path.join(config.residencyRoot, "config.json");
   fs.writeFileSync(configPath, JSON.stringify(config));
   const idle = vi.fn();
   const host = new ResidentHost(config, idle);
   return { root, config, host, idle };
 };
+
+describe("fresh startup ownership batches", () => {
+  it("a file-only writer between cached batches vetoes prune/manage and the locked registry merge", async () => {
+    const { root, config, host } = fixture();
+    const peerIdentity = { id: "session:peer-owner", name: "peer", kind: "main" as const };
+    const peer = new ParticipantDirectory(new MeshStore(config.meshRoot, 65536, 100), {
+      enabled: true, hostId: peerIdentity.id, rootId: config.rootId, identity: peerIdentity,
+    });
+    const sweeps: Array<() => void> = [];
+    const interval = globalThis.setInterval;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms: number, ...args: unknown[]) => {
+      if (ms === 15 * 60 * 1000) sweeps.push(callback);
+      return interval(callback, ms, ...args);
+    }) as typeof setInterval);
+    try {
+      await host.start(); await peer.start();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const actors: Awaited<ReturnType<typeof host.actors.create>>[] = [];
+      for (let i = 0; i < 10; i++) actors.push(await host.actors.create({ name: `owner-${i}`, instructions: "local", residency: "durable" }));
+      await host.participants.refresh(); // Publish every actor before priming the reader cache.
+      const victim = actors[9]!;
+      const expiredRun = path.join(path.dirname(victim.sessionFile!), "runs", "expired");
+      fs.mkdirSync(expiredRun, { recursive: true });
+      fs.writeFileSync(path.join(expiredRun, "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483646", finishedAt: 1 }));
+      const registry = new ActorRegistryStore(config.actorRoot);
+      const publishOwner = (target: typeof victim) => {
+        const prior = host.participants.list({ scope: "project", fresh: true }).find((record) => record.id === target.id)!;
+        expect(prior.ownerHostId).toBe(host.hostId);
+        const key = "topology/participants/" + createHash("sha256").update(target.id).digest("hex");
+        const entry = { format: 1, key, version: 2, updatedAt: Date.now() + 1000, updatedBy: peerIdentity,
+          value: { ...prior, ownerHostId: peerIdentity.id, ownerIdentityId: peerIdentity.id, updatedAt: Date.now() + 1000 } };
+        const file = path.join(config.meshRoot, "participants", key.split("/").at(-1)! + ".json");
+        // A different process must not invalidate this reader's production 2s cache.
+        execFileSync(process.execPath, ["-e", "const fs=require('node:fs');fs.writeFileSync(process.argv[1]+'.new',process.argv[2]);fs.renameSync(process.argv[1]+'.new',process.argv[1]);", file, JSON.stringify(entry)]);
+        expect(host.participants.list({ scope: "project" }).find((record) => record.id === target.id)?.ownerHostId).toBe(host.hostId);
+        registry.write(registry.records().map((record) => record.id === target.id ? { ...record, instructions: "remote-owner-state" } : record));
+      };
+      let published = false, writerError: unknown;
+      const prune = ActorLogStore.prototype.pruneRuns;
+      vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function(this: ActorLogStore, actor, now) {
+        prune.call(this, actor, now);
+        if (actor.sessionFile === actors[7]!.sessionFile && !published) {
+          setImmediate(() => {
+            try { publishOwner(victim); published = true; }
+            catch (error) { writerError = error; }
+          });
+        }
+      });
+      expect(sweeps).toHaveLength(2); for (const sweep of sweeps) sweep();
+      for (let i = 0; i < 5; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(writerError).toBeUndefined();
+      expect(published).toBe(true);
+      expect(fs.existsSync(expiredRun)).toBe(true);
+      host.actors.resumeQueued();
+      expect(host.actors.owns(victim.id)).toBe(false);
+      const saveVictim = actors[0]!;
+      await host.actors.create({ name: "save-trigger", instructions: "save", residency: "durable" }, {
+        asRegistryOwner: true, beforeCommit: () => publishOwner(saveVictim),
+      });
+      for (const id of [victim.id, saveVictim.id]) {
+        expect(registry.records().find((record) => record.id === id)?.instructions).toBe("remote-owner-state");
+      }
+    } finally {
+      vi.restoreAllMocks(); await peer.close(); await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resident activation filter telemetry", () => {
+  it("returns owning-host skips and expiry through the Main's resident status path", async () => {
+    const { root, config, host } = fixture({}, true);
+    const client = new ResidentActorClient(config.meshRoot, config.rootId);
+    const caller = { identity: { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId }, hostId: config.rootId };
+    const filter = [{ id: "review-claim", topic: ["github.demo"] }];
+    const participants = new ParticipantDirectory(new MeshStore(config.meshRoot, 65536, 1000), {
+      enabled: true, hostId: caller.hostId, rootId: config.rootId, identity: caller.identity,
+    });
+    participants.registerSource(() => [{
+      format: 1, id: config.rootId, kind: "root", rootId: config.rootId, ownerHostId: caller.hostId, ownerIdentityId: config.rootId,
+      name: "Main", status: "idle", residency: "session", runner: "pi", transport: "host", capabilities: [],
+      sessionId: config.sessionId, startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    }]);
+    try {
+      await participants.start();
+      await host.start();
+      const actor = await host.actors.create({ name: "claimed-review", instructions: "x", residency: "durable", topics: ["github.demo"], coalesceKey: "payload.number" });
+      const expiresAt = Date.now() + 30_000;
+      await client.setActor({ operation: "setActivationFilter", id: actor.id, activationFilter: filter, expiresAt }, undefined, caller);
+      const event = await new MeshStore(config.meshRoot, 65536, 1000).publish({ topic: "github.demo", from: caller.identity, data: { payload: { number: 7 } } });
+      const deadline = Date.now() + 5000;
+      while (host.actors.status(actor.id).filterSkipped.count !== 1) {
+        if (Date.now() > deadline) throw new Error("Resident skip did not arrive");
+        await delay(20);
+      }
+      expect(await client.actorStatus(actor.id)).toMatchObject({
+        activationFilterExpiresAt: expiresAt,
+        filterSkipped: { count: 1, lastKey: JSON.stringify(["mesh", event.topic, 7]), lastTopic: event.topic, lastAt: expect.any(Number) },
+      });
+      await client.setActor({ operation: "setActivationFilter", id: actor.id, activationFilter: filter, expiresAt: Date.now() - 1 }, undefined, caller);
+      while (host.actors.status(actor.id).activationFilter) {
+        if (Date.now() > deadline) throw new Error("Resident expiry did not clear");
+        await delay(20);
+      }
+      expect(await client.actorStatus(actor.id)).toMatchObject({ filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } });
+      expect(host.actors.messages(actor.id)).toContainEqual(expect.objectContaining({ reason: "activationFilter cleared: expired" }));
+    } finally { await host.close(); await participants.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
 
 describe("resident maintenance readiness attachment", () => {
   it("waits for the published live generation before one accepted create, without another launcher", async () => {

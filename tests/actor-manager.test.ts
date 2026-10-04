@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ACTOR_FAILURE_NOTICE_AFTER, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
+import { ACTOR_FAILURE_NOTICE_AFTER, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -94,6 +94,31 @@ afterEach(async () => {
   await Promise.all(actorManagers.splice(0).map((manager) => manager.close()));
   await Promise.all(agentManagers.splice(0).map((manager) => manager.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("ActorManager idle registry writes (#4383)", () => {
+  it("reloads and polls unchanged actors without saving observational timestamps back to the registry", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "idle-reload", instructions: "Remain idle." });
+    await state.actors.close();
+    const file = path.join(state.root, "actors", "actors.json");
+    const before = fs.readFileSync(file, "utf8");
+    const saves = vi.spyOn(ActorRegistryStore.prototype, "write");
+    try {
+      const reloaded = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+        actorRoot: path.join(state.root, "actors"), persistent: true,
+      });
+      actorManagers.push(reloaded);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      for (let i = 0; i < 100; i++) { reloaded.list(); reloaded.resumeQueued(); }
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(saves).not.toHaveBeenCalled();
+      expect(reloaded.status(actor.id).updatedAt).toBe(JSON.parse(before).actors[0].updatedAt);
+      expect(fs.readFileSync(file, "utf8")).toBe(before);
+      await reloaded.setTools(actor.id, ["read"]);
+      expect(saves).toHaveBeenCalledTimes(1);
+    } finally { saves.mockRestore(); }
+  });
 });
 
 describe("ActorManager fleet model policy (#2490)", () => {
@@ -2795,7 +2820,7 @@ describe("ActorManager", () => {
 
   // smarty-dev#390: activation-context supervisors failed every activation silently for an hour.
   it("tells the owner's Main once when an actor keeps failing, and again after it recovers and fails", async () => {
-    const { actors, deliveries } = setup();
+    const { actors, deliveries, mesh } = setup();
     const actor = await actors.create({
       name: "supervisor",
       instructions: "Watch and steer only when needed.",
@@ -2809,11 +2834,111 @@ describe("ActorManager", () => {
     await actors.ask(actor.id, "FAIL_DIRECTIVE");
     expect(notices()).toEqual([expect.stringContaining(`actor supervisor failed its last ${ACTOR_FAILURE_NOTICE_AFTER} activations`)]);
     expect(notices()[0]).toContain("Structured agent output was invalid");
+    expect(actors.status(actor.id).activationBlocked).toMatchObject({ code: "unknown", count: ACTOR_FAILURE_NOTICE_AFTER });
+    await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
     await actors.ask(actor.id, "FAIL_DIRECTIVE");
     expect(notices()).toHaveLength(1);                       // once per streak
     await actors.ask(actor.id, "all good");                  // a completed run ends the streak
+    expect(actors.status(actor.id).activationBlocked).toBeUndefined();
     for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await actors.ask(actor.id, "FAIL_DIRECTIVE");
     expect(notices()).toHaveLength(2);
+    await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 2);
+  }, 60_000);
+
+  it("creates, reconfigures and runs activation actors without a host turn-provenance capability gate", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "legacy-host", instructions: "Activate.", inferenceContext: "activation" });
+    await expect(actors.setInstructions(actor.id, "Updated activation.")).resolves.toMatchObject({ inferenceContext: "activation" });
+    const ordinary = await actors.create({ name: "ordinary", instructions: "Run." });
+    await expect(actors.setInferenceContext(ordinary.id, "activation")).resolves.toMatchObject({ inferenceContext: "activation" });
+    await actors.ask(actor.id, "activate");
+    expect(actors.status(actor.id).activationBlocked).toBeUndefined();
+  });
+
+  it.each([
+    ["[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.\nFabric activation window failed: Error: Activation window lost current activation messages",
+      "activation-window-lost", "Fabric activation window failed: Error: Activation window lost current activation messages"],
+    ["Error: earlier failure\nError: Context exceeds window: 100 > 80", "context-overflow", "Error: Context exceeds window: 100 > 80"],
+    ["[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; legacy behavior\r\nError: Activation window lost current activation messages\r\n    at activate (C:\\Users\\fleet bot\\Error\\worker.js:42:7)\r\n", "activation-window-lost", "Error: Activation window lost current activation messages"],
+    ["Error: Context exceeds window: 100 > 80\n    at activate (/home/fleet/Error/worker.js:42:7)", "context-overflow", "Error: Context exceeds window: 100 > 80"],
+    ["Child Pi exited before requested model admission completed; task was not sent", "child-exit-before-admission", "Child Pi exited before requested model admission completed; task was not sent"],
+    ["Error: Activation window lost current activation messages\nError: unrelated terminal failure\nWarning: turnProvenance is unavailable", "unknown", "Error: unrelated terminal failure"],
+    ["[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; legacy behavior", "unknown", "Unknown activation failure"],
+  ])("classifies the last actual activation error (%s)", async (error, code, reason) => {
+    const { actors, agents, mesh, deliveries } = setup();
+    vi.spyOn(agents, "run").mockRejectedValue(new Error(error));
+    const actor = await actors.create({ name: "failed-activation", instructions: "Activate.", inferenceContext: "activation", responseMode: "text" });
+    for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
+      await expect(actors.ask(actor.id, "activate")).rejects.toThrow(error);
+      await waitFor(() => actors.status(actor.id).status === "idle");
+    }
+    expect(actors.status(actor.id).activationBlocked).toMatchObject({ reason, code, count: ACTOR_FAILURE_NOTICE_AFTER, since: expect.any(Number) });
+    await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
+    expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data).toMatchObject({ reason, code });
+    expect(deliveries.filter(text => text.startsWith("Fabric host notice:"))).toHaveLength(1);
+    expect(deliveries.find(text => text.startsWith("Fabric host notice:"))).toContain(`Last error: ${reason}`);
+  });
+
+  it("settles restored failed activation asks and callerless work without stranded in-flight items", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "restored", instructions: "Activate.", inferenceContext: "activation", coalesce: false });
+    await s.actors.close();
+    vi.spyOn(s.agents, "run").mockRejectedValue(new Error("Fabric activation window failed: Error: Activation window lost current activation messages"));
+    const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "actors"), persistent: true,
+    });
+    actorManagers.push(restored);
+    await expect(restored.ask(actor.id, "caller")).rejects.toThrow("Activation window lost current activation messages");
+    await restored.tell(actor.id, "event-one");
+    await restored.tell(actor.id, "event-two");
+    await waitFor(() => restored.status(actor.id).status === "idle");
+    expect(restored.status(actor.id)).toMatchObject({ queued: 0, activationBlocked: { code: "activation-window-lost", count: 3 } });
+    expect(restored.messages(actor.id).filter(message => message.direction === "out" && message.error)).toHaveLength(3);
+    await restored.close();
+    const next = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "actors"), persistent: true,
+    });
+    actorManagers.push(next);
+    expect(next.status(actor.id)).toMatchObject({ status: "idle", queued: 0, activationBlocked: { code: "activation-window-lost", count: 3 } });
+    await expect(next.ask(actor.id, "next caller")).rejects.toThrow("Activation window lost current activation messages");
+    await waitFor(() => next.status(actor.id).status === "idle");
+    expect(next.status(actor.id).activationBlocked?.count).toBe(4);
+    expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toHaveLength(1);
+  });
+
+  it("persists the failure budget and one alarm per uninterrupted streak across restarts", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "restart-streak", instructions: "Respond.", responseMode: "text" });
+    let manager = s.actors;
+    const restart = async () => {
+      await waitFor(() => manager.status(actor.id).status === "idle");
+      await manager.close();
+      manager = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+        actorRoot: path.join(s.root, "actors"), persistent: true,
+      });
+      actorManagers.push(manager);
+    };
+    const fail = async () => {
+      await expect(manager.ask(actor.id, "FAIL_DIRECTIVE")).rejects.toThrow();
+      await waitFor(() => manager.status(actor.id).status === "idle");
+    };
+    const alarms = () => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 });
+    await fail(); await fail();
+    const since = manager.status(actor.id).activationBlocked!.since;
+    expect(alarms()).toHaveLength(0);
+    await restart(); await fail();
+    await waitFor(() => alarms().length === 1);
+    expect(manager.status(actor.id).activationBlocked).toMatchObject({ since, count: 3 });
+    await restart();
+    await fail(); await fail(); await fail();
+    expect(manager.status(actor.id).activationBlocked).toMatchObject({ since, count: 6 });
+    expect(alarms()).toHaveLength(1);
+    await manager.ask(actor.id, "recover");
+    await waitFor(() => manager.status(actor.id).status === "idle");
+    expect(manager.status(actor.id).activationBlocked).toBeUndefined();
+    await restart(); await fail(); await fail(); await fail();
+    await waitFor(() => alarms().length === 2);
+    expect(manager.status(actor.id).activationBlocked?.count).toBe(3);
   }, 60_000);
 
   // dev-lead review of #34: interrupted activations (ESC) are not failures, and no notice
@@ -3421,14 +3546,16 @@ describe("ActorManager", () => {
     });
     expect(actors.status(actor.id).model).toBeUndefined();
 
-    await actors.setModel(actor.id, "anthropic/claude-sonnet-4-5");
+    await actors.setModel(actor.id, "anthropic/claude-sonnet-4-5", "session", undefined, "Named setter metering probe");
     expect(actors.status(actor.id).model).toBe("anthropic/claude-sonnet-4-5");
+    expect(actors.status(actor.id).modelReason).toBe("Named setter metering probe");
 
     // The new model is forwarded to the agent run launched for the next message.
     await actors.ask(actor.id, "Inspect auth");
     await waitFor(() => actors.status(actor.id).status === "idle");
     const run = actors.readLog(actor.id, { type: "run" });
     expect(run.run?.status?.model).toBe("anthropic/claude-sonnet-4-5");
+    expect(run.run?.status?.modelReason).toBe("Named setter metering probe");
 
     // Clearing the override falls back to the Fabric default (no stored model).
     await actors.setModel(actor.id, undefined);
@@ -3437,6 +3564,7 @@ describe("ActorManager", () => {
     await waitFor(() => actors.status(actor.id).status === "idle");
     const clearedRun = actors.readLog(actor.id, { type: "run" });
     expect(clearedRun.run?.status?.model).toBeUndefined();
+    expect(clearedRun.run?.status?.modelReason).toBeUndefined();
 
     // Whitespace-only values are treated as clearing the override.
     await actors.setModel(actor.id, "  ");
@@ -4401,7 +4529,9 @@ describe("ActorManager removal behind an in-flight run", () => {
         replacements.length = 0;
         await actors.setNice(other.id, 7);
       } else {
-        expect(replacements.filter((replacement) => replacement.pending).length).toBeGreaterThanOrEqual(2);
+        // Acceptance already fenced this inode; the unchanged presence save must not
+        // replace it again. All actual replacements below still owe their own barriers.
+        expect(replacements.filter((replacement) => replacement.pending)).toHaveLength(1);
       }
       const pending = replacements.filter((replacement) => replacement.pending);
       expect(pending.length).toBeGreaterThan(0);

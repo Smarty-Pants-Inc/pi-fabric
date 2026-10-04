@@ -811,7 +811,7 @@ export class AgentManager {
     this.#budgetOwned =
       !inheritedBudget && this.#currentDepth === 0 && config.budgetUsd > 0;
     const adapters: AgentTransportAdapter[] = [
-      new ProcessTransport(),
+      new ProcessTransport(config.processSlice),
       new TmuxTransport(),
       new ScreenTransport(),
       new LocaltermTransport(),
@@ -830,6 +830,23 @@ export class AgentManager {
   defaultModel(runner: FabricAgentRunner = this.config.runner): string | undefined {
     return runner === "claude" ? this.config.claude.model
       : runner === "veda" ? this.config.veda.model : this.config.model;
+  }
+
+  /** Call only on explicit public requests, before defaults/aliases are materialized. */
+  assertExplicitModelReason(model: unknown, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, inheritedDefault?: string): void {
+    if (typeof model !== "string" || !model.trim()) return;
+    const key = model.trim().toLowerCase();
+    const required = this.config.modelPolicy.requireReason.some(entry => {
+      const prefix = entry.trim().toLowerCase();
+      if (!prefix) return false;
+      return key.startsWith(prefix) || (!prefix.includes("/") && key.includes(`/${prefix}`));
+    });
+    if (!required) return;
+    const fallback = inheritedDefault ?? this.defaultModel(runner) ?? `${runner} default (inherited session model)`;
+    if (typeof modelReason !== "string" || !modelReason.trim() || modelReason.length > 200) {
+      throw new Error(`model ${model.trim()} requires modelReason (named exception); omit model to use the role default ${fallback}, see smarty-dev#3134` +
+        (typeof modelReason === "string" && modelReason.length > 200 ? "; modelReason must be ≤200 chars" : ""));
+    }
   }
 
   assertModelAllowed(model: string | undefined, runner?: FabricAgentRunner): void {
@@ -1460,6 +1477,10 @@ export class AgentManager {
         this.#invalidateUiList();
         void this.#monitor(managed, timeoutMs);
         const handle = this.#handleInfo(managed, "running");
+        this.#emitLifecycle(managed, "run.spawned", Date.now(), { status: "running", data: {
+          ...(model ? { model } : {}),
+          ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
+        } });
         // A queued receipt is not a worker. Notify only after launch and registration.
         try { onLaunched?.(handle); } catch { /* observers must not undo a launched worker */ }
         return handle;
@@ -3414,6 +3435,7 @@ export class AgentManager {
       cwd: managed.cwd,
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       ...(model ? { model } : {}),
+      ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
       ...(thinking ? { thinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),

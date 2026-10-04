@@ -6,7 +6,7 @@ import { decideModelRoute, type ModelRoutingConfig, type ModelRouteDecision, typ
 /** Shared auto-task/actor preparation: exact pins, finite authenticated candidates, one shadow Choice. */
 export async function prepareModelRoute(input: {
   routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown;
-  parentSessionId: string; actorId?: string; activationId?: string;
+  parentSessionId: string; actorId?: string; activationId?: string; modelReason?: string;
   registry: PiModelRegistryView; aliases: FabricModelAliases; config?: ModelRoutingConfig | undefined;
   assertModelAllowed: (model: string) => void; evaluate: RouteEvaluate; signal?: AbortSignal | undefined;
 }): Promise<ModelRouteDecision> {
@@ -35,5 +35,6 @@ export async function prepareModelRoute(input: {
     isFabricThinking(candidate.effort) && available.some(model => `${model.provider}/${model.id}` === candidate.model));
   return decideModelRoute({ routeClass: input.routeClass, protected: input.protected, pin, candidates,
     candidatesValid, parentSessionId: input.parentSessionId,
+    ...(input.modelReason !== undefined ? { modelReason: input.modelReason } : {}),
     ...(input.actorId ? { actorId: input.actorId } : {}), ...(input.activationId ? { activationId: input.activationId } : {}) }, input.evaluate, input.signal);
 }

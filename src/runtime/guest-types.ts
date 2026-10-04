@@ -66,7 +66,7 @@ interface FabricAgentRequest {
   runner?: FabricAgentRunner;
   transport?: FabricTransport;
   model?: string;
-  /** Required and non-blank when explicitly selecting cliproxyapi/gpt-6-astra. */
+  /** Named exception: non-blank and ≤200 chars for explicit models in the host requireReason list. */
   modelReason?: string;
   persona?: string;
   thinking?: FabricThinking;
@@ -227,6 +227,7 @@ type FabricLifecycleEventType =
   | "pi.agent_settled"
   | "pi.tool_error"
   | "pi.session_compact"
+  | "run.spawned"
   | "run.completed"
   | "run.failed"
   | "run.stopped"
@@ -683,7 +684,7 @@ interface FabricActorValidityFacts {
 }
 type FabricActorValidityDecision = boolean | { valid: boolean; reason?: string };
 type FabricActorBindingScope = "session" | "project";
-interface FabricActorRunBinding { model?: string; thinking?: FabricThinking }
+interface FabricActorRunBinding { model?: string; modelReason?: string; thinking?: FabricThinking }
 type FabricActorActivationFilterScalar = string | number | boolean | null;
 /** One test on a payload field; exactly one of equals, in, exists. A missing field never matches. */
 interface FabricActorActivationFilterPredicate {
@@ -730,7 +731,7 @@ interface FabricActorRequestBase {
   protected?: boolean;
   runner?: FabricAgentRunner;
   model?: string;
-  /** Required and non-blank when explicitly selecting cliproxyapi/gpt-6-astra. */
+  /** Named exception: non-blank and ≤200 chars for explicit models in the host requireReason list. */
   modelReason?: string;
   thinking?: FabricThinking;
   tools?: string[];
@@ -795,11 +796,15 @@ interface FabricActorInfo {
   coalesce: boolean;
   coalesceKey?: string;
   activationFilter?: FabricActorActivationFilter;
-  /** Events the activation filter skipped without a model run. */
+  /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
+  filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
+  activationFilterExpiresAt?: number;
   filteredCount?: number;
   lastFilteredAt?: number;
   /** The stored filter cannot be read: it is kept but not applied (every event is delivered). */
   activationFilterError?: string;
+  /** Named exception for the effective model, retained for metering. */
+  modelReason?: string;
   model?: string;
   thinking?: FabricThinking;
   routeClass?: "status-groom";
@@ -813,6 +818,8 @@ interface FabricActorInfo {
   requirements?: Array<{ ref: string; optional?: boolean }>;
   capabilityDigest?: string;
   missingCapabilities?: string[];
+  /** Persistent reason an activation is blocked; cleared after a later successful activation. */
+  activationBlocked?: { reason: string; code: string; since: number; count: number };
   inferenceContext?: "full-history" | "activation";
   validWhile?: { version: 1; source: string };
   residency: FabricParticipantResidency;
@@ -981,7 +988,7 @@ interface FabricAgentsApi {
   createActor(args: FabricActorRequest): Promise<FabricActorInfo>;
   /** Main setModel (own or remote) is refused; deferred to smarty-dev#4153. Actor bindings are unchanged. */
   setModel(args: { id: \`session:\${string}\`; model?: string; scope?: "session" }): Promise<never>;
-  setModel<Id extends string>(args: { id: Id; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
+  setModel<Id extends string>(args: { id: Id; model?: string; modelReason?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
   /** Only this session's own Main is supported; remote Main targets are refused. */
   setThinking(args: { id: \`session:\${string}\`; thinking: FabricThinking; scope?: "session" }): Promise<FabricMainAgentBindingResult>;
@@ -990,7 +997,7 @@ interface FabricAgentsApi {
   setNice(args: { id: string; nice: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setCoalesceKey(args: { id: string; coalesceKey: string | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
-  setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
+  setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setEvents(args: { id: string; events: FabricActorHostEvent[] }): Promise<FabricActorInfo>;
   setDeliveryPolicy(args: {
     id: string;

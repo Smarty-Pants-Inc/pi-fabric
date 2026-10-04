@@ -1,3 +1,4 @@
+import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -67,6 +68,8 @@ interface MeshStateFile {
 export interface MeshReadOptions {
   /** Read and parse the canonical file on every call, without reusing a cached snapshot. */
   fresh?: boolean;
+  /** Reuse one already-captured canonical state for a multi-namespace scan. */
+  snapshot?: object;
 }
 
 export interface MeshStoreOptions {
@@ -1126,7 +1129,9 @@ export class MeshStore {
   #select(prefix: string, options: MeshReadOptions): MeshStateEntry[] {
     if (prefix) this.#validateKey(prefix);
     const fresh = options.fresh === true;
-    const state = (!fresh && this.#signalledState(prefix)) || this.#readCachedState(fresh);
+    const state = options.snapshot !== undefined
+      ? options.snapshot as MeshStateFile
+      : (!fresh && this.#signalledState(prefix)) || this.#readCachedState(fresh);
     const memo = this.#memoOf(state);
     let selection = memo.selections.get(prefix);
     if (!selection) {
@@ -1601,7 +1606,7 @@ export class MeshStore {
     let attempts = 0;
     let maxGapMs = 0;
     let lastAttemptAt = Date.now();
-    let retryCeilingMs = 20;
+    let retryAttempt = 0;
     while (true) {
       const attemptAt = Date.now();
       if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
@@ -1666,11 +1671,9 @@ export class MeshStore {
         if (Date.now() >= deadline) {
           throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
         }
-        // Equal-range jitter separates competing writers without hot 10 ms retries. Keep
-        // the floor at 10 ms, the ceiling at 250 ms, and never sleep past this wait's deadline.
-        const backoffMs = 10 + Math.floor(Math.random() * (retryCeilingMs - 10));
-        await delay(Math.min(backoffMs, Math.max(0, deadline - Date.now())));
-        retryCeilingMs = Math.min(250, retryCeilingMs * 2);
+        // Full jitter spreads a fleet after a stalled holder resumes. The original
+        // absolute deadline still bounds every sleep (including a zero draw).
+        await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()));
       }
     }
     try {

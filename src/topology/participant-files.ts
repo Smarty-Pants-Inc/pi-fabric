@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, AtomicFileWriter } from "../core/atomic-write.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 
 // Participant records outside the shared state (smarty-dev#2004). Each record lived in the one
@@ -58,7 +58,8 @@ export const writeParticipantFileIf = async (
     const entry = decide(readFresh(file));
     if (!entry) return false;
     if (entry.key !== key) throw new Error(`Participant entry key mismatch: ${entry.key}`);
-    writeJsonAtomic(file, { format: 1, ...entry }, options);
+    // Presence lapses/rebuilds after a crash; migration callers still request barriers.
+    new AtomicFileWriter(file).write(JSON.stringify({ format: 1, ...entry }), options);
     if (options.durable && JSON.stringify(readFresh(file)) !== JSON.stringify(entry)) {
       throw new Error(`Participant migration verification failed: ${key}`);
     }
@@ -84,11 +85,11 @@ export const removeParticipantFileIf = async (
   });
 };
 
-/** Writes a record's file unconditionally (tests and tools; runtimes use writeParticipantFileIf). */
+/** Writes a changed record (tests and tools; runtimes use writeParticipantFileIf). */
 export const writeParticipantFile = (meshRoot: string, entry: MeshStateEntry): void => {
   const file = fileOf(meshRoot, entry.key);
   if (!file) throw new Error(`Not a participant key: ${entry.key}`);
-  writeJsonAtomic(file, { format: 1, ...entry });
+  new AtomicFileWriter(file).write(JSON.stringify({ format: 1, ...entry }));
   rescan(path.dirname(file));
 };
 

@@ -1081,20 +1081,22 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     await h.owner.close();
     const old = new Date(Date.now() - DEFAULT_FABRIC_CONFIG.retention.actorRunArchiveMs - 1000);
     for (const file of fs.readdirSync(store.directory)) fs.utimesSync(path.join(store.directory, file), old, old);
-    const restarted = h.makeOwner(); // Startup runs the normal archive retention sweep.
+    const restarted = h.makeOwner(); // Maintenance yields; activation must still reject expired context.
     cleanups.push(() => restarted.close());
-    expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
-    expect(fs.readdirSync(path.dirname(h.actor.sessionFile!)).filter((file) => file.startsWith("queue-"))).toEqual([]);
     const tasks: string[] = [];
     const run = AgentManager.prototype.run.bind(h.ownerAgents);
     vi.spyOn(h.ownerAgents, "run").mockImplementation(async (...args) => {
       tasks.push(args[0].task);
       return run(...args);
     });
-    restarted.tell(h.actor.id, "new work after expiry");
+    restarted.tell(h.actor.id, "new work after expiry"); // Do not await the startup sweep first.
     await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
     expect(tasks).toHaveLength(1);
     expect(tasks[0]).not.toContain(JSON.stringify(store.resultFile(child.id)));
+    await vi.waitFor(() => {
+      expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+      expect(fs.readdirSync(path.dirname(h.actor.sessionFile!)).filter((file) => file.startsWith("queue-"))).toEqual([]);
+    }, { timeout: 5000 });
   });
 
   it("keeps a stopped actor's unread completion stored instead of falling back to Main", async () => {

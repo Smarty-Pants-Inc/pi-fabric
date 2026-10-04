@@ -1,7 +1,10 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { hasUnresolvedWorker, markUnresolvedWorker } from "../src/storage/retention.js";
+import { beforeEach } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { retainedProcessStates, retainedProcessWorker } from "./helpers/retained-process-worker.js";
 import fs from "node:fs";
+import { completionConsumed } from "../src/agents/completion-journal.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -51,6 +54,8 @@ const hostPath = path.resolve("dist/residency/launcher.js");
 const fakeWorker = path.resolve("tests/fixtures/fake-worker.mjs");
 const hasResidentHost = fs.existsSync(hostPath);
 const roots: string[] = [];
+
+beforeEach(() => installInProcessResidentFence());
 
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -770,6 +775,43 @@ describe("durable completion receipts", () => {
       await waitFor(() => state.mesh.get(seeded.key) === undefined);
       expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeGreaterThan(0);
     } finally { inbox.close(); await registry.close(); await client.close(); await lifecycle.close(); await actors.close(); await agents.close(); await state.participants.close(); }
+  });
+
+  it.each(["rename", "read"] as const)("keeps the journal fence retryable when resident acknowledgment %s fails", async mode => {
+    const state = await rootHarness(`acknowledgment-${mode}`);
+    const seeded = await seedCompletion(state);
+    const completed = vi.fn();
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants,
+      mainAgent: state.mainAgent, onBackgroundComplete: completed });
+    let fault: { mockRestore(): void } | undefined;
+    try {
+      client.start(); await waitFor(() => completed.mock.calls.length === 1);
+      const acknowledge = completed.mock.calls[0]![1] as () => void;
+      const denied = Object.assign(new Error("resident metadata unavailable"), { code: "EPERM" });
+      if (mode === "rename") {
+        const rename = fs.renameSync;
+        fault = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+          if (String(target) === seeded.metadataPath) throw denied;
+          return rename(source, target);
+        });
+      } else {
+        const read = fs.readFileSync;
+        fault = vi.spyOn(fs, "readFileSync").mockImplementation(((target: any, ...args: any[]) => {
+          if (String(target) === seeded.metadataPath) throw denied;
+          return (read as any)(target, ...args);
+        }) as typeof fs.readFileSync);
+      }
+      expect(acknowledge).toThrow(denied);
+      fault.mockRestore(); fault = undefined;
+      expect(completionConsumed(state.config.meshRoot, seeded.id)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeUndefined();
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(state.mesh.get(seeded.key)).toBeDefined();
+      acknowledge();
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeGreaterThan(0);
+      expect(completionConsumed(state.config.meshRoot, seeded.id)).toBe(true);
+      await waitFor(() => state.mesh.get(seeded.key) === undefined);
+    } finally { fault?.mockRestore(); await client.close(); await state.participants.close(); }
   });
 
   // smarty-dev#878: a resident host whose root is gone sends its actors' messages to the project's
@@ -1833,6 +1875,10 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh,
       participants: state.participants, mainAgent: state.mainAgent, hostPath });
     fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    // This is corruption/reuse within the new protocol, not permission to adopt
+    // an unproven legacy inode (which requires a verified drain).
+    const prior = new ResidentHost(state.config);
+    await prior.start(); await prior.close();
     const stale = { format: RESIDENT_HOST_FORMAT, hostId: client.hostId, pid: process.pid,
       processStartTime: "0", token: "stale", startedAt: 0, readyAt: 0 };
     for (const file of ["owner.json", "host.lock"]) fs.writeFileSync(path.join(state.config.residencyRoot, file), JSON.stringify(stale));

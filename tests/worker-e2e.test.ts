@@ -769,7 +769,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     await new Promise((resolve) => setTimeout(resolve, 200));
     ac.abort();
     const result = await manager.wait(handle.id);
-    expect(result.status).toBe("stopped");
+    expect(result.status, JSON.stringify(result)).toBe("stopped");
   });
 
   it("reports a terminal failure (not exited-without-a-result) when the worker crashes mid-stream", async () => {

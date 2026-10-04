@@ -42,6 +42,8 @@ export interface FabricParticipantRecord {
   /** Reserved remote Main setter advertisement; false until a native Pi commit guard exists.
    * Kept outside capabilities: existing format-1 readers reject unknown capability strings. */
   mainBindings?: boolean;
+  /** Outside capabilities so old format-1 parsers can read the advertisement. */
+  livenessLeaseFiles?: 1;
   status: string;
   /** Fixed expiry of a Main reload handoff; never a grace period for an exited session. */
   reloadUntil?: number;
@@ -86,6 +88,7 @@ export interface FabricParticipantInfo extends FabricParticipantRecord {
 
 export interface FabricHostRecord {
   format: 1;
+  livenessLeaseFiles?: 1;
   id: string;
   rootId: string;
   identity: MeshIdentity;

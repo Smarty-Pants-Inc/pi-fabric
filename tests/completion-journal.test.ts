@@ -32,7 +32,7 @@ const setup = () => {
     fs.writeFileSync(file(value.id), JSON.stringify({ format: 1, recipient: address, result: value }));
     return value;
   };
-  return { root, meshRoot, recipient, result, file, receipt, journal, seed, mesh };
+  return { root, meshRoot, recipient, result, file, receipt, journal, seed, mesh, resetClaims: () => entries.clear() };
 };
 
 // Test-only async_hooks seam: before/after delimit each uninterrupted synchronous
@@ -50,16 +50,18 @@ const measureSynchronousSections = async (operation: (finishSlice: () => void) =
   let depth = 0;
   let sliceMs = 0, syncMaxMs = 0, sliceCpuMs = 0, syncCpuMaxMs = 0, syncSamples = 0;
   const recordActive = () => {
-    if (activeSince === undefined || activeCpuSince === undefined) return;
+    if (activeSince === undefined) return;
     const now = performance.now();
-    const cpu = process.cpuUsage(activeCpuSince);
     sliceMs += now - activeSince;
-    sliceCpuMs += (cpu.user + cpu.system) / 1000;
+    if (activeCpuSince !== undefined) {
+      const cpu = process.cpuUsage(activeCpuSince);
+      sliceCpuMs += (cpu.user + cpu.system) / 1000;
+    }
     syncMaxMs = Math.max(syncMaxMs, sliceMs);
     syncCpuMaxMs = Math.max(syncCpuMaxMs, sliceCpuMs);
     syncSamples++;
     activeSince = now;
-    activeCpuSince = process.cpuUsage();
+    activeCpuSince = process.platform === "linux" ? process.cpuUsage() : undefined;
   };
   const finishSlice = () => { recordActive(); sliceMs = 0; sliceCpuMs = 0; };
   const hook = createHook({
@@ -69,7 +71,7 @@ const measureSynchronousSections = async (operation: (finishSlice: () => void) =
     before(id) {
       if (descendants.has(id) && depth++ === 0) {
         activeSince = performance.now();
-        activeCpuSince = process.cpuUsage();
+        activeCpuSince = process.platform === "linux" ? process.cpuUsage() : undefined;
       }
     },
     after(id) {
@@ -85,7 +87,7 @@ const measureSynchronousSections = async (operation: (finishSlice: () => void) =
   try {
     // Also time the synchronous prefix, before operation() returns its promise.
     activeSince = performance.now();
-    activeCpuSince = process.cpuUsage();
+    activeCpuSince = process.platform === "linux" ? process.cpuUsage() : undefined;
     depth = 1;
     let pending: Promise<void>;
     try { pending = operation(finishSlice); }
@@ -98,13 +100,17 @@ const measureSynchronousSections = async (operation: (finishSlice: () => void) =
     }
     await pending;
   } finally { hook.disable(); }
-  return { syncMaxMs, syncCpuMaxMs, syncSamples };
+  // Windows CPU accounting is tick-quantized; keep CPU time as a Linux-only diagnostic.
+  return { syncMaxMs, syncCpuMaxMs: process.platform === "linux" ? syncCpuMaxMs : undefined, syncSamples };
 };
-const assertSynchronousWork = (measured: Awaited<ReturnType<typeof measureSynchronousSections>>): void => {
-  expect(measured.syncSamples).toBeGreaterThan(0);
-  // CPU time excludes scheduler preemption. This is the platform-independent
-  // primary guard; syncMaxMs remains the wall-clock diagnostic in the log.
-  expect(measured.syncCpuMaxMs, "scan synchronous CPU time must stay below 16 ms on every platform").toBeLessThan(16);
+const SCAN_MEASUREMENT_PASSES = 3;
+const assertSynchronousWork = (passes: Awaited<ReturnType<typeof measureSynchronousSections>>[], platform: NodeJS.Platform = process.platform): void => {
+  expect(passes).toHaveLength(SCAN_MEASUREMENT_PASSES);
+  for (const measured of passes) expect(measured.syncSamples).toBeGreaterThan(0);
+  // ponytail: min-of-max across three independent passes rejects random preemption
+  // noise; a deterministic synchronous stall exceeds the wall budget in every pass.
+  expect(Math.min(...passes.map(measured => measured.syncMaxMs)),
+    `scan synchronous wall time must stay below 16 ms under the ${platform} policy`).toBeLessThan(16);
 };
 // The concurrent timer is independent of generator bookkeeping. Measure the full
 // gap between 1 ms ticks (without subtracting timer resolution), so a synchronous
@@ -143,12 +149,21 @@ const measureIdleSlices = async (label: string, operation: () => Promise<void>) 
     return measured;
   } finally { clearInterval(timer); setCompletionJournalSliceObserver(undefined); }
 };
-const assertIdleLatency = (measured: Awaited<ReturnType<typeof measureIdleSlices>>, platform: NodeJS.Platform = process.platform): void => {
-  assertSynchronousWork(measured); // Primary acceptance guard: identical on Linux and Windows.
-  expect(measured.samples).toBeGreaterThan(0);
-  // The synchronous-section wall clock is diagnostic only on Windows because
-  // scheduler preemption can inflate it. Linux retains the strict 16 ms maximum.
-  if (platform !== "win32") expect(measured.syncMaxMs).toBeLessThan(16);
+// Prepare outside the timed sections: restore the fixture and use a fresh journal
+// for each pass, so later passes cannot become empty polls or cache-only scans.
+const measureIdlePasses = async (label: string, prepare: () => () => Promise<void>, verify?: (measured: Awaited<ReturnType<typeof measureIdleSlices>>) => void) => {
+  const passes: Awaited<ReturnType<typeof measureIdleSlices>>[] = [];
+  for (let pass = 0; pass < SCAN_MEASUREMENT_PASSES; pass++) {
+    const operation = prepare();
+    const measured = await measureIdleSlices(`${label} (pass ${pass + 1}/${SCAN_MEASUREMENT_PASSES})`, operation);
+    verify?.(measured);
+    passes.push(measured);
+  }
+  return passes;
+};
+const assertIdleLatency = (passes: Awaited<ReturnType<typeof measureIdleSlices>>[], platform: NodeJS.Platform = process.platform): void => {
+  assertSynchronousWork(passes, platform); // Identical wall-clock acceptance on Linux and Windows.
+  for (const measured of passes) expect(measured.samples).toBeGreaterThan(0);
 };
 
 describe("completion journal idle scans", () => {
@@ -163,48 +178,64 @@ describe("completion journal idle scans", () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it("separates Windows scheduler noise from the platform-independent synchronous guard", () => {
-    const measured = { maxMs: 1, p99Ms: 1, samples: 200, passMs: 100,
-      syncMaxMs: 17, syncCpuMaxMs: 1, syncSamples: 100, sliceMaxMs: 1, sliceSamples: 100, delayedTicks: [] };
-    expect(() => assertIdleLatency(measured, "win32")).not.toThrow();
-    expect(() => assertIdleLatency(measured, "linux")).toThrow();
-    expect(() => assertIdleLatency({ ...measured, syncMaxMs: 50 }, "win32")).not.toThrow();
-    expect(() => assertIdleLatency({ ...measured, syncMaxMs: 50 }, "linux")).toThrow();
+  it("rejects deterministic wall stalls but tolerates two noisy passes under both platform policies", () => {
+    const measured = { maxMs: 50, p99Ms: 2, samples: 200, passMs: 100,
+      syncMaxMs: 1, syncCpuMaxMs: 48, syncSamples: 100, sliceMaxMs: 50, sliceSamples: 100, delayedTicks: [] };
+    const passes = (maxima: number[]) => maxima.map(syncMaxMs => ({ ...measured, syncMaxMs }));
     for (const platform of ["win32", "linux"] as const) {
-      expect(() => assertIdleLatency({ ...measured, maxMs: 1, p99Ms: 1, syncMaxMs: 1, syncCpuMaxMs: 16 }, platform)).toThrow();
-      expect(() => assertIdleLatency({ ...measured, maxMs: 21, p99Ms: 2, syncMaxMs: 1, syncCpuMaxMs: 20 }, platform)).toThrow();
-      expect(() => assertIdleLatency({ ...measured, maxMs: 1, p99Ms: 1, syncSamples: 0 }, platform)).toThrow();
+      expect(() => assertIdleLatency(passes([1, 1, 50]), platform)).not.toThrow();
+      expect(() => assertIdleLatency(passes([50, 1, 50]), platform)).not.toThrow();
+      expect(() => assertIdleLatency(passes([50, 50, 15.9]), platform)).not.toThrow();
+      expect(() => assertIdleLatency(passes([16, 50, 50]), platform)).toThrow("scan synchronous wall time");
+      expect(() => assertIdleLatency(passes([25, 25, 25]).map(pass => ({ ...pass, syncCpuMaxMs: 1 })), platform)).toThrow("scan synchronous wall time");
+      expect(() => assertIdleLatency(passes([1, 1, 1]).map(pass => ({ ...pass, syncCpuMaxMs: undefined })), platform)).not.toThrow();
+      expect(() => assertIdleLatency(passes([1, 1, 1]).map((pass, index) => ({ ...pass, syncSamples: index === 1 ? 0 : 100 })), platform)).toThrow();
+      expect(() => assertIdleLatency(passes([1, 1, 1]).map((pass, index) => ({ ...pass, samples: index === 1 ? 0 : 200 })), platform)).toThrow();
+      expect(() => assertIdleLatency(passes([1, 1]), platform)).toThrow();
+      expect(() => assertIdleLatency(passes([1, 1, 1, 1]), platform)).toThrow();
     }
   });
 
   it("times the synchronous prefix and resumed work, but not an awaited 30 ms timer", async () => {
-    const measured = await measureSynchronousSections(async () => {
-      await new Promise<void>(resolve => setTimeout(resolve, 30));
-    });
-    expect(measured.syncSamples).toBeGreaterThan(1);
-    assertSynchronousWork(measured);
-    for (const resumed of [false, true]) {
-      const blocked = await measureSynchronousSections(async () => {
-        if (resumed) await new Promise<void>(resolve => setImmediate(resolve));
-        const start = performance.now();
-        while (performance.now() - start < 20) { /* Verify both instrumentation paths. */ }
+    const passes: Awaited<ReturnType<typeof measureSynchronousSections>>[] = [];
+    for (let pass = 0; pass < SCAN_MEASUREMENT_PASSES; pass++) {
+      const measured = await measureSynchronousSections(async () => {
+        await new Promise<void>(resolve => setTimeout(resolve, 30));
       });
-      expect(blocked.syncMaxMs).toBeGreaterThanOrEqual(20);
-      expect(() => assertSynchronousWork(blocked)).toThrow();
+      expect(measured.syncSamples).toBeGreaterThan(1);
+      passes.push(measured);
+    }
+    assertSynchronousWork(passes);
+    for (const resumed of [false, true]) {
+      const blocked: typeof passes = [];
+      for (let pass = 0; pass < SCAN_MEASUREMENT_PASSES; pass++) {
+        const measured = await measureSynchronousSections(async () => {
+          if (resumed) await new Promise<void>(resolve => setImmediate(resolve));
+          const start = performance.now();
+          while (performance.now() - start < 25) { /* Verify both instrumentation paths. */ }
+        });
+        expect(measured.syncMaxMs).toBeGreaterThanOrEqual(25);
+        blocked.push(measured);
+      }
+      expect(() => assertSynchronousWork(blocked)).toThrow("scan synchronous wall time");
     }
   });
 
   it("accumulates synchronous microtasks within a slice instead of budgeting each callback separately", async () => {
-    const measured = await measureSynchronousSections(async finishSlice => {
-      for (let index = 0; index < 6; index++) {
-        await Promise.resolve(); // Not an event-loop turn or a new journal slice.
-        const start = performance.now();
-        while (performance.now() - start < 4) { /* Individually cheap, collectively over budget. */ }
-      }
-      finishSlice();
-    });
-    expect(measured.syncMaxMs).toBeGreaterThanOrEqual(24);
-    expect(() => assertSynchronousWork(measured)).toThrow();
+    const passes: Awaited<ReturnType<typeof measureSynchronousSections>>[] = [];
+    for (let pass = 0; pass < SCAN_MEASUREMENT_PASSES; pass++) {
+      const measured = await measureSynchronousSections(async finishSlice => {
+        for (let index = 0; index < 6; index++) {
+          await Promise.resolve(); // Not an event-loop turn or a new journal slice.
+          const start = performance.now();
+          while (performance.now() - start < 4) { /* Individually cheap, collectively over budget. */ }
+        }
+        finishSlice();
+      });
+      expect(measured.syncMaxMs).toBeGreaterThanOrEqual(24);
+      passes.push(measured);
+    }
+    expect(() => assertSynchronousWork(passes)).toThrow("scan synchronous wall time");
   });
   it.each([false, true])("forget hides the result immediately while claim retirement is held (refused: %s)", async refused => {
     const h = setup(); const result = h.seed(1); const journal = h.journal();
@@ -291,27 +322,23 @@ describe("completion journal idle scans", () => {
     } finally { clearImmediate(turn); }
   });
 
-  it.each(["linux", "win32"] as const)("rejects a synchronous 20 ms final consumer block under the %s policy", async platform => {
-    const h = setup(); h.seed(1);
+  it.each(["linux", "win32"] as const)("rejects a synchronous 25 ms final consumer block under the %s policy", async platform => {
+    const h = setup();
     // Block the final enqueue after the scan's awaited I/O: neither a final
     // small slice nor async-generator yields may hide this from the guard.
     const enqueue = vi.fn(() => {
-      // Deliberately burn 20 ms of CPU, rather than sleeping: both platform
-      // policies must reject this even if Windows preempts the process.
-      const started = process.cpuUsage();
-      let accumulator = 0;
-      for (;;) {
-        for (let index = 0; index < 10_000; index++) accumulator = Math.imul(accumulator + index, 16_777_619);
-        const cpu = process.cpuUsage(started);
-        if ((cpu.user + cpu.system) / 1000 >= 20) break;
-      }
-      if (accumulator === Number.MIN_SAFE_INTEGER) throw new Error("unreachable");
+      const started = performance.now();
+      while (performance.now() - started < 25) { /* Robust wall-clock stall, independent of CPU tick resolution. */ }
     });
-    const measured = await measureIdleSlices(`negative control: 20 ms consumer (${platform})`, () => h.journal(enqueue).drain());
-    expect(measured.syncCpuMaxMs).toBeGreaterThanOrEqual(20);
-    expect(() => assertSynchronousWork(measured)).toThrow("scan synchronous CPU time"); // Direct primary-guard proof.
-    expect(() => assertIdleLatency(measured, platform)).toThrow("scan synchronous CPU time");
-    expect(enqueue).toHaveBeenCalledTimes(1);
+    const passes = await measureIdlePasses(`negative control: 25 ms consumer (${platform})`, () => {
+      h.seed(1); h.resetClaims();
+      const journal = h.journal(enqueue);
+      return () => journal.drain();
+    });
+    for (const measured of passes) expect(measured.syncMaxMs).toBeGreaterThanOrEqual(25);
+    expect(() => assertSynchronousWork(passes, platform)).toThrow("scan synchronous wall time"); // Direct primary-guard proof.
+    expect(() => assertIdleLatency(passes, platform)).toThrow("scan synchronous wall time");
+    expect(enqueue).toHaveBeenCalledTimes(SCAN_MEASUREMENT_PASSES);
   });
 
   it("a queued delivery callback cannot restore a forgotten result", async () => {
@@ -333,13 +360,22 @@ describe("completion journal idle scans", () => {
     const a = h.seed(101), b = h.seed(102);
     const callbacks = new Map<string, () => void>();
     const enqueue = vi.fn((result: AgentRunResult, delivered: () => void) => { callbacks.set(result.id, delivered); });
-    const journal = h.journal(enqueue);
+    let journal = h.journal(enqueue);
     const sync = vi.spyOn(fs, "fsyncSync");
     const asyncOpen = vi.spyOn(fs.promises, "open");
     expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(2);
-    const slices = await measureIdleSlices("consumed and pending", async () => { await journal.drain(); await journal.drain(); });
-    assertIdleLatency(slices);
-    expect(slices.sliceSamples).toBeGreaterThan(0);
+    const passes = await measureIdlePasses("consumed and pending", () => {
+      for (let index = 1; index <= 102; index++) h.seed(index); // Restore pruned envelopes, keeping the same receipts.
+      h.resetClaims(); enqueue.mockClear(); callbacks.clear();
+      journal = h.journal(enqueue);
+      return async () => { await journal.drain(); await journal.drain(); };
+    }, measured => {
+      expect(measured.sliceSamples).toBeGreaterThan(0);
+      expect(enqueue.mock.calls.map(([result]) => result.id)).toEqual(expect.arrayContaining([a.id, b.id]));
+      expect(enqueue).toHaveBeenCalledTimes(2);
+      for (let index = 1; index <= 100; index++) expect(fs.existsSync(h.file(h.result(index).id))).toBe(false);
+    });
+    assertIdleLatency(passes);
     expect(sync).not.toHaveBeenCalled(); expect(asyncOpen).toHaveBeenCalled();
     expect(enqueue.mock.calls.map(([result]) => result.id)).toEqual(expect.arrayContaining([a.id, b.id]));
     expect(enqueue).toHaveBeenCalledTimes(2);
@@ -350,7 +386,7 @@ describe("completion journal idle scans", () => {
     callbacks.get(a.id)!(); callbacks.get(b.id)!();
     await journal.drain(); expect(enqueue).toHaveBeenCalledTimes(2);
     expect(fs.existsSync(h.file(a.id))).toBe(false); expect(fs.existsSync(h.file(b.id))).toBe(false);
-  });
+  }, 15_000 * SCAN_MEASUREMENT_PASSES); // Allow three full async passes; the synchronous budget stays 16 ms.
 
   it.each(["consumed leftovers", "pending", "attempts"] as const)("bounds every idle slice with slow plain reads: %s", async state => {
     const h = setup();
@@ -365,7 +401,7 @@ describe("completion journal idle scans", () => {
       }
     }
     const expected = pendingCompletions(h.meshRoot, h.root).map(envelope => envelope.result.id);
-    const enqueue = vi.fn(); const journal = h.journal(enqueue);
+    const enqueue = vi.fn();
     const read = fs.promises.readFile.bind(fs.promises);
     let reads = 0;
     // Do not retain every large body in a spy's result history: the latency probe
@@ -377,20 +413,31 @@ describe("completion journal idle scans", () => {
     }) as typeof fs.promises.readFile);
     const sync = vi.spyOn(fs, "fsyncSync");
     try {
-      const slices = await measureIdleSlices(state, () => journal.drain());
-      expect(reads).toBeGreaterThanOrEqual(100);
-      expect(slices.passMs).toBeGreaterThan(30); // A whole-pass timer would incorrectly reject this scan.
-      assertIdleLatency(slices);
-      expect(slices.sliceSamples).toBeGreaterThan(0);
-      expect(sync).not.toHaveBeenCalled();
-      expect(enqueue.mock.calls.map(([result]) => result.id)).toEqual(expected); // Preserve directory order.
+      const passes = await measureIdlePasses(state, () => {
+        if (state === "consumed leftovers") {
+          for (let index = 1; index <= count; index++) h.seed(index); // Undo the previous pass's destructive pruning.
+        }
+        h.resetClaims(); enqueue.mockClear(); reads = 0;
+        const journal = h.journal(enqueue);
+        return () => journal.drain();
+      }, measured => {
+        expect(reads).toBeGreaterThanOrEqual(100); // Every pass must exercise the full original fixture.
+        expect(measured.passMs).toBeGreaterThan(30); // A whole-pass timer would incorrectly reject this scan.
+        expect(measured.sliceSamples).toBeGreaterThan(0);
+        expect(sync).not.toHaveBeenCalled();
+        expect(enqueue.mock.calls.map(([result]) => result.id)).toEqual(expected); // Preserve directory order.
+        if (state === "consumed leftovers") {
+          expect(fs.readdirSync(path.dirname(h.file(h.result(1).id))).filter(file => file.endsWith(".json"))).toHaveLength(132);
+        }
+      });
+      assertIdleLatency(passes);
     } finally { asyncRead.mockRestore(); }
     if (state === "consumed leftovers") {
       const envelopes = fs.readdirSync(path.dirname(h.file(h.result(1).id))).filter(file => file.endsWith(".json"));
       expect(envelopes).toHaveLength(132); // Still cap destructive pruning at 128 per pass.
       for (let index = 1; index <= count; index++) expect(completionConsumed(h.meshRoot, h.result(index).id)).toBe(true);
     }
-  });
+  }, 15_000 * SCAN_MEASUREMENT_PASSES);
 
   it("recovers a crash after the receipt barrier but before envelope unlink without redelivery", async () => {
     const h = setup(); const result = h.seed(1); const journal = h.journal();

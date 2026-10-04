@@ -95,6 +95,23 @@ import {
   type TempRunSweepRequest,
 } from "../storage/retention.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
+
+const removeManagedRunRoot = async (root: string): Promise<void> => {
+  const deadline = Date.now() + (process.platform === "win32" ? 2_000 : 250);
+  while (true) {
+    try {
+      const entries = fs.readdirSync(root);
+      if (!entries.every((name) => name === ".fabric-owner.json")) return;
+      if (entries.includes(".fabric-owner.json")) fs.unlinkSync(path.join(root, ".fabric-owner.json"));
+      fs.rmdirSync(root);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if ((code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY") || Date.now() >= deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+};
 import { effectiveAgentNice, parseAgentNice } from "./priority.js";
 import {
   isFabricLifecycleEventType,
@@ -2293,12 +2310,9 @@ export class AgentManager {
           // All tracked transports are confirmed exited above; untracked runs stay put.
           await Promise.all(all.filter((managed) => this.#canCollect(managed))
             .map((managed) => removeTree(managed.runDirectory).catch(() => undefined)));
-          try {
-            if (this.#managedTempRoot && fs.readdirSync(this.#runRoot).every((name) => name === ".fabric-owner.json")) {
-              fs.unlinkSync(path.join(this.#runRoot, ".fabric-owner.json"));
-            }
-            fs.rmdirSync(this.#runRoot); // Never recursively remove an untracked directory.
-          } catch { /* nonempty, missing, or unsafe roots are retained */ }
+          // Windows can retain the just-closed worker directory briefly. Retry
+          // only the owned empty root; never recursively remove unknown contents.
+          await removeManagedRunRoot(this.#runRoot);
         }
       } else if (this.#managedTempRoot) {
         try { markRunRootClosed(this.#runRoot, Date.now(), true); } catch {}

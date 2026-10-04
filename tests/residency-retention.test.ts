@@ -40,11 +40,35 @@ describe("resident terminal event retention", () => {
   const make = (dir: string, id: string, status: string, finishedAt = day) => {
     const run = path.join(dir, "runs", id);
     fs.mkdirSync(run, { recursive: true });
-    fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status, finishedAt }));
+    fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status, finishedAt, transport: "process", sessionId: "2147483647" }));
     fs.writeFileSync(path.join(run, "events.jsonl"), log);
     fs.writeFileSync(path.join(run, "reply.json"), '{"text":"keep reply"}');
     return run;
   };
+
+  it.each(([undefined, "unknown", "herdr", "localterm"] as const).flatMap(transport =>
+    (["startup", "streaming"] as const).map(phase => ({ transport, phase }))))(
+    "preserves receiptless $transport root custody through $phase retention", ({ transport, phase }) => {
+      const dir = root(); const run = make(dir, "unknown-root", "completed");
+      write(run, ".", "status", { status: "completed", finishedAt: day, transport, sessionId: "2147483647", exitCode: 0 });
+      fs.utimesSync(run, day / 1000, day / 1000);
+      const before = fs.readdirSync(run).sort().map(name => {
+        const file = path.join(run, name); const stat = fs.statSync(file);
+        return [name, stat.ino, stat.mtimeMs, stat.ctimeMs, fs.readFileSync(file, "utf8")];
+      });
+      const mtime = fs.statSync(run).mtimeMs;
+      if (phase === "startup") expect(sweepResidentRuns(path.join(dir, "runs"), now, 10000)).toEqual([]);
+      else {
+        const collector = new ResidentRequestRetention(dir);
+        try { collector.sweep(now, new Set(), 10000); } finally { collector.close(); }
+      }
+      expect(fs.readdirSync(run).sort().map(name => {
+        const file = path.join(run, name); const stat = fs.statSync(file);
+        return [name, stat.ino, stat.mtimeMs, stat.ctimeMs, fs.readFileSync(file, "utf8")];
+      })).toEqual(before);
+      expect(fs.statSync(run).mtimeMs).toBe(mtime);
+    },
+  );
 
   it.each([
     ["startup", false], ["startup", true], ["streaming", false], ["streaming wildcard", false],
@@ -532,7 +556,7 @@ describe("bounded resident request retention", () => {
     const host = new ResidentHost(config);
     try {
       await host.start();
-      expect(exists(dir, "decisions", command.requestId)).toBe(false);
+      await vi.waitFor(() => expect(exists(dir, "decisions", command.requestId)).toBe(false));
       const remove = vi.spyOn(host.actors, "remove");
       write(dir, "requests", command.requestId, { ...command, createdAt: Date.now() });
       const deadline = Date.now() + 2_000;

@@ -165,10 +165,16 @@ export interface FabricAgentConfig {
   enabled: boolean;
   runner: FabricAgentRunner;
   transport: FabricAgentTransport;
+  /** Host-only Linux user scope slice; unset launches workers directly. */
+  processSlice?: string;
   model?: string;
   /** Host-only fleet policy; workspace configuration cannot override these keys. */
   deniedModels: string[];
+  /** Host-only explicit-selection exception policy; [] disables the reason gate. */
+  modelPolicy: { requireReason: string[] };
   deniedModelReplacement?: string;
+  /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
+  instructionsRoot?: string;
   claude: FabricClaudeRunnerConfig;
   veda: FabricVedaRunnerConfig;
   thinking: FabricThinking;
@@ -461,6 +467,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     runner: "pi",
     transport: "process",
     deniedModels: [],
+    modelPolicy: { requireReason: ["gpt-6-astra"] },
     claude: { binary: "claude" },
     veda: { binary: "veda", backend: "agy", persona: "navigator-chat" },
     thinking: DEFAULT_FABRIC_THINKING,
@@ -521,7 +528,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     orphanedTempRunMs: 6 * 60 * 60 * 1_000,
     oneShotRunMs: 24 * 60 * 60 * 1_000,
     actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
-    terminalRunEventsAgeMs: 24 * 60 * 60 * 1_000,
+    terminalRunEventsAgeMs: 6 * 60 * 60 * 1_000,
     terminalRunEventsMaxBytes: 256 * 1024,
   },
   actors: {
@@ -1049,11 +1056,15 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       enabled: booleanValue(agents.enabled, DEFAULT_FABRIC_CONFIG.agents.enabled),
       runner: runnerValue(agents.runner, DEFAULT_FABRIC_CONFIG.agents.runner),
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
+      ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
+        ? { processSlice: agents.processSlice } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
         ? { modelRouting: (() => {
             const routing = agents.modelRouting as Record<string, unknown>;
+            if (routing.live !== undefined && routing.live !== false) throw new Error("Live model routing requires measured parity and Paul's floor approval (#2236); unavailable in shadow mode");
             return {
+              live: false as const,
               ...(typeof routing.pinModel === "string" ? { pinModel: routing.pinModel } : {}),
               ...(isFabricThinking(routing.pinThinking) ? { pinThinking: routing.pinThinking } : {}),
               shadowCandidates: Array.isArray(routing.shadowCandidates)
@@ -1068,6 +1079,13 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
             };
           })() }
         : {}),
+      modelPolicy: {
+        requireReason: [...new Set((Array.isArray(objectValue(agents.modelPolicy).requireReason)
+          ? objectValue(agents.modelPolicy).requireReason as unknown[]
+          : DEFAULT_FABRIC_CONFIG.agents.modelPolicy.requireReason)
+          .filter((model): model is string => typeof model === "string" && !!model.trim())
+          .map(model => model.trim().toLowerCase()))],
+      },
       deniedModels: [...new Set((Array.isArray(agents.deniedModels) ? agents.deniedModels : [])
         .filter((model): model is string => typeof model === "string" && !!model.trim())
         .map((model) => model.trim().toLowerCase()))],
@@ -1135,6 +1153,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           ? agents.sessionExportDir
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
+      ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
     },
     jev: normalizeJevConfig(input.jev),
     records: normalizeRecordsConfig(input.records),
@@ -1574,8 +1593,11 @@ const resolveFabricConfig = (
     const document = { ...plan.document };
     if (plan === projectPlan) {
       const agents = { ...objectValue(document.agents) };
+      delete agents.modelPolicy;
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;
+      delete agents.instructionsRoot;
+      delete agents.processSlice;
       document.agents = agents;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

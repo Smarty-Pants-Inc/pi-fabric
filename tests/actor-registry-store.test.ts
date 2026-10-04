@@ -117,6 +117,46 @@ describe("ActorRegistryStore", () => {
     }
   });
 
+  it.skipIf(process.platform === "win32")("does not skip a durable registry write after an ancestor symlink replacement", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-registry-link-"));
+    roots.push(root);
+    const physical = path.join(root, "physical"), alias = path.join(root, "alias");
+    const actorRoot = path.join(alias, "actors"), physicalActorRoot = path.join(physical, "actors");
+    fs.mkdirSync(physical, { recursive: true });
+    fs.symlinkSync(physical, alias, "dir");
+    const store = new ActorRegistryStore(actorRoot);
+    const actor = { id: "same", rootId: "owner" };
+    store.write([actor], { durable: true });
+
+    // Rebind the ancestor to the same physical directory. The leaf inode/stamp and
+    // bytes are unchanged, but the namespace link still needs a fresh durable receipt.
+    fs.unlinkSync(alias);
+    fs.symlinkSync(physical, alias, "dir");
+    const descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs);
+    const sync = fs.fsyncSync.bind(fs);
+    let parentBarrierAttempted = false;
+    let fail = true;
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode);
+      descriptors.set(fd, String(file));
+      return fd;
+    });
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const file = descriptors.get(fd);
+      if (file && fs.realpathSync(file) === physicalActorRoot) {
+        parentBarrierAttempted = true;
+        if (fail) {
+          fail = false;
+          throw new Error("ancestor parent barrier unavailable");
+        }
+      }
+      sync(fd);
+    });
+    expect(() => store.write([actor], { durable: true })).toThrow("ancestor parent barrier unavailable");
+    expect(parentBarrierAttempted).toBe(true);
+  });
+
   it("preserves unknown record fields and filters only invalid record identities", () => {
     const { store, actorRoot, registryPath } = setup();
     fs.mkdirSync(actorRoot);

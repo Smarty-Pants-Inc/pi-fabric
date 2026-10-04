@@ -205,6 +205,40 @@ The trusted host's `<agentDir>/fabric.json` can set:
 
 These policy keys are ignored in project/workspace `.pi/fabric.json`, even in trusted projects. The default deny-list is empty. Fabric checks requested selectors and canonical selections case-insensitively, including aliases, inherited models and defaults, before spawn/create or model-setter mutation. A denial raises `FabricModelDeniedError` (`code: "FABRIC_MODEL_DENIED"`), names #2236 and the configured replacement, and never silently falls back to another model. Alternate runners also admit the backend selector produced by their argv normalizer (including `veda/`, `claude/` and `anthropic/` routing forms). Under active policy, Claude aliases must have an allowed native CLI catalog `resolvedModel` (checked as both a runtime ID and `anthropic/<id>`); Veda requires backend `pi` and an exact concrete `provider/model` resolved by the Pi registry. Unknown targets, Veda aliases/bare IDs/defaults and other Veda backends fail closed with the same typed refusal before queueing or durable submission. Allowed canonical targets, not unresolved selectors, are forwarded to workers. In-place Prewalk checks policy at manual/automatic arm and again before switching Main, and denied binding clears preserve the old binding when the actual owning-session fallback is denied. The fixed refusal code is preserved in public TypeScript guest catches; arbitrary host error properties are not transferred. Deploy the host policy to enforce the fleet list; rebuilding does not retroactively change existing workers or resident owners. See the [public-path CLI proof and installation-only owner gate](model-policy-acceptance.md).
 
+### Explicit model exceptions (#3134)
+
+`agents.spawn`, `agents.run`, `agents.create` (including `createActor`) and actor
+`agents.setModel` refuse an explicit Astra selector unless `modelReason` is a
+non-blank string of at most 200 JavaScript characters. The default match is
+`/(^|\/)gpt-6-astra/`: bare IDs and provider-qualified Astra variants are covered.
+No model is silently substituted. The error names the configured runner role
+default and tells the caller to omit `model` or supply a named exception:
+
+```ts
+await agents.spawn({ task: "Bounded compatibility probe", model: "cliproxyapi/gpt-6-astra",
+  modelReason: "Named exception: reproduce an Astra-specific parser failure" });
+```
+
+Only the trusted host's `<agentDir>/fabric.json` may override the list:
+
+```json
+{ "agents": { "modelPolicy": { "requireReason": ["cliproxyapi/gpt-6-astra"] } } }
+```
+
+Bare entries match a model-ID prefix on any provider; provider-qualified entries
+match that provider/model prefix. Matching is case-insensitive. The default list
+is `["gpt-6-astra"]`; `[]` disables the gate (rollback). Project/workspace policy
+entries are ignored even in trusted projects. Omitted `model`, inherited role or
+project defaults, Sol and other unlisted models are unaffected. Existing actors
+continue unchanged; an explicit `setModel` request needs its own exception.
+Aliases are tested as the explicitly requested selector, not their resolved target.
+
+The reason is retained verbatim on run records and actor definitions/session
+bindings, and follows the effective binding into activation run records. Clearing
+or replacing a binding clears its old reason. The `run.spawned` lifecycle event
+is emitted after actual worker registration (not queue admission) with
+`data.model` and, when supplied, `data.modelReason` for metering.
+
 ### Requested models are authoritative
 
 For Pi workers, Fabric reapplies the resolved `provider/model` over RPC **after startup extensions finish**, reapplies the requested thinking level, and independently reads `get_state` before sending the task. A successful `set_model` response alone is insufficient: it can echo the requested model even when an extension switches away during `model_select`. Thinking is reported at Pi's effective, capability-clamped level.
@@ -486,6 +520,46 @@ Pi-runner `model` arguments on `agents.run`, `agents.spawn`, `agents.create`, an
 
 This is the host-level equivalent of the `pi-model-switch` extension's `switch_model` tool, with aliases moved into Fabric configuration so project and agent scopes behave like every other Fabric section.
 
+### Changing this session's own live Main
+
+`agents.setThinking` accepts this Main's exact `session:<id>`:
+
+```ts
+const main = await agents.main();
+const effort = await agents.setThinking({ id: main.id, thinking: "high" });
+```
+
+This call uses Pi's synchronous thinking setter: the in-flight inference stays
+unchanged, and the next model turn consumes the new effort. It returns Main's
+native read-back state plus `previous: { model?, thinking? }` and `caller` (the
+exact calling Main ID); Pi's capability clamp is reflected in `thinking`.
+Cancellation, deadline, authority and liveness are checked after the serialized
+queue wait, with no await between the final fence and native state/journal commit.
+Only session scope is supported; a Main thinking binding cannot be cleared.
+Actor IDs and names (including an actor named `main`) keep their existing binding
+behavior for both setters.
+
+**Main `agents.setModel` is deferred entirely**, for own and remote targets:
+`Main setModel is not supported yet (own or remote); see smarty-dev#4153`.
+It refuses before registry resolution, native authentication, publication or
+mutation. Pi's native model setter awaits authentication before mutation without
+a requester cancellation/commit guard; same-process execution does not close
+that window. The pre-existing `agents.switchModel` API is unchanged by this cut.
+
+Only this session's own live Main may change thinking. Cross-process thinking
+changes are refused, even for a recorded lead or org/product owner:
+`remote Main model changes are not supported yet; see smarty-dev#4153`.
+Nothing is queued or mutated. Follow-up support is tracked separately; this PR
+contains no Pi-core patch. Participant format-1 capabilities stay unchanged and
+`mainBindings` is false. Ordinary discovery and messaging remain compatible.
+
+Successful own-session changes write a `pi-fabric.main-binding-change` entry in
+this Main's native Pi journal with the action, caller, target and before/after
+model/effort; the public calls retain their ordinary Fabric execution audit.
+
+Native artifact proof (keyless, offline real Pi RPC; no external inference):
+`nice -n 19 node scripts/prove-main-bindings.mjs dist/index.js "$TASK_OUT"`.
+
 ### Transports
 
 **Execution-custody scope cut (smarty-dev#2566 / pi-fabric#218):** agent
@@ -624,7 +698,22 @@ For a code-owned typed alternative to a reasoning actor, use [Jev Main-turn obse
 
 ## Persistent actors
 
-`agents.create()` makes a named actor. The actor has a fixed runner, persistent runner session, serial mailbox, and optional subscriptions to parent-session events or durable mesh topics:
+`agents.create()` (also spelled `agents.createActor()`) makes a named actor. It and `agents.setInstructions()` accept either inline `instructions` **or** the pair `instructionsFile` + `sha256`, never both:
+
+```ts
+return agents.createActor({
+  name: "reviewer",
+  instructionsFile: "/home/paul/.local/share/smarty-dev/factory/current/roles/reviewer.md",
+  sha256: "<lowercase 64-hex SHA256 of the file bytes>",
+});
+// The same pair works on agents.setInstructions({ id, instructionsFile, sha256 }).
+```
+
+The **owning host** (Main for local actors, resident for durable actors) resolves the file under the realpath of `agents.instructionsRoot`, defaulting to `~/.local/share/smarty-dev/factory/current/`. The root is configurable only in host configuration. Traversal components (`..`), outside-root paths, symlink escapes, non-regular or missing files, files over 512 KiB, invalid UTF-8, and digest mismatches are refused before actor state changes. Existing configured actor instruction size limits also apply. In-root symlinks are allowed, including a `current` symlink to a factory generation. The host reads one bounded byte snapshot and applies its text without BOM/newline normalization; `instructionsDigest` equals the supplied digest. Only the text is persisted, not a file reference; later file changes do not affect the actor. The existing >80% shrink guard still requires `replace: true` for intentional replacements.
+
+**Platform boundary:** File-backed instructions require Linux and a genuine, accessible `/proc/self/fd`. The owner pins the canonical root with an `O_DIRECTORY` handle, checks its identity, then opens each canonical path component relative to pinned directory descriptors with `O_NOFOLLOW`. An ancestor link swapped between containment checks and opening cannot redirect the read outside the root; all handles close on success or refusal. Static in-root symlinks still work because they are canonicalized before that no-follow walk. Node does not expose a portable handle-relative open or Windows reparse-safe equivalent, so Windows/macOS/other hosts refuse **all** file-backed sources (including reparse-point paths) before filesystem access or actor mutation; use inline `instructions` there. Missing/inaccessible procfs also fails closed; there is no pathname-only fallback. This assumes the host controls mount topology/procfs; it does not defend against a privileged mount replacement.
+
+The actor has a fixed runner, persistent runner session, serial mailbox, and optional subscriptions to parent-session events or durable mesh topics:
 
 ```ts
 return agents.create({
@@ -742,7 +831,7 @@ Pass `coalesceKey` to `agents.create` for a new actor, or `null` to `agents.setC
 
 An actor that runs a model on every event spends most runs on events it always ignores. Set `activationFilter` to a list of skip rules. Fabric checks each queued mesh or host event against the rules just before it would run the model. When a rule matches, Fabric skips the event with no model call. A rule only skips: it never acts, replies or changes the event. Direct messages (`ask`, `tell`) are never filtered. Fabric checks an event when it arrives, before it can join or replace a queued item, and again just before the run (for items queued before the filter was set). So a skipped event never replaces a queued one by `coalesceKey`: a comment edit that arrives while its comment's creation waits in the queue is skipped, and the creation still runs.
 
-Each skip adds a record to the actor's message log: direction `in`, the event's `source`, and reason `filtered: <rule id>`. The actor status counts skips in `filteredCount` and `lastFilteredAt`.
+Each skip adds a record to the actor's message log: direction `in`, the event's `source`, and reason `filtered: <rule id>`. `agents.actorStatus({ id })` returns `filterSkipped: { count, lastKey, lastTopic, lastAt }`. `count` counts rejections since the filter was last set or cleared; the last fields are `null` until a rejection. `lastKey` is the queue's coalesce key (the JSON tuple `["mesh", topic, value]`) when present, otherwise the mesh event ID used for deduplication (or the host item's ID); `lastTopic` is the mesh topic or host event name, and `lastAt` is the rejection time in epoch milliseconds. This soft telemetry is stored with actor state, coalesced at the existing poll boundary without an extra fsync per skip, and restored after a host restart. A crash may lose the latest unflushed poll window. Resident actors return the execution owner's telemetry through the existing owner status RPC, including when read by the owning Main. The legacy `filteredCount` and `lastFilteredAt` remain lifetime counters.
 
 Two presets come ready to use. Each had zero false skips in 24 hours of supervisor runs (smarty-dev#1579):
 
@@ -772,7 +861,17 @@ const supervisor = (await agents.actors()).find((actor) => actor.name === "dev-s
 if (supervisor) await agents.setActivationFilter({ id: supervisor.id, activationFilter: ["hold", "never-message-events"] });
 ```
 
-Pass `activationFilter` to `agents.create` for a new actor, or `null` to `agents.setActivationFilter` to clear it. A change applies from the next queued event; the counter stays.
+Pass `activationFilter` to `agents.create` for a new actor, or `null` (or `[]`) to `agents.setActivationFilter` to clear it. A change applies from the next queued event and resets `filterSkipped`, even when setting the same filter; legacy lifetime counters stay.
+
+For a temporary review claim, set a finite `expiresAt` (epoch milliseconds) on a live actor:
+
+```ts
+await agents.setActivationFilter({
+  id: "release-reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60_000,
+});
+```
+
+At or after that time, the next event or existing poll clears the filter **before** testing an event, resets `filterSkipped`, and records an actor message with source `actor:activation-filter` and reason `activationFilter cleared: expired`. Explicit clears record `activationFilter cleared: explicit`. The expiry survives restart and is visible as `activationFilterExpiresAt` in actor status; setting a filter without `expiresAt` removes any previous expiry. No additional timers are created. Global templates do not support expiry. `clearWhen` verdict-based clearing is not implemented: use expiry or explicitly clear after observing the PR's complete verdict.
 
 A stored filter that this version cannot read (for example, one written by a newer version or edited by hand) never removes or rewrites its actor or global template. Fabric keeps the stored value unchanged, applies no filter (every event is delivered), logs a `PI_FABRIC_ACTIVATION_FILTER` warning, and shows the reason in `activationFilterError`. Set a valid filter to repair it.
 
@@ -878,7 +977,7 @@ A persistent actor keeps one Pi session across activations. The session can grow
 const actor = await agents.resetSession({ id: "release-reviewer" });
 ```
 
-The call works only on an actor that this session or host owns. On an actor that another host owns, it throws `Fabric actor is owned by another host: <id>`. When a run is in progress, the call waits until the run settles. It does not interrupt the run. Fabric then moves `<actor dir>/session.jsonl` to `session.jsonl.<UTC stamp>.bak` in the same directory, for example `session.jsonl.20260927T145012345Z.bak`. Fabric keeps the two newest backups and deletes older ones. The next run starts a fresh Pi session. A Claude actor also drops its stored runner session ID. The call returns the new `FabricActorInfo` and publishes presence.
+For a session actor, the call works only on the owning session or host; a foreign owner receives `Fabric actor is owned by another host: <id>`. For a durable resident actor, the owning root Main routes the repair to its resident host; foreign roots and inherited task/actor lineage cannot reset it. When a run is in progress, the call waits at the fenced activation boundary until the run settles, then returns the same actor to service. It does not interrupt the run or clear its mailbox. Request reset directly; it is non-destructive repair, not terminal cancellation. An explicit `agents.stop()` cancels a pending boundary reset, terminates the owned activation, and drops queued work; the reset reports `ACTOR_SESSION_RESET_CANCELLED` without rotating the journal. Resident status and other commands remain serviceable while reset or stop waits for the activation fence. Resetting an explicitly stopped actor changes its history only; it does not resume it. Fabric then moves `<actor dir>/session.jsonl` to `session.jsonl.<UTC stamp>.bak` in the same directory, for example `session.jsonl.20260927T145012345Z.bak`. Fabric keeps the two newest backups and deletes older ones. The next run starts a fresh Pi session. A Claude actor also drops its stored runner session ID. The call returns the new `FabricActorInfo` and publishes presence.
 
 The reset keeps instructions, topics, bindings, events, the queue, the overflow, and the message log. Queued work goes to the fresh session. The message log records the reset as an `out` message from source `fabric-host`, with reason `session reset (requested)` or `session reset (size limit)` and data `{ sessionReset: { trigger: "requested" | "size", bytes, archived } }`. `archived` is the backup path, or `null` when there was no session file.
 

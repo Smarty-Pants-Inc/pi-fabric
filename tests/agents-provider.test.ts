@@ -96,12 +96,12 @@ const visiblePiModels = [
 
 describe("explicit Astra launch guard (#3134)", () => {
   const model = "cliproxyapi/gpt-6-astra";
-  const refusal = "named passes use cliproxyapi/gpt-6.1-sol thinking max; otherwise omit model (role default)";
+  const refusal = `model ${model} requires modelReason (named exception); omit model to use the role default pi default (inherited session model), see smarty-dev#3134`;
   const reason = "  Explicit exception for a bounded compatibility probe  ";
-  const argsFor = (action: string): Record<string, unknown> => action === "create"
+  const argsFor = (action: string): Record<string, unknown> => action === "create" || action === "createActor"
     ? { name: "guard-probe", instructions: "Work." } : { task: "Work.", transport: "process" };
 
-  it.each(["run", "spawn", "create"] as const)("%s refuses missing, blank and non-string reasons before any side effect", async action => {
+  it.each(["run", "spawn", "create", "createActor"] as const)("%s refuses missing, blank and non-string reasons before any side effect", async action => {
     const { provider, agents, actors, globalActors } = setup();
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
@@ -114,6 +114,60 @@ describe("explicit Astra launch guard (#3134)", () => {
       expect(globalActors.list()).toEqual([]);
       expect(launch).not.toHaveBeenCalled();
     } finally { launch.mockRestore(); }
+  });
+
+  it.each(["run", "spawn", "create", "createActor"] as const)("%s covers all Astra provider prefixes and the reason length boundary", async action => {
+    const { provider, agents, actors } = setup([], [], undefined, { agentsConfig: { model: "cliproxyapi/gpt-6.1-sol" } });
+    for (const selection of ["gpt-6-astra", "openai-codex/gpt-6-astra-xhigh", "cliproxyapi/gpt-6-astra-preview"]) {
+      await expect(provider.invoke(action, { ...argsFor(action), model: selection }, context))
+        .rejects.toThrow(`model ${selection} requires modelReason (named exception); omit model to use the role default cliproxyapi/gpt-6.1-sol, see smarty-dev#3134`);
+    }
+    const inherited = { ...context, extensionContext: { ...context.extensionContext, model: { provider: "provider", id: "session" } } as ExtensionContext };
+    await expect(provider.invoke(action, { ...argsFor(action), model }, inherited)).rejects.toThrow("role default provider/session, see smarty-dev#3134");
+    await expect(provider.invoke(action, { ...argsFor(action), model, modelReason: "x".repeat(201) }, context))
+      .rejects.toThrow("modelReason must be ≤200 chars");
+    expect(agents.list()).toEqual([]); expect(actors.list()).toEqual([]);
+    const receipt = await provider.invoke(action, { ...argsFor(action), model, modelReason: "x".repeat(200) }, context) as AgentRunRecord;
+    if (action === "spawn") await agents.wait(receipt.id);
+    expect(receipt.modelReason).toBe("x".repeat(200));
+  });
+
+  it.each(["session", "project", "global"] as const)("setModel refuses without a fresh reason and records an accepted %s exception", async scope => {
+    const { provider, actors, agents, globalActors } = setup([], [], undefined, { agentsConfig: { model: "cliproxyapi/gpt-6.1-sol" } });
+    const actor = await provider.invoke("create", { name: "setter", instructions: "Work.", ...(scope === "global" ? { scope } : {}) }, context) as FabricActorInfo;
+    for (const modelReason of [undefined, "", "  ", false, "x".repeat(201)]) {
+      await expect(provider.invoke("setModel", { id: actor.id, scope, model, modelReason }, context)).rejects.toThrow("requires modelReason (named exception)");
+    }
+    const selected = await provider.invoke("setModel", { id: actor.id, scope, model, modelReason: reason }, context) as FabricActorInfo;
+    expect(selected).toMatchObject({ model, modelReason: reason });
+    if (scope === "global") expect(globalActors.toRequest(globalActors.resolve(actor.id)!)).toMatchObject({ model, modelReason: reason });
+    else {
+      const message = await provider.invoke("ask", { id: actor.id, message: "Work." }, context) as { runId: string };
+      expect(agents.status(message.runId)).toMatchObject({ model, modelReason: reason });
+      expect(actors.status(actor.id).modelReason).toBe(reason);
+    }
+    const cleared = await provider.invoke("setModel", { id: actor.id, scope, model: "cliproxyapi/gpt-6.1-sol" }, context) as FabricActorInfo;
+    expect(cleared.modelReason).toBeUndefined();
+  });
+
+  it("keeps existing actors and template imports running without a retroactive reason requirement", async () => {
+    const { provider, actors, agents, globalActors } = setup();
+    const existing = await actors.create({ name: "pre-policy", instructions: "Work.", model });
+    const message = await provider.invoke("ask", { id: existing.id, message: "Work." }, context) as { runId: string };
+    expect(agents.status(message.runId)).toMatchObject({ model, status: "completed" });
+    expect(agents.status(message.runId).modelReason).toBeUndefined();
+    await expect(provider.invoke("setModel", { id: existing.id, model }, context)).rejects.toThrow("requires modelReason");
+    const template = globalActors.create({ name: "pre-policy-template", instructions: "Work.", model });
+    expect(await provider.invoke("import", { id: template.id, as: "legacy-import" }, context)).toMatchObject({ model });
+  });
+
+  it("honors an empty rollback list and a provider-qualified override", async () => {
+    const disabled = setup([], [], undefined, { agentsConfig: { modelPolicy: { requireReason: [] } } });
+    expect(await disabled.provider.invoke("run", { task: "Work.", model, transport: "process" }, context)).toMatchObject({ model });
+    const custom = setup([], [], undefined, { agentsConfig: { modelPolicy: { requireReason: ["cliproxyapi/gpt-6.1-sol"] } } });
+    expect(await custom.provider.invoke("run", { task: "Work.", model, transport: "process" }, context)).toMatchObject({ model });
+    await expect(custom.provider.invoke("spawn", { task: "Work.", model: "cliproxyapi/gpt-6.1-sol" }, context)).rejects.toThrow("requires modelReason");
+    custom.agents.assertExplicitModelReason("other/gpt-6.1-sol", undefined);
   });
 
   it.each(["run", "spawn"] as const)("%s accepts a reason and records it verbatim on the run", async action => {
@@ -139,20 +193,20 @@ describe("explicit Astra launch guard (#3134)", () => {
     expect(await provider.invoke("run", { task: "Work.", model: selection, modelReason: reason, transport: "process" }, context))
       .toMatchObject({ status: "completed", modelReason: reason });
   });
-  it("create retains the reason in persistent definitions and activation run records", async () => {
+  it.each(["create", "createActor"] as const)("%s retains the reason in persistent definitions and activation run records", async action => {
     const { provider, actors, agents, globalActors } = setup();
-    const actor = await provider.invoke("create", { ...argsFor("create"), model, modelReason: reason }, context) as FabricActorInfo;
+    const actor = await provider.invoke(action, { ...argsFor(action), model, modelReason: reason }, context) as FabricActorInfo;
     expect(actors.definition(actor.id)).toMatchObject({ model, modelReason: reason });
     const message = await provider.invoke("ask", { id: actor.id, message: "Work." }, context) as { runId: string };
     expect(agents.status(message.runId)).toMatchObject({ status: "completed", model, modelReason: reason });
     expect(agents.list()[0]).toMatchObject({ modelReason: reason });
-    const template = await provider.invoke("create", { ...argsFor("create"), name: "guard-template", scope: "global", model, modelReason: reason }, context) as FabricActorInfo;
+    const template = await provider.invoke(action, { ...argsFor(action), name: "guard-template", scope: "global", model, modelReason: reason }, context) as FabricActorInfo;
     globalActors.update(template.id, { instructions: "Updated." });
     const definition = globalActors.list().find(entry => entry.id === template.id)!;
     expect(globalActors.toRequest(definition)).toMatchObject({ model, modelReason: reason });
   });
 
-  it.each(["run", "spawn", "create"] as const)("%s leaves omitted, inherited, other and alias model selections unaffected", async action => {
+  it.each(["run", "spawn", "create", "createActor"] as const)("%s leaves omitted, inherited, other and alias model selections unaffected", async action => {
     const { provider, agents } = setup([], [], undefined, {
       agentsConfig: { model }, modelsConfig: { aliases: { probe: { targets: [model] } } },
     });
@@ -160,7 +214,7 @@ describe("explicit Astra launch guard (#3134)", () => {
     let sequence = 0;
     for (const [selection, invocation] of [
       [{}, context], [{}, inherited], [{ model: "cliproxyapi/gpt-6.1-sol" }, context],
-      [{ model: "probe" }, context], [{ model: "gpt-6-astra" }, context],
+      [{ model: "probe" }, context],
     ] as const) {
       const receipt = await provider.invoke(action, { ...argsFor(action), name: `guard-probe-${sequence++}`, ...selection }, invocation) as AgentRunRecord;
       if (action === "spawn") expect((await agents.wait(receipt.id)).status).toBe("completed");
@@ -169,17 +223,22 @@ describe("explicit Astra launch guard (#3134)", () => {
     }
   });
 
-  it.each(["run", "spawn", "create"] as const)("public guest %s receives the exact refusal", async action => {
-    const { provider } = setup();
+  it.each(["run", "spawn", "create", "createActor"] as const)("public guest %s receives the exact refusal", async action => {
+    const { provider, agents, actors, globalActors } = setup();
     const registry = new ActionRegistry(); registry.register(provider);
     const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
     const service = new FabricExecutionService(registry, config);
-    const result = await service.execute({
-      code: `try { await agents.${action}(${JSON.stringify({ ...argsFor(action), model })}); return "unexpected admission"; } catch (error) { return error.message; }`,
-      signal: undefined, parentToolCallId: "astra-guard-guest", context: context.extensionContext, onPartial() {},
-    });
-    expect(result.success, result.error).toBe(true);
-    expect(result.value).toBe(refusal);
+    for (const modelReason of [undefined, " \t\n "]) {
+      const result = await service.execute({
+        code: `try { await agents.${action}(${JSON.stringify({ ...argsFor(action), model, modelReason })}); return "unexpected admission"; } catch (error) { return error.message; }`,
+        signal: undefined, parentToolCallId: "astra-guard-guest", context: context.extensionContext, onPartial() {},
+      });
+      expect(result.success, result.error).toBe(true);
+      expect(result.value).toBe(refusal);
+      expect(agents.list()).toEqual([]);
+      expect(actors.list()).toEqual([]);
+      expect(globalActors.list()).toEqual([]);
+    }
   });
 });
 
@@ -483,7 +542,7 @@ describe("fleet model policy (#2490)", () => {
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
       for (const model of ["veda/cliproxyapi/gpt-6-astra", undefined]) {
-        await expect(provider.invoke("spawn", { task: "review", residency, ...(model ? { model } : {}) }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+        await expect(provider.invoke("spawn", { task: "review", residency, ...(model ? { model, modelReason: "Exercise independent backend deny policy" } : {}) }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
       }
       expect(agents.list()).toEqual([]);
       expect(launch).not.toHaveBeenCalled();
@@ -838,12 +897,17 @@ describe('model: "auto" spawn routing (#2890)', () => {
     const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
     const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
       agentsConfig: { modelRouting: { shadowCandidates: [{ model: "provider/model-b", effort: "medium" }] } } });
-    const handle = await provider.invoke("spawn", { ...request, cwd: root }, context) as AgentHandleInfo & { routeDecision: { model: string } };
-    expect(handle).toMatchObject({ model: "provider/model-a", thinking: "high", routeDecision: { model: "provider/model-b", effort: "medium", reasonCode: "shadow-choice" } });
+    const modelReason = "  Named routed-task exception  ";
+    const handle = await provider.invoke("spawn", { ...request, cwd: root, modelReason }, context) as AgentHandleInfo & { routeDecision: { model: string } };
+    expect(handle).toMatchObject({ model: "provider/model-a", modelReason, thinking: "high", routeDecision: { model: "provider/model-b", modelReason, effort: "medium", reasonCode: "shadow-choice" } });
     const result = await agents.wait(handle.id);
-    expect(result).toMatchObject({ status: "completed", model: "provider/model-a", thinking: "high" });
+    expect(result).toMatchObject({ status: "completed", model: "provider/model-a", modelReason, thinking: "high",
+      routeClass: "bounded-lookup", routeClassSource: "explicit", protected: false });
     const rows = fs.readFileSync(path.join(process.env.PI_CODING_AGENT_DIR!, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows).toHaveLength(2); expect(rows[1].decisionId).toBe(rows[0].decisionId);
+    for (const row of rows) expect(row.modelReason).toBe(modelReason);
+    expect(agents.status(handle.id).modelReason).toBe(modelReason);
+    expect(JSON.stringify(evaluate.mock.calls)).not.toContain(modelReason.trim());
     expect(evaluate).toHaveBeenCalledTimes(1);
   });
   it.each([true, undefined])("excludes protected/unknown before Jev at the public API: %s", async protectedFlag => {
@@ -887,6 +951,26 @@ describe('model: "auto" spawn routing (#2890)', () => {
     const { provider, agents } = setup(); const spawn = vi.spyOn(agents, "spawn");
     await expect(provider.invoke(action, { task: "lookup", name: "not-auto", instructions: "lookup", model: "auto" }, context)).rejects.toThrow();
     expect(spawn).not.toHaveBeenCalled();
+  });
+  it.each(["spawn", "run"] as const)("records a plain %s as a derived task class without Jev", async action => {
+    const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
+    const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const value = await provider.invoke(action, { task: "review security actor:status-groom", name: "supervisor",
+      transport: "process", protected: true }, context) as AgentHandleInfo;
+    expect(value).toMatchObject({ routeClass: "task:pi:process", routeClassSource: "derived", protected: true });
+    const result = await agents.wait(value.id);
+    expect(result).toMatchObject({ routeClass: "task:pi:process", routeClassSource: "derived", protected: true, status: "completed" });
+    expect(JSON.parse(fs.readFileSync(path.join(root, "runs", value.id, "status.json"), "utf8")))
+      .toMatchObject({ routeClass: "task:pi:process", routeClassSource: "derived", protected: true });
+    expect(evaluate).not.toHaveBeenCalled();
+  });
+  it.each(["spawn", "run"] as const)("preserves an explicit history class on non-auto %s without routing", async action => {
+    const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const value = await provider.invoke(action, { task: "security", routeClass: "custom-review",
+      routeClassSource: "derived", model: request.pinModel, transport: "process", protected: false }, context) as AgentHandleInfo;
+    expect(await agents.wait(value.id)).toMatchObject({ routeClass: "custom-review", routeClassSource: "explicit", protected: false, model: request.pinModel });
+    expect(evaluate).not.toHaveBeenCalled();
   });
   it("leaves explicit model calls unchanged and never asks Jev", async () => {
     const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
@@ -1637,13 +1721,6 @@ describe("runtime observation receipts", () => {
     const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => { record("background completion", { id: result.id, status: result.status }); inbox.enqueue(result); });
     const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
     const registry = new ActionRegistry(); registry.register(h.provider);
-    let admitGuest: (() => void) | undefined;
-    registry.register({
-      name: "receipt_probe", description: "Receipt regression guest readiness",
-      async list() { return [{ name: "ready", description: "Mark guest admission", risk: "read" as const, inputSchema: { type: "object", properties: {} } }]; },
-      async describe() { return (await this.list({}, context))[0]; },
-      async invoke() { admitGuest?.(); return null; },
-    });
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     config.executor.memoryLimitBytes = 128 * 1024 * 1024;
     const python = backend === "monty" || backend === "cpython";
@@ -1661,38 +1738,19 @@ describe("runtime observation receipts", () => {
     }, 35_000);
     const execute = async (parentToolCallId: string, code: string) => {
       record(`${parentToolCallId}: start`);
-      const controller = new AbortController();
-      let guard: ReturnType<typeof setTimeout> | undefined;
-      // As with the admission-clock regressions, startup is not the tested
-      // boundary. CPython starts a fresh interpreter/Windows IPC for every call;
-      // a warmup cannot make later starts cheap. Arm the active-work guard only
-      // when a real guest host call proves admission, not before cold startup.
-      admitGuest = () => {
-        if (guard !== undefined) return;
-        record(`${parentToolCallId}: guest admitted`);
-        guard = setTimeout(() => {
-          record(`${parentToolCallId}: hang guard`);
-          controller.abort(new Error("Receipt regression execution exceeded its 12-second admitted hang guard"));
-        }, 12_000);
-      };
-      try {
-        const ready = python ? 'await tools.call(ref="receipt_probe.ready", args={})\n' : 'await tools.call({ ref: "receipt_probe.ready", args: {} });\n';
-        const result = await service.execute({ code: ready + code, context: mainContext, signal: AbortSignal.any([controller.signal, lifetime.signal]), parentToolCallId, onPartial() {} });
-        record(`${parentToolCallId}: end`, { success: result.success, error: result.error, logs: result.logs, phases: result.phases, audits: result.audits });
-        return result;
-      } finally { clearTimeout(guard); admitGuest = undefined; }
+      const result = await service.execute({ code, context: mainContext, signal: lifetime.signal, parentToolCallId, onPartial() {} });
+      record(`${parentToolCallId}: end`, { success: result.success, error: result.error, logs: result.logs, phases: result.phases, audits: result.audits });
+      // A test safety timeout is not a product cancellation regression.
+      lifetime.signal.throwIfAborted();
+      return result;
     };
     const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
     try {
-      // Startup is not the behavior under test. Both watchdogs rearm on early
-      // firings; advance the wall clock only at the tested boundary. The old
-      // real 5-second ceiling could expire before encode on a cold CI runner.
-      const warmupClock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
-      try {
-        const warmup = await execute("receipt-warmup", python ? "return 1" : "return 1;");
-        expect(warmup.success, warmup.error).toBe(true);
-        expect(warmup.value).toBe(1);
-      } finally { warmupClock.mockRestore(); }
+      // CPython starts a fresh interpreter for each execution; a warmup and
+      // readiness round trip only add untested startup/IPC work. Freeze the
+      // budget until encoding or the real guest continuation below, not for a
+      // guessed amount of wall time after admission. The lifetime guard above
+      // bounds hangs without racing those receipt boundaries on slow hosts.
       const handle = await h.agents.spawn({ task: "encoding receipt", transport: "process" });
       h.agents.detachSignal(handle.id);
       await waitFor(() => completed.mock.calls.length === 1, 5_000);
@@ -1717,6 +1775,7 @@ describe("runtime observation receipts", () => {
         rejected = await execute("receipt-encoding", python ? `return await agents.wait(id=${JSON.stringify(handle.id)})` : `return await agents.wait({ id: ${JSON.stringify(handle.id)} });`);
       } finally { encoding.mockRestore(); clock.mockRestore(); }
       expect(encode).toHaveBeenCalled();
+      expect(rejected.success).toBe(false);
       expect(rejected.error).toMatch(/MainExecutionCeilingError/);
       expect(consumed).not.toHaveBeenCalled();
       boundary(); boundary();
@@ -1753,6 +1812,7 @@ describe("runtime observation receipts", () => {
         record("fire runtime deadline", { deadlineAt });
         timer.fireAt(deadlineAt);
         const observed = await execution;
+        expect(observed.success).toBe(false);
         expect(observed.error).toMatch(/MainExecutionCeilingError/);
         expect(consumed).toHaveBeenCalledExactlyOnceWith(delivered.id);
         boundary(); boundary();
@@ -2102,6 +2162,7 @@ describe("AgentsProvider runner support", () => {
         delivery: request.delivery ?? "mailbox",
         responseMode: request.responseMode ?? "text",
         triggerTurn: request.triggerTurn ?? false,
+        filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
         coalesce: request.coalesce ?? true,
         residency: "durable",
         queued: 0,
@@ -2615,8 +2676,8 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("list", {}, context)).resolves.toBeInstanceOf(Array);
   });
 
-  it("defers explicit handoff until the finalized outer Fabric result", async () => {
-    const { provider, root } = setup();
+  it.each([undefined, "handoff-review"])("defers handoff until the finalized outer Fabric result and records its class: %s", async routeClass => {
+    const { provider, root, agents } = setup();
     const source = SessionManager.create(process.cwd(), path.join(root, "source-session"));
     source.appendMessage({
       role: "user",
@@ -2668,6 +2729,8 @@ describe("AgentsProvider runner support", () => {
       model: "anthropic/executor",
       task: "Finish the implementation and verify it.",
       transport: "process",
+      protected: true,
+      ...(routeClass !== undefined ? { routeClass } : {}),
     };
 
     await expect(provider.invoke("handoff", args, handoffContext)).resolves.toMatchObject({
@@ -2711,6 +2774,10 @@ describe("AgentsProvider runner support", () => {
       implementation: "fake worker complete",
       agent: { model: "anthropic/executor" },
     });
+    const expectedClass = { routeClass: routeClass ?? "handoff", routeClassSource: routeClass !== undefined ? "explicit" : "derived", protected: true };
+    expect(agents.status(result.agent.id)).toMatchObject(expectedClass);
+    expect(JSON.parse(fs.readFileSync(path.join(root, "runs", result.agent.id, "status.json"), "utf8")))
+      .toMatchObject(expectedClass);
     expect(updates).toContainEqual(expect.stringContaining("caller is waiting"));
     expect(updates).toContainEqual(expect.stringContaining("completed implementation"));
     const task = fs.readFileSync(
@@ -5149,6 +5216,12 @@ describe("AgentsProvider steering", () => {
       name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], activationFilter: ["hold", "never-message-events"],
     }, context)) as { id: string; activationFilter?: unknown };
     expect(actor.activationFilter).toEqual(["hold", "never-message-events"]);
+    const expiresAt = Date.now() + 60_000;
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt }, context))
+      .resolves.toMatchObject({ activationFilterExpiresAt: expiresAt, filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } });
+    for (const invalid of [NaN, Infinity, "tomorrow"]) {
+      await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt: invalid }, context)).rejects.toThrow("expiresAt");
+    }
     await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: null }, context)).resolves.not.toHaveProperty("activationFilter");
     await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"] }, context))
       .resolves.toMatchObject({ activationFilter: ["hold"] });
@@ -5159,6 +5232,7 @@ describe("AgentsProvider steering", () => {
       name: "template", instructions: "Supervise.", scope: "global", activationFilter: ["never-message-events"],
     }, context)) as { id: string; activationFilter?: unknown };
     expect(template.activationFilter).toEqual(["never-message-events"]);
+    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], expiresAt, scope: "global" }, context)).rejects.toThrow("only supported for live actors");
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], scope: "global" }, context))
       .resolves.toMatchObject({ activationFilter: ["hold"] });
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: null, scope: "global" }, context))
@@ -5660,7 +5734,7 @@ describe("AgentsProvider switchModel", () => {
       } as unknown as ExtensionContext,
     };
     const results = await Promise.allSettled([
-      provider.invoke("spawn", { task: "Astra", model: "openai-codex/gpt-6-astra" }, invocation),
+      provider.invoke("spawn", { task: "Astra", model: "openai-codex/gpt-6-astra", modelReason: "Named compatibility probe" }, invocation),
       provider.invoke("spawn", { task: "Sol", model: "openai-codex/gpt-6-sol" }, invocation),
       provider.invoke("spawn", { task: "Unrelated", model: "openai-codex/zzzz" }, invocation),
     ]);
@@ -5862,6 +5936,24 @@ describe("own-root resident setters and authoritative status", () => {
     expect(state.actors.status(state.actor.id)).toMatchObject({ model: "provider/session", projectDefaults: { model: "provider/project" } });
   });
 
+  it("resident setModel requires a named exception before submission and forwards its metering reason", async () => {
+    const state = await remoteState();
+    const model = "cliproxyapi/gpt-6-astra";
+    const modelReason = "Named resident compatibility probe";
+    for (const scope of ["session", "project"]) {
+      await expect(state.provider.invoke("setModel", { id: state.actor.id, scope, model }, context)).rejects.toThrow("requires modelReason");
+    }
+    expect(state.setActor).not.toHaveBeenCalled();
+    state.setActor.mockResolvedValue({ ...state.effective, model, modelReason });
+    for (const scope of ["session", "project"]) {
+      await expect(state.provider.invoke("setModel", { id: state.actor.id, scope, model, modelReason }, context)).resolves.toMatchObject({ model, modelReason });
+      expect(state.setActor).toHaveBeenLastCalledWith(
+        { operation: "setModel", id: state.actor.id, scope, model, modelReason },
+        context.signal, { identity: state.identity, hostId: state.identity.id },
+      );
+    }
+  });
+
   it("returns model and via from resident model setters without activity", async () => {
     const state = await remoteState();
     state.setActor.mockResolvedValue({ ...state.effective, model: "cliproxyapi/gpt-6.1-sol" });
@@ -5928,10 +6020,18 @@ describe("own-root resident setters and authoritative status", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it("forwards resident expiry to the execution owner", async () => {
+    const state = await remoteState();
+    const expiresAt = Date.now() + 60000;
+    await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], expiresAt }, context);
+    expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], expiresAt });
+  });
+
   it("returns host effective status/list rather than a stale Main overlay", async () => {
     const state = await remoteState();
+    state.effective.filterSkipped = { count: 7, lastKey: "review-key", lastTopic: "github.demo", lastAt: 1234 };
     const roster = vi.spyOn(ResidentActorClient.prototype, "actors").mockResolvedValue([state.effective]);
-    await expect(state.provider.invoke("actorStatus", { id: state.actor.id }, context)).resolves.toMatchObject({ model: "provider/model-b", thinking: "max" });
+    await expect(state.provider.invoke("actorStatus", { id: state.actor.id }, context)).resolves.toMatchObject({ model: "provider/model-b", thinking: "max", filterSkipped: state.effective.filterSkipped });
     await expect(state.provider.invoke("actors", {}, context)).resolves.toEqual([state.effective]);
     expect(state.actorStatus).toHaveBeenCalledWith(state.actor.id, context.signal);
     roster.mockRestore();

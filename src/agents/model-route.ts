@@ -15,6 +15,8 @@ export interface ModelRoutingConfig {
   pinModel?: string;
   pinThinking?: FabricThinking;
   shadowCandidates?: RouteCandidate[];
+  /** Reserved for PR2. True is refused until measured parity and Paul's floor approval. */
+  live?: false;
 }
 export type RouteReason = "shadow-choice" | "excluded-protected" | "excluded-unknown" | "excluded-class" |
   "judgment-agent" | "low-confidence" | "jev-error" | "jev-timeout" | "malformed" | "invalid-candidates" | "record-failed";
@@ -23,6 +25,11 @@ export interface ModelRouteDecision extends RouteCandidate {
   mode: "shadow" | "judgment";
   routeClass: string;
   parentSessionId: string;
+  /** Durable activation identity; never inferred from task text. */
+  actorId?: string;
+  activationId?: string;
+  /** Accepted exception for the dispatched pin; never sent to Choice inference. */
+  modelReason?: string;
   pin: RouteCandidate;
   candidates: RouteCandidate[];
   shadowChoice: RouteCandidate;
@@ -39,7 +46,7 @@ export const allocateDecisionId = (): string => randomUUID().replaceAll("-", "")
 /** One finite Choice. No prompt, task text, history, credentials or generated reason leaves Fabric. */
 export async function decideModelRoute(input: {
   routeClass: string; protected: unknown; pin: RouteCandidate; candidates: RouteCandidate[];
-  parentSessionId: string; candidatesValid?: boolean;
+  parentSessionId: string; candidatesValid?: boolean; actorId?: string; activationId?: string; modelReason?: string;
 }, evaluate: RouteEvaluate, signal?: AbortSignal): Promise<ModelRouteDecision> {
   const started = performance.now();
   signal?.throwIfAborted();
@@ -48,12 +55,14 @@ export async function decideModelRoute(input: {
   const decision: ModelRouteDecision = {
     ...input.pin, decisionId: allocateDecisionId(), mode: "shadow",
     routeClass: input.routeClass, parentSessionId: input.parentSessionId, pin: { ...input.pin },
+    ...(input.modelReason !== undefined ? { modelReason: input.modelReason } : {}),
+    ...(input.actorId ? { actorId: input.actorId, activationId: input.activationId } : {}),
     candidates, shadowChoice: { ...input.pin }, confidence: null, probability: null,
     reasonCode: "jev-error", latencyMs: 0,
   };
   if (input.protected === true) decision.reasonCode = "excluded-protected";
   else if (input.protected !== false) decision.reasonCode = "excluded-unknown";
-  else if (input.routeClass !== "bounded-lookup") decision.reasonCode = "excluded-class";
+  else if (input.routeClass !== "bounded-lookup" && input.routeClass !== "status-groom") decision.reasonCode = "excluded-class";
   else if (input.candidatesValid === false) decision.reasonCode = "invalid-candidates";
   else {
     const controller = new AbortController();
@@ -63,7 +72,7 @@ export async function decideModelRoute(input: {
     try {
       const response = await runAbortable(deadline, () => evaluate({
         state: { routeClass: input.routeClass, mode: "shadow", protection: "clear" },
-        questions: { route: { type: "choice", instructions: "Choose the cheapest model and effort suitable for a bounded lookup with a checkable result. This is a shadow judgment, not permission to change the role pin.", criteria } },
+        questions: { route: { type: "choice", instructions: "Choose the cheapest model and effort suitable for the declared bounded class: bounded-lookup is a checkable lookup/extraction; status-groom is checks/grooming producing a status line or no-op. This is a shadow judgment, not permission to change the role pin.", criteria } },
       }, deadline));
       const answer = response?.answers?.route;
       const validProbability = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
@@ -154,7 +163,7 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
     // Direct callers may already know the final cwd; manager binds after worktree creation.
     fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
     if (cwd !== undefined) bindSession(cwd);
-    if (!options.decisionRecorded) appendRouteRecord(file, { type: "decision", ...decision, childSessionId: childId, childAgentId: childId, at: Date.now() });
+    if (!options.decisionRecorded) appendRouteRecord(file, { type: "decision", ...decision, childSessionId: decision.actorId ? null : childId, childAgentId: childId, runId: childId, at: Date.now() });
   } catch (error) {
     // Judgment dispatch is fail-closed; only shadow routing may fall back.
     if (decision.mode === "judgment") throw error;
@@ -169,10 +178,12 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
     header: routeHeader(decision), ...(sessionFile ? { sessionFile } : {}), bindSession,
     outcome(result) {
       if (appended) return;
-      pendingRecord ??= { type: "outcome", decisionId: decision.decisionId, childSessionId: childId,
+      pendingRecord ??= { type: "outcome", decisionId: decision.decisionId, childSessionId: decision.actorId ? null : childId, runId: childId,
+        ...(decision.actorId ? { actorId: decision.actorId, activationId: decision.activationId } : {}),
         status: result.status, admittedModel: result.admittedModel ?? (result.status === "completed" ? result.model ?? null : null),
         admittedEffort: result.admittedThinking ?? (result.status === "completed" ? result.thinking ?? null : null),
         observedModel: result.model ?? null,
+        ...(decision.modelReason !== undefined ? { modelReason: decision.modelReason } : {}),
         tokens: result.usage ?? null, reasonCode: decision.reasonCode, at: Date.now() };
       try { appendRouteRecord(file, pendingRecord); }
       catch (error) {

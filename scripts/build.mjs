@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { build } from "esbuild";
-import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { buildLandlock } from "./build-landlock.mjs";
 
@@ -14,6 +14,7 @@ const primaryEntryPoints = [
   "src/releases-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
+  "src/agents/worker-protocol.ts",
   "src/jev.ts",
   "src/protocol.ts",
   "src/residency/host.ts",
@@ -45,6 +46,7 @@ const lazyEntryPoints = [
   "src/core/provider-operations.ts",
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
+  "src/agents/model-route-prepare.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
@@ -54,6 +56,7 @@ const lazyEntryPoints = [
   "src/providers/jev-provider.ts",
   "src/records/service.ts",
   "src/jev/client.ts",
+  "src/jev/routes.ts",
   "src/jev/observation.ts",
   "src/runtime/core-override-guest-types.ts",
   "src/runtime/dynamic-guest-types.ts",
@@ -84,10 +87,12 @@ const lazyEntryPoints = [
   "src/worker/principal-delivery.ts",
   "src/worker/session-id.ts",
   "src/worker/model-control.ts",
+  "src/worker/context-admission.ts",
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",
   "src/worker/retry-profile.ts",
   "src/worker/task-entry.ts",
+  "src/worker/release-entry.ts",
   "src/worker/run-log.ts",
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
@@ -122,6 +127,10 @@ const result = await build({
   logLevel: "info",
 });
 
+// Advertise the exact manager/worker contract without importing candidate code at spawn.
+const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
+writeFileSync("dist/worker-protocol.json", `${JSON.stringify({ version: WORKER_PROTOCOL_VERSION })}\n`);
+
 // Pi supplies these packages to extensions through its module aliases, so
 // they are peers and must never be bundled into code that Pi loads.
 const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozechner)\/pi-[a-z-]+)(?:\/|$)/;
@@ -132,7 +141,7 @@ const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozec
 // ponytail: typebox (agent-result schema checks) is their only host import
 // today; scripts/smoke-package-install.mjs fails if one gains another.
 const standalone = await build({
-  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts"],
+  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts", "src/storage/retention-cli.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",

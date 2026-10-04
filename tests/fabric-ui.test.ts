@@ -182,6 +182,7 @@ const snapshot = (): FabricDashboardSnapshot => {
     ],
     actors: [
       {
+        filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
         id: "actor-1",
         scope: "project",
         name: "advisor",
@@ -236,6 +237,13 @@ const snapshot = (): FabricDashboardSnapshot => {
 };
 
 describe("Fabric dynamic UI", () => {
+  it.each(["agents.create", "agents.createActor"])("does not duplicate an actor creation call for %s", ref => {
+    const current = snapshot();
+    current.runs[0]!.calls.push({ id: "actor-create", ref, label: "advisor", kind: "actor", status: "completed", entityId: "actor-1", startedAt: current.now, updatedAt: current.now });
+    const entities = entitiesForOverview(current, undefined, undefined, "activity");
+    expect(entities.some(entity => entity.id === "call:actor-create")).toBe(false);
+    expect(entities.some(entity => entity.id === "actor:actor-1")).toBe(true);
+  });
   it("projects component lifecycle and dependency nodes into both overview modes", () => {
     const current = snapshot();
     const now = Date.now();
@@ -3136,6 +3144,7 @@ describe("Fabric dashboard global actors and instructions editor", () => {
       agents: [],
       actors: [
         {
+          filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
           id: "actor-1",
           scope: "project",
           name: "advisor",

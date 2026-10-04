@@ -125,6 +125,7 @@ export type FabricActorStorageScope = "session" | "project";
 
 export interface FabricActorRunBinding {
   model?: string;
+  modelReason?: string;
   thinking?: FabricThinking;
 }
 
@@ -195,6 +196,8 @@ export interface FabricActorValidityFacts {
   };
 }
 
+/** Public creation input; file instructions are resolved only by the actor owner. */
+export type FabricActorCreateRequest = Omit<FabricActorRequest, "instructions"> & import("./instructions-file.js").FabricActorInstructionsSource;
 export interface FabricActorRequest {
   /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
   idempotencyKey?: string;
@@ -229,9 +232,13 @@ export interface FabricActorRequest {
   /** Host-only backend snapshot for persistent/resident sessions; not a provider argument. */
   pythonRuntime?: FabricPythonRuntime;
   model?: string;
-  /** Creation-time model justification retained on actor activation runs. */
+  /** Named model exception (non-blank, ≤200 chars), retained on activation runs. */
   modelReason?: string;
   thinking?: FabricThinking;
+  /** Opt-in per-activation shadow Choice; requires explicit model/effort pins. */
+  routeClass?: "status-groom";
+  /** Trusted review/security/audit/needs-security-pass snapshot, never prompt-inferred. */
+  protected?: boolean;
   tools?: string[];
   transport?: FabricAgentTransport;
   timeoutMs?: number;
@@ -282,7 +289,10 @@ export interface FabricActorInfo {
   coalesce: boolean;
   coalesceKey?: string;
   activationFilter?: FabricActorActivationFilter;
-  /** Events the activation filter skipped without a model run. */
+  /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
+  filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
+  activationFilterExpiresAt?: number;
+  /** Lifetime events the activation filter skipped without a model run (legacy). */
   filteredCount?: number;
   lastFilteredAt?: number;
   /**
@@ -295,10 +305,14 @@ export interface FabricActorInfo {
   via?: string;
   /** Canonical selection when via is present; may differ from the session's effective model. */
   selectedModel?: string;
+  /** Named exception for the effective model, retained for metering. */
+  modelReason?: string;
   /** Effective value for this caller after session bindings overlay project defaults. */
   model?: string;
   /** Effective value for this caller after session bindings overlay project defaults. */
   thinking?: FabricThinking;
+  routeClass?: "status-groom";
+  protected?: boolean;
   binding?: FabricActorBindingView;
   projectDefaults?: FabricActorProjectDefaults;
   tools?: string[];

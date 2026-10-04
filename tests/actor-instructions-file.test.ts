@@ -1,0 +1,486 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createHash } from "node:crypto";
+import { describe, expect, it, vi } from "vitest";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { resolveActorInstructions, MAX_ACTOR_INSTRUCTIONS_FILE_BYTES } from "../src/actors/instructions-file.js";
+import { ActorManager } from "../src/actors/manager.js";
+import { AgentManager } from "../src/agents/manager.js";
+import { GlobalActorRegistry } from "../src/actors/global-registry.js";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { AgentsProvider } from "../src/providers/agents-provider.js";
+import { LifecycleBroker } from "../src/lifecycle/broker.js";
+import { ResidentHost } from "../src/residency/host.js";
+import { ResidencyClient } from "../src/residency/client.js";
+import { ResidentActorClient } from "../src/residency/actor-client.js";
+import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import { FabricExecutionService } from "../src/execution-service.js";
+import type { FabricMainAgentTarget } from "../src/main-agent.js";
+import type { FabricActorInfo } from "../src/actors/types.js";
+import type { FabricInvocationContext } from "../src/protocol.js";
+
+const digest = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+const text = "\ufeffOwn this role — café 🚀.\r\nKeep the final newline.\n";
+const fileSource = (instructionsFile: string, bytes = text) => ({ instructionsFile, sha256: digest(bytes) });
+
+const fixture = async (durable = false) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-instructions-file-"));
+  const localRoot = path.join(root, "main-factory");
+  const factory = path.join(root, "resident-factory");
+  fs.mkdirSync(localRoot); fs.mkdirSync(factory);
+  const identity = { id: "session:instructions", name: "Main", kind: "main" as const, sessionId: "instructions" };
+  const meshRoot = path.join(root, "mesh");
+  const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, maxEventBytes: 1024 * 1024, actorPollMs: 20 };
+  const mesh = new MeshStore(meshRoot, meshConfig.maxEventBytes, 100);
+  const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity });
+  participants.registerSource(() => [{
+    format: 1, id: identity.id, kind: "root", rootId: identity.id, ownerHostId: identity.id, ownerIdentityId: identity.id,
+    name: "Main", status: "idle", residency: "session", runner: "pi", transport: "host", capabilities: ["fabric"],
+    cwd: root, sessionId: identity.sessionId, startedAt: 1, updatedAt: Date.now(), controlProtocol: "v1",
+  }]);
+  await participants.start();
+  const agents = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: localRoot }, {
+    runRoot: path.join(root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+  });
+  const localActorRoot = path.join(root, "main-actors");
+  const actors = new ActorManager(identity.sessionId, identity, mesh, meshConfig, agents, () => {}, { actorRoot: localActorRoot, persistent: true });
+  const config: ResidentHostConfig = {
+    format: 1, rootId: identity.id, sessionId: identity.sessionId, cwd: root, projectRoot: root, meshRoot,
+    actorRoot: path.join(root, "resident-actors"), residencyRoot: residentRoot(meshRoot, identity.id), fullCodeMode: true,
+    agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: factory }, mesh: meshConfig,
+    retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+    fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
+    piModels: { available: [{ provider: "fixture", id: "visible" }, { provider: "cliproxyapi", id: "gpt-6-astra" }], aliases: {}, defaultModel: "fixture/visible" },
+  };
+  const mainAgent = { id: identity.id, local: true, matches: (id: string) => id === identity.id } as FabricMainAgentTarget;
+  const host = durable ? new ResidentHost(config, () => {}) : undefined;
+  if (host) await host.start();
+  const client = host ? new ResidencyClient({ config, mesh, participants, commandTimeoutMs: 5000, mainAgent }) : undefined;
+  const globalActors = new GlobalActorRegistry(root, meshConfig.maxEventBytes);
+  const lifecycle = new LifecycleBroker(mesh, identity, participants, { enabled: false, pollMs: 20, maxReadEvents: 100 }, async () => {});
+  const provider = new AgentsProvider(agents, actors, globalActors, mainAgent, participants, undefined, lifecycle, () => false, client, false);
+  const context: FabricInvocationContext = { cwd: root, signal: undefined, extensionContext: { modelRegistry: { getAvailable: () => config.piModels!.available } } as unknown as ExtensionContext,
+    parentToolCallId: "instructions-probe", nestedToolCallId: "instructions-probe", update() {} };
+  const owner = host?.actors ?? actors;
+  const allowed = durable ? factory : localRoot;
+  const create = (args: Record<string, unknown>) => provider.invoke("createActor", { name: "role", ...(durable ? { residency: "durable", model: "fixture/visible" } : {}), ...args }, context) as Promise<FabricActorInfo>;
+  return { root, allowed, localRoot, factory, owner, actors, provider, create, context, globalActors, client, config, identity, host,
+    close: async () => {
+      await provider.close(); await lifecycle.close(); await actors.close(); await agents.close();
+      await client?.close(); await host?.close(); await participants.close(); fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+};
+
+for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} createActor Astra reason guard (#389)`, () => {
+  it.each((["inline", "file"] as const).flatMap(source =>
+    (["project", "global"] as const).flatMap(scope =>
+      (["direct", "guest"] as const).map(route => [source, scope, route] as const))))(
+    "refuses missing/blank reasons for %s instructions, %s scope, %s route without actor/template/registry mutation",
+    async (source, scope, route) => {
+      const state = await fixture(durable);
+      try {
+        const file = path.join(scope === "global" ? state.localRoot : state.allowed, "guard.md");
+        fs.writeFileSync(file, text);
+        const registries = [
+          path.join(state.root, "main-actors", "actors.json"),
+          path.join(state.config.actorRoot, "actors.json"),
+          path.join(state.root, "fabric", "actors", "global-actors.json"),
+        ];
+        const snapshot = () => registries.map(file => fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null);
+        const before = snapshot();
+        const registry = new ActionRegistry(); registry.register(state.provider);
+        const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
+        const service = new FabricExecutionService(registry, config);
+        // #436 unifies #389's createActor guard with run/spawn/setModel policy.
+        // Keep the complete instructions/scope/route matrix on the shared refusal.
+        const refusal = "model cliproxyapi/gpt-6-astra requires modelReason (named exception); omit model to use the role default pi default (inherited session model), see smarty-dev#3134";
+        for (const modelReason of [undefined, "", " \t\n "]) {
+          const args = {
+            name: "refused-astra", scope, residency: durable ? "durable" : "session",
+            model: "cliproxyapi/gpt-6-astra", modelReason,
+            ...(source === "file" ? fileSource(file) : { instructions: text }),
+          };
+          if (route === "direct") {
+            await expect(state.provider.invoke("createActor", args, state.context)).rejects.toMatchObject({ message: refusal });
+          } else {
+            const result = await service.execute({
+              code: `try { await agents.createActor(${JSON.stringify(args)}); return "unexpected admission"; } catch (error) { return error.message; }`,
+              signal: undefined, parentToolCallId: "guest-astra-file-guard", context: state.context.extensionContext, onPartial() {},
+            });
+            expect(result.success, result.error).toBe(true);
+            expect(result.value).toBe(refusal);
+          }
+          expect(state.actors.listOwned()).toEqual([]);
+          expect(state.owner.listOwned()).toEqual([]);
+          expect(state.globalActors.list()).toEqual([]);
+          expect(snapshot()).toEqual(before);
+        }
+      } finally { await state.close(); }
+    },
+  );
+
+  for (const source of ["inline", "file"] as const) it.skipIf(source === "file" && process.platform !== "linux")(`preserves a nonblank reason for ${source} instructions`, async () => {
+    const state = await fixture(durable);
+    try {
+      const file = path.join(state.allowed, "reason.md"); fs.writeFileSync(file, text);
+      const modelReason = "  Bounded compatibility exception  ";
+      const actor = await state.create({ model: "cliproxyapi/gpt-6-astra", modelReason,
+        ...(source === "file" ? fileSource(file) : { instructions: text }) });
+      expect(state.owner.definition(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-astra", modelReason });
+      expect(state.owner.instructions(actor.id)).toBe(text);
+    } finally { await state.close(); }
+  });
+});
+
+const rejectionCases = (root: string, allowed: string) => {
+  const good = path.join(allowed, "role.md"); fs.writeFileSync(good, text);
+  const outside = path.join(root, "outside.md"); fs.writeFileSync(outside, text);
+  const sibling = `${allowed}-sibling`; fs.mkdirSync(sibling); fs.writeFileSync(path.join(sibling, "role.md"), text);
+  const link = path.join(allowed, "escape.md"); fs.symlinkSync(outside, link);
+  const directoryLink = path.join(allowed, "escape-dir"); fs.symlinkSync(sibling, directoryLink, "dir");
+  const large = path.join(allowed, "large.md"); fs.writeFileSync(large, "x".repeat(MAX_ACTOR_INSTRUCTIONS_FILE_BYTES + 1));
+  const directory = path.join(allowed, "directory"); fs.mkdirSync(directory);
+  const invalid = path.join(allowed, "invalid.md"); const bytes = Buffer.from([0xff, 0xfe]); fs.writeFileSync(invalid, bytes);
+  return [
+    ["outside", fileSource(outside), /outside/],
+    ["prefix sibling", fileSource(path.join(sibling, "role.md")), /outside/],
+    ["traversal", fileSource(`${allowed}/../${path.basename(allowed)}/role.md`), /traversal/],
+    ["tilde traversal", fileSource(`~/${path.relative(root, allowed)}/../${path.basename(allowed)}/role.md`), /traversal/],
+    ["tilde backslash traversal", fileSource(`~\\${path.relative(root, allowed)}/../${path.basename(allowed)}/role.md`), /traversal/],
+    ["symlink escape", fileSource(link), /outside/],
+    ["directory symlink escape", fileSource(path.join(directoryLink, "role.md")), /outside/],
+    ["oversize", fileSource(large), /512 KB/],
+    ["mismatch", { ...fileSource(good), sha256: "0".repeat(64) }, /digest mismatch/],
+    ["missing", fileSource(path.join(allowed, "missing.md")), /ENOENT/],
+    ["nonregular", fileSource(directory), /regular file/],
+    ["invalid UTF-8", { instructionsFile: invalid, sha256: digest(bytes) }, /UTF-8/],
+    ["both", { ...fileSource(good), instructions: "inline" }, /not both/],
+    ["incomplete pair", { instructionsFile: good }, /requires/],
+  ] as const;
+};
+
+for (const durable of [false, true]) describe.skipIf(process.platform !== "linux")(`${durable ? "resident" : "Main"} verified actor instructions (#3819)`, () => {
+  it("applies exact bytes for create and setter, reports digest, and never rereads a stored reference", async () => {
+    const state = await fixture(durable);
+    try {
+      const file = path.join(state.allowed, "role.md"); fs.writeFileSync(file, text);
+      const actor = await state.create(fileSource(file));
+      expect(actor.instructionsDigest).toBe(digest(text));
+      expect(state.owner.instructions(actor.id)).toBe(text);
+      fs.unlinkSync(file);
+      expect(state.owner.status(actor.id).instructionsDigest).toBe(digest(text));
+      const updated = `${text}Updated owner instructions.\n`; fs.writeFileSync(file, updated);
+      const result = await state.provider.invoke("setInstructions", { id: actor.id, ...fileSource(file, updated) }, state.context) as FabricActorInfo;
+      expect(result.instructionsDigest).toBe(digest(updated));
+      expect(state.owner.instructions(actor.id)).toBe(updated);
+      const registry = fs.readFileSync(path.join(durable ? state.config.actorRoot : path.join(state.root, "main-actors"), "actors.json"), "utf8");
+      expect(registry).not.toContain("instructionsFile"); expect(registry).not.toContain(file);
+      // The resident root differs from Main's: Main must forward, not read here.
+      if (durable) expect(() => resolveActorInstructions(fileSource(file, updated), state.localRoot)).toThrow(/outside/);
+      await state.provider.invoke("setInstructions", { id: actor.id, instructions: "inline still works", replace: true }, state.context);
+      expect(state.owner.instructions(actor.id)).toBe("inline still works");
+    } finally { await state.close(); }
+  });
+
+  it("refuses every bad source with no setter mutation or replacement create", async () => {
+    const state = await fixture(durable);
+    try {
+      const actor = await state.create({ instructions: text });
+      const before = state.owner.status(actor.id);
+      const registryPath = path.join(durable ? state.config.actorRoot : path.join(state.root, "main-actors"), "actors.json");
+      const registry = fs.readFileSync(registryPath, "utf8");
+      // Make both tilde spellings expand to an existing, digest-matching in-root
+      // file. A normalizing expansion must not hide the original '..' segment.
+      const home = vi.spyOn(os, "homedir").mockReturnValue(state.root);
+      try {
+        const unchanged = (label: string) => {
+          expect(state.owner.status(actor.id), label).toEqual(before);
+          expect(state.owner.instructions(actor.id), label).toBe(text);
+          expect(state.owner.listOwned(), label).toHaveLength(1);
+          expect(fs.readFileSync(registryPath, "utf8"), label).toBe(registry);
+        };
+        for (const [label, source, error] of rejectionCases(state.root, state.allowed)) {
+          await expect(state.provider.invoke("setInstructions", { id: actor.id, replace: true, ...source }, state.context), label).rejects.toThrow(error);
+          unchanged(`${label}: setter`);
+          await expect(state.create(source), label).rejects.toThrow(error);
+          unchanged(`${label}: create`);
+        }
+      } finally { home.mockRestore(); }
+    } finally { await state.close(); }
+  });
+
+  it("refuses an ancestor swap-and-restore before open without mutating the actor or registry", async () => {
+    const state = await fixture(durable);
+    const ancestor = path.join(state.allowed, "roles");
+    const saved = path.join(state.allowed, "roles-saved");
+    const outside = path.join(state.root, "outside-roles");
+    const file = path.join(ancestor, "role.md");
+    const outsideText = "Outside-root attacker instructions.\n";
+    let swapped = false;
+    const restore = () => {
+      if (!swapped) return;
+      fs.unlinkSync(ancestor); fs.renameSync(saved, ancestor); swapped = false;
+    };
+    let statSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let openSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      fs.mkdirSync(ancestor); fs.mkdirSync(outside);
+      fs.writeFileSync(file, text); fs.writeFileSync(path.join(outside, "role.md"), outsideText);
+      const actor = await state.create({ instructions: text });
+      const before = state.owner.status(actor.id);
+      const registryPath = path.join(durable ? state.config.actorRoot : path.join(state.root, "main-actors"), "actors.json");
+      const registry = fs.readFileSync(registryPath, "utf8");
+      const realStat = fs.statSync;
+      const realOpen = fs.openSync;
+      for (const operation of ["setter", "create"] as const) {
+        let injected = false;
+        let outsideOpened = false;
+        const outsideStat = realStat(path.join(outside, "role.md"));
+        const opened: number[] = [];
+        const realClose = fs.closeSync;
+        const closed: number[] = [];
+        const closeSpy = vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+          closed.push(fd); return realClose(fd);
+        });
+        // Inject after realpath/containment, before the expected stat and open.
+        // Both pathname operations in the old resolver see the outside inode.
+        statSpy = vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, options?: fs.StatOptions) => {
+          if (String(target) === file && !injected) {
+            fs.renameSync(ancestor, saved); fs.symlinkSync(outside, ancestor, "dir");
+            swapped = true; injected = true;
+          }
+          return realStat(target, options);
+        }) as typeof fs.statSync);
+        openSpy = vi.spyOn(fs, "openSync").mockImplementation((target, flags, mode) => {
+          const fd = realOpen(target, flags, mode);
+          opened.push(fd);
+          const openedStat = fs.fstatSync(fd);
+          if (openedStat.dev === outsideStat.dev && openedStat.ino === outsideStat.ino) {
+            outsideOpened = true;
+          }
+          if (String(target) === file) {
+            // Restore before the old resolver's second realpath observation.
+            restore();
+          }
+          return fd;
+        });
+        try {
+          const source = fileSource(file, outsideText);
+          const attempt = operation === "setter"
+            ? state.provider.invoke("setInstructions", { id: actor.id, replace: true, ...source }, state.context)
+            : state.create(source); // same-name replacement must not remove the predecessor
+          await expect(attempt, operation).rejects.toThrow();
+          expect(injected, operation).toBe(true);
+          expect(outsideOpened, operation).toBe(false);
+          expect(opened.length, operation).toBeGreaterThan(0);
+          expect(closed, operation).toEqual([...opened].reverse());
+          closeSpy.mockRestore();
+          expect(state.owner.status(actor.id), operation).toEqual(before);
+          expect(state.owner.instructions(actor.id), operation).toBe(text);
+          expect(state.owner.listOwned(), operation).toHaveLength(1);
+          expect(fs.readFileSync(registryPath, "utf8"), operation).toBe(registry);
+        } finally {
+          statSpy.mockRestore(); openSpy.mockRestore(); closeSpy.mockRestore(); restore();
+        }
+      }
+    } finally {
+      statSpy?.mockRestore(); openSpy?.mockRestore(); restore(); await state.close();
+    }
+  });
+  it("keeps the shrink guard authoritative and accepts replace", async () => {
+    const state = await fixture(durable);
+    try {
+      const actor = await state.create({ instructions: "x".repeat(100) });
+      const file = path.join(state.allowed, "tiny.md"); fs.writeFileSync(file, "tiny");
+      await expect(state.provider.invoke("setInstructions", { id: actor.id, ...fileSource(file, "tiny") }, state.context)).rejects.toThrow(/replace: true/);
+      expect(state.owner.instructions(actor.id)).toBe("x".repeat(100));
+      await state.provider.invoke("setInstructions", { id: actor.id, ...fileSource(file, "tiny"), replace: true }, state.context);
+      expect(state.owner.status(actor.id).instructionsDigest).toBe(digest("tiny"));
+    } finally { await state.close(); }
+  });
+});
+
+it.skipIf(process.platform !== "linux")("pins every directory handle for a deep canonical path and closes them after success or digest refusal", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-instructions-handles-"));
+  const dir = path.join(root, "a", "b"); fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "role.md"); fs.writeFileSync(file, text);
+  const realOpen = fs.openSync;
+  const realClose = fs.closeSync;
+  const opened: { fd: number; target: string; flags: number }[] = [];
+  const closed: number[] = [];
+  const open = vi.spyOn(fs, "openSync").mockImplementation((target, flags, mode) => {
+    const fd = realOpen(target, flags, mode);
+    opened.push({ fd, target: String(target), flags: Number(flags) }); return fd;
+  });
+  const close = vi.spyOn(fs, "closeSync").mockImplementation(fd => { closed.push(fd); realClose(fd); });
+  try {
+    for (const valid of [true, false]) {
+      opened.length = 0; closed.length = 0;
+      const source = { instructionsFile: file, sha256: valid ? digest(text) : "0".repeat(64) };
+      if (valid) expect(resolveActorInstructions(source, root)).toBe(text);
+      else expect(() => resolveActorInstructions(source, root)).toThrow(/digest mismatch/);
+      expect(opened).toHaveLength(4);
+      expect(opened[0]!.target).toBe(root);
+      for (let index = 0; index < opened.length; index++) {
+        const entry = opened[index]!;
+        expect(entry.flags & fs.constants.O_NOFOLLOW).toBe(fs.constants.O_NOFOLLOW);
+        if (index < 3) expect(entry.flags & fs.constants.O_DIRECTORY).toBe(fs.constants.O_DIRECTORY);
+        if (index > 0) expect(entry.target).toBe(`/proc/self/fd/${opened[index - 1]!.fd}/${["a", "b", "role.md"][index - 1]}`);
+      }
+      expect(closed).toEqual(opened.map(entry => entry.fd).reverse());
+    }
+  } finally { open.mockRestore(); close.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+it.skipIf(process.platform !== "linux").each(["root swap", "missing procfs"])("refuses %s before reading and closes the pinned root", failure => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-instructions-root-"));
+  const root = path.join(base, "factory"), saved = path.join(base, "saved"), outside = path.join(base, "outside");
+  fs.mkdirSync(root); fs.mkdirSync(outside);
+  const file = path.join(root, "role.md"); fs.writeFileSync(file, text); fs.writeFileSync(path.join(outside, "role.md"), text);
+  const realOpen = fs.openSync, realPath = fs.realpathSync;
+  let injected = false;
+  const opened: number[] = [];
+  const open = vi.spyOn(fs, "openSync").mockImplementation((target, flags, mode) => {
+    if (failure === "root swap" && String(target) === root && !injected) {
+      fs.renameSync(root, saved); fs.renameSync(outside, root); injected = true;
+    }
+    const fd = realOpen(target, flags, mode); opened.push(fd); return fd;
+  });
+  const realpath = vi.spyOn(fs, "realpathSync").mockImplementation(((target: fs.PathLike) => {
+    if (failure === "missing procfs" && String(target).startsWith("/proc/self/fd/")) {
+      injected = true; throw new Error("ENOENT: procfs unavailable");
+    }
+    return realPath(target);
+  }) as typeof fs.realpathSync);
+  const read = vi.spyOn(fs, "readSync");
+  const close = vi.spyOn(fs, "closeSync");
+  try {
+    expect(() => resolveActorInstructions(fileSource(file), root)).toThrow(/root changed|procfs unavailable/);
+    expect(injected).toBe(true);
+    expect(opened).toHaveLength(1);
+    expect(read).not.toHaveBeenCalled();
+    expect(close.mock.calls.map(([fd]) => fd)).toEqual(opened);
+  } finally {
+    open.mockRestore(); realpath.mockRestore(); read.mockRestore(); close.mockRestore();
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+it.each(["win32", "darwin", "freebsd"])("fails closed before filesystem access on %s, while inline instructions work", platform => {
+  const original = process.platform;
+  const realpath = vi.spyOn(fs, "realpathSync");
+  const open = vi.spyOn(fs, "openSync");
+  try {
+    Object.defineProperty(process, "platform", { value: platform });
+    expect(() => resolveActorInstructions(fileSource("untrusted/reparse/role.md"), "untrusted/root")).toThrow(/requires Linux/);
+    expect(resolveActorInstructions({ instructions: text })).toBe(text);
+    expect(realpath).not.toHaveBeenCalled();
+    expect(open).not.toHaveBeenCalled();
+  } finally {
+    Object.defineProperty(process, "platform", { value: original });
+    realpath.mockRestore(); open.mockRestore();
+  }
+});
+
+for (const durable of [false, true]) it.skipIf(process.platform === "linux")(`${durable ? "resident" : "Main"} refuses unsupported file sources without actor or registry mutation`, async () => {
+  const state = await fixture(durable);
+  try {
+    const actor = await state.create({ instructions: text });
+    const before = state.owner.status(actor.id);
+    const registryPath = path.join(durable ? state.config.actorRoot : path.join(state.root, "main-actors"), "actors.json");
+    const registry = fs.readFileSync(registryPath, "utf8");
+    const source = fileSource(path.join(state.allowed, "untrusted-reparse", "role.md"));
+    for (const operation of ["setter", "create"] as const) {
+      const attempt = operation === "setter"
+        ? state.provider.invoke("setInstructions", { id: actor.id, replace: true, ...source }, state.context)
+        : state.create(source);
+      await expect(attempt).rejects.toThrow(/requires Linux/);
+      expect(state.owner.status(actor.id)).toEqual(before);
+      expect(state.owner.instructions(actor.id)).toBe(text);
+      expect(state.owner.listOwned()).toHaveLength(1);
+      expect(fs.readFileSync(registryPath, "utf8")).toBe(registry);
+    }
+  } finally { await state.close(); }
+});
+
+it.skipIf(process.platform !== "linux")("uses the default factory/current realpath, allows an in-root symlink and the exact 512 KiB boundary", async () => {
+  const state = await fixture();
+  const home = vi.spyOn(os, "homedir").mockReturnValue(state.root);
+  try {
+    const defaultPath = path.join(state.root, ".local/share/smarty-dev/factory/current");
+    fs.mkdirSync(path.dirname(defaultPath), { recursive: true }); fs.symlinkSync(state.allowed, defaultPath, "dir");
+    const bytes = "x".repeat(MAX_ACTOR_INSTRUCTIONS_FILE_BYTES);
+    const file = path.join(state.allowed, "boundary.md"); fs.writeFileSync(file, bytes);
+    const link = path.join(defaultPath, "inside.md"); fs.symlinkSync(file, link);
+    expect(resolveActorInstructions(fileSource(link, bytes))).toBe(bytes);
+    expect(resolveActorInstructions(fileSource("~/.local/share/smarty-dev/factory/current/inside.md", bytes))).toBe(bytes);
+    expect(resolveActorInstructions(fileSource(file, bytes), state.allowed)).toBe(bytes);
+  } finally { home.mockRestore(); await state.close(); }
+});
+
+it.skipIf(process.platform !== "linux")("resolves global template sources locally and reports the verified digest without persisting the reference", async () => {
+  const state = await fixture();
+  try {
+    const file = path.join(state.allowed, "template.md"); fs.writeFileSync(file, text);
+    const created = await state.create({ scope: "global", ...fileSource(file) });
+    expect(created.instructionsDigest).toBe(digest(text));
+    expect(state.globalActors.resolve(created.id)?.instructions).toBe(text);
+    const updated = `${text}New template.\n`; fs.writeFileSync(file, updated);
+    const result = await state.provider.invoke("setInstructions", { id: created.id, scope: "global", ...fileSource(file, updated) }, state.context) as FabricActorInfo;
+    expect(result.instructionsDigest).toBe(digest(updated));
+    const before = state.globalActors.resolve(created.id);
+    await expect(state.provider.invoke("setInstructions", { id: created.id, scope: "global", ...fileSource(file) }, state.context)).rejects.toThrow(/mismatch/);
+    expect(state.globalActors.resolve(created.id)).toEqual(before);
+    fs.unlinkSync(file);
+    expect(state.globalActors.resolve(created.id)?.instructions).toBe(updated);
+    expect(state.globalActors.resolve(created.id)).not.toHaveProperty("instructionsFile");
+  } finally { await state.close(); }
+});
+it.skipIf(process.platform !== "linux")("routes the file pair unchanged through the resident proxy client", async () => {
+  const state = await fixture(true);
+  try {
+    const file = path.join(state.factory, "proxy.md"); fs.writeFileSync(file, text);
+    const proxy = new ResidentActorClient(state.config.meshRoot, state.config.rootId, 5000);
+    const actor = await proxy.createActor({ name: "proxy", residency: "durable", ...fileSource(file), model: "fixture/visible" });
+    expect(actor.instructionsDigest).toBe(digest(text));
+    const after = `${text}Proxy update.\n`; fs.writeFileSync(file, after);
+    const result = await proxy.setActor({ operation: "setInstructions", id: actor.id, ...fileSource(file, after) }, undefined,
+      { identity: state.identity, hostId: state.identity.id });
+    expect(result.instructionsDigest).toBe(digest(after));
+  } finally { await state.close(); }
+});
+
+it.skipIf(process.platform !== "linux")("exercises public guest createActor/create and setter schema admission end to end", async () => {
+  const state = await fixture();
+  try {
+    const file = path.join(state.allowed, "guest.md"); fs.writeFileSync(file, text);
+    const registry = new ActionRegistry(); registry.register(state.provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
+    const service = new FabricExecutionService(registry, config);
+    const source = JSON.stringify(fileSource(file));
+    const result = await service.execute({ code: `const a = await agents.createActor({ name: "guest", ...${source} });
+      const b = await agents.create({ name: "compat", instructions: "Inline" });
+      const updated = await agents.setInstructions({ id: b.id, ...${source} });
+      return [a.instructionsDigest, updated.instructionsDigest];`,
+      signal: undefined, parentToolCallId: "guest-instructions", context: { cwd: state.root, hasUI: false } as ExtensionContext, onPartial() {} });
+    expect(result.success).toBe(true); expect(result.value).toEqual([digest(text), digest(text)]);
+    const budgeted = await service.execute({ code: `await agents.createActor({ name: "budget-one", instructions: "Inline" });
+      return await agents.createActor({ name: "budget-two", instructions: "Inline" });`,
+      maxAgentCalls: 1, signal: undefined, parentToolCallId: "alias-budget", context: { cwd: state.root, hasUI: false } as ExtensionContext, onPartial() {} });
+    expect(budgeted.success).toBe(false); expect(budgeted.error).toContain("agent budget exhausted");
+    expect(state.owner.listOwned()).toHaveLength(3);
+    await state.owner.remove(state.owner.listOwned().find(actor => actor.name === "budget-one")!.id);
+    for (const name of ["create", "createActor", "setInstructions"]) {
+      const target = name === "setInstructions" ? { id: state.owner.listOwned()[0]!.id } : { name: "bad-guest" };
+      const invalid = await service.execute({ code: `return await tools.call({ ref: "agents.${name}", args: ${JSON.stringify({ ...target, ...fileSource(file), instructions: "both" })} });`,
+        signal: undefined, parentToolCallId: "bad-source", context: { cwd: state.root, hasUI: false } as ExtensionContext, onPartial() {} });
+      expect(invalid.success).toBe(false);
+      expect(state.owner.listOwned()).toHaveLength(2);
+    }
+  } finally { await state.close(); }
+});

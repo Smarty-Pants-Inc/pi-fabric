@@ -34,6 +34,22 @@ afterEach(() => {
   }
 });
 
+describe("host-only explicit model exceptions (#3134)", () => {
+  it("defaults to Astra and supports an empty rollback or normalized override", () => {
+    expect(normalizeFabricConfig({}).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+    expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [] } } }).agents.modelPolicy.requireReason).toEqual([]);
+    expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [" CLIPROXYAPI/GPT-6-ASTRA ", "cliproxyapi/gpt-6-astra"] } } }).agents.modelPolicy.requireReason).toEqual(["cliproxyapi/gpt-6-astra"]);
+  });
+  it.each([true, false])("project cannot disable the host reason gate (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: ["provider/expensive"] } } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: [] } } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["provider/expensive"]);
+    fs.unlinkSync(path.join(agentDir, "fabric.json"));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+  });
+});
 describe("fleet model policy configuration (#2490)", () => {
   it("normalizes and registers host policy keys", () => {
     expect(DEFAULT_FABRIC_CONFIG.agents.deniedModels).toEqual([]);
@@ -61,6 +77,39 @@ describe("fleet model policy configuration (#2490)", () => {
     const config = loadFabricConfig({ cwd, agentDir, projectTrusted: true });
     expect(config.agents.deniedModels).toEqual([]);
     expect(config.agents.deniedModelReplacement).toBeUndefined();
+  });
+});
+
+describe("host-only actor instruction root (#3819)", () => {
+  it("leaves the default implicit and normalizes the configured root", () => {
+    expect(normalizeFabricConfig({}).agents.instructionsRoot).toBeUndefined();
+    expect(normalizeFabricConfig({ agents: { instructionsRoot: " /factory/current " } }).agents.instructionsRoot).toBe("/factory/current");
+    expect(normalizeFabricConfig({ agents: { instructionsRoot: " " } }).agents.instructionsRoot).toBeUndefined();
+  });
+  it.each([true, false])("cannot be widened by workspace config (trusted: %s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/host/factory" } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/" } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBe("/host/factory");
+    fs.unlinkSync(path.join(agentDir, "fabric.json"));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBeUndefined();
+  });
+});
+describe("host-only processSlice (#4383)", () => {
+  it("defaults off and only accepts a slice unit name", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.processSlice).toBeUndefined();
+    expect(normalizeFabricConfig({ agents: { processSlice: "batch.slice" } }).agents.processSlice).toBe("batch.slice");
+    for (const processSlice of ["", "../bad.slice", "bad.service", 12]) {
+      expect(normalizeFabricConfig({ agents: { processSlice } }).agents.processSlice).toBeUndefined();
+    }
+  });
+  it.each([true, false])("ignores even trusted project overrides (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { processSlice: "workspace.slice" } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processSlice: "batch.slice" } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBe("batch.slice");
   });
 });
 
@@ -390,7 +439,7 @@ describe("Fabric configuration", () => {
       orphanedTempRunMs: 6 * 60 * 60 * 1_000,
       oneShotRunMs: 24 * 60 * 60 * 1_000,
       actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
-      terminalRunEventsAgeMs: 24 * 60 * 60 * 1_000,
+      terminalRunEventsAgeMs: 6 * 60 * 60 * 1_000,
       terminalRunEventsMaxBytes: 256 * 1024,
     });
     expect(

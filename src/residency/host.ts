@@ -2,6 +2,7 @@
 
 import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
+import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
   RESIDENT_HANDOVER_ABI, HANDOVER_DRAIN_MS, exactResidentProcess, assertAutomaticReleaseRecovery,
   residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec,
@@ -23,12 +24,14 @@ import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
-import { resolvePiModel, type PiModelRegistryView } from "../core/model-refresh.js";
+import { resolvePiModel, resolvePiRoutePin, type PiModelRegistryView } from "../core/model-refresh.js";
+import { ShadowRouteOwner } from "../agents/model-route-owner.js";
 import {
   parseFabricOwnedModelGuidance,
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
+import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
@@ -38,6 +41,7 @@ import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mes
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
+import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
@@ -217,12 +221,16 @@ export class ResidentHost {
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
+  // Boundary commands retain response custody without occupying serial admission.
+  readonly #boundaryRequests = new Map<string, Promise<void>>();
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
   readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
+  #routeOwner?: ShadowRouteOwner;
   readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
+  #ready = false;
   #idleSince = Date.now();
   #admissions = 0;
   readonly #requestRetention: ResidentRequestRetention;
@@ -233,7 +241,7 @@ export class ResidentHost {
   #reloadEvent: Promise<unknown> | undefined;
   readonly #publications = new Set<Promise<unknown>>();
   #effectiveConfig: (() => ResidentHostConfig) | undefined;
-  readonly #retention: ResidentHostConfig["retention"];
+  readonly #retention: ResidentHostConfig["retention"] & { retainRuns: boolean };
 
   constructor(
     readonly config: ResidentHostConfig,
@@ -255,9 +263,10 @@ export class ResidentHost {
     this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
     // All resident collectors share one mutable policy, not the constructor's
     // config snapshot (nor the process-wide default object).
-    this.#retention = { ...config.retention };
+    this.#retention = { ...config.retention, retainRuns: config.agents.retainRuns };
     this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
-      [...new Set(Object.values(residentActorRoots(config)))], this.#retention);
+      [...new Set(Object.values(residentActorRoots(config)))], this.#retention,
+      (directory) => { this.agents.recoverPendingArchives(directory); });
   }
 
   #initialize(): void {
@@ -276,6 +285,7 @@ export class ResidentHost {
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
       bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
+      canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
@@ -310,7 +320,26 @@ export class ResidentHost {
     // The session's visible models (synced at each ensureHost) plus, after a miss, this host's
     // own refreshed Pi registry: the one shared resolver, so an already-running host resolves a
     // model added to models.json after it started (pi-fabric#138).
-    const resolveResidentPiModel = async (selector?: string, options: { closest?: boolean } = {}): Promise<string> => {
+    // A bare resident registry does not load Main's provider extensions. Workers do:
+    // retain the trusted, auth-filtered catalog synced by Main for exact route pins
+    // and candidates, just as ordinary resident model selection does below.
+    // Keep one view so concurrent exact misses share the bounded registry refresh.
+    const routeRegistry: PiModelRegistryView = {
+      getAvailable: () => {
+        const live = modelRegistry?.getAvailable() ?? [];
+        const snapshot = (currentConfig().piModels ?? config.piModels)?.available ?? [];
+        return [...live, ...snapshot.filter(candidate => !live.some(model =>
+          model.provider === candidate.provider && model.id === candidate.id))];
+      },
+      ...(modelRegistry?.refresh ? { refresh: () => modelRegistry.refresh!() } : {}),
+    };
+    const residentRouteRegistry = (): PiModelRegistryView => routeRegistry;
+    const resolveResidentPiModel = async (selector?: string, options: { requiredPin?: boolean; closest?: boolean } = {}): Promise<string> => {
+      if (options.requiredPin) {
+        const exact = await resolvePiRoutePin({ selector: selector ?? "", registry: residentRouteRegistry(),
+          aliases: normalizeModelAliases((currentConfig().piModels ?? config.piModels)?.aliases) });
+        return `${exact.provider}/${exact.id}`;
+      }
       const state = currentConfig().piModels ?? config.piModels;
       const snapshot: FabricModelCandidate[] = Array.isArray(state?.available)
         ? state.available.flatMap((candidate) =>
@@ -354,7 +383,7 @@ export class ResidentHost {
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: this.#retention,
-      preparePiModel: async (model) => resolveResidentPiModel(model),
+      preparePiModel: async (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false }),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;
         return resolveFabricModelGuidance(currentModelGuidance(), {
@@ -371,11 +400,14 @@ export class ResidentHost {
         fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
         try {
           writeJsonAtomic(file, result, { durable: true });
-          // Rejected queued durable spawns have no admitted worker/source.
-          if (!this.agents.runDirectory(result.id)) return;
+          const trackedRun = this.agents.runDirectory(result.id);
+          const runDirectory = trackedRun ?? path.join(config.residencyRoot, "runs", result.id);
+          // Rejected queued spawns have no worker source; recovered admitted
+          // runs do, even though this manager no longer has their transport.
+          if (!trackedRun && !fs.existsSync(path.join(runDirectory, "status.json"))) return;
           // Retain/retry full sources on faults; logical settlement is recoverable
           // even when inbox notifications are disabled.
-          const recipient = completionRecipientFromRun(config.meshRoot, this.agents.runDirectory(result.id)!);
+          const recipient = completionRecipientFromRun(config.meshRoot, runDirectory);
           if (!recipient) throw new Error(`Missing admitted completion recipient for ${result.id}`);
           saveCompletion(config.meshRoot, recipient, result);
         } catch (error) { this.#publicationFailed = true; throw error; }
@@ -401,6 +433,7 @@ export class ResidentHost {
     const lineageAlive = (rootId: string): boolean =>
       this.participants.lineageAlive(rootId);
     const actorRoots = residentActorRoots(config);
+    this.#routeOwner = new ShadowRouteOwner(() => currentConfig().shadowRouting ?? config.shadowRouting);
     this.actors = new ActorDirectory([
       config.sessionId,
       this.identity,
@@ -438,7 +471,9 @@ export class ResidentHost {
         ));
       },
       {
-        releasePaused: this.#staged,
+        // Restoration must not launch queued work until owner and readiness publication commit.
+        releasePaused: true,
+        canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
         persistent: true,
         canManageActor,
         lineageAlive,
@@ -451,7 +486,14 @@ export class ResidentHost {
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: this.#retention,
         ...(typeof config.actors?.maxSessionBytes === "number" ? { maxSessionBytes: config.actors.maxSessionBytes } : {}),
-        resolvePiModel: (model) => resolveResidentPiModel(model, { closest: false }),
+        resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
+        prepareModelRoute: async (input, signal) => {
+          const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
+          return prepareModelRoute({ ...input, signal, config: config.agents.modelRouting,
+            registry: residentRouteRegistry(), aliases: normalizeModelAliases((currentConfig().piModels ?? config.piModels)?.aliases),
+            assertModelAllowed: model => this.agents.assertModelAllowed(model, "pi"),
+            evaluate: (request, routeSignal) => this.#routeOwner!.evaluate(request, routeSignal) });
+        },
       },
     ], actorRoots, config.mesh.actorScope);
     this.lifecycle = new LifecycleBroker(
@@ -462,6 +504,7 @@ export class ResidentHost {
         enabled: true,
         pollMs: config.mesh.actorPollMs,
         maxReadEvents: config.mesh.maxReadEvents,
+        canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
       },
       (subscription, event) => this.#deliverLifecycle(subscription, event),
     );
@@ -472,11 +515,9 @@ export class ResidentHost {
     await this.#acquireLock();
     this.#started = true;
     try {
-      sweepResidentRuns(path.join(this.config.residencyRoot, "runs"), Date.now(), 100, {
-        ...this.config.retention,
-        actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
-        retainRuns: this.config.agents.retainRuns,
-      });
+      // Archived runs are read on demand, never walked before the host lease is up.
+      // The streaming request collector replays pending full archives before
+      // terminal retention after readiness. Failed sinks retain their sources.
       this.#initialize();
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
@@ -511,6 +552,12 @@ export class ResidentHost {
         this.#acceptControl(command, from, signal, verification));
       if (this.#staged) this.control.pause();
       await this.participants.start().catch(() => undefined);
+      // A publication failure is not readiness. Keep this same start pending,
+      // with requests/events untouched, until a real locked renewal confirms it.
+      while (!this.participants.canConsumeMesh()) {
+        if (this.#closed) throw new Error(HOST_CLOSING_RETRY);
+        await delay(20);
+      }
       this.lifecycle.start();
       if (this.#staged) {
         this.lifecycle.pause();
@@ -534,6 +581,7 @@ export class ResidentHost {
         ...(process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN ? { launchToken: process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN } : {}),
         startedAt: now,
         readyAt: now,
+        maintenanceReady: 1, // client requires the same-token startup receipt before business admission
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
         callerBoundSpawn: 1,
@@ -545,15 +593,23 @@ export class ResidentHost {
       };
       atomicWrite(this.#ownerPath, owner);
       fs.rmSync(this.#errorPath, { force: true });
+      // The originating client may cancel this owned attempt until it sees the
+      // required receipt. Commit it BEFORE opening any business gate or resuming
+      // restored queues: publication failure/timeout must remain a non-serving
+      // start, not shutdown of work that may already have escaped the attempt.
+      atomicWrite(path.join(this.config.residencyRoot, "maintenance-ready.json"), { token: this.#token, readyAt: now });
+      // No fallible/awaited startup work remains. Accepted backlog is untouched
+      // on failure; maintenance/collection stays on normal post-readiness ticks.
+      this.#ready = true;
       // Removals a previous host accepted: their runs ended with it.
       if (!this.#staged) {
-      void this.#backgroundDeliveries.enqueue(async () => {
-        await this.actors.finishPendingRemovals();
-        this.#writeRemovals();
-      });
-      void this.#retryDeliveries();
+        this.actors.resumeAfterRelease();
+        void this.#backgroundDeliveries.enqueue(async () => {
+          await this.actors.finishPendingRemovals();
+          this.#writeRemovals();
+        });
+        void this.#retryDeliveries();
       }
-      await this.#pollRequests();
     } catch (error) {
       await this.close();
       throw error;
@@ -563,6 +619,7 @@ export class ResidentHost {
   async close(): Promise<void> {
     if (this.#closed || !this.#started) return;
     this.#closed = true;
+    const routeClosed = this.#routeOwner?.close();
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
     this.#requestRetention.close();
@@ -577,6 +634,7 @@ export class ResidentHost {
       try {
         try {
           await this.agents?.close();
+          await routeClosed;
         } finally {
           // Fenced actor deliveries may still be acquiring custody. Join them
           // before releasing the host; closed hosts retain their durable outbox.
@@ -598,12 +656,16 @@ export class ResidentHost {
     if (this.#closed || this.#staged || this.#handover) {
       return { accepted: false, error: HOST_CLOSING_RETRY };
     }
+    assertMeshConsumption(() => this.participants.canConsumeMesh());
     this.#admissions++;
     try { return await this.#handleControl(command, from, signal, verification); }
     finally { this.#admissions--; }
   }
 
   async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal, verification?: "mesh" | "bridge"): Promise<FabricControlAcceptance> {
+    if (command.operation === "setModel" || command.operation === "setThinking") {
+      return { accepted: false, error: "remote Main model changes are not supported yet; see smarty-dev#4153" };
+    }
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
     }
@@ -621,6 +683,20 @@ export class ResidentHost {
         if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
         if (!this.actors.owns(command.targetId)) {
           return { accepted: false, error: `Resident host does not own ${command.targetId}` };
+        }
+        // The resident command path remains owner-only. Legacy mesh stop also
+        // serves a detached actor after its originating Main withdraws: a
+        // verified Main may stop it, without acquiring setter/reset authority.
+        // While the root is addressable (including reload), retain its fence.
+        const now = Date.now();
+        // One snapshot includes stale/reloading roots: a lease lapse is not
+        // withdrawal, and separate live/stale reads could race a renewal.
+        const root = this.participants.list({ scope: "project", kinds: ["root"], includeStale: true, fresh: true }, now)
+          .find(candidate => candidate.id === this.config.rootId);
+        const detachedMain = !root && from.kind === "main" && (verification === "mesh" || verification === "bridge");
+        if (!detachedMain) {
+          const caller = this.participants.get(from.id, now, { fresh: true });
+          this.#authorizeResidentSetter({ identity: from, hostId: caller?.ownerHostId ?? "" });
         }
         await this.actors.stop(command.targetId);
         this.participants.scheduleRefresh();
@@ -672,9 +748,11 @@ export class ResidentHost {
       // Validate now without turning the resolved owner defaults into per-call overrides.
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
+      assertMeshConsumption(() => this.participants.canConsumeMesh());
       const result = this.actors.tell(command.targetId, message, command.data, { provenance, ...options });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
+      if (error instanceof MeshConsumptionPausedError) throw error;
       return { accepted: false, error: errorMessage(error) };
     }
   }
@@ -684,6 +762,7 @@ export class ResidentHost {
     event: FabricLifecycleEvent,
   ): Promise<void> {
     if (this.#closed || this.#staged || this.#handover) throw new Error(HOST_CLOSING_RETRY);
+    assertMeshConsumption(() => this.participants.canConsumeMesh());
     this.#admissions++;
     try { await this.#handleLifecycle(subscription, event); }
     finally { this.#admissions--; }
@@ -808,7 +887,7 @@ export class ResidentHost {
   }
 
   async #pollRequests(): Promise<void> {
-    if (this.#pollingRequests || this.#closed) return;
+    if (!this.#ready || this.#pollingRequests || this.#closed) return;
     if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
@@ -822,12 +901,29 @@ export class ResidentHost {
         if (this.#handover || this.#closed) break;
         const source = path.join(this.#requestsPath, entry);
         const processing = path.join(this.#processingPath, entry);
+        // Never overwrite an admitted exchange while its response is still pending.
+        if (this.#boundaryRequests.has(processing)) continue;
         try {
           fs.renameSync(source, processing);
         } catch {
           continue;
         }
-        await this.#processRequest(processing);
+        let releaseAdmission!: () => void;
+        let boundary = false;
+        const admitted = new Promise<void>(resolve => { releaseAdmission = resolve; });
+        const response = this.#processRequest(processing, () => {
+          // ActorManager installed its commit fence and boundary waiter (or stop
+          // intent) synchronously. Only settlement/publication may now run aside.
+          boundary = true;
+          releaseAdmission();
+        });
+        await Promise.race([response, admitted]);
+        if (boundary) {
+          this.#boundaryRequests.set(processing, response);
+          // Shutdown/handover retains custody until the terminal response is durable.
+          this.#trackPublication(response);
+          void response.finally(() => this.#boundaryRequests.delete(processing)).catch(() => undefined);
+        }
       }
     } finally {
       this.#pollingRequests = false;
@@ -838,7 +934,7 @@ export class ResidentHost {
 
   #maintainRequests(): void {
     const now = Date.now();
-    if (this.#closed || !this.#requestRetention.due(now)) return;
+    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh() || !this.#requestRetention.due(now)) return;
     // ensureHost/syncPiModels already publishes reloads to config.json. Apply
     // only the same-release/root/session overlay at the next existing sweep;
     // actor archives and agent collectors hold this same policy object.
@@ -1036,7 +1132,7 @@ export class ResidentHost {
     }
   }
 
-  async #processRequest(filePath: string): Promise<void> {
+  async #processRequest(filePath: string, boundaryAdmitted?: () => void): Promise<void> {
     const command = readJson<ResidentCommand>(filePath);
     const requestId = path.basename(filePath, ".json");
     let response: ResidentCommandResponse;
@@ -1056,7 +1152,7 @@ export class ResidentHost {
       if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
         throw new Error(`Fabric residency request ${requestId} was abandoned before commit`);
       }
-      response = await this.#executeOnce(command);
+      response = await this.#executeOnce(command, boundaryAdmitted);
     } catch (error) {
       response = { format: RESIDENT_HOST_FORMAT, requestId, ok: false, error: errorMessage(error),
         ...(error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
@@ -1083,9 +1179,9 @@ export class ResidentHost {
     // Never evict an in-flight creation: retries must join the same promise.
   }
 
-  async #executeOnce(command: ResidentCommand): Promise<ResidentCommandResponse> {
+  async #executeOnce(command: ResidentCommand, boundaryAdmitted?: () => void): Promise<ResidentCommandResponse> {
     if ((command.operation !== "spawnBound" && command.operation !== "createActor") || command.idempotencyKey === undefined) {
-      return this.#executeRequest(command);
+      return this.#executeRequest(command, boundaryAdmitted);
     }
     if (typeof command.idempotencyKey !== "string" || !command.idempotencyKey.length || command.idempotencyKey.length > 256) {
       throw new Error("Resident idempotencyKey must be a string of 1 to 256 characters");
@@ -1128,7 +1224,7 @@ export class ResidentHost {
         : Math.max(Date.now(), residentRequestGeneration(command.requestId) ?? 0) };
   }
 
-  async #executeRequest(command: ResidentCommand): Promise<ResidentCommandResponse> {
+  async #executeRequest(command: ResidentCommand, boundaryAdmitted?: () => void): Promise<ResidentCommandResponse> {
     const requestId = command.requestId;
     let response: ResidentCommandResponse;
     try {
@@ -1215,7 +1311,9 @@ export class ResidentHost {
         // This handler already runs inside the authoritative durable host.
         // Keep the new actor locally owned; ceding it here created a needless
         // self-transfer window that blocked the next recruitment request.
-        const actor = await this.actors.create(command.request, { asRegistryOwner: true, beforeCommit: commit });
+        const { instructionsFile: _file, sha256: _digest, ...base } = command.request;
+        const instructions = resolveActorInstructions(command.request, this.config.agents.instructionsRoot);
+        const actor = await this.actors.create({ ...base, instructions }, { asRegistryOwner: true, beforeCommit: commit });
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,
@@ -1231,7 +1329,8 @@ export class ResidentHost {
         };
       } else if (command.operation !== "removeActor") {
         if (command.operation === "setInstructions" || command.operation === "setModel" ||
-          command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools") {
+          command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools" ||
+          command.operation === "resetSession" || command.operation === "stop") {
           this.#authorizeResidentSetter(command.caller);
           if (command.operation === "setTools") assertResidentActorToolCeiling(command.tools, command.caller?.toolCeiling);
         }
@@ -1242,10 +1341,29 @@ export class ResidentHost {
         let updated: FabricActorInfo;
         switch (command.operation) {
           case "actorStatus": updated = actor; break;
-          case "setInstructions": updated = await this.actors.setInstructions(actor.id, command.instructions, commit); break;
-          case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit); break;
+          case "setInstructions": {
+            const instructions = resolveActorInstructions(command, this.config.agents.instructionsRoot);
+            assertActorInstructionReplacement(this.actors.instructions(actor.id), instructions, command.replace);
+            updated = await this.actors.setInstructions(actor.id, instructions, commit);
+            break;
+          }
+          // Repair is a boundary request, not terminal stop: the admitted run settles,
+          // then queued deliveries resume on the fresh session under the same actor.
+          case "resetSession": {
+            const pending = this.actors.resetSession(actor.id, { beforeCommit: commit });
+            boundaryAdmitted?.();
+            updated = await pending;
+            break;
+          }
+          case "stop": {
+            const pending = this.actors.stop(actor.id, commit, true);
+            boundaryAdmitted?.();
+            updated = await pending;
+            break;
+          }
+          case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit, command.modelReason); break;
           case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope, commit); break;
-          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit); break;
+          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit, command.expiresAt); break;
           case "setTools": updated = await this.actors.setTools(actor.id, command.tools, commit); break;
           default: throw new Error("Unknown resident actor operation");
         }
@@ -1282,6 +1400,7 @@ export class ResidentHost {
         error: errorMessage(error),
         ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
           ? { errorCode: error.code } : {}),
+        ...(error instanceof ActorSessionResetCancelledError ? { errorCode: error.code } : {}),
         ...(error instanceof FabricModelDeniedError ? {
           errorCode: error.code, modelDenied: { model: error.model, ...(error.replacement ? { replacement: error.replacement } : {}) },
         } : {}),

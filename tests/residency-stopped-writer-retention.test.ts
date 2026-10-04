@@ -88,7 +88,7 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     await participants.start();
     await host.start();
     client = new ResidencyClient({ config, mesh: host.mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
-    control = new FabricControlPlane(host.mesh, { id: rootId, name: "main", kind: "main" },
+    control = new FabricControlPlane(host.mesh, { id: rootId, name: "main", kind: "main", sessionId: config.sessionId },
       { enabled: true, hostId: rootId, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
     control.start(() => ({ accepted: false }));
     const request = { name: "live stopped writer", instructions: "Reply.", residency: "durable" as const, scope,
@@ -198,7 +198,7 @@ it.skipIf(process.platform === "win32").each([
     await participants.start();
     await host.start();
     client = new ResidencyClient({ config, mesh: host.mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
-    control = new FabricControlPlane(host.mesh, { id: rootId, name: "main", kind: "main" },
+    control = new FabricControlPlane(host.mesh, { id: rootId, name: "main", kind: "main", sessionId: config.sessionId },
       { enabled: true, hostId: rootId, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
     control.start(() => ({ accepted: false }));
     const request = { name: "nested stopped writer", instructions: "Reply.", residency: "durable" as const, scope,

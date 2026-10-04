@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type {
   AgentRunRecord,
+  AgentRunRouteMetadata,
   AgentUsage,
   AgentWorkerOptions,
 } from "../agents/types.js";
@@ -16,6 +17,27 @@ export const emptyUsage = (): AgentUsage => ({
   cacheWrite: 0,
   cost: 0,
 });
+
+/** Shared by host receipts and worker status writes. No task or instruction text is accepted. */
+export const createRunRouteMetadata = (
+  facts: Pick<AgentWorkerOptions, "runner" | "transport" | "actorId" | "actorName" | "routeClass" | "routeClassSource" | "protected"> & { handoff?: boolean },
+): AgentRunRouteMetadata => {
+  const protection = typeof facts.protected === "boolean" ? { protected: facts.protected } : {};
+  if (typeof facts.routeClass === "string") {
+    return { routeClass: facts.routeClass, routeClassSource: facts.routeClassSource ?? "explicit", ...protection };
+  }
+  let routeClass: string;
+  if (facts.actorId || facts.actorName) {
+    const name = facts.actorName ?? "";
+    const role = /(?:^|-)review-astra$/.test(name) ? "review"
+      : /(?:^|-)security-astra$/.test(name) ? "security"
+      : /(?:^|-)supervisor$/.test(name) ? "status-groom" : "other";
+    routeClass = `actor:${role}`;
+  } else {
+    routeClass = facts.handoff ? "handoff" : `task:${facts.runner}:${facts.transport}`;
+  }
+  return { routeClass, routeClassSource: "derived", ...protection };
+};
 
 // Keep the plain-Node worker boundary self-contained (see renameWithRetry).
 const workerProcessIdentity = (): Pick<AgentRunRecord, "sessionId" | "processStartTime"> => {
@@ -36,6 +58,7 @@ export const createRunningRecord = (
   thinking: AgentRunRecord["thinking"],
   startedAt: number,
 ): AgentRunRecord => ({
+  ...createRunRouteMetadata(options),
   id: options.id,
   name: options.name,
   ...(options.spawner ? { spawner: options.spawner } : {}),
@@ -46,6 +69,7 @@ export const createRunningRecord = (
   ...(options.fabricSessionId ? { fabricSessionId: options.fabricSessionId } : {}),
   ...(options.kernel ? { kernel: options.kernel } : {}),
   transport: options.transport,
+  ...(options.fabricRelease ? { fabricRelease: options.fabricRelease } : {}),
   // The publisher must save its own identity before any terminal publication;
   // the manager's enriched in-memory result is not a persistent exit receipt.
   ...(options.transport === "process" ? workerProcessIdentity() : {}),

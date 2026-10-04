@@ -23,18 +23,84 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("types per-filter telemetry and expiry (fullCodeMode=%s)", fullCodeMode => {
+    const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000 });
+      const actor = await agents.actorStatus({ id: "reviewer" });
+      const count: number = actor.filterSkipped.count;
+      const key: string | null = actor.filterSkipped.lastKey;
+      const topic: string | null = actor.filterSkipped.lastTopic;
+      const at: number | null = actor.filterSkipped.lastAt;
+      const expiry: number | undefined = actor.activationFilterExpiresAt;
+      return { count, key, topic, at, expiry };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    const descriptor = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "setActivationFilter")!;
+    expect(descriptor.inputSchema.properties).toHaveProperty("expiresAt");
+  });
+  it.each(["spawn", "run", "wait", "join"])("types the optional observed Fabric release on agents.%s", method => {
+    const args = method === "spawn" || method === "run" ? '{ task: "work" }' : '{ id: "child" }';
+    for (const fullCodeMode of [false, true]) {
+      const code = `const result = await agents.${method}(${args});
+        const release: string | undefined = result.fabricRelease;
+        const omitted: Pick<typeof result, "fabricRelease"> = {};
+        return { release, omitted };`;
+      expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    }
+  });
+
+  it.each([false, true])("types Main before/after readback without regressing literal actor targets (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const main = await agents.setThinking({ id: "session:root", thinking: "high" });
+      const actor = await agents.setModel({ id: "actor", model: "probe/b" });
+      const caller: string = main.caller;
+      const previous: string | undefined = main.previous.model;
+      const scope: "session" | "project" = actor.scope;
+      const dynamic = await agents.setThinking({ id: (await agents.main()).id, thinking: "high" });
+      if ("previous" in dynamic) return dynamic.previous.thinking;
+      return { caller, previous, scope };`;
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    const refused = `const model = await agents.setModel({ id: "session:root", model: "probe/b" }); return model.previous;`;
+    expect(typeCheckFabricCode(refused, declarations, true).errors.map(error => error.message))
+      .toEqual([expect.stringContaining("does not exist on type 'never'")]);
+  });
+
+  it.each([false, true])("#3819 types inline XOR verified file instructions (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    for (const name of ["create", "createActor", "setInstructions"]) {
+      const target = name === "setInstructions" ? 'id: "actor"' : 'name: "actor"';
+      expect(typeCheckFabricCode(`await agents.${name}({ ${target}, instructionsFile: "/factory/role.md", sha256: "${"a".repeat(64)}" });`, declarations, true).errors).toEqual([]);
+      expect(typeCheckFabricCode(`await agents.${name}({ ${target}, instructions: "inline" });`, declarations, true).errors).toEqual([]);
+      for (const fields of ['instructionsFile: "/factory/role.md"', 'sha256: "digest"', 'instructions: "inline", instructionsFile: "/factory/role.md", sha256: "digest"']) {
+        expect(typeCheckFabricCode(`await agents.${name}({ ${target}, ${fields} });`, declarations, true).errors.length).toBeGreaterThan(0);
+      }
+      const schema = AGENTS_ACTION_DESCRIPTORS.find(action => action.name === name)!.inputSchema as { properties: Record<string, unknown> };
+      expect(schema.properties.instructionsFile).toMatchObject({ type: "string" });
+      expect(schema.properties.sha256).toMatchObject({ type: "string", pattern: "^[a-f0-9]{64}$" });
+    }
+  });
+
+  it.each([false, true])("generated reset guidance never requires destructive stop (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const guidance = declarations.slice(declarations.lastIndexOf("/**", declarations.indexOf("resetSession(args:")), declarations.indexOf("resetSession(args:"));
+    expect(guidance).not.toMatch(/stop[ -]first|idle boundary/);
+    expect(guidance).toMatch(/owning Main.*directly/);
+    expect(guidance).toMatch(/activation.*settles.*fenced boundary/);
+    expect(guidance).toMatch(/stop.*cancels work/);
+  });
   it.each([false, true])("types and advertises modelReason on launch calls (fullCodeMode=%s)", fullCodeMode => {
     const result = typeCheckFabricCode(
       `const run = await agents.run({ task: "probe", model: "cliproxyapi/gpt-6-astra", modelReason: "Compatibility probe" });
        await agents.spawn({ task: "probe", modelReason: "Compatibility probe" });
        await agents.create({ name: "probe", instructions: "Work.", modelReason: "Compatibility probe" });
-       const reason: string | undefined = run.modelReason; return reason;`,
+       await agents.createActor({ name: "alias-probe", instructions: "Work.", modelReason: "Compatibility probe" });
+       const actor = await agents.setModel({ id: "actor", model: "cliproxyapi/gpt-6-astra", modelReason: "Named probe" });
+       const actorReason: string | undefined = actor.modelReason;
+       const reason: string | undefined = run.modelReason; return { reason, actorReason };`,
       guestTypeDeclarations(fullCodeMode), true,
     );
     expect(result.errors).toEqual([]);
-    for (const name of ["run", "spawn", "create"]) {
+    for (const name of ["run", "spawn", "create", "createActor", "setModel"]) {
       const schema = AGENTS_ACTION_DESCRIPTORS.find(descriptor => descriptor.name === name)!.inputSchema as { properties: Record<string, unknown> };
-      expect(schema.properties.modelReason).toMatchObject({ type: "string" });
+      expect(schema.properties.modelReason).toMatchObject({ type: "string", maxLength: 200 });
     }
   });
 

@@ -65,8 +65,18 @@ export const parseWorkerOptions = (
   const model = optional(args, "model");
   const modelReason = args.get("model-reason");
   const routeHeader = optional(args, "route-header");
+  const routeClass = args.get("route-class");
+  const routeClassSource = optional(args, "route-class-source");
+  if (routeClassSource !== undefined && routeClassSource !== "explicit" && routeClassSource !== "derived") {
+    throw new Error("Invalid worker route class source");
+  }
+  const protection = optional(args, "protected");
+  if (protection !== undefined && protection !== "true" && protection !== "false") {
+    throw new Error("Invalid worker protection snapshot");
+  }
   const thinking = optional(args, "thinking");
   const fabricExtensionPath = optional(args, "fabric-extension");
+  const fabricRelease = optional(args, "fabric-release");
   const schemaFile = optional(args, "schema-file");
   const replyTool = optional(args, "reply-tool") === "true";
   const imagesFile = optional(args, "images-file");
@@ -176,6 +186,7 @@ export const parseWorkerOptions = (
   return {
     ...(residentStartupProbe ? { residentStartupProbe: true } : {}),
     id: required(args, "id"),
+    ...(fabricRelease ? { fabricRelease } : {}),
     runner,
     ...(kernel ? { kernel, pythonRuntime } : {}),
     name: required(args, "name"),
@@ -207,6 +218,9 @@ export const parseWorkerOptions = (
     ...(model ? { model } : {}),
     ...(modelReason !== undefined ? { modelReason } : {}),
     ...(routeHeader ? { routeHeader } : {}),
+    ...(routeClass !== undefined ? { routeClass } : {}),
+    ...(routeClassSource ? { routeClassSource } : {}),
+    ...(protection !== undefined ? { protected: protection === "true" } : {}),
     ...(thinking ? { thinking } : {}),
     ...(systemPrompt ? { systemPrompt } : {}),
     ...(sessionFile ? { sessionFile } : {}),

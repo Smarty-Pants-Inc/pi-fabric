@@ -470,7 +470,7 @@ globalThis.cache = __providerProxy("cache");
 globalThis.prewalk = __providerProxy("prewalk");
 globalThis.records = __providerProxy("records");
 globalThis.jev = __providerProxy("jev");
-const __createActor = async (args = {}) => {
+const __createActor = async (args = {}, ref = "agents.create") => {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
     throw new TypeError("agents.create expects an options object");
   }
@@ -486,7 +486,7 @@ const __createActor = async (args = {}) => {
     }
     request.validWhile = { version: 1, source };
   }
-  return __call("agents.create", request);
+  return __call(ref, request);
 };
 const __handoff = async (args = {}) => {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
@@ -534,10 +534,12 @@ globalThis.agents = Object.freeze({
   stop: (args) => __call("agents.stop", args),
   cleanup: (args) => __call("agents.cleanup", args),
   create: __createActor,
+  createActor: (args) => __createActor(args, "agents.createActor"),
   ask: (target, message) => __call("agents.ask", __messageArgs(target, message)),
   tell: (target, message) => __call("agents.tell", __messageArgs(target, message)),
   steer: (target, message) => __call("agents.steer", __messageArgs(target, message)),
   followUp: (target, message) => __call("agents.followUp", __messageArgs(target, message)),
+  cancelFollowUp: (args) => __call("agents.cancelFollowUp", args),
   setSteeringMode: (args) => __call("agents.setSteeringMode", args),
   setFollowUpMode: (args) => __call("agents.setFollowUpMode", args),
   compact: (args) => __call("agents.compact", args),

@@ -236,8 +236,18 @@ describe("I-2 production-worker ingress retention", () => {
     const root = temporary(); const actor = { sessionFile: path.join(root, "actor.jsonl"), lastRunId: "latest" };
     const base = Math.max(plain.result.finishedAt!, attributed.result.finishedAt!);
     const store = new ActorLogStore({ maxEventBytes: DEFAULT_FABRIC_CONFIG.mesh.maxEventBytes }, DEFAULT_FABRIC_CONFIG.mesh, { actorRunArchiveMs: 60_000 });
+    fs.mkdirSync(path.join(root, "sources"), { mode: 0o700 });
     for (const kind of ["successful", "latest", ...unsafeKinds] as const) {
       const source = copyRun(plain.run, path.join(root, "sources", kind));
+      // cpSync's destination creation must not inherit a group-writable umask.
+      fs.chmodSync(source, 0o700);
+      // Each renamed top-level fixture represents a distinct actor run. Keep its
+      // execution receipt bound to that run, just as the production manager does;
+      // nested copies retain their original identities and all unsafe controls.
+      const receiptFile = path.join(source, "route-dispatch-receipt.json");
+      const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
+      expect(receipt.runId).toBe(plain.result.id);
+      fs.writeFileSync(receiptFile, JSON.stringify({ ...receipt, runId: kind }));
       copyRun(plain.run, path.join(source, "nested", "plain"));
       const nested = copyRun(attributed.run, path.join(source, "nested", "attributed"));
       if (kind !== "successful" && kind !== "latest") makeUnsafe(nested, kind);
@@ -246,6 +256,7 @@ describe("I-2 production-worker ingress retention", () => {
       const archive = path.join(root, "runs", kind);
       expect(fs.readdirSync(path.join(archive, "nested", "attributed")).sort()).toEqual(fs.readdirSync(nested).sort());
       expect(fs.existsSync(path.join(archive, "deliveries"))).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(archive, "route-dispatch-receipt.json"), "utf8"))).toEqual({ ...receipt, runId: kind });
       // cpSync makes independent copies of hardlinked source files. Reintroduce
       // an actual multiply-linked file in the archive to test the collector veto.
       if (kind === "hardlink") makeUnsafe(path.join(archive, "nested", "attributed"), kind);

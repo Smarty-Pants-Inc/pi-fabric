@@ -7,6 +7,17 @@ import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 import { StringDecoder } from "node:string_decoder";
 
+export interface DetachedProcessHandle {
+  pid: number;
+  closed: Promise<void>;
+  stop(): Promise<void>;
+  isAlive(): Promise<boolean>;
+  lostContact(): string | undefined;
+  stopDebt?(): string | undefined;
+  waitForClose(): Promise<void>;
+  readStderr?: () => string;
+}
+
 export interface ExecFileResult {
   stdout: string;
   stderr: string;
@@ -281,14 +292,14 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
-  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit"> & { captureStderr?: boolean },
+  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit"> & { captureStderr?: boolean; onCustody?: (handle: DetachedProcessHandle) => void },
   environment?: NodeJS.ProcessEnv,
   options: { captureStderr?: boolean } = {},
   scope?: { executable: string; slice: string; warn: (reason: string) => void } | number,
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs: number | boolean = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void>; readStderr?: () => string }> => {
+): Promise<DetachedProcessHandle> => {
 
   // Preserve the pre-scope positional contract used by older callers:
   // (options, termGraceMs, executionCustodian).
@@ -658,6 +669,8 @@ export const spawnDetached = async (
         : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0);
     },
   };
+  // Transfer the captured control handle before scoped admission can reject.
+  authority?.onCustody?.(handle);
   if (scope && marker) {
     let nativeClosed = false;
     void closed.then(() => { nativeClosed = true; });
@@ -675,6 +688,15 @@ export const spawnDetached = async (
       scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
       return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, options, undefined, termGraceMs, executionCustodian);
 
+    } catch (error) {
+      // A rejected admission is not proof that its captured execution stopped.
+      // Keep both a machine-readable obligation and the already-transferred handle.
+      if (handle.lostContact() !== undefined || await handle.isAlive().catch(() => true)) {
+        const reason = error instanceof Error ? error.message : String(error);
+        unconfirmed(reason);
+        throw Object.assign(new Error(reason), { launchOutcome: "unknown" });
+      }
+      throw error;
     } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }
   }
   return handle;

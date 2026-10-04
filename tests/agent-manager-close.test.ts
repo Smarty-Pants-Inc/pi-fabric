@@ -34,6 +34,28 @@ afterEach(async () => {
 });
 
 describe("AgentManager close storage", () => {
+  it.each(["explicit", "environment"] as const)("A25 preserves a foreign owner marker in an empty %s root", async source => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manager-foreign-root-"));
+    roots.push(tempRoot);
+    const root = path.join(tempRoot, "foreign");
+    fs.mkdirSync(root);
+    const marker = JSON.stringify({ pid: process.pid + 100000, startedAt: 1, heartbeatAt: 1 });
+    fs.writeFileSync(path.join(root, ".fabric-owner.json"), marker);
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", source === "environment" ? root : undefined);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: false },
+      source === "explicit" ? { runRoot: root } : {});
+    managers.push(manager);
+    await manager.close();
+    expect(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8")).toBe(marker);
+  });
+
+  it("A25 refuses a replaced foreign marker even in its managed temporary root", async () => {
+    const { manager, root } = setup(false);
+    const marker = JSON.stringify({ pid: process.pid + 100000, startedAt: 1, heartbeatAt: 1 });
+    fs.writeFileSync(path.join(root, ".fabric-owner.json"), marker);
+    await manager.close();
+    expect(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8")).toBe(marker);
+  });
   it.each(["before-close", "during-drain"] as const)("joins a child settled %s without foreground consumption, but real wait still consumes", async (timing) => {
     const fence = vi.fn();
     const consumed = vi.fn();

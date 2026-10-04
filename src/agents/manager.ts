@@ -132,6 +132,7 @@ import {
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
 
 const removeManagedRunRoot = async (root: string, managed: boolean): Promise<void> => {
+  if (!managed) return; // Explicit/environment roots are not this manager's temporary allocation.
   const deadline = Date.now() + (managed || process.platform === "win32" ? 2_000 : 250);
   let emptyChecked = false;
   while (true) {
@@ -139,6 +140,7 @@ const removeManagedRunRoot = async (root: string, managed: boolean): Promise<voi
       if (!emptyChecked) {
         const entries = fs.readdirSync(root);
         if (!entries.every((name) => name === ".fabric-owner.json")) return;
+        if (!canRemoveManagedRunRoot(root)) return; // Revalidate the marker owner immediately before unlink.
         if (entries.includes(".fabric-owner.json")) fs.unlinkSync(path.join(root, ".fabric-owner.json"));
         emptyChecked = true;
       }
@@ -387,7 +389,11 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** A retry launch owns custody until its exact replacement handle is installed. */
   relaunchPending?: Promise<boolean>;
   /** Terminal results do not discharge execution custody or admission permits. */
-  executionExited?: boolean;
+  executionGeneration: number;
+  /** Positive exit evidence belongs to one generation AND its exact transport. */
+  executionExitReceipt?: { generation: number; transport: AgentTransportHandle };
+  /** Effectful replacement rejection blocks all result/admission settlement. */
+  replacementLaunchUnresolved?: boolean;
   launchCancelled?: boolean;
   joinedStopDebt?: string;
   executionRelease?: () => void;
@@ -1668,7 +1674,8 @@ export class AgentManager {
           signal,
           onUnconfirmedExit: (reason) => {
             const managed = this.#runs.get(id);
-            if (managed) this.#markLost(managed, reason);
+            if (managed?.executionGeneration === 1) this.#markLost(managed, reason);
+            else if (managed) return; // A predecessor callback cannot certify or taint its replacement.
             else {
               // Cancelled/in-flight launches have no registered owner yet.
               try { markUnresolvedWorker(runDirectory, reason, { runId: id, transport: adapter.kind }); } catch { /* launch cleanup remains pending */ }
@@ -1718,6 +1725,7 @@ export class AgentManager {
           lifecycleRemainder: Buffer.alloc(0),
           runDirectory,
           transport,
+          executionGeneration: 1,
           adapter,
           // Ordinary caller abort detaches a managed worker; it must not veto
           // that worker's later retries. Actor authority stays attached.
@@ -1725,7 +1733,7 @@ export class AgentManager {
           startupAttempts: 1,
           ...lifecycle,
           release: () => {
-            if (managed.executionExited) release();
+            if (this.#executionExited(managed)) release();
             else managed.executionRelease = release;
           },
           abortSignal: queued && !authorize ? undefined : signal,
@@ -2125,6 +2133,7 @@ export class AgentManager {
       lifecycleRemainder: Buffer.alloc(0),
       runDirectory: hosted.context.runDirectory,
       transport: hosted.handle,
+      executionGeneration: 1,
       adapter: HOSTED_TRANSPORT,
       launch: { id: record.id, name: record.name, cwd: record.cwd, workerPath: "", workerArguments: [] },
       startupAttempts: 1,
@@ -2684,7 +2693,7 @@ export class AgentManager {
       // Hosted terminal reporting is not a native exit receipt. The adapter's
       // durable stop obligation remains retryable until it confirms release.
       await this.#stopManagedTransport(managed);
-      managed.executionExited = managed.hosted.executionReleased;
+      // Hosted release is read directly by the exact adapter custody guard.
     } else {
       await this.#drainExecution(managed);
     }
@@ -3146,7 +3155,7 @@ export class AgentManager {
     // other handle (including custom process handles on Windows) stays strict.
     if (transports.some((transport, index) => alive[index] &&
           !all.some(managed => managed.transport === transport && this.#hasNativeStopDebt(managed))) ||
-        all.some((managed) => !managed.hosted && !managed.executionExited && !this.#hasNativeStopDebt(managed)) ||
+        all.some((managed) => !managed.hosted && !this.#executionExited(managed) && !this.#hasNativeStopDebt(managed)) ||
         [...this.#queued.values()].some(queued => queued.cleanupPending)) {
       throw new Error("Agent manager close incomplete: execution exit unconfirmed; custody and files retained");
     }
@@ -3199,7 +3208,7 @@ export class AgentManager {
       await this.#startTempRunSweep();
     }
     const expired = [...this.#runs.values()].filter((managed) => {
-      if (!managed.settled || !managed.executionExited || managed.actorId || managed.processStopPending ||
+      if (!managed.settled || !this.#executionExited(managed) || managed.actorId || managed.processStopPending ||
           managed.nativeReleasePending || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
       const record = readRecord(managed.statusFile) ?? managed.latestRecord;
       const finishedAt = record?.finishedAt ?? record?.updatedAt;
@@ -3315,15 +3324,16 @@ export class AgentManager {
     return managed.processStop;
   }
 
-  // After a stop: a worker whose exit is not confirmed (lost contact, or still reported
-  // alive) may keep using its files, so the run is marked unresolved (never cleaned up).
+  // Exit/release receipts must certify the attempt observed before the await.
   async #noteUnconfirmedExit(managed: ManagedAgent): Promise<void> {
-    const lost = uncheckedExternalExit(managed.transport) ? "external transport has no checked exit contract" : managed.transport.lostContact?.();
-    const alive = lost === undefined && await this.#transportAliveUntil(managed.transport, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7).catch(() => true);
+    const generation = managed.executionGeneration;
+    const transport = managed.transport;
+    const lost = uncheckedExternalExit(transport) ? "external transport has no checked exit contract" : transport.lostContact?.();
+    const alive = lost === undefined && await this.#transportAliveUntil(transport, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7).catch(() => true);
+    if (managed.executionGeneration !== generation || managed.transport !== transport) return;
     if (lost === undefined && !alive) {
-      managed.executionExited = true;
-      // Only this exact transport's positive exit probe discharges a transient
-      // manager mark. Unknown/lost transport identity never reaches this branch.
+      managed.executionExitReceipt = { generation, transport };
+      delete managed.replacementLaunchUnresolved;
       delete managed.lostContact;
       fs.rmSync(path.join(managed.runDirectory, "unresolved-worker.json"), { force: true });
       managed.executionRelease?.();
@@ -3331,6 +3341,12 @@ export class AgentManager {
       return;
     }
     this.#markLost(managed, lost ?? "the worker did not confirm its exit after it was stopped");
+  }
+
+  #executionExited(managed: ManagedAgent): boolean {
+    if (managed.hosted) return managed.hosted.executionReleased;
+    const receipt = managed.executionExitReceipt;
+    return receipt?.generation === managed.executionGeneration && receipt.transport === managed.transport;
   }
 
   #hasNativeStopDebt(managed: ManagedAgent): boolean {
@@ -3344,10 +3360,12 @@ export class AgentManager {
     if (managed.hosted) {
       // A hosted terminal/liveness report cannot discharge remote custody.
       // Only the adapter's durable confirmed-release receipt authorizes it.
-      managed.executionExited = managed.hosted.executionReleased;
+      // Hosted release is read directly by the exact adapter custody guard.
       return;
     }
-    if (managed.executionExited) return;
+    if (this.#executionExited(managed)) return;
+    const generation = managed.executionGeneration;
+    const exactTransport = managed.transport;
     if (managed.executionDrain) return managed.executionDrain;
     const pending = (async () => {
       // The same bounded stop/probe contract covers launches promoted solely
@@ -3370,7 +3388,9 @@ export class AgentManager {
         if (this.#hasNativeStopDebt(managed)) return;
         throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${managed.lostContact}`);
       }
-      managed.executionExited = true;
+      if (managed.executionGeneration !== generation || managed.transport !== exactTransport) return;
+      managed.executionExitReceipt = { generation, transport: exactTransport };
+      delete managed.replacementLaunchUnresolved;
       delete managed.lostContact;
       fs.rmSync(path.join(managed.runDirectory, "unresolved-worker.json"), { force: true });
       managed.executionRelease?.();
@@ -3526,6 +3546,7 @@ export class AgentManager {
     record: AgentRunRecord,
     resume?: { task: string; carryOver: AgentRunCarryOver },
   ): Promise<boolean> {
+    let replacement: { generation: number; custody: boolean; unknown: boolean; pending: boolean } | undefined;
     try {
       if (managed.runner === "pi") {
         const model = await this.prepareModelForAdmission(managed.routePin?.model ?? managed.model, managed.runner, undefined, Boolean(managed.routePin));
@@ -3607,14 +3628,38 @@ export class AgentManager {
 
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
-      const transport = await this.#launchTransport(managed.adapter, managed.launch);
-      // Stop receipts belong to one transport attempt, not the run id. Install
-      // the replacement and its fresh custody together, after launch resolves.
-      managed.transport = transport;
-      managed.executionExited = false;
+      // Own the attempt BEFORE launch can acquire execution or reject. Never
+      // probe the predecessor after this point, even if no handle is returned.
+      const attempt: NonNullable<typeof replacement> = { generation: ++managed.executionGeneration, custody: false, unknown: false, pending: true };
+      replacement = attempt;
+      const unresolved = (): string | undefined => attempt.pending || attempt.unknown
+        ? "replacement launch execution exit unconfirmed; custody retained" : undefined;
+      managed.transport = {
+        kind: managed.adapter.kind, sessionId: `launch:${managed.id}:${attempt.generation}`,
+        isAlive: async () => Boolean(unresolved()), lostContact: unresolved,
+        stop: async () => { if (unresolved()) throw new Error(unresolved()); },
+      };
+      managed.replacementLaunchUnresolved = true;
+      delete managed.executionExitReceipt;
       delete managed.processStop;
       delete managed.processStopPending;
       delete managed.joinedStopDebt;
+      const transport = await this.#launchTransport(managed.adapter, {
+        ...managed.launch,
+        onCustody: handle => {
+          if (managed.executionGeneration !== attempt.generation) return;
+          attempt.custody = true;
+          managed.transport = handle;
+        },
+        onUnconfirmedExit: reason => {
+          if (managed.executionGeneration !== attempt.generation) return;
+          attempt.unknown = true;
+          this.#markLost(managed, reason);
+        },
+      });
+      attempt.pending = false;
+      managed.transport = transport;
+      delete managed.replacementLaunchUnresolved;
       this.#unregisteredTransports.delete(transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
       delete managed.relaunchFailure;
@@ -3646,6 +3691,19 @@ export class AgentManager {
       this.#invalidateUiList();
       return true;
     } catch (error) {
+      if (replacement) {
+        replacement.pending = false;
+        replacement.unknown ||= (error as { launchOutcome?: string } | undefined)?.launchOutcome === "unknown";
+        if (!replacement.custody && !replacement.unknown) {
+          // Adapter contract: rejection without custody/unknown notification
+          // confirms no execution. Certify this attempt's placeholder, not its
+          // predecessor. Acquired handles instead owe their own checked drain.
+          managed.executionExitReceipt = { generation: replacement.generation, transport: managed.transport };
+          delete managed.replacementLaunchUnresolved;
+        } else {
+          this.#markLost(managed, error instanceof Error ? error.message : String(error));
+        }
+      }
       const retryError = error instanceof Error ? error.message : String(error);
       try {
         fs.appendFileSync(
@@ -3855,9 +3913,10 @@ export class AgentManager {
 
   #settle(managed: ManagedAgent, result: AgentRunResult): void {
     if (managed.settled) return;
+    if (managed.replacementLaunchUnresolved && !this.#executionExited(managed)) return;
     // An actor result resumes its same-session activation drain. Holding only
     // a parent concurrency permit would not fence that writer when capacity >1.
-    if (managed.actorId && !managed.executionExited &&
+    if (managed.actorId && !this.#executionExited(managed) &&
         !(managed.transport.kind === "process" && process.platform === "win32" &&
           managed.transport.waitForClose && !managed.launchCancelled &&
           (!managed.transport.lostContact?.() || this.#hasNativeStopDebt(managed)))) return;
@@ -3903,7 +3962,7 @@ export class AgentManager {
     // Images are transport inputs, not retained run artifacts. Startup retries
     // have finished by settlement, so remove the owner-only handoff file for
     // every terminal outcome even when retainRuns keeps the rest of the run.
-    if (managed.executionExited || (process.platform === "win32" && managed.transport.waitForClose &&
+    if (this.#executionExited(managed) || (process.platform === "win32" && managed.transport.waitForClose &&
         !managed.launchCancelled && !managed.transport.lostContact?.() && !managed.lostContact)) {
       fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
     }
@@ -4006,7 +4065,7 @@ export class AgentManager {
   }
 
   #canCollect(managed: ManagedAgent): boolean {
-    if (!managed.executionExited || managed.processStopPending || managed.nativeReleasePending ||
+    if (!this.#executionExited(managed) || managed.processStopPending || managed.nativeReleasePending ||
         managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
     if (uncheckedExternalExit(managed.transport)) return false;
     // Retry the durable full archive before asking its pending-marker collection veto.
@@ -4268,7 +4327,7 @@ export class AgentManager {
     const settled = [...this.#runs.values()].filter((managed) => managed.settled);
     const evicted = settled.slice(0, -MAX_RETAINED_RUN_HANDLES);
     for (const managed of evicted) {
-      if (managed.executionExited && !managed.settlementSaveFailure && !managed.processStopPending &&
+      if (this.#executionExited(managed) && !managed.settlementSaveFailure && !managed.processStopPending &&
           !managed.nativeReleasePending && !managed.lostContact && !hasUnresolvedWorker(managed.runDirectory)) this.#runs.delete(managed.id);
     }
     const retained = evicted.length > 0 ? settled.slice(evicted.length) : settled;

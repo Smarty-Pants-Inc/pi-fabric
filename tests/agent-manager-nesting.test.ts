@@ -130,10 +130,11 @@ describe("nested agent shutdown", () => {
     await parent.cleanup(handle.id);
     expect(fs.existsSync(directory)).toBe(false);
     await parent.close();
-    expect(fs.existsSync(root)).toBe(false);
+    expect(fs.existsSync(root)).toBe(true); // A25: the supplied allocation belongs to the caller.
+    expect(fs.readdirSync(root)).toEqual([]);
   });
 
-  it.each(["missing lineage", "different owner", "explicit root"])("does not transfer cleanup ownership for %s", async (scenario) => {
+  it.each(["missing lineage", "different owner", "explicit root"])("does not adopt or remove a supplied root with %s", async (scenario) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nested-ownership-"));
     roots.push(root);
     const nested = path.join(root, "owner", "nested");
@@ -146,7 +147,8 @@ describe("nested agent shutdown", () => {
     }));
     const manager = makeManager(scenario === "explicit root" ? nested : undefined);
     await manager.close();
-    expect(fs.existsSync(nested)).toBe(false);
+    expect(fs.existsSync(nested)).toBe(true); // Missing lineage never grants ownership of the supplied root.
+    expect(fs.readdirSync(nested)).toEqual([]);
   });
 
   it("does not leave cached session descendants running when their owner ends without retained terminal evidence", async () => {

@@ -438,6 +438,11 @@ export interface AgentTransportLaunch {
   authorize?: () => boolean;
   /** Persist unknown tree/native close before stop returns or a parent-only fallback reports exit. */
   onUnconfirmedExit?: (reason: string) => void;
+  /** Transfer exact launch-attempt control before any effectful await can reject.
+   * Rejection without this callback, onUnconfirmedExit or launchOutcome:"unknown"
+   * certifies non-launch. Effectful failures MUST retain one of these obligations.
+   */
+  onCustody?: (handle: AgentTransportHandle) => void;
 }
 
 export interface AgentTransportObservationOptions {

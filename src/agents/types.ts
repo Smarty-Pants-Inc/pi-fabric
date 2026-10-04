@@ -144,12 +144,10 @@ export interface AgentRunRequest {
   handoffCompact?: HandoffCompactionRequest;
   /** Host-only parent /switch-account pins; not a model argument. */
   inheritedSessionPins?: InheritedSessionPin[];
-<<<<<<< HEAD
   /** Unix niceness 0-19; only raises agents.nice, never lowers it. */
   nice?: number;
   /** Actor runs: default bash timeout (s), exported as PI_FABRIC_ACTOR_BASH_TIMEOUT_S; 0 = none. */
   bashTimeoutSeconds?: number;
-=======
   /** Host-created fork of the caller branch ending at its last completed turn (seed: "branch"). */
   forkSeed?: AgentForkSeed;
 }
@@ -158,7 +156,6 @@ export interface AgentForkSeed {
   sourceSessionId: string;
   sourceSessionFile?: string;
   sourceBranch: SessionEntry[];
->>>>>>> upstream-v0.105.0
 }
 
 export interface AgentUsage {
@@ -265,12 +262,10 @@ export interface AgentRunRecord {
   /** Set while a routed child dialog waits for an answer (status detail waiting_for_answer). */
   blockedOn?: { decisionId?: string; since: number };
   compaction?: AgentCompactionStatus;
-<<<<<<< HEAD
   /** Unconsumed outcome, including recovery from a dead Main to its exact lane successor. */
   completionDelivery?: { status: "undelivered"; addressedTo: string; redeliveredFrom?: string };
   /** Terminal event-log optimization was skipped; the full original log remains. */
   compactionSkipped?: string;
-=======
   /** Settlement diff summary of a worktree: true run; `worktree` stays the path. */
   worktreeResult?: AgentWorktreeResult;
   /** Hosted runs: the adapter locator, persisted before the run is submitted. */
@@ -281,7 +276,6 @@ export interface AgentRunRecord {
   outcome?: FabricRunOutcome;
   /** A hosted runner's failure hint; Fabric itself never retries. */
   retryable?: boolean;
->>>>>>> upstream-v0.105.0
 }
 
 export interface AgentRunResult extends AgentRunRecord {
@@ -457,7 +451,6 @@ export interface AgentTransportHandle {
   sessionId?: string;
   attachCommand?: string;
   livenessPollIntervalMs?: number;
-<<<<<<< HEAD
   /**
    * False when a lost worker must never be launched again automatically: the transport
    * cannot prove the previous one is gone (Herdr, smarty-dev#266). Default true.
@@ -473,14 +466,10 @@ export interface AgentTransportHandle {
   observe?(options?: AgentTransportObservationOptions): Promise<AgentTransportObservation>;
   /** Bounded join of the captured process worker's native close (not PID absence). */
   waitForClose?(): Promise<void>;
-  isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
-  stop(options?: AgentTransportObservationOptions): Promise<void>;
-=======
   /** Bounded diagnostic tail for workers that fail before writing a status record. */
   readStderr?(): string;
-  isAlive(): Promise<boolean>;
-  stop(): Promise<void>;
->>>>>>> upstream-v0.105.0
+  isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
+  stop(options?: AgentTransportObservationOptions): Promise<void>;
 }
 
 export interface AgentTransportAdapter {
@@ -544,7 +533,6 @@ export interface AgentSteerEntry {
   ts: number;
 }
 
-<<<<<<< HEAD
 export const FOLLOW_UP_RUNNING_TASK_MESSAGE = "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.";
 
 /** Sender-only, receiver-time advisory; it does not change followUp delivery. */
@@ -556,7 +544,6 @@ export interface AgentFollowUpRunningWarning {
   message: string;
 }
 
-=======
 /** A routed child dialog (agents.childQuestions "route"); `question` is the raw worker payload. */
 export interface AgentChildQuestionRequest {
   runId: string;
@@ -574,7 +561,6 @@ export type AgentChildQuestionResponse =
   | { confirmed: boolean }
   | { cancelled: true };
 
->>>>>>> upstream-v0.105.0
 export interface AgentSteerResult {
   deadlineAt?: number;
   warning?: AgentFollowUpRunningWarning;

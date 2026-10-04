@@ -37,27 +37,21 @@ const primaryEntryPoints = [
   "src/memory/normalize.ts",
   "src/memory/worker-provider.ts",
   "src/providers/memory-provider.ts",
-<<<<<<< HEAD
   "src/records/service-main.ts",
-=======
   // Standalone `pi-fabric` bin; never reachable from the extension entry.
   "src/cli/index.ts",
->>>>>>> upstream-v0.105.0
 ];
 
 // Every package-local dynamic import is also an entry point. Its stable output
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
-<<<<<<< HEAD
   "src/judge/agent.ts",
   "src/core/landlock.ts",
   "src/core/pattern-kill.ts",
   "src/lifecycle/reload-target-profile.ts",
   "src/lifecycle/reload-slots.ts",
   "src/coordination/unverified-ids.ts",
-=======
-  "src/type-error-guidance.ts",
   "src/cli/mesh.ts",
   "src/cli/decisions.ts",
   "src/thinking-control.ts",
@@ -65,7 +59,6 @@ const lazyEntryPoints = [
   "src/compaction/orphan-repair.ts",
   "src/decisions/command.ts",
   "src/programs/host.ts",
->>>>>>> upstream-v0.105.0
   "src/core/provider-operations.ts",
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
@@ -122,13 +115,10 @@ const lazyEntryPoints = [
   "src/worker/options.ts",
   "src/worker/questions.ts",
   "src/worker/recovery-watchdog.ts",
-<<<<<<< HEAD
   "src/worker/retry-profile.ts",
   "src/worker/task-entry.ts",
   "src/worker/run-log.ts",
-=======
   "src/worker/result.ts",
->>>>>>> upstream-v0.105.0
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
 ];

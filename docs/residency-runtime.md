@@ -49,7 +49,7 @@ Older hosts without that optional flag retain their existing readiness contract.
 The default usable-start observation budget includes the mandatory 30-second
 empty legacy mesh-lock grace plus bounded boot/acquisition time; explicit caller
 budgets remain unchanged. A client attaching between owner publication and the
-maintenance receipt waits for that existing generation instead of launching
+maintenance receipt waits for that existing generation without launching
 a competitor.
 
 Scope travels with each request. The host has no session scope of its own, so
@@ -72,7 +72,6 @@ and reconnection.
 The host exits after its normal idle grace once it owns no live durable actor or
 running durable agent.
 
-<<<<<<< HEAD
 ### PR #394 scope cut: recovery supervision deferred
 
 This change keeps cold startup without an archive walk and lease-fenced mesh
@@ -89,7 +88,7 @@ A file-only heartbeat is liveness, not permission to consume mesh work. Control,
 actor mesh, and lifecycle consumers require a confirmed shared-lock renewal.
 An overdue consumer requests a prompt renewal attempt, but stays fenced until
 that real acquisition succeeds. Initial publication failure keeps the same
-host start pending rather than publishing a usable owner prematurely.
+host start pending and does not publish a usable owner prematurely.
 
 Control admission checks the lease under both the shared claim lock and the
 host-local claim lock. The resident rechecks after awaited binding resolution,
@@ -107,7 +106,6 @@ not pick up queued resident requests before the start succeeds. Restored actor
 queues stay release-paused, and control/lifecycle delivery gates remain closed,
 until owner publication commits. A failed start after confirmed lease publication
 therefore also preserves accepted, unlaunched work.
-=======
 [Scheduled mesh events](agents.md#scheduled-events) add one rule, computed by the
 pure `residentIdleDecision`: pending schedules on any topic keep the host alive
 while it owns at least one durable participant, and every idle check re-arms a
@@ -161,7 +159,6 @@ alone.
 
 Hosts and containers that share `.pi/fabric` need clocks that agree within the
 heartbeat TTL.
->>>>>>> upstream-v0.105.0
 
 ## Validation
 

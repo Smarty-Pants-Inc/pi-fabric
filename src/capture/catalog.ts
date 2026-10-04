@@ -68,12 +68,8 @@ export class CapturedToolCatalog {
 
     for (const registeredTool of registeredTools) {
       const { definition, sourceInfo } = registeredTool;
-<<<<<<< HEAD
-      if (sourceInfo.path === ownSourcePath) continue;
-      if (isRunReplyTool(definition.name, sourceInfo.path)) continue;     // host-owned (smarty-dev#967)
-=======
       if (sourceInfo.path === ownSourcePath || definition.exposure === "hidden") continue;
->>>>>>> upstream-v0.105.0
+      if (isRunReplyTool(definition.name, sourceInfo.path)) continue;     // host-owned (smarty-dev#967)
       this.#tools.set(definition.name, {
         name: definition.name,
         definition,

@@ -103,9 +103,6 @@ export class JevProvider implements FabricProvider {
       case "stop": return this.manager.stop(args.id as string);
     }
   }
-<<<<<<< HEAD
-  async close(): Promise<void> { await this.manager.close(); await this.client.drainCredentials(); this.client.close(); }
-=======
   /**
    * Program decisions go through the run's own jev-fabric connection when
    * configured and available; direct calls stay in-process. `auto` falls back
@@ -156,10 +153,10 @@ export class JevProvider implements FabricProvider {
 
   async close(): Promise<void> {
     await this.manager.close();
+    await this.client.drainCredentials();
     this.client.close();
     const connections = [...this.#runs.values()];
     this.#runs.clear();
     await Promise.allSettled(connections.map(async pending => (await pending)?.close()));
   }
->>>>>>> upstream-v0.105.0
 }

@@ -8,6 +8,7 @@ import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
 import { HumanWaitDeadlinePause } from "./deadline-pause.js";
+import { humanWaitDeadlineClock } from "./kernel.js";
 import { montyBindings } from "./monty-bridge.js";
 import { MONTY_BOOTSTRAP_SOURCE, montyErrorText, prepareMontySource } from "./monty-source.js";
 import { montyInput, normalizeMontyValue } from "./monty-values.js";
@@ -94,33 +95,18 @@ export class MontyRuntime implements FabricKernelRuntime {
       kill();
     };
     const abort = (): void => stop("aborted");
-<<<<<<< HEAD
-    const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(() => stop("timed_out"));
+    const scheduleDeadline = (): void => {
+      if (stopped || hostAbort.signal.aborted || humanWait.paused) return;
+      executionDeadline.scheduleDeadline(() => stop("timed_out"));
+    };
     const checkDeadline = (): void => {
       if (executionDeadline.reached) stop("timed_out");
       if (hostAbort.signal.aborted) throw hostAbort.signal.reason;
-=======
-    const scheduleDeadline = (): void => {
-      if (timer) clearTimeout(timer);
-      if (stopped || !Number.isFinite(deadlineAt)) return;
-      timer = setTimeout(() => {
-        if (Date.now() < deadlineAt) scheduleDeadline();
-        else stop("timed_out");
-      }, Math.min(2_147_483_647, Math.max(0, deadlineAt - Date.now())));
->>>>>>> upstream-v0.105.0
     };
+    const humanWait = new HumanWaitDeadlinePause(humanWaitDeadlineClock(
+      () => executionDeadline, options, scheduleDeadline, () => stop("timed_out"),
+    ));
     scheduleDeadline();
-    const humanWait = new HumanWaitDeadlinePause({
-      remainingMs: () => deadlineAt - Date.now(),
-      suspend: () => {
-        if (timer) clearTimeout(timer);
-        deadlineAt = Infinity;
-      },
-      resume: (remainingMs) => {
-        deadlineAt = Date.now() + remainingMs;
-        scheduleDeadline();
-      },
-    });
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();
     let result: FabricSandboxResult | undefined;
@@ -132,7 +118,7 @@ export class MontyRuntime implements FabricKernelRuntime {
           binaryPath, minProcesses: 0, maxProcesses: 1, maxCheckoutsPerWorker: 1,
           // A fixed VM/per-turn limit would defeat a longer host-call floor. In that
           // mode the reschedulable host watchdog hard-kills the captured native PID.
-          ...(options.minimumTimeoutMsForHostCall ? {
+          ...(options.minimumTimeoutMsForHostCall || options.isHumanWaitHostCall ? {
             durationLimitGrace: null, requestTimeout: MAX_EXECUTOR_TIMEOUT_MS / 1000 + 1,
           } : {
             requestTimeout: options.timeoutMs / 1000 + 1, durationLimitGrace: 1,
@@ -147,7 +133,7 @@ export class MontyRuntime implements FabricKernelRuntime {
         const checkedOut = await ownedPool.checkout({
           scriptName: "fabric-exec.py", printFlushInterval: 0,
           limits: { maxMemory: options.memoryLimitBytes, maxRecursionDepth: 500, maxSuspensions: 10_000,
-            ...(!options.minimumTimeoutMsForHostCall ? { maxDurationSecs: options.timeoutMs / 1000 } : {}),
+            ...(!options.minimumTimeoutMsForHostCall && !options.isHumanWaitHostCall ? { maxDurationSecs: options.timeoutMs / 1000 } : {}),
           },
         });
         if (hostAbort.signal.aborted) { await checkedOut.close(); throw hostAbort.signal.reason; }
@@ -169,20 +155,12 @@ export class MontyRuntime implements FabricKernelRuntime {
         const settle = isPiShellRef(ref) && args.settle === true;
         if (isPiShellRef(ref)) delete args.settle;
         const floor = options.minimumTimeoutMsForHostCall?.(ref, args);
-<<<<<<< HEAD
-        if (executionDeadline.extend(floor)) scheduleDeadline();
+        if (humanWait.paused && typeof floor === "number" && Number.isFinite(floor)) humanWait.raise(floor);
+        else if (executionDeadline.extend(floor)) scheduleDeadline();
         checkDeadline();
-=======
-        if (typeof floor === "number" && Number.isFinite(floor)) {
-          if (humanWait.paused) humanWait.raise(floor);
-          else if (Date.now() + floor > deadlineAt) {
-            deadlineAt = Date.now() + Math.max(1, Math.floor(floor));
-            scheduleDeadline();
-          }
-        }
         const waitsForHuman = options.isHumanWaitHostCall?.(ref, args) === true;
+        checkDeadline();
         if (waitsForHuman) humanWait.enter();
->>>>>>> upstream-v0.105.0
         const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal));
         tasks.add(task);
         try {

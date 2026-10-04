@@ -191,7 +191,6 @@ type FabricParticipantCapability = "steer" | "followUp" | "stop" | "ask" | "acto
 interface FabricParticipantInfo {
   format: 1;
   id: string;
-<<<<<<< HEAD
   /** The root's fleet role, for example "project-agent". */
   role?: string;
   /** The checkout that owns the root's git common directory. */
@@ -202,10 +201,7 @@ interface FabricParticipantInfo {
   interactive?: boolean;
   /** Reserved remote Main setter advertisement; currently false/absent. */
   mainBindings?: boolean;
-  kind: FabricParticipantKind;
-=======
   kind: FabricParticipantKind | "provider";
->>>>>>> upstream-v0.105.0
   rootId: string;
   ownerHostId: string;
   ownerIdentityId: string;
@@ -365,16 +361,13 @@ interface FabricAgentResult extends FabricAgentHandle {
   error?: string;
   usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
   pendingMessages?: { steering: string[]; followUp: string[] };
-<<<<<<< HEAD
   currentToolStartedAt?: number;
   followUpDeliveries?: FabricFollowUpDelivery[];
-=======
   /** worktree: true runs; worktree stays the path. */
   worktreeResult?: {
     path: string; branch?: string; baseRef?: string; changedFiles: string[];
     diffstat: { files: number; insertions: number; deletions: number }; kept: boolean; diffError?: string;
   };
->>>>>>> upstream-v0.105.0
 }
 interface FabricModelInfo {
   runner?: FabricAgentRunner;
@@ -462,7 +455,6 @@ interface FabricCapabilityCatalog {
   complete: boolean;
   reasons: string[];
 }
-interface FabricToolsApi {
 interface FabricActionListEnvelope {
   kind: "pi-fabric.action-list";
   version: 1;
@@ -1163,11 +1155,8 @@ interface FabricMeshStateEntry<T = unknown> {
 }
 interface FabricMeshApi {
   self(): Promise<FabricMeshIdentity>;
-<<<<<<< HEAD
   /** An unverified-ids notice is advisory; it is also appended to the durable event text. */
   publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; message?: string; body?: string }): Promise<FabricMeshEvent & { notice?: string }>;
-=======
-  publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; message?: string; body?: string }): Promise<FabricMeshEvent>;
   /** Schedules instead: notBefore (epoch ms/ISO) or afterMs, ≤366 days; key replaces. */
   publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; notBefore?: number | string; afterMs?: number; key?: string }): Promise<FabricMeshSchedule & { scheduled: true }>;
   scheduled(args?: { topic?: string; limit?: number }): Promise<FabricMeshSchedule[]>;
@@ -1176,7 +1165,6 @@ interface FabricMeshApi {
   grant(args: { topic: string; ttlMs: number; uses?: number; kind?: string }): Promise<FabricMeshGrant & { token: string; command: string }>;
   revoke(args: { grantId: string }): Promise<{ revoked: boolean }>;
   grants(): Promise<FabricMeshGrant[]>;
->>>>>>> upstream-v0.105.0
   read(args?: { after?: number; topic?: string; to?: string; limit?: number; max?: number }): Promise<FabricMeshEvent[]>;
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean; limit?: number; max?: number; include_stale?: boolean }): Promise<FabricParticipantInfo[]>;
   get<T = unknown>(args: { key: string }): Promise<FabricMeshStateEntry<T> | null>;

@@ -110,14 +110,9 @@ export const shouldShowFabricWidget = (
 ): boolean => {
   if (mode === "hidden") return false;
   if (mode === "always") return true;
-<<<<<<< HEAD
-  if (snapshot.shells?.some(job => job.finishedAt === undefined || snapshot.now - job.finishedAt < 30000)) return true;
-  if (ownAgents(snapshot).some((agent) => isActiveStatus(agent.status))) return true;
-=======
   retention.sync(snapshot);
   if (snapshot.shells?.some(job => job.finishedAt === undefined || isRecentWidgetCompletion(job.finishedAt, snapshot.now))) return true;
-  if (snapshot.agents.some((agent) => retention.visible(agent, snapshot))) return true;
->>>>>>> upstream-v0.105.0
+  if (ownAgents(snapshot).some((agent) => retention.visible(agent, snapshot))) return true;
   if (snapshot.actors.some((actor) => actor.status !== "stopped")) return true;
   const run = snapshot.runs[0];
   if (!run) return false;
@@ -226,12 +221,8 @@ export class FabricWidget implements Component {
         candidateFinishedAt > (snapshot.widgetDismissedAt ?? 0))
         ? candidateRun
         : undefined;
-<<<<<<< HEAD
-    const orderedAgents = orderAgentsByCreation(ownAgents(snapshot));
-=======
     this.retention.sync(snapshot);
-    const orderedAgents = orderAgentsByCreation(snapshot.agents);
->>>>>>> upstream-v0.105.0
+    const orderedAgents = orderAgentsByCreation(ownAgents(snapshot));
     const activeAgents = orderedAgents.filter((agent) => isActiveStatus(agent.status));
     const activeAgentIds = new Set(activeAgents.map((agent) => agent.id));
     // Keep settle-time rows stable, then retire each completion independently.

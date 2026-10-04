@@ -154,15 +154,12 @@ export class JevClient {
     const model = resolveJevUpstreamModel(this.route, requestedModel);
     if (!model) throw new Error(`Jev model "${requestedModel}" is not available on the ${this.route.label} route`);
     const timedSignal = AbortSignal.any([signal, AbortSignal.timeout(this.config.requestTimeoutMs)]);
-<<<<<<< HEAD
     const key = await runAbortable(timedSignal, () => {
       const pending = this.credentials.resolve(timedSignal);
       this.#pendingCredentials.add(pending);
       void pending.then(() => this.#pendingCredentials.delete(pending), () => this.#pendingCredentials.delete(pending));
       return pending;
     });
-=======
-    const key = await runAbortable(timedSignal, () => this.credentials.resolve(timedSignal));
     if (dispatch) {
       let answer: unknown;
       try {
@@ -172,7 +169,6 @@ export class JevClient {
       }
       return checkResponse(answer, request);
     }
->>>>>>> upstream-v0.105.0
     const body = jsonText({ ...request, model }, this.config.maxRequestBytes, "Jev request");
     let response: Response;
     try {

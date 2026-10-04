@@ -550,17 +550,14 @@ export interface FabricInvocationContext {
   extensionContext: ExtensionContext;
   update(message: string): void;
   activity?(update: FabricInvocationActivityUpdate): void;
-<<<<<<< HEAD
   /** Host-owned absolute Main ceiling, shared by observations; never supplied by guest arguments. */
   readonly mainDeadlineAt?: number;
   /** Host budget guard at effect admission and publication; never populated from guest arguments. */
   readonly checkExecutionBudget?: () => void;
   /** Host-only receipt: commit consumption after result publication, abandon on rejection. */
   deferResultConsumption?(consume: () => void, abandon?: () => void): void;
-=======
   /** Host-supplied inside fabric_exec: register provider-owned work as a participant. */
   participants?: FabricInvocationParticipants;
->>>>>>> upstream-v0.105.0
   /** Host-supplied inside fabric_exec so agents.handoff schedules the outer-call boundary. */
   deferHandoff?(args: Record<string, unknown>): Record<string, unknown>;
   // Out-of-band image content blocks a provider (currently only pi.read of an

@@ -4,10 +4,7 @@ import fs from "node:fs";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-<<<<<<< HEAD
 import { randomUUID } from "node:crypto";
-=======
->>>>>>> upstream-v0.105.0
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { assertWorkerRuntime, writeWorkerStartupFailure } from "./worker/startup.js";
 
@@ -93,7 +90,6 @@ const loadWorkerRecovery = async (): Promise<WorkerRecoveryModule> => {
   return import(sourceModulePath) as Promise<WorkerRecoveryModule>;
 };
 
-<<<<<<< HEAD
 type WorkerToolCallStreamGuardModule = typeof import("./worker/tool-call-stream-guard.js");
 const loadToolCallStreamGuard = async (): Promise<WorkerToolCallStreamGuardModule> => {
   if (!import.meta.url.endsWith(".ts")) return import("./worker/tool-call-stream-guard.js");
@@ -101,10 +97,7 @@ const loadToolCallStreamGuard = async (): Promise<WorkerToolCallStreamGuardModul
   return import(sourceModulePath) as Promise<WorkerToolCallStreamGuardModule>;
 };
 
-type AgentResultModule = typeof import("./agents/result.js");
-=======
 type AgentResultModule = typeof import("./worker/result.js");
->>>>>>> upstream-v0.105.0
 
 const loadAgentResult = async (): Promise<AgentResultModule> => {
   if (!import.meta.url.endsWith(".ts")) return import("./worker/result.js");
@@ -251,12 +244,8 @@ let runRecordHelpers: WorkerRunRecordModule | undefined;
 let terminalWritten = false;
 let flushRunLog: (() => void) | undefined;
 const writeCrashStatus = (error: unknown): void => {
-<<<<<<< HEAD
   flushRunLog?.();
-  if (!crashContext || !runRecordHelpers || terminalWritten) return;
-=======
   if (terminalWritten) return;
->>>>>>> upstream-v0.105.0
   try {
     if (crashContext && runRecordHelpers) {
       runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);
@@ -280,13 +269,9 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
-<<<<<<< HEAD
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog, PI_PROVIDER_RESUME_DELAYS_MS, recoveryTimeScale }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
-=======
   assertWorkerRuntime();
   crossSpawn = (await import("cross-spawn")).default;
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }] = await Promise.all([
->>>>>>> upstream-v0.105.0
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog, PI_PROVIDER_RESUME_DELAYS_MS, recoveryTimeScale }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
@@ -433,7 +418,6 @@ const main = async (): Promise<void> => {
     piArguments.push("-e", hookPath, "--no-auto-compaction");
   }
   if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
-<<<<<<< HEAD
   const deliveryHook = fileURLToPath(new URL(
     import.meta.url.endsWith(".ts") ? "./worker/principal-delivery.ts" : "./worker/principal-delivery.js", import.meta.url));
   piArguments.push("-e", deliveryHook);
@@ -478,17 +462,13 @@ const main = async (): Promise<void> => {
     // Explicit -e is loaded even with --no-extensions: attribution is not optional.
     piArguments.push("-e", hookPath);
   }
-  const piTools = replyTool ? [...options.tools, "fabric_reply"] : options.tools;
-  if (piTools.length > 0) piArguments.push("--tools", piTools.join(","));
-=======
   if (options.writePolicy) {
-    // The guard loads even with --no-extensions; other runners cannot enforce it.
     if (options.runner !== "pi") throw new Error(`Write confinement requires the Pi runner, not ${options.runner}`);
     const guard = import.meta.url.endsWith(".ts") ? "./agents/write-guard.ts" : "./agents/write-guard.js";
     piArguments.push("-e", fileURLToPath(new URL(guard, import.meta.url)));
   }
-  if (options.tools.length > 0) piArguments.push("--tools", options.tools.join(","));
->>>>>>> upstream-v0.105.0
+  const piTools = replyTool ? [...options.tools, "fabric_reply"] : options.tools;
+  if (piTools.length > 0) piArguments.push("--tools", piTools.join(","));
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
   if (options.model) piArguments.push("--model", options.model);
   if (thinking) piArguments.push("--thinking", thinking);
@@ -873,12 +853,8 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
-<<<<<<< HEAD
-  }, activationWindow, options.residentStartupProbe === true, Boolean(options.routeHeader));
+  }, activationWindow, options.residentStartupProbe === true, Boolean(options.routeHeader), options.modelAdmission);
   let modelControl = createModelControl();
-=======
-  }, options.modelAdmission);
->>>>>>> upstream-v0.105.0
 
   // Attributed token telemetry. Every usage-bearing child event emits one
   // tokens.usage lifecycle entry identified by this run/actor/runner/depth.
@@ -1619,11 +1595,7 @@ const main = async (): Promise<void> => {
         const line = raw.trim();
         if (!line) continue;
         processedCommands += 1;
-<<<<<<< HEAD
-        let command: { type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown; followUpId?: string };
-=======
-        let command: { type?: string; message?: string; mode?: string; instructions?: string; requestId?: string };
->>>>>>> upstream-v0.105.0
+        let command: { type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown; followUpId?: string; requestId?: string };
         try {
           command = JSON.parse(line);
         } catch {

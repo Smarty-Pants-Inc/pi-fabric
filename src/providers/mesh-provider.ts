@@ -4,27 +4,14 @@ import type {
   FabricProvider,
   FabricProviderListRequest,
 } from "../protocol.js";
-<<<<<<< HEAD
 import { invocationFabricPrincipal, snapshotFabricInvocation } from "../fabric-provenance.js";
-import { MeshStore, type MeshIdentity } from "../mesh/store.js";
-=======
 import {
-  MESH_MAX_PENDING_SCHEDULES,
-  MESH_MAX_SCHEDULE_AHEAD_MS,
-  MeshStore,
-  type MeshIdentity,
+  MESH_MAX_PENDING_SCHEDULES, MESH_MAX_SCHEDULE_AHEAD_MS, MeshStore, type MeshIdentity,
 } from "../mesh/store.js";
 import {
-  createMeshGrant,
-  listMeshGrants,
-  meshCliArgv,
-  meshPostCommand,
-  MESH_GRANT_MAX_TTL_MS,
-  MESH_GRANT_MAX_USES,
-  MESH_GRANT_MIN_TTL_MS,
-  revokeMeshGrant,
+  createMeshGrant, listMeshGrants, meshCliArgv, meshPostCommand,
+  MESH_GRANT_MAX_TTL_MS, MESH_GRANT_MAX_USES, MESH_GRANT_MIN_TTL_MS, revokeMeshGrant,
 } from "../mesh/grants.js";
->>>>>>> upstream-v0.105.0
 import type { FabricParticipantSource } from "../topology/types.js";
 import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC } from "../lifecycle/types.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
@@ -325,55 +312,27 @@ export class MeshProvider implements FabricProvider {
       case "self":
         return this.identity;
       case "publish": {
-<<<<<<< HEAD
-        const topic = String(args.topic);
-        if (
-          topic.startsWith(INTERNAL_CONTROL_PREFIX) ||
-          topic === INTERNAL_HOST_EVENT_TOPIC ||
-          topic === FABRIC_PARTICIPANT_LIFECYCLE_TOPIC
-        ) {
-          throw new Error(`Fabric mesh topic is reserved for host coordination: ${topic}`);
-        }
+        const topic = assertPublicMeshTopic(String(args.topic));
+        const dueAt = meshScheduleDueAt(args);
+        if (dueAt === undefined && args.key !== undefined) throw new Error("mesh.publish key requires notBefore or afterMs");
         const checked = typeof args.text === "string" ? await outgoingMessageNotice(args.text, context, this.identity.id) : undefined;
         const publish = (text?: string) => {
           context.signal?.throwIfAborted();
-          return this.store.publish({
-            topic,
-            from: this.identity,
-            principal: invocationFabricPrincipal(context),
-            signal: context.signal,
+          const message = {
+            topic, from: this.identity, principal: invocationFabricPrincipal(context), signal: context.signal,
             ...(typeof args.kind === "string" ? { kind: args.kind } : {}),
             ...(typeof args.to === "string" ? { to: args.to } : {}),
             ...(text === undefined ? {} : { text }),
             ...(args.data !== undefined ? { data: args.data } : {}),
-          });
+          };
+          return dueAt === undefined ? this.store.publish(message) : this.store.schedule({
+            ...message, dueAt, ...(typeof args.key === "string" ? { key: args.key } : {}),
+          }).then(schedule => ({ scheduled: true, ...schedule }));
         };
         const event = checked
-          ? await deliverWithMessageNotice(args.text as string, checked, publish, "mesh.publish")
+          ? await deliverWithMessageNotice<Awaited<ReturnType<typeof publish>>>(args.text as string, checked, publish, "mesh.publish")
           : await publish();
         return checked?.notice ? { ...event, notice: checked.notice } : event;
-=======
-        const topic = assertPublicMeshTopic(String(args.topic));
-        const message = {
-          topic,
-          from: this.identity,
-          ...(typeof args.kind === "string" ? { kind: args.kind } : {}),
-          ...(typeof args.to === "string" ? { to: args.to } : {}),
-          ...(typeof args.text === "string" ? { text: args.text } : {}),
-          ...(args.data !== undefined ? { data: args.data } : {}),
-        };
-        const dueAt = meshScheduleDueAt(args);
-        if (dueAt === undefined) {
-          if (args.key !== undefined) throw new Error("mesh.publish key requires notBefore or afterMs");
-          return this.store.publish(message);
-        }
-        const schedule = await this.store.schedule({
-          ...message,
-          dueAt,
-          ...(typeof args.key === "string" ? { key: args.key } : {}),
-        });
-        return { scheduled: true, ...schedule };
->>>>>>> upstream-v0.105.0
       }
       case "scheduled":
         return this.store.scheduled({

@@ -7,10 +7,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { readFabricExecutionTraceV1 } from "../audit/index.js";
 import { FABRIC_NESTED_TOOL_CALL_ID_PREFIX as NESTED_TOOL_CALL_ID_PREFIX } from "../protocol.js";
-<<<<<<< HEAD
-import { PI_CORE_TOOL_NAME_SET } from "./pi-tools.js";
 import { REPLY_TOOL_NAME } from "./reply-tool-identity.js";
-=======
 import type {
   FabricToolPlacement,
   FabricToolPlacementMode,
@@ -79,7 +76,6 @@ export const fabricModelContext = (
     return { ...rest, ...(declare ? { toolsAdded: declared } : {}) };
   });
 };
->>>>>>> upstream-v0.105.0
 
 export interface FabricToolOwnershipHost {
   getActiveTools(): string[];

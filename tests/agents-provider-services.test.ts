@@ -518,7 +518,6 @@ describe("agents provider message routing service boundaries", () => {
     expect(actors.steerRemote).not.toHaveBeenCalled();
   });
 
-<<<<<<< HEAD
   it("routes listed busy peer roots through their current owner, without treating them as actors", async () => {
     const { router, participants, control, actors, main } = routing();
     const peer = { ...participant(), id: "session:peer", rootId: "session:peer" };
@@ -559,13 +558,15 @@ describe("agents provider message routing service boundaries", () => {
     expect(main.deliverAgent).not.toHaveBeenCalled();
   });
 
-  it("uses the existing legacy relay for a listed peer root without a control protocol", async () => {
+  it("refuses a listed peer root without an authenticated control protocol", async () => {
     const { router, participants, actors, control } = routing();
     participants.get.mockReturnValue({ ...participant(), id: "session:legacy", controlProtocol: "legacy" });
-    await router.routeMessage("session:legacy", "observation", undefined, "followUp");
-    expect(actors.steerRemote).toHaveBeenCalledWith("session:legacy", "observation", "followUp", undefined);
+    await expect(router.routeMessage("session:legacy", "observation", undefined, "followUp"))
+      .rejects.toThrow("has no control channel");
+    expect(actors.steerRemote).not.toHaveBeenCalled();
     expect(control.request).not.toHaveBeenCalled();
-=======
+  });
+
   it("routes a remote root to its authenticated owner without actor validation", async () => {
     const { router, participants, control, actors, main } = routing();
     const remote = { ...participant(), id: "session:peer", rootId: "session:peer" };
@@ -574,7 +575,7 @@ describe("agents provider message routing service boundaries", () => {
     control.request.mockResolvedValue(ack);
     await expect(router.routeMessage(remote.id, "hello", { topic: "work" }, "followUp", undefined, { triggerTurn: false })).resolves.toEqual(ack);
     expect(control.request).toHaveBeenCalledWith(
-      "host", remote.id, "followUp", { message: "hello", data: { topic: "work" }, triggerTurn: false }, "owner",
+      "host", remote.id, "followUp", { message: "hello", data: { topic: "work" }, triggerTurn: false }, "owner", { routedRemoteHost: null },
     );
     expect(main.deliverAgent).not.toHaveBeenCalled();
     expect(actors.validateDirectMessage).not.toHaveBeenCalled();
@@ -606,8 +607,7 @@ describe("agents provider message routing service boundaries", () => {
     participants.get.mockReturnValue(actor);
     await router.routeMessage(actor.id, "actor message", undefined, "steer");
     expect(actors.validateDirectMessage).toHaveBeenCalledWith("actor message", undefined);
-    expect(control.request).toHaveBeenCalledWith("host", actor.id, "steer", { message: "actor message", data: undefined }, "owner");
->>>>>>> upstream-v0.105.0
+    expect(control.request).toHaveBeenCalledWith("host", actor.id, "steer", { message: "actor message", data: undefined }, "owner", { routedRemoteHost: null });
   });
 
   it("does not hide local agent failures by falling through to actors", async () => {

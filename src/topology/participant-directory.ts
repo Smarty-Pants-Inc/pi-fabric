@@ -1024,14 +1024,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: main.id,
       ownerHostId: this.options.hostId,
       ownerIdentityId: this.options.identity.id,
-<<<<<<< HEAD
+      ...(this.options.ownerIncarnation ? { ownerIncarnation: this.options.ownerIncarnation } : {}),
       name: rootParticipantName(sessionName),
-=======
-      ...(this.options.ownerIncarnation
-        ? { ownerIncarnation: this.options.ownerIncarnation }
-        : {}),
-      name: "main",
->>>>>>> upstream-v0.105.0
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",
@@ -1158,19 +1152,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
           format: 1,
           ownerHostId: this.options.hostId,
           ownerIdentityId: this.options.identity.id,
-<<<<<<< HEAD
-          // A root that is shutting down takes no new steer, and says why (smarty-dev#1113).
+          ...(this.options.ownerIncarnation ? { ownerIncarnation: this.options.ownerIncarnation } : {}),
+          // Reload retains its bounded lease; terminal quiescence advertises no capabilities.
           ...(this.#quiescing
             ? this.#reloadUntil !== undefined && candidate.kind === "root" && candidate.id === this.options.rootId
               ? { status: "reloading", reloadUntil: this.#reloadUntil }
               : { capabilities: [], status: "stopping" }
             : {}),
-=======
-          ...(this.options.ownerIncarnation
-            ? { ownerIncarnation: this.options.ownerIncarnation }
-            : {}),
-          ...(this.#quiescing ? { capabilities: [] } : {}),
->>>>>>> upstream-v0.105.0
           controlProtocol: "v1",
         };
         desired.set(record.id, record);

@@ -255,21 +255,11 @@ describe("/fabric command", () => {
       prewalk: { arm, status: vi.fn(), cancel: vi.fn() },
     } as unknown as FabricState;
     const context = {
-<<<<<<< HEAD
-      hasUI: true,
-      modelRegistry: {
-        getAvailable: () => [
-          { provider: "openai", id: "executor" },
-          { provider: "anthropic", id: "other" },
-        ],
-        find: (provider: string, id: string) =>
-          [{ provider: "openai", id: "executor" }, { provider: "anthropic", id: "other" }]
-            .find(model => model.provider === provider && model.id === id),
-      },
-=======
       hasUI,
-      modelRegistry: { getAvailable: () => models },
->>>>>>> upstream-v0.105.0
+      modelRegistry: {
+        getAvailable: () => models,
+        find: (provider: string, id: string) => models.find(model => model.provider === provider && model.id === id),
+      },
       sessionManager: { getSessionId: () => "session-1", getBranch: () => [] },
       ui: { select, custom, setStatus: vi.fn(), notify },
     } as unknown as ExtensionContext;

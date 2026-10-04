@@ -11,18 +11,11 @@ import { assertResidentRequestNotExpired, newResidentRequestId, residentRequestG
 import path from "node:path";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricModelAliases, FabricModelCandidate } from "../core/model-resolution.js";
-<<<<<<< HEAD
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { FabricActorInfo, FabricActorCreateRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
 import type { FabricThinking } from "../thinking.js";
-import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
-import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
-=======
-import type { FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
-import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import type { AgentHandleInfo, AgentRunRequest, FabricRunOutcome } from "../agents/types.js";
-import type { FabricKernel } from "../runtime/kernel.js";
->>>>>>> upstream-v0.105.0
+import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { OwnerHeartbeatFields } from "../core/atomic-write.js";
 import type { FabricScope } from "../protocol.js";
@@ -444,13 +437,10 @@ interface ResidentSpawnCommand {
   requestId: string;
   rootId: string;
   request: AgentRunRequest;
-<<<<<<< HEAD
   /** Host-captured runtime binding, separate from all task-supplied run settings. */
   caller: ResidentTaskCaller;
-=======
   /** A registered runner's residentModule, imported by the host before launch. */
   runnerModule?: string;
->>>>>>> upstream-v0.105.0
   createdAt: number;
 }
 
@@ -636,14 +626,11 @@ export interface ResidentCommandResponse {
   pending?: string;
   cleaned?: boolean;
   error?: string;
-<<<<<<< HEAD
   errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED";
   /** Allowlisted policy-refusal payload, never arbitrary host Error properties. */
   modelDenied?: { model: string; replacement?: string };
-=======
   /** Set when a claimed request was interrupted; the same concept as a run record's outcome. */
   outcome?: FabricRunOutcome;
->>>>>>> upstream-v0.105.0
   completedAt: number;
 }
 

@@ -141,17 +141,16 @@ export class RuntimeStateBuiltins {
         provider: "state",
         description: "Labeled world state over the project mesh",
         requires: ["mesh.get"],
-<<<<<<< HEAD
-        create: () => new StateProvider(mesh, identity, () => config.fullCodeMode || config.schema.mode === "enforce"),
-=======
-        create: () => new StateProvider(mesh, identity, { schemaMode: config.schema.mode }),
+        create: () => new StateProvider(mesh, identity, {
+          schemaMode: config.schema.mode,
+          piTools: () => config.fullCodeMode || config.schema.mode === "enforce",
+        }),
       }));
       await this.install(createProviderComponent({
         provider: "decisions",
         description: "Durable pending decisions over the project mesh",
         requires: ["mesh.get"],
         create: () => new DecisionsProvider(new DecisionStore(mesh, identity), identity),
->>>>>>> upstream-v0.105.0
       }));
     } else {
       const meshDisabled =

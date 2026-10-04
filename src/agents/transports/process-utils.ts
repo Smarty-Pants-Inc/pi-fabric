@@ -1,13 +1,10 @@
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-<<<<<<< HEAD
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
-=======
 import { StringDecoder } from "node:string_decoder";
->>>>>>> upstream-v0.105.0
 
 export interface ExecFileResult {
   stdout: string;
@@ -262,14 +259,10 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
-<<<<<<< HEAD
-  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
+  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit"> & { captureStderr?: boolean },
   environment?: NodeJS.ProcessEnv,
-): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void> }> => {
-=======
   options: { captureStderr?: boolean } = {},
-): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; readStderr(): string }> => {
->>>>>>> upstream-v0.105.0
+): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; waitForClose(): Promise<void>; readStderr(): string }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
   const child = spawn(runtime, [workerPath, ...workerArguments], {
@@ -277,11 +270,9 @@ export const spawnDetached = async (
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
     // Resident hosts must remain independent of the launching process's pipes.
-    stdio: ["ignore", "ignore", options.captureStderr ? "pipe" : "ignore"],
+    stdio: ["ignore", "ignore", (options.captureStderr ?? authority?.captureStderr) ? "pipe" : "ignore"],
   });
-<<<<<<< HEAD
-  if (!child.pid) throw new Error("Failed to launch Fabric worker process");
-  const pid = child.pid;
+  // Install native exit/close receipts before awaiting spawn acknowledgement.
   // Once the worker exited, its numeric id is no identity: after its group empties, the id
   // can name an unrelated process (group). So nothing is signalled or probed by number then.
   // ponytail: descendants an exited worker left in its group are not signalled; liveness
@@ -297,9 +288,7 @@ export const spawnDetached = async (
     lost = reason;
     try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
   };
-=======
   // Drain throughout the run, retaining only a bounded UTF-8 tail in memory.
-  // No disk log can grow without bound or keep secrets after run cleanup.
   const decoder = new StringDecoder("utf8");
   let stderr = "";
   child.stderr?.on("data", (chunk: Buffer) => {
@@ -309,23 +298,26 @@ export const spawnDetached = async (
   child.stderr?.on("error", () => {});
   await new Promise<void>((resolve, reject) => {
     child.once("spawn", resolve);
-    child.once("error", reject);
+    child.once("error", (error) => {
+      if (child.pid) unconfirmed(`Owned process worker emitted a native error: ${error.message}`);
+      reject(error);
+    });
+    // Native spawn publishes pid synchronously only after OS creation succeeds.
+    // Retain the fork's immediate owned-handle contract; a pid-less failed spawn
+    // must still await its native error instead of leaving it unhandled.
+    if (child.pid) resolve();
   });
-  const pid = child.pid!;
->>>>>>> upstream-v0.105.0
+  if (!child.pid) throw new Error("Failed to launch Fabric worker process");
+  const pid = child.pid;
   child.unref();
   // A diagnostic pipe must not keep the owner process alive on its own.
   (child.stderr as (NodeJS.ReadableStream & { unref?: () => void }) | null)?.unref?.();
   return {
     pid,
-<<<<<<< HEAD
+    readStderr: () => stderr,
     lostContact: () => lost,
     async waitForClose() {
       let deadline: ReturnType<typeof setTimeout> | undefined;
-=======
-    readStderr: () => stderr,
-    async stop() {
->>>>>>> upstream-v0.105.0
       try {
         await Promise.race([closed, new Promise<void>(resolve => {
           deadline = setTimeout(() => {

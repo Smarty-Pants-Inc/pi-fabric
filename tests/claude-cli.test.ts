@@ -1,12 +1,8 @@
 import { describe, expect, it } from "vitest";
-<<<<<<< HEAD
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { claudeUserMessage, discoverClaudeModels } from "../src/agents/claude-cli.js";
-=======
-import { buildClaudeArguments, claudeUserMessage } from "../src/agents/claude-cli.js";
->>>>>>> upstream-v0.105.0
+import { buildClaudeArguments, claudeUserMessage, discoverClaudeModels } from "../src/agents/claude-cli.js";
 
 describe("Claude stream-json messages", () => {
   it("distinguishes a native resolved target from an alias display fallback", async () => {

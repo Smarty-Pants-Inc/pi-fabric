@@ -19,7 +19,6 @@ export class ProcessTransport implements AgentTransportAdapter {
       request.workerPath,
       request.workerArguments,
       request.cwd,
-<<<<<<< HEAD
       request,
       // Worker arguments are flag/value pairs. A flag-shaped value is not an
       // actor identity; explicit actor ids alone retain the parent's role env.
@@ -28,9 +27,7 @@ export class ProcessTransport implements AgentTransportAdapter {
           ? { ...process.env } : taskAgentEnvironment(),
         request.workerArguments,
       ),
-=======
       { captureStderr: true },
->>>>>>> upstream-v0.105.0
     );
     return {
       kind: this.kind,

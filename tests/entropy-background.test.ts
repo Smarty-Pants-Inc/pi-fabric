@@ -7,14 +7,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // Gate each background compile at its evidence read: `resolve()` releases it.
 const scanControl = vi.hoisted(() => ({
   calls: 0,
-<<<<<<< HEAD
+  autoRelease: false,
   files: [] as string[][],
   resolvers: [] as Array<() => void>,
   signals: [] as Array<AbortSignal | undefined>,
-=======
-  files: undefined as string[] | undefined,
-  resolvers: [] as Array<(files: string[]) => void>,
->>>>>>> upstream-v0.105.0
 }));
 
 vi.mock("../src/entropy/sessions.js", async (importOriginal) => {
@@ -29,15 +25,11 @@ vi.mock("../src/entropy/sessions.js", async (importOriginal) => {
       options: Parameters<typeof actual.sessionWindowEvidenceAsync>[1] = {},
     ) => {
       scanControl.calls += 1;
-<<<<<<< HEAD
       scanControl.files.push([...files]);
       scanControl.signals.push(options.signal);
+      if (scanControl.autoRelease) return actual.sessionWindowEvidenceAsync(files, options);
       return new Promise<void>((resolve) => scanControl.resolvers.push(resolve))
         .then(() => actual.sessionWindowEvidenceAsync(files, options));
-=======
-      if (scanControl.files) return Promise.resolve(scanControl.files);
-      return new Promise<string[]>((resolve) => scanControl.resolvers.push(resolve));
->>>>>>> upstream-v0.105.0
     },
   };
 });
@@ -87,12 +79,9 @@ type ExtensionHandler = (event: unknown, context: ExtensionContext) => unknown;
 const tempRoots: string[] = [];
 afterEach(() => {
   scanControl.calls = 0;
-<<<<<<< HEAD
   scanControl.files.length = 0;
-=======
-  scanControl.files = undefined;
+  scanControl.autoRelease = false;
   activeSurface.clearActiveCompiledSurface();
->>>>>>> upstream-v0.105.0
   scanControl.resolvers.length = 0;
   scanControl.signals.length = 0;
   vi.unstubAllEnvs();
@@ -139,7 +128,7 @@ const retryHarness = async () => {
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
   const file = path.join(root, "session.jsonl");
   fs.writeFileSync(file, "");
-  scanControl.files = [file];
+  scanControl.autoRelease = true;
   const harness = createHarness();
   await piFabric(harness.pi);
   const context = {
@@ -179,9 +168,6 @@ const mockRetryIO = () => {
 };
 
 describe("entropy background scheduler", () => {
-<<<<<<< HEAD
-  it("reads only this session's file, compiles each turn and skips unchanged pool writes", async () => {
-=======
   it("compiles despite a live pool lock and retries without another user turn", async () => {
     const harness = await retryHarness();
     const lock = installLiveLock(harness.agentDir, "observation-pool.lock");
@@ -313,8 +299,7 @@ describe("entropy background scheduler", () => {
   });
 
 
-  it("reuses discovery but still compiles each turn and skips unchanged pool writes", async () => {
->>>>>>> upstream-v0.105.0
+  it("reads only this session's file, compiles each turn and skips unchanged pool writes", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-entropy-background-"));
     tempRoots.push(root);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
@@ -343,15 +328,8 @@ describe("entropy background scheduler", () => {
     scanControl.resolvers.shift()!();
     await vi.waitFor(() => expect(compile).toHaveBeenCalledTimes(2));
     await emit(harness.handlers, "session_shutdown", {}, context);
-<<<<<<< HEAD
     expect(scanControl.files).toEqual([[file], [file]]);
     expect(save).toHaveBeenCalledTimes(1);
-=======
-    expect(scanControl.calls).toBe(1);
-    expect(save).toHaveBeenCalledTimes(2);
-    expect((await save.mock.results[0]!.value).written).toBe(true);
-    expect((await save.mock.results[1]!.value).written).toBe(false);
->>>>>>> upstream-v0.105.0
     expect(compile.mock.calls[1]![0].windows).toEqual([{ file, traces: [] }]);
   });
 

@@ -91,14 +91,16 @@ export class ApprovalController {
       decision?: FabricAutoApprovalDecision,
     ) => void,
     readonly brokeredNetwork?: (provider: string) => boolean,
-<<<<<<< HEAD
-    /** Internal routing cannot own a classifier or approval dialog: refuse ungranted `auto`/`ask` before queuing. */
-    readonly internalRouting = false,
-=======
-    /** approvals.headless "decision": resolve to true only on an explicit approve. */
-    readonly headless?: (action: ResolvedFabricAction, reason?: string) => Promise<boolean>,
->>>>>>> upstream-v0.105.0
+    /** Upstream's headless callback slot also accepts the fork's legacy routing fence. */
+    readonly headlessOrInternalRouting: ((action: ResolvedFabricAction, reason?: string) => Promise<boolean>) | boolean = false,
+    /** Internal routing cannot own classifier work or a queued approval dialog. */
+    readonly internalRouting = typeof headlessOrInternalRouting === "boolean" ? headlessOrInternalRouting : false,
   ) {}
+
+  /** Headless decisions resolve to true only on an explicit approve. */
+  get headless(): ((action: ResolvedFabricAction, reason?: string) => Promise<boolean>) | undefined {
+    return typeof this.headlessOrInternalRouting === "function" ? this.headlessOrInternalRouting : undefined;
+  }
 
   async approve(
     action: ResolvedFabricAction,

@@ -1570,17 +1570,13 @@ export class ActionRegistry {
     const view = context.capabilityView ? this.#requireView(context.capabilityView) : undefined;
     throwIfAborted(context.signal);
     if (this.#shutdown.signal.aborted) throw new FabricResolutionError("Fabric registry is closed");
-<<<<<<< HEAD
-    return snapshotFabricInvocation({ ...context, signal: shareCancellationEffects(AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]), context.signal) });
-=======
-    // Host-issued scope (src/scope.ts) replaces any caller value; failed issuance refuses every call.
+    // Host-issued scope replaces caller input; failed issuance refuses every call.
     const issued = (globalThis as Record<symbol, { scope?: FabricScope; error?: string } | undefined>)[SCOPE_HOLDER];
     if (issued?.error) throw new FabricResolutionError(`Fabric scope issuance failed; provider calls are refused: ${issued.error}`);
-    const scoped = { ...context, signal: AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]) };
+    const scoped = { ...context, signal: shareCancellationEffects(AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]), context.signal) };
     if (issued?.scope) scoped.scope = issued.scope;
     else delete scoped.scope;
-    return scoped;
->>>>>>> upstream-v0.105.0
+    return snapshotFabricInvocation(scoped);
   }
 
   #bindingContext<T extends FabricInvocationContext>(binding: FabricProviderBinding, context: T): T {

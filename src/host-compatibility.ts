@@ -3,7 +3,6 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import path from "node:path";
 
-<<<<<<< HEAD
 /** Trusted host policy for every Fabric participant model selection. */
 export interface FabricModelPolicy {
   deniedModels?: readonly string[];
@@ -28,10 +27,7 @@ export const assertFabricModelAllowed = (model: string | undefined, policy?: Fab
   }
 };
 
-export const MINIMUM_PI_HOST_VERSION = "0.80.6";
-=======
 export const MINIMUM_PI_HOST_VERSION = "1.0.0";
->>>>>>> upstream-v0.105.0
 
 /** Pi 0.86.0 intercepts both RPC/TUI user shell requests and propagates hook failures. */
 export const MINIMUM_FIXTURE_PI_HOST_VERSION = "0.86.0";

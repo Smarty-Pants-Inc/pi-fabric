@@ -15,9 +15,7 @@ const SHELL_HANG_SNAPSHOT_BYTES = 8_000;
 export const SHELL_TAIL_BYTES = 1024 * 1024;
 export const SHELL_LOG_BYTES = 8 * 1024 * 1024;
 export const SHELL_COMPLETED_HANDLES = 256;
-<<<<<<< HEAD
 const SHELL_SPILL_PID_WAIT_MS = 10_000;
-=======
 /** Output kept readable by offset after a task finishes, like jev-fabric's 32 KiB receipt tails. */
 export const SHELL_FINISHED_READ_BYTES = 32 * 1024;
 /** Largest single tasks.read page. */
@@ -51,7 +49,6 @@ const utf8Boundary = (buffer: Buffer): number => {
   }
   return buffer.length;
 };
->>>>>>> upstream-v0.105.0
 const SHELL_COMPLETED_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const LOG_HEADER = "[Bounded shell log: starts with retained pre-spill tail; 8 MiB total cap, then further output is omitted. Not a full-output archive.]\n";
 const LOG_TRUNCATED = "\n[Shell log truncated: disk limit reached; subsequent output omitted.]\n";
@@ -212,17 +209,12 @@ class FabricShellJob implements FabricShellJobHandle {
   readonly #replay = new ShellReplay();
   unread = false;
 
-<<<<<<< HEAD
-  constructor(tool: PiShellToolName, command: string, readonly onChange: (type: FabricShellJobEvent["type"], output?: string) => void, tempRoot: string, readonly scratch: ScratchScope, readonly options: FabricShellJobOptions = {}) {
-    this.id = randomUUID();
-=======
   get eventCount(): number { return this.#replay.cursor; }
 
-  constructor(tool: PiShellToolName, command: string, readonly onChange: (type: FabricShellJobEvent["type"], output?: string) => void, tempRoot: string, readonly options: FabricShellJobOptions = {}) {
+  constructor(tool: PiShellToolName, command: string, readonly onChange: (type: FabricShellJobEvent["type"], output?: string) => void, tempRoot: string, readonly scratch: ScratchScope, readonly options: FabricShellJobOptions = {}) {
     this.id = options.id ?? randomUUID();
     this.startedAt = options.startedAt ?? Date.now();
     this.durable = options.durable ? { ...options.durable } : undefined;
->>>>>>> upstream-v0.105.0
     this.tool = tool;
     this.command = command;
     this.#directory = scratch.create("shell", tempRoot);
@@ -495,15 +487,9 @@ class FabricShellJob implements FabricShellJobHandle {
     this.#tail = Buffer.alloc(0);
     this.#omitted = false;
     if (!this.#spill.signal.aborted) this.#spill.abort();
-<<<<<<< HEAD
     await this.#cleanup();
     this.announced = true;
-=======
-    await unlink(this.pidPath).catch(() => undefined);
-    if (this.logPath) closeScratch(this.#directory);
-    else { try { fs.rmSync(this.#directory, { recursive: true, force: true }); } catch {} }
     this.#notifyOutput();
->>>>>>> upstream-v0.105.0
     this.onChange("finished", [output, footer?.slice(-1000)].filter(Boolean).join("\n"));
   }
 
@@ -732,14 +718,10 @@ export class FabricShellJobStore {
       if (job.durable) job.detach();
       else if (!job.abort.signal.aborted) job.abort.abort(new Error("Fabric session ended"));
     }
-<<<<<<< HEAD
-    await Promise.allSettled([...this.#jobs.values()].map((job) => job.finish(null, "\n\n[Process ended: session closed]\n")));
-    await this.#scratch.close();
-=======
-    await Promise.allSettled(live.map((job) => job.finish(null, job.durable
+    await Promise.allSettled([...this.#jobs.values()].map((job) => job.finish(null, job.durable
       ? `\n\n[Detached: jev-fabric job ${job.durable.jobId ?? "(starting)"} keeps running outside this session]\n`
       : "\n\n[Process ended: session closed]\n")));
->>>>>>> upstream-v0.105.0
+    await this.#scratch.close();
     this.#jobs.clear();
   }
 }

@@ -79,6 +79,9 @@ describe("package manifest", () => {
       expect(manifest.dependencies?.[name], `${name} must not be a dependency`).toBeUndefined();
     }
     expect(manifest.peerDependencies).toEqual({
+      "@earendil-works/chord": "1.0.0",
+      "@earendil-works/pi-durable": "1.0.0",
+      "@earendil-works/pi-agent-core": "*",
       "@earendil-works/pi-ai": "*",
       "@earendil-works/pi-coding-agent": "*",
       "@earendil-works/pi-tui": "*",
@@ -92,20 +95,7 @@ describe("package manifest", () => {
       fs.readFileSync(path.join(root, "package.json"), "utf8"),
     ) as PackageManifest;
     const worker = fs.readFileSync(path.join(root, "src", "worker.ts"), "utf8");
-<<<<<<< HEAD
-    // Type-only imports are erased from the emitted worker.
-    const imports = [...worker.matchAll(/\b(?:import|export)\s+(type\s+)?[^;"']*?\bfrom\s+["']([^"']+)["']/g)]
-      .filter((match) => !match[1])
-      .map((match) => match[2])
-      .filter((specifier): specifier is string =>
-        Boolean(specifier && !specifier.startsWith(".") && !specifier.startsWith("node:")),
-      )
-      .map(packageName);
-
-    for (const dependency of new Set(imports)) {
-=======
     for (const dependency of runtimePackages(worker)) {
->>>>>>> upstream-v0.105.0
       expect(
         manifest.dependencies?.[dependency],
         `${dependency} is imported by the standalone worker but is not installed at runtime`,

@@ -56,11 +56,7 @@ import {
   codeUsesOrchestration,
   isBlockingOrchestrationRef,
 } from "./runtime/orchestration.js";
-<<<<<<< HEAD
-import type { FabricCommittedCapabilityView, FabricInvocationOutcome, FabricMediaBlock } from "./protocol.js";
-=======
-import type { FabricCommittedCapabilityView, FabricGuestTypeSources, FabricMediaBlock } from "./protocol.js";
->>>>>>> upstream-v0.105.0
+import type { FabricCommittedCapabilityView, FabricGuestTypeSources, FabricInvocationOutcome, FabricMediaBlock } from "./protocol.js";
 import {
   sanitizeFabricMediaText,
   sanitizeFabricMediaValue,
@@ -69,22 +65,18 @@ import { fabricExecTitleHintCached } from "./ui/fabric-title-hint.js";
 import type {
   FabricHostCall,
   FabricKernel,
-  FabricHostCall,
   FabricKernelRuntime,
   FabricResidentOutcomeReceipt,
   FabricSandboxResult,
   FabricSandboxTerminationReason,
 } from "./runtime/kernel.js";
 import type { TypeScriptKernelRuntime } from "./runtime/typescript-kernel.js";
-<<<<<<< HEAD
 import type { QuickJsSandboxOptions } from "./runtime/quickjs-runtime.js";
-=======
 import {
   PROGRAM_CANCELLED_REASON,
   type ProviderParticipantRegistry,
   type ProviderParticipantStopOutcome,
 } from "./topology/provider-participants.js";
->>>>>>> upstream-v0.105.0
 import type { FabricTypeError, FabricTypeCheckResult } from "./runtime/type-checker.js";
 import { isInteractiveMain } from "./agents/wait-bound.js";
 
@@ -242,19 +234,6 @@ export class FabricExecutionService {
     this.#capabilityView = view;
   }
 
-<<<<<<< HEAD
-  #effectiveFullCodeMode(): boolean {
-    return this.config.fullCodeMode || this.config.schema.mode === "enforce";
-  }
-
-  #coreOverrides(): { name: string; inputSchema: unknown }[] {
-    return this.capturedTools?.list().map((entry) => ({
-      name: entry.name, inputSchema: entry.definition.parameters,
-    })) ?? [];
-  }
-
-  async #acquireRuntime(): Promise<FabricKernelRuntime> {
-=======
   /** Host event bus for observation-only events such as workflow item transitions. */
   setEventEmitter(emit: ((channel: string, data: unknown) => void) | undefined): void {
     this.#emitEvent = emit;
@@ -273,6 +252,83 @@ export class FabricExecutionService {
   /** No-UI approval fallback used when approvals.headless is "decision". */
   setHeadlessApproval(handler: FabricHeadlessApproval | undefined): void {
     this.#headlessApproval = handler;
+  }
+
+  #effectiveFullCodeMode(): boolean {
+    return this.config.fullCodeMode || this.config.schema.mode === "enforce";
+  }
+
+  #coreOverrides(): { name: string; inputSchema: unknown }[] {
+    return this.capturedTools?.list().map((entry) => ({
+      name: entry.name, inputSchema: entry.definition.parameters,
+    })) ?? [];
+  }
+
+  async #acquireRuntime(): Promise<FabricKernelRuntime> {
+    const python = this.config.executor.kernel === "python";
+    const enforce = this.config.schema.mode === "enforce";
+    const monty = python && this.config.executor.pythonRuntime === "monty";
+    // Snapshot kernel identity before awaits. Schema enforce isolates the selected
+    // language rather than silently changing Python programs into TypeScript.
+    const runtimeKind = python
+      ? monty ? "python:monty" : `python:${this.config.executor.cpython.binary}:${enforce}`
+      : `typescript:${enforce ? "quickjs" : this.config.executor.runtime}`;
+    let runtime = this.#runtimeKind === runtimeKind ? this.#runtime : undefined;
+    if (!runtime) {
+      if (monty) {
+        const { MontyRuntime } = await import("./runtime/monty-runtime.js");
+        runtime = new MontyRuntime();
+      } else if (python) {
+        const { CPythonRuntime } = await import("./runtime/cpython-runtime.js");
+        runtime = new CPythonRuntime(this.config.executor.cpython.binary, enforce);
+      } else {
+        const { TypeScriptKernelRuntime } = await import("./runtime/typescript-kernel.js");
+        runtime = new TypeScriptKernelRuntime(enforce ? "quickjs" : this.config.executor.runtime);
+      }
+      this.#runtime = runtime;
+      this.#runtimeKind = runtimeKind;
+    }
+    return runtime;
+  }
+
+  /** TypeScript alone consumes live schemas as compiler declarations; Python compiles in CPython. */
+  async #prepareTypeScript(
+    runtime: TypeScriptKernelRuntime,
+    source: string,
+    unavailable: string[],
+    coreOverrides: { name: string; inputSchema: unknown }[],
+    options: Pick<FabricExecutionOptions, "context" | "signal" | "parentToolCallId">,
+  ): Promise<{ code: string; checked: FabricTypeCheckResult; guestTypeSources: FabricGuestTypeSources }> {
+    const guestTypeSources = await this.registry.guestTypeSources({
+      cwd: options.context.cwd,
+      signal: options.signal,
+      parentToolCallId: options.parentToolCallId,
+      nestedToolCallId: `${options.parentToolCallId}_typedecls`,
+      extensionContext: options.context,
+      update() {},
+      ...(this.#capabilityView ? { capabilityView: this.#capabilityView } : {}),
+    });
+    return {
+      ...runtime.prepare(source, this.#effectiveFullCodeMode(), unavailable, guestTypeSources, coreOverrides),
+      guestTypeSources,
+    };
+  }
+
+  /**
+   * Load the kernel and build the guest type checker for the current declarations, so the first
+   * fabric_exec of a session does not pay them after the model finishes streaming it
+   * (smarty-dev#2010). Idempotent; a later execute() reuses both through their caches.
+   */
+  async prewarm(context: ExtensionContext): Promise<void> {
+    if (this.config.executor.kernel === "python") return;
+    const runtime = await this.#acquireRuntime();
+    await this.#prepareTypeScript(
+      runtime as TypeScriptKernelRuntime,
+      "return undefined;",
+      this.registry.unavailableProviders().map((entry) => entry.name),
+      this.#coreOverrides(),
+      { context, signal: undefined, parentToolCallId: "fabric_prewarm" },
+    );
   }
 
   async execute(options: FabricExecutionOptions): Promise<FabricExecutionResult> {
@@ -310,82 +366,6 @@ export class FabricExecutionService {
         : fabricExecTitleHintCached(options.code, this.config.executor.kernel)
           ?? (this.config.executor.kernel === "python" ? "Python program" : undefined),
     );
-    const effectiveFullCodeMode =
-      this.config.fullCodeMode || this.config.schema.mode === "enforce";
->>>>>>> upstream-v0.105.0
-    const python = this.config.executor.kernel === "python";
-    const enforce = this.config.schema.mode === "enforce";
-    const monty = python && this.config.executor.pythonRuntime === "monty";
-    // Snapshot kernel identity before awaits. Schema enforce isolates the selected
-    // language rather than silently changing Python programs into TypeScript.
-    const runtimeKind = python
-      ? monty ? "python:monty" : `python:${this.config.executor.cpython.binary}:${enforce}`
-      : `typescript:${enforce ? "quickjs" : this.config.executor.runtime}`;
-    let runtime = this.#runtimeKind === runtimeKind ? this.#runtime : undefined;
-    if (!runtime) {
-      if (monty) {
-        const { MontyRuntime } = await import("./runtime/monty-runtime.js");
-        runtime = new MontyRuntime();
-      } else if (python) {
-        const { CPythonRuntime } = await import("./runtime/cpython-runtime.js");
-        runtime = new CPythonRuntime(this.config.executor.cpython.binary, enforce);
-      } else {
-        const { TypeScriptKernelRuntime } = await import("./runtime/typescript-kernel.js");
-        runtime = new TypeScriptKernelRuntime(enforce ? "quickjs" : this.config.executor.runtime);
-      }
-      this.#runtime = runtime;
-      this.#runtimeKind = runtimeKind;
-    }
-    return runtime;
-  }
-
-  /** TypeScript alone consumes live schemas as compiler declarations; Python compiles in CPython. */
-  async #prepareTypeScript(
-    runtime: TypeScriptKernelRuntime,
-    source: string,
-    unavailable: string[],
-    coreOverrides: { name: string; inputSchema: unknown }[],
-    options: Pick<FabricExecutionOptions, "context" | "signal" | "parentToolCallId">,
-  ): Promise<{ code: string; checked: FabricTypeCheckResult }> {
-    const guestTypeSources = await this.registry.guestTypeSources({
-      cwd: options.context.cwd,
-      signal: options.signal,
-      parentToolCallId: options.parentToolCallId,
-      nestedToolCallId: `${options.parentToolCallId}_typedecls`,
-      extensionContext: options.context,
-      update() {},
-      ...(this.#capabilityView ? { capabilityView: this.#capabilityView } : {}),
-    });
-    return runtime.prepare(source, this.#effectiveFullCodeMode(), unavailable, guestTypeSources, coreOverrides);
-  }
-
-  /**
-   * Load the kernel and build the guest type checker for the current declarations, so the first
-   * fabric_exec of a session does not pay them after the model finishes streaming it
-   * (smarty-dev#2010). Idempotent; a later execute() reuses both through their caches.
-   */
-  async prewarm(context: ExtensionContext): Promise<void> {
-    if (this.config.executor.kernel === "python") return;
-    const runtime = await this.#acquireRuntime();
-    await this.#prepareTypeScript(
-      runtime as TypeScriptKernelRuntime,
-      "return undefined;",
-      this.registry.unavailableProviders().map((entry) => entry.name),
-      this.#coreOverrides(),
-      { context, signal: undefined, parentToolCallId: "fabric_prewarm" },
-    );
-  }
-
-  async execute(options: FabricExecutionOptions): Promise<FabricExecutionResult> {
-    const startedAt = performance.now();
-    const traceRecorder = new FabricExecutionTraceRecorder();
-    this.activity?.start(
-      options.parentToolCallId,
-      options.display,
-      options.display?.name?.trim() ? undefined
-        : fabricExecTitleHintCached(options.code, this.config.executor.kernel)
-          ?? (this.config.executor.kernel === "python" ? "Python program" : undefined),
-    );
     const effectiveFullCodeMode = this.#effectiveFullCodeMode();
     const python = this.config.executor.kernel === "python";
     const monty = python && this.config.executor.pythonRuntime === "monty";
@@ -401,23 +381,8 @@ export class FabricExecutionService {
       .filter((entry) => PI_CORE_TOOL_NAME_SET.has(entry.name))
       .map((entry) => [entry.name, Object.keys((entry.inputSchema as { properties?: object }).properties ?? {})]));
     if (!python) {
-<<<<<<< HEAD
-      ({ code, checked } = await this.#prepareTypeScript(
+      ({ code, checked, guestTypeSources } = await this.#prepareTypeScript(
         runtime as TypeScriptKernelRuntime,
-=======
-      // TypeScript alone consumes live schemas as compiler declarations. Python
-      // compiles in CPython; both kernels share authoritative registry validation.
-      guestTypeSources = await this.registry.guestTypeSources({
-        cwd: options.context.cwd,
-        signal: options.signal,
-        parentToolCallId: options.parentToolCallId,
-        nestedToolCallId: `${options.parentToolCallId}_typedecls`,
-        extensionContext: options.context,
-        update() {},
-        ...(this.#capabilityView ? { capabilityView: this.#capabilityView } : {}),
-      });
-      ({ code, checked } = (runtime as TypeScriptKernelRuntime).prepare(
->>>>>>> upstream-v0.105.0
         options.code,
         [...unavailable.keys()],
         coreOverrides,
@@ -662,16 +627,13 @@ export class FabricExecutionService {
           : 0;
       return Math.max(orchestrationTimeoutMs, requestedTimeoutMs);
     };
-<<<<<<< HEAD
     const minimumTimeoutMsForHostCall = (ref: string, args: Record<string, unknown>): number | undefined => {
       const floor = timeoutFloorForHostCall(ref, args);
       return floor === undefined ? undefined : capForMain(floor);
     };
-=======
     const humanWaitRefs = new Set(this.config.executor.humanWaitRefs);
     const isHumanWaitHostCall = (ref: string, args: Record<string, unknown>): boolean =>
       humanWaitRefs.has(ref === "fabric.$call" && typeof args.ref === "string" ? args.ref : ref);
->>>>>>> upstream-v0.105.0
     const traceAttempt = async <T>(
       ref: string,
       args: Record<string, unknown>,
@@ -756,7 +718,6 @@ export class FabricExecutionService {
       });
     };
     let sandboxResult: FabricSandboxResult;
-<<<<<<< HEAD
     let invocationOutcome: FabricInvocationOutcome = "failed";
     // Host-call floors are measured from each call and can slide a runtime's deadline.
     // This independent, fixed Main watchdog cannot be extended by a loop, a computed
@@ -840,29 +801,6 @@ export class FabricExecutionService {
       checkMainDeadline();
       return dispatch(ref, args, signal).then(value => { checkMainDeadline(); return value; });
     };
-    try {
-      sandboxResult = await runtime.execute(
-        code,
-        guardHostCall(async (ref, args, runtimeSignal) => {
-          const callContext = {
-            ...baseContext, signal: providerSignal(runtimeSignal),
-            deferResultConsumption(consume: () => void, abandon?: () => void) {
-              if (consumptionClosed) {
-                const dropped = new ResultConsumption();
-                dropped.defer(consume, abandon);
-                dropped.abandon();
-                return;
-              }
-              let consumption = pendingConsumption.get(args);
-              if (!consumption) {
-                consumption = new ResultConsumption();
-                pendingConsumption.set(args, consumption);
-              }
-              consumption.defer(consume, abandon);
-            },
-            ...(mainDeadlineAt !== undefined ? { mainDeadlineAt, checkExecutionBudget: checkMainDeadline } : {}),
-          };
-=======
     let hostCall: FabricHostCall | undefined;
     const sandboxBase = {
       cwd: options.context.cwd,
@@ -870,7 +808,13 @@ export class FabricExecutionService {
       maxLogChars: this.config.executor.maxOutputChars,
       minimumTimeoutMsForHostCall,
       ...(humanWaitRefs.size > 0 ? { isHumanWaitHostCall } : {}),
-      ...(!python ? { piToolCanonicalFields } : {}),
+      ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt, maximumDeadlineReason: mainCeilingReason! } : {}),
+      onHostResultDelivered(args: Record<string, unknown>) {
+        const consumption = pendingConsumption.get(args);
+        pendingConsumption.delete(args);
+        consumption?.commit();
+      },
+      ...(!python ? { piToolCanonicalFields, piTools: effectiveFullCodeMode } : {}),
       ...(options.tokenBudget !== undefined ? { tokenBudget: options.tokenBudget } : {}),
     };
     // Saved programs (`programs.run`) execute through this same bridge, so a
@@ -894,7 +838,11 @@ export class FabricExecutionService {
         program: request.program,
         ...(options.invokedBy ? { invokedBy: options.invokedBy } : {}),
       });
-      const runSignal = signal ?? new AbortController().signal;
+      // Saved programs cannot outlive the enclosing invocation or split its receipt ledger.
+      const runSignal = shareCancellationEffects(AbortSignal.any([
+        programSignal,
+        ...(signal ? [signal] : []),
+      ]), programSignal);
       let stage: FabricExecutionFailureStageV1 = "invoke";
       try {
         if (request.call) {
@@ -930,13 +878,28 @@ export class FabricExecutionService {
           (ref === "fabric.$spanStart" || ref === "fabric.$spanEnd") && typeof args.id === "string"
             ? bridge(ref, { ...args, id: `${spanPrefix}${args.id}` }, callSignal)
             : bridge(ref, args, callSignal);
-        const result = await runtime.execute(source, nestedBridge, {
-          ...sandboxBase,
-          timeoutMs: codeUsesOrchestration(source) ? orchestrationTimeoutMs : this.config.executor.timeoutMs,
-          ...(prepared.javascript ? { transpiledCode: prepared.javascript } : {}),
-          ...(prepared.sourceMap ? { transpiledSourceMap: prepared.sourceMap } : {}),
-          signal: runSignal,
+        const nestedTimeoutMs = capForMain(codeUsesOrchestration(source) ? orchestrationTimeoutMs : this.config.executor.timeoutMs);
+        const nestedDeadline = new ExecutionDeadline({
+          timeoutMs: nestedTimeoutMs,
+          ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt, maximumDeadlineReason: mainCeilingReason! } : {}),
         });
+        let result: FabricSandboxResult;
+        try {
+          result = await runtime.execute(source, nestedBridge, {
+            ...sandboxBase,
+            timeoutMs: nestedTimeoutMs,
+            executionDeadline: nestedDeadline,
+            ...(prepared.javascript ? { transpiledCode: prepared.javascript } : {}),
+            ...(prepared.sourceMap ? { transpiledSourceMap: prepared.sourceMap } : {}),
+            signal: runSignal,
+          });
+          if (result.terminationReason === "completed" && !runSignal.aborted && nestedDeadline.reached) {
+            result = preserveCancellationOutcome({ ...result, ...nestedDeadline.timeoutResult(result.logs) }, runSignal, true);
+          }
+          checkMainDeadline();
+        } finally {
+          nestedDeadline.clear();
+        }
         for (const line of result.logs) {
           if (nestedLogChars > this.config.executor.maxOutputChars) break;
           nestedLogChars += line.length;
@@ -967,9 +930,25 @@ export class FabricExecutionService {
     try {
       sandboxResult = await runtime.execute(
         code,
-        hostCall = async (ref, args, runtimeSignal) => {
-          const callContext = { ...baseContext, signal: runtimeSignal };
->>>>>>> upstream-v0.105.0
+        hostCall = guardHostCall(async (ref, args, runtimeSignal) => {
+          const callContext = {
+            ...baseContext, signal: providerSignal(runtimeSignal),
+            deferResultConsumption(consume: () => void, abandon?: () => void) {
+              if (consumptionClosed) {
+                const dropped = new ResultConsumption();
+                dropped.defer(consume, abandon);
+                dropped.abandon();
+                return;
+              }
+              let consumption = pendingConsumption.get(args);
+              if (!consumption) {
+                consumption = new ResultConsumption();
+                pendingConsumption.set(args, consumption);
+              }
+              consumption.defer(consume, abandon);
+            },
+            ...(mainDeadlineAt !== undefined ? { mainDeadlineAt, checkExecutionBudget: checkMainDeadline } : {}),
+          };
           switch (ref) {
             case "fabric.$providers":
               return traceAttempt(
@@ -1307,32 +1286,15 @@ export class FabricExecutionService {
         {
           ...sandboxBase,
           timeoutMs: effectiveTimeoutMs,
-<<<<<<< HEAD
           executionDeadline: runtimeDeadline,
           ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt, maximumDeadlineReason: mainCeilingReason! } : {}),
-          cwd: options.context.cwd,
-          memoryLimitBytes: this.config.executor.memoryLimitBytes,
-          maxLogChars: this.config.executor.maxOutputChars,
-          minimumTimeoutMsForHostCall,
-          onHostResultDelivered(args) {
-            const consumption = pendingConsumption.get(args);
-            pendingConsumption.delete(args);
-            consumption?.commit();
-          },
-          ...(!python ? { piToolCanonicalFields, piTools: effectiveFullCodeMode } : {}),
+
           ...(checked.javascript ? { transpiledCode: checked.javascript } : {}),
           ...(checked.sourceMap ? { transpiledSourceMap: checked.sourceMap } : {}),
           ...(options.strings ? { strings: options.strings } : {}),
           ...(options.tokenBudget !== undefined ? { tokenBudget: options.tokenBudget } : {}),
           ...(programSignal ? { signal: programSignal } : {}),
         } satisfies QuickJsSandboxOptions,
-=======
-          ...(checked.javascript ? { transpiledCode: checked.javascript } : {}),
-          ...(checked.sourceMap ? { transpiledSourceMap: checked.sourceMap } : {}),
-          ...(options.strings ? { strings: options.strings } : {}),
-          ...(options.signal ? { signal: options.signal } : {}),
-        },
->>>>>>> upstream-v0.105.0
       );
       // A runtime-first ceiling carries its opaque cause. A shorter timeout
       // stays ordinary even if its cleanup runs past Main's deadline. Only a
@@ -1355,7 +1317,7 @@ export class FabricExecutionService {
       }
       throw error;
     } finally {
-<<<<<<< HEAD
+      this.#nestedRunners.delete(options.parentToolCallId);
       consumptionClosed = true;
       for (const consumption of pendingConsumption.values()) consumption.abandon();
       pendingConsumption.clear();
@@ -1363,10 +1325,6 @@ export class FabricExecutionService {
       runtimeDeadline?.clear();
       mainBudget?.clear();
       await this.registry.endInvocation(options.parentToolCallId, invocationOutcome);
-=======
-      this.#nestedRunners.delete(options.parentToolCallId);
-      await this.registry.endInvocation(options.parentToolCallId);
->>>>>>> upstream-v0.105.0
       flushEmit();
     }
 
@@ -1374,8 +1332,18 @@ export class FabricExecutionService {
       const hint = pythonErrorRecoveryHint(code, sandboxResult.error, monty ? "monty" : "cpython");
       if (hint && !sandboxResult.error.includes(hint)) sandboxResult.error += `\n\nRecovery hint: ${hint}`;
     }
-<<<<<<< HEAD
-=======
+    // Logs, results, and error text reach the model, the event stream, and
+    // persisted traces. Raw media must not: images are hoisted out of band and
+    // base64 payloads collapse to a descriptor (see core/media-sanitize.ts).
+    let sanitizedValue = sanitizeFabricMediaValue(sandboxResult.value);
+    const sanitizedLogs = [...sandboxResult.logs, ...nestedLogs].map(sanitizeFabricMediaText);
+    // Cleanup and final media/log serialization also consume the absolute budget.
+    // Reject before announcing success or attaching model-visible media.
+    const finalizedResult = preserveLateDeadline(sandboxResult);
+    if (finalizedResult !== sandboxResult) {
+      sandboxResult = finalizedResult;
+      sanitizedValue = sanitizeFabricMediaValue(undefined);
+    }
     const runOutcome = executionOutcomeFromTermination(sandboxResult.terminationReason);
     const succeeded = runOutcome === "succeeded";
     const ownedWork = (runOutcome === "aborted" || runOutcome === "timed_out") && this.#participants
@@ -1389,31 +1357,11 @@ export class FabricExecutionService {
     }
     this.activity?.finish(options.parentToolCallId, succeeded, sandboxResult.error);
     itemTransitions.finish(succeeded);
->>>>>>> upstream-v0.105.0
-    // Logs, results, and error text reach the model, the event stream, and
-    // persisted traces. Raw media must not: images are hoisted out of band and
-    // base64 payloads collapse to a descriptor (see core/media-sanitize.ts).
-    let sanitizedValue = sanitizeFabricMediaValue(sandboxResult.value);
-    const sanitizedLogs = sandboxResult.logs.map(sanitizeFabricMediaText);
-    // Cleanup and final media/log serialization also consume the absolute budget.
-    // Reject before announcing success or attaching model-visible media.
-    const finalizedResult = preserveLateDeadline(sandboxResult);
-    if (finalizedResult !== sandboxResult) {
-      sandboxResult = finalizedResult;
-      sanitizedValue = sanitizeFabricMediaValue(undefined);
-    }
-    const runOutcome = executionOutcomeFromTermination(sandboxResult.terminationReason);
-    const succeeded = runOutcome === "succeeded";
-    this.activity?.finish(options.parentToolCallId, succeeded, sandboxResult.error);
     return {
       success: succeeded,
       kernel: python ? "python" : "typescript",
       value: sanitizedValue.value,
-<<<<<<< HEAD
       logs: sanitizedLogs,
-=======
-      logs: [...sandboxResult.logs, ...nestedLogs].map(sanitizeFabricMediaText),
->>>>>>> upstream-v0.105.0
       ...(sanitizedValue.images.length > 0 ? { media: sanitizedValue.images } : {}),
       audits,
       phases,

@@ -881,29 +881,22 @@ const notifyInstructionError = (
   context.ui.notify(clipUtf8(`Fabric compaction rejected: ${error.code}: ${error.message}`, 512), "error");
 };
 
-<<<<<<< HEAD
 export const handleFabricBeforeCompact = (
   event: SessionBeforeCompactEvent,
   context: ExtensionContext,
   options: CompactionHookOptions,
   pi?: ExtensionAPI,
 ) => {
-    // Both lazy and synchronous registration carry the same runtime identity. Pi stops
-    // dispatch at a veto, so Main needs this operation signal to distinguish a benign
-    // decline from an owner cancellation without eagerly importing this engine.
+    // A benign compaction veto is not an owner cancellation. Keep this
+    // provenance in the shared handler used by lazy and direct registration.
     const decline = (event: SessionBeforeCompactEvent): { cancel: true } => {
       if (pi) recordCompactionDecline(pi, event);
       return { cancel: true };
     };
-    if (event.customInstructions === "__pi_vcc__") return;
-=======
-export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHookOptions): void => {
-  pi.on("session_before_compact", (event: SessionBeforeCompactEvent, context: ExtensionContext) => {
     if (event.customInstructions === "__pi_vcc__") {
       options.onYield?.();
       return;
     }
->>>>>>> upstream-v0.105.0
     const { preparation, branchEntries } = event;
     const contextWindow = context?.model?.contextWindow;
     const modelKey = modelCompactionKey(context?.model);

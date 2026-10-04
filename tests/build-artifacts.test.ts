@@ -14,7 +14,7 @@ const fixture = (): string => {
   temporary.push(dir);
   fs.cpSync(path.join(root, "dist"), path.join(dir, "dist"), { recursive: true });
   fs.cpSync(path.join(root, "bin"), path.join(dir, "bin"), { recursive: true });
-  for (const file of ["package.json", "scripts/assert-build-artifacts.mjs", "src/verified/generated/manifest.json"]) {
+  for (const file of ["package.json", "config/landlock-roles.json", "scripts/assert-build-artifacts.mjs", "src/verified/generated/manifest.json"]) {
     fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
     fs.copyFileSync(path.join(root, file), path.join(dir, file));
   }

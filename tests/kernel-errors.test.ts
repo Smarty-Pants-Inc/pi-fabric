@@ -55,17 +55,11 @@ for (const backend of ["monty", "cpython"] as const) {
     it("retains host schema ref/property and gives Python repair advice", async () => {
       const code = 'return await tools.call(ref="demo.echo", args={"count": "bad"})';
       const result = await run(code, async () => { throw new Error("Invalid arguments for demo.echo: /count: expected number"); });
-<<<<<<< HEAD
-      expect(result.error).toContain("Invalid arguments for demo.echo: /count: expected number");
-      if (backend === "cpython") {
-        expect(result.terminationReason).toBe("runtime_error");
-        expect(result.error).toContain("RuntimeError: Invalid arguments for demo.echo: /count: expected number");
-        expect(result.error).toContain('File "fabric-exec.py", line 1, in <fabric_exec>');
-      }
-=======
       expect(result.terminationReason).toBe("runtime_error");
       expect(result.error).toContain("RuntimeError: Invalid arguments for demo.echo: /count: expected number");
->>>>>>> upstream-v0.105.0
+      if (backend === "cpython") {
+        expect(result.error).toContain('File "fabric-exec.py", line 1, in <fabric_exec>');
+      }
       expect(result.error).not.toMatch(/<string>|_HostError|in _call|in __call__/);
       expect(pythonErrorRecoveryHint(code, result.error!, backend)).toContain("Python dictionary");
     });

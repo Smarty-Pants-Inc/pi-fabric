@@ -1,17 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
-<<<<<<< HEAD
-import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
-=======
 import {
-  type OwnerIdentity,
-  ownerHeartbeatFields,
-  ownerIdentityFields,
-  ownerLiveness,
-  recordOwnerLiveness,
-  writeJsonAtomic,
+  type OwnerIdentity, ownerHeartbeatFields, ownerIdentityFields, ownerLiveness, recordOwnerLiveness,
+  writeFileAtomic, writeJsonAtomic,
 } from "../core/atomic-write.js";
->>>>>>> upstream-v0.105.0
 import { ownedStat, processAlive } from "./scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
@@ -243,17 +235,10 @@ const safeFollowUps = (directory: string, expired: Deadline): boolean => {
   return true;
 };
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
-<<<<<<< HEAD
-const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline): boolean => {
+const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, owner?: RunRootOwner): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
-  // Offline collection cannot establish never-launched custody from filenames
-  // or a host-wide childrenStopped marker. Only the live admission caller can
-  // authorize recordless pre-launch rollback through the non-retention mode.
+  // Host death or childrenStopped never replaces persisted root/descendant exit proof.
   if (runTreeExitVeto(root, 0, expired, true)) return false;
-=======
-const safeRunTree = (root: string, childrenStopped: boolean, owner?: RunRootOwner, depth = 0): boolean => {
-  if (depth > 32 || !ownedStat(root)?.isDirectory()) return false;
->>>>>>> upstream-v0.105.0
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   // Automatic retention keeps its independent live-writer fence. A mismatched
   // birth identity can clear explicit cleanup's exit veto, but never authorizes
@@ -299,11 +284,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, owner?: RunRootOwne
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
-<<<<<<< HEAD
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired)) return false;
-=======
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, owner, depth + 1)) return false;
->>>>>>> upstream-v0.105.0
+        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, owner)) return false;
         continue;
       }
       return false;
@@ -311,19 +292,13 @@ const safeRunTree = (root: string, childrenStopped: boolean, owner?: RunRootOwne
     return true;
   } catch { return false; }
 };
-<<<<<<< HEAD
-/** Explicit resident roots have no managed-temp owner. Require terminal status
- * plus checked process absence, and veto nested survivors and unresolved markers. */
-export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline): boolean => {
+/** Explicit resident roots require persisted terminal status and checked tree-wide exit. */
+export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline, owner?: RunRootOwner): boolean => {
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired);
+  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, owner);
 };
-const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
-  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }
-=======
 const safeRootContents = (root: string, childrenStopped: boolean, owner?: RunRootOwner): boolean => {
-  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped, owner)); }
->>>>>>> upstream-v0.105.0
+  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped, 0, noDeadline, owner)); }
   catch { return false; }
 };
 export const canRemoveManagedRunRoot = (root: string): boolean => {
@@ -352,20 +327,16 @@ const pruneClosedRunRoot = (
     if (expired()) break;
     if (!entry.isDirectory()) continue;
     const directory = path.join(root, entry.name);
-<<<<<<< HEAD
     // Age first: a young run is kept either way, so it needs no full tree walk (smarty-dev#2010).
-=======
-    if (!safeRunTree(directory, owner.childrenStopped === true, owner)) continue;
->>>>>>> upstream-v0.105.0
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
     const terminal = !!record?.status && TERMINAL_STATUSES.has(record.status);
     const reference = terminal ? recordAgeReference(record!, ownedStat(directory)?.mtimeMs ?? now) : owner.closedAt!;
     const retention = terminal && !record?.actorId ? oneShotMs : orphanMs;
     if (now - reference < retention) {
-      compactTerminalRunEvents(directory, { ...eventsRetention, now, expired });
+      compactTerminalRunEvents(directory, { ...eventsRetention, now, expired, owner });
       continue;
     }
-    if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) continue;
+    if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired, owner)) continue;
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
   return removed;
@@ -438,7 +409,6 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       try { writeOwner(root, { ...owner, orphanedAt: now }); } catch {}
       continue;
     }
-<<<<<<< HEAD
     if (now - owner.orphanedAt < options.orphanedTempRunRetentionMs) continue;
     // Run by run, not one whole-root walk and removal: each run passes the same safety check
     // before it goes, the deadline is checked between runs, and the root goes once empty.
@@ -448,15 +418,11 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       if (expired()) break;
       if (run.name === RUN_ROOT_OWNER_FILE || !run.isDirectory()) continue;
       const directory = path.join(root, run.name);
-      if (!safeRunTree(directory, false, 0, expired)) continue;
+      if (!safeRunTree(directory, false, 0, expired, owner)) continue;
       // Reported as the root's removal once it is empty, as before.
       try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}
     }
     if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
-=======
-    if (now - owner.orphanedAt < options.orphanedTempRunRetentionMs || !safeRootContents(root, false, owner)) continue;
-    try { fs.rmSync(root, { recursive: true, force: true }); result.removedRoots.push(root); } catch {}
->>>>>>> upstream-v0.105.0
   }
   return result;
 };
@@ -505,7 +471,7 @@ const EVENT_TAIL_MARKER = Buffer.from('{"fabricTruncated":true,"reason":"termina
  * Callers retain their ownership/latest-run vetoes before entering this shared predicate. */
 export const compactTerminalRunEvents = (
   directory: string,
-  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean; dryRun?: boolean;
+  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean; dryRun?: boolean; owner?: RunRootOwner;
     onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
 ): boolean => {
   const now = options.now ?? Date.now();
@@ -521,7 +487,7 @@ export const compactTerminalRunEvents = (
   const file = path.join(directory, "events.jsonl");
   const stat = ownedStat(file);
   if (!stat?.isFile() || stat.size === 0 || runTreeExitVeto(directory, 0, expired, true) ||
-      !canRemoveTerminalRun(directory, expired)) return false;
+      !canRemoveTerminalRun(directory, expired, options.owner)) return false;
   try {
     const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
     let tail: Buffer;
@@ -572,7 +538,7 @@ export const compactTerminalRunEvents = (
     const checked = ownedStat(file);
     if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
         checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
-        runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
+        runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired, options.owner) ||
         expired() || options.isRetained?.()) return false;
     if (!options.dryRun) {
       try { writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained])); }

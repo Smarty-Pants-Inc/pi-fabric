@@ -8,6 +8,7 @@ import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { HumanWaitDeadlinePause } from "./deadline-pause.js";
+import { humanWaitDeadlineClock } from "./kernel.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
 import { transpileFabricCodeWithSourceMap } from "./type-checker.js";
 
@@ -1028,14 +1029,8 @@ export class QuickJsRuntime {
       rejectDeadline?.(new Error(outcome));
     };
     const scheduleDeadline = (): void => {
-      if (!rejectDeadline || closing || cancelled || timedOut) return;
-<<<<<<< HEAD
+      if (!rejectDeadline || closing || cancelled || timedOut || humanWait.paused) return;
       executionDeadline.scheduleDeadline(expireDeadline);
-=======
-      clearTimeout(timeout);
-      if (!Number.isFinite(executionDeadlineAt)) return;
-      timeout = setTimeout(expireDeadline, Math.min(2_147_483_647, Math.max(0, executionDeadlineAt - Date.now())));
->>>>>>> upstream-v0.105.0
     };
     const extendExecutionTimeout = (
       ref: string,
@@ -1048,34 +1043,13 @@ export class QuickJsRuntime {
       ) {
         return;
       }
-<<<<<<< HEAD
+      if (humanWait.paused) { humanWait.raise(requestedTimeoutMs); return; }
       if (executionDeadline.extend(requestedTimeoutMs)) scheduleDeadline();
-=======
-      const requestedDurationMs = Math.max(1, Math.floor(requestedTimeoutMs));
-      if (humanWait.paused) {
-        humanWait.raise(requestedDurationMs);
-        return;
-      }
-      const nextDeadlineAt = Date.now() + requestedDurationMs;
-      const nextTimeoutMs = nextDeadlineAt - executionStartedAt;
-      if (nextDeadlineAt <= executionDeadlineAt) return;
-      effectiveTimeoutMs = nextTimeoutMs;
-      executionDeadlineAt = nextDeadlineAt;
-      scheduleDeadline();
->>>>>>> upstream-v0.105.0
     };
 
-    const humanWait = new HumanWaitDeadlinePause({
-      remainingMs: () => executionDeadlineAt - Date.now(),
-      suspend: () => {
-        clearTimeout(timeout);
-        executionDeadlineAt = Infinity;
-      },
-      resume: (remainingMs) => {
-        executionDeadlineAt = Date.now() + remainingMs;
-        scheduleDeadline();
-      },
-    });
+    const humanWait = new HumanWaitDeadlinePause(humanWaitDeadlineClock(
+      () => executionDeadline, options, scheduleDeadline, expireDeadline,
+    ));
 
     try {
       const hostFunction = context.newFunction(
@@ -1116,23 +1090,17 @@ export class QuickJsRuntime {
             void promise.settled.then(() => pendingTimers.delete(timer));
             return promise.handle;
           }
-<<<<<<< HEAD
+          const waitsForHuman = options.isHumanWaitHostCall?.(reference, args) === true;
+          // Policy evaluation also spends budget; an expired call cannot revive it by pausing.
+          if (deadlineReached()) { expireDeadline(); return { error: context.newError(timeoutMessage()) }; }
+          if (waitsForHuman) humanWait.enter();
           const task = runAbortable(hostAbortController.signal, () => {
-            // Argument decoding and deadline policy also consume wall time.
-            // Recheck immediately before admitting actual host work.
             if (deadlineReached()) { expireDeadline(); throw executionDeadline.reason; }
             return hostCall(reference, args, hostAbortController.signal);
           })
-=======
-          const waitsForHuman = options.isHumanWaitHostCall?.(reference, args) === true;
-          if (waitsForHuman) humanWait.enter();
-          const task = runAbortable(hostAbortController.signal, () =>
-            hostCall(reference, args, hostAbortController.signal),
-          )
             .finally(() => {
               if (waitsForHuman) humanWait.leave();
             })
->>>>>>> upstream-v0.105.0
             .then((value) => {
               if (closing || promise.alive === false) return;
               if (deadlineReached()) { expireDeadline(); return; }

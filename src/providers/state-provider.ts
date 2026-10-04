@@ -217,24 +217,18 @@ export class StateProvider implements FabricProvider {
   readonly #identity: MeshIdentity;
   readonly #schemaMode: FabricSchemaMode | undefined;
 
-<<<<<<< HEAD
-  // Whether `pi` exists inside fabric_exec; selects the recovery hint wording.
+  // Keep the recovery hint mode-aware independently of certificate schema mode.
   readonly #piTools: () => boolean;
 
-  constructor(store: MeshStore, identity: MeshIdentity, piTools: () => boolean = () => true) {
-    this.#store = new StateStore(store);
-    this.#identity = identity;
-    this.#piTools = piTools;
-=======
   constructor(
     store: MeshStore,
     identity: MeshIdentity,
-    options: { schemaMode?: FabricSchemaMode } = {},
+    options: { schemaMode?: FabricSchemaMode; piTools?: () => boolean } | (() => boolean) = {},
   ) {
     this.#store = new StateStore(store);
     this.#identity = identity;
-    this.#schemaMode = options.schemaMode;
->>>>>>> upstream-v0.105.0
+    this.#piTools = typeof options === "function" ? options : options.piTools ?? (() => true);
+    this.#schemaMode = typeof options === "function" ? undefined : options.schemaMode;
   }
 
   get state(): StateStore {

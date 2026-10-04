@@ -6,13 +6,10 @@ import type { FabricLogLine, AgentRunRecord, AgentUsage } from "../agents/types.
 import type { FabricCapabilityRequirement } from "../components/types.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
-<<<<<<< HEAD
 import type { FabricActorActivationFilter } from "./activation-filter.js";
 
 export type { FabricActorActivationFilter } from "./activation-filter.js";
-=======
 import type { FabricScope } from "../protocol.js";
->>>>>>> upstream-v0.105.0
 
 // Pi's extension event union is closed; every member we want the actor host
 // to observe must appear in FABRIC_ACTOR_PI_HOST_EVENTS below. `project_trust`
@@ -30,20 +27,6 @@ import type { FabricScope } from "../protocol.js";
 //     messages and its result is sent verbatim. Exposing it to actors would let
 //     them rewrite the system prompt per request, which Fabric deliberately
 //     avoids to keep the cached system prefix byte-stable.
-<<<<<<< HEAD
-//   - `provider_stream_event` (newer Pi) fires for every raw provider stream chunk: far
-//     too frequent for an actor mailbox. Excluding it is a no-op on Pi versions that
-//     do not define it.
-// To observe one of these as an actor event, add it to
-// FABRIC_ACTOR_PI_HOST_EVENTS below and give it a FABRIC_LIFECYCLE_EVENTS topic.
-export type FabricActorPiHostEvent = Exclude<
-  ExtensionEvent["type"],
-  | "project_trust"
-  | "cache_warming_decision"
-  | "agent_before_settle"
-  | "context_with_system"
-  | "provider_stream_event"
-=======
 // Pi 0.99's mcp_servers_change is infrastructure reconciliation, and
 // provider_stream_event carries raw provider data on the request hot path.
 // Neither is an actor observation: forwarding would expose raw payloads and
@@ -53,7 +36,6 @@ export type FabricActorPiHostEvent = Exclude<
 export type FabricActorPiHostEvent = Exclude<
   ExtensionEvent["type"],
   "project_trust" | "cache_warming_decision" | "agent_before_settle" | "context_with_system" | "mcp_servers_change" | "provider_stream_event"
->>>>>>> upstream-v0.105.0
 >;
 
 const defineFabricActorPiHostEvents = <

@@ -5892,7 +5892,6 @@ describe("AgentsProvider switchModel", () => {
     ).rejects.toThrow(/requires a model selector/);
   });
 });
-<<<<<<< HEAD
 
 describe("own-root resident setters and authoritative status", () => {
   afterEach(() => vi.restoreAllMocks());
@@ -6082,6 +6081,3 @@ describe("own-root resident setters and authoritative status", () => {
     expect(globalActors.resolve(template.id)).not.toHaveProperty("thinking");
   });
 });
-
-=======
->>>>>>> upstream-v0.105.0

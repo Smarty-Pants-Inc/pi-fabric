@@ -22,15 +22,12 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
-<<<<<<< HEAD
 import { ResidentHost, RESIDENT_RUN_RETENTION_MS } from "../src/residency/host.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 import { projectOf } from "../src/topology/project-identity.js";
-=======
 import { registerAgentRunner } from "../src/runners.js";
 import { normalizeScope, type FabricScope } from "../src/scope.js";
->>>>>>> upstream-v0.105.0
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import {
   RESIDENT_HOST_FORMAT,

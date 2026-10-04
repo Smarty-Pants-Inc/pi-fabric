@@ -396,7 +396,6 @@ export const writeJsonAtomicAsync = async (
   await writeFileAtomicAsync(filePath, serialized, options);
 };
 
-<<<<<<< HEAD
 export const MESH_LOCK_TIMEOUT_CODE = "FABRIC_MESH_LOCK_TIMEOUT";
 
 /** A failed acquisition wrote nothing. Foreground callers must see this error, not a retry. */
@@ -539,7 +538,6 @@ export class MeshBackgroundQueue {
     for (const item of this.#pending.splice(0)) item.attempted();
   }
 }
-=======
 // ---------------------------------------------------------------------------
 // Namespace-safe owner liveness. It shares this module with the atomic
 // writers whose files it guards: a separate module would become its own
@@ -844,4 +842,3 @@ export const startOwnerHeartbeat = (
   timer.unref?.();
   return () => clearInterval(timer);
 };
->>>>>>> upstream-v0.105.0

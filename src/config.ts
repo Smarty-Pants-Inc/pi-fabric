@@ -233,10 +233,8 @@ export interface FabricAgentConfig {
   sessionExport: boolean;
   /** Export store root override; PI_FABRIC_AGENT_DIR wins. Empty = ~/.pi-fabric/agent. */
   sessionExportDir: string;
-<<<<<<< HEAD
   /** Unix niceness 0-19 for every child agent; 0 leaves priority unchanged. */
   nice: number;
-=======
   /** Admission policy for the model a child process actually reports. */
   modelAdmission: FabricModelAdmission;
   /** Shell command run in each new agent worktree before the child starts. */
@@ -245,7 +243,6 @@ export interface FabricAgentConfig {
   childQuestions?: "cancel" | "route";
   /** Routed child question deadline; absent means 10 minutes. */
   childQuestionTimeoutMs?: number;
->>>>>>> upstream-v0.105.0
 }
 
 export interface FabricToolCaptureConfig {
@@ -574,11 +571,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     maxTokensPerChild: 0,
     sessionExport: true,
     sessionExportDir: "",
-<<<<<<< HEAD
     nice: 0,
-=======
     modelAdmission: "strict",
->>>>>>> upstream-v0.105.0
   },
   jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
   records: structuredClone(DEFAULT_RECORDS_CONFIG),
@@ -939,14 +933,11 @@ const memorySourcesValue = (value: unknown): FabricMemorySourceConfig[] | undefi
 export const normalizeFabricConfig = (input: Record<string, unknown>): FabricConfig => {
   const executor = objectValue(input.executor);
   const cpython = objectValue(executor.cpython);
-<<<<<<< HEAD
   const landlock = objectValue(executor.landlock);
   if (landlock.mode !== undefined && landlock.mode !== "off" && landlock.mode !== "enforce") {
     throw new Error("executor.landlock.mode must be off or enforce. Landlock has no honest warn/audit mode on kernel 6.8; use a one-lane enforce trial with logged PI_FABRIC_LANDLOCK_ESCAPE=1 commands.");
   }
-=======
   const jevFabric = objectValue(executor.jevFabric);
->>>>>>> upstream-v0.105.0
   const executorKernel = executorKernelValue(executor.kernel, DEFAULT_FABRIC_CONFIG.executor.kernel);
   const executorMaxTimeoutMs = boundedInteger(
     executor.maxTimeoutMs,
@@ -1344,10 +1335,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         typeof agents.sessionExportDir === "string"
           ? agents.sessionExportDir
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
-<<<<<<< HEAD
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
-=======
       modelAdmission: modelAdmissionValue(
         agents.modelAdmission,
         DEFAULT_FABRIC_CONFIG.agents.modelAdmission,
@@ -1359,7 +1348,6 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ...(agents.childQuestionTimeoutMs === undefined ? {} : {
         childQuestionTimeoutMs: boundedInteger(agents.childQuestionTimeoutMs, 600_000, 1_000, 86_400_000),
       }),
->>>>>>> upstream-v0.105.0
     },
     jev: normalizeJevConfig(input.jev),
     records: normalizeRecordsConfig(input.records),

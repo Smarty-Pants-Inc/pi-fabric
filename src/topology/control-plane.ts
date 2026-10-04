@@ -5,13 +5,10 @@ import path from "node:path";
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
-<<<<<<< HEAD
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "./mesh-consumption.js";
-=======
 import type { FabricMessageSender } from "../protocol.js";
->>>>>>> upstream-v0.105.0
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -25,7 +22,6 @@ const CANCELLATION_RETENTION_MS = 60_000;
 const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
-<<<<<<< HEAD
 // The sender keeps waiting this long past the command deadline. The owner admits a
 // command only before its deadline, but its acknowledgement can queue for the mesh lock:
 // without this grace a delivered command was reported as timed out and then retried
@@ -43,11 +39,9 @@ const isLockTimeout = (error: unknown): boolean =>
 const SHARED_SEEN_GRACE_MS = 10 * 60 * 1_000;
 /** Host-reserved policy key; { version: 1, sharedClaims: "expiry" } enables expiry reclamation. */
 export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
-=======
 const MAX_INCARNATION_LENGTH = 128;
 export const STALE_INCARNATION_ERROR =
   "Fabric control command targets a previous owner incarnation; the owner restarted. Re-resolve the participant and retry.";
->>>>>>> upstream-v0.105.0
 
 // Legacy Main setter wire names remain parseable only so owners can refuse them clearly.
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel" | "setModel" | "setThinking";
@@ -205,13 +199,10 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
     (data.destinationRemoteHost !== undefined && data.destinationRemoteHost !== null &&
       typeof data.destinationRemoteHost !== "string") ||
     (data.operation === "cancel" && typeof data.cancelCommandId !== "string") ||
-<<<<<<< HEAD
     (data.bindingProvenance !== undefined &&
       (!isObject(data.bindingProvenance) || data.bindingProvenance.kind !== "owner-defaults" ||
         typeof data.bindingProvenance.rootId !== "string")) ||
-=======
     (data.ownerIncarnation !== undefined && !isIncarnation(data.ownerIncarnation)) ||
->>>>>>> upstream-v0.105.0
     (data.binding !== undefined &&
       (!isObject(data.binding) ||
         (data.binding.model !== undefined && typeof data.binding.model !== "string") ||
@@ -219,16 +210,13 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
   ) {
     return undefined;
   }
-<<<<<<< HEAD
-  return { ...data, principal: event.verification === "mesh" || event.verification === "bridge"
-    ? copyFabricPrincipal(event.principal) : undefined } as unknown as FabricControlCommand;
-=======
   const { sender: _forged, ...command } = data;
   return {
     ...(command as unknown as FabricControlCommand),
+    principal: event.verification === "mesh" || event.verification === "bridge"
+      ? copyFabricPrincipal(event.principal) : undefined,
     ...(event.sender ? { sender: event.sender } : {}),
   };
->>>>>>> upstream-v0.105.0
 };
 
 interface FabricControlSeenRecord {
@@ -237,15 +225,12 @@ interface FabricControlSeenRecord {
   commandId: string;
   targetId: string;
   expiresAt: number;
-<<<<<<< HEAD
   /** The command carried its own deadlineAt, so every receiver computes the same deadline. */
   explicitDeadline?: boolean;
   /** The command event's sequence, or an upper bound for a record moved from the shared state. */
   sequence?: number;
-=======
   /** Incarnation that claimed the command; absent on claims by older owners. */
   ownerIncarnation?: string;
->>>>>>> upstream-v0.105.0
   acceptance?: FabricControlAcceptance;
 }
 
@@ -286,15 +271,12 @@ export interface FabricControlInput {
   data?: unknown;
   triggerTurn?: boolean;
   binding?: FabricActorRunBinding;
-<<<<<<< HEAD
   bindingProvenance?: FabricActorBindingProvenance;
-=======
   /**
    * The target participant record's `ownerIncarnation`. When set, a restarted
    * owner refuses the command and acknowledgements from other incarnations are ignored.
    */
   ownerIncarnation?: string;
->>>>>>> upstream-v0.105.0
 }
 
 /** Trust owner-default provenance only from a validated member of that actor's root. */
@@ -379,11 +361,8 @@ export class FabricControlPlane {
   }
   readonly #pollMs: number;
   readonly #ackTimeoutMs: number;
-<<<<<<< HEAD
   readonly #bridgeTimeoutMs: number;
-=======
   readonly #incarnation = randomUUID();
->>>>>>> upstream-v0.105.0
   #offset: number;
   #lastSequence: number;
   #timer: NodeJS.Timeout | undefined;
@@ -531,7 +510,6 @@ export class FabricControlPlane {
     }
     if (!ownerHostId.trim()) throw new Error("Remote participant has no execution owner");
     if (options.signal?.aborted) throw new Error(`Remote Fabric request cancelled: ${targetId}`);
-<<<<<<< HEAD
     const commandId = randomUUID();
     let mirroredOwner: PendingControlRequest["mirroredOwner"];
     const unavailable = (host: string): Error => new Error(
@@ -556,11 +534,9 @@ export class FabricControlPlane {
     const destinationRemoteHost = destination.remoteHost;
     // One budget drives the wire deadline and the sender's ACK timer: mirrored owners
     // need bridge transit time, while native commands retain the local ACK window.
-=======
     if (input.ownerIncarnation !== undefined && !isIncarnation(input.ownerIncarnation)) {
       throw new Error(`Invalid Fabric owner incarnation for ${targetId}`);
     }
->>>>>>> upstream-v0.105.0
     const timeoutMs = Math.max(
       this.#pollMs * 4,
       typeof destinationRemoteHost === "string" ? this.#bridgeTimeoutMs : 0,
@@ -638,32 +614,19 @@ export class FabricControlPlane {
           ...(input.data !== undefined ? { data: input.data } : {}),
           ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
           ...(input.binding !== undefined ? { binding: input.binding } : {}),
-<<<<<<< HEAD
           ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
+          ...(input.ownerIncarnation !== undefined ? { ownerIncarnation: input.ownerIncarnation } : {}),
           requestedAt: committedAt,
           deadlineAt: committedAt + timeoutMs,
         }),
       }).then(() => {
         pendingRequest!.commandPublished = true;
-        // Other requests retain their commit-time ACK window. Never overwrite a mirrored
-        // message's admission timer, or revive a request already settled while publishing.
+        // Only arm a still-pending request with no admission timer.
         if (this.#pending.get(commandId) === pendingRequest! && !pendingRequest!.timer) {
-          pendingRequest!.timer = setTimeout(
-            () => this.#timeoutPending(commandId), timeoutMs + ackGraceMs,
-          );
+          pendingRequest!.timer = setTimeout(() => this.#timeoutPending(commandId), timeoutMs + ackGraceMs);
           pendingRequest!.timer.unref();
         }
-        if (pendingRequest!.cancellationRequested) {
-          void this.#publishCancellation(commandId, pendingRequest!);
-        }
-=======
-          ...(input.ownerIncarnation !== undefined
-            ? { ownerIncarnation: input.ownerIncarnation }
-            : {}),
-          requestedAt,
-          deadlineAt: requestedAt + timeoutMs,
-        } satisfies FabricControlCommand,
->>>>>>> upstream-v0.105.0
+        if (pendingRequest!.cancellationRequested) void this.#publishCancellation(commandId, pendingRequest!);
       });
       await Promise.race([publishing, acceptance.then(() => undefined)]);
       const acknowledged = await acceptance;
@@ -1168,11 +1131,8 @@ export class FabricControlPlane {
             commandId: command.commandId,
             targetId: command.targetId,
             expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
-<<<<<<< HEAD
             sequence,
-=======
             ownerIncarnation: this.#incarnation,
->>>>>>> upstream-v0.105.0
             acceptance,
           } satisfies FabricControlSeenRecord,
           identity: this.identity,
@@ -1345,13 +1305,10 @@ export class FabricControlPlane {
             ? { result: acceptance.result }
             : {}),
           ...(acceptance.error ? { error: acceptance.error } : {}),
-<<<<<<< HEAD
           ...(!acceptance.accepted && acceptance.notRun ? { notRun: true } : {}),
-          };
-=======
           ...(ownerIncarnation !== undefined ? { ownerIncarnation } : {}),
           ...(staleIncarnation !== undefined ? { staleIncarnation } : {}),
->>>>>>> upstream-v0.105.0
+          };
         },
       })
       .catch((error: unknown) => {

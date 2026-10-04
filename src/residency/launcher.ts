@@ -6,8 +6,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
-<<<<<<< HEAD
-import { observeResidentOwner } from "./launcher-owner.js";
+import { liveOwnerPid, observeResidentOwner } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
@@ -19,9 +18,6 @@ import {
   type ResidentLaunchSpec, type ResidentLauncherIdentity, type ResidentHandoverPlan, type ResidentHandoverState,
 } from "./handover.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
-=======
-import { liveOwnerPid, observeResidentOwner } from "./launcher-owner.js";
->>>>>>> upstream-v0.105.0
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -38,24 +34,12 @@ const readConfig = (file: string): ResidentHostConfig => {
   if (typeof config.cwd !== "string" || typeof config.piBinary !== "string") throw new Error("Fabric resident host config is incomplete");
   return config;
 };
-<<<<<<< HEAD
 const writeFailure = (root: string, error: unknown): void => {
   try {
     fs.mkdirSync(root, { recursive: true });
     fs.writeFileSync(path.join(root, "error.json"), JSON.stringify({
       error: error instanceof Error ? error.message : String(error), occurredAt: Date.now(),
       launcherPid: process.pid, launcherBirth: processStartTime(process.pid),
-=======
-
-const writeFailure = (configPath: string, error: unknown): void => {
-  try {
-    const message = error instanceof Error ? error.message : String(error);
-    const dir = path.dirname(configPath);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "error.json"), JSON.stringify({
-      error: message,
-      occurredAt: Date.now(),
->>>>>>> upstream-v0.105.0
     }, null, 2));
   } catch { /* Diagnostics can never suppress owned recovery. */ }
 };
@@ -198,7 +182,8 @@ async function supervise(configPath: string): Promise<void> {
   };
   const observe = (attempt: Attempt): void => {
     const owner = readOwner();
-    const live = owner && residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined;
+    const live = owner ? (owner.identity ? liveOwnerPid(path.join(root, "owner.json")) :
+      residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined) : undefined;
     const observation = observeResidentOwner(live, attempt.child.pid, attempt.claimedOwner);
     attempt.claimedOwner = observation.claimed; attempt.seenOwner ||= observation.observedOwner;
     if (observation.closeInput && !attempt.closingInput) { attempt.closingInput = true; attempt.child.stdin?.end(); }

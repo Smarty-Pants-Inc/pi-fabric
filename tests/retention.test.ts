@@ -13,12 +13,9 @@ import {
   runTreeExitVeto,
   markUnresolvedWorker,
   pruneActorRunArchives,
-<<<<<<< HEAD
   compactTerminalRunEvents,
   RUN_ROOT_SWEEP_MARKER,
-=======
   RUN_ROOT_HEARTBEAT_TTL_MS,
->>>>>>> upstream-v0.105.0
   sweepTempRunRoots,
 } from "../src/storage/retention.js";
 
@@ -404,7 +401,6 @@ describe("safe run roots", () => {
   });
 });
 
-<<<<<<< HEAD
 describe("terminal run event log retention", () => {
   const log = Buffer.from(Array.from({ length: 12000 }, (_, sequence) =>
     JSON.stringify({ sequence, text: "🙂".repeat(24) }) + "\n").join(""));
@@ -520,7 +516,9 @@ describe("terminal run event log retention", () => {
       expect(fs.readFileSync(path.join(dir, "events.jsonl")).equals(log)).toBe(true);
       expect(fs.readdirSync(dir).sort()).toEqual(["events.jsonl", "reply.json", "status.json"]);
     } finally { rename.mockRestore(); }
-=======
+  });
+});
+
 describe("run-root owner identity", () => {
   const sweep = (tempRoot: string, now: number) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
   // A PID namespace this process is not in: the signal probe means nothing for it.
@@ -569,7 +567,6 @@ describe("run-root owner identity", () => {
     fs.writeFileSync(path.join(child, "task.txt"), "foreign worker");
     expect(sweep(tempRoot, 100 * DAY).removedRoots).toEqual([]);
     expect(fs.existsSync(child)).toBe(true);
->>>>>>> upstream-v0.105.0
   });
 });
 

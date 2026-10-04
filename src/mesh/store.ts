@@ -3,17 +3,8 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-<<<<<<< HEAD
-import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, MeshLockTimeoutError, decodeOwnerIdentityLine, ownerLiveness } from "../core/atomic-write.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
-=======
-import {
-  writeFileAtomic,
-  encodeOwnerIdentityLine,
-  lockOwnerLiveness,
-  SHORT_LOCK_MAX_HOLD_MS,
-} from "../core/atomic-write.js";
->>>>>>> upstream-v0.105.0
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
@@ -67,6 +58,9 @@ export interface MeshAppendInput {
   grantId?: string;
   scheduled?: { dueAt: number; key?: string };
   sender?: FabricMessageSender;
+  /** Host-only relay metadata and under-lock admission fence. */
+  principal?: FabricPrincipal | undefined;
+  signal?: AbortSignal | undefined;
   /** A tighter per-event byte ceiling than the store's own. */
   maxEventBytes?: number;
 }
@@ -85,6 +79,7 @@ export interface MeshSchedule {
   createdAt: number;
   /** Stamped when scheduled; carried onto the released event. */
   sender?: FabricMessageSender;
+  principal?: FabricPrincipal | undefined;
 }
 
 interface MeshScheduleFile {
@@ -176,17 +171,14 @@ const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
 const READ_HINT_LINES = 128;
 const CURSOR_OFFSET_BASE = 2 ** 32;
-<<<<<<< HEAD
 /** A tail cursor's live-log generation: it changes when the log is rewritten. */
 export const meshCursorGeneration = (cursor: number): number => Math.floor(cursor / CURSOR_OFFSET_BASE);
 /** The cursor at the start of a generation's log. */
 export const meshCursorAtStart = (generation: number): number => generation * CURSOR_OFFSET_BASE;
-=======
 export const MESH_MAX_PENDING_SCHEDULES = 1_000;
 export const MESH_MAX_SCHEDULE_AHEAD_MS = 366 * 24 * 60 * 60 * 1_000;
 const MAX_SCHEDULE_FILE_BYTES = 16 * 1024 * 1024;
 const SCHEDULE_KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
->>>>>>> upstream-v0.105.0
 
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -625,14 +617,11 @@ export class MeshStore {
       generation: string | undefined;
     }
     | undefined;
-<<<<<<< HEAD
   #oldestLive: { identity: string; sequence: number | undefined } | undefined;
-=======
   readonly #schedulesPath: string;
   #scheduleCache:
     | { inode: number; size: number; modifiedAt: number; file: MeshScheduleFile; error?: string }
     | undefined;
->>>>>>> upstream-v0.105.0
 
   constructor(
     readonly root: string,
@@ -649,13 +638,10 @@ export class MeshStore {
     this.#counterPath = path.join(root, "sequence");
     this.#generationPath = path.join(root, "generation");
     this.#lockPath = path.join(root, ".lock");
-<<<<<<< HEAD
     this.#signalPath = path.join(root, "state.read-signal.json");
-=======
     // Pending schedules live beside state.json, outside the verified storage
     // revision table: they are serialized by this lock, not by key CAS.
     this.#schedulesPath = path.join(root, "schedules.json");
->>>>>>> upstream-v0.105.0
     this.#maxEventLogBytes = Math.min(
       CURSOR_OFFSET_BASE - 1,
       Math.max(maxEventBytes + 2, Math.floor(options.maxEventLogBytes ?? DEFAULT_MAX_EVENT_LOG_BYTES)),
@@ -707,66 +693,14 @@ export class MeshStore {
   }): Promise<MeshEvent> {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
-<<<<<<< HEAD
     const principal = copyFabricPrincipal(input.principal);
     const stamp = typeof input.data === "function" ? input.data as (createdAt: number) => unknown : undefined;
     const fixedData = stamp || input.data === undefined ? undefined : jsonClone(input.data);
-    return this.#withLock(() => {
-      input.signal?.throwIfAborted();
-      this.#repairEventLog();
-      const archive = MeshArchive.fromRoot(this.root);
-      if (archive) this.#recoverArchive(archive);
-      const createdAt = Date.now();
-      const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
-      const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
-      const event: MeshEvent = {
-        id: randomUUID(),
-        sequence,
-        topic: input.topic,
-        kind: input.kind?.trim() || "message",
-        from: jsonClone(input.from),
-        ...(principal ? { principal } : {}),
-        // Old bridges only wrote data.bridge. It can veto a native attestation, but
-        // arbitrary payload data cannot establish bridge verification or any authority.
-        ...(input.from.verified === "bridge" ? { verification: "bridge" as const }
-          : eventData && typeof eventData === "object" && "bridge" in eventData ? {}
-          : { verification: "mesh" as const }),
-        ...(input.to ? { to: input.to } : {}),
-        ...(input.text !== undefined ? { text: input.text } : {}),
-        ...(eventData !== undefined ? { data: eventData } : {}),
-        createdAt,
-      };
-      const line = JSON.stringify(event);
-      if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
-        throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
-      }
-      // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
-      // The archive holds the event durably before it goes live (smarty-dev#754); the live
-      // append commits it. If either step fails, the event is cut back out of the archive.
-      // ponytail: the archive's fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a
-      // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
-      // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
-      atomicWrite(this.#counterPath, sequence);
-      const pending = archive?.begin({ event, line });
-      try {
-        fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
-      } catch (error) {
-        if (pending) archive!.rollback(pending);
-        throw error;
-      }
-      if (pending) archive!.commit(pending);
-      this.#compactEventLog();
-      return event;
-=======
-    const eventData = input.data === undefined ? undefined : jsonClone(input.data);
     const sender = input.sender ?? processSender();
     return this.#withLock(() => {
-      // Any write that already holds the lock also releases due schedules first,
-      // so the log keeps due-time order relative to this event. Damaged
-      // schedule state must not block ordinary publishing.
+      input.signal?.throwIfAborted();
       try { this.#releaseDueLocked(Date.now()); } catch { /* schedule mutations report it */ }
-      return this.#appendLocked({ ...input, ...(eventData !== undefined ? { data: eventData } : {}), sender });
->>>>>>> upstream-v0.105.0
+      return this.#appendLocked({ ...input, data: stamp ?? fixedData, principal, sender });
     });
   }
 
@@ -785,7 +719,13 @@ export class MeshStore {
   }
 
   #appendLocked(input: MeshAppendInput): MeshEvent {
+    input.signal?.throwIfAborted();
     this.#repairEventLog();
+    const archive = MeshArchive.fromRoot(this.root);
+    if (archive) this.#recoverArchive(archive);
+    const createdAt = Date.now();
+    const data = typeof input.data === "function" ? input.data(createdAt) : input.data;
+    const principal = input.origin === "external" || input.untrusted ? undefined : copyFabricPrincipal(input.principal);
     const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
     const event: MeshEvent = {
       id: input.id ?? randomUUID(),
@@ -795,8 +735,14 @@ export class MeshStore {
       from: jsonClone(input.from),
       ...(input.to ? { to: input.to } : {}),
       ...(input.text !== undefined ? { text: input.text } : {}),
-      ...(input.data !== undefined ? { data: jsonClone(input.data) } : {}),
-      createdAt: Date.now(),
+      ...(data !== undefined ? { data: jsonClone(data) } : {}),
+      ...(principal ? { principal } : {}),
+      // External grants and untrusted payloads never acquire native attestation.
+      ...(input.origin === "external" || input.untrusted ? {}
+        : input.from.verified === "bridge" ? { verification: "bridge" as const }
+        : data && typeof data === "object" && "bridge" in data ? {}
+        : { verification: "mesh" as const }),
+      createdAt,
       ...(input.origin ? { origin: input.origin } : {}),
       ...(input.untrusted ? { untrusted: true as const } : {}),
       ...(input.grantId ? { grantId: input.grantId } : {}),
@@ -808,8 +754,16 @@ export class MeshStore {
     if (Buffer.byteLength(line, "utf8") > limit) {
       throw new Error(`Mesh event exceeds ${limit} bytes`);
     }
-    fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+    // Reserve before archive/live append: failures leave gaps, not reused ids.
     atomicWrite(this.#counterPath, sequence);
+    const pending = archive?.begin({ event, line });
+    try {
+      fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+    } catch (error) {
+      if (pending) archive!.rollback(pending);
+      throw error;
+    }
+    if (pending) archive!.commit(pending);
     this.#compactEventLog();
     return event;
   }
@@ -828,6 +782,8 @@ export class MeshStore {
     data?: unknown;
     dueAt: number;
     key?: string;
+    principal?: FabricPrincipal | undefined;
+    signal?: AbortSignal | undefined;
   }, now = Date.now()): Promise<MeshSchedule> {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
@@ -852,6 +808,7 @@ export class MeshStore {
       dueAt: input.dueAt,
       createdAt: now,
       sender: processSender(),
+      ...(copyFabricPrincipal(input.principal) ? { principal: copyFabricPrincipal(input.principal) } : {}),
     };
     // Reject at schedule time what release could never append.
     const released: MeshEvent = {
@@ -862,11 +819,14 @@ export class MeshStore {
       createdAt: Number.MAX_SAFE_INTEGER,
       scheduled: { dueAt: schedule.dueAt, ...(schedule.key !== undefined ? { key: schedule.key } : {}) },
       ...(schedule.sender ? { sender: schedule.sender } : {}),
+      ...(schedule.principal ? { principal: schedule.principal } : {}),
+      verification: "mesh",
     };
     if (Buffer.byteLength(JSON.stringify(released), "utf8") > this.maxEventBytes) {
       throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
     }
     return this.#withLock(() => {
+      input.signal?.throwIfAborted();
       const file = this.#readSchedules(false);
       const pending = file.schedules.filter((entry) => input.key === undefined || entry.key !== input.key);
       if (pending.length >= MESH_MAX_PENDING_SCHEDULES) {
@@ -944,6 +904,7 @@ export class MeshStore {
           scheduled: { dueAt: entry.dueAt, ...(entry.key !== undefined ? { key: entry.key } : {}) },
           // Older schedules stay unstamped: the releasing host never lends its own authority.
           ...(entry.sender ? { sender: entry.sender } : {}),
+          ...(copyFabricPrincipal(entry.principal) ? { principal: copyFabricPrincipal(entry.principal) } : {}),
         }));
         releasedIds.add(entry.id);
       }
@@ -1919,10 +1880,11 @@ export class MeshStore {
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
     const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
+    // Preserve the negotiated V1/V2 wire and exact birth-identity receipt. Readers
+    // also recognize upstream namespace identities, without age-only recovery.
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     const releaseOwned = (): void => {
       try {
-<<<<<<< HEAD
         if (fs.readFileSync(ownerPath, "utf8") === ownerRecord) {
           // Detach the complete owned directory before unlinking anything inside it.
           // Interrupted/resumed recursive cleanup must never follow the canonical name.
@@ -1995,13 +1957,6 @@ export class MeshStore {
             fs.rmSync(staging, { recursive: true, force: true });
           }
         }
-=======
-        fs.mkdirSync(this.#lockPath, { mode: 0o700 });
-        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n${encodeOwnerIdentityLine()}\n`, {
-          encoding: "utf8",
-          mode: 0o600,
-        });
->>>>>>> upstream-v0.105.0
         break;
       } catch (error) {
         const code = errorCode(error);
@@ -2036,7 +1991,6 @@ export class MeshStore {
   // Torn/corrupt receipts and nonempty unrecorded directories remain protected.
   async #clearStaleLock(ownerPath: string): Promise<boolean> {
     try {
-<<<<<<< HEAD
       const stat = fs.lstatSync(this.#lockPath);
       if (!stat.isDirectory()) return false;
       const readOwner = (): string | undefined => {
@@ -2058,28 +2012,6 @@ export class MeshStore {
         fs.mkdirSync(fence, { recursive: true, mode: 0o700 });
         try { fs.writeFileSync(path.join(fence, ".recovery-fence"), "1\n", { flag: "wx", mode: 0o600 }); }
         catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
-=======
-      owner = fs.readFileSync(ownerPath, "utf8");
-    } catch {
-      try {
-        lockModifiedAt = fs.statSync(this.#lockPath).mtimeMs;
-      } catch {
-        return false;
-      }
-    }
-    if (owner !== undefined) {
-      const [, pidText, createdText, identityLine] = owner.trim().split("\n");
-      const createdAt = Number(createdText);
-      if (Number.isFinite(createdAt) && Date.now() - createdAt <= this.#staleLockMs) return false;
-      // Unknown (another PID namespace within the hold ceiling) is not death.
-      if (lockOwnerLiveness(Number(pidText), createdAt, identityLine, {
-        legacyAlive: processAlive,
-        maxHoldMs: Math.max(SHORT_LOCK_MAX_HOLD_MS, this.#staleLockMs),
-      }) !== "dead") return false;
-      try {
-        if (fs.readFileSync(ownerPath, "utf8") !== owner) return false;
-        fs.rmSync(this.#lockPath, { recursive: true, force: true });
->>>>>>> upstream-v0.105.0
         return true;
       }
       const fields = owner.split("\n");
@@ -2088,11 +2020,18 @@ export class MeshStore {
       const recordedStart = owner?.endsWith("\n") ? startText : undefined;
       const pid = Number(pidText);
       const validPid = Number.isSafeInteger(pid) && pid > 0;
-      const validOwner = owner?.endsWith("\n") && (fields.length === 4 || fields.length === 5) &&
+      const validOwner = owner?.endsWith("\n") && (fields.length === 4 || fields.length === 5 || fields.length === 6) &&
         !!token && validPid && createdText !== undefined &&
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
       if (!validOwner) return false;
-      if (processAlive(pid)) {
+      const identityLine = startText?.startsWith("{") ? startText : fields[4];
+      const identity = decodeOwnerIdentityLine(identityLine);
+      if ((identityLine !== undefined && identityLine !== "" && !identity) ||
+          (fields.length === 6 && !identity)) return false;
+      if (identity) {
+        // No age-only recovery: a paused/foreign owner without exit proof stays protected.
+        if (ownerLiveness({ ...identity, pid }, { legacyAlive: processAlive }) !== "dead") return false;
+      } else if (processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
         const actualStart = await processIncarnation(pid);
         if (!actualStart || actualStart === recordedStart) return false;

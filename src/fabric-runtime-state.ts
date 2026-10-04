@@ -81,14 +81,10 @@ import { RuntimeStateSpeculation } from "./runtime-state-speculation.js";
 import { schemaRefAllowedInEnforce } from "./schema/policy.js";
 import { actionApprovalOverride } from "./core/approval-overrides.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
-<<<<<<< HEAD
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "./mesh/store.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "./core/atomic-write.js";
-=======
-import { MeshStore, type MeshIdentity } from "./mesh/store.js";
 import { DecisionStore } from "./decisions/store.js";
 import { requestHeadlessApproval, routeChildQuestion } from "./decisions/host.js";
->>>>>>> upstream-v0.105.0
 import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
@@ -466,15 +462,12 @@ export class FabricRuntimeState {
     try {
       await this.#closeInternal();
       this.#shellJobs = new FabricShellJobStore();
-<<<<<<< HEAD
       this.#outputArtifacts = new OutputArtifactStore();
-=======
       // Closed-world managed hosts must not reach the ambient session manager.
       const sessionId = this.#managedHost ? undefined : context.sessionManager?.getSessionId?.();
       if (sessionId && this.pi.events) {
         this.#shellTiming = new FabricShellTimingBridge(this.pi.events, sessionId, this.#shellJobs);
       }
->>>>>>> upstream-v0.105.0
     } finally {
       this.#suppressResidentGuidanceSync = false;
     }
@@ -693,21 +686,21 @@ export class FabricRuntimeState {
       enabled: this.#config.mesh.enabled,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
+      bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
+      readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
+        this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
     this.#participants = new ParticipantDirectory(this.#mesh, {
       enabled: this.#config.mesh.enabled,
       hostId,
       rootId: mainAgentId,
       identity,
-<<<<<<< HEAD
       onRootCollision: collision => {
         const warning = `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`;
         console.warn(`[pi-fabric] ${warning}`);
         if (context.hasUI) context.ui.notify(warning, "warning");
       },
-=======
       ownerIncarnation: this.#control.incarnation,
->>>>>>> upstream-v0.105.0
       ...(process.env.PI_FABRIC_OWNER_HOST_ID
         ? { selfOwnerHostId: process.env.PI_FABRIC_OWNER_HOST_ID }
         : {}),
@@ -715,7 +708,6 @@ export class FabricRuntimeState {
         ? { selfOwnerIdentityId: process.env.PI_FABRIC_OWNER_IDENTITY_ID }
         : {}),
     });
-<<<<<<< HEAD
     // Resumption must invalidate an earlier terminal proof before actors/control
     // can activate, not merely as part of the later participant publication batch.
     await this.#participants.resumeLineage();
@@ -727,16 +719,6 @@ export class FabricRuntimeState {
       this.#config.mesh.followUpStallSeconds,
     );
     this.#rootInbox?.start();
-    this.#control = new FabricControlPlane(this.#mesh, identity, {
-      enabled: this.#config.mesh.enabled,
-      hostId,
-      pollMs: this.#config.mesh.actorPollMs,
-      bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
-      readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
-        this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
-    });
-=======
->>>>>>> upstream-v0.105.0
     await builtins.mesh(this.#config, this.#mesh, identity, this.#participants);
     this.#decisions = this.#config.mesh.enabled ? new DecisionStore(this.#mesh, identity) : undefined;
     this.#schema = new SchemaController(
@@ -892,7 +874,8 @@ export class FabricRuntimeState {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publishBackground(event);
       },
-<<<<<<< HEAD
+      onChildQuestion: (request) =>
+        routeChildQuestion(request, { context, ...(this.#decisions ? { store: this.#decisions } : {}) }),
       // Retain terminal results until consumption, for both Main residency and actor children.
       onSettled: (result, admittedRecipient) => {
         this.#residency?.enqueueCompletion(result, admittedRecipient);
@@ -939,12 +922,6 @@ export class FabricRuntimeState {
       restore: (runs) => agents.restorePreviousRuns(runs),
       enqueue: (run, delivered) => completionInbox.enqueue(run, delivered),
       appendEntry: (data) => this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, data),
-=======
-      onBackgroundComplete: (result) => completionInbox.enqueue(result),
-      onResultConsumed: (id) => completionInbox.acknowledge(id),
-      onChildQuestion: (request) =>
-        routeChildQuestion(request, { context, ...(this.#decisions ? { store: this.#decisions } : {}) }),
->>>>>>> upstream-v0.105.0
     });
     const canManageActor = (actorId: string): boolean | undefined => {
       const participant = this.#participants?.get(actorId);
@@ -1115,14 +1092,11 @@ export class FabricRuntimeState {
     );
     this.#agents.subscribeUi(() => this.#participants?.scheduleRefresh());
     this.#actors.subscribe(() => this.#participants?.scheduleRefresh());
-<<<<<<< HEAD
     let routeOwner: { client: import("./jev/client.js").JevClient; signal: AbortSignal; pending: Set<Promise<unknown>> } | undefined;
-=======
     const providerParticipants = this.#providerParticipants;
     this.#participants.registerSource(() =>
       providerParticipants.records(mainAgentId, hostId, identity.id));
     providerParticipants.subscribe(() => this.#participants?.scheduleRefresh());
->>>>>>> upstream-v0.105.0
     const agentsProvider = new AgentsProvider(
       this.#agents,
       this.#actors,
@@ -1761,24 +1735,17 @@ export class FabricRuntimeState {
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
-<<<<<<< HEAD
     // Stop the resident drainer (and await its drain) before the Main journal closes: a delivery
     // must never reach a Main that can no longer journal it (review round 3 on pi-fabric#160).
     await this.#residency?.close().catch(() => undefined);
     if (reason !== "reload") this.#mainAgent?.closeFollowUpDrain();
-    this.#suppressResidentGuidanceSync = true;
-    await this.#deactivateRepairs();
-    clearActiveCompiledSurface();
-    if (reason !== "reload") await this.#participants?.quiesce().catch(() => undefined);
-=======
     this.#shellTiming?.close();
     this.#shellTiming = undefined;
     this.#suppressResidentGuidanceSync = true;
     await this.#deactivateRepairs();
     clearActiveCompiledSurface();
     this.#releaseProviderParticipants();
-    await this.#participants?.quiesce().catch(() => undefined);
->>>>>>> upstream-v0.105.0
+    if (reason !== "reload") await this.#participants?.quiesce().catch(() => undefined);
     this.#stopComponentWatch?.();
     this.#stopComponentWatch = undefined;
     await this.#componentControl?.close();
@@ -1904,26 +1871,19 @@ export class FabricRuntimeState {
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
-<<<<<<< HEAD
     // Stop the resident drainer (and await its drain) before the Main journal closes: a delivery
     // must never reach a Main that can no longer journal it (review round 3 on pi-fabric#160).
     await this.#residency?.close().catch(() => undefined);
     this.#mainAgent?.closeFollowUpDrain();
-    await this.shellJobs.close();
-    await this.#deactivateRepairs();
-    if (!this.#registry) {
-      await this.#outputArtifacts.close();
-      return;
-    }
-=======
     this.#shellTiming?.close();
     this.#shellTiming = undefined;
     await this.shellJobs.close();
     await this.#deactivateRepairs();
-    if (!this.#registry) return;
     this.#releaseProviderParticipants();
-    await this.#participants?.quiesce().catch(() => undefined);
->>>>>>> upstream-v0.105.0
+    if (!this.#registry) {
+      await this.#outputArtifacts.close();
+      return;
+    }
     this.#stopComponentWatch?.();
     this.#stopComponentWatch = undefined;
     await this.#componentControl?.close();

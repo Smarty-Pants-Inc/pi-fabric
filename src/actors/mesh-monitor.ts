@@ -42,12 +42,7 @@ export class ActorMeshMonitor {
   #lastCheckpointAt = Date.now();
 
   constructor(
-<<<<<<< HEAD
-    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter" | "latestCursor">>,
-=======
-    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> &
-      Partial<Pick<MeshStore, "nextScheduleDueAt" | "releaseDueSchedules">>,
->>>>>>> upstream-v0.105.0
+    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter" | "latestCursor" | "nextScheduleDueAt" | "releaseDueSchedules">>,
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
@@ -172,7 +167,15 @@ export class ActorMeshMonitor {
     if (!this.callbacks.beforePoll() || this.callbacks.canConsumeMesh?.() === false) return;
     this.#polling = true;
     try {
-<<<<<<< HEAD
+      // Release due schedules before reading, without bypassing receipt/cursor fences.
+      let dueAt: number | undefined;
+      try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
+      if (dueAt !== undefined && dueAt <= Date.now()) {
+        await this.mesh.releaseDueSchedules?.().catch(() => undefined);
+        if (this.#closed || this.callbacks.canConsumeMesh?.() === false) return;
+        try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
+      }
+      this.#armDue(dueAt);
       if (this.#archiveAfter !== undefined && !this.#catchUpArchive()) return;
       // Live and catch-up both read whole pages. A throwing dispatch restores the boundary
       // before its event, so an empty later poll cannot checkpoint past failed work.
@@ -251,23 +254,6 @@ export class ActorMeshMonitor {
       // Yield to the event loop between catch-up pages, so timers such as the lease
       // heartbeat keep running through a long backlog.
       if (catchingUp) setImmediate(() => this.schedule());
-=======
-      // Whichever process polls first releases due schedules; the store lock
-      // makes the release exactly-once, and this poll's tail then sees them.
-      // The lockless due check keeps an idle poll synchronous.
-      let dueAt: number | undefined;
-      try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
-      if (dueAt !== undefined && dueAt <= Date.now()) {
-        await this.mesh.releaseDueSchedules?.().catch(() => undefined);
-        if (this.#closed) return;
-        try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
-      }
-      this.#armDue(dueAt);
-      const tail = this.mesh.tail(this.#offset, this.config.maxReadEvents);
-      this.#offset = tail.nextOffset;
-      for (const event of tail.events) this.callbacks.onEvent(event);
-      this.#writeCursor();
->>>>>>> upstream-v0.105.0
     } finally {
       this.#polling = false;
     }

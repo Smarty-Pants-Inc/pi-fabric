@@ -182,17 +182,15 @@ export const parseWorkerOptions = (
   if (runner !== "pi" && runner !== "claude" && runner !== "veda") {
     throw new Error(`Unsupported Fabric agent runner: ${runner}`);
   }
-<<<<<<< HEAD
+  if (persistSession && runner !== "claude") {
+    throw new Error("Worker persist-session requires the Claude runner");
+  }
   const inferenceContext = optional(args, "inference-context");
   if (inferenceContext !== undefined && inferenceContext !== "full-history" && inferenceContext !== "activation") {
     throw new Error("Invalid worker inference context");
   }
   if (inferenceContext === "activation" && (runner !== "pi" || !sessionFile || !actorId)) {
     throw new Error("Activation inference context requires a persistent Pi actor session");
-=======
-  if (persistSession && runner !== "claude") {
-    throw new Error("Worker persist-session requires the Claude runner");
->>>>>>> upstream-v0.105.0
   }
   const extensions = required(args, "extensions") === "true";
   const selectedKernel = args.get("kernel");

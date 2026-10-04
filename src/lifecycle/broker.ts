@@ -224,22 +224,18 @@ export class LifecycleBroker {
 
   async #drain(): Promise<void> {
     const entries = this.mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX);
-<<<<<<< HEAD
     const listed = new Set<string>();
     let latestSequence: number | undefined;
-=======
-    if (entries.length === 0) return;
-    // One directory rebuild serves every subscription in this cycle. Each
-    // get() rebuilds the whole project directory from mesh state, so a
-    // per-subscription lookup costs O(subscriptions x state entries) and
-    // competes with terminal input on the main thread.
+    if (entries.length === 0) { this.#unsaved.clear(); return; }
+    // Generic sources may rebuild the whole directory in get(): amortize their
+    // project projection once per cycle. The fork's publication-aware directory
+    // instead reads one participant key plus its lease, so keep its idle fast path.
     let directory: Map<string, FabricParticipantInfo> | undefined;
->>>>>>> upstream-v0.105.0
+    const localTargets = new Map<string, FabricParticipantInfo | undefined>();
     for (const entry of entries) {
       if (this.options.canConsumeMesh?.() === false) return;
       const subscription = lifecycleSubscriptionFromValue(entry.value);
       if (!subscription || entry.key !== subscriptionKey(subscription.id)) continue;
-<<<<<<< HEAD
       listed.add(subscription.id);
       if (this.#delivered.has(subscription.id)) {
         // Retry only the cursor/delete receipt; use a fresh poll after success.
@@ -250,16 +246,20 @@ export class LifecycleBroker {
       // memory) and caught-up subscriptions before the directory read: that read parses every
       // participant and host record, and ran for every subscription on every poll of every
       // host, about a quarter of a core per idle Pi on the fleet mesh (smarty-dev#557).
-      if (this.participants.publishes?.(subscription.to) === false) continue;
-      latestSequence ??= this.mesh.latestSequence();
-      if (latestSequence <= this.#cursor(subscription)) continue;
-      const target = this.participants.get(subscription.to);
-=======
-      directory ??= new Map(
-        this.participants.list({ scope: "project" }).map((record) => [record.id, record]),
-      );
-      const target = directory.get(subscription.to) ?? this.participants.get(subscription.to);
->>>>>>> upstream-v0.105.0
+      const publishedHere = this.participants.publishes?.(subscription.to);
+      if (publishedHere === false) continue;
+      let target: FabricParticipantInfo | undefined;
+      if (publishedHere === true) {
+        latestSequence ??= this.mesh.latestSequence();
+        if (latestSequence <= this.#cursor(subscription)) continue;
+        if (!localTargets.has(subscription.to)) localTargets.set(subscription.to, this.participants.get(subscription.to));
+        target = localTargets.get(subscription.to);
+      } else {
+        directory ??= new Map(
+          this.participants.list({ scope: "project" }).map((record) => [record.id, record]),
+        );
+        target = directory.get(subscription.to) ?? this.participants.get(subscription.to);
+      }
       if (!target || target.stale || !target.local) continue;
       await this.#drainSubscription(entry, subscription);
     }

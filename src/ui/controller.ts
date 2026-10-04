@@ -102,14 +102,11 @@ export class FabricUiController {
   #activeConversationReader: string | undefined;
   readonly #snapshotCache = new FabricDashboardSnapshotCache();
   #refreshGeneration = 0;
-<<<<<<< HEAD
   // What the last snapshot was built from, as cheap stamps (smarty-dev#1043).
   #builtLocal: string | undefined;
   #builtRemote: string | undefined;
   #builtAt = 0;
-=======
   readonly #widgetRetention = new FabricWidgetRetention();
->>>>>>> upstream-v0.105.0
 
   constructor(
     readonly state: FabricState,
@@ -660,15 +657,10 @@ export class FabricUiController {
       this.#timer = undefined;
     }
     if (this.#timer || !this.#context) return;
-<<<<<<< HEAD
-    const localActive =
-      this.#snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000) ||
-=======
     const expiryDelay = this.#widgetRetention.nextExpiryDelay(this.#snapshot, Date.now());
-    const active =
+    const localActive =
       expiryDelay !== undefined ||
       this.#snapshot.shells?.some(job => job.finishedAt === undefined) ||
->>>>>>> upstream-v0.105.0
       this.#snapshot.runs.some((run) => run.status === "running") ||
       this.#snapshot.agents.some((agent) => agent.local !== false && isActiveStatus(agent.status)) ||
       this.#snapshot.actors.some(
@@ -690,11 +682,7 @@ export class FabricUiController {
       this.#timer = undefined;
       this.#refresh(false);
       this.#schedulePoll();
-<<<<<<< HEAD
-    }, delay);
-=======
-    }, Math.min(this.state.config.ui.refreshMs, expiryDelay ?? Infinity));
->>>>>>> upstream-v0.105.0
+    }, Math.min(delay, expiryDelay ?? Infinity));
     this.#timer.unref();
   }
 
@@ -799,7 +787,6 @@ export class FabricUiController {
         this.state.config.mesh.enabled ? this.state.mesh.stateStamp?.() : undefined,
         participantsRoot ? participantFilesStamp(participantsRoot) : undefined,
       );
-<<<<<<< HEAD
       const unchanged =
         !force && !this.#dashboardOpen && !this.#conversationOpen && revision !== undefined &&
         local === this.#builtLocal && now - this.#builtAt < REMOTE_MAX_AGE_MS &&
@@ -832,9 +819,7 @@ export class FabricUiController {
           participantsRoot ? participantFilesCachedStamp(participantsRoot) : undefined,
         );
       }
-=======
       this.#widgetRetention.sync(this.#snapshot);
->>>>>>> upstream-v0.105.0
       this.#renderWidget(context);
       // Read the native source even when manager metadata is unchanged: log
       // appends and pinned-window growth do not require a status revision.

@@ -20,28 +20,12 @@ import { lockFile, FileLockBusy } from "./file-lock.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
-<<<<<<< HEAD
-import { fileURLToPath } from "node:url";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { writeJsonAtomic, ownerHeartbeatFields, recordOwnerLiveness, startOwnerHeartbeat } from "../core/atomic-write.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin, type PiModelRegistryView } from "../core/model-refresh.js";
 import { ShadowRouteOwner } from "../agents/model-route-owner.js";
-=======
-import { fileURLToPath, pathToFileURL } from "node:url";
-import {
-  writeJsonAtomic,
-  ownerHeartbeatFields,
-  recordOwnerLiveness,
-  startOwnerHeartbeat,
-} from "../core/atomic-write.js";
-import {
-  normalizeModelAliases,
-  resolveAvailablePiModel,
-  type FabricModelCandidate,
-} from "../core/model-resolution.js";
-import { loadModelUsage } from "../core/model-usage.js";
->>>>>>> upstream-v0.105.0
 import {
   parseFabricOwnedModelGuidance,
   resolveFabricModelGuidance,
@@ -165,9 +149,6 @@ const readJson = <T>(filePath: string): T | undefined => {
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
-<<<<<<< HEAD
-export class ResidentHostAlreadyRunning extends Error {}
-=======
 const processAlive = (pid: number): boolean => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
@@ -183,7 +164,8 @@ const processAlive = (pid: number): boolean => {
 // Identity-less (pre-heartbeat) owners keep the plain signal probe; an owner
 // in another PID namespace is judged by its heartbeat, and "unknown" is not death.
 const ownerAlive = (record: unknown): boolean =>
-  recordOwnerLiveness(record, { legacyAlive: processAlive }) !== "dead";
+  recordOwnerLiveness(record, { legacyAlive: (pid: number) => residentProcessAlive(pid,
+    (record as { processStartTime?: string } | null)?.processStartTime) }) !== "dead";
 
 // The resident host runs Pi with --no-extensions, so a custom runner is only
 // registered here when its residentModule is imported (once per process).
@@ -202,8 +184,7 @@ const loadRunnerModule = (specifier: string): Promise<void> => {
   return pending;
 };
 
-class ResidentHostAlreadyRunning extends Error {}
->>>>>>> upstream-v0.105.0
+export class ResidentHostAlreadyRunning extends Error {}
 
 const parseResidentHostConfigPath = (argv: readonly string[]): string => {
   const index = argv.indexOf("--config");
@@ -251,9 +232,6 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
   return config as ResidentHostConfig;
 };
 
-<<<<<<< HEAD
-export class ResidentHost {
-=======
 /**
  * The resident host's idle rule. Live durable participants, queued work or a
  * pending request keep it alive; pending mesh schedules do too while at least
@@ -278,8 +256,7 @@ export const residentIdleDecision = (input: {
   return { busy, exit, ...(wakeAt !== undefined ? { wakeAt } : {}) };
 };
 
-class ResidentHost {
->>>>>>> upstream-v0.105.0
+export class ResidentHost {
   readonly hostId: string;
   readonly identity: MeshIdentity;
   mesh!: MeshStore;
@@ -345,7 +322,6 @@ class ResidentHost {
     this.#processingPath = path.join(config.residencyRoot, "processing");
     this.#responsesPath = path.join(config.residencyRoot, "responses");
     this.#agentsPath = path.join(config.residencyRoot, "agents");
-<<<<<<< HEAD
     this.#removalsPath = residentRemovalsPath(config.residencyRoot);
     this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
     // All resident collectors share one mutable policy, not the constructor's
@@ -359,34 +335,20 @@ class ResidentHost {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
-=======
-    this.#deliveryPrefix = residentDeliveryPrefix(config.rootId);
-    this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
     this.control = new FabricControlPlane(this.mesh, this.identity, {
-      enabled: true,
-      hostId: this.hostId,
-      pollMs: config.mesh.actorPollMs,
+      enabled: true, hostId: this.hostId, pollMs: config.mesh.actorPollMs,
+      bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
+      canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
+      readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
+        this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
->>>>>>> upstream-v0.105.0
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,
-<<<<<<< HEAD
-      reapDeadHosts: false,                                    // its session's runtime sweeps
-    });
-    this.control = new FabricControlPlane(this.mesh, this.identity, {
-      enabled: true,
-      hostId: this.hostId,
-      pollMs: config.mesh.actorPollMs,
-      bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
-      canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
-      readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
-        this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
-=======
+      reapDeadHosts: false, // its session's runtime sweeps
       ownerIncarnation: this.control.incarnation,
->>>>>>> upstream-v0.105.0
     });
     if (config.agents.budgetUsd > 0) {
       const budgetFile = path.join(config.residencyRoot, "budget.jsonl");
@@ -610,11 +572,11 @@ class ResidentHost {
     if (this.#started) return;
     await this.#acquireLock();
     this.#started = true;
-<<<<<<< HEAD
     try {
       // Archived runs are read on demand, never walked before the host lease is up.
       // The streaming request collector handles terminal retention after readiness.
       this.#initialize();
+      this.#stopHeartbeat = startOwnerHeartbeat((heartbeatAt: number) => this.#refreshHeartbeat(heartbeatAt));
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
@@ -624,47 +586,12 @@ class ResidentHost {
       this.participants.registerSource(() =>
         agentParticipantRecords(
           this.agents.listForUi(),
-=======
-    this.#stopHeartbeat = startOwnerHeartbeat((heartbeatAt) => this.#refreshHeartbeat(heartbeatAt));
-    try {
-      await this.#startOwned();
-    } catch (error) {
-      this.#stopHeartbeat();
-      this.#stopHeartbeat = undefined;
-      throw error;
-    }
-  }
-
-  async #startOwned(): Promise<void> {
-    fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });
-    this.#recoverInterruptedRequests();
-    await this.#recoverHostedRuns();
-    const firstSeenAgents = new Map<string, number>();
-    this.participants.registerSource(() =>
-      agentParticipantRecords(
-        this.agents.listForUi(),
-        this.config.rootId,
-        this.hostId,
-        this.identity.id,
-        this.config.rootId,
-        firstSeenAgents,
-      ),
-    );
-    this.participants.registerSource(() =>
-      this.actors.listOwned().map((actor) =>
-        actorParticipantRecord(
-          actor,
->>>>>>> upstream-v0.105.0
           this.config.rootId,
           this.hostId,
           this.identity.id,
           this.config.rootId,
           firstSeenAgents,
         ),
-<<<<<<< HEAD
       );
       this.participants.registerSource(() =>
         this.actors.listOwned().map((actor) =>
@@ -707,6 +634,7 @@ class ResidentHost {
         hostId: this.hostId,
         pid: process.pid,
         processStartTime: processStartTime(process.pid),
+        ...ownerHeartbeatFields(now),
         fabricExtensionPath: this.config.fabricExtensionPath,
         token: this.#token,
         startedAt: now,
@@ -735,6 +663,8 @@ class ResidentHost {
       if (!this.#staged) {
         this.actors.resumeAfterRelease();
         void this.#backgroundDeliveries.enqueue(async () => {
+          // Re-attach existing adapter-owned work only after serving readiness.
+          await this.#recoverHostedRuns();
           await this.actors.finishPendingRemovals();
           this.#writeRemovals();
         });
@@ -744,33 +674,6 @@ class ResidentHost {
       await this.close();
       throw error;
     }
-=======
-      ),
-    );
-    this.agents.subscribeUi(() => this.participants.scheduleRefresh());
-    this.actors.subscribe(() => this.participants.scheduleRefresh());
-    this.control.start((command, from, signal) =>
-      this.#acceptControl(command, from, signal));
-    await this.participants.start().catch(() => undefined);
-    this.lifecycle.start();
-    this.#requestTimer = setInterval(
-      () => void this.#pollRequests().catch(() => undefined),
-      REQUEST_POLL_MS,
-    );
-    const now = Date.now();
-    const owner: ResidentHostOwner = {
-      format: RESIDENT_HOST_FORMAT,
-      hostId: this.hostId,
-      pid: process.pid,
-      token: this.#token,
-      startedAt: now,
-      readyAt: now,
-      ...ownerHeartbeatFields(now),
-    };
-    atomicWrite(this.#ownerPath, owner);
-    fs.rmSync(this.#errorPath, { force: true });
-    await this.#pollRequests();
->>>>>>> upstream-v0.105.0
   }
 
   async close(): Promise<void> {
@@ -779,23 +682,16 @@ class ResidentHost {
     const routeClosed = this.#routeOwner?.close();
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
-<<<<<<< HEAD
+    if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
+    this.#scheduleTimer = undefined;
+    this.#stopHeartbeat?.();
+    this.#stopHeartbeat = undefined;
     this.#requestRetention.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
     const actorsClosed = this.actors?.close();
     while (this.#pollingRequests || this.#admissions) await delay(10);
     await this.participants?.quiesce().catch(() => undefined);
     await this.lifecycle?.close().catch(() => undefined);
-=======
-    if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
-    this.#scheduleTimer = undefined;
-    this.#stopHeartbeat?.();
-    this.#stopHeartbeat = undefined;
-    while (this.#pollingRequests) await delay(10);
-    await this.participants.quiesce().catch(() => undefined);
-    await this.lifecycle.close().catch(() => undefined);
-    await this.control.close().catch(() => undefined);
->>>>>>> upstream-v0.105.0
     try {
       await closeWithActors({ close: () => actorsClosed }, () => this.control?.close().catch(() => undefined));
     } finally {
@@ -887,12 +783,8 @@ class ResidentHost {
           message,
           command.data,
           signal,
-<<<<<<< HEAD
-          { provenance, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+          { provenance, sender: command.sender ?? null, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
             this.participants.get(from.id)?.rootId) },
-=======
-          { ...(command.binding !== undefined ? { binding: command.binding } : {}), sender: command.sender ?? null },
->>>>>>> upstream-v0.105.0
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -915,22 +807,13 @@ class ResidentHost {
       if (!this.actors.owns(command.targetId)) {
         return { accepted: false, error: `Resident host does not own ${command.targetId}` };
       }
-<<<<<<< HEAD
       const options = controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
         this.participants.get(from.id)?.rootId);
       // Validate now without turning the resolved owner defaults into per-call overrides.
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
       assertMeshConsumption(() => this.participants.canConsumeMesh());
-      const result = this.actors.tell(command.targetId, message, command.data, { provenance, ...options });
-=======
-      const result = this.actors.tell(
-        command.targetId,
-        message,
-        command.data,
-        { ...(command.binding !== undefined ? { binding: command.binding } : {}), sender: command.sender ?? null },
-      );
->>>>>>> upstream-v0.105.0
+      const result = this.actors.tell(command.targetId, message, command.data, { provenance, sender: command.sender ?? null, ...options });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (error instanceof MeshConsumptionPausedError) throw error;
@@ -1147,20 +1030,10 @@ class ResidentHost {
     const activeAgent = this.agents
       .listForUi()
       .some((agent) => agent.status === "queued" || agent.status === "running");
-<<<<<<< HEAD
-    const pendingRequest = [this.#requestsPath, this.#processingPath].some((directory) => {
+    const pendingRequest = this.#admissions > 0 || [this.#requestsPath, this.#processingPath].some((directory) => {
       try { return fs.readdirSync(directory).some((entry) => entry.endsWith(".json")); }
       catch { return false; }
     });
-    if (activeActor || activeAgent || pendingRequest || this.#admissions) {
-      this.#idleSince = Date.now();
-=======
-    let pendingRequest = false;
-    try {
-      pendingRequest = fs.readdirSync(this.#requestsPath).some((entry) => entry.endsWith(".json"));
-    } catch {
-      // Missing request directory is empty.
-    }
     let nextScheduleDueAt: number | undefined;
     try {
       nextScheduleDueAt = this.mesh.nextScheduleDueAt();
@@ -1180,7 +1053,6 @@ class ResidentHost {
     this.#armScheduleWake(decision.wakeAt);
     if (decision.busy) {
       this.#idleSince = now;
->>>>>>> upstream-v0.105.0
       return;
     }
     if (decision.exit) this.onIdle();
@@ -1294,6 +1166,8 @@ class ResidentHost {
         this.#staged = false;
         this.actors.resumeAfterRelease(); this.control.resume(); this.lifecycle.resume();
         this.#trackPublication(this.#backgroundDeliveries.enqueue(async () => {
+          // Re-attach existing adapter-owned work only after serving readiness.
+          await this.#recoverHostedRuns();
           await this.actors.finishPendingRemovals();
           this.#writeRemovals();
         }));
@@ -1479,18 +1353,13 @@ class ResidentHost {
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
         }
-<<<<<<< HEAD
+        if (command.runnerModule) await loadRunnerModule(command.runnerModule);
         // No executor fallback: revalidate the captured caller before the mutation fence.
         const caller = command.caller;
         const returnAddress = assertResidentTaskCaller(caller,
           caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
         const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, undefined, undefined, returnAddress);
-=======
-        if (command.runnerModule) await loadRunnerModule(command.runnerModule);
-        const handle = await this.agents.spawn({ ...command.request, residency: "durable" });
-        // spawn already validated the forwarded scope; record what the child received.
         const scope = launchScope(command.request.scope, command.request.inheritedScope);
->>>>>>> upstream-v0.105.0
         const runDirectory = this.agents.runDirectory(handle.id);
         if (!runDirectory) {
           // Durable metadata currently requires an admitted run directory. Never
@@ -1711,7 +1580,6 @@ class ResidentHost {
 
   async #acquireLock(): Promise<void> {
     fs.mkdirSync(this.config.residencyRoot, { recursive: true, mode: 0o700 });
-<<<<<<< HEAD
     if (process.platform === "linux") {
       try { this.#lockFd = await lockFile(this.#lockPath, 0, true); }
       catch (error) {
@@ -1723,35 +1591,14 @@ class ResidentHost {
       // Windows durable residency is unsupported; non-Linux identity is #2566.
       const existing = readJson<ResidentHostOwner>(this.#ownerPath);
       const locked = readJson<ResidentHostOwner>(this.#lockPath);
-      if ((existing && residentProcessAlive(existing.pid, existing.processStartTime)) ||
-          (locked && residentProcessAlive(locked.pid, locked.processStartTime))) {
+      if ((existing && ownerAlive(existing)) ||
+          (locked && ownerAlive(locked))) {
         throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
       }
       fs.rmSync(this.#lockPath, { force: true });
       try { this.#lockFd = fs.openSync(this.#lockPath, "wx", 0o600); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new ResidentHostAlreadyRunning("Fabric resident host is starting");
-=======
-    const existing = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (existing && ownerAlive(existing)) {
-      throw new ResidentHostAlreadyRunning(`Fabric resident host is already running (${existing.pid})`);
-    }
-    try {
-      const descriptor = fs.openSync(this.#lockPath, "wx", 0o600);
-      fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid, ...ownerHeartbeatFields() }));
-      fs.closeSync(descriptor);
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-        const locked = readJson<{ pid?: unknown }>(this.#lockPath);
-        if (typeof locked?.pid === "number" && ownerAlive(locked)) {
-          throw new ResidentHostAlreadyRunning(`Fabric resident host is starting (${locked.pid})`);
-        }
-        fs.rmSync(this.#lockPath, { force: true });
-        const descriptor = fs.openSync(this.#lockPath, "wx", 0o600);
-        fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid, ...ownerHeartbeatFields() }));
-        fs.closeSync(descriptor);
-      } else {
->>>>>>> upstream-v0.105.0
         throw error;
       }
       this.#fallbackLock = true;
@@ -1759,13 +1606,13 @@ class ResidentHost {
     // A pre-flock host may own these diagnostic records without holding our fence.
     // Read BEFORE overwriting; unknown birth identity is not authority to displace it.
     const records = [readJson<ResidentHostOwner>(this.#lockPath), readJson<ResidentHostOwner>(this.#ownerPath)];
-    if (records.some((owner) => owner && owner.pid !== process.pid && residentProcessAlive(owner.pid, owner.processStartTime))) {
+    if (records.some((owner) => owner && owner.pid !== process.pid && ownerAlive(owner))) {
       this.#releaseLock();
       throw new ResidentHostAlreadyRunning("Fabric resident host is already running (legacy owner)");
     }
     try {
       fs.ftruncateSync(this.#lockFd, 0);
-      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
+      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid), ...ownerHeartbeatFields() }));
     } catch (error) { this.#releaseLock(); throw error; }
   }
 
@@ -1773,7 +1620,13 @@ class ResidentHost {
   // they are still ours, so readers in other PID namespaces can judge us.
   #refreshHeartbeat(heartbeatAt: number): void {
     const lock = readJson<Record<string, unknown>>(this.#lockPath);
-    if (lock?.token === this.#token) atomicWrite(this.#lockPath, { ...lock, heartbeatAt });
+    if (lock?.token === this.#token && this.#lockFd !== undefined) {
+      // flock fences this inode for the whole host lifetime: atomic rename would
+      // replace it and let a second host acquire an unrelated lock. Refresh in place.
+      const text = JSON.stringify({ ...lock, heartbeatAt });
+      fs.writeSync(this.#lockFd, text, 0, "utf8");
+      fs.ftruncateSync(this.#lockFd, Buffer.byteLength(text));
+    }
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
     if (owner?.token === this.#token) atomicWrite(this.#ownerPath, { ...owner, heartbeatAt });
   }

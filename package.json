@@ -4,9 +4,6 @@
   "description": "A programmable tool and agent runtime for Pi",
   "type": "module",
   "main": "./dist/index.js",
-  "bin": {
-    "pi-fabric": "./dist/cli/index.js"
-  },
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
@@ -45,18 +42,17 @@
       "types": "./dist/memory.d.ts",
       "import": "./dist/memory.js"
     },
-<<<<<<< HEAD
     "./mesh": {
       "types": "./dist/mesh.d.ts",
       "import": "./dist/mesh.js"
-=======
+    },
     "./scope": {
       "types": "./dist/scope.d.ts",
       "import": "./dist/scope.js"
->>>>>>> upstream-v0.105.0
     }
   },
   "bin": {
+    "pi-fabric": "./dist/cli/index.js",
     "fabric-participants": "./bin/fabric-participants",
     "fabric-judge": "./bin/fabric-judge",
     "mesh-bridge": "./bin/mesh-bridge",
@@ -165,18 +161,6 @@
     "yaml": "^2.9.0"
   },
   "peerDependencies": {
-<<<<<<< HEAD
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
-  },
-  "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.87.0",
-    "@earendil-works/pi-ai": "0.87.0",
-    "@earendil-works/pi-coding-agent": "0.87.0",
-    "@earendil-works/pi-tui": "0.87.0",
-=======
     "@earendil-works/chord": "1.0.0",
     "@earendil-works/pi-durable": "1.0.0",
     "@earendil-works/pi-ai": "*",
@@ -197,13 +181,11 @@
     "@earendil-works/pi-coding-agent": "1.0.0",
     "@earendil-works/pi-tui": "1.0.0",
     "typebox": "1.3.27",
->>>>>>> upstream-v0.105.0
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^26.1.2",
     "@types/pg": "^8.23.1",
     "esbuild": "^0.25.12",
     "knip": "^6.29.0",
-    "typebox": "1.3.8",
     "vitest": "^4.1.10"
   },
   "workspaces": [

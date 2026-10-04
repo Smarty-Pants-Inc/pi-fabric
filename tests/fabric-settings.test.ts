@@ -878,7 +878,6 @@ describe("FabricSettingsComponent", () => {
     } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-<<<<<<< HEAD
   it("persists terminal event byte cap and age through the real settings dialog and reload", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-retention-"));
     const cwd = path.join(root, "project"); const agentDir = path.join(root, "agent");
@@ -914,7 +913,9 @@ describe("FabricSettingsComponent", () => {
       expect(config.retention).toMatchObject(saved.retention);
       expect(loadFabricConfig(location).retention).toMatchObject(saved.retention);
       expect(state.reloadConfig).toHaveBeenCalledTimes(2);
-=======
+    } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("opens the settings screen as a centered overlay", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-overlay-"));
     const cwd = path.join(root, "project");
@@ -949,7 +950,6 @@ describe("FabricSettingsComponent", () => {
           overlayOptions: expect.objectContaining({ anchor: "center", width: "94%", maxHeight: "90%" }),
         }),
       );
->>>>>>> upstream-v0.105.0
     } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 

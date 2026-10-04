@@ -87,7 +87,6 @@ import {
 import {
   aliasThinking,
   FUZZY_RESOLUTION_MARKERS,
-  aliasThinking,
   resolveAvailablePiModel,
   resolveFabricModel,
   type FabricModelCandidate,
@@ -107,15 +106,12 @@ import {
 import { actionArgNormalizer } from "./arg-normalization.js";
 import { isFabricThinking } from "../thinking.js";
 import { normalizeAgentRunRequest } from "../agents/request.js";
-<<<<<<< HEAD
 import { parseAgentNice } from "../agents/priority.js";
-=======
 import {
   BUILT_IN_RUNNER_IDS,
   isFabricRunnerId,
   requireAgentRunner,
 } from "../agents/runner-registry.js";
->>>>>>> upstream-v0.105.0
 import { ResidencyClient } from "../residency/client.js";
 import { ResidentActorClient } from "../residency/actor-client.js";
 import { AgentTranscriptReader } from "../ui/transcript.js";
@@ -224,13 +220,14 @@ const runRequest = (
   args: Record<string, unknown>,
   context: FabricInvocationContext,
   manager: AgentManager,
-<<<<<<< HEAD
+  modelsConfig: FabricModelsConfig,
   options: { allowCwd?: boolean; inheritedThinking?: string | undefined } = {},
 ): AgentRunRequest => ({
   ...normalizeAgentRunRequest(
     { ...args, timeoutMs: longerTimeoutOverride(args.timeoutMs, manager) },
     {
       ...manager.config,
+      models: modelsConfig,
       inheritedThinking: options.inheritedThinking,
       ...(context.extensionContext.model ? { inheritedModel: context.extensionContext.model } : {}),
     },
@@ -238,19 +235,6 @@ const runRequest = (
   ),
   ...(context.extensionContext.sessionManager ? { provenance: fabricTurnProvenance(fabricHostIdentity(context.extensionContext.sessionManager.getSessionId()), "actor", "mesh", invocationFabricPrincipal(context)) } : {}),
 });
-=======
-  modelsConfig: FabricModelsConfig,
-  options: {allowCwd?: boolean} = {},
-): AgentRunRequest => normalizeAgentRunRequest(
-  {...args, timeoutMs: longerTimeoutOverride(args.timeoutMs, manager)},
-  {
-    ...manager.config,
-    models: modelsConfig,
-    ...(context.extensionContext.model ? {inheritedModel: context.extensionContext.model} : {}),
-  },
-  options,
-);
->>>>>>> upstream-v0.105.0
 
 const handoffTask = (args: Record<string, unknown>): string => {
   const task = typeof args.task === "string" ? args.task.trim() : "";
@@ -561,18 +545,9 @@ export class AgentsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
     runnerOverride?: FabricAgentRunner,
-<<<<<<< HEAD
     closest = true,
   ): Promise<Record<string, unknown>> {
-    const runner = runnerOverride ??
-      (args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
-        ? args.runner
-        : this.manager.config.runner);
-=======
-  ): Record<string, unknown> {
     const runner = runnerOverride ?? checkedRunner(args.runner, this.manager.config.runner);
-    if (runner !== "pi") return args;
->>>>>>> upstream-v0.105.0
     const model = typeof args.model === "string" ? args.model.trim() : "";
     this.manager.assertModelAllowed(model || undefined, runner);
     if (runner !== "pi") {
@@ -581,28 +556,16 @@ export class AgentsProvider implements FabricProvider {
       return { ...args, model: prepared };
     }
     if (!model) return args;
-<<<<<<< HEAD
     if (model === "auto") throw new Error('model: "auto" is supported only by agents.spawn with required routing pins');
     const thinking = isFabricThinking(args.thinking) ? args.thinking
       : aliasThinking(this.modelsConfig().aliases, model);
     const resolved = await this.#resolvePiModelSelection(model, context, closest);
     return { ...args, ...resolved, ...(thinking ? { thinking } : {}) };
-=======
-    const thinking = isFabricThinking(args.thinking)
-      ? args.thinking
-      : aliasThinking(this.modelsConfig().aliases, model);
-    const resolved = this.#resolvePiModel(model, context);
-    return {
-      ...args,
-      ...(thinking ? { thinking } : {}),
-      ...(resolved === model ? {} : { model: resolved }),
-    };
->>>>>>> upstream-v0.105.0
   }
 
   /** `closest: false` (agents.spawn) refuses an inexact requested model instead of closest-matching it. */
   async #runRequest(args: Record<string, unknown>, context: FabricInvocationContext, closest = true): Promise<AgentRunRequest & { via?: string }> {
-    const request = runRequest(args, context, this.manager, { inheritedThinking: this.callerThinking() });
+    const request = runRequest(args, context, this.manager, this.modelsConfig(), { inheritedThinking: this.callerThinking() });
     const model = request.model ?? this.manager.defaultModel(request.runner);
     return await this.#resolvePiModelArgs(
       { ...request, ...(model ? { model } : {}) }, context, undefined, closest || request.model === undefined,
@@ -841,36 +804,11 @@ export class AgentsProvider implements FabricProvider {
     switch (actionName) {
       case "run": {
         const main = isInteractiveMain(context.extensionContext);
-        const request = await this.#runRequest(args, context);
+        const request = this.#applySeed(args, await this.#runRequest(args, context), context);
         const handle = await this.manager.spawn(
-<<<<<<< HEAD
           request,
-          // Only the branded Main ceiling is observation-only, including during launch.
-          // Escape and ordinary deadlines retain zero-progress child cancellation.
+          // Main's observation ceiling never cancels admitted child work.
           main ? withoutMainExecutionCeiling(context.signal) : context.signal,
-=======
-          this.#applySeed(
-            args,
-            runRequest(this.#resolvePiModelArgs(args, context), context, this.manager, this.modelsConfig()),
-            context,
-          ),
-          context.signal,
-        );
-        this.participants.scheduleRefresh();
-        context.activity?.({
-          type: "entity",
-          id: handle.id,
-          kind: "agent",
-          name: handle.name,
-        });
-        context.update(agentStartedMessage(handle));
-        return waitWithProgress(
-          this.manager,
-          this.#transcripts,
-          handle.id,
-          context,
-          this.agentToolPreviewEnabled,
->>>>>>> upstream-v0.105.0
         );
         const timeoutMs = mainAgentWaitBound(args.timeoutMs, context.mainDeadlineAt);
         try {
@@ -902,43 +840,25 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-<<<<<<< HEAD
-        const request = await this.#prepareSpawnRequest(args, context);
-        const kernel = this.manager.resolveKernel(request);
-        const { kernel: _requestedKernel, ...baseRequest } = request;
-        const durableCwd = request.residency === "durable" && request.cwd !== undefined
-          ? await this.manager.resolveCwd(request.cwd, context.signal)
-          : undefined;
-=======
-        const request = this.#applySeed(
-          args,
-          runRequest(this.#resolvePiModelArgs(args, context), context, this.manager, this.modelsConfig()),
-          context,
-        );
+        const request = this.#applySeed(args, await this.#prepareSpawnRequest(args, context), context);
         if (request.residency === "durable") this.#assertUnconfinedDurable();
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...requestWithScope } = request;
-        // The resident host has no session scope: send the derived scope in full.
         const inheritedScope = request.residency === "durable" ? childScope(request.scope) : undefined;
         const { scope: _narrowing, ...unscopedRequest } = requestWithScope;
         const baseRequest = request.residency === "durable" ? unscopedRequest : requestWithScope;
->>>>>>> upstream-v0.105.0
+        const durableCwd = request.residency === "durable" && request.cwd !== undefined
+          ? await this.manager.resolveCwd(request.cwd, context.signal)
+          : undefined;
         const durableRequest = withInheritedSessionPins({
           ...baseRequest,
           ...(inheritedScope ? { inheritedScope } : {}),
           ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime() } : {}),
           extensions: request.extensions ?? this.manager.config.extensions,
-<<<<<<< HEAD
           ...(durableCwd !== undefined ? { cwd: durableCwd } : {}),
-=======
-          ...(request.residency === "durable" && request.cwd !== undefined
-            ? { cwd: this.manager.resolveCwd(request.cwd) }
-            : {}),
-          // The resident host does not know this session's bounds: send them narrowed.
           ...(request.residency === "durable"
             ? { thinkingBounds: this.manager.childThinkingBounds(request.thinkingBounds) }
             : {}),
->>>>>>> upstream-v0.105.0
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
         const handle = durableRequest.residency === "durable"
           ? await this.#resident().spawnAgent(durableRequest, context.signal)
@@ -1064,9 +984,11 @@ export class AgentsProvider implements FabricProvider {
           ...(args.includeStale === true ? { includeStale: true } : {}),
         });
       }
-<<<<<<< HEAD
-      case "self":
-        return this.participants.self();
+      case "self": {
+        const self = await this.participants.self();
+        const lineage = readAgentLineage();
+        return lineage ? { ...self, lineage } : self;
+      }
       case "main": {
         const address = this.#taskReturnAddress;
         const info = this.mainAgent.info(context.extensionContext);
@@ -1081,16 +1003,6 @@ export class AgentsProvider implements FabricProvider {
       case "sessions": {
         const stalled = this.participants.writeStalled?.();
         if (stalled) throw stalled;
-=======
-      case "self": {
-        const self = await this.participants.self();
-        const lineage = readAgentLineage();
-        return lineage ? { ...self, lineage } : self;
-      }
-      case "main":
-        return this.mainAgent.info(context.extensionContext);
-      case "sessions":
->>>>>>> upstream-v0.105.0
         return this.participants.sessions?.() ??
           this.participants.list({ scope: "project", kinds: ["root"] });
       }
@@ -1298,7 +1210,7 @@ export class AgentsProvider implements FabricProvider {
           const resident = this.#residentActorOwner(id);
           if (resident) return this.#setResidentActor(resident, { operation: "stop", id: resident.id }, context);
         }
-        return this.stopParticipant(id);
+        return this.stopParticipant(id, context);
       }
       case "cleanup": {
         const id = String(args.id);
@@ -1378,13 +1290,10 @@ export class AgentsProvider implements FabricProvider {
             message,
             ...(args.data === undefined ? {} : { data: args.data }),
             ...(needsBinding ? { binding } : {}),
-<<<<<<< HEAD
             ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
-=======
             ...(participant.ownerIncarnation
               ? { ownerIncarnation: participant.ownerIncarnation }
               : {}),
->>>>>>> upstream-v0.105.0
           },
           participant.ownerIdentityId,
           {
@@ -1515,6 +1424,7 @@ export class AgentsProvider implements FabricProvider {
         }
         const target = this.#resolveActorTarget(id);
         const runner = target.actor?.runner ?? target.participant!.runner;
+        if (!runner) throw new Error(`Fabric actor ${id} has no execution runner`);
         const resident = this.#residentActorOwner(id);
         const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;
         const resolved = model && target.actor?.routeClass !== undefined
@@ -1748,23 +1658,15 @@ export class AgentsProvider implements FabricProvider {
       deadlineMs?: number;
     } = {},
   ): Promise<FabricAgentMessageResult> {
-<<<<<<< HEAD
-    // Host-authored lifecycle routing has no sender invocation/history. Check
-    // only model sends, before *all* local/actor/remote routing branches.
-    if (!context) return this.#router.routeMessage(id, message, data, kind, context, options);
+    const route = (text: string) => isProviderParticipantRef(id)
+      ? this.#controlProviderParticipant(id, kind, text, data, context) as Promise<FabricAgentMessageResult>
+      : this.#router.routeMessage(id, text, data, kind, context, options);
+    // Host-authored lifecycle messages have no invocation/history.
+    if (!context) return route(message);
     context = snapshotFabricInvocation(context);
     const checked = await outgoingMessageNotice(message, context, this.actorManager.identity.id);
-    const result = await deliverWithMessageNotice(message, checked,
-      text => this.#router.routeMessage(id, text, data, kind, context, options), `agents.${kind}`);
+    const result = await deliverWithMessageNotice(message, checked, route, `agents.${kind}`);
     return checked.notice ? { ...result, notice: checked.notice } : result;
-=======
-    if (isProviderParticipantRef(id)) {
-      return controlProviderParticipant(
-        this.providerParticipants, this.participants, this.control, id, kind, message, data,
-      ) as Promise<FabricAgentMessageResult>;
-    }
-    return this.#router.routeMessage(id, message, data, kind, context, options);
->>>>>>> upstream-v0.105.0
   }
 
   /** Flush pending coalesced lifecycle deliveries; used by tests and shutdown. */
@@ -1842,15 +1744,11 @@ export class AgentsProvider implements FabricProvider {
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
-<<<<<<< HEAD
-    // The router retains legacy wire names only to give old senders a clear refusal.
-    return this.#router.acceptControl(command, from, signal, verification);
-=======
     if (isProviderParticipantRef(command.targetId)) {
       return acceptProviderParticipantControl(this.providerParticipants, command);
     }
-    return this.#router.acceptControl(command, from, signal);
->>>>>>> upstream-v0.105.0
+    // Retain verification and clear refusal of legacy Main setters.
+    return this.#router.acceptControl(command, from, signal, verification);
   }
 
   #resolveActorTarget(id: string): {
@@ -1877,7 +1775,6 @@ export class AgentsProvider implements FabricProvider {
       ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime(request.pythonRuntime) } : {}),
       ...(principalScope ? { principalScope } : {}),
     };
-<<<<<<< HEAD
     if (request.residency !== "durable") {
       // Reuse the host-originated outcome ledger for local actors too: publication
       // may await contended locks after the actor is already runnable/subscribed.
@@ -1904,20 +1801,8 @@ export class AgentsProvider implements FabricProvider {
             outcome ??= new ResidentOutcomeUnknownError(command, decision, reason, signal));
         },
       });
-=======
-    if (request.residency !== "durable") return this.actorManager.create(request);
-    this.#assertUnconfinedDurable();
-    if (!this.residency) return this.#residentActorClient().createActor(request);
-
-    await this.residency.ensureHost();
-    let actor: FabricActorInfo;
-    try {
-      actor = await this.actorManager.create(request);
-    } catch (error) {
-      if (!(error instanceof ActorRegistryOwnershipError)) throw error;
-      return this.residency.createActor(request);
->>>>>>> upstream-v0.105.0
     }
+    this.#assertUnconfinedDurable();
     // Even the first actor in an empty registry must use the authoritative
     // host's capability check and request fence. A local-create/cede path can
     // publish after cancellation with neither a decision nor a known-ID receipt.
@@ -2116,9 +2001,36 @@ export class AgentsProvider implements FabricProvider {
     return value === "local" || value === "lineage" || value === "project" ? value : fallback;
   }
 
-  async stopParticipant(id: string): Promise<unknown> {
+  #controlProviderParticipant(
+    id: string, operation: "stop" | "steer" | "followUp",
+    message?: string, data?: unknown, context?: FabricInvocationContext,
+  ) {
+    context?.signal?.throwIfAborted();
+    const control = this.control;
+    const request: FabricControlPlane["request"] = (ownerHostId, targetId, kind, input, ownerIdentityId, options) => {
+      context?.signal?.throwIfAborted();
+      const participant = this.participants.get(targetId, undefined, { fresh: true });
+      if (!participant || participant.ownerHostId !== ownerHostId ||
+          (ownerIdentityId !== undefined && participant.ownerIdentityId !== ownerIdentityId)) {
+        throw new Error(`Fabric participant ${targetId} changed execution owner; this attempt was not published`);
+      }
+      return control!.request(ownerHostId, targetId, kind, {
+        ...input, ...(context ? { principal: invocationFabricPrincipal(context) } : {}),
+      }, ownerIdentityId, {
+        ...options, routedRemoteHost: participant.remoteHost ?? null,
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+    };
+    return controlProviderParticipant(this.providerParticipants, {
+      get: ref => this.participants.get(ref, undefined, { fresh: true }),
+    }, control ? { request } : undefined, id, operation, message, data);
+  }
+
+  async stopParticipant(id: string, context?: FabricInvocationContext): Promise<unknown> {
+    if (context) context = snapshotFabricInvocation(context);
+    context?.signal?.throwIfAborted();
     if (isProviderParticipantRef(id)) {
-      return controlProviderParticipant(this.providerParticipants, this.participants, this.control, id, "stop");
+      return this.#controlProviderParticipant(id, "stop", undefined, undefined, context);
     }
     try {
       const result = await this.manager.stop(id);
@@ -2155,9 +2067,10 @@ export class AgentsProvider implements FabricProvider {
       participant.ownerHostId,
       participant.id,
       "stop",
-      participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {},
+      { ...(participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {}),
+        ...(context ? { principal: invocationFabricPrincipal(context) } : {}) },
       participant.ownerIdentityId,
-      { routedRemoteHost: participant.remoteHost ?? null },
+      { routedRemoteHost: participant.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
     );
     if (this.residency?.hasAgent(id)) this.residency.acknowledgeCompletion(id);
     return result;

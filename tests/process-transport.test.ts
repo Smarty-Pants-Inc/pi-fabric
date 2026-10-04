@@ -284,7 +284,10 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
     } finally { await manager.close(); }
   });
   it("keeps direct launches on non-Linux platforms even when configured", async () => {
-    const f = fixture(); vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const f = fixture();
+    // Portable custody needs ps, while the scope fixture intentionally hides PATH.
+    vi.stubEnv("PATH", `${f.root}:/usr/bin:/bin`);
+    vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const handle = await new ProcessTransport("batch.slice").launch(f.request);
     try { expect(await workerStarted(f.root)).toBe(Number(handle.sessionId)); expect(fs.existsSync(path.join(f.root, "scope-args"))).toBe(false); expect(warn).not.toHaveBeenCalled(); }

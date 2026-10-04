@@ -104,7 +104,7 @@ describe("standalone worker without Pi host peers", () => {
     expect(record?.error).toContain("cross-spawn");
   });
 
-  it.skipIf(!tmuxAvailable)("boots and reports early failures through an isolated real tmux server", async () => {
+  it.skipIf(!tmuxAvailable)("refuses an isolated real tmux server without confirmed detached execution custody", async () => {
     const { root, worker, piBinary } = installation();
     const binary = execFileSync("which", ["tmux"], { encoding: "utf8" }).trim();
     const socket = `fabric-install-${process.pid}-${path.basename(root)}`;
@@ -118,12 +118,9 @@ describe("standalone worker without Pi host peers", () => {
     });
     managers.push(manager);
     try {
-      const good = await manager.run({ task: "offline tmux probe", transport: "tmux", extensions: false });
-      expect(good, good.error).toMatchObject({ status: "completed", text: "hi" });
-      fs.rmSync(path.join(root, "node_modules/cross-spawn"));
-      const bad = await manager.run({ task: "offline failure probe", transport: "tmux", extensions: false });
-      expect(bad.status).toBe("failed");
-      expect(bad.error).toContain("cross-spawn");
+      await expect(manager.run({ task: "offline tmux probe", transport: "tmux", extensions: false }))
+        .rejects.toThrow(/tmux is disabled: detached execution custody is not confirmed/);
+      expect(manager.list()).toEqual([]);
     } finally {
       await manager.close();
       spawnSync(binary, ["-L", socket, "kill-server"], { timeout: 5000 });

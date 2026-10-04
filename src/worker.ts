@@ -18,6 +18,29 @@ import { applyChildPriority } from "./agents/priority.js";
 import { saveWorkerCompletion } from "./agents/completion-journal.js";
 import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
+import { processStartTime } from "./residency/process-identity.js";
+import { executionGroup } from "./worker/execution-group.js";
+
+// ProcessTransport's native channel transfers the execution cleanup obligation
+// before spawning. Other transports have no channel and retain normal signals.
+let externalStopRequested = false;
+let externalStop = () => { externalStopRequested = true; };
+const custodyReady = new Promise<void>((resolve) => {
+  if (process.platform === "win32" || !process.send) { resolve(); return; }
+  process.on("message", (message: unknown) => {
+    if (!message || typeof message !== "object" || !("type" in message)) return;
+    if (message.type === "fabric-execution-custody-ack") { process.channel?.unref?.(); resolve(); }
+    else if (message.type === "fabric-stop") { externalStopRequested = true; externalStop(); }
+  });
+  process.send({ type: "fabric-execution-custody" }, () => undefined);
+});
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+  process.once(signal, () => { externalStopRequested = true; externalStop(); });
+}
+const executionSettled = (): Promise<void> => new Promise(resolve => {
+  if (process.platform !== "win32" && process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
+  else resolve();
+});
 import { retryableProviderError } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
@@ -230,11 +253,11 @@ const assistantError = (message: Record<string, unknown>): string => {
 const runnerLabel = (runner: string): string =>
   runner === "claude" ? "Claude" : runner === "veda" ? "Veda" : "Pi";
 
+const executionGroups = new WeakMap<ChildProcess, ReturnType<typeof executionGroup>>();
+let executionCleanup: () => Promise<void> = async () => {};
 const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
-  if (!child.pid) return;
-  try {
-    process.kill(process.platform === "win32" ? child.pid : -child.pid, signal);
-  } catch { /* child process group already exited */ }
+  try { executionGroups.get(child)?.signal(signal); }
+  catch (error) { console.error(`Execution cleanup unresolved: ${String(error)}`); }
 };
 
 
@@ -257,20 +280,31 @@ const writeCrashStatus = (error: unknown): void => {
     // to "Agent transport exited without a result".
   }
 };
-process.on("uncaughtException", (error) => {
-  writeCrashStatus(error);
-  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : error}\n`);
-  process.exit(1);
-});
-process.on("unhandledRejection", (error) => {
-  writeCrashStatus(error);
-  process.stderr.write(`Unhandled rejection: ${error instanceof Error ? error.stack ?? error.message : error}\n`);
-  process.exit(1);
-});
+let crashPending = false;
+const finishCrash = async (error: unknown): Promise<void> => {
+  if (crashPending) return;
+  crashPending = true;
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  try {
+    // A crash result is not an exit receipt. Do not publish it (or exit this
+    // custodian) until every admitted execution obligation has been drained.
+    await executionCleanup();
+    await executionSettled();
+    writeCrashStatus(error);
+    process.exit(1);
+  } catch (cleanupError) {
+    console.error(`Crash cleanup unresolved; retaining execution custody: ${String(cleanupError)}`);
+    // Keep the custodian available to its parent even if no native pipes remain.
+    setInterval(() => {}, 1000);
+  }
+};
+process.on("uncaughtException", (error) => { void finishCrash(error); });
+process.on("unhandledRejection", (error) => { void finishCrash(error); });
 
 const main = async (): Promise<void> => {
   assertWorkerRuntime();
   crossSpawn = (await import("cross-spawn")).default;
+  await custodyReady;
   const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog, PI_PROVIDER_RESUME_DELAYS_MS, recoveryTimeScale }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
@@ -558,6 +592,15 @@ const main = async (): Promise<void> => {
   }
   // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
   // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
+  if (externalStopRequested) {
+    record.status = "stopped"; record.error = "Agent stopped before execution launch";
+    record.finishedAt = Date.now(); record.updatedAt = record.finishedAt;
+    writeRunRecord(options.statusFile, record); terminalWritten = true;
+    await executionSettled();
+    await new Promise<void>(resolve => sessionStream ? sessionStream.end(resolve) : resolve());
+    process.exitCode = 1;
+    return;
+  }
   const taskEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/task-entry.ts" : "./worker/task-entry.js", import.meta.url));
   const releaseEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/release-entry.ts" : "./worker/release-entry.js", import.meta.url));
   const spawnChild = (): ChildProcess => spawnCli(piRetrySdk ? taskEntryPath : piReleaseSdk ? releaseEntryPath : childBinary,
@@ -631,7 +674,44 @@ const main = async (): Promise<void> => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  // Every provider resume is a new execution obligation. Drain each attempt
+  // before replacement, but retain the worker's custody until the whole run ends.
+  const retainExecutionCustody = (execution: ChildProcess): void => {
+    const executionBirth = execution.pid === undefined ? undefined : processStartTime(execution.pid);
+    let nativeClosed = false;
+    // Windows preserves native-child cleanup, not an execution-tree receipt.
+    const group = process.platform === "win32" ? {
+      observe(): void {},
+      exited: () => nativeClosed,
+      signal: (signal: NodeJS.Signals): void => {
+        if (execution.exitCode === null && execution.signalCode === null) execution.kill(signal);
+      },
+    } : executionGroup(execution);
+    executionGroups.set(execution, group);
+    execution.once("close", () => { nativeClosed = true; });
+    const groupObserver = setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, 100);
+    let draining: Promise<void> | undefined;
+    executionCleanup = () => draining ??= (async () => {
+      const exited = () => nativeClosed && group.exited();
+      const wait = async (ms: number) => {
+        const deadline = Date.now() + ms;
+        do { if (exited()) return true; await new Promise(resolve => setTimeout(resolve, 20)); } while (Date.now() < deadline);
+        return exited();
+      };
+      if (!exited()) {
+        group.signal("SIGTERM");
+        execution.stdin?.end();
+        if (!await wait(KILL_GRACE_MS)) {
+          group.signal("SIGKILL");
+          if (!await wait(2000)) throw new Error("Execution group did not confirm exit after cleanup");
+        }
+      }
+      clearInterval(groupObserver);
+    })();
+    if (process.platform !== "win32") process.send?.({ type: "fabric-execution-started", pid: execution.pid, started: executionBirth }, () => undefined);
+  };
   let child = spawnChild();
+  retainExecutionCustody(child);
   let childExited = false;
   let piControlLive = false;
   let nativeActivity = false;
@@ -1797,9 +1877,8 @@ const main = async (): Promise<void> => {
     terminalError = "Agent stopped";
     killChild();
   };
-  process.once("SIGTERM", stop);
-  process.once("SIGINT", stop);
-  process.once("SIGHUP", stop);
+  externalStop = stop;
+  if (externalStopRequested) stop();
 
   let exitCode: number | null;
   while (true) {
@@ -1809,7 +1888,11 @@ const main = async (): Promise<void> => {
         terminalError = error.message;
         // Wait for close as well: a spawn error still owns its stream handles.
       });
-      child.once("close", (code) => { childExited = true; piControlLive = false; resolve(code); });
+      child.once("close", (code) => {
+        childExited = true;
+        piControlLive = false;
+        void executionCleanup().then(() => resolve(code)).catch(finishCrash);
+      });
     });
     if (closeTimer) clearTimeout(closeTimer);
     closeTimer = undefined;
@@ -1883,11 +1966,14 @@ const main = async (): Promise<void> => {
     modelControl = createModelControl();
     compactControl = createCompactControl();
     child = spawnChild();
+    retainExecutionCustody(child);
     childExited = false;
     attachChildStreams();
     startChildInput();
   }
+  await executionSettled();
 
+  if (crashPending) return; // finishCrash owns result publication after the drain.
   if (steerTimer) clearInterval(steerTimer);
   questionRelay?.close();
   delete record.blockedOn;
@@ -2071,8 +2157,4 @@ const main = async (): Promise<void> => {
   process.exitCode = record.status === "completed" ? 0 : 1;
 };
 
-main().catch((error) => {
-  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
-  writeCrashStatus(error);
-  process.exit(1);
-});
+main().catch(finishCrash);

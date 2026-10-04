@@ -80,7 +80,7 @@ async function supervise(configPath: string): Promise<void> {
   };
   const readOwner = (): ResidentHostOwner | undefined => readHandoverJson<ResidentHostOwner>(ownerPath);
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  trace("launcher-started", { pid: process.pid, configPath, platform: process.platform });
+  trace("launcher-started", { pid: process.pid, processStartTime: processStartTime(process.pid), configPath, platform: process.platform });
   if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(root)))) {
     trace("launcher-deferred", { reason: "existing handover custody" }); return;
   }

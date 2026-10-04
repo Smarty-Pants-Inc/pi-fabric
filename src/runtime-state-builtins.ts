@@ -23,6 +23,7 @@ import type { FabricShellJobStore } from "./core/shell-jobs.js";
 import { SessionsProvider } from "./providers/sessions-provider.js";
 import { TasksProvider } from "./providers/tasks-provider.js";
 import { StateProvider } from "./providers/state-provider.js";
+import { readWritePolicy } from "./agents/write-guard.js";
 
 import type { FabricManagedHost } from "./managed-host.js";
 
@@ -88,7 +89,17 @@ export class RuntimeStateBuiltins {
         this.#sessions = true;
         await this.install(createProviderComponent({
           provider: "sessions", description: "Interactive jev-fabric children: open, write, read, wait and stop",
-          create: () => new SessionsProvider(durable, { cwd, shellOverride: () => capturedTools.get("bash") !== undefined }),
+          create: () => new SessionsProvider(durable, {
+            cwd, shellOverride: () => capturedTools.get("bash") !== undefined,
+            writePolicy: () => {
+              // Read in the invocation process so malformed/inherited policy fails closed.
+              return readWritePolicy();
+            },
+            landlockEnforced: () => {
+              const settings = shell.getLandlockSettings?.();
+              return process.platform === "linux" && settings?.mode === "enforce" && !settings.disabled;
+            },
+          }),
         }));
       }
     }

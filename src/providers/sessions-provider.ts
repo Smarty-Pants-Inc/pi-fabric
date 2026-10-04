@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { writePolicyDenial, type FabricWritePolicy } from "../agents/write-guard.js";
 import type { FabricActionDescriptor, FabricInvocationContext, FabricProvider, FabricProviderListRequest } from "../protocol.js";
 import { validationMessage } from "../core/action-arguments.js";
 import type { DurableShellBridge } from "../jev-fabric/bridge.js";
@@ -78,7 +79,14 @@ export class SessionsProvider implements FabricProvider {
 
   constructor(
     readonly bridge: DurableShellBridge,
-    readonly options: { cwd: string; shellOverride: () => boolean },
+    readonly options: {
+      cwd: string;
+      shellOverride: () => boolean;
+      /** Session runners cannot preserve Pi's child write policy. */
+      writePolicy?: () => FabricWritePolicy | undefined;
+      /** Durable jev-fabric cannot run inside the host Landlock sandbox. */
+      landlockEnforced?: () => boolean;
+    },
   ) {}
 
   async list(request: FabricProviderListRequest): Promise<FabricActionDescriptor[]> {
@@ -129,6 +137,14 @@ export class SessionsProvider implements FabricProvider {
   async #open(args: Record<string, unknown>, context: FabricInvocationContext): Promise<unknown> {
     // Sessions run outside pi.bash: never let them bypass an extension's shell gate.
     if (this.options.shellOverride()) throw new Error("Interactive sessions are unavailable while an extension overrides bash; they would bypass its shell protection");
+    if (this.options.landlockEnforced?.()) throw new Error("Interactive sessions are unavailable while Landlock enforce is active; the jev-fabric runner cannot preserve the sandbox");
+    const policy = this.options.writePolicy?.();
+    if (policy) {
+      // The external runner cannot apply Pi's effective roots and shell hook.
+      // Refuse both argv and cmd forms rather than delegate an unrestricted child.
+      const denial = writePolicyDenial(policy, "bash", { command: "sessions.open" }, this.options.cwd);
+      throw new Error(denial ?? "Interactive sessions are unavailable while a child write policy is active; the runner cannot preserve it");
+    }
     if ((args.argv === undefined) === (args.cmd === undefined)) throw new Error("sessions.open needs exactly one of argv or cmd");
     const cwd = path.resolve(this.options.cwd, typeof args.cwd === "string" ? args.cwd : ".");
     if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Working directory does not exist: ${cwd}`);

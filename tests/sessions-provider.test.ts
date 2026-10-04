@@ -11,13 +11,18 @@ const fake = fileURLToPath(new URL("./fixtures/fake-jev-fabric.mjs", import.meta
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
-const setup = (options: { shellOverride?: boolean; root?: string } = {}) => {
+const setup = (options: { shellOverride?: boolean; root?: string; writePolicy?: () => any; landlockEnforced?: () => boolean } = {}) => {
   const root = options.root ?? fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-sessions-")));
   // PI_FABRIC_JEV_FABRIC_BIN runs the same contract against a real jev-fabric build.
   const binary = process.env.PI_FABRIC_JEV_FABRIC_BIN || path.join(root, "jev-fabric");
   if (!process.env.PI_FABRIC_JEV_FABRIC_BIN && !fs.existsSync(binary)) fs.writeFileSync(binary, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`, { mode: 0o755 });
   const bridge = { home: path.join(root, "home"), resolve: async () => ({ path: binary }) } as unknown as DurableShellBridge;
-  const provider = new SessionsProvider(bridge, { cwd: root, shellOverride: () => options.shellOverride === true });
+  const provider = new SessionsProvider(bridge, {
+    cwd: root,
+    shellOverride: () => options.shellOverride === true,
+    ...(options.writePolicy ? { writePolicy: options.writePolicy } : {}),
+    ...(options.landlockEnforced ? { landlockEnforced: options.landlockEnforced } : {}),
+  });
   if (!options.root) cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
   cleanups.push(() => provider.close());
   const call = (name: string, args: Record<string, unknown>, parentToolCallId = "fabric_exec_1") =>
@@ -26,6 +31,14 @@ const setup = (options: { shellOverride?: boolean; root?: string } = {}) => {
 };
 
 describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve", () => {
+  it("fails closed for child write policy and Landlock, for both command forms", async () => {
+    const policy = () => ({ readOnly: false, writableRoots: [process.cwd()], shell: "deny" as const });
+    await expect(setup({ writePolicy: policy }).call("open", { argv: ["true"] })).rejects.toThrow(/write policy|shell/);
+    await expect(setup({ writePolicy: policy }).call("open", { cmd: "true" })).rejects.toThrow(/write policy|shell/);
+    await expect(setup({ landlockEnforced: () => true }).call("open", { argv: ["true"] })).rejects.toThrow(/Landlock enforce/);
+    await expect(setup({ landlockEnforced: () => true }).call("open", { cmd: "true" })).rejects.toThrow(/Landlock enforce/);
+  });
+
   it("drives a persistent interactive child with write and read by offset", async () => {
     const { call } = setup();
     const opened = await call("open", { argv: ["cat"], label: "echo" });

@@ -6,7 +6,7 @@ import { normalizeFabricConfig } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { JevClient, JevCredentials } from "../src/jev/client.js";
 import type { DurableShellBridge } from "../src/jev-fabric/bridge.js";
-import { resolveJevFabric } from "../src/jev-fabric/resolve.js";
+import { resolveJevFabric, stageBundledJevFabric } from "../src/jev-fabric/resolve.js";
 import { JevProvider } from "../src/providers/jev-provider.js";
 import { jevContext } from "./jev-test-helpers.js";
 
@@ -113,6 +113,42 @@ describe.skipIf(process.platform === "win32")("SR-11 installed executable proven
   it("retains the explicit trusted custom-prefix override", async () => {
     const dir = root(); const candidate = binary(path.join(dir, "custom")); answer();
     await expect(resolveJevFabric({ ...options(dir, dir, ""), configured: candidate })).resolves.toMatchObject({ path: candidate, source: "config" });
+  });
+
+  it.each(["repository", "worktree", "repository alias", "staging worktree", "relative source", "relative agent directory"])("bundled staging refuses %s before creating an installed release", (layout) => {
+    const dir = root();
+    const repo = path.join(dir, "checkout");
+    fs.mkdirSync(repo, { recursive: true });
+    fs.writeFileSync(path.join(repo, ".git"), "gitdir: /fixture-not-followed");
+    let agentDir = path.join(dir, "agent");
+    let source = binary(path.join(dir, "installed", "node_modules", "jev-fabric-linux-x64", "bin"));
+    if (layout === "repository" || layout === "worktree" || layout === "repository alias") {
+      if (layout === "repository") { fs.unlinkSync(path.join(repo, ".git")); fs.mkdirSync(path.join(repo, ".git")); }
+      source = binary(path.join(repo, "bin"));
+      if (layout === "repository alias") {
+        const alias = path.join(dir, "installed-source-alias");
+        fs.symlinkSync(source, alias); source = alias;
+      }
+    } else if (layout === "staging worktree") agentDir = repo;
+    else if (layout === "relative source") source = "relative-source/jev-fabric";
+    else agentDir = "relative-agent";
+    expect(stageBundledJevFabric(agentDir, () => ({ version: "0.5.0", binaryPath: () => source }))).toBeUndefined();
+    expect(fs.existsSync(path.join(agentDir, "fabric"))).toBe(false);
+    expect(mocks.execFile).not.toHaveBeenCalled();
+  });
+
+  it("refuses an installation leaf owned by another principal", async () => {
+    const dir = root(); const candidate = binary(path.join(dir, "home", ".local", "bin"));
+    const lstat = fs.lstatSync.bind(fs);
+    const spy = vi.spyOn(fs, "lstatSync").mockImplementation(((target: any, ...args: any[]) => {
+      const stat = (lstat as any)(target, ...args);
+      return target === candidate ? Object.assign(Object.create(stat), { uid: process.getuid!() + 1 }) : stat;
+    }) as typeof fs.lstatSync);
+    answer();
+    try {
+      await expect(resolveJevFabric(options(dir, path.join(dir, "repo", "nested"), path.dirname(candidate)))).rejects.toThrow("not host-owned");
+      expect(mocks.execFile).not.toHaveBeenCalled();
+    } finally { spy.mockRestore(); }
   });
 
   it("refuses a repository-provided bundled candidate too", async () => {

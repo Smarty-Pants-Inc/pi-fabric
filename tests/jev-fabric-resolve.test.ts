@@ -40,7 +40,7 @@ describe.skipIf(process.platform === "win32")("jev-fabric binary resolution", ()
   it("prefers a compatible user install, including a newer one", async () => {
     const dir = root();
     const user = fake(path.join(dir, ".local", "bin"), newer);
-    const bundled = fake(path.join(dir, "bundled"), current);
+    const bundled = fake(path.join(dir, "fabric", "jev-fabric", "0.5.0"), current);
     const resolution = await resolveJevFabric({ configured: "", cwd: path.join(dir, "repo"), agentDir: dir, home: dir, requirement: "sessions", env: { PATH: path.join(dir, ".local", "bin") }, bundled: () => bundled });
     expect(resolution).toMatchObject({ path: user, source: "user", capabilities: { version: "0.7.0-native" } });
     expect(jevFabricStatus()).toContain("(yours)");
@@ -49,7 +49,7 @@ describe.skipIf(process.platform === "win32")("jev-fabric binary resolution", ()
   it("falls back to the bundled binary when the user's is too old, and says why", async () => {
     const dir = root();
     const user = fake(path.join(dir, ".local", "bin"), { version: "0.4.0-native" });
-    const bundled = fake(path.join(dir, "bundled"), current);
+    const bundled = fake(path.join(dir, "fabric", "jev-fabric", "0.5.0"), current);
     const resolution = await resolveJevFabric({ configured: "auto", cwd: path.join(dir, "repo"), agentDir: dir, home: dir, requirement: "sessions", env: { PATH: path.join(dir, ".local", "bin") }, bundled: () => bundled });
     expect(resolution).toMatchObject({ path: bundled, source: "bundled", skipped: [{ path: user, source: "user", reason: "protocol 1 < 2 (0.4.0-native)" }] });
     // The same old binary still serves durable tasks, which protocol 1 covers.
@@ -72,7 +72,7 @@ describe.skipIf(process.platform === "win32")("jev-fabric binary resolution", ()
   it("never falls back from an explicit binary, and explains a total miss", async () => {
     const dir = root();
     const old = fake(path.join(dir, "old"), { version: "0.4.0-native" });
-    const bundled = fake(path.join(dir, "bundled"), current);
+    const bundled = fake(path.join(dir, "fabric", "jev-fabric", "0.5.0"), current);
     await expect(resolveJevFabric({ configured: old, cwd: dir, agentDir: dir, home: dir, requirement: "sessions", env: { PATH: "" }, bundled: () => bundled }))
       .rejects.toThrow("does not fall back from an explicit binary");
     await expect(resolveJevFabric({ configured: "", cwd: dir, agentDir: dir, home: dir, requirement: "durable", env: { PATH: "" }, bundled: () => undefined }))

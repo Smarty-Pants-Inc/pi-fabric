@@ -691,7 +691,7 @@ keep working files. Unknown process/group identity is never permission to signal
 a recycled numeric ID or to discard custody. Worker crash publication waits for
 execution drain; on Linux surviving same-birth group members remain cleanup
 anchors after the leader exits. Portable POSIX leaderless groups without such
-anchors remain unresolved rather than being signaled blindly.
+anchors remain unresolved; no signal is sent without an owned cleanup anchor.
 
 **Windows scope cut:** the new execution-tree custody/exit receipt is unsupported
 on Windows. Ordinary process workers preserve the pre-PR native-child cleanup
@@ -707,10 +707,10 @@ cleanup or a product-owner risk acceptance.
 | Transport   | Operation                                                     | Command to attach            |
 | ----------- | ------------------------------------------------------------- | ---------------------------- |
 | `process`   | Runs a detached local worker process with the lowest overhead. This is the default transport | none |
-| `tmux`      | Disabled pending execution-custody support                    | —                           |
-| `screen`    | Disabled pending execution-custody support                    | —                           |
-| `localterm` | Disabled pending execution-custody support                    | —                           |
-| `herdr`     | Disabled pending execution-custody support                    | —                           |
+| `tmux`      | Disabled pending execution-custody support                    | unavailable                 |
+| `screen`    | Disabled pending execution-custody support                    | unavailable                 |
+| `localterm` | Disabled pending execution-custody support                    | unavailable                 |
+| `herdr`     | Disabled pending execution-custody support                    | unavailable                 |
 | `auto`      | Selects `process` only                                        | none                        |
 
 The following session-transport integration notes describe the disabled adapters

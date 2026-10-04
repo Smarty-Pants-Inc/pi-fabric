@@ -164,14 +164,23 @@ export function stageBundledJevFabric(agentDir: string, load: () => BundledPacka
     return undefined;
   }
   const source = located.binaryPath();
-  if (!source || !/^[0-9A-Za-z.+-]+$/.test(located.version)) return undefined;
+  if (!path.isAbsolute(agentDir) || !source || !path.isAbsolute(source) || !/^[0-9A-Za-z.+-]+$/.test(located.version)) return undefined;
+  let installedSource: string;
+  try {
+    installedSource = fs.realpathSync.native(source);
+    // Staging must not launder repository code into an apparently installed
+    // release. The bundled package is resolved from this installed extension,
+    // never from cwd; reject checkout/worktree sources and staging roots too.
+    if (enclosingRoot(path.dirname(source)) || enclosingRoot(path.dirname(installedSource)) ||
+        enclosingRoot(agentDir) || enclosingRoot(real(agentDir)) || !fs.statSync(installedSource).isFile()) return undefined;
+  } catch { return undefined; }
   const target = path.join(agentDir, "fabric", "jev-fabric", located.version, "jev-fabric");
   try {
-    if (fs.statSync(target).size === fs.statSync(source).size) return target;
+    if (fs.statSync(target).size === fs.statSync(installedSource).size) return target;
   } catch { /* Not staged yet. */ }
   fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   const temporary = `${target}.${process.pid}.tmp`;
-  fs.copyFileSync(source, temporary);
+  fs.copyFileSync(installedSource, temporary);
   fs.chmodSync(temporary, 0o755);
   fs.renameSync(temporary, target);
   return target;
@@ -230,7 +239,7 @@ export async function resolveJevFabric(options: {
   }
   const bundled = (options.bundled ?? (() => stageBundledJevFabric(options.agentDir)))();
   if (bundled) {
-    const root = real(path.resolve(options.agentDir));
+    const root = path.join(options.agentDir, "fabric", "jev-fabric");
     const identity = installedBinary(bundled, [root], workspaceRoots(options.cwd));
     if (!identity.path) skipped.push({ path: bundled, source: "bundled", reason: identity.reason! });
     else {

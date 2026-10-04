@@ -2,4 +2,4 @@
  * Bump on an incompatible boundary change; installed releases advertise this
  * value in dist/worker-protocol.json without executing their code in the parent.
  */
-export const WORKER_PROTOCOL_VERSION = 1;
+export const WORKER_PROTOCOL_VERSION = 2;

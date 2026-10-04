@@ -1,3 +1,4 @@
+import { assertNativeRolePair, assertNativeRoleTools, snapshotNativeRoleBinding, type NativeRoleBinding } from "./native-role-binding.js";
 import { copyFabricPrincipal, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
@@ -360,6 +361,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   routeOutcome?: (result: AgentRunResult) => void;
   /** Original authority for every attempt, never a prepared/observed replacement label. */
   routePin?: Readonly<NonNullable<AgentRunRequest["routeDecision"]>["pin"]>;
+  nativeRoleBinding?: NativeRoleBinding;
   actorId?: string;
   actorName?: string;
   spawner?: AgentSpawner;
@@ -1067,6 +1069,17 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
+    if (request.nativeRoleBinding) {
+      const binding = snapshotNativeRoleBinding(request.nativeRoleBinding);
+      request = { ...request, nativeRoleBinding: binding, runner: request.runner ?? "pi",
+        model: request.model ?? binding.model, thinking: request.thinking ?? binding.thinking,
+        tools: [...(request.tools ?? binding.tools)] };
+      if (request.runner !== "pi" || request.extensions === false || request.sessionSeed) {
+        throw new Error("NATIVE_ROLE_BINDING_MISMATCH: role work requires a native Pi worker with Fabric metadata");
+      }
+      assertNativeRoleTools(binding, request.tools!, "requested");
+      assertNativeRolePair(binding, request.model, request.thinking);
+    }
     // Snapshot trusted classification inputs before asynchronous preparation/queueing.
     const explicitRouteClass = request.routeClass ?? request.routeDecision?.routeClass;
     const routeFacts = {
@@ -1179,6 +1192,9 @@ export class AgentManager {
         if (queued) { queued.preparing = true; this.#invalidateUiList(); }
         preparation?.onPreparing?.();
         model = await this.prepareModelForAdmission(routePin?.model ?? model, runner, undefined, Boolean(routePin), signal, preparation?.timeoutMs);
+        if (request.nativeRoleBinding) {
+          assertNativeRolePair(request.nativeRoleBinding, model, routePin?.effort ?? request.thinking);
+        }
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();
@@ -1353,12 +1369,13 @@ export class AgentManager {
           "--route-class", runRoute.routeClass,
           "--route-class-source", runRoute.routeClassSource,
           ...(runRoute.protected !== undefined ? ["--protected", String(runRoute.protected)] : []),
-          ...(recursive || inheritedFullCodeMode || requiresFabricKernel
+          ...(recursive || inheritedFullCodeMode || requiresFabricKernel || request.nativeRoleBinding
             ? ["--fabric-extension", this.#fabricExtensionPath]
             : []),
           ...(model ? ["--model", model] : []),
           ...(request.modelReason !== undefined ? ["--model-reason", request.modelReason] : []),
           ...(thinking ? ["--thinking", thinking] : []),
+          ...(request.nativeRoleBinding ? ["--native-role-binding", JSON.stringify(request.nativeRoleBinding)] : []),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
           ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
@@ -1471,6 +1488,7 @@ export class AgentManager {
           ...(thinking ? { thinking } : {}),
           ...(routeDispatch ? { routeOutcome: routeDispatch.outcome } : {}),
           ...(routePin ? { routePin } : {}),
+          ...(request.nativeRoleBinding ? { nativeRoleBinding: request.nativeRoleBinding } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
           ...(request.actorName ? { actorName: request.actorName } : {}),
           ...(this.#spawner ? { spawner: this.#spawner } : {}),
@@ -2901,6 +2919,7 @@ export class AgentManager {
     try {
       if (managed.runner === "pi") {
         const model = await this.prepareModelForAdmission(managed.routePin?.model ?? managed.model, managed.runner, undefined, Boolean(managed.routePin));
+        if (managed.nativeRoleBinding) assertNativeRolePair(managed.nativeRoleBinding, model, managed.thinking);
         if (managed.routePin) setWorkerArgument(managed.launch.workerArguments, "thinking", managed.routePin.effort);
         const modelIndex = managed.launch.workerArguments.indexOf("--model");
         if (model) {
@@ -3501,6 +3520,7 @@ export class AgentManager {
       (tool) => tool !== "fabric_exec" &&
         (this.#inheritedToolAllowlist === undefined || this.#inheritedToolAllowlist.has(tool)),
     );
+    if (request.nativeRoleBinding) assertNativeRoleTools(request.nativeRoleBinding, tools, "after inherited ceiling");
     const extensions = request.recursive === true
       ? true
       : (request.extensions ?? this.config.extensions);

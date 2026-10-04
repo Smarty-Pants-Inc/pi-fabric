@@ -1,3 +1,4 @@
+import { nativeRoleBinding, assertNativeRolePair, assertNativeRoleParticipant, registerNativeRoleAttester } from "./agents/native-role-binding.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession } from "./topology/root-inbox.js";
 import type { RecordsService } from "./records/service.js";
@@ -1019,6 +1020,30 @@ export class FabricRuntimeState {
         actorParticipantRecord(actor, mainAgentId, hostId, identity.id, identity.id),
       ),
     );
+    const nativeBinding = nativeRoleBinding(this.pi.events);
+    if (nativeBinding) {
+      const directory = this.#participants;
+      let removeVerifiedSource: (() => void) | undefined;
+      registerNativeRoleAttester(this.pi.events, async (model, thinking) => {
+        assertNativeRolePair(nativeBinding, model, thinking);
+        const self = directory.self();
+        // Existing contradictory metadata is a refusal, not a label to silently repair.
+        if (self.model !== undefined || self.thinking !== undefined) {
+          assertNativeRolePair(nativeBinding, self.model, self.thinking);
+        }
+        const kind = identity.kind === "actor" ? "actor" : "agent";
+        if (identity.kind === "main" || self.id !== identity.id || self.kind !== kind) {
+          throw new Error("NATIVE_ROLE_BINDING_MISMATCH: self metadata identity cannot attest this worker");
+        }
+        const { local: _local, stale: _stale, ...record } = self;
+        removeVerifiedSource?.();
+        removeVerifiedSource = directory.registerSource(() => [{ ...record, model, thinking, updatedAt: Date.now() }]);
+        await directory.refresh();
+        const verified = directory.self();
+        assertNativeRoleParticipant(nativeBinding, verified, identity.id, kind);
+        return verified;
+      });
+    }
     this.#agents.subscribeUi(() => this.#participants?.scheduleRefresh());
     this.#actors.subscribe(() => this.#participants?.scheduleRefresh());
     let routeOwner: { client: import("./jev/client.js").JevClient; signal: AbortSignal; pending: Set<Promise<unknown>> } | undefined;
@@ -1066,6 +1091,7 @@ export class FabricRuntimeState {
         void pending.then(() => owner.pending.delete(pending), () => owner.pending.delete(pending));
         return pending;
       },
+      () => nativeRoleBinding(this.pi.events),
     );
     this.#agentsProvider = agentsProvider;
     this.#control.start((command, from, signal, verification) =>

@@ -1,3 +1,4 @@
+import { assertNativeRolePair, assertNativeRoleTools, snapshotNativeRoleBinding, type NativeRoleBinding } from "../agents/native-role-binding.js";
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
@@ -426,6 +427,8 @@ export class AgentsProvider implements FabricProvider {
     /** Current host effort, including child processes where the Main target is remote. */
     readonly callerThinking: () => string | undefined = () => undefined,
     readonly routeEvaluate: (request: JevRequest, signal: AbortSignal, context: FabricInvocationContext) => Promise<JevResponse> = async () => { throw new Error("Jev routing unavailable"); },
+    /** Supplied native activation authority, never reconstructed from self/name/environment. */
+    readonly callerNativeRoleBinding: () => NativeRoleBinding | undefined = () => undefined,
   ) {
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
@@ -568,6 +571,22 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #prepareSpawnRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
+    const activation = this.callerNativeRoleBinding();
+    if (activation) {
+      const binding = snapshotNativeRoleBinding(activation);
+      if ((args.runner !== undefined && args.runner !== "pi") || args.model === "auto" ||
+          args.extensions === false || (args.thinking !== undefined && !isFabricThinking(args.thinking)) ||
+          (args.model !== undefined && (typeof args.model !== "string" || !args.model.trim())) ||
+          (args.tools !== undefined && (!Array.isArray(args.tools) || args.tools.some(tool => typeof tool !== "string")))) {
+        throw new Error("NATIVE_ROLE_BINDING_MISMATCH: invalid role child selection; task was not sent");
+      }
+      const tools = args.tools === undefined ? [...binding.tools] : [...args.tools as string[]];
+      assertNativeRoleTools(binding, tools, "requested");
+      const request = await this.#runRequest({ ...args, runner: "pi", extensions: true, tools,
+        model: args.model ?? binding.model, thinking: args.thinking ?? binding.thinking }, context, false);
+      assertNativeRolePair(binding, request.model, request.thinking);
+      return { ...request, nativeRoleBinding: binding };
+    }
     if (args.model !== "auto") return this.#runRequest(args, context, false);
     const runner = args.runner ?? this.manager.config.runner;
     const transport = args.transport ?? this.manager.config.transport;
@@ -784,7 +803,8 @@ export class AgentsProvider implements FabricProvider {
     switch (actionName) {
       case "run": {
         const main = isInteractiveMain(context.extensionContext);
-        const request = await this.#runRequest(args, context);
+        const request = this.callerNativeRoleBinding()
+          ? await this.#prepareSpawnRequest(args, context) : await this.#runRequest(args, context);
         const handle = await this.manager.spawn(
           request,
           // Only the branded Main ceiling is observation-only, including during launch.

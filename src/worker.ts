@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import { assertNativeRolePair, assertNativeRoleTools, assertNativeRoleParticipant } from "./agents/native-role-binding.js";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -420,6 +421,14 @@ const main = async (): Promise<void> => {
     const { resolveRetrySdk } = await import(profileModule) as typeof import("./worker/retry-profile.js");
     piReleaseSdk = piRetrySdk ?? resolveRetrySdk(options.piBinary);
   }
+  const roleNonce = options.nativeRoleBinding ? randomUUID() : undefined;
+  const roleSnapshotFile = roleNonce ? path.join(path.dirname(options.statusFile), "native-role-binding.json") : undefined;
+  if (options.nativeRoleBinding) {
+    assertNativeRolePair(options.nativeRoleBinding, options.model, thinking);
+    assertNativeRoleTools(options.nativeRoleBinding, options.tools, "worker launch");
+    fs.writeFileSync(roleSnapshotFile!, JSON.stringify({ binding: options.nativeRoleBinding, runId: options.id,
+      nonce: roleNonce, id: options.actorId ?? options.id, kind: options.actorId ? "actor" : "agent" }), { mode: 0o600 });
+  }
   const piArguments = ["--mode", "rpc"];
   if (piSessionFile) piArguments.push("--session", activationSession?.file ?? piSessionFile);
   else piArguments.push("--no-session");
@@ -446,6 +455,12 @@ const main = async (): Promise<void> => {
     // CLI extensions precede discovered extensions. Install the compaction
     // guard before any other hook can start summarization work.
     piArguments.push("-e", hookPath, "--no-auto-compaction");
+  }
+  if (options.nativeRoleBinding) {
+    const roleHookPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts")
+      ? "./worker/native-role-binding.ts" : "./worker/native-role-binding.js", import.meta.url));
+    if (!fs.existsSync(roleHookPath)) throw new Error("Native role binding hook is missing");
+    piArguments.push("-e", roleHookPath);
   }
   if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
   const deliveryHook = fileURLToPath(new URL(
@@ -580,7 +595,9 @@ const main = async (): Promise<void> => {
   }
   const taskEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/task-entry.ts" : "./worker/task-entry.js", import.meta.url));
   const releaseEntryPath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./worker/release-entry.ts" : "./worker/release-entry.js", import.meta.url));
-  const spawnChild = (): ChildProcess => spawnCli(piRetrySdk ? taskEntryPath : piReleaseSdk ? releaseEntryPath : childBinary,
+  const spawnChild = (): ChildProcess => {
+    const roleFd = roleSnapshotFile ? fs.openSync(roleSnapshotFile, "r") : undefined;
+    try { return spawnCli(piRetrySdk ? taskEntryPath : piReleaseSdk ? releaseEntryPath : childBinary,
     piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments]
       : piReleaseSdk ? [piReleaseSdk, pinnedFabricExtension!, ...childArguments] : childArguments, {
     cwd: options.cwd,
@@ -641,8 +658,9 @@ const main = async (): Promise<void> => {
         : {}),
       ...(options.runRoot ? { PI_FABRIC_RUN_ROOT: options.runRoot } : {}),
     },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+    stdio: roleFd === undefined ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", roleFd],
+  }); } finally { if (roleFd !== undefined) fs.closeSync(roleFd); }
+  };
   // Every provider resume is a new execution obligation. Drain each attempt
   // before replacement, but retain the worker's custody until the whole run ends.
   const retainExecutionCustody = (execution: ChildProcess): void => {
@@ -823,6 +841,9 @@ const main = async (): Promise<void> => {
     }
   };
   let activationWindowReady = false;
+  let roleHookReady = false;
+  let roleAttested = false;
+  let roleAttestationRequested = false;
   let residentProbeReady = false;
   // Optional worker-only edge: never load native estimation in Main registration.
   const admissionModule = options.runner === "pi" && options.actorId && !activationWindow
@@ -834,6 +855,13 @@ const main = async (): Promise<void> => {
   let contextAdmission: InstanceType<NonNullable<typeof admissionModule>["ActorContextAdmission"]> | undefined;
   const dispatchPiPrompt = (): void => {
     if (terminalStatus) return;
+    if (options.nativeRoleBinding && !roleAttested) {
+      if (!roleAttestationRequested) {
+        roleAttestationRequested = true;
+        child.stdin?.write(`${JSON.stringify({ type: "prompt", message: "/fabric-role-admit " + roleNonce })}\n`);
+      }
+      return;
+    }
     const message = resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task;
     if (taskProvenance?.principal) sendPiDelivery(message, taskProvenance, "steer", resumePrompt ? [] : images);
     else child.stdin?.write(`${JSON.stringify({ type: "prompt", message, ...(!resumePrompt && images.length > 0 ? { images } : {}) })}\n`);
@@ -853,6 +881,11 @@ const main = async (): Promise<void> => {
     },
     admitted(model, effectiveThinking) {
       if (terminalStatus) return;
+      if (options.nativeRoleBinding) {
+        if (!roleHookReady) { modelControl.fail("NATIVE_ROLE_BINDING_MISMATCH: native role hook did not acknowledge readiness; task was not sent"); return; }
+        try { assertNativeRolePair(options.nativeRoleBinding, model, effectiveThinking); }
+        catch (error) { modelControl.fail(error instanceof Error ? error.message : String(error)); return; }
+      }
       if ((options.routeHeader || options.judgment) && (!thinking || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(effectiveThinking ?? "") || effectiveThinking !== thinking)) {
         modelControl.fail("routed effort pin was not admitted; task was not sent");
         return;
@@ -865,7 +898,7 @@ const main = async (): Promise<void> => {
       if (["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(effectiveThinking ?? "")) {
         record.thinking = effectiveThinking as NonNullable<AgentRunRecord["thinking"]>;
       }
-      if (options.routeHeader) {
+      if (options.routeHeader || options.nativeRoleBinding) {
         if (record.model) record.admittedModel = record.model;
         if (effectiveThinking) record.admittedThinking = effectiveThinking as NonNullable<AgentRunRecord["thinking"]>;
       }
@@ -1323,6 +1356,27 @@ const main = async (): Promise<void> => {
       }
       return;
     }
+    if (options.nativeRoleBinding && event.type === "fabric_native_role_ready") {
+      if (event.runId === options.id && event.nonce === roleNonce && event.protocol === 1 && !roleHookReady) roleHookReady = true;
+      else modelControl.fail("NATIVE_ROLE_BINDING_MISMATCH: native role readiness does not match this worker");
+      return;
+    }
+    if (options.nativeRoleBinding && event.type === "fabric_native_role_admitted") {
+      try {
+        if (!roleAttestationRequested || roleAttested || event.runId !== options.id || event.nonce !== roleNonce || event.error) {
+          throw new Error(`NATIVE_ROLE_BINDING_MISMATCH: invalid native role attestation: ${String(event.error ?? "run/nonce/state mismatch")}`);
+        }
+        assertNativeRolePair(options.nativeRoleBinding, stringField(event.model), stringField(event.thinking));
+        if (!Array.isArray(event.tools) || event.tools.some(tool => typeof tool !== "string")) throw new Error("native tool attestation is missing");
+        assertNativeRoleTools(options.nativeRoleBinding, event.tools as string[], "delivered");
+        if (!event.participant || typeof event.participant !== "object") throw new Error("self metadata attestation is missing");
+        assertNativeRoleParticipant(options.nativeRoleBinding, event.participant as import("./topology/types.js").FabricParticipantInfo,
+          options.actorId ?? options.id, options.actorId ? "actor" : "agent");
+        roleAttested = true;
+        dispatchPiPrompt();
+      } catch (error) { modelControl.fail(error instanceof Error ? error.message : String(error)); }
+      return;
+    }
     compactControl.observe(event);
     if (activationWindow && event.type === "fabric_activation_window_ready") {
       if (event.runId === options.id && event.nonce === activationNonce &&
@@ -1597,6 +1651,7 @@ const main = async (): Promise<void> => {
   let steerRemainder = Buffer.alloc(0);
   let skippingOversizedSteerLine = false;
   const pollSteer = (): void => {
+    if (options.nativeRoleBinding && !roleAttested) return;
     if (!options.steerFile || terminalStatus || (options.runner === "pi" &&
         (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))) return;
     let descriptor: number | undefined;
@@ -1913,6 +1968,9 @@ const main = async (): Promise<void> => {
     piSettledSuccessfully = false;
     stderr = "";
     activationWindowReady = false;
+    roleHookReady = false;
+    roleAttested = false;
+    roleAttestationRequested = false;
     outputDecoder = new StringDecoder("utf8");
     stderrDecoder = new StringDecoder("utf8");
     eventProjection = new PiEventProjection();

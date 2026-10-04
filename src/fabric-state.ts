@@ -234,6 +234,11 @@ export class FabricState {
   }
 
   shouldEagerlyActivate(context: ExtensionContext): boolean {
+    // A bound native worker must attest its real self record before its first task.
+    // Unbound/idle Main and ordinary task workers keep the existing lazy behavior.
+    let nativeRole = false;
+    this.pi.events?.emit("fabric.native-role.activation-query", { accept() { nativeRole = true; } });
+    if (nativeRole) return true;
     if (
       process.env.PI_FABRIC_CAPABILITY_REQUIREMENTS !== undefined &&
       Boolean(process.env.PI_FABRIC_CAPABILITY_DIGEST)

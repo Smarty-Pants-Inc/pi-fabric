@@ -1,3 +1,4 @@
+import { isNativePassRole, snapshotNativeRoleBinding } from "../agents/native-role-binding.js";
 import { copyFabricProvenance, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
@@ -3033,7 +3034,12 @@ export class ActorManager {
     capabilityRequirements?: string[],
     capabilityDigest?: string,
   ): AgentRunRequest {
+    // Role selection is the owner's actor definition, not a child request name or environment.
+    const nativeRoleBinding = actor.runner === "pi" && isNativePassRole(actor.name)
+      ? snapshotNativeRoleBinding({ role: actor.name, model: binding.model,
+          thinking: binding.thinking, tools: actor.tools }) : undefined;
     return {
+      ...(nativeRoleBinding ? { nativeRoleBinding } : {}),
       ...(item.provenance ? { provenance: structuredClone(item.provenance) } : {}),
       task: [
         `Fabric actor message from ${item.source}:`,

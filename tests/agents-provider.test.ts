@@ -1,3 +1,4 @@
+import { snapshotNativeRoleBinding, type NativeRoleBinding } from "../src/agents/native-role-binding.js";
 import { execFileSync } from "node:child_process";
 import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -663,6 +664,7 @@ const setup = (
     selfOwnerHostId?: string;
     switchModel?: FabricMainAgentTarget["switchModel"];
     callerThinking?: string;
+    nativeRoleBinding?: NativeRoleBinding;
     modelsConfig?: FabricModelsConfig;
     routeEvaluate?: import("../src/agents/model-route.js").RouteEvaluate;
     agentsConfig?: Partial<FabricAgentConfig>;
@@ -796,6 +798,7 @@ const setup = (
     () => options?.modelsConfig ?? DEFAULT_FABRIC_CONFIG.models,
     () => options?.callerThinking,
     options?.routeEvaluate,
+    () => options?.nativeRoleBinding,
   );
   return {
     root,
@@ -813,6 +816,59 @@ const setup = (
     actorDeliveries,
   };
 };
+
+describe("#2668 role-bound child provider admission", () => {
+  const nativeTools = ["read", "grep", "find", "ls", "bash", "write"];
+  const binding = (role: "review-agent" | "security-agent") => snapshotNativeRoleBinding({ role,
+    model: "cliproxyapi/gpt-6.1-sol", thinking: "max", tools: nativeTools });
+  it.each(["review-agent", "security-agent"] as const)("%s child inherits the trusted activation, not global/default/current labels", async role => {
+    const h = setup([], [], undefined, { nativeRoleBinding: binding(role), callerThinking: "medium",
+      agentsConfig: { model: "provider/project", thinking: "medium", defaultTools: ["read"] } });
+    const launch = vi.spyOn(h.agents, "spawn");
+    const inherited = { ...context, extensionContext: { ...context.extensionContext,
+      model: { provider: "provider", id: "project" } } as ExtensionContext };
+    const child = await h.provider.invoke("spawn", { task: "pass", name: "unrelated-task-name" }, inherited) as AgentHandleInfo;
+    await h.agents.wait(child.id);
+    expect(launch.mock.calls[0]![0]).toMatchObject({ model: binding(role).model, thinking: "max",
+      tools: nativeTools, nativeRoleBinding: binding(role), extensions: true });
+    expect(launch.mock.calls[0]![0]).not.toHaveProperty("actorId");
+    expect(launch.mock.calls[0]![0]).not.toHaveProperty("actorName");
+  });
+  it.each(["review-agent", "security-agent"] as const)("%s accepts an explicit canonical matching pair and unordered matching native set", async role => {
+    const h = setup([], [], undefined, { nativeRoleBinding: binding(role) });
+    const child = await h.provider.invoke("spawn", { task: "pass", model: binding(role).model, thinking: "max",
+      tools: [...nativeTools].reverse().concat("fabric_exec", "bash") }, context) as AgentHandleInfo;
+    expect((await h.agents.wait(child.id)).status).toBe("completed");
+  });
+  it.each([
+    { model: "provider/project" }, { thinking: "medium" }, { thinking: "turbo" },
+    { model: "auto" }, { model: "" }, { model: false }, { tools: nativeTools.filter(tool => tool !== "bash") },
+    { tools: [...nativeTools, "edit"] }, { tools: ["bash", 1] }, { tools: null }, { runner: "claude" }, { extensions: false },
+  ])("refuses explicit mismatch without launching: %j", async patch => {
+    const h = setup([], [], undefined, { nativeRoleBinding: binding("review-agent") });
+    const launch = vi.spyOn(h.agents, "spawn");
+    await expect(h.provider.invoke("spawn", { task: "pass", ...patch }, context)).rejects.toThrow("NATIVE_ROLE_BINDING_MISMATCH");
+    expect(launch).not.toHaveBeenCalled(); expect(h.agents.list()).toEqual([]);
+  });
+  it("run cannot bypass the same role-bound child launch checks", async () => {
+    const h = setup([], [], undefined, { nativeRoleBinding: binding("security-agent") });
+    const launch = vi.spyOn(h.agents, "spawn");
+    await expect(h.provider.invoke("run", { task: "pass", thinking: "medium" }, context)).rejects.toThrow("NATIVE_ROLE_BINDING_MISMATCH");
+    expect(launch).not.toHaveBeenCalled();
+  });
+  it("neither public nativeRoleBinding nor task/name/environment labels bind ordinary Main children", async () => {
+    vi.stubEnv("PI_FABRIC_ACTOR_NAME", "review-agent"); vi.stubEnv("SMARTY_ROLE", "security-agent");
+    try {
+      const h = setup([], [], undefined, { agentsConfig: { defaultTools: ["read"], thinking: "medium" } });
+      const launch = vi.spyOn(h.agents, "spawn");
+      const child = await h.provider.invoke("spawn", { task: "review/security pass", name: "review-agent",
+        nativeRoleBinding: binding("review-agent") }, context) as AgentHandleInfo;
+      await h.agents.wait(child.id);
+      expect(launch.mock.calls[0]![0]).not.toHaveProperty("nativeRoleBinding");
+      expect(h.agents.status(child.id).thinking).toBe("medium");
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
 
 describe("#2643 immediate bound spawner routing", () => {
   it.each(["session", "durable"] as const)("routes a %s actor child's spawner followUp to the actor, not root Main", async (residency) => {

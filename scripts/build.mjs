@@ -86,6 +86,7 @@ const lazyEntryPoints = [
   "src/worker/reply-tool.ts",
   "src/worker/principal-delivery.ts",
   "src/worker/session-id.ts",
+  "src/worker/native-role-binding.ts",
   "src/worker/model-control.ts",
   "src/worker/context-admission.ts",
   "src/worker/options.ts",

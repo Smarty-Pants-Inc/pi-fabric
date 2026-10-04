@@ -58,6 +58,8 @@ export interface AgentSpawner {
 }
 
 export interface AgentRunRequest {
+  /** Immutable native activation contract; host-only, never public argument authority. */
+  nativeRoleBinding?: import("./native-role-binding.js").NativeRoleBinding;
   /** Explicit history class; routing still requires a separately prepared decision. */
   routeClass?: string;
   protected?: boolean;
@@ -277,6 +279,7 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  nativeRoleBinding?: import("./native-role-binding.js").NativeRoleBinding;
   /** Spawn-selected Fabric package root, retained in the durable run record. */
   fabricRelease?: string;
   /** Host-created record metadata, independent of the route header/decision. */

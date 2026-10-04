@@ -1,3 +1,4 @@
+import { snapshotNativeRoleBinding } from "../agents/native-role-binding.js";
 import type { AgentRunCarryOver, AgentWorkerOptions } from "../agents/types.js";
 
 const argumentMap = (argv: readonly string[]): Map<string, string> => {
@@ -62,6 +63,8 @@ export const parseWorkerOptions = (
   argv: readonly string[] = process.argv,
 ): AgentWorkerOptions => {
   const args = argumentMap(argv);
+  const nativeRoleSource = optional(args, "native-role-binding");
+  const nativeRoleBinding = nativeRoleSource === undefined ? undefined : snapshotNativeRoleBinding(JSON.parse(nativeRoleSource));
   const model = optional(args, "model");
   const modelReason = args.get("model-reason");
   const routeHeader = optional(args, "route-header");
@@ -183,7 +186,11 @@ export const parseWorkerOptions = (
   if (residentStartupProbe && (runner !== "pi" || !extensions || actorId || sessionFile || schemaFile || replyTool)) {
     throw new Error("Resident startup probe must be an isolated Pi worker");
   }
+  if (nativeRoleBinding && (runner !== "pi" || !extensions)) {
+    throw new Error("NATIVE_ROLE_BINDING_MISMATCH: role workers require Pi and Fabric extensions");
+  }
   return {
+    ...(nativeRoleBinding ? { nativeRoleBinding } : {}),
     ...(residentStartupProbe ? { residentStartupProbe: true } : {}),
     id: required(args, "id"),
     ...(fabricRelease ? { fabricRelease } : {}),

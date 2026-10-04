@@ -547,6 +547,8 @@ export interface FabricInvocationContext {
   signal: AbortSignal | undefined;
   parentToolCallId: string;
   nestedToolCallId: string;
+  /** Host-owned scoped runner; preserves nested budget ancestry across registry signal wrappers. */
+  nestedProgramRunner?: import("./execution-service.js").FabricNestedProgramRunner;
   extensionContext: ExtensionContext;
   update(message: string): void;
   activity?(update: FabricInvocationActivityUpdate): void;

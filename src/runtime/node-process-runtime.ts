@@ -186,6 +186,7 @@ export class NodeProcessRuntime {
       const humanWait = new HumanWaitDeadlinePause(humanWaitDeadlineClock(
         () => executionDeadline, options, scheduleDeadline, expireDeadline,
       ));
+      options.registerHumanWaitPause?.(humanWait);
 
       abortHandler = () => {
         // Preserve only the Main watchdog reason for host observers (e.g. a local actor ASK).

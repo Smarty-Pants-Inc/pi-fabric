@@ -1,6 +1,7 @@
 import { createMainExecutionCeilingError, isMainExecutionCeilingError, mainExecutionCeilingAbortReason, preserveCancellationOutcome, shareCancellationEffects } from "./async-settlement.js";
 import { ResultConsumption } from "./result-consumption.js";
 import { ExecutionDeadline } from "./runtime/execution-deadline.js";
+import type { HumanWaitDeadlinePause } from "./runtime/deadline-pause.js";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -675,6 +676,10 @@ export class FabricExecutionService {
       const separator = ref.indexOf(".");
       return this.registry.invoke(ref, args, {
         ...callContext,
+        ...(ref === "programs.run" ? { nestedProgramRunner: {
+          kernel: python ? "python" as const : "typescript" as const,
+          run: (request: FabricNestedProgramRun, signal: AbortSignal | undefined) => runNestedProgram(request, signal, humanWaitPauses.get(callContext.signal)),
+        } } : {}),
         // The registry resolves `provider.action` by this exact prefix, so the
         // view is bound to the provider that receives it.
         ...(participants && separator > 0
@@ -751,6 +756,11 @@ export class FabricExecutionService {
     // Observe the original outer signal before a runtime's lossy forwarding.
     // For runtime-first expiry, consult the shared host-owned clamp record,
     // never guest text/name or merely the fact that Main's wall time elapsed.
+    // Each nested guest owns a distinct runtime signal. Preserve its ancestors
+    // through provider normalization, then bind them into the scoped runner:
+    // registry shutdown/binding signals are intentionally different objects.
+    const humanWaitPauses = new WeakMap<AbortSignal, HumanWaitDeadlinePause[]>();
+    let rootHumanWaitPause: HumanWaitDeadlinePause | undefined;
     const providerSignals = new WeakMap<AbortSignal, AbortSignal>();
     const providerSignalCleanups: Array<() => void> = [];
     const providerSignal = (runtimeSignal: AbortSignal): AbortSignal => {
@@ -783,6 +793,8 @@ export class FabricExecutionService {
         // receipt ledger from the runtime's outer cancellation/teardown boundary.
         combined = shareCancellationEffects(AbortSignal.any([programSignal, normalizedRuntime.signal]), runtimeSignal);
         providerSignals.set(runtimeSignal, combined);
+        const pauses = humanWaitPauses.get(runtimeSignal);
+        if (pauses) humanWaitPauses.set(combined, pauses);
       }
       return combined;
     };
@@ -807,6 +819,7 @@ export class FabricExecutionService {
       memoryLimitBytes: this.config.executor.memoryLimitBytes,
       maxLogChars: this.config.executor.maxOutputChars,
       minimumTimeoutMsForHostCall,
+      registerHumanWaitPause(pause: HumanWaitDeadlinePause) { rootHumanWaitPause = pause; },
       ...(humanWaitRefs.size > 0 ? { isHumanWaitHostCall } : {}),
       ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt, maximumDeadlineReason: mainCeilingReason! } : {}),
       onHostResultDelivered(args: Record<string, unknown>) {
@@ -827,6 +840,7 @@ export class FabricExecutionService {
     const runNestedProgram = async (
       request: FabricNestedProgramRun,
       signal: AbortSignal | undefined,
+      inheritedPauses?: HumanWaitDeadlinePause[],
     ): Promise<unknown> => {
       const bridge = hostCall;
       if (!bridge) throw new Error("Fabric program runs need an active execution");
@@ -843,6 +857,7 @@ export class FabricExecutionService {
         programSignal,
         ...(signal ? [signal] : []),
       ]), programSignal);
+      const enclosingPauses = inheritedPauses ?? (rootHumanWaitPause ? [rootHumanWaitPause] : []);
       let stage: FabricExecutionFailureStageV1 = "invoke";
       try {
         if (request.call) {
@@ -874,10 +889,19 @@ export class FabricExecutionService {
         }
         // Guest span ids restart in each program; keep them distinct per run.
         const spanPrefix = `program-${nestedRuns}:`;
-        const nestedBridge: FabricHostCall = (ref, args, callSignal) =>
-          (ref === "fabric.$spanStart" || ref === "fabric.$spanEnd") && typeof args.id === "string"
-            ? bridge(ref, { ...args, id: `${spanPrefix}${args.id}` }, callSignal)
-            : bridge(ref, args, callSignal);
+        let nestedPause: HumanWaitDeadlinePause | undefined;
+        const nestedBridge: FabricHostCall = async (ref, args, callSignal) => {
+          humanWaitPauses.set(callSignal, [...enclosingPauses, ...(nestedPause ? [nestedPause] : [])]);
+          const humanWait = isHumanWaitHostCall(ref, args);
+          if (humanWait) for (const pause of enclosingPauses) pause.enter();
+          try {
+            return await ((ref === "fabric.$spanStart" || ref === "fabric.$spanEnd") && typeof args.id === "string"
+              ? bridge(ref, { ...args, id: `${spanPrefix}${args.id}` }, callSignal)
+              : bridge(ref, args, callSignal));
+          } finally {
+            if (humanWait) for (const pause of enclosingPauses) pause.leave();
+          }
+        };
         const nestedTimeoutMs = capForMain(codeUsesOrchestration(source) ? orchestrationTimeoutMs : this.config.executor.timeoutMs);
         const nestedDeadline = new ExecutionDeadline({
           timeoutMs: nestedTimeoutMs,
@@ -889,6 +913,7 @@ export class FabricExecutionService {
             ...sandboxBase,
             timeoutMs: nestedTimeoutMs,
             executionDeadline: nestedDeadline,
+            registerHumanWaitPause(pause: HumanWaitDeadlinePause) { nestedPause = pause; },
             ...(prepared.javascript ? { transpiledCode: prepared.javascript } : {}),
             ...(prepared.sourceMap ? { transpiledSourceMap: prepared.sourceMap } : {}),
             signal: runSignal,

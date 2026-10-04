@@ -106,6 +106,7 @@ export class MontyRuntime implements FabricKernelRuntime {
     const humanWait = new HumanWaitDeadlinePause(humanWaitDeadlineClock(
       () => executionDeadline, options, scheduleDeadline, () => stop("timed_out"),
     ));
+    options.registerHumanWaitPause?.(humanWait);
     scheduleDeadline();
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();

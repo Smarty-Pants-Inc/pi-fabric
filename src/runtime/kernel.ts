@@ -1,5 +1,5 @@
 import type { ExecutionDeadline } from "./execution-deadline.js";
-import type { PausableDeadlineClock } from "./deadline-pause.js";
+import type { HumanWaitDeadlinePause, PausableDeadlineClock } from "./deadline-pause.js";
 
 /**
  * Adapt upstream's human-wait clock to the fork's shared deadline. The shared
@@ -149,6 +149,8 @@ export interface FabricSandboxOptions {
   /** True for a host call that waits for a person (executor.humanWaitRefs).
    * The program deadline is paused while any such call is in flight. */
   isHumanWaitHostCall?(ref: string, args: Record<string, unknown>): boolean;
+  /** Host-only registration so nested human waits can pause this enclosing runtime. */
+  registerHumanWaitPause?(pause: HumanWaitDeadlinePause): void;
   /** Declared core override fields must not be consumed as built-in aliases. */
   piToolCanonicalFields?: Record<string, string[]>;
   /** False in orchestration-only mode, where the guest has no usable `pi`; guides runtime hints. */

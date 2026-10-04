@@ -148,7 +148,7 @@ export class ProgramsProvider implements FabricProvider {
   }
 
   async #run(args: Record<string, unknown>, context: FabricInvocationContext): Promise<unknown> {
-    const runner = this.nestedRunner(context.parentToolCallId);
+    const runner = context.nestedProgramRunner ?? this.nestedRunner(context.parentToolCallId);
     if (!runner) throw new Error("programs.run runs only inside a fabric_exec program or a host program run");
     const record = await this.store.resolve(args.ref, { requirePromoted: args.requirePromoted === true });
     const label = programRef(record, true);

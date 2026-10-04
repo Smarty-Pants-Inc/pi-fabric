@@ -264,6 +264,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
       const humanWait = new HumanWaitDeadlinePause(humanWaitDeadlineClock(
         () => executionDeadline, options, scheduleDeadline, expireDeadline,
       ));
+      options.registerHumanWaitPause?.(humanWait);
       const send = (message: any, delivered?: () => void): void => {
         // A terminal guest result closes its reply channel while issued host
         // work may still be settling. Its late replies are no longer consumed.

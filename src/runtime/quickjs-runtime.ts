@@ -1050,6 +1050,7 @@ export class QuickJsRuntime {
     const humanWait = new HumanWaitDeadlinePause(humanWaitDeadlineClock(
       () => executionDeadline, options, scheduleDeadline, expireDeadline,
     ));
+    options.registerHumanWaitPause?.(humanWait);
 
     try {
       const hostFunction = context.newFunction(

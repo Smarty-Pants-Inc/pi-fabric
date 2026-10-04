@@ -11,7 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import {
@@ -41,7 +41,7 @@ import { tokenUsagePayloadFromValue } from "../lifecycle/types.js";
 import type { FabricTokenUsagePayload } from "../lifecycle/types.js";
 import { AgentAdmission, assertAgentTask, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, type AgentLifecycleState } from "./lifecycle.js";
 import { removeTree } from "./rm.js";
-import { ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, type PendingRunArchive } from "./archive-custody.js";
+import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, type PendingRunArchive } from "./archive-custody.js";
 import { ActorChildCompletionStore } from "../actors/child-completions.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
@@ -102,19 +102,24 @@ import {
 } from "../storage/retention.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
 
-const removeManagedRunRoot = async (root: string): Promise<void> => {
-  const deadline = Date.now() + (process.platform === "win32" ? 2_000 : 250);
+const removeManagedRunRoot = async (root: string, managed: boolean): Promise<void> => {
+  const deadline = Date.now() + (managed || process.platform === "win32" ? 2_000 : 250);
+  let emptyChecked = false;
   while (true) {
     try {
-      const entries = fs.readdirSync(root);
-      if (!entries.every((name) => name === ".fabric-owner.json")) return;
-      if (entries.includes(".fabric-owner.json")) fs.unlinkSync(path.join(root, ".fabric-owner.json"));
+      if (!emptyChecked) {
+        const entries = fs.readdirSync(root);
+        if (!entries.every((name) => name === ".fabric-owner.json")) return;
+        if (entries.includes(".fabric-owner.json")) fs.unlinkSync(path.join(root, ".fabric-owner.json"));
+        emptyChecked = true;
+      }
+      // rmdir itself protects contents appearing after the initial empty check.
       fs.rmdirSync(root);
       return;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException | undefined)?.code;
-      if ((code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY") || Date.now() >= deadline) return;
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      if ((code !== "EBUSY" && code !== "EPERM" && (managed || code !== "ENOTEMPTY")) || Date.now() >= deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(managed ? 50 : 25, deadline - Date.now())));
     }
   }
 };
@@ -1082,7 +1087,7 @@ export class AgentManager {
       ? { ...(typeof this.#completionRecipient === "function" ? this.#completionRecipient() : this.#completionRecipient) }
       : undefined;
     if (request.model === "auto") throw new Error('Unresolved model: "auto" must go through agents.spawn routing');
-    const routedActor = request.routeDecision?.mode === "shadow" && Boolean(request.actorId) &&
+    const routedActor = (request.routeDecision?.mode === "shadow" || request.routeDecision?.mode === "live") && Boolean(request.actorId) &&
       request.routeDecision.actorId === request.actorId && Boolean(request.routeDecision.activationId) && Boolean(request.sessionFile);
     if (request.routeDecision && ((request.runner ?? this.config.runner) !== "pi" ||
       (request.transport ?? this.config.transport) !== "process" || (request.residency ?? "session") !== "session" ||
@@ -1135,7 +1140,9 @@ export class AgentManager {
     const tools = this.#childTools(request, runner, requiresFabricKernel);
     if (runner === "claude") mapClaudeTools(tools);
     if (runner === "veda") mapVedaTools(tools);
-    const routePin = request.routeDecision ? Object.freeze({ ...request.routeDecision.pin }) : undefined;
+    // Freeze the admitted finite selection for every retry/resume.
+    let routePin = request.routeDecision ? Object.freeze({ ...(request.routeDecision.mode === "live"
+      ? { model: request.routeDecision.model, effort: request.routeDecision.effort } : request.routeDecision.pin) }) : undefined;
     let model = routePin?.model ?? (request.model?.trim() || this.defaultModel(runner));
     this.assertModelAllowed(model, runner);
     // Alternate backend targets must be known before even accepting a queue receipt.
@@ -1169,6 +1176,10 @@ export class AgentManager {
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
       routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id, request.routeRecord);
+      // Failed decision storage demotes before admission: no unlogged candidate.
+      routePin = Object.freeze({ ...(request.routeDecision.mode === "live"
+        ? { model: request.routeDecision.model, effort: request.routeDecision.effort } : request.routeDecision.pin) });
+      model = routePin.model;
     }
     const startPrepared = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try {
@@ -1198,6 +1209,12 @@ export class AgentManager {
         writeJsonAtomic(path.join(runDirectory, ARCHIVE_PENDING_FILE), { format: 1, awaitingResult: true, ownerPid: process.pid,
           ...(process.env.PI_FABRIC_ACTOR_SESSION_FILE && this.#spawner?.kind === "actor" ? { actorSessionFile: process.env.PI_FABRIC_ACTOR_SESSION_FILE, spawner: this.#spawner, notify: this.config.notifyOnComplete, actorOnly: !routeDispatch } : {}) }, { durable: true });
         if (process.env.PI_FABRIC_ACTOR_SESSION_FILE && this.#spawner?.kind === "actor") new ActorChildCompletionStore(process.env.PI_FABRIC_ACTOR_SESSION_FILE).trackArchiveSource(id, runDirectory);
+      }
+      // Actor-log custody is a separate sink from the terminal routing save.
+      // Establish it before dispatch; only a confirmed archive can release it.
+      if (routedActor && request.sessionFile) {
+        writeJsonAtomic(path.join(runDirectory, ACTOR_RUN_ARCHIVE_PENDING_FILE), { format: 1, runId: id,
+          actorId: request.actorId, sessionFile: request.sessionFile }, { durable: true });
       }
       if (this.#managedTempRoot && !this.#retentionTimer) {
         this.#retentionTimer = setInterval(() => this.#scheduleRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
@@ -1587,8 +1604,8 @@ export class AgentManager {
       ...(kernel ? { kernel } : {}),
       ...(model ? { model } : {}),
       ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
-      ...(request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking
-        ? { thinking: request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking } : {}),
+      ...(routePin?.effort ?? request.thinking ?? this.config.thinking
+        ? { thinking: routePin?.effort ?? request.thinking ?? this.config.thinking } : {}),
       ...(request.actorId ? { actorId: request.actorId } : {}),
       ...(request.actorName ? { actorName: request.actorName } : {}),
       ...(this.#spawner ? { spawner: this.#spawner } : {}),
@@ -1730,6 +1747,8 @@ export class AgentManager {
     if (queued && !queued.terminal && !queued.preparing) onQueued?.(this.#queuedInfo(queued));
     return this.wait(handle.id);
   }
+
+  /** Caller/actor quality assertion, joined to a locally owned routed run only. */
 
   /** Side-effect-free settlement join for preparation before a durable mutation fence. */
   async join(id: string): Promise<void> {
@@ -2066,6 +2085,34 @@ export class AgentManager {
 
   runDirectory(id: string): string | undefined {
     return this.#runs.get(id)?.runDirectory;
+  }
+
+  /** Discharge actor-log custody only after the owning archive succeeded. */
+  async commitActorArchive(runId: string, actorId: string, sessionFile: string): Promise<void> {
+    const directory = this.actorArchiveSources(actorId, sessionFile).get(runId);
+    if (!directory) return;
+    fs.rmSync(path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE));
+    syncDirectoryChain(directory);
+    // A restarted owner has no live handle, but the saved native exit and all
+    // other archive fences still govern collection of this exact source.
+    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await removeTree(directory);
+  }
+  /** Recover only this actor's fenced sources under the configured host run root. */
+  actorArchiveSources(actorId: string, sessionFile: string): Map<string, string> {
+    const sources = new Map<string, string>();
+    if (!ownedStat(this.#runRoot)?.isDirectory()) return sources;
+    for (const runId of fs.readdirSync(this.#runRoot)) {
+      if (!/^[a-f0-9]{32}$/.test(runId)) continue;
+      const directory = path.join(this.#runRoot, runId);
+      const file = path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE);
+      if (!ownedStat(directory)?.isDirectory() || !ownedStat(file)?.isFile()) continue;
+      try {
+        if (fs.statSync(file).size > 4096) continue;
+        const marker = JSON.parse(fs.readFileSync(file, "utf8"));
+        if (marker.format === 1 && marker.runId === runId && marker.actorId === actorId && marker.sessionFile === sessionFile) sources.set(runId, directory);
+      } catch { /* Unreadable custody stays a collection veto, never authority. */ }
+    }
+    return sources;
   }
 
   worktreeGitRoot(id: string): string | undefined {
@@ -2533,9 +2580,9 @@ export class AgentManager {
             .filter(queued => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
               !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
             .map(queued => removeTree(path.join(this.#runRoot, queued.info.id)).catch(() => undefined)));
-          // Windows can retain the just-closed worker directory briefly. Retry
-          // only the owned empty root; never recursively remove unknown contents.
-          await removeManagedRunRoot(this.#runRoot);
+          // Independently collectible tracked runs were removed above. Retry only
+          // the owned empty root; never recursively remove unknown contents.
+          await removeManagedRunRoot(this.#runRoot, this.#managedTempRoot);
         }
       } else if (this.#managedTempRoot) {
         try { markRunRootClosed(this.#runRoot, Date.now(), true); } catch {}

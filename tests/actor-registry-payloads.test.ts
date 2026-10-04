@@ -17,6 +17,30 @@ afterEach(() => {
 });
 
 describe("compact actor registry payloads (#3752, #4383)", () => {
+  it("keeps a bounded filter journal soft, then archives it before substantive history or overflow", async () => {
+    const { store, id, log, root } = setup();
+    const skips = messages(30).map(message => ({ ...message, reason: "filtered: noise" }));
+    const sync = vi.spyOn(fs, "fsyncSync");
+    await store.withLock(() => store.write([{ id, messages: [] }]));
+    sync.mockClear();
+    await store.withLock(() => store.write([{ id, messages: skips, registryMessageAppend: skips }]));
+    expect(sync).not.toHaveBeenCalled();
+    expect(store.records()[0]!.messageHistory).toBeUndefined();
+    expect(new ActorRegistryStore(root).messages(store.records()[0]!)).toEqual(skips);
+    const next = { ...messages(31)[30]!, reason: undefined };
+    await store.withLock(() => store.write([{ id, messages: [...skips, next], registryMessageAppend: [next] }]));
+    expect(sync).toHaveBeenCalled();
+    expect(store.messages(store.records()[0]!)).toEqual([...skips, next]);
+    const archived = fs.readFileSync(log, "utf8").split("\n").filter(Boolean).flatMap(line => JSON.parse(line).messages);
+    expect(archived).toEqual([...skips, JSON.parse(JSON.stringify(next))]);
+
+    const other = "b".repeat(32), burst = messages(150).map(message => ({ ...message, reason: "filtered: noise" }));
+    await store.withLock(() => store.write([...store.records(), { id: other, messages: burst.slice(-100), registryMessageAppend: burst }]));
+    expect(store.messages(store.records().find(row => row.id === other)!)).toEqual(burst.slice(-100));
+    const archive = path.join(root, other, "registry", "messages.jsonl");
+    expect(JSON.parse(fs.readFileSync(archive, "utf8").trim()).messages).toEqual(burst);
+  });
+
   it("recovers accepted history after a legacy owned-row save drops all unknown fields", async () => {
     const { store, id, file, root, log } = setup();
     const actor = { id, instructions: "i".repeat(20_000), messages: messages(100) };

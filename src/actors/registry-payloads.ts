@@ -184,8 +184,26 @@ export class ActorRegistryPayloads {
     delete compact.registryMessageAppend;
     delete compact.registryMessageReset;
     // Read the previous PR layout once, but never publish an instructions stub.
+    // Hydrated manager rows are committed inline by the durable atomic registry
+    // writer: never re-fsync an existing instruction file through a read-only
+    // handle (FlushFileBuffers on Windows requires write access).
     if (row.instructionsFile !== undefined) compact.instructions = this.instructions(row);
     delete compact.instructionsFile;
+    // Filter skips are bounded, rebuildable telemetry, not accepted activations.
+    // Preserve their existing soft inline journal until substantive history exists;
+    // externalizing this case would introduce fsyncs on every filter poll.
+    const filteredOnly = (value: unknown): boolean => Array.isArray(value) && value.every(message =>
+      typeof message === "object" && message !== null &&
+      typeof (message as Row).reason === "string" && String((message as Row).reason).startsWith("filtered: "));
+    if (row.messageHistory === undefined && previous?.messageHistory === undefined &&
+        this.savedHead(id) === undefined && filteredOnly(row.messages) &&
+        filteredOnly(row.registryMessageAppend ?? []) && filteredOnly(previous?.messages ?? []) &&
+        (Array.isArray(previous?.messages) ? previous.messages.length : 0) +
+          (Array.isArray(row.registryMessageAppend) ? row.registryMessageAppend.length : 0) <= HISTORY_LIMIT &&
+        (row.messages as unknown[]).length <= HISTORY_LIMIT) {
+      compact.messages = (row.messages as unknown[]).slice(-HISTORY_LIMIT);
+      return compact;
+    }
     let ref = history(row.messageHistory);
     if (!ref) {
       const saved = this.savedHead(id);

@@ -29,13 +29,67 @@ function setup(records: Record<string, unknown>[] = [], actorQueueLimit = DEFAUL
   vi.spyOn(ActorMeshMonitor.prototype, "schedule").mockImplementation(() => {});
   const agent = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") }); agents.push(agent);
   vi.spyOn(agent, "status").mockReturnValue({ id: "mock-run", queuePosition: 1 } as ReturnType<AgentManager["status"]>);
-  const manager = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorQueueLimit }, agent, () => {}, {
-    actorRoot, persistent: true, rootId: identity.id, claimResidency: "session", reapDeadSessionPresence: false,
-  }); managers.push(manager);
-  return { manager, agent, root, actorRoot, store };
+  const restart = () => {
+    const manager = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorQueueLimit }, agent, () => {}, {
+      actorRoot, persistent: true, rootId: identity.id, claimResidency: "session", reapDeadSessionPresence: false,
+    }); managers.push(manager);
+    return manager;
+  };
+  const manager = restart();
+  return { manager, agent, root, actorRoot, store, restart };
 }
 
 describe("actor registry lazy/status writes (#3752, #4383)", () => {
+  it("restarts over external instructions/history and saves hydrated owned rows on Windows", async () => {
+    const f = setup();
+    const instructions = "Review. ".repeat(2_500);
+    const actor = await f.manager.create({ name: "windows-restart", instructions });
+    await f.manager.close();
+    const messages = [{ id: "before-restart", source: "direct", direction: "in", createdAt: 1, text: "Keep history." }];
+    await f.store.withLock(() => f.store.write(f.store.records().map(row => ({ ...row, messages }))));
+    const { createHash } = await import("node:crypto");
+    const digest = createHash("sha256").update(instructions).digest("hex");
+    const payload = path.join(f.actorRoot, actor.id, "registry", `instructions-${digest}.txt`);
+    fs.writeFileSync(payload, instructions);
+    const record = { ...f.store.records()[0]!, instructions: "legacy external stub", instructionsFile: digest };
+    fs.writeFileSync(path.join(f.actorRoot, "actors.json"), JSON.stringify({ format: 1, actors: [record] }));
+    const log = path.join(f.actorRoot, actor.id, "registry", "messages.jsonl");
+    const archive = fs.readFileSync(log, "utf8");
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const open = fs.openSync, sync = fs.fsyncSync;
+    const handles = new Map<number, string | number>();
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode); handles.set(fd, flags); return fd;
+    });
+    let fileSyncs = 0;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fs.fstatSync(fd).isFile()) {
+        const flags = handles.get(fd);
+        const writable = typeof flags === "number" ? (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR)) !== 0
+          : typeof flags === "string" && /[wa+]/.test(flags);
+        if (!writable) throw Object.assign(new Error("FlushFileBuffers needs write access"), { code: "EPERM" });
+        fileSyncs++;
+      }
+      sync(fd);
+    });
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      const restarted = f.restart(); // New manager AND new registry store; no payload cache.
+      expect(restarted.instructions(actor.id)).toBe(instructions);
+      expect(restarted.messages(actor.id, 100)).toEqual(messages);
+      await restarted.setNice(actor.id, 7);
+      await restarted.close();
+      const fresh = new ActorRegistryStore(f.actorRoot), saved = fresh.records()[0]!;
+      expect(saved.instructions).toBe(instructions);
+      expect(saved.instructionsFile).toBeUndefined();
+      expect(saved.nice).toBe(7);
+      expect(fresh.messages(saved)).toEqual(messages);
+      expect(fs.readFileSync(payload, "utf8")).toBe(instructions);
+      expect(fs.readFileSync(log, "utf8")).toBe(archive);
+      expect(fileSyncs).toBeGreaterThan(0);
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
   it("honors an explicit clear after a legacy save strips the history reference", async () => {
     const id = "a".repeat(32), messages = [{ id: "m", source: "direct", createdAt: 1, direction: "in", text: "keep until clear" }];
     const f = setup([{ id, name: "mixed-clear", rootId: "session:test", instructions: "Review.", messages, createdAt: 1, status: "idle" }]);

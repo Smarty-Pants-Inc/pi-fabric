@@ -2553,7 +2553,8 @@ export class ActorManager {
   async #publishDrainPresence(actor: ManagedActor): Promise<void> {
     if (!this.#canManage(actor.id)) return;
     this.#emitChange();
-    await this.#prepare(actor, "registry", () => this.#saveActors());
+    // Preparation is an admission boundary, not a coalescible worker status pulse.
+    await this.#prepare(actor, "registry", () => this.#saveActors(new Set(), { flush: true }));
     // Do not break presence serialization or retry a late write out of order. Once a join
     // timed out, the pending publisher still owes the latest state, but is not launch authority.
     if (this.#stalledPresence.has(actor.id) && this.#presenceChains.has(actor.id)) {

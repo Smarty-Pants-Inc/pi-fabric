@@ -984,6 +984,7 @@ describe("AgentManager", () => {
     const result = await manager.run({ task: "Observe lifecycle", transport: "process" });
 
     expect(lifecycle.map((event) => event.event)).toEqual([
+      "run.spawned",
       "pi.agent_start",
       "pi.turn_end",
       "pi.agent_end",

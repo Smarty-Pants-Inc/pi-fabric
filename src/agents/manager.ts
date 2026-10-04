@@ -41,6 +41,8 @@ import { tokenUsagePayloadFromValue } from "../lifecycle/types.js";
 import type { FabricTokenUsagePayload } from "../lifecycle/types.js";
 import { AgentAdmission, assertAgentTask, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, type AgentLifecycleState } from "./lifecycle.js";
 import { removeTree } from "./rm.js";
+import { ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, type PendingRunArchive } from "./archive-custody.js";
+import { ActorChildCompletionStore } from "../actors/child-completions.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
 import { ProcessTransport } from "./transports/process-transport.js";
@@ -65,7 +67,10 @@ import type {
   AgentTransportLaunch,
   AgentUsage,
 } from "./types.js";
-import { FOLLOW_UP_RUNNING_TASK_MESSAGE } from "./types.js";
+import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
+import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
+import { createRunRouteMetadata } from "../worker/run-record.js";
+import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager } from "./worktree-manager.js";
 import { writeHandoffSession } from "./handoff.js";
 import type { FabricCompactionBudget } from "../compaction/hook.js";
@@ -86,6 +91,7 @@ import {
   canRemoveTerminalRun,
   hasUnresolvedWorker,
   runTreeExitVeto,
+  runTreeResourceVeto,
   markUnresolvedWorker,
   heartbeatRunRoot,
   markRunRootActive,
@@ -291,6 +297,7 @@ export const awaitAgentCwd = async (
   }
 };
 interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
+  runRoute: AgentRunRouteMetadata;
   id: string;
   name: string;
   task: string;
@@ -382,6 +389,7 @@ interface QueuedAgent {
   /** Host-owned admission address, including terminal outcomes with no launch manifest. */
   completionRecipient?: CompletionRecipient;
   routeSaveFailure?: string;
+  outcomeSaved?: boolean;
   routeOutcome?: (result: AgentRunResult) => void;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
   cleanupPending?: string;
@@ -591,6 +599,7 @@ const failedRecord = (
     usage[key] = Math.max(usage[key], previous?.usage[key] ?? 0);
   }
   return {
+    ...managed.runRoute,
     id: managed.id,
     name: managed.name,
     task: managed.task,
@@ -601,6 +610,7 @@ const failedRecord = (
     ...(managed.latestRecord?.runnerSessionIds ? { runnerSessionIds: [...managed.latestRecord.runnerSessionIds] } : {}),
     ...(managed.kernel ? { kernel: managed.kernel } : {}),
     transport: managed.transport.kind,
+    ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
     cwd: managed.cwd,
     ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
     startedAt: now,
@@ -647,10 +657,10 @@ const hostStoppedResult = (result: AgentRunResult, lastEventAt: number | undefin
 
 // Settled handles can be evicted while their descendants still use the shared
 // budget. Inspect persisted trees too; marker absence is not checked child exit.
-const runRootHasExitVeto = (root: string): boolean => {
+const runRootHasExitVeto = (root: string, prelaunchIds: ReadonlySet<string>): boolean => {
   try {
     return fs.readdirSync(root, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && !!runTreeExitVeto(path.join(root, entry.name), 0, undefined, true));
+      .some((entry) => entry.isDirectory() && !!runTreeResourceVeto(path.join(root, entry.name), 0, undefined, true, !prelaunchIds.has(entry.name)));
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
@@ -688,11 +698,18 @@ export class AgentManager {
   readonly #onBackgroundComplete: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
   readonly #onBeforeResultReturned: ((id: string) => void) | undefined;
+  readonly #onResultAbandoned: ((id: string) => void) | undefined;
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
   readonly #onSettled: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
+  readonly #foregroundPrepared = new Set<string>();
+  readonly #pendingAbandonment = new Set<string>();
+  readonly #foregroundDelivered = new Set<string>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
+  readonly #onFollowUpAlarm: ((alarm: AgentFollowUpAlarm) => void) | undefined;
+  readonly #followUps = new Map<string, Map<string, AgentFollowUpDelivery>>();
+  readonly #followUpTimers = new Map<string, NodeJS.Timeout>();
   readonly #preparePiModel:
     | ((model: string | undefined, requiredPin?: boolean) => Promise<string | void>)
     | undefined;
@@ -750,10 +767,13 @@ export class AgentManager {
       onResultConsumed?: (id: string) => void;
       /** Fail-closed durable fence before a foreground value reaches its caller. */
       onBeforeResultReturned?: (id: string) => void;
+      /** A fenced host value was discarded before publication to the guest. */
+      onResultAbandoned?: (id: string) => void;
       onStoppedAtClose?: (results: AgentRunResult[]) => void;
       /** Every terminal result, foreground or background, before its run directory can be removed. */
       onSettled?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
+      onFollowUpAlarm?: (alarm: AgentFollowUpAlarm) => void;
       preparePiModel?: (model: string | undefined, requiredPin?: boolean) => Promise<string | void>;
       resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
       resolveParticipantGuidance?: AgentParticipantGuidanceResolver;
@@ -770,7 +790,7 @@ export class AgentManager {
     this.#sweepPath =
       options.sweepPath ?? fileURLToPath(new URL("../storage/sweep-main.js", import.meta.url));
     this.#fabricExtensionPath =
-      options.fabricExtensionPath ?? fileURLToPath(new URL("../index.js", import.meta.url));
+      options.fabricExtensionPath ?? fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "../index.ts" : "../index.js", import.meta.url));
     this.#piBinary = resolvePiBinary(options.piBinary);
     this.#claudeBinary =
       options.claudeBinary ?? process.env.PI_FABRIC_CLAUDE_BINARY ?? config.claude.binary;
@@ -779,9 +799,11 @@ export class AgentManager {
     this.#onBackgroundComplete = options.onBackgroundComplete;
     this.#onResultConsumed = options.onResultConsumed;
     this.#onBeforeResultReturned = options.onBeforeResultReturned;
+    this.#onResultAbandoned = options.onResultAbandoned;
     this.#onStoppedAtClose = options.onStoppedAtClose;
     this.#onSettled = options.onSettled;
     this.#onLifecycle = options.onLifecycle;
+    this.#onFollowUpAlarm = options.onFollowUpAlarm;
     this.#preparePiModel = options.preparePiModel;
     this.#resolveHandoffCompactionBudget = options.resolveHandoffCompactionBudget;
     this.#resolveParticipantGuidance = options.resolveParticipantGuidance;
@@ -814,7 +836,7 @@ export class AgentManager {
     this.#budgetOwned =
       !inheritedBudget && this.#currentDepth === 0 && config.budgetUsd > 0;
     const adapters: AgentTransportAdapter[] = [
-      new ProcessTransport(),
+      new ProcessTransport(config.processSlice),
       new TmuxTransport(),
       new ScreenTransport(),
       new LocaltermTransport(),
@@ -833,6 +855,23 @@ export class AgentManager {
   defaultModel(runner: FabricAgentRunner = this.config.runner): string | undefined {
     return runner === "claude" ? this.config.claude.model
       : runner === "veda" ? this.config.veda.model : this.config.model;
+  }
+
+  /** Call only on explicit public requests, before defaults/aliases are materialized. */
+  assertExplicitModelReason(model: unknown, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, inheritedDefault?: string): void {
+    if (typeof model !== "string" || !model.trim()) return;
+    const key = model.trim().toLowerCase();
+    const required = this.config.modelPolicy.requireReason.some(entry => {
+      const prefix = entry.trim().toLowerCase();
+      if (!prefix) return false;
+      return key.startsWith(prefix) || (!prefix.includes("/") && key.includes(`/${prefix}`));
+    });
+    if (!required) return;
+    const fallback = inheritedDefault ?? this.defaultModel(runner) ?? `${runner} default (inherited session model)`;
+    if (typeof modelReason !== "string" || !modelReason.trim() || modelReason.length > 200) {
+      throw new Error(`model ${model.trim()} requires modelReason (named exception); omit model to use the role default ${fallback}, see smarty-dev#3134` +
+        (typeof modelReason === "string" && modelReason.length > 200 ? "; modelReason must be ≤200 chars" : ""));
+    }
   }
 
   assertModelAllowed(model: string | undefined, runner?: FabricAgentRunner): void {
@@ -1028,16 +1067,27 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
+    // Snapshot trusted classification inputs before asynchronous preparation/queueing.
+    const explicitRouteClass = request.routeClass ?? request.routeDecision?.routeClass;
+    const routeFacts = {
+      ...(explicitRouteClass !== undefined ? { routeClass: explicitRouteClass } : {}),
+      ...(typeof request.protected === "boolean" ? { protected: request.protected } : {}),
+      ...(request.actorId !== undefined ? { actorId: request.actorId } : {}),
+      ...(request.actorName !== undefined ? { actorName: request.actorName } : {}),
+      handoff: Boolean(request.sessionSeed),
+    };
     // Snapshot host-owned identity before any await/queue: later /name changes
     // affect new spawns, never an already-admitted run or its retries.
     const completionRecipient = this.#completionRecipient
       ? { ...(typeof this.#completionRecipient === "function" ? this.#completionRecipient() : this.#completionRecipient) }
       : undefined;
     if (request.model === "auto") throw new Error('Unresolved model: "auto" must go through agents.spawn routing');
+    const routedActor = request.routeDecision?.mode === "shadow" && Boolean(request.actorId) &&
+      request.routeDecision.actorId === request.actorId && Boolean(request.routeDecision.activationId) && Boolean(request.sessionFile);
     if (request.routeDecision && ((request.runner ?? this.config.runner) !== "pi" ||
       (request.transport ?? this.config.transport) !== "process" || (request.residency ?? "session") !== "session" ||
-      request.actorId || request.actorName || request.sessionSeed || request.sessionFile)) {
-      throw new Error("Shadow routing is only supported for new process/Pi task sessions");
+      request.sessionSeed || (!routedActor && (request.actorId || request.actorName || request.sessionFile)))) {
+      throw new Error("Shadow routing requires a new process/Pi task session or a host-prepared actor activation");
     }
     const kernel = this.resolveKernel({
       ...request,
@@ -1142,6 +1192,13 @@ export class AgentManager {
       }
       const runDirectory = path.join(this.#runRoot, id);
       fs.mkdirSync(runDirectory, { recursive: true });
+      // Establish custody before a worker can produce its only full outcome. A
+      // later disk failure cannot leave a terminal source collectible without a fence.
+      if (this.#onSettled || this.#onStoppedAtClose || routeDispatch) {
+        writeJsonAtomic(path.join(runDirectory, ARCHIVE_PENDING_FILE), { format: 1, awaitingResult: true, ownerPid: process.pid,
+          ...(process.env.PI_FABRIC_ACTOR_SESSION_FILE && this.#spawner?.kind === "actor" ? { actorSessionFile: process.env.PI_FABRIC_ACTOR_SESSION_FILE, spawner: this.#spawner, notify: this.config.notifyOnComplete, actorOnly: !routeDispatch } : {}) }, { durable: true });
+        if (process.env.PI_FABRIC_ACTOR_SESSION_FILE && this.#spawner?.kind === "actor") new ActorChildCompletionStore(process.env.PI_FABRIC_ACTOR_SESSION_FILE).trackArchiveSource(id, runDirectory);
+      }
       if (this.#managedTempRoot && !this.#retentionTimer) {
         this.#retentionTimer = setInterval(() => this.#scheduleRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
         this.#retentionTimer.unref();
@@ -1201,8 +1258,9 @@ export class AgentManager {
               request.handoffCompact,
               request.handoffCompact ? await this.#resolveHandoffCompactionBudget?.(model, agentCwd) : undefined,
             )
-          : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
+          : routedActor ? request.sessionFile : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
         const adapter = await this.#resolveTransport(request.transport ?? this.config.transport);
+        const runRoute = createRunRouteMetadata({ ...routeFacts, runner, transport: adapter.kind });
         const timeoutMs = effectiveAgentTimeoutMs(
           this.config.timeoutMs,
           request.timeoutMs,
@@ -1292,6 +1350,9 @@ export class AgentManager {
           ...(nice > 0 ? ["--nice", String(nice)] : []),
           "--transport",
           adapter.kind,
+          "--route-class", runRoute.routeClass,
+          "--route-class-source", runRoute.routeClassSource,
+          ...(runRoute.protected !== undefined ? ["--protected", String(runRoute.protected)] : []),
           ...(recursive || inheritedFullCodeMode || requiresFabricKernel
             ? ["--fabric-extension", this.#fabricExtensionPath]
             : []),
@@ -1374,6 +1435,7 @@ export class AgentManager {
         }
         if (launchCancelled) queued?.abort.abort();
         const managed: ManagedAgent = {
+          runRoute,
           id,
           name,
           task: request.task,
@@ -1451,6 +1513,10 @@ export class AgentManager {
           });
         }
         const handle = this.#handleInfo(managed, "running");
+        this.#emitLifecycle(managed, "run.spawned", Date.now(), { status: "running", data: {
+          ...(model ? { model } : {}),
+          ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
+        } });
         // A queued receipt is not a worker. Notify only after launch and registration.
         try { onLaunched?.(handle); } catch { /* observers must not undo a launched worker */ }
         return handle;
@@ -1486,7 +1552,11 @@ export class AgentManager {
         }
         release();
         try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
-        if (worktree && !runTreeExitVeto(runDirectory, 0, undefined, true)) await this.#worktrees.cleanup(id, true).catch(() => false);
+        // Prelaunch archive custody is not native worker debt. Persisted worker
+        // records still require a checked root exit before rollback.
+        if (worktree && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
+          await this.#worktrees.cleanup(id, true).catch(() => false);
+        }
         throw error;
       }
     };
@@ -1509,8 +1579,9 @@ export class AgentManager {
       try { routeDispatch?.outcome({ status: admissionSignal.aborted ? "stopped" : "failed" }); } catch { /* storage does not block cancellation */ }
       throw error;
     }
-    if (release) return start(release);
+    if (release) return start(release).catch((error) => { release(); throw error; });
     return this.#enqueue({
+      ...createRunRouteMetadata({ ...routeFacts, runner, transport: request.transport ?? this.config.transport }),
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
       cwd: selectedCwd, residency, recursive: request.recursive === true,
       ...(kernel ? { kernel } : {}),
@@ -1590,19 +1661,43 @@ export class AgentManager {
     queued.resolve(record);
     this.#emitLifecycle(queued.info, `run.${status}`, now, { status });
     this.#invalidateUiList();
-    try { this.#onSettled?.(record, queued.completionRecipient); } catch { /* retain queued terminal result on publication failure */ }
     this.#notifyQueuedComplete(queued);
   }
 
   #saveQueuedRouteOutcome(queued: QueuedAgent): boolean {
-    if (!queued.terminal || queued.cleanupPending) return !queued.routeSaveFailure;
+    if (queued.outcomeSaved) return true;
+    if (!queued.terminal) return !queued.routeSaveFailure;
     let failure: unknown;
     // Finite retries only; persistent failure keeps the full terminal receipt and run files.
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
+        if (queued.routeOutcome || this.#onSettled) {
+          // Even an unlaunched queued run needs a durable full source if archival fails.
+          writeJsonAtomic(path.join(this.#runRoot, queued.info.id, "queued-result.json"), queued.terminal, { durable: true });
+        }
+        if (queued.routeOutcome || this.#onSettled) this.#stageArchive(path.join(this.#runRoot, queued.info.id), queued.terminal, "settlement", queued.completionRecipient, !queued.routeOutcome);
+        this.#onSettled?.(queued.terminal, queued.completionRecipient);
+        // Archival is independent of native custody. Keep the existing route fence:
+        // an unresolved launcher must not commit its routed outcome yet.
+        if (queued.cleanupPending) return !queued.routeSaveFailure;
         queued.routeOutcome?.(queued.terminal);
         if (queued.routeSaveFailure) queued.terminal.warnings = (queued.terminal.warnings ?? []).filter(warning => warning !== queued.routeSaveFailure);
         delete queued.routeSaveFailure;
+        if (queued.routeOutcome || this.#onSettled) this.#commitArchive(path.join(this.#runRoot, queued.info.id), queued.terminal);
+        // Recordless prelaunch sources are not worker runs. Persist their safe
+        // archived state before best-effort deletion, so a Windows sharing error
+        // cannot make this committed source uncollectible on a later sweep.
+        const directory = path.join(this.#runRoot, queued.info.id);
+        if ((!fs.existsSync(path.join(directory, "status.json")) ||
+            (readRecord(path.join(directory, "status.json")) as AgentRunRecord & { queuedArchiveCommitted?: boolean } | undefined)?.queuedArchiveCommitted) && !runTreeExitVeto(directory)) {
+          writeJsonAtomic(path.join(directory, "status.json"), { id: queued.info.id, status: queued.terminal.status, queuedArchiveCommitted: true,
+            startedAt: queued.terminal.startedAt, updatedAt: queued.terminal.updatedAt, finishedAt: queued.terminal.finishedAt }, { durable: true });
+          try {
+            fs.rmSync(path.join(directory, "queued-result.json"), { force: true });
+            fs.rmSync(directory, { recursive: true, force: true });
+          } catch { /* Its committed terminal state is collectible later. */ }
+        }
+        queued.outcomeSaved = true;
         return true;
       } catch (error) { failure = error; }
     }
@@ -1655,15 +1750,15 @@ export class AgentManager {
   async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal; deferConsumption?: (consume: () => void, abandon?: () => void) => void } = {}): Promise<AgentRunResult> {
     const previous = this.#previousRun(id);
     if (previous) {
+      if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id), () => this.abandonForeground(id));
       this.prepareForeground(id);
-      if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id));
-      else this.#onResultConsumed?.(id);
+      if (!options.deferConsumption) this.markForeground(id);
       return previous;
     }
     const consumed = (): void => {
+      if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id), () => this.abandonForeground(id));
       this.prepareForeground(id);
-      if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id), () => this.detachSignal(id));
-      else this.#onResultConsumed?.(id);
+      if (!options.deferConsumption) this.markForeground(id);
     };
     const queued = this.#queued.get(id);
     if (queued) {
@@ -1738,17 +1833,36 @@ export class AgentManager {
   prepareForeground(id: string): void {
     if (!this.isSettled(id)) return;
     this.#onBeforeResultReturned?.(id);
+    this.#foregroundPrepared.add(id);
   }
 
   markForeground(id: string): void {
     if (!this.isSettled(id)) return;
-    this.prepareForeground(id);
+    if (!this.#foregroundPrepared.has(id)) this.prepareForeground(id);
+    this.#foregroundDelivered.add(id); // Publication happened; cleanup cannot make a later abandon unread.
     if (!this.#previousRun(id)) {
       const queued = this.#queued.get(id);
       if (queued) queued.background = false;
       else this.#requireRun(id).background = false;
     }
     this.#onResultConsumed?.(id);
+  }
+
+  abandonForeground(id: string): void {
+    if (!this.#foregroundDelivered.has(id)) {
+      this.#foregroundPrepared.delete(id);
+      this.#pendingAbandonment.add(id);
+      this.#retryAbandonment(id);
+    }
+    if (!this.#previousRun(id)) this.detachSignal(id);
+  }
+
+  #retryAbandonment(id: string): void {
+    if (this.#foregroundDelivered.has(id)) { this.#pendingAbandonment.delete(id); return; }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { this.#onResultAbandoned?.(id); this.#pendingAbandonment.delete(id); return; }
+      catch { /* Retain the rollback obligation for close if storage is still unavailable. */ }
+    }
   }
 
   detachSignal(id: string): void {
@@ -1844,7 +1958,12 @@ export class AgentManager {
     const record = managed.settled
       ? readRecord(managed.statusFile) ?? managed.latestRecord
       : managed.latestRecord ?? readRecord(managed.statusFile);
-    if (!record) return this.#handleInfo(managed, "running");
+    if (!record) {
+      const info = this.#handleInfo(managed, "running");
+      const deliveries = this.#checkFollowUps(managed);
+      if (deliveries.length) info.followUpDeliveries = deliveries;
+      return info;
+    }
     managed.latestRecord = record;
     if (!managed.latestUiRecord) {
       managed.latestUiRecord = compactUiRecord(record);
@@ -1852,6 +1971,8 @@ export class AgentManager {
     }
     const result = structuredClone(this.#withTransportMetadata(record, managed));
     this.#pruneRetainedUiRecords();
+    const deliveries = this.#checkFollowUps(managed);
+    if (deliveries.length) result.followUpDeliveries = deliveries;
     return result;
   }
 
@@ -1980,8 +2101,8 @@ export class AgentManager {
     return structuredClone(previous);
   }
 
-  async stop(id: string): Promise<AgentRunResult> {
-    return this.#stop(id, true);
+  async stop(id: string, options: { consume?: boolean } = {}): Promise<AgentRunResult> {
+    return this.#stop(id, options.consume !== false);
   }
 
   /** Internal close joins execution custody without acknowledging an actor result. */
@@ -2003,6 +2124,8 @@ export class AgentManager {
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
     managed.stopRequested = true;
+    // Stop retracts notices; guest publication still uses its deferred receipt.
+    managed.background = false;
     // A retry may already be launching its replacement. The previous attempt's
     // exit cannot settle/release this run while that new execution is in flight.
     await managed.relaunchPending;
@@ -2072,6 +2195,9 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
+    if (managed.settlementSaveFailure && !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) {
+      throw new Error(`Cannot clean up agent ${id}: ${managed.settlementSaveFailure.warning}`);
+    }
     const exitVeto = runTreeExitVeto(managed.runDirectory, 0, undefined, true);
     if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
     if (!this.#canCollect(managed)) {
@@ -2083,6 +2209,8 @@ export class AgentManager {
       await removeTree(managed.runDirectory);
     }
     this.#runs.delete(id);
+    for (const messageId of this.#followUps.get(id)?.keys() ?? []) this.#clearFollowUpTimer(messageId);
+    this.#followUps.delete(id);
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
     return { cleaned: cleaned || !fs.existsSync(managed.runDirectory) };
@@ -2117,9 +2245,78 @@ export class AgentManager {
     return this.#appendSteer(id, { type: "steer", message, data, provenance });
   }
 
-  followUp(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance): AgentSteerResult {
+  followUp(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance,
+    options?: { deadlineMs: number }): AgentSteerResult {
     this.#requireSteerable(id);
-    return this.#appendSteer(id, { type: "follow_up", message, data, provenance });
+    if (!options) return this.#appendSteer(id, { type: "follow_up", message, data, provenance });
+    const managed = this.#requireRun(id);
+    if (managed.runner !== "pi") throw new Error("Delivery deadlines require a local Pi task agent");
+    if (!Number.isSafeInteger(options.deadlineMs) || options.deadlineMs < 1) throw new Error("deadlineMs must be a positive safe integer");
+    const messageId = randomUUID();
+    const deadlineAt = Date.now() + options.deadlineMs;
+    if (!Number.isSafeInteger(deadlineAt)) throw new Error("deadlineMs exceeds the safe timestamp range");
+    const file = followUpFile(managed.runDirectory, messageId);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, JSON.stringify({ messageId, deadlineAt }), { mode: 0o600 });
+    let receipt: AgentSteerResult;
+    try { receipt = this.#appendSteer(id, { type: "follow_up", message, data, provenance, followUpId: messageId, deadlineAt }); }
+    catch (error) { fs.unlinkSync(file); throw error; }
+    const entries = this.#followUps.get(id) ?? new Map<string, AgentFollowUpDelivery>();
+    entries.set(messageId, { messageId, deadlineAt, state: "queued" });
+    this.#followUps.set(id, entries);
+    this.#armFollowUpDeadline(managed, entries.get(messageId)!);
+    return { ...receipt, messageId, deadlineAt };
+  }
+
+  cancelFollowUp(id: string, messageId: string): AgentFollowUpDelivery {
+    const managed = this.#requireRun(id);
+    const delivery = this.#followUps.get(id)?.get(messageId);
+    if (!delivery) throw new Error(`Unknown follow-up: ${messageId}`);
+    delivery.state = settleFollowUp(followUpFile(managed.runDirectory, messageId), "cancelled");
+    releaseFollowUpPayload(followUpFile(managed.runDirectory, messageId));
+    if (delivery.state === "delivered" || delivery.state === "cancelled") this.#clearFollowUpTimer(messageId);
+    return structuredClone(delivery);
+  }
+
+  #clearFollowUpTimer(messageId: string): void {
+    clearTimeout(this.#followUpTimers.get(messageId));
+    this.#followUpTimers.delete(messageId);
+  }
+
+  #armFollowUpDeadline(managed: ManagedAgent, delivery: AgentFollowUpDelivery): void {
+    // Only message admission starts a timer. Keep it after receiver settlement,
+    // but never past sender teardown; long deadlines must not overflow setTimeout.
+    const timer = setTimeout(() => {
+      this.#followUpTimers.delete(delivery.messageId);
+      if (Date.now() < delivery.deadlineAt) this.#armFollowUpDeadline(managed, delivery);
+      else this.#checkFollowUps(managed);
+    }, Math.max(0, Math.min(delivery.deadlineAt - Date.now(), 2_147_483_647)));
+    timer.unref();
+    this.#followUpTimers.set(delivery.messageId, timer);
+  }
+
+  #checkFollowUps(managed: ManagedAgent, record = readRecord(managed.statusFile)): AgentFollowUpDelivery[] {
+    const entries = this.#followUps.get(managed.id);
+    if (!entries) return [];
+    for (const delivery of entries.values()) {
+      delivery.state = followUpState(followUpFile(managed.runDirectory, delivery.messageId));
+      if (delivery.state === "delivered" || delivery.state === "cancelled" || delivery.alarm) { this.#clearFollowUpTimer(delivery.messageId); continue; }
+      if (Date.now() < delivery.deadlineAt) continue;
+      const alarm: AgentFollowUpAlarm = {
+        code: "FABRIC_FOLLOW_UP_DEADLINE", messageId: delivery.messageId,
+        targetId: managed.id, targetName: managed.name, deadlineAt: delivery.deadlineAt,
+        status: record?.status ?? "running",
+        ...(record?.currentTool ? { currentTool: record.currentTool, currentToolStartedAt: record.currentToolStartedAt } : {}),
+        options: ["wait", "steer", "cancel"],
+        message: `Follow-up ${delivery.messageId} to ${managed.name} (${managed.id}) missed its delivery deadline; ` +
+          `${record?.currentTool ? `busy in tool ${record.currentTool} since ${new Date(record.currentToolStartedAt ?? record.updatedAt).toISOString()}` : record?.status ?? "running"}. ` +
+          `${delivery.state === "settling" ? "Delivery remains uncertain and fenced." : "It remains queued."} Wait, use agents.steer, or agents.cancelFollowUp({ id: '${managed.id}', messageId: '${delivery.messageId}' }).`,
+      };
+      delivery.alarm = alarm; // Mark before calling observers: one alarm, even under reentrant status.
+      this.#clearFollowUpTimer(delivery.messageId);
+      try { this.#onFollowUpAlarm?.(structuredClone(alarm)); } catch { /* Status retains the sender alarm. */ }
+    }
+    return structuredClone([...entries.values()]);
   }
 
   // Veda children run one headless prompt per invocation; there is no stdin
@@ -2169,7 +2366,7 @@ export class AgentManager {
       );
     }
     const steerFile = path.join(managed.runDirectory, "steer.jsonl");
-    const messageId = randomUUID();
+    const messageId = entry.followUpId ?? randomUUID();
     const line = JSON.stringify({ ...entry, id: messageId, ts: Date.now() }) + "\n";
     if (entry.type === "steer" || entry.type === "follow_up") {
       const incoming = copyFabricPrincipal(entry.provenance?.principal);
@@ -2252,9 +2449,11 @@ export class AgentManager {
 
   close(): Promise<void> {
     this.#closing = true;
+    for (const timer of this.#followUpTimers.values()) clearTimeout(timer);
+    this.#followUpTimers.clear();
     this.#closeAbort.abort(new Error("Fabric agent manager is closing"));
     return this.#closePromise ??= this.#close().catch(error => {
-      this.#closePromise = undefined; // exact transport receipts may succeed on a later close
+      this.#closePromise = undefined; // retain exact custody for a later close retry
       throw error;
     });
   }
@@ -2265,6 +2464,7 @@ export class AgentManager {
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
     await this.#retentionSweep?.catch(() => undefined);
+    for (const id of this.#pendingAbandonment) this.#retryAbandonment(id);
     const tracked = [...this.#runs.values()];
     const running = tracked.filter((managed) => !managed.settled);
     const lastEventAt = new Map(running.map((managed) => [managed.id, lastEventTime(managed)]));
@@ -2277,16 +2477,30 @@ export class AgentManager {
     ]);
     // A reload or shutdown ends these runs; tell the spawner's session (smarty-dev#1602).
     const results = stopped.flatMap((outcome) =>
-      outcome.status === "fulfilled" && outcome.value && lastEventAt.has(outcome.value.id)
+      outcome.status === "fulfilled" && outcome.value &&
+        (lastEventAt.has(outcome.value.id) || queuedAtClose.some(queued => queued.info.id === outcome.value!.id))
         ? [hostStoppedResult(outcome.value, lastEventAt.get(outcome.value.id))] : []);
     if (results.length > 0) {
-      try { this.#onStoppedAtClose?.(results); } catch { /* must not block close */ }
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          if (this.#onStoppedAtClose) for (const result of results) this.#stageArchive(path.join(this.#runRoot, result.id), result, "shutdown");
+          this.#onStoppedAtClose?.(results);
+          if (this.#onStoppedAtClose) for (const result of results) {
+            const directory = path.join(this.#runRoot, result.id);
+            this.#commitArchive(directory, result, "shutdown");
+            if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure && !fs.existsSync(path.join(directory, "status.json"))) fs.rmSync(directory, { recursive: true, force: true });
+          }
+          break;
+        }
+        catch { /* The staged archive retains each failed shutdown result. */ } // A failed archive never grants source deletion.
+      }
     }
     await Promise.allSettled([...this.#spawns]);
     await Promise.allSettled([...this.#queuedStarts]);
     await Promise.allSettled([...this.#launches]);
     for (const queued of this.#queued.values()) this.#saveQueuedRouteOutcome(queued);
     const all = [...this.#runs.values()];
+    for (const managed of all) if (managed.settlementSaveFailure) this.#saveSettledResult(managed, managed.settlementSaveFailure.result);
     await Promise.allSettled(all.flatMap(managed => [managed.processStop, managed.nativeReleasePending]));
     await Promise.allSettled(all.map((managed) => this.#waitForTransportExit(managed)));
     const transports = [...all.map((managed) => managed.transport), ...this.#unregisteredTransports];
@@ -2298,8 +2512,15 @@ export class AgentManager {
     // Primary transport exit cannot release a surviving descendant's files or
     // shared budget. Keep the persistent run tree (and its owning actor ID) for
     // the next fenced owner whenever tree-wide exit evidence is incomplete.
-    const unresolved = all.some((managed) => managed.processStopPending || managed.nativeReleasePending || managed.lostContact || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) ||
-      [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasExitVeto(this.#runRoot);
+    const unresolved = all.some((managed) => managed.processStopPending || managed.nativeReleasePending || managed.lostContact || runTreeResourceVeto(managed.runDirectory, 0, undefined, true)) ||
+      [...this.#queued.values()].some((queued) => queued.cleanupPending) ||
+      runRootHasExitVeto(this.#runRoot, new Set([...this.#queued.values()].filter(queued => queued.terminal && !queued.cleanupPending).map(queued => queued.info.id)));
+    // An unrelated retained tree fences shared budget/root deletion, not an
+    // independently joined tracked run with its full outcome durably archived.
+    if (!this.config.retainRuns) {
+      await Promise.all(all.filter(managed => this.#canCollect(managed))
+        .map(managed => removeTree(managed.runDirectory).catch(() => undefined)));
+    }
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {
       this.#unregisteredTransports.clear();
@@ -2308,8 +2529,10 @@ export class AgentManager {
         if (storageSafe) {
           // A recovered manager does not own workers left by an earlier host.
           // All tracked transports are confirmed exited above; untracked runs stay put.
-          await Promise.all(all.filter((managed) => this.#canCollect(managed))
-            .map((managed) => removeTree(managed.runDirectory).catch(() => undefined)));
+          await Promise.all([...this.#queued.values()]
+            .filter(queued => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
+              !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
+            .map(queued => removeTree(path.join(this.#runRoot, queued.info.id)).catch(() => undefined)));
           // Windows can retain the just-closed worker directory briefly. Retry
           // only the owned empty root; never recursively remove unknown contents.
           await removeManagedRunRoot(this.#runRoot);
@@ -2345,6 +2568,8 @@ export class AgentManager {
       currentRoot: this.#runRoot,
       orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
       oneShotRunRetentionMs: this.#retention.oneShotRunMs,
+      terminalRunEventsAgeMs: this.#retention.terminalRunEventsAgeMs,
+      terminalRunEventsMaxBytes: this.#retention.terminalRunEventsMaxBytes,
     };
     try {
       // A Bun-compiled Pi's execPath is Pi itself: resolve a real node/bun (the override, then PATH)
@@ -2440,8 +2665,18 @@ export class AgentManager {
     managed.processStop = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
     // Install the promise before stop can synchronously emit native events.
     void (async () => {
+      const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7;
       try {
         await managed.transport.stop();
+        // A stop acknowledgement is not the captured native-close receipt.
+        // Use the same deadline: do not add a second grace after native timeout.
+        const remaining = deadline - Date.now();
+        if (managed.transport.closed && remaining > 0) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([managed.transport.closed, new Promise<void>(done => { timer = setTimeout(done, remaining); })]);
+          } finally { if (timer) clearTimeout(timer); }
+        }
         // Legacy Windows adapters can join their helper and captured primary
         // without implementing stopDebt. Checked primary absence after that
         // successful join permits ONLY logical stop, never tree exit/release.
@@ -2800,6 +3035,7 @@ export class AgentManager {
         toolCalls: Math.max(record.toolCalls, managed.observedProgress.toolCalls),
         error: `${record.error ?? "Agent run failed"} · relaunch failed: ${retryError}`,
       };
+      Object.assign(failed, managed.runRoute);
       writeRecord(managed.statusFile, failed);
       managed.latestRecord = failed;
       managed.relaunchFailure = failed;
@@ -2810,9 +3046,22 @@ export class AgentManager {
   async #monitor(managed: ManagedAgent, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS;
     let firstObservedDeadAt: number | undefined;
+    let watchedTransport: AgentTransportHandle | undefined;
+    let nativeClosePending = false;
+    let wake: (() => void) | undefined;
     while (!managed.settled) {
+      if (managed.transport !== watchedTransport) {
+        const transport = watchedTransport = managed.transport;
+        nativeClosePending = false;
+        void transport.closed?.then(() => {
+          if (managed.transport !== transport || managed.settled) return;
+          nativeClosePending = true;
+          wake?.();
+        }, () => { /* notification is not exit proof */ });
+      }
       this.#drainLifecycle(managed);
       const record = readRecord(managed.statusFile);
+      this.#checkFollowUps(managed, record);
       if (record) {
         this.#observeProgress(managed, record);
         const previous = managed.latestRecord;
@@ -2942,7 +3191,11 @@ export class AgentManager {
           firstObservedDeadAt = undefined;
         }
       }
-      await delay(AGENT_STATUS_POLL_INTERVAL_MS);
+      if (nativeClosePending) { nativeClosePending = false; continue; }
+      await new Promise<void>(resolve => {
+        const timer = setTimeout(() => { wake = undefined; resolve(); }, AGENT_STATUS_POLL_INTERVAL_MS);
+        wake = () => { clearTimeout(timer); wake = undefined; nativeClosePending = false; resolve(); };
+      });
     }
   }
 
@@ -3020,10 +3273,63 @@ export class AgentManager {
     this.#notifyBackgroundComplete(managed, reported);
   }
 
+  #stageArchive(directory: string, result: AgentRunResult, kind: PendingRunArchive["kind"], recipient?: CompletionRecipient, actorOnly = true): void {
+    const actorSessionFile = process.env.PI_FABRIC_ACTOR_SESSION_FILE;
+    stageRunArchive(directory, { format: 1, kind, result, routePending: !actorOnly, ...(recipient ? { recipient } : {}),
+      ...(actorSessionFile && result.spawner?.kind === "actor" ? { actorSessionFile, notify: this.config.notifyOnComplete, actorOnly } : {}) });
+    if (actorSessionFile && result.spawner?.kind === "actor") new ActorChildCompletionStore(actorSessionFile).trackArchiveSource(result.id, directory);
+  }
+
+  #commitArchive(directory: string, result: AgentRunResult, kind: PendingRunArchive["kind"] = "settlement"): void {
+    commitRunArchive(directory, kind);
+    const sessionFile = process.env.PI_FABRIC_ACTOR_SESSION_FILE;
+    if (sessionFile && result.spawner?.kind === "actor" && !fs.existsSync(path.join(directory, ARCHIVE_PENDING_FILE))) new ActorChildCompletionStore(sessionFile).releaseArchiveSource(result.id);
+  }
+
+  /** Retry retained full outcomes after the original manager exited. No worker is relaunched. */
+  recoverPendingArchives(runDirectory?: string): number {
+    let recovered = 0;
+    const visit = (directory: string, depth: number): void => {
+      if (depth > 32 || !ownedStat(directory)?.isDirectory()) return;
+      const file = path.join(directory, ARCHIVE_PENDING_FILE);
+      const ageReference = ownedStat(directory);
+      if (ownedStat(file)?.isFile()) {
+        try {
+          for (const archive of readPendingRunArchives(directory)) {
+            if (archive.routePending || archive.result?.id !== path.basename(directory)) continue;
+            if (archive.actorSessionFile && archive.actorOnly && archive.result.spawner?.kind === "actor") {
+              new ActorChildCompletionStore(archive.actorSessionFile).enqueue(archive.result, archive.result.spawner, archive.notify);
+            } else if (archive.kind === "shutdown" && this.#onStoppedAtClose) this.#onStoppedAtClose([archive.result]);
+            else if (archive.kind === "settlement" && this.#onSettled) this.#onSettled(archive.result, archive.recipient);
+            else continue;
+            commitRunArchive(directory, archive.kind);
+            // Replaying an old result is not new worker activity. Removing its
+            // custody marker must not reset the source's retention age and make
+            // an already expired, durably archived run uncollectible at startup.
+            const current = ownedStat(directory);
+            if (ageReference && current?.dev === ageReference.dev && current.ino === ageReference.ino) {
+              fs.utimesSync(directory, ageReference.atime, ageReference.mtime);
+            }
+            recovered++;
+          }
+        } catch { /* The persisted veto remains for the next recovery attempt. */ }
+      }
+      const nested = path.join(directory, "nested");
+      if (ownedStat(nested)?.isDirectory()) for (const name of fs.readdirSync(nested)) visit(path.join(nested, name), depth + 1);
+    };
+    if (runDirectory) visit(runDirectory, 0);
+    else if (ownedStat(this.#runRoot)?.isDirectory()) for (const name of fs.readdirSync(this.#runRoot)) visit(path.join(this.#runRoot, name), 0);
+    return recovered;
+  }
+
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
     try {
+      const full = this.#withTransportMetadata(result, managed, false) as AgentRunResult;
+      if (managed.routeOutcome || this.#onSettled) this.#stageArchive(managed.runDirectory, full, "settlement", undefined, !managed.routeOutcome);
       managed.routeOutcome?.(result);
-      this.#onSettled?.(this.#withTransportMetadata(result, managed, false) as AgentRunResult);
+      this.#onSettled?.(full);
+      if (managed.routeOutcome || this.#onSettled) this.#commitArchive(managed.runDirectory, full);
+      else if (this.#onStoppedAtClose && !this.#closing) commitRunArchive(managed.runDirectory);
       delete managed.settlementSaveFailure;
       return true;
     } catch (error) {
@@ -3040,11 +3346,12 @@ export class AgentManager {
   #canCollect(managed: ManagedAgent): boolean {
     if (!managed.executionExited || managed.processStopPending || managed.nativeReleasePending ||
         managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
-    if (uncheckedExternalExit(managed.transport) || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) return false;
+    if (uncheckedExternalExit(managed.transport)) return false;
+    // Retry the durable full archive before asking its pending-marker collection veto.
     // Settlement compacts UI caches. Retry only the original full result, never those caches.
     if (managed.settlementSaveFailure &&
         !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) return false;
-    return true;
+    return !runTreeExitVeto(managed.runDirectory, 0, undefined, true);
   }
 
   #notifyBackgroundComplete(managed: ManagedAgent, result: AgentRunResult): void {
@@ -3287,15 +3594,18 @@ export class AgentManager {
     const model = managed.latestRecord?.model ?? managed.model;
     const thinking = managed.latestRecord?.thinking ?? managed.thinking;
     return {
+      ...managed.runRoute,
       id: managed.id,
       name: managed.name,
       status,
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
       transport: managed.transport.kind,
+      ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
       cwd: managed.cwd,
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       ...(model ? { model } : {}),
+      ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
       ...(thinking ? { thinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),
@@ -3352,12 +3662,14 @@ export class AgentManager {
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
     return {
       ...safeRecord,
+      ...managed.runRoute,
       ...(includeSaveFailure && managed.settlementSaveFailure
         ? { warnings: [...(record.warnings ?? []), managed.settlementSaveFailure.warning] }
         : {}),
       cwd: managed.cwd,
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
+      ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       logFile: path.join(managed.runDirectory, "events.jsonl"),
       ...(nestedAgents.length > 0 ? { nestedAgents } : {}),

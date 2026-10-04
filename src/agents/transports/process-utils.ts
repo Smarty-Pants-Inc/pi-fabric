@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
@@ -281,22 +282,39 @@ export const spawnDetached = async (
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
+  scope?: { executable: string; slice: string; warn: (reason: string) => void },
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
   // The new tree-custody protocol is unsupported on Windows. Even an internal
   // caller requesting it must get only the legacy native worker-exit contract.
   const tracksExecution = executionCustodian && process.platform !== "win32";
-  const child = spawn(runtime, [workerPath, ...workerArguments], {
+  // Scope admission execs in place: the captured PID and custody IPC stay owned.
+  const scopeRoot = scope ? fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scope-")) : undefined;
+  const marker = scopeRoot ? path.join(scopeRoot, "admitted") : undefined;
+  const child = spawn(scope?.executable ?? runtime, scope ? [
+    "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", "--",
+    "/bin/sh", "-c", 'printf admitted > "$1" || exit 125; shift; exec "$@"',
+    "fabric-scope", marker!, runtime, workerPath, ...workerArguments,
+  ] : [workerPath, ...workerArguments], {
     cwd,
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
     stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });
-  if (!child.pid) throw new Error("Failed to launch Fabric worker process");
+  let spawnError: Error | undefined;
+  child.once("error", error => { spawnError = error; });
+  if (!child.pid) {
+    await new Promise<void>(resolve => child.once("close", () => resolve()));
+    if (!scope) throw spawnError ?? new Error("Failed to launch Fabric worker process");
+    fs.rmSync(scopeRoot!, { recursive: true, force: true });
+    assertTransportLaunchAllowed(authority);
+    scope.warn(spawnError?.message ?? "systemd-run did not launch");
+    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
+  }
   const pid = child.pid;
   // Exit is latched: after the worker/group empties its numeric id is not identity.
   let exited = false;
@@ -465,8 +483,9 @@ export const spawnDetached = async (
       throw new Error(`Fabric worker ${pid} did not exit after bounded SIGTERM/SIGKILL cleanup`);
     }
   };
-  return {
+  const handle = {
     pid,
+    closed,
     lostContact: () => lost,
     stopDebt: () => stopFailed ? undefined : lost,
     async waitForClose() {
@@ -557,4 +576,23 @@ export const spawnDetached = async (
         : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0);
     },
   };
+  if (scope && marker) {
+    let nativeClosed = false;
+    void closed.then(() => { nativeClosed = true; });
+    const admissionDeadline = Date.now() + 5_000;
+    try {
+      while (!fs.existsSync(marker) && !nativeClosed && Date.now() < admissionDeadline && !authority?.signal?.aborted) {
+        await new Promise<void>(resolve => setTimeout(resolve, 10));
+      }
+      if (fs.existsSync(marker)) return handle;
+      if (!nativeClosed) await handle.stop();
+      if (handle.lostContact()) throw new Error(handle.lostContact());
+      if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");
+      assertTransportLaunchAllowed(authority);
+      if (fs.existsSync(marker)) return handle; // admitted during teardown: never replay
+      scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
+      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
+    } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }
+  }
+  return handle;
 };

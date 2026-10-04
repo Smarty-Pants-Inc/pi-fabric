@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
+import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 
 import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
@@ -10,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorCreateRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
@@ -71,6 +72,10 @@ import {
 // extension loading can exceed 10s on slow runners (e.g. CI Windows), so give
 // startup a generous budget. Idle exit still reclaims the processes.
 const STARTUP_TIMEOUT_MS = 30_000;
+// Usable readiness now requires confirmed publication, which cannot recover an
+// empty legacy mesh lock before its mandatory 30 s grace. Include bounded boot
+// and post-grace acquisition time; explicit caller startup budgets stay exact.
+const HOST_READY_TIMEOUT_MS = 45_000;
 // smarty-dev#883: the start is CPU-bound process boot, so its wall time grows
 // with contention (a 1 s boot took 16 s at load 5 per core). Scale the budget
 // by the 1-minute load per core, capped. Windows reports no load average (0).
@@ -286,7 +291,7 @@ export class ResidencyClient {
     await this.#stopStartingLauncher();
     this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
-    const existing = this.#liveOwner();
+    const existing = this.#readyOwner();
     if (existing) return existing;
     // The detached launcher already owns the exact attempt/fallback. Neither
     // ensureHost nor the watchdog may become a competing handover executor.
@@ -298,8 +303,16 @@ export class ResidencyClient {
       }
       await delay(STATUS_POLL_MS);
     }
-    const followed = this.#liveOwner();
-    if (followed) return followed;
+    // Owner publication is not maintenance readiness. Attach to its exact
+    // live generation; never launch a competing startup while its fence holds.
+    const attachDeadline = Date.now() + startupBudgetMs(this.options.startupTimeoutMs ?? HOST_READY_TIMEOUT_MS);
+    while (this.#liveOwner()) {
+      if (this.#closed) throw new Error("Fabric residency client is closed");
+      const followed = this.#readyOwner();
+      if (followed) return followed;
+      if (Date.now() >= attachDeadline) throw new Error("Timed out waiting for Fabric resident host maintenance readiness");
+      await delay(STATUS_POLL_MS);
+    }
     fs.rmSync(this.#errorPath, { force: true });
     const launchToken = randomUUID();
     const launcher = await spawnDetached(
@@ -311,7 +324,7 @@ export class ResidencyClient {
     // The budget counts from the launcher's first sign of life (its
     // launcher-started trace), so its own boot does not consume it.
     const launcherBirth = processStartTime(launcher.pid);
-    const budget = startupBudgetMs(this.options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS);
+    const budget = startupBudgetMs(this.options.startupTimeoutMs ?? HOST_READY_TIMEOUT_MS);
     let deadline = Date.now() + budget;
     let started = false;
     let launcherExited = false;
@@ -320,7 +333,7 @@ export class ResidencyClient {
         await this.#stopStartingLauncher();
         throw new Error("Fabric residency client is closed");
       }
-      const owner = this.#liveOwner();
+      const owner = this.#readyOwner();
       if (owner) {
         // Only our attempt may transfer custody to durable residency. Another
         // winner does not prove our losing launcher (or restored work) exited.
@@ -421,7 +434,7 @@ export class ResidencyClient {
     await this.#waitForParticipant(id, "actor");
   }
 
-  async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+  async createActor(request: FabricActorCreateRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
     await this.ensureHost();
     const response = await this.#command({
@@ -507,6 +520,10 @@ export class ResidencyClient {
     const tools = allowedTools === undefined ? undefined
       : (request.tools ?? this.options.config.agents.defaultTools).filter((tool) => allowedTools.has(tool));
     await this.ensureHost();
+    // Durable settlement can synchronously occupy the caller's event loop past
+    // its last heartbeat. Publish a fresh trusted owner lease before dispatch;
+    // the host still checks the captured binding and rejects absent/stale peers.
+    await this.options.participants.refresh?.();
     const response = await this.#command(
       {
         format: RESIDENT_HOST_FORMAT,
@@ -532,6 +549,9 @@ export class ResidencyClient {
 
   /** Persist session-scoped background outcomes before their retractable inbox admission. */
   enqueueCompletion(result: AgentRunResult, admittedRecipient?: CompletionRecipient): void {
+    // No manifest and no host binding means no authorized recipient. This is a
+    // deliberate prelaunch refusal, not a transient storage failure to retry.
+    if (!result.logFile && !admittedRecipient && typeof this.#completions.recipientSource === "function") return;
     this.#completions.save(result, admittedRecipient);
   }
 
@@ -793,6 +813,9 @@ export class ResidencyClient {
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           if (acknowledgeResidentResponse(this.options.config.residencyRoot, response, Date.now(), command.format)) fs.rmSync(responsePath, { force: true });
           if (!response.ok) {
+            if (command.operation === "resetSession" && response.errorCode === "ACTOR_SESSION_RESET_CANCELLED") {
+              throw new ActorSessionResetCancelledError(command.id, response.error, command.requestId);
+            }
             if (response.errorCode === "RESIDENT_REQUEST_EXPIRED") throw new ResidentRequestExpiredError(command.requestId);
             if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
             if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
@@ -815,6 +838,8 @@ export class ResidencyClient {
       throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}` +
         ` (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
+      // This acknowledged terminal response is known, unlike a lost post-commit reply.
+      if (error instanceof ActorSessionResetCancelledError) throw error;
       if (error instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.options.config.residencyRoot, command, signal);
       let decision;
       try {
@@ -882,6 +907,9 @@ export class ResidencyClient {
       name: handle.name,
       task: "",
       status: "failed",
+      ...(handle.routeClass !== undefined ? { routeClass: handle.routeClass } : {}),
+      ...(handle.routeClassSource !== undefined ? { routeClassSource: handle.routeClassSource } : {}),
+      ...(handle.protected !== undefined ? { protected: handle.protected } : {}),
       runner: handle.runner,
       transport: handle.transport,
       cwd: handle.cwd,
@@ -955,11 +983,19 @@ export class ResidencyClient {
     return owner;
   }
 
+  #readyOwner(): ResidentHostOwner | undefined {
+    const owner = this.#liveOwner();
+    if (owner?.maintenanceReady === 1 &&
+        readJson<{ token?: string }>(path.join(this.options.config.residencyRoot, "maintenance-ready.json"))?.token !== owner.token) return undefined;
+    return owner;
+  }
+
   async #watchdog(): Promise<void> {
     const now = Date.now();
     if (this.#closed || this.#startingHost || now < this.#nextWatchdogAt || !kernelFenceAvailable()) return;
     this.#nextWatchdogAt = now + WATCHDOG_INTERVAL_MS;
     if (this.#liveOwner()) {
+      if (!this.#readyOwner()) return;
       void this.reconcileRelease().catch((error) => this.#deferRelease(error));
       return;
     }
@@ -1009,11 +1045,14 @@ export class ResidencyClient {
   }
 
   #recipient(config: ResidentHostConfig): CompletionRecipient {
-    // A startup-only client can precede the resident directory's initialization.
-    // Its persisted config still supplies the original, fixed lane address.
-    const original = this.options.participants?.lastKnown?.(config.rootId)?.participant;
+    const name = (config === this.options.config ? this.options.mainName?.() : undefined) ?? config.mainName;
+    // lastKnown performs a fresh full-fleet scan. Current Main configs already supply
+    // both fields; idle completion polls need that scan only for legacy metadata.
+    // Keep the live name callback uncached so renames still bind new admissions.
+    const original = name === undefined || config.mainStartedAt === undefined
+      ? this.options.participants?.lastKnown?.(config.rootId)?.participant : undefined;
     return { rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd, projectRoot: config.projectRoot,
-      name: (config === this.options.config ? this.options.mainName?.() : undefined) ?? config.mainName ?? original?.name ?? "main", role: config.role,
+      name: name ?? original?.name ?? "main", role: config.role,
       startedAt: config.mainStartedAt ?? original?.startedAt ??
         (/^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-/.test(config.sessionId)
           ? Number.parseInt(config.sessionId.replaceAll("-", "").slice(0, 12), 16) : 0) };

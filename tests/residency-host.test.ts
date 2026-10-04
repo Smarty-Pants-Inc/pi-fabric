@@ -431,7 +431,7 @@ describe.skipIf(process.platform !== "linux")("#2566 owned startup shutdown", ()
   it("item 5 retains the exact launcher after failed verification and surfaces close cleanup failure", async () => {
     const { root, config, host } = fixture();
     const stop = vi.fn<() => Promise<void>>().mockRejectedValue(new Error("owned process exit unconfirmed"));
-    const spawn = vi.spyOn(processUtils, "spawnDetached").mockResolvedValue({ pid: process.pid, stop, isAlive: async () => true, lostContact: () => undefined, waitForClose: async () => {} });
+    const spawn = vi.spyOn(processUtils, "spawnDetached").mockResolvedValue({ pid: process.pid, closed: new Promise<void>(() => {}), stop, isAlive: async () => true, lostContact: () => undefined, waitForClose: async () => {} });
     const client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants,
       mainAgent: { local: false } as FabricMainAgentTarget, startupTimeoutMs: 20 });
     try {

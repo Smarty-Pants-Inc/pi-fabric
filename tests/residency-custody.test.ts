@@ -149,7 +149,7 @@ describe.skipIf(process.platform !== "linux")("round 2 execution custody", () =>
       const launchToken = argv[argv.indexOf("--launch-token") + 1];
       expect(launchToken).toMatch(/^[0-9a-f-]{36}$/);
       fs.writeFileSync(path.join(config.residencyRoot, "owner.json"), JSON.stringify({ format: 1, hostId: residentHostId(config.rootId), pid: process.pid, token: "ours", launchToken, startedAt: Date.now(), readyAt: Date.now() }));
-      return { pid: process.pid + 1, stop, isAlive: async () => true, lostContact: () => undefined, waitForClose: async () => {} };
+      return { pid: process.pid + 1, closed: new Promise<void>(() => {}), stop, isAlive: async () => true, lostContact: () => undefined, waitForClose: async () => {} };
     });
     try {
       expect(await client.ensureHost()).toMatchObject({ token: "ours" });
@@ -168,7 +168,7 @@ describe.skipIf(process.platform !== "linux")("round 2 execution custody", () =>
     const stop = vi.fn(async () => { if (failCleanup) throw new Error("loser exit unconfirmed"); await stopping; });
     const spawn = vi.spyOn(processUtils, "spawnDetached").mockImplementation(async () => {
       fs.writeFileSync(path.join(config.residencyRoot, "owner.json"), JSON.stringify(owner));
-      return { pid: process.pid + 1, stop, isAlive: async () => true, lostContact: () => undefined, waitForClose: async () => {} };
+      return { pid: process.pid + 1, closed: new Promise<void>(() => {}), stop, isAlive: async () => true, lostContact: () => undefined, waitForClose: async () => {} };
     });
     try {
       let settled = false;

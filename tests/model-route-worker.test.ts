@@ -39,7 +39,7 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     const saved = JSON.parse(fs.readFileSync(path.join(root, "runs", result.id, "status.json"), "utf8"));
     return { result, rows, launch, events, pin, saved };
   };
-  it("R3 cleanup joins a process that publishes its terminal result before exiting", async () => {
+  it("R3 terminal publication joins owned process exit before result delivery and cleanup", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-exit-")); roots.push(root);
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
       workerPath: path.resolve("tests/fixtures/terminal-before-exit-worker.mjs"), runRoot: path.join(root, "runs"),
@@ -48,7 +48,9 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     expect(result.status).toBe("completed");
     const pid = Number(result.sessionId);
     expect(Number.isSafeInteger(pid)).toBe(true);
-    expect(() => process.kill(pid, 0)).not.toThrow();
+    // A worker's terminal status is provisional: #2566 now joins the owned
+    // launcher before exposing its result, not only when cleanup is requested.
+    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
     const directory = manager.runDirectory(result.id)!;
     expect(fs.existsSync(directory)).toBe(true);
     await manager.cleanup(result.id);

@@ -321,6 +321,28 @@ describe("tasks provider", () => {
     expect(done).toMatchObject({ reason: "finished", lines: [], more: false });
     expect(job.abort.signal.aborted).toBe(false);
   });
+  it("A21 keeps malformed UTF-8 line cursors in raw bytes and sees appended matches", async () => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "invalid utf8"); job.spill();
+    job.append(Buffer.from([0xff, 0x78, 0x0a]));
+    const first = await provider.invoke("watch", { id: job.id, match: "x" }, context) as { nextCursor: number };
+    expect(first).toMatchObject({ lines: ["�x"], nextCursor: 3, omittedBytes: 0, more: false });
+    await expect(provider.invoke("watch", { id: job.id, match: "x", after: first.nextCursor, timeoutMs: 5 }, context))
+      .resolves.toMatchObject({ lines: [], nextCursor: 3, reason: "timeout" });
+    job.append(Buffer.from("xx\n"));
+    await expect(provider.invoke("watch", { id: job.id, match: "x", after: first.nextCursor }, context))
+      .resolves.toMatchObject({ lines: ["xx"], nextCursor: 6, omittedBytes: 0 });
+  });
+  it("A21 clips malformed UTF-8 pending lines by bytes, not replacement text length", async () => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "invalid clipped utf8"); job.spill();
+    job.append(Buffer.concat([Buffer.from([0xff]), Buffer.alloc(SHELL_READ_MAX_BYTES - 1, 120)]));
+    const first = await provider.invoke("watch", { id: job.id, match: "x" }, context) as { nextCursor: number };
+    expect(first).toMatchObject({ nextCursor: SHELL_READ_MAX_BYTES, more: false });
+    job.append(Buffer.from("NEXT x\n"));
+    await expect(provider.invoke("watch", { id: job.id, match: "NEXT", after: first.nextCursor }, context))
+      .resolves.toMatchObject({ lines: ["NEXT x"], nextCursor: SHELL_READ_MAX_BYTES + 7, omittedBytes: 0 });
+  });
   it("does not spin on incomplete UTF-8 tails or page-boundary multibyte output", async () => {
     const { store, provider } = setup();
     const job = store.begin("bash", "utf8"); job.spill();

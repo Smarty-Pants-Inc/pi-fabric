@@ -1,5 +1,4 @@
 import type { FabricActionDescriptor, FabricInvocationContext, FabricProvider, FabricProviderListRequest } from "../protocol.js";
-import { StringDecoder } from "node:string_decoder";
 import { SHELL_READ_MAX_BYTES, type FabricShellJobStore } from "../core/shell-jobs.js";
 import { validationMessage } from "../core/action-arguments.js";
 
@@ -17,6 +16,17 @@ const readSchema = { ...idSchema, properties: { ...idSchema.properties,
   waitMs: { type: "integer", minimum: 1, maximum: 300000, description: "Long-poll ceiling: return as soon as bytes past offset exist or the task ends. Never stops the task." },
   encoding: { type: "string", enum: ["text", "base64"], description: "text (default) never splits a UTF-8 character; base64 returns byte-exact data." },
 } };
+// Keep a possibly incomplete UTF-8 suffix for replay, but count malformed bytes
+// as raw bytes too: replacement decoding must never determine a stream offset.
+const utf8PrefixLength = (bytes: Buffer): number => {
+  for (let back = 1; back <= Math.min(3, bytes.length); back++) {
+    const byte = bytes[bytes.length - back]!;
+    if ((byte & 0xc0) === 0x80) continue;
+    const need = byte >= 0xc2 && byte <= 0xdf ? 2 : byte >= 0xe0 && byte <= 0xef ? 3 : byte >= 0xf0 && byte <= 0xf4 ? 4 : 1;
+    return need > back ? bytes.length - back : bytes.length;
+  }
+  return bytes.length;
+};
 const WATCH_LINES = 64;
 const WATCH_LINE_CHARS = 2048;
 const clean = (line: string): string => line.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
@@ -99,11 +109,10 @@ export class TasksProvider implements FabricProvider {
     if (after > job.written) throw new Error("tasks.watch after must not be past the task's output");
     const deadline = Date.now() + timeoutMs;
     const lines: string[] = [];
-    const decoder = new StringDecoder("utf8");
     let readCursor = after;
     let cursor = after;
     let lineStart = after;
-    let pending = "";
+    let pending: Buffer = Buffer.alloc(0);
     let omittedBytes = 0;
     const result = (reason: "event" | "finished" | "timeout") =>
       ({ task: job.info(), reason, lines, omittedBytes, more: cursor < job.written, nextCursor: cursor });
@@ -112,39 +121,40 @@ export class TasksProvider implements FabricProvider {
       const previousReadCursor = readCursor;
       const page = job.read(readCursor, SHELL_READ_MAX_BYTES, "base64");
       omittedBytes += page.omittedBytes;
-      if (page.offset > previousReadCursor && !pending) {
+      if (page.offset > previousReadCursor) {
+        // A disclosed retention gap breaks a pending line; never join across it.
+        pending = Buffer.alloc(0);
         lineStart = page.offset;
         cursor = page.offset;
       }
       readCursor = page.next;
-      pending += decoder.write(Buffer.from(page.data ?? "", "base64"));
+      pending = Buffer.concat([pending, Buffer.from(page.data ?? "", "base64")]);
       for (;;) {
-        const end = pending.indexOf("\n");
+        const end = pending.indexOf(0x0a);
         if (end < 0 || lines.length >= WATCH_LINES) break;
-        const line = pending.slice(0, end);
-        pending = pending.slice(end + 1);
-        lineStart += Buffer.byteLength(line + "\n");
+        const line = pending.subarray(0, end).toString("utf8");
+        pending = pending.subarray(end + 1);
+        lineStart += end + 1;
         cursor = lineStart;
         if (line.includes(match)) lines.push(clean(line).slice(0, WATCH_LINE_CHARS));
       }
       if (lines.length) return result("event");
       if (page.eof) {
-        pending += decoder.end();
-        if (pending && lines.length < WATCH_LINES) {
-          if (pending.includes(match)) lines.push(clean(pending).slice(0, WATCH_LINE_CHARS));
+        if (pending.length && lines.length < WATCH_LINES) {
+          const line = pending.toString("utf8");
+          if (line.includes(match)) lines.push(clean(line).slice(0, WATCH_LINE_CHARS));
           cursor = readCursor;
         }
         return result("finished");
       }
       // Bound an unterminated line and, crucially, advance the read cursor even
       // when a page ends in an incomplete UTF-8 sequence.
-      if (pending && readCursor - lineStart >= SHELL_READ_MAX_BYTES) {
-        if (pending.includes(match)) lines.push(clean(pending).slice(0, WATCH_LINE_CHARS));
-        // The decoder may still hold bytes of the next UTF-8 character.
-        // Publish only a complete-character cursor so the next watch can replay
-        // that character intact, even after clipping an unterminated page.
-        lineStart += Buffer.byteLength(pending);
-        pending = "";
+      if (pending.length && readCursor - lineStart >= SHELL_READ_MAX_BYTES) {
+        const end = utf8PrefixLength(pending);
+        const line = pending.subarray(0, end).toString("utf8");
+        if (line.includes(match)) lines.push(clean(line).slice(0, WATCH_LINE_CHARS));
+        lineStart += end;
+        pending = pending.subarray(end);
         cursor = lineStart;
         if (lines.length) return result("event");
       }

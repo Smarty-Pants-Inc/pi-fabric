@@ -99,6 +99,8 @@ export class ProcessTransport implements AgentTransportAdapter {
         workerArguments,
       ),
       executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
+      7_000, // allow the worker's five-second execution-child cleanup
+      process.platform !== "win32", // Windows retains its native-close/helper contract
     );
     return {
       kind: this.kind,
@@ -106,6 +108,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       sessionId: String(processHandle.pid),
       isAlive: processHandle.isAlive,
       lostContact: processHandle.lostContact,
+      ...(processHandle.stopDebt ? { stopDebt: processHandle.stopDebt } : {}),
       waitForClose: processHandle.waitForClose,
       closed: processHandle.closed,
       stop: processHandle.stop,

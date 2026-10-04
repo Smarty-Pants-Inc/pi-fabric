@@ -24,7 +24,12 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
   const sessions: AgentSession[] = [];
   const saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   afterEach(async () => {
-    for (const session of sessions.splice(0)) session.dispose();
+    for (const session of sessions.splice(0)) {
+      // dispose() invalidates host contexts; it does not emit the extension shutdown
+      // hook. Close Fabric's observers and delayed compiles before invalidating them.
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+    }
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
@@ -126,6 +131,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     h.missedWork("retry unseen work");
     await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     session.dispose();
+    sessions.splice(sessions.indexOf(session), 1);
     await loader.reload();
     const { session: reloaded } = await createAgentSession({
       cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,

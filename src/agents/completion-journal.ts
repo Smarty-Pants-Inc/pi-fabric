@@ -152,9 +152,23 @@ const readRecipient = (file: string): CompletionRecipient | undefined => {
   finally { if (fd !== undefined) fs.closeSync(fd); }
   return undefined;
 };
-const readRecipientAsync = async (file: string): Promise<CompletionRecipient | undefined> => {
+// Idle discovery visits every lane's envelopes twice per poll. Keep only parsed routing
+// metadata, never bodies, receipts, canonical-path decisions or durability confirmations.
+// Directory mtime alone is insufficient: legacy/in-place writers need per-file validation.
+const recipientCache = new Map<string, { stamp: string; address: CompletionRecipient }>();
+const recipientStamp = (stat: fs.BigIntStats): string =>
+  `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+const RECIPIENT_CACHE_LIMIT = 1024;
+const readRecipientAsync = async (file: string, reuse = false): Promise<CompletionRecipient | undefined> => {
   let handle: fs.promises.FileHandle | undefined;
+  let stamp: string | undefined;
   try {
+    if (reuse) {
+      stamp = recipientStamp(await fs.promises.stat(file, { bigint: true }));
+      const cached = recipientCache.get(file);
+      if (cached?.stamp === stamp) return cached.address;
+      recipientCache.delete(file);
+    }
     handle = await fs.promises.open(file, "r");
     const buffer = Buffer.alloc(addressBuffer.length);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
@@ -172,12 +186,21 @@ const readRecipientAsync = async (file: string): Promise<CompletionRecipient | u
       else if (character === "{") depth++;
       else if (character === "}" && --depth === 0) {
         const address = JSON.parse(prefix.slice(start, i + 1)) as CompletionRecipient;
-        return typeof address.projectRoot === "string" && typeof address.cwd === "string" &&
+        if (!(typeof address.projectRoot === "string" && typeof address.cwd === "string" &&
           typeof address.rootId === "string" && typeof address.sessionId === "string" &&
-          typeof address.name === "string" ? address : undefined;
+          typeof address.name === "string")) return undefined;
+        // Bind the cache to the inode actually read. A replace or in-place write between
+        // the path stat and the read must not label those bytes with a different stamp.
+        if (reuse && stamp === recipientStamp(await handle.stat({ bigint: true }))) {
+          recipientCache.set(file, { stamp, address });
+          if (recipientCache.size > RECIPIENT_CACHE_LIMIT) recipientCache.delete(recipientCache.keys().next().value!);
+        }
+        return address;
       }
     }
-  } catch { /* Missing, torn or oversized addresses cannot authorize body/fence access. */ }
+  } catch {
+    recipientCache.delete(file); // Unknown/missing files are retried, never a stale answer.
+  }
   finally { await handle?.close(); }
   return undefined;
 };
@@ -315,8 +338,8 @@ export const saveWorkerCompletion = (statusFile: string, result: AgentRunRecord)
 const promoteOrphanAsync = async (meshRoot: string, projectRoot: string, project: string, target: string,
   accepts: (recipient: CompletionRecipient) => Promise<boolean>): Promise<void> => {
   const file = path.basename(target);
-  const address = await readRecipientAsync(target);
-  if (!address || await canonicalAsync(address.projectRoot) !== project || !await accepts(address)) return;
+  const address = await readRecipientAsync(target, true);
+  if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) return;
   const fence = path.join(directory(meshRoot), "receipts", file);
   if (await readReceiptAsync(fence)) return;
   const candidate = await readAsync<CompletionCandidate>(target);
@@ -393,8 +416,8 @@ const pendingCompletionAsync = async (meshRoot: string, projectRoot: string, pro
   accepts: (recipient: CompletionRecipient) => Promise<boolean>, consumed?: ReadonlySet<string>): Promise<CompletionEnvelope[]> => {
   const file = path.basename(target);
   if (consumed?.has(file)) return [];
-  const recipient = await readRecipientAsync(target);
-  if (!recipient || await canonicalAsync(recipient.projectRoot) !== project || !await accepts(recipient)) return [];
+  const recipient = await readRecipientAsync(target, true);
+  if (!recipient || !await accepts(recipient) || await canonicalAsync(recipient.projectRoot) !== project) return [];
   if (await readReceiptAsync(path.join(directory(meshRoot), "receipts", file))) return [];
   const value = await readAsync<CompletionEnvelope>(target);
   if (value?.format !== 1 || !value.recipient || !value.result ||
@@ -562,8 +585,12 @@ export class CompletionJournal {
     const project = await canonicalAsync(recipient.projectRoot);
     for await (const target of scanTargets([directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts")])) {
       const file = path.basename(target);
-      const address = await readRecipientAsync(target);
-      if (!address || await canonicalAsync(address.projectRoot) !== project || !await accepts(address)) continue;
+      let address = await readRecipientAsync(target, true);
+      if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) continue;
+      // Reuse only rejects unchanged foreign entries. Cleanup authority always reopens
+      // the exact address, then confirms the exact receipt and full namespace below.
+      address = await readRecipientAsync(target);
+      if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) continue;
       const fence = path.join(directory(this.meshRoot), "receipts", file);
       const receipt = await readReceiptAsync(fence);
       if (!receipt) continue;

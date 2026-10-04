@@ -89,6 +89,8 @@ export interface MeshStoreOptions {
    * default) re-reads whenever the file changed.
    */
   readCacheMs?: number;
+  /** A live turn/pending operation bypasses the idle reuse window on demand. */
+  readActive?: () => boolean;
 }
 
 // Opt-in commit diagnostics: no values or stacks are collected on the normal path.
@@ -114,9 +116,11 @@ const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
  * Read-cache age for non-fresh reads in a Fabric runtime and its resident host. Fresh protocol
  * decisions always read canonical state (smarty-dev#2355); ordinary polls reuse a recent parse
  * (smarty-dev#251: ~50 processes previously parsed every change, about 10 times a second).
- * ponytail: listings may lag other hosts by up to 2 s; leases are 15 s and heartbeats 5 s.
+ * Idle observers coalesce for 5 s by default (mesh.idleReadCoalesceMs). Active turns and pending
+ * Main messages bypass the window; CAS, ownership and delivery still request canonical freshness.
+ * This is a reader policy only: no on-disk format or writer cadence change (mixed fleets).
  */
-export const RUNTIME_MESH_READ_CACHE_MS = 2_000;
+export const RUNTIME_MESH_READ_CACHE_MS = 5_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
@@ -538,6 +542,7 @@ export class MeshStore {
   readonly #lockTimeoutMs: number;
   readonly #staleLockMs: number;
   readonly #readCacheMs: number;
+  readonly #readActive: (() => boolean) | undefined;
   /**
    * Line ends (sequence, offset) that recent read({ after }) scans passed, by rising sequence. A
    * read starts at the last one at or below its cursor. One remembered point was not enough:
@@ -592,6 +597,7 @@ export class MeshStore {
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
     this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
+    this.#readActive = options.readActive;
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   }
 
@@ -601,7 +607,12 @@ export class MeshStore {
 
   /** The reuse window of reads (MeshStoreOptions.readCacheMs), for readers of files beside the state. */
   get readCacheMs(): number {
-    return this.#readCacheMs;
+    return this.#readActive?.() ? 0 : this.#readCacheMs;
+  }
+
+  /** Time until an idle observer may revalidate; hits do not slide this deadline. */
+  get readCacheRemainingMs(): number {
+    return this.#stateCache ? Math.max(0, this.readCacheMs - (Date.now() - this.#stateCache.parsedAt)) : 0;
   }
 
   async publish(input: {
@@ -1097,7 +1108,10 @@ export class MeshStore {
   // decides a protocol step rather than a listing.
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
-    const entries = this.#readCachedState(options.fresh === true).entries;
+    const state = options.fresh === true || options.snapshot === undefined
+      ? this.#readCachedState(options.fresh === true)
+      : options.snapshot as MeshStateFile;
+    const entries = state.entries;
     return Object.hasOwn(entries, key) ? jsonClone(entries[key]) : undefined;
   }
 
@@ -1161,7 +1175,8 @@ export class MeshStore {
   #signalledState(prefix: string): MeshStateFile | undefined {
     const cached = this.#stateCache;
     const namespace = keyNamespace(prefix);
-    if (!cached || !namespace || this.#readCacheMs <= 0 || Date.now() - cached.parsedAt < this.#readCacheMs) return undefined;
+    const readCacheMs = this.readCacheMs;
+    if (!cached || !namespace || readCacheMs <= 0 || Date.now() - cached.parsedAt < readCacheMs) return undefined;
     const before = statStamp(this.#statePath);
     if (!before) return undefined;
     // The canonical header decides, not the stat (which can repeat): an unchanged generation is
@@ -1538,7 +1553,8 @@ export class MeshStore {
 
   #readCachedState(fresh = false, canonical = fresh): MeshStateFile {
     const recent = this.#stateCache;
-    if (!fresh && recent && this.#readCacheMs > 0 && Date.now() - recent.parsedAt < this.#readCacheMs) {
+    const readCacheMs = this.readCacheMs;
+    if (!fresh && recent && readCacheMs > 0 && Date.now() - recent.parsedAt < readCacheMs) {
       return recent.state;
     }
     let before: string;

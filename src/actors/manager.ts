@@ -401,7 +401,7 @@ export class ActorManager {
   #filterStateSave: Promise<void> | undefined;
   readonly #bindings: ActorBindingStore;
   readonly #mainAgent: FabricMainAgentTarget | undefined;
-  readonly #canManageActor: ((id: string) => boolean | undefined) | undefined;
+  readonly #canManageActor: ((id: string, fresh?: boolean) => boolean | undefined) | undefined;
   readonly #isOwnResidentActor: ((id: string) => boolean) | undefined;
   // Set while one mesh event is delivered synchronously after a single ownership refresh.
   #ownershipSnapshot = false;
@@ -487,7 +487,8 @@ export class ActorManager {
       actorScope?: import("./types.js").FabricActorStorageScope;
       persistent?: boolean;
       mainAgent?: FabricMainAgentTarget;
-      canManageActor?: (id: string) => boolean | undefined;
+      /** Fresh by default for authority; false is only an observational ownership view. */
+      canManageActor?: (id: string, fresh?: boolean) => boolean | undefined;
       /** Creation-only proof of a live actor owned by this Main's resident host. Never grants management. */
       isOwnResidentActor?: (id: string) => boolean;
       /** May refresh the model registry on a miss, so it is awaited (smarty-dev#1830). */
@@ -577,7 +578,7 @@ export class ActorManager {
       beforePoll: () => {
         if (this.#releasePaused || options.canConsumeMesh?.() === false) return false;
         this.#syncActorsFromRegistry();
-        this.#refreshOwnership();
+        this.#refreshOwnership(undefined, false);
         for (const actor of this.#actors.values()) {
           if (this.#canManageCached(actor.id)) this.#expireActivationFilter(actor);
         }
@@ -808,7 +809,7 @@ export class ActorManager {
 
   listOwned(): FabricActorInfo[] {
     this.#syncActorsFromRegistry();
-    this.#refreshOwnership();
+    this.#refreshOwnership(undefined, false);
     return [...this.#actors.values()]
       .filter((actor) => this.#canManageCached(actor.id))
       .map((actor) => this.#publicInfo(actor));
@@ -3301,12 +3302,9 @@ export class ActorManager {
   // Returns false when an owned receiver's queue was full; the monitor then offers the event
   // again while it catches up, and actors that already took it are skipped.
   #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
-    // beforePoll already refreshed all owners for this synchronous page. No
-    // await separates that snapshot from dispatch, including archive catch-up.
-    // Re-refreshing per event or full-queue retry repeats directory reads without
-    // adding an authority boundary. Async activation continuations recheck their
-    // own target after every wait.
-
+    // Empty polls only observe owners through the idle cache. The matched targets below
+    // revalidate canonical ownership before delivery; unrelated mesh traffic must not refresh
+    // every actor. Async continuations also recheck after every wait (smarty-dev#4383).
     this.#ownershipSnapshot = true;
     try {
       return this.#deliverMeshEvent(event);
@@ -3324,6 +3322,7 @@ export class ActorManager {
       const subscribed = actor.topics.includes(event.topic);
       if (!addressed && !subscribed) continue;
       if (event.from.id === actor.id && !addressed) continue;
+      this.#refreshOwnership(actor.id); // Fresh authority only for an actual delivery target.
       if (!this.#canManageCached(actor.id)) continue;
       const delivery = `${actor.id}\0${event.id}`;
       if (this.#delivered.has(delivery)) continue;
@@ -4283,10 +4282,10 @@ export class ActorManager {
     }
   }
 
-  #ownershipDecision(id: string): boolean {
+  #ownershipDecision(id: string, fresh = true): boolean {
     if (this.#ceded.has(id)) return false;
     const actor = this.#actors.get(id);
-    const decision = this.#canManageActor?.(id);
+    const decision = fresh ? this.#canManageActor?.(id) : this.#canManageActor?.(id, false);
 
     // The participant directory is authoritative when it has a live opinion.
     if (decision === false) return false;
@@ -4432,7 +4431,7 @@ export class ActorManager {
     this.#emitChange();
   }
 
-  #refreshOwnership(id?: string): void {
+  #refreshOwnership(id?: string, fresh = true): void {
     if (!this.#canManageActor || this.#reloadingOwnership) return;
     let acquired = false;
     // Async activation boundaries recheck their target, not every actor for
@@ -4441,7 +4440,7 @@ export class ActorManager {
     const actors = id === undefined ? this.#actors.values() : target ? [target] : [];
     for (const actor of actors) {
       const previous = this.#ownership.get(actor.id) ?? false;
-      const next = this.#ownershipDecision(actor.id);
+      const next = this.#ownershipDecision(actor.id, fresh);
       this.#ownership.set(actor.id, next);
       if (previous && !next) {
         this.#markOwnershipAbort(actor);
@@ -4679,7 +4678,7 @@ export class ActorManager {
   }
 
   #canManageCached(id: string): boolean {
-    return this.#ownership.get(id) ?? this.#ownershipDecision(id);
+    return this.#ownership.get(id) ?? this.#ownershipDecision(id, false);
   }
 
   #canManage(id: string): boolean {

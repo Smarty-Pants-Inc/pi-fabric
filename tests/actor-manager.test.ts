@@ -96,6 +96,41 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("ActorManager idle observer versus canonical authority (#4383)", () => {
+  it("coalesces an ownership view but refuses tell after canonical ownership moved", async () => {
+    let canonical = true;
+    const decision = vi.fn((_id: string, fresh = true) => fresh ? canonical : true);
+    const { actors, agents } = setup(false, decision);
+    const actor = await actors.create({ name: "authority", instructions: "Remain idle." });
+    decision.mockClear();
+    canonical = false;
+    expect(actors.listOwned().map(row => row.id)).toContain(actor.id); // Observer can still show the old owner.
+    expect(decision.mock.calls.some(([, fresh]) => fresh === false)).toBe(true);
+    expect(() => actors.tell(actor.id, "must not be delivered")).toThrow("owned by another host");
+    expect(decision.mock.calls.some(([, fresh]) => fresh !== false)).toBe(true);
+    expect(actors.status(actor.id).queued).toBe(0);
+    expect(agents.list()).toEqual([]);
+  });
+
+  it("does not use a cached owner for matched mesh delivery, or revalidate unrelated traffic", async () => {
+    let canonical = true;
+    const decision = vi.fn((_id: string, fresh = true) => fresh ? canonical : true);
+    const { actors, mesh, agents, identity } = setup(false, decision);
+    const actor = await actors.create({ name: "authority", instructions: "Remain idle.", topics: ["owner.work"] });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    decision.mockClear(); canonical = false;
+    await mesh.publish({ topic: "unrelated", from: identity });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(decision.mock.calls.every(([, fresh]) => fresh === false)).toBe(true); // Empty/no-match observation only.
+    decision.mockClear();
+    await mesh.publish({ topic: "owner.work", from: identity, text: "must not be delivered" });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(decision.mock.calls.some(([, fresh]) => fresh !== false)).toBe(true);
+    expect(actors.status(actor.id).queued).toBe(0);
+    expect(agents.list()).toEqual([]);
+  });
+});
+
 describe("ActorManager idle registry writes (#4383)", () => {
   it("reloads and polls unchanged actors without saving observational timestamps back to the registry", async () => {
     const state = setup(true);

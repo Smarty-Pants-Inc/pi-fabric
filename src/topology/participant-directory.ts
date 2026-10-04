@@ -719,7 +719,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // Check initial registration AND heartbeat renames, using both file and legacy/state peers.
   // This is an alert, not a race-free exclusive claim or a fork-ancestry inference.
   #reportRootCollisions(root: FabricParticipantRecord): void {
-    for (const peer of this.list({ scope: "project", kinds: ["root"], fresh: true })) {
+    // Advisory only: collision alerts may lag the bounded idle view. They must not bypass
+    // coalescing on every heartbeat; ownership/lineage/delivery reads below stay fresh.
+    for (const peer of this.list({ scope: "project", kinds: ["root"] })) {
       if (peer.id === root.id || !["idle", "running", "reloading"].includes(peer.status)) continue;
       const sameSession = root.sessionId !== undefined && root.sessionId === peer.sessionId;
       const sameName = root.name !== "main" && root.name === peer.name;

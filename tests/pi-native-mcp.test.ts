@@ -217,7 +217,7 @@ describe("Pi-owned MCP tools inside Fabric", () => {
     setActiveCompiledSurface(undefined, true);
     const trace = new FabricExecutionTraceRecorder();
     await f.registry.invoke("mcp.docs-api.find.item", { VALUE: "x", count: "2" }, { ...f.context, trace });
-    expect(f.context.approve).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ ref: "mcp.docs-api.find.item" }), { value: "x", count: 2 });
+    expect(f.context.approve).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ ref: "mcp.docs-api.find.item" }), { value: "x", count: 2 }, expect.any(AbortSignal));
     expect(f.executeTool).toHaveBeenCalledWith("mcp__hashed_0", { value: "x", count: 2 }, expect.anything());
     const operations = trace.seal("succeeded", []).operations;
     expect(operations).toHaveLength(1);

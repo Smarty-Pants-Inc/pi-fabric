@@ -8,7 +8,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { FabricMemorySourceConfig } from "../config.js";
-import { readSessionHeader } from "./normalize.js";
 import {
   MEMORY_SOURCE_INTERFACE_VERSION,
   createMemorySourceRegistry,
@@ -39,11 +38,75 @@ interface DiscoveredSession {
   mtimeMs: number;
 }
 
+const isInside = (root: string, target: string): boolean => {
+  const relative = path.relative(root, target);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+};
+
 const statMtimeMs = (file: string): number => {
   try {
     return fs.statSync(file).mtimeMs;
   } catch {
     return 0;
+  }
+};
+
+interface ConfinedFile {
+  content: string;
+  mtimeMs: number;
+}
+
+/** Read only a regular file whose canonical target remains inside root. */
+const readConfinedFile = (root: string, file: string): ConfinedFile | null => {
+  const rootLexical = path.resolve(root);
+  let rootReal: string;
+  let canonical: string;
+  try {
+    rootReal = fs.realpathSync(rootLexical);
+    canonical = fs.realpathSync(file);
+  } catch {
+    return null;
+  }
+  if (!isInside(rootReal, canonical)) return null;
+  let current = rootLexical;
+  const relative = path.relative(rootLexical, file);
+  for (const segment of relative.split(path.sep)) {
+    if (!segment || segment === ".") continue;
+    current = path.join(current, segment);
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) return null;
+    } catch {
+      return null;
+    }
+  }
+  let fd: number | undefined;
+  try {
+    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) return null;
+    return { content: fs.readFileSync(fd, "utf8"), mtimeMs: stat.mtimeMs };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+  }
+};
+
+const headerFromContent = (content: string): { sessionId?: string; cwd?: string } | null => {
+  try {
+    const firstLine = content.split("\n", 1)[0]!.trim();
+    if (!firstLine) return null;
+    const raw = JSON.parse(firstLine) as Record<string, unknown>;
+    if (raw.type !== "session") return null;
+    return {
+      ...(typeof raw.id === "string" ? { sessionId: raw.id } : {}),
+      ...(typeof raw.cwd === "string" ? { cwd: raw.cwd } : {}),
+    };
+  } catch {
+    return null;
   }
 };
 
@@ -142,13 +205,10 @@ export const createFileSystemMemorySource = (
       const descriptors: MemorySourceSessionDescriptor[] = [];
       for (const found of discovered.slice(0, boundedLimit)) {
         signal?.throwIfAborted();
-        let content: string;
-        try {
-          content = fs.readFileSync(found.file, "utf8");
-        } catch {
-          continue;
-        }
-        const header = readSessionHeader(found.file);
+        const loaded = readConfinedFile(options.root, found.file);
+        if (!loaded) continue;
+        const content = loaded.content;
+        const header = headerFromContent(content);
         descriptors.push({
           sessionKey: found.sessionKey,
           sessionId: sessionIdFor(found.file, header),
@@ -156,7 +216,7 @@ export const createFileSystemMemorySource = (
           metadata: {
             sessionId: sessionIdFor(found.file, header),
             cwd: header?.cwd ?? "",
-            updatedAt: found.mtimeMs,
+            updatedAt: loaded.mtimeMs,
           },
         });
       }
@@ -174,13 +234,10 @@ export const createFileSystemMemorySource = (
       signal?.throwIfAborted();
       const file = resolveSessionFile(options.root, sessionKey);
       if (!file) return null;
-      let content: string;
-      try {
-        content = fs.readFileSync(file, "utf8");
-      } catch {
-        return null;
-      }
-      const header = readSessionHeader(file);
+      const loaded = readConfinedFile(options.root, file);
+      if (!loaded) return null;
+      const content = loaded.content;
+      const header = headerFromContent(content);
       return {
         sessionKey,
         sessionId: sessionIdFor(file, header),
@@ -188,7 +245,7 @@ export const createFileSystemMemorySource = (
         metadata: {
           sessionId: sessionIdFor(file, header),
           cwd: header?.cwd ?? "",
-          updatedAt: statMtimeMs(file),
+          updatedAt: loaded.mtimeMs,
         },
         records: parseRecords(content),
       } satisfies MemorySourceSnapshot;

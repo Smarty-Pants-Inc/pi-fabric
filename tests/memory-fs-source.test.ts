@@ -165,6 +165,14 @@ describe("filesystem memory source adapter", () => {
     expect(await source.loadSession("missing.jsonl", {})).toBeNull();
     expect(await source.loadSession("../" + path.basename(outside) + "/secret.jsonl", {})).toBeNull();
     expect(await source.loadSession(path.resolve(outside, "secret.jsonl"), {})).toBeNull();
+    if (process.platform !== "win32") {
+      fs.symlinkSync(path.join(outside, "secret.jsonl"), path.join(root, "file-link.jsonl"));
+      fs.symlinkSync(outside, path.join(root, "directory-link"), "dir");
+      expect(await source.loadSession("file-link.jsonl", {})).toBeNull();
+      expect(await source.loadSession("directory-link/secret.jsonl", {})).toBeNull();
+      expect(asArray(await source.listSessions({ limit: 20 })).sessions.map(session => session.sessionKey))
+        .not.toEqual(expect.arrayContaining(["file-link.jsonl", "directory-link/secret.jsonl"]));
+    }
   });
 });
 

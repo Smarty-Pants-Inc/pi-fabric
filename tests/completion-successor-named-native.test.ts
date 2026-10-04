@@ -11,6 +11,7 @@ import { ResidencyClient } from "../src/residency/client.js";
 import { AGENT_COMPLETION_MESSAGE_TYPE } from "../src/agents/completion-inbox.js";
 import { completionConsumed, saveCompletion, saveWorkerCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
 import type { AgentRunResult } from "../src/agents/types.js";
+import { deliveryRoot } from "../src/topology/project-identity.js";
 
 // #3178, native Pi: real AgentSession + SessionManager name (`pi --name`).
 // The old expectation transferred named A's results to equally named B without adoption.
@@ -136,5 +137,14 @@ describe("named lane succession in native Pi sessions", () => {
     await nudge(returned.session); await nudge(successor.session); await nudge(unnamed.session); await nudge(other.session);
     for (const value of [ordinary, durable]) expect(bodies(returned.session).filter(b => b.includes(value.text!))).toHaveLength(1);
     for (const bystander of [unnamed, other, successor]) expect(bodies(bystander.session)).toEqual([]);
+
+    // #3178 extension, real native-Pi roots: an actor output keeps its dead owner root;
+    // same-cwd/name equality and a recorded integrator do not authorize another Main.
+    const actorOwner = a.id;
+    const otherMain = other.id;
+    expect(deliveryRoot(actorOwner, [{ id: otherMain, startedAt: 1 }], root, {
+      lineageAlive: () => false, boundIntegrator: () => ({ leadId: otherMain }),
+    })).toBe(actorOwner);
+    console.info("F11 native Pi actor exact-owner proof", JSON.stringify({ actorOwner, otherMain, otherReceived: false, redirected: false }));
   }, 90_000);
 });

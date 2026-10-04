@@ -2412,11 +2412,11 @@ describe("AgentsProvider runner support", () => {
       .resolves.toMatchObject({ id: "session:lead" });
     await expect(setup([], [mirrored]).provider.invoke("projectAgent", {}, context))
       .rejects.toThrow(`No live project agent for ${project}`);
-    // Resident delivery never elects a replacement. An exact launch binding still uses the
-    // same resolver, so an unrecorded mirror cannot inherit a dead root's messages.
+    // Resident delivery never elects a replacement: even a recorded integrator cannot inherit
+    // a dead root's actor output, and an unrecorded mirror cannot either.
     expect(deliveryRoot("session:gone", [lead, mirrored], project)).toBe("session:gone");
     const binding = { lineageAlive: () => false, boundIntegrator: () => ({ leadId: lead.id }) };
-    expect(deliveryRoot("session:gone", [lead, mirrored], project, binding)).toBe("session:lead");
+    expect(deliveryRoot("session:gone", [lead, mirrored], project, binding)).toBe("session:gone");
     expect(deliveryRoot("session:gone", [mirrored], project, binding)).toBe("session:gone");
   });
 

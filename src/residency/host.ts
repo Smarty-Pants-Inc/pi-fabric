@@ -69,7 +69,7 @@ import {
   type ResidentHostOwner,
 } from "./protocol.js";
 import { completionRecipientFromRun, saveCompletion } from "../agents/completion-journal.js";
-import { deliveryRoot, projectOf, recordedProjectLead, repositoryOf } from "../topology/project-identity.js";
+import { projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { canRemoveTerminalRun, compactTerminalRunEvents, retainedActorRunIds, runTreeExitVeto, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
@@ -448,7 +448,6 @@ export class ResidentHost {
         if (!message.text) return;
         const mode = delivery === "steer" ? "steer" : "followUp";
         const triggers = delivery === "nextTurn" ? false : triggerTurn;
-        const project = actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd));
         this.#trackPublication(this.#queueDelivery(
           { id: actor.id, name: actor.name, kind: "actor" },
           message.text,
@@ -456,20 +455,9 @@ export class ResidentHost {
           triggers,
           message.data,
           undefined,
-          // smarty-dev#3662: lease lapse is not death; only the exact recorded integrator may inherit.
-          () => deliveryRoot(
-            config.rootId,
-            this.participants.list({ scope: "project", kinds: ["root"] }),
-            project,
-            {
-              lineageAlive,
-              boundIntegrator: () => {
-                const repository = repositoryOf(project);
-                const leadId = recordedProjectLead(config.cwd);
-                return { ...(repository ? { repository } : {}), ...(leadId ? { leadId } : {}) };
-              },
-            },
-          ),
+          // #471: actor output is bound to the exact owning root; a dead root is retained,
+          // never re-homed to another Main selected by cwd, project, or launch metadata.
+          config.rootId,
           message.source === "fabric-host" ? undefined : message.principal,
           message.source === "fabric-host" ? "fabric-host" : "actor-output",
         ));

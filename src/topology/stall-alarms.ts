@@ -197,13 +197,17 @@ export class MainInboxMaintenance {
         await alarm(item, owner.rootId, owner.ownerIdentityId);
         // A lapsed lease is not permission to move a still-running writer's volatile queue.
         if (live.has(owner.rootId) || (!owner.retired && residentProcessAlive(owner.pid, owner.processStartedAt))) continue;
-        const successor = read<Successor>(successorFile(this.mesh.root, owner.rootId));
-        const newRoot = successor?.oldRoot === owner.rootId ? successor.newRoot : undefined;
-        if (!newRoot && (since === undefined || now - since <= this.options.rootGoneTtlMs)) continue;
         await this.mesh.exclusive(() => {
           const currentOwner = read<InboxOwner>(ownerFile(this.mesh.root, owner.sessionId));
           if (!currentOwner || JSON.stringify(currentOwner) !== JSON.stringify(owner) ||
             (!currentOwner.retired && residentProcessAlive(currentOwner.pid, currentOwner.processStartedAt))) return;
+          // Native confirmation can publish succession without changing a retired
+          // owner. Decide reroute OR TTL disposal under custody, holding the lock
+          // through the durable claim and source removal: no pre-lock absence of
+          // a successor can authorize destructive no-destination custody.
+          const successor = read<Successor>(successorFile(this.mesh.root, owner.rootId));
+          const newRoot = successor?.oldRoot === owner.rootId ? successor.newRoot : undefined;
+          if (!newRoot && (since === undefined || now - since <= this.options.rootGoneTtlMs)) return;
           const file = routeFile(this.mesh.root, item.id);
           const prior = read<InboxRoute>(file);
           if (prior && prior.newRoot !== owner.rootId) return;

@@ -221,6 +221,64 @@ it("no successor yields explicit undeliverable after TTL, but a live writer with
   expect(JSON.parse(fs.readFileSync(path.join(mesh.root, "main-followups", "B.json"), "utf8")).items).toHaveLength(0);
 });
 
+it("TTL source claim rechecks succession when native C confirms before custody lock acquisition", async () => {
+  const { mesh } = setup(); const old = main(mesh, B), survivor = main(mesh, A, true);
+  const carrier = old.controller.deliverAgent({ from: A, message: "TTL interleaving carrier", delivery: "followUp", deliveryId: "ttl-confirmation" });
+  const journalFile = path.join(mesh.root, "main-followups", "B.json");
+  const original = JSON.parse(fs.readFileSync(journalFile, "utf8")).items[0];
+  const targetFile = path.join(mesh.root, "C-native.jsonl");
+  old.controller.closeFollowUpDrain();
+  await stageMainSuccessor(mesh, B.id, "B", targetFile);
+  const ownerFile = path.join(mesh.root, "main-followups", "B.owner.json");
+  const retiredOwner = fs.readFileSync(ownerFile, "utf8");
+  const successorFile = path.join(mesh.root, "main-followups", "successors", `${createHash("sha256").update(B.id).digest("hex")}.json`);
+  const routeFile = path.join(mesh.root, "main-followups", "routes", `${createHash("sha256").update(carrier.messageId).digest("hex")}.json`);
+  // A has its own store, as a competing Main process would. Seed B's absence
+  // without claiming its carrier, then advance the supplied clock past the TTL.
+  const recoveryMesh = new MeshStore(mesh.root, 64 * 1024, 500);
+  const roots = source([participant(A.id, "root", A.id, "running", A.id)]);
+  const recovery = new MainInboxMaintenance(recoveryMesh, A, roots, survivor.controller, options);
+  const firstAbsent = original.sentAt;
+  await recovery.run(firstAbsent);
+  expect(fs.existsSync(routeFile)).toBe(false);
+  const now = firstAbsent + options.rootGoneTtlMs + 1;
+  const exclusive = recoveryMesh.exclusive.bind(recoveryMesh);
+  let next!: ReturnType<typeof main>;
+  let injected = false;
+  vi.spyOn(recoveryMesh, "exclusive").mockImplementationOnce(async (operation, timeout) => {
+    // Pause A's source claim immediately BEFORE lock acquisition. On the old
+    // implementation A has already captured no successor here. C wins the real
+    // lock, registers, and confirms B -> C without changing B's retired owner.
+    injected = true;
+    expect(JSON.parse(fs.readFileSync(successorFile, "utf8")).newRoot).toBeUndefined();
+    expect(fs.existsSync(routeFile)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(journalFile, "utf8")).items).toEqual([original]);
+    next = await mesh.exclusive(() => main(mesh, C, true, targetFile));
+    expect(await confirmMainSuccessor(mesh, C.id, targetFile)).toBe(true);
+    expect(fs.readFileSync(ownerFile, "utf8")).toBe(retiredOwner);
+    return exclusive(operation, timeout); // Resume A only after confirmation committed.
+  });
+  await recovery.run(now);
+  expect(injected).toBe(true);
+  expect(JSON.parse(fs.readFileSync(routeFile, "utf8"))).toMatchObject({ newRoot: C.id, item: original });
+  expect(JSON.parse(fs.readFileSync(journalFile, "utf8")).items).toEqual([]);
+  const admission = vi.spyOn(next.controller, "receiveInboxItem");
+  const destination = new MainInboxMaintenance(mesh, C, roots, next.controller, options);
+  await destination.run(now);
+  await recovery.run(now + 1);
+  await destination.run(now + 1);
+  expect(admission).toHaveBeenCalledExactlyOnceWith(original);
+  expect(next.sent.map(packet => packet.message.details.id)).toEqual([carrier.messageId]);
+  expect(old.sent).toHaveLength(0); expect(survivor.sent).toHaveLength(0);
+  const receipts = mesh.read({ topic: "fleet.work.inbox-receipts" });
+  expect(receipts).toMatchObject([{ kind: "rerouted", to: A.id, text: `rerouted: ${B.id} -> ${C.id}`, data: { messageId: carrier.messageId } }]);
+  expect(receipts).toHaveLength(1);
+  expect(receipts.some(event => event.kind === "undeliverable" || event.text === "undeliverable: root gone")).toBe(false);
+  expect(JSON.parse(fs.readFileSync(routeFile, "utf8"))).toEqual({ newRoot: C.id, messageId: carrier.messageId, oldRoot: B.id, done: true });
+  expect(mainInboxOwns(mesh.root, B.id, carrier.messageId)).toBe(false);
+  expect(mainInboxOwns(mesh.root, C.id, carrier.messageId)).toBe(true);
+});
+
 it("canonical persisted delivery stays at predecessor and is never rerouted", async () => {
   const { mesh } = setup(); const file = path.join(mesh.root, "B-session.jsonl"); const old = main(mesh, B, true, file);
   const receipt = old.controller.deliverAgent({ from: A, message: "already there", delivery: "steer", deliveryId: "delivered" });

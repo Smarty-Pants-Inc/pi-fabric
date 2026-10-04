@@ -23,6 +23,8 @@ import {
 /** Stable machine-readable coverage reasons (engine pattern-validated). */
 const REASON_MAX_SESSIONS = "fs_source_max_sessions";
 const REASON_SCAN_CAPPED = "fs_source_scan_capped";
+const REASON_UNAVAILABLE = "fs_source_unavailable";
+const REASON_INCOMPLETE = "fs_source_incomplete";
 
 /** Defensive walk bound: directory entries examined per list call. */
 const SCAN_ENTRY_LIMIT = 100_000;
@@ -43,10 +45,11 @@ const isInside = (root: string, target: string): boolean => {
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 };
 
-const statMtimeMs = (file: string): number => {
+const statMtimeMs = (file: string, onFailure?: () => void): number => {
   try {
     return fs.statSync(file).mtimeMs;
   } catch {
+    onFailure?.();
     return 0;
   }
 };
@@ -118,15 +121,20 @@ const compareByRecency = (left: DiscoveredSession, right: DiscoveredSession): nu
 /** Collect every *.jsonl file under root, newest first (mtime, then path).
  *  Symlinks are skipped: cycles cannot hang a listing, and a config should
  *  declare the real archive path. */
-const discoverSessionFiles = (root: string): { sessions: DiscoveredSession[]; scanCapped: boolean } => {
+const discoverSessionFiles = (root: string): { sessions: DiscoveredSession[]; scanCapped: boolean; unavailable: boolean; incomplete: boolean } => {
   const sessions: DiscoveredSession[] = [];
   let examined = 0;
   let scanCapped = false;
+  let unavailable = false;
+  let incomplete = false;
+  const rootResolved = path.resolve(root);
   const walk = (dir: string): void => {
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch {
+      if (dir === rootResolved) unavailable = true;
+      else incomplete = true;
       return;
     }
     for (const entry of entries) {
@@ -142,14 +150,14 @@ const discoverSessionFiles = (root: string): { sessions: DiscoveredSession[]; sc
         sessions.push({
           file,
           sessionKey: path.relative(root, file).split(path.sep).join("/"),
-          mtimeMs: statMtimeMs(file),
+          mtimeMs: statMtimeMs(file, () => { incomplete = true; }),
         });
       }
     }
   };
-  walk(path.resolve(root));
+  walk(rootResolved);
   sessions.sort(compareByRecency);
-  return { sessions, scanCapped };
+  return { sessions, scanCapped, unavailable, incomplete };
 };
 
 /** Resolve a session key inside root; absolute keys and traversal are rejected. */
@@ -201,12 +209,16 @@ export const createFileSystemMemorySource = (
     async listSessions({ limit, signal }) {
       signal?.throwIfAborted();
       const boundedLimit = Math.max(0, Math.floor(limit));
-      const { sessions: discovered, scanCapped } = discoverSessionFiles(options.root);
+      const { sessions: discovered, scanCapped, unavailable, incomplete } = discoverSessionFiles(options.root);
+      let readFailed = false;
       const descriptors: MemorySourceSessionDescriptor[] = [];
       for (const found of discovered.slice(0, boundedLimit)) {
         signal?.throwIfAborted();
         const loaded = readConfinedFile(options.root, found.file);
-        if (!loaded) continue;
+        if (!loaded) {
+          readFailed = true;
+          continue;
+        }
         const content = loaded.content;
         const header = headerFromContent(content);
         descriptors.push({
@@ -220,12 +232,14 @@ export const createFileSystemMemorySource = (
           },
         });
       }
-      if (!scanCapped && discovered.length <= boundedLimit) return descriptors;
+      if (!unavailable && !incomplete && !readFailed && !scanCapped && discovered.length <= boundedLimit) return descriptors;
       const page: MemorySourceListPage = {
         sessions: descriptors,
         coverage: {
           complete: false,
-          reason: scanCapped ? REASON_SCAN_CAPPED : REASON_MAX_SESSIONS,
+          reason: unavailable ? REASON_UNAVAILABLE
+            : incomplete || readFailed ? REASON_INCOMPLETE
+            : scanCapped ? REASON_SCAN_CAPPED : REASON_MAX_SESSIONS,
         },
       };
       return page;

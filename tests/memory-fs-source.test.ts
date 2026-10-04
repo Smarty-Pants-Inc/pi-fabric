@@ -270,6 +270,20 @@ describe("runtime memory source wiring", () => {
     expect(sessions.sessions[0]!.file.startsWith("memory-source:laptop/")).toBe(true);
   });
 
+  it("reports a missing configured archive as non-exhaustive recall", async () => {
+    const root = path.join(track(rootDir("missing-recall")), "absent");
+    const provider = await installMemoryProvider(normalizeFabricConfig({
+      memory: { enabled: true, sources: [{ id: "laptop", kind: "fs", root }] },
+    }));
+    const recalled = await provider.invoke("recall", { source: "laptop", query: "anything" }, invocation()) as {
+      total: number; coverage: { complete: boolean; reasons: string[] };
+    };
+    expect(recalled.total).toBe(0);
+    expect(recalled.coverage.complete).toBe(false);
+    expect(recalled.coverage.reasons).toContain("source_coverage:fs_source_unavailable");
+    expect(JSON.stringify(recalled)).not.toContain(root);
+  });
+
   it("keeps source-less configuration failing closed for unknown sources", async () => {
     const provider = await installMemoryProvider(normalizeFabricConfig({
       memory: { enabled: true },

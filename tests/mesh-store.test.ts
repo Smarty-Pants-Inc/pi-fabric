@@ -1034,9 +1034,9 @@ describe("MeshStore lock recovery", () => {
     expect(operation).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1_000);
     const waits = timers.mock.calls.map(([, wait]) => Number(wait));
-    expect(waits.slice(0, 6)).toEqual([15, 25, 45, 85, 130, 130]);
+    expect(waits.slice(0, 6)).toEqual([10, 20, 40, 80, 125, 125]);
     expect(waits.length).toBeLessThan(15); // fixed 10 ms retries took 100 probes here
-    expect(waits.every((wait) => wait >= 10 && wait <= 250)).toBe(true);
+    expect(waits.every((wait) => wait >= 0 && wait <= 250)).toBe(true);
     expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toContain(`${process.pid}\n`);
     fs.rmSync(lockPath, { recursive: true });
     await vi.advanceTimersByTimeAsync(250);
@@ -1045,7 +1045,7 @@ describe("MeshStore lock recovery", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("bounded lock backoff applies the jitter floor and clamps the deadline, preserving diagnostics", async () => {
+  it("bounded full-jitter lock backoff clamps the deadline, preserving diagnostics", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
     const store = createStore({ lockTimeoutMs: 100 });
     const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now() - 60_000}\n`);
@@ -1062,13 +1062,16 @@ describe("MeshStore lock recovery", () => {
     expect(fs.existsSync(lockPath)).toBe(true); // a live holder is never swept, even beyond stale age
     expect(vi.getTimerCount()).toBe(0);
 
-    // Minimum randomness still sleeps at least 10 ms rather than spinning on contention.
+    // A zero draw yields through a timer (native timers have a 1ms floor),
+    // and still cannot extend the absolute deadline.
     vi.mocked(Math.random).mockReturnValue(0);
     timers.mockClear();
     const second = store.exclusive(operation).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(100);
     await second;
-    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual(Array(10).fill(10));
+    expect(timers.mock.calls.length).toBeGreaterThanOrEqual(100);
+    expect(timers.mock.calls.every(([, wait]) => wait === 0)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("reclaims a recent dead holder immediately without spending the stale window", async () => {

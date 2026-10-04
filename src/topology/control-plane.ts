@@ -1,3 +1,4 @@
+import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -345,6 +346,8 @@ export class FabricControlPlane {
   // Cancellation may become publishable after close, when an admitted command finally commits.
   // Its queue owns that final obligation until success/deadline; idle has no timer or resources.
   readonly #backgroundCancellations = new MeshBackgroundQueue("control cancellation");
+  // A proven-notRun request remains close-owned while waiting to resend.
+  readonly #resendWaits = new Set<() => void>();
   #closed = false;
   #paused = false;
   #releasePublicationFailed = false;
@@ -386,8 +389,7 @@ export class FabricControlPlane {
     if (!this.options.enabled || this.#timer) return;
     this.#closed = false;
     this.#paused = false;
-    this.#timer = setInterval(() => void this.#backgroundPoll.run(() => this.#poll()), this.#pollMs);
-    this.#timer.unref();
+    this.#schedulePoll(this.#pollMs);
   }
 
   async request(
@@ -401,15 +403,17 @@ export class FabricControlPlane {
     // Shared across the bounded retry: first admission may discover a mirror even
     // for an older caller that supplied no routing snapshot.
     const destination = { remoteHost: options.routedRemoteHost };
-    const send = () => this.#requestAcceptance(
+    const timeoutMs = options.timeoutMs ?? this.#ackTimeoutMs;
+    const send = (retryBudgetSpentMs = 0) => this.#requestAcceptance(
       ownerHostId,
       targetId,
       operation,
       input,
       ownerIdentityId,
-      { ...options, timeoutMs: options.timeoutMs ?? this.#ackTimeoutMs },
+      { ...options, timeoutMs },
       destination,
       true,
+      retryBudgetSpentMs,
     );
     let sent;
     try {
@@ -426,7 +430,10 @@ export class FabricControlPlane {
         !(error instanceof FabricControlRejection) ||
         !error.notRun
       ) throw error;
-      sent = await send();
+      const delayMs = retryDelayMs(0, 100, 1_000, Math.max(0, timeoutMs - this.#pollMs * 4));
+      await this.#waitForResend(delayMs);
+      // The delay consumes the pre-existing second-attempt budget, not a new one.
+      sent = await send(delayMs);
     }
     const { commandId, acceptance } = sent;
     return {
@@ -439,6 +446,22 @@ export class FabricControlPlane {
       ...runningTaskWarningOf(acceptance as unknown as Record<string, unknown>, targetId),
       ...triggeredOf(acceptance as unknown as Record<string, unknown>),
     };
+  }
+
+  #waitForResend(delayMs: number): Promise<void> {
+    if (this.#closed) return Promise.reject(new Error("Fabric control plane closed"));
+    return new Promise<void>((resolve, reject) => {
+      const cancel = (): void => {
+        clearTimeout(timer);
+        this.#resendWaits.delete(cancel);
+        reject(new Error("Fabric control plane closed"));
+      };
+      const timer = setTimeout(() => {
+        this.#resendWaits.delete(cancel);
+        resolve();
+      }, delayMs);
+      this.#resendWaits.add(cancel);
+    });
   }
 
   async requestResult<T>(
@@ -472,7 +495,9 @@ export class FabricControlPlane {
     options: FabricControlRequestOptions,
     destination = { remoteHost: options.routedRemoteHost },
     messageRequest = false,
+    retryBudgetSpentMs = 0,
   ): Promise<{ commandId: string; acceptance: FabricControlAcceptance }> {
+    if (this.#closed) throw new Error("Fabric control plane closed");
     if (!this.options.enabled) {
       throw new Error("Fabric mesh is disabled; cannot control a remote participant");
     }
@@ -502,11 +527,14 @@ export class FabricControlPlane {
     const destinationRemoteHost = destination.remoteHost;
     // One budget drives the wire deadline and the sender's ACK timer: mirrored owners
     // need bridge transit time, while native commands retain the local ACK window.
-    const timeoutMs = Math.max(
+    const originalTimeoutMs = Math.max(
       this.#pollMs * 4,
       typeof destinationRemoteHost === "string" ? this.#bridgeTimeoutMs : 0,
       Math.min(MAX_CONTROL_TIMEOUT_MS, Math.floor(options.timeoutMs ?? this.#ackTimeoutMs)),
     );
+    // Charge the randomized resend sleep after applying native/bridge floors.
+    // In particular, the 30s bridge floor must not erase the spent retry budget.
+    const timeoutMs = Math.max(this.#pollMs * 4, originalTimeoutMs - retryBudgetSpentMs);
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
     let pendingRequest: PendingControlRequest;
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
@@ -711,16 +739,15 @@ export class FabricControlPlane {
   /** Reload: leave new commands unclaimed in the durable mesh log for the next runtime. */
   pause(): void {
     this.#paused = true;
-    if (this.#timer) clearInterval(this.#timer);
+    if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
   }
 
   resume(): void {
     if (this.#closed || !this.#paused) return;
     this.#paused = false;
-    this.#timer = setInterval(() => void this.#backgroundPoll.run(() => this.#poll()), this.#pollMs);
-    this.#timer.unref();
-    void this.#backgroundPoll.run(() => this.#poll());
+    this.#schedulePoll(this.#pollMs);
+    void this.#backgroundPoll.run(() => this.#poll(), false);
   }
 
   /** Join through outcome and ACK publication, not merely the host admission counter. */
@@ -729,18 +756,20 @@ export class FabricControlPlane {
     await this.#polling;
     await Promise.all([...this.#activeHandlers]);
     await this.#backgroundCancellations.checkpointForRelease();
-    if (this.#activeCommands.size || this.#pending.size || this.#sharedClaims.size || this.#ownedCommands.size || this.#releasePublicationFailed) {
+    if (this.#activeCommands.size || this.#pending.size || this.#resendWaits.size || this.#sharedClaims.size || this.#ownedCommands.size || this.#releasePublicationFailed) {
       throw new Error("Control release has unsettled publication obligations");
     }
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
-    if (this.#timer) clearInterval(this.#timer);
+    // Fence new requests before joining polls: a late notRun ACK must not arm a resend.
+    this.#closed = true;
+    for (const cancel of this.#resendWaits) cancel();
+    if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     await this.#polling?.catch(() => undefined);
     if (!this.#paused) await this.#drain().catch(() => undefined);
-    this.#closed = true;
     this.#sharedClaims.clear();
     const cancellations: Promise<void>[] = [];
     for (const id of [...this.#pending.keys()]) {
@@ -762,11 +791,26 @@ export class FabricControlPlane {
     this.#polling = operation;
     try {
       await operation;
+      if (!this.#ownedCommands.size && !this.#sharedClaims.size) this.#backgroundPoll.success();
     } catch (error) {
       if (!(error instanceof MeshConsumptionPausedError)) throw error;
     } finally {
       if (this.#polling === operation) this.#polling = undefined;
     }
+  }
+
+  #schedulePoll(waitMs: number): void {
+    const timer = setTimeout(() => {
+      void this.#backgroundPoll.run(() => this.#poll(), false).finally(() => {
+        // A pause/close/resume can replace the timer while a drain is in flight.
+        // Only this captured generation may schedule its next randomized wake.
+        if (this.#timer === timer && !this.#closed && !this.#paused) {
+          this.#schedulePoll(this.#backgroundPoll.waitMs || this.#pollMs);
+        }
+      });
+    }, waitMs);
+    this.#timer = timer;
+    timer.unref();
   }
 
   async #drain(): Promise<void> {
@@ -1000,6 +1044,10 @@ export class FabricControlPlane {
     const deadlineAt = Math.min(command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs, command.requestedAt + MAX_CONTROL_TIMEOUT_MS);
     owned.running = true;
     const execution = this.#executeClaimedCommand(command, owned.event.from, key, owned, deadlineAt, owned.event.sequence, owned.event.verification)
+      .catch(error => {
+        if (detachedControlOperation(command.operation) && isLockTimeout(error)) this.#backgroundPoll.failure(error);
+        throw error;
+      })
       .finally(() => { owned.running = false; });
     if (detachedControlOperation(command.operation)) {
       this.#activeHandlers.add(execution);

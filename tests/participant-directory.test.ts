@@ -1282,6 +1282,9 @@ describe("ParticipantDirectory", () => {
 
     it("preserves backoff and one warning across unchanged refreshes until real lock recovery", async () => {
       vi.useFakeTimers();
+      // Exercise near-ceiling full-jitter draws: the fixed 200 ms tick below
+      // must not consume the second outage's doubled backoff before checking it.
+      vi.spyOn(Math, "random").mockReturnValue(0.999999);
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-outage-"));
       roots.push(root);
       const identity: MeshIdentity = { id: "session:busy", name: "main", kind: "main", sessionId: "busy" };

@@ -45,7 +45,7 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     expect(launch.header).toBe(`task:exact-checks/runinfra%2Fglm-5-3-flash-max/live-choice:${rows[0].decisionId}`);
     expect(rows[1]).toMatchObject({ decisionId: rows[0].decisionId, admittedModel: "runinfra/glm-5-3-flash", admittedEffort: "max" });
   });
-  it("R3 cleanup joins a process that publishes its terminal result before exiting", async () => {
+  it("R3 POSIX terminal publication and all-platform cleanup join owned process exit", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-exit-")); roots.push(root);
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
       workerPath: path.resolve("tests/fixtures/terminal-before-exit-worker.mjs"), runRoot: path.join(root, "runs"),
@@ -54,7 +54,12 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     expect(result.status).toBe("completed");
     const pid = Number(result.sessionId);
     expect(Number.isSafeInteger(pid)).toBe(true);
-    expect(() => process.kill(pid, 0)).not.toThrow();
+    // POSIX custody joins the launcher before exposing a terminal result.
+    // Windows deliberately preserves main's logical-result-before-native-close
+    // contract; admission stays held and cleanup still joins that exact close.
+    if (process.platform !== "win32") {
+      expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    }
     const directory = manager.runDirectory(result.id)!;
     expect(fs.existsSync(directory)).toBe(true);
     await manager.cleanup(result.id);

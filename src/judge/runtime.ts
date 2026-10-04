@@ -78,10 +78,13 @@ export async function judge(value: unknown, deps: JudgeDependencies, signal?: Ab
     }, { timeoutMs: remaining, maxTokens: request.budget.maxTokens - envelope.cost.tokens }, combined);
     envelope.cost.tokens += result.usage.input + result.usage.output + result.usage.cacheRead + result.usage.cacheWrite;
     appendRouteRecord(deps.ledger, { type: "judgment-attempt", decisionId, backend: "pi-process", childAgentId: result.id, status: result.status, admittedModel: result.admittedModel ?? null, admittedEffort: result.admittedThinking ?? null, usage: result.usage, error: result.error?.startsWith("agent_cleanup_unresolved:") ? result.error : null, at: Date.now() });
+    // Cleanup custody can remain unresolved after the wait deadline or caller
+    // abort. Preserve that actionable veto after accounting for the receipt;
+    // neither a timeout nor cancellation proves the worker exited.
+    if (result.error?.startsWith("agent_cleanup_unresolved:")) return envelope = unknown("agent_cleanup_unresolved");
     // Jev pricing is unknown: never claim that an unpriced attempt is free.
     combined.throwIfAborted();
     if (elapsed() >= request.timeboxMs) return envelope = unknown("timeout");
-    if (result.error?.startsWith("agent_cleanup_unresolved:")) return envelope = unknown("agent_cleanup_unresolved");
     // The worker intentionally uses timed_out for its token guard too. Preserve
     // that explicit cause before treating timed_out as a wall-clock deadline.
     if (/^Fabric token limit reached:/.test(result.error ?? "")) return envelope = unknown("token_budget");

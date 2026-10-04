@@ -117,6 +117,20 @@ describe("guest agents surface", () => {
       .toEqual([expect.stringContaining("not assignable to type 'boolean'")]);
   });
 
+  it.each([false, true])("types activation-blocked diagnostics on actor status (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const code = `const status = await agents.actorStatus({ id: "actor" });
+      const code: string | undefined = status.activationBlocked?.code;
+      const reason: string | undefined = status.activationBlocked?.reason;
+      const since: number | undefined = status.activationBlocked?.since;
+      const count: number | undefined = status.activationBlocked?.count;
+      const omitted: Pick<FabricActorInfo, "activationBlocked"> = {};
+      return { code, reason, since, count, omitted };`;
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    expect(typeCheckFabricCode(`${code}\nconst invalid: boolean = status.activationBlocked?.code;`, declarations, true).errors.map(error => error.message))
+      .toEqual([expect.stringContaining("not assignable to type 'boolean'")]);
+  });
+
   it.each([false, true])("#3307 types preparation states and diagnostics (fullCodeMode=%s)", fullCodeMode => {
     const result = typeCheckFabricCode(
       `const actor = await agents.actorStatus({ id: "actor" });

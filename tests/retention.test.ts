@@ -45,7 +45,7 @@ afterEach(() => {
 });
 
 describe("persistent archive custody", () => {
-  it("retains full terminal event sources until archive commit, then permits main compaction", () => {
+  it.each(["archive-pending.json", "actor-run-archive-pending.json"])("retains full terminal event sources until %s commit, then permits main compaction", pendingFile => {
     const directory = temporaryDirectory();
     writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" });
     const events = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
@@ -53,7 +53,7 @@ describe("persistent archive custody", () => {
     fs.writeFileSync(file, events);
     fs.writeFileSync(path.join(directory, "reply.json"), '{"text":"full outcome"}');
     const status = fs.readFileSync(path.join(directory, "status.json"), "utf8");
-    const pending = path.join(directory, "archive-pending.json");
+    const pending = path.join(directory, pendingFile);
     fs.writeFileSync(pending, JSON.stringify({ format: 1, awaitingResult: true }));
     expect(runTreeResourceVeto(directory, 0, undefined, true)).toBeUndefined();
     expect(compactTerminalRunEvents(directory, { now: DAY })).toBe(false);
@@ -76,12 +76,12 @@ describe("persistent archive custody", () => {
     writeStatus(directory, { status: "stopped", queuedArchiveCommitted: true, transport: "unknown" });
     expect(runTreeExitVeto(directory, 0, undefined, true)).toMatch(/unknown root identity/);
   });
-  it("separates pending archives from native resource debt without authorizing source deletion", () => {
+  it.each(["archive-pending.json", "actor-run-archive-pending.json"])("separates %s from native resource debt without authorizing source deletion", pendingFile => {
     const parent = temporaryDirectory();
     writeStatus(parent, { status: "completed", transport: "process", sessionId: "2147483647" });
     const child = path.join(parent, "nested", "child");
     writeStatus(child, { status: "completed", transport: "process", sessionId: "2147483647" });
-    fs.writeFileSync(path.join(child, "archive-pending.json"), JSON.stringify({ format: 1, awaitingResult: true }));
+    fs.writeFileSync(path.join(child, pendingFile), JSON.stringify({ format: 1, awaitingResult: true }));
     const probe = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
     try {
       expect(runTreeResourceVeto(parent, 0, undefined, true)).toBeUndefined();
@@ -369,13 +369,14 @@ describe("shared run-tree exit veto", () => {
 describe("safe run roots", () => {
   const sweep = (tempRoot: string, now = 100 * DAY) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
 
-  it.each(["closed", "orphan"])("R3 collects owned route sessions in expired %s roots without weakening fences", kind => {
+  it.each(["closed", "orphan"])("R3 collects owned route sessions and dispatch receipts in expired %s roots without weakening fences", kind => {
     const tempRoot = temporaryDirectory();
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + kind);
     for (const name of ["done", "pending", "live", "unresolved"]) {
       const directory = path.join(root, name);
       writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: name === "live" ? String(process.pid) : "2147483647" });
       fs.writeFileSync(path.join(directory, "route-session.jsonl"), '{"type":"session"}\n');
+      fs.writeFileSync(path.join(directory, "route-dispatch-receipt.json"), '{"runId":"owned-receipt"}');
       if (name === "pending") fs.writeFileSync(path.join(directory, "pending-route-outcome.json"), "{}");
       if (name === "unresolved") markUnresolvedWorker(directory, "not joined");
     }

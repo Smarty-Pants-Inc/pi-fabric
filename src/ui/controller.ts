@@ -195,19 +195,20 @@ export class FabricUiController {
     if (this.ownsInput) return;
     const jobs = this.state.shellJobs;
     if (!jobs) { context.ui.notify("No shell task store in this session", "info"); return; }
-    // Input ownership is claimed synchronously; reattached tasks arrive as store events.
-    void jobs.durable?.resume();
-    const candidates = query ? jobs.list().filter(job => job.id === query || job.id.startsWith(query)) : [];
-    if (query && candidates.length !== 1) { context.ui.notify("Task ID is unknown or ambiguous", "warning"); return; }
-    if (context.mode !== "tui") {
-      context.ui.notify(JSON.stringify(query ? candidates[0] : jobs.list(), null, 2), "info");
-      return;
-    }
-    if (!this.state.config.ui.enabled) { context.ui.notify("The Fabric UI is disabled by ui.enabled", "warning"); return; }
-    if (!this.#context) this.start(context);
+    if (context.mode === "tui" && !this.state.config.ui.enabled) { context.ui.notify("The Fabric UI is disabled by ui.enabled", "warning"); return; }
+    if (context.mode === "tui" && !this.#context) this.start(context);
+    // Claim input before the first await, including asynchronous reattachment.
     this.#tasksOpen = true;
     const epoch = this.#epoch;
     try {
+      await jobs.durable?.resume();
+      if (epoch !== this.#epoch) return;
+      const candidates = query ? jobs.list().filter(job => job.id === query || job.id.startsWith(query)) : [];
+      if (query && candidates.length !== 1) { context.ui.notify("Task ID is unknown or ambiguous", "warning"); return; }
+      if (context.mode !== "tui") {
+        context.ui.notify(JSON.stringify(query ? candidates[0] : jobs.list(), null, 2), "info");
+        return;
+      }
       const [{ ShellTasksView }, { imageSafeCustom }] = await Promise.all([import("./shell-tasks.js"), import("./image-overlays.js")]);
       if (epoch !== this.#epoch) return;
       await imageSafeCustom<void>(context.ui, (tui, theme, keys, done) => {

@@ -248,6 +248,7 @@ export class ResidentHost {
     readonly onIdle: () => void = () => {},
     private readonly modelRegistry?: PiModelRegistryView,
     readonly launch?: ResidentHostLaunchContext,
+    readonly supportsTurnProvenance = true,
   ) {
     this.#staged = !!launch?.attempt;
     this.hostId = residentHostId(config.rootId);
@@ -474,6 +475,7 @@ export class ResidentHost {
         // Restoration must not launch queued work until owner and readiness publication commit.
         releasePaused: true,
         canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
+        supportsTurnProvenance: this.supportsTurnProvenance,
         persistent: true,
         canManageActor,
         lineageAlive,
@@ -1527,12 +1529,13 @@ const runResidentHost = async (
   config: ResidentHostConfig,
   signal?: AbortSignal,
   modelRegistry?: PiModelRegistryView,
+  supportsTurnProvenance = true,
 ): Promise<void> => {
   let finishIdle: (() => void) | undefined;
   const idle = new Promise<void>((resolve) => {
     finishIdle = resolve;
   });
-  const host = new ResidentHost(config, () => finishIdle?.(), modelRegistry, residentHostLaunchContext(config));
+  const host = new ResidentHost(config, () => finishIdle?.(), modelRegistry, residentHostLaunchContext(config), supportsTurnProvenance);
   await host.start();
   if (signal?.aborted) {
     await host.close();
@@ -1554,11 +1557,12 @@ export const runResidentHostFromConfigPath = async (
   configPath: string,
   signal?: AbortSignal,
   modelRegistry?: PiModelRegistryView,
+  supportsTurnProvenance = true,
 ): Promise<void> => {
   let config: ResidentHostConfig | undefined;
   try {
     config = validateResidentHostConfig(readJson<unknown>(configPath), configPath);
-    await runResidentHost(config, signal, modelRegistry);
+    await runResidentHost(config, signal, modelRegistry, supportsTurnProvenance);
   } catch (error) {
     if (error instanceof ResidentHostAlreadyRunning) return;
     const residencyRoot = config?.residencyRoot ?? path.dirname(configPath);

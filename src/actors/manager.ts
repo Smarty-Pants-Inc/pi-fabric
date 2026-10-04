@@ -156,6 +156,7 @@ interface ManagedActor {
   requirements: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
+  activationBlocked?: { reason: string; code: string; since: number; count: number };
   validWhile?: FabricActorValidWhileSource;
   latestActivationSequence: number;
   sessionFile: string;
@@ -331,6 +332,8 @@ export class ActorRegistryOwnershipError extends Error {
 export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
 /** Three preparation requeues, independent of the owner-restoration/drop budget. */
 const ACTOR_PREPARATION_MAX_RETRIES = 3;
+export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
+const ACTIVATION_HOST_CAPABILITIES = ["turnProvenance"] as const;
 
 export class ActorPreparationError extends Error {
   readonly code: string = "FABRIC_ACTOR_PREPARATION_FAILED";
@@ -393,6 +396,7 @@ export class ActorManager {
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
+  readonly #supportsTurnProvenance: boolean;
   readonly #project: string | undefined;
   readonly #role: string | undefined;
   readonly #meshMonitor: ActorMeshMonitor;
@@ -486,6 +490,8 @@ export class ActorManager {
       meshCursorPath?: string;
       /** Resident lease fence, also defers archive retention until initial publication. */
       canConsumeMesh?: () => boolean;
+      /** Capability of the Pi runtime owning this manager. Legacy direct test hosts default true. */
+      supportsTurnProvenance?: boolean;
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
       /** Per-await preparation deadline; independent of model/run and permit wait timeouts. */
@@ -528,6 +534,7 @@ export class ActorManager {
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
     this.#rootId = options.rootId ?? identity.id;
+    this.#supportsTurnProvenance = options.supportsTurnProvenance ?? true;
     this.#project = options.project;
     this.#role = options.role;
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
@@ -669,6 +676,7 @@ export class ActorManager {
       throw new Error(`Invalid Fabric actor runner: ${String(request.runner)}`);
     }
     validateActorInferenceContext(request.inferenceContext, runner);
+    this.#assertActivationCapabilities(request.inferenceContext);
     validateActorCoalesceKey(request.coalesceKey);
     const activationFilter = request.activationFilter === undefined
       ? undefined
@@ -954,6 +962,7 @@ export class ActorManager {
     const actor = this.#requireOwnedActor(id);
     validateActorInferenceContext(inferenceContext, actor.runner);
     if (inferenceContext === undefined) throw new Error("inferenceContext is required");
+    this.#assertActivationCapabilities(inferenceContext);
     actor.inferenceContext = inferenceContext;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
@@ -1229,6 +1238,7 @@ export class ActorManager {
     if (Buffer.byteLength(instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
     }
+    this.#assertActivationCapabilities(actor.inferenceContext);
     beforeCommit?.(actor.id);
     actor.instructions = instructions;
     actor.updatedAt = Date.now();
@@ -2534,6 +2544,7 @@ export class ActorManager {
         }
         this.#inFlight.set(actor.id, item);
         const inferenceContext = actor.inferenceContext;
+        this.#assertActivationCapabilities(inferenceContext);
         actor.status = "preparing";
         actor.preparing = { phase: "presence", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
         actor.updatedAt = Date.now();
@@ -2708,6 +2719,8 @@ export class ActorManager {
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
           this.#failureStreaks.delete(actor.id);
+          delete actor.activationBlocked;
+          actor.updatedAt = Date.now();
           const beforeDelivery = await this.#validity(actor, item);
           if (!this.#canManage(actor.id)) {
             throw new Error(`Fabric actor ownership moved before delivery: ${actor.id}`);
@@ -2885,12 +2898,20 @@ export class ActorManager {
     // Retry exhaustion must still alarm after recreation discarded the in-memory streak.
     streak.count = Math.max(streak.count + 1, countFloor);
     this.#failureStreaks.set(actor.id, streak);
+    const reason = error.split("\n")[0]!.slice(0, 300);
+    const code = error.includes("turnProvenance") ? "host-capability-missing:turnProvenance" : "activation-failed";
+    const previous = actor.activationBlocked;
+    actor.activationBlocked = {
+      reason, code, since: previous?.code === code ? previous.since : Date.now(),
+      count: previous?.code === code ? previous.count + 1 : 1,
+    };
+    actor.updatedAt = Date.now();
+    void this.#publishPresence(actor).catch(() => undefined);
     // Deterministic budget failures need operator action, not three silent
     // activations. Existing host reporting bypasses mailbox/silent delivery.
     const contextOverflow = /Context exceeds window:/i.test(error);
     if (streak.notified || (!contextOverflow && streak.count < ACTOR_FAILURE_NOTICE_AFTER)) return;
     streak.notified = true;
-    const reason = error.split("\n")[0]!.slice(0, 300);
     const text =
       `Fabric host notice: actor ${actor.name} failed its last ${streak.count} activations, so it is not acting on its events. ` +
       `Last error: ${reason}${runId ? ` (run ${runId})` : ""}. ` +
@@ -2906,6 +2927,11 @@ export class ActorManager {
       void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
         text, data: { actorId: actor.id, reason: "context_window", error, runId } }).catch(() => undefined);
     }
+    void this.#publishNotification({
+      topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
+      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code,
+        since: actor.activationBlocked?.since, count: actor.activationBlocked?.count, ...(runId ? { runId } : {}) },
+    }).catch(() => undefined);
     try {
       this.onDeliver({
         actor: this.#publicInfo(actor),
@@ -2927,6 +2953,12 @@ export class ActorManager {
       (this.#inFlight.get(actor.id) !== item || !this.#persistQueue(actor.id, true))) {
       throw new Error(`Cannot persist output-principal downgrade for Fabric actor ${actor.id}; steering rejected`);
     }
+  }
+
+  #assertActivationCapabilities(inferenceContext: FabricActorInferenceContext | undefined): void {
+    if (inferenceContext !== "activation" || this.#supportsTurnProvenance) return;
+    const missing = ACTIVATION_HOST_CAPABILITIES.join(", ");
+    throw new Error(`Actor activation requires host capability ${missing}; reload or rotate the owning root onto a Pi that advertises hostCapabilities.turnProvenance === 1.`);
   }
 
   #runRequest(
@@ -3499,6 +3531,7 @@ export class ActorManager {
       ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
       requirements: actor.requirements,
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
+      ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.validWhile ? { validWhile: actor.validWhile } : {}),
       sessionFile: actor.sessionFile,
       messages: actor.messages,
@@ -3714,6 +3747,10 @@ export class ActorManager {
         requirements,
         ...(typeof record.capabilityDigest === "string"
           ? { capabilityDigest: record.capabilityDigest }
+          : {}),
+        ...(typeof record.activationBlocked?.reason === "string" && typeof record.activationBlocked?.code === "string" &&
+          typeof record.activationBlocked?.since === "number" && typeof record.activationBlocked?.count === "number"
+          ? { activationBlocked: { reason: record.activationBlocked.reason, code: record.activationBlocked.code, since: record.activationBlocked.since, count: record.activationBlocked.count } }
           : {}),
         ...(record.validWhile?.version === 1 && typeof record.validWhile.source === "string"
           ? { validWhile: record.validWhile }
@@ -4149,6 +4186,7 @@ export class ActorManager {
       ...(actor.missingCapabilities
         ? { missingCapabilities: [...actor.missingCapabilities] }
         : {}),
+      ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.validWhile ? { validWhile: structuredClone(actor.validWhile) } : {}),
       queued: actor.queue.length + (this.#overflow.get(actor.id)?.length ?? 0),
       messages: actor.messages.length,

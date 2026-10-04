@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ACTOR_FAILURE_NOTICE_AFTER, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
+import { ACTOR_FAILURE_NOTICE_AFTER, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -2795,7 +2795,7 @@ describe("ActorManager", () => {
 
   // smarty-dev#390: activation-context supervisors failed every activation silently for an hour.
   it("tells the owner's Main once when an actor keeps failing, and again after it recovers and fails", async () => {
-    const { actors, deliveries } = setup();
+    const { actors, deliveries, mesh } = setup();
     const actor = await actors.create({
       name: "supervisor",
       instructions: "Watch and steer only when needed.",
@@ -2809,12 +2809,36 @@ describe("ActorManager", () => {
     await actors.ask(actor.id, "FAIL_DIRECTIVE");
     expect(notices()).toEqual([expect.stringContaining(`actor supervisor failed its last ${ACTOR_FAILURE_NOTICE_AFTER} activations`)]);
     expect(notices()[0]).toContain("Structured agent output was invalid");
+    expect(actors.status(actor.id).activationBlocked).toMatchObject({ code: "activation-failed", count: ACTOR_FAILURE_NOTICE_AFTER });
+    await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
     await actors.ask(actor.id, "FAIL_DIRECTIVE");
     expect(notices()).toHaveLength(1);                       // once per streak
     await actors.ask(actor.id, "all good");                  // a completed run ends the streak
+    expect(actors.status(actor.id).activationBlocked).toBeUndefined();
     for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await actors.ask(actor.id, "FAIL_DIRECTIVE");
     expect(notices()).toHaveLength(2);
+    await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 2);
   }, 60_000);
+
+  it("refuses activation actors when the owning Pi lacks turn provenance", async () => {
+    const s = setup(true);
+    const denied = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "denied-actors"), persistent: true, supportsTurnProvenance: false,
+    });
+    actorManagers.push(denied);
+    await expect(denied.create({ name: "blocked", instructions: "Activate.", inferenceContext: "activation" }))
+      .rejects.toThrow(/turnProvenance.*reload or rotate/i);
+    const ordinary = await denied.create({ name: "ordinary", instructions: "Run." });
+    await expect(denied.setInferenceContext(ordinary.id, "activation")).rejects.toThrow(/turnProvenance.*reload or rotate/i);
+    const existing = await s.actors.create({ name: "existing", instructions: "Activate.", inferenceContext: "activation" });
+    await s.actors.close();
+    const reloaded = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "actors"), persistent: true, supportsTurnProvenance: false,
+    });
+    actorManagers.push(reloaded);
+    await expect(reloaded.setInstructions(existing.id, "Updated activation."))
+      .rejects.toThrow(/turnProvenance.*reload or rotate/i);
+  });
 
   // dev-lead review of #34: interrupted activations (ESC) are not failures, and no notice
   // may start a turn while the halt holds.

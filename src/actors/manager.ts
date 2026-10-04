@@ -3377,18 +3377,27 @@ export class ActorManager {
   }
 
   #deliverMeshEvent(event: MeshEvent): boolean | "ignored" {
+    const targets = [...this.#actors.values()].filter((actor) => {
+      if (actor.status === "stopped") return false;
+      const addressed = event.to === actor.id || event.to === actor.name;
+      return (addressed || actor.topics.includes(event.topic)) &&
+        (event.from.id !== actor.id || addressed) &&
+        !this.#delivered.has(`${actor.id}\0${event.id}`);
+    });
+    if (targets.length === 0) return "ignored";
+    // One canonical directory snapshot per matching event, shared only by its
+    // synchronous deliveries. Activation/presence continuations still read fresh.
+    return this.#withOwnershipRead(() => this.#deliverMeshTargets(event, targets));
+  }
+
+  #deliverMeshTargets(event: MeshEvent, targets: ManagedActor[]): boolean | "ignored" {
     let full = false;
     let handedOn = false;
-    for (const actor of this.#actors.values()) {
-      if (actor.status === "stopped") continue;
+    for (const actor of targets) {
       const addressed = event.to === actor.id || event.to === actor.name;
-      const subscribed = actor.topics.includes(event.topic);
-      if (!addressed && !subscribed) continue;
-      if (event.from.id === actor.id && !addressed) continue;
-      this.#refreshOwnership(actor.id); // Fresh authority only for an actual delivery target.
+      this.#refreshOwnership(actor.id);
       if (!this.#canManageCached(actor.id)) continue;
       const delivery = `${actor.id}\0${event.id}`;
-      if (this.#delivered.has(delivery)) continue;
       try {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
           this.#acceptRelayedHostEvent(actor, event);

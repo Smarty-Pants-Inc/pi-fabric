@@ -68,6 +68,24 @@ const journalPath = () => {
   return path.join(dir, "main-followups", "root.json");
 };
 
+describe("Main unchanged durable followups (#4383)", () => {
+  it("acknowledges an idle replay loop without rewriting, but a new payload still fsyncs", () => {
+    const journal = journalPath(), first = fakePi(), context = busy([]);
+    const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(context, 60_000, journal);
+    const request = { from: actor, message: "held", delivery: "followUp" as const, deliveryId: "idle-replay" };
+    main.deliverAgent(request);
+    const writes = vi.spyOn(fs, "writeFileSync"), syncs = vi.spyOn(fs, "fsyncSync");
+    try {
+      for (let i = 0; i < 100; i++) main.deliverAgent(request);
+      expect(writes).not.toHaveBeenCalled(); expect(syncs).not.toHaveBeenCalled();
+      main.deliverAgent({ ...request, message: "changed", deliveryId: "next" });
+      expect(writes).toHaveBeenCalledTimes(1); expect(syncs).toHaveBeenCalled();
+      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items).toHaveLength(2);
+    } finally { writes.mockRestore(); syncs.mockRestore(); main.closeFollowUpDrain(); }
+  });
+});
+
 describe("#169 round 3 receiver receipt durability", () => {
   it("keeps the journal until the session receipt file can be synced", () => {
     const journal = journalPath();

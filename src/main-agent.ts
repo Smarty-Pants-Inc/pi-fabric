@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentFollowUpRunningWarning } from "./agents/types.js";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, writeFileAtomic } from "./core/atomic-write.js";
+import { readFileRetrying, AtomicFileWriter } from "./core/atomic-write.js";
 import { withConfirmedSessionFile } from "./core/session-receipts.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
@@ -306,6 +306,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   #scanned: number | undefined;
   #sessionFileIdentity: string | undefined;
   #journal: string | undefined;
+  #journalWriter: AtomicFileWriter | undefined;
+  #indexWriter: AtomicFileWriter | undefined;
   // Delivery ids whose message the session holds, or that will never go (replaced, dropped):
   // persisted beside the journal, bounded, oldest first. This index also retains the owner halt
   // after the message journal is empty. With the journal's own items they make
@@ -703,7 +705,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #saveIndex(): void {
     const file = this.#consumedPath();
     if (!file || !this.#consumedDirty || this.#haltIndexUnknown) return;
-    writeFileAtomic(file, JSON.stringify({ version: 1, ids: [...this.#consumed], ...(this.#halted ? { halted: true } : {}) }), { durable: true });
+    this.#indexWriter!.write(JSON.stringify({ version: 1, ids: [...this.#consumed], ...(this.#halted ? { halted: true } : {}) }), { durable: true });
     this.#consumedDirty = false;
     pendingHalts().delete(file); // Only the completed durability barriers commit authority.
   }
@@ -715,7 +717,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#saveIndex();
     const items = [...this.#unverified, ...this.#sent, ...this.#held];
     if (!items.length) { fs.rmSync(this.#journal, { force: true }); return; }
-    writeFileAtomic(this.#journal, JSON.stringify({ version: 1, items }), { durable: true });
+    this.#journalWriter!.write(JSON.stringify({ version: 1, items }), { durable: true });
   }
 
   #trySave(indexOnly = false): void {
@@ -968,6 +970,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#recoverProvider();
     this.#haltIndexUnknown = false;
     this.#journal = journal === undefined ? undefined : path.resolve(journal);
+    // A reload cannot reuse a previous process/generation's durability receipt.
+    this.#journalWriter = this.#journal ? new AtomicFileWriter(this.#journal) : undefined;
+    this.#indexWriter = this.#journal ? new AtomicFileWriter(this.#consumedPath()!) : undefined;
     const on = (name: string, fn: (event: any, ctx: ExtensionContext) => unknown): void => {
       if (typeof this.pi.on !== "function") return;
       const off = (this.pi.on as (name: string, fn: (event: any, ctx: ExtensionContext) => unknown) => unknown)(name, fn);

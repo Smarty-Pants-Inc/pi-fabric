@@ -321,6 +321,40 @@ export const writeFileAtomic = (
   }
 };
 
+/** A single-owner writer (or used under its protocol lock). Never treat equal bytes
+ * recovered from disk as a durability receipt: only this writer's successful barriers
+ * on the same inode/stamp authorize skipping a durable replacement.
+ */
+export class AtomicFileWriter {
+  #durableStamp: string | undefined;
+
+  constructor(readonly file: string) {}
+
+  #stamp(): string {
+    const stat = fs.statSync(this.file);
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  }
+
+  write(contents: string, options?: AtomicWriteOptions): boolean {
+    let unchanged = false;
+    let stamp: string | undefined;
+    try {
+      const before = this.#stamp();
+      const current = readFileRetrying(this.file);
+      stamp = this.#stamp();
+      unchanged = before === stamp && current === contents;
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+    }
+    if (unchanged && (!options?.durable || stamp === this.#durableStamp)) return false;
+    // A failed post-rename barrier must not leave a cached acceptance receipt.
+    this.#durableStamp = undefined;
+    writeFileAtomic(this.file, contents, options);
+    if (options?.durable) this.#durableStamp = this.#stamp();
+    return true;
+  }
+}
+
 export interface AtomicJsonOptions extends AtomicWriteOptions {
   // Pretty-print indent for JSON.stringify (default: compact).
   space?: number;

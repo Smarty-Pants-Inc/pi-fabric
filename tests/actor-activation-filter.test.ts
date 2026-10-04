@@ -40,6 +40,32 @@ const skip = (filter: FabricActorActivationFilter, item: { source: string; paylo
 const BOTH: FabricActorActivationFilter = ["hold", "never-message-events"];
 
 describe("activation filter rules on real envelopes", () => {
+  it("keeps absent filter telemetry absent after a current-host reload for rollback", async () => {
+    const first = setup();
+    const actor = await first.actors.create({ name: "untouched", instructions: "x", topics: ["github.demo"] });
+    const registryPath = path.join(first.root, "actors", "actors.json");
+    const before = JSON.parse(fs.readFileSync(registryPath, "utf8")) as { actors: Array<Record<string, unknown>> };
+    const beforeRow = before.actors.find(row => row.id === actor.id)!;
+    expect(beforeRow).not.toHaveProperty("filterSkipped");
+    await first.actors.close();
+    closers.length = 0;
+    await first.agents.close();
+
+    const second = setup(first.root);
+    expect(second.actors.status(actor.id).filterSkipped).toEqual({ count: 0, lastKey: null, lastTopic: null, lastAt: null });
+    await waitFor(() => {
+      const row = (JSON.parse(fs.readFileSync(registryPath, "utf8")) as { actors: Array<Record<string, unknown>> }).actors.find(value => value.id === actor.id);
+      return row !== undefined && typeof row.updatedAt === "number" && row.updatedAt > (beforeRow.updatedAt as number);
+    });
+    const after = JSON.parse(fs.readFileSync(registryPath, "utf8")) as { actors: Array<Record<string, unknown>> };
+    const afterRow = after.actors.find(row => row.id === actor.id)!;
+    expect(afterRow).not.toHaveProperty("filterSkipped");
+    const stable = (row: Record<string, unknown>) => {
+      const { status: _status, updatedAt: _updatedAt, messages: _messages, ...settings } = row;
+      return settings;
+    };
+    expect(stable(afterRow)).toEqual(stable(beforeRow));
+  });
   it("R7 never-message-events skips the five observed silent event types", () => {
     expect(skip(BOTH, envelope("issues.field_added"))).toBe("never-message-events/issues.field_added");
     expect(skip(BOTH, envelope("issues.typed"))).toBe("never-message-events/issues.typed");

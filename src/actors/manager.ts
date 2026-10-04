@@ -3785,7 +3785,9 @@ export class ActorManager {
         ...(typeof record.lastFilteredAt === "number" ? { lastFilteredAt: record.lastFilteredAt } : {}),
         ...(typeof record.activationFilterExpiresAt === "number" && Number.isFinite(record.activationFilterExpiresAt)
           ? { activationFilterExpiresAt: record.activationFilterExpiresAt } : {}),
-        filterSkipped: loadedFilterSkipped(record.filterSkipped),
+        ...(Object.hasOwn(record, "filterSkipped")
+          ? { filterSkipped: loadedFilterSkipped(record.filterSkipped) }
+          : {}),
         requirements,
         ...(typeof record.capabilityDigest === "string"
           ? { capabilityDigest: record.capabilityDigest }

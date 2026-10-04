@@ -101,6 +101,7 @@ export function createJevFabricBashOperations(launch: JevFabricLaunch): BashOper
         : launch.defaultTimeoutMs;
       let jobId: string;
       try {
+        signal?.throwIfAborted(); // Preparation awaited IO; stop must fence the launch effect.
         jobId = await launch.cli.start([shell, scriptPath], {
           cwd, ...(env ? { env } : {}), timeoutMs, ...(launch.label ? { label: launch.label } : {}),
         });
@@ -108,7 +109,19 @@ export function createJevFabricBashOperations(launch: JevFabricLaunch): BashOper
         await fs.promises.rm(scriptPath, { force: true });
         throw error;
       }
-      await launch.onStarted(jobId, scriptPath);
+      // Do not cancel the start control process and lose its job id. Once its
+      // receipt arrives, honor cancellation before any awaited bookkeeping, and
+      // keep stop live until followJevFabricJob installs its own handler.
+      let stopping: Promise<unknown> | undefined;
+      const stop = (): void => { stopping ??= launch.cli.stop(jobId).catch(() => undefined); };
+      if (signal?.aborted) stop();
+      else signal?.addEventListener("abort", stop, { once: true });
+      try {
+        await launch.onStarted(jobId, scriptPath);
+      } finally {
+        signal?.removeEventListener("abort", stop);
+        await stopping;
+      }
       const receipt = await followJevFabricJob(launch.cli, jobId, { onData, signal, detached: launch.detached });
       await launch.onFinished();
       if (signal?.aborted) throw new Error("aborted");

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ActionRegistry } from "../src/core/action-registry.js";
 import { JevFabricServe } from "../src/jev-fabric/serve.js";
 import type { DurableShellBridge } from "../src/jev-fabric/bridge.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
@@ -100,6 +101,47 @@ describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve
     expect(await outcome).toMatchObject({ error: expect.any(Error) });
     expect(await other.call("status", { id })).toMatchObject({ state: "cancelled" });
   });
+
+  it("A19 registry teardown ends a live child with a silent launch acknowledgement and retains custody", async () => {
+    const { provider, root } = setup({ launchDelayMs: 60_000 });
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    cleanups.push(() => registry.close());
+    const close = vi.spyOn(provider, "close");
+    const invoke = vi.spyOn(provider, "invoke");
+    const pidFile = path.join(root, "child.pid");
+    const pending = registry.invoke("sessions.open", { cmd: `echo $$ > "${pidFile}"; exec sleep 90` }, {
+      cwd: root, parentToolCallId: "jev:registry-teardown", nestedToolCallId: "pending-launch",
+      update() {}, approve: async () => {}, audits: [], maxResultChars: 10_000,
+    } as unknown as FabricInvocationContext & { approve: () => Promise<void>; audits: []; maxResultChars: number });
+    const outcome = pending.then(value => ({ value }), error => ({ error }));
+    const marker = path.join(root, "home", "launch-submitted.json");
+    await vi.waitFor(() => {
+      expect(fs.existsSync(marker)).toBe(true);
+      expect(fs.existsSync(pidFile)).toBe(true);
+    });
+    const pid = Number(fs.readFileSync(pidFile, "utf8").trim());
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    const actual = invoke.mock.results[0]!.value as Promise<unknown>;
+    const actualOutcome = actual.then(value => ({ value }), error => ({ error }));
+    // Both launch custody and invocationEnded remain in-flight. The lifecycle
+    // must still drain before close; shutdown's signal must arm the fallback.
+    const ended = registry.endInvocation("jev:registry-teardown");
+    await registry.close();
+    await ended;
+    expect(await outcome).toMatchObject({ error: expect.any(Error) });
+    expect(close).not.toHaveBeenCalled();
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow(), { timeout: 35_000, interval: 100 });
+    expect(await actualOutcome).toMatchObject({ error: expect.objectContaining({ message: expect.stringMatching(/receipt is uncertain.*custody retained/) }) });
+    await vi.waitFor(() => expect(close).toHaveBeenCalled());
+    const directory = path.join(root, "home", ".fabric-launch-custody");
+    const records = fs.readdirSync(directory);
+    expect(records).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(path.join(directory, records[0]!), "utf8")))
+      .toMatchObject({ version: 1, owner: "jev:registry-teardown", lifetime: "session", state: "awaiting-receipt" });
+    expect(registry.providerStatus()).toEqual([]);
+  }, 40_000);
 
   it("SR-7 refuses an already cancelled launch before connecting or submitting", async () => {
     const { provider } = setup();

@@ -65,7 +65,8 @@ const descriptors: FabricActionDescriptor[] = [
 ];
 
 type Opened = { id: string; lifetime: "session" | "durable"; label?: string; owner?: string; stopRequired?: boolean; custodyFile?: string };
-type PendingLaunch = { owner: string; lifetime: "session" | "durable"; ended: boolean; pending: Promise<unknown> };
+type PendingLaunch = { owner: string; lifetime: "session" | "durable"; ended: boolean; pending: Promise<unknown>;
+  closeTimer?: ReturnType<typeof setTimeout>; forcedClose?: Promise<void> };
 
 /**
  * Interactive children through jev-fabric's serve protocol: the same verbs,
@@ -167,8 +168,32 @@ export class SessionsProvider implements FabricProvider {
     const launch: PendingLaunch = { owner: context.parentToolCallId, lifetime: args.durable === true ? "durable" : "session",
       ended: false, pending: Promise.resolve() };
     this.#launches.add(launch);
-    launch.pending = this.#launch(args, context, launch).finally(() => this.#launches.delete(launch));
+    // Registry shutdown/revocation aborts the invocation before bindings can
+    // drain. Arm provider-owned fallback here, not only in close(), which the
+    // binding lifecycle cannot call while a launch receipt is still pending.
+    const ended = () => this.#endLaunch(launch);
+    context.signal?.addEventListener("abort", ended, { once: true });
+    if (context.signal?.aborted) ended();
+    launch.pending = this.#launch(args, context, launch).finally(async () => {
+      context.signal?.removeEventListener("abort", ended);
+      clearTimeout(launch.closeTimer);
+      await launch.forcedClose;
+      this.#launches.delete(launch);
+    });
     return launch.pending;
+  }
+
+  #endLaunch(launch: PendingLaunch): void {
+    launch.ended = true;
+    if (launch.closeTimer || launch.forcedClose) return;
+    const connection = this.#serve;
+    if (!connection) return; // An aborted pre-submission launch cannot start a child.
+    // Keep collecting delayed receipts and compensating first. If the receipt
+    // stays silent, end this exact connection (never a replacement connection).
+    // Session children die with serve; durable uncertainty retains its record.
+    launch.closeTimer = setTimeout(() => {
+      launch.forcedClose = connection.then(serve => serve.close()).catch(() => undefined);
+    }, 30_000);
   }
 
   async #launch(args: Record<string, unknown>, context: FabricInvocationContext, launch: PendingLaunch): Promise<unknown> {
@@ -235,7 +260,7 @@ export class SessionsProvider implements FabricProvider {
   async invocationEnded(parentToolCallId: string): Promise<void> {
     if (!parentToolCallId.startsWith("jev:")) return;
     const launching = [...this.#launches].filter(launch => launch.owner === parentToolCallId && launch.lifetime === "session");
-    for (const launch of launching) launch.ended = true;
+    for (const launch of launching) this.#endLaunch(launch);
     await Promise.allSettled(launching.map(launch => launch.pending));
     const owned = [...this.#opened.values()].filter(opened => opened.owner === parentToolCallId);
     if (!owned.length || !this.#serve) return;
@@ -247,7 +272,7 @@ export class SessionsProvider implements FabricProvider {
 
   close(): Promise<void> {
     this.#closed = true;
-    for (const launch of this.#launches) launch.ended = true;
+    for (const launch of this.#launches) this.#endLaunch(launch);
     return this.#closePromise ??= this.#close();
   }
 
@@ -255,16 +280,7 @@ export class SessionsProvider implements FabricProvider {
     // Join launch acknowledgements and compensating stops before ending the
     // connection; durable children do not die merely because serve disconnects.
     const connection = this.#serve;
-    let forcedClose: Promise<void> | undefined;
-    // A silent/lost serve acknowledgement cannot hang host teardown forever.
-    // Closing the connection rejects pending receipts; durable uncertainty stays
-    // in the write-ahead custody record, while session children die with serve.
-    const timer = this.#launches.size ? setTimeout(() => {
-      forcedClose = connection?.then(serve => serve.close()).catch(() => undefined);
-    }, 30_000) : undefined;
-    try { await Promise.allSettled([...this.#launches].map(launch => launch.pending)); }
-    finally { clearTimeout(timer); }
-    await forcedClose;
+    await Promise.allSettled([...this.#launches].map(launch => launch.pending));
     const serve = await connection?.catch(() => undefined);
     if (serve) await Promise.allSettled([...this.#opened.values()].filter(opened => opened.stopRequired).map(opened => this.#stopOpened(serve, opened)));
     this.#opened.clear();

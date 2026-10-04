@@ -5,6 +5,19 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { windowsDataRoot } from "../src/storage/windows-temp-root.js";
+import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
+
+// Policy unit tests supply raw snapshots; transport/cold-vs-warm checks live in
+// windows-acl-inspector.test.ts, and native ACL mutations still use the real bridge.
+vi.mock("../src/storage/windows-acl-inspector.js", () => ({
+  inspectWindowsAclChain: (source: string, env: NodeJS.ProcessEnv) => {
+    const command = windowsSecurityPowerShell(source, env);
+    return childProcess.execFileSync(command.file, command.args, {
+      env: command.env, encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  },
+}));
 
 type Ace = { type: number; flags: number; sid: string; mask: number };
 type Directory = { path: string; attributes: number; owner: string; dacl: Ace[] | null };
@@ -159,7 +172,8 @@ describe("Windows file-data namespace ACL policy", () => {
     const source = Buffer.from((args as string[])[4]!, "base64").toString("utf16le");
     expect(source.startsWith("$ErrorActionPreference = 'Stop'\nImport-Module Microsoft.PowerShell.Security -ErrorAction Stop\n")).toBe(true);
     expect(source).toContain("RawSecurityDescriptor");
-    expect(source).toContain("Get-Acl -LiteralPath");
+    expect(source).toContain("[System.IO.Directory]::GetAccessControl($directory)");
+    expect(source).toContain("[System.IO.File]::GetAttributes($directory)");
     expect(source).not.toContain(unusual);
     expect(options).toMatchObject({ timeout: 15000, windowsHide: true, encoding: "utf8", env: { PSModulePath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules", PI_FABRIC_ACL_CHAIN: JSON.stringify([paths[0], paths[1], unusual]) } });
   });

@@ -91,7 +91,7 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
     piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
     piModels: { available: [{ provider: "test", id: "visible" }], aliases: {}, defaultModel: "test/visible" },
   };
-  fs.mkdirSync(residencyRoot, { recursive: true });
+  fs.mkdirSync(residencyRoot, { recursive: true, mode: 0o700 });
   const configPath = path.join(residencyRoot, "config.json");
   fs.writeFileSync(configPath, JSON.stringify(config));
   seed?.(config);

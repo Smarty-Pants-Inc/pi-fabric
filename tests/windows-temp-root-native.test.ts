@@ -142,6 +142,19 @@ describe.skipIf(process.platform !== "win32")("native Windows temp-root ACL cont
     expect(windowsDataRoot(os.tmpdir(), { private: true })).toBe(path.resolve(os.tmpdir()));
   }, 30_000);
 
+  it("reuses the native inspector but never reuses an ACL decision after a real grant", () => {
+    const directory = privateDirectory("warm-inspector");
+    const spawn = vi.spyOn(childProcess, "spawn");
+    expect(windowsDataRoot(directory, { private: true })).toBe(directory);
+    grant(directory, "S-1-1-0", 0x1);
+    const before = sddl(directory);
+    expect(() => windowsDataRoot(directory, { private: true })).toThrow(/not private/);
+    expect(sddl(directory)).toBe(before);
+    // beforeAll already opened this process's inspector. Changing policy on the
+    // filesystem must not require spawning/compiling another PowerShell process.
+    expect(spawn).not.toHaveBeenCalled();
+  }, 30_000);
+
   it("accepts a private per-user directory and places actual scratch data there", () => {
     const directory = privateDirectory("quote'$;日本語");
     const before = sddl(directory);

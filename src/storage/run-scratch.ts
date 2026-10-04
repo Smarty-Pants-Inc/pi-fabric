@@ -31,12 +31,15 @@ export const prepareRunRoot = (root: string): string => {
       current = parent;
     }
   }
-  windowsDataRoot(current, { private: true });
+  let checked = windowsDataRoot(current, { private: true });
   for (const directory of missing) {
-    fs.mkdirSync(directory);
-    windowsDataRoot(directory, { private: true });
+    fs.mkdirSync(directory, { mode: 0o700 });
+    checked = windowsDataRoot(directory, { private: true });
   }
-  return windowsDataRoot(root, { private: true });
+  // The final snapshot already includes a canonical root and its full chain.
+  // A different caller spelling still needs the original lexical policy (e.g.
+  // drive-relative paths or dot components); never normalize away a refusal.
+  return root === path.resolve(root) ? checked : windowsDataRoot(root, { private: true });
 };
 
 /** Only a fresh, confirmed pre-spawn failure can issue this receipt. It never

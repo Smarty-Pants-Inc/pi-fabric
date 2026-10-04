@@ -26,6 +26,9 @@ const sentinel = process.env.FLEET_ISOLATION_SENTINEL;
 const entry = process.env.FLEET_ISOLATION_ENTRY;
 const testControls = JSON.parse(process.env.FLEET_ISOLATION_TEST_CONTROLS);
 const baseline = fs.readFileSync(path.join(sentinel, "agent", "fabric.json"), "utf8");
+// A permissive caller umask must never make the newly isolated fleet roots
+// writable by a different user. This change is confined to the probe process.
+if (process.platform !== "win32") process.umask(0);
 const module = await import(pathToFileURL(entry).href);
 // These selectors grant WRITE locations; semantic project attribution is deliberately absent.
 const keys = ["PI_FABRIC_MESH_ROOT", "PI_FABRIC_PROJECT_ROOT",
@@ -40,6 +43,8 @@ const assertIsolated = () => {
   for (const key of keys) {
     assert(process.env[key], key + " must be explicitly isolated, not defaulted");
     assert(contained(root, process.env[key]), key + " inherited a fleet path");
+    if (process.platform !== "win32" && key !== "MCPORTER_CONFIG")
+      assert.equal(fs.statSync(process.env[key]).mode & 0o777, 0o700, key + " must be owner-private even under umask 0");
   }
   assert.equal(process.env.PI_FABRIC_PROJECT, undefined, "inherited semantic project must be scrubbed, not replaced");
   const safe = new Set(keys.filter(key => key.startsWith("PI_FABRIC_")));

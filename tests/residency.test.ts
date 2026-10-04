@@ -1985,7 +1985,11 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(rejection).toBe(ceiling);
       expect(current()!.inFlightRun!.id).toBe(runId);
       if (queued) expect(current()!.queued).toBe(1);
-      const worker = JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "runs", runId, "status.json"), "utf8"));
+      const statusFile = path.join(state.config.residencyRoot, "runs", runId, "status.json");
+      // inFlightRun is admission, not first worker publication. A cold process
+      // can still be starting after the ceiling; retain the exact running proof.
+      await waitFor(() => fs.existsSync(statusFile));
+      const worker = JSON.parse(fs.readFileSync(statusFile, "utf8"));
       expect(worker).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
       await first;
       await waitFor(() => state.deliveries.length === (queued ? 2 : 1) && participant()?.actorRun === undefined);

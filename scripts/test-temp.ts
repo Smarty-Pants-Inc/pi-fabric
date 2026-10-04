@@ -92,7 +92,7 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
     MCPORTER_CONFIG: join(root, "mcporter.json"),
   };
   for (const directory of ["mesh", "project", "runs", "exports", "agent"]) {
-    mkdirSync(join(root, directory), { recursive: true });
+    mkdirSync(join(root, directory), { recursive: true, mode: 0o700 });
   }
   writeFileSync(environment.MCPORTER_CONFIG, '{"mcpServers":{},"imports":[]}\n');
   Object.assign(process.env, environment);

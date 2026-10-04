@@ -1,6 +1,5 @@
-import childProcess from "node:child_process";
 import path from "node:path";
-import { windowsSecurityPowerShell } from "./windows-powershell.js";
+import { inspectWindowsAclChain } from "./windows-acl-inspector.js";
 
 // Use SIDs, not localized names or the caller's group membership. These principals
 // can already administer the machine. Services and ordinary user groups are not trusted.
@@ -26,6 +25,7 @@ try {
   $paths = ConvertFrom-Json -InputObject $env:PI_FABRIC_ACL_CHAIN
   # A mapped network drive or SUBST alias can hide the physical ancestor chain.
   # Query the DOS device before any path access; only direct local volumes qualify.
+  if (-not ('FabricTempRootDevice' -as [type])) {
   Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -41,11 +41,15 @@ public static class FabricTempRootDevice {
   }
 }
 '@
+  }
   $device = [FabricTempRootDevice]::Resolve([System.IO.Path]::GetPathRoot($paths[0]).Substring(0, 2))
   if ($device -notmatch '^\\Device\\HarddiskVolume[0-9]+$') { throw 'Not a direct local volume' }
   $directories = @(foreach ($directory in $paths) {
-    $item = Get-Item -Force -LiteralPath $directory
-    $acl = Get-Acl -LiteralPath $directory
+    # Windows PowerShell 5.1 uses .NET Framework: these are the same native
+    # descriptors/attributes as the filesystem provider, without a cmdlet
+    # pipeline for every ancestor in every launch/retirement snapshot.
+    $attributes = [int][System.IO.File]::GetAttributes($directory)
+    $acl = [System.IO.Directory]::GetAccessControl($directory)
     $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
     $dacl = $null
     if ($null -ne $raw.DiscretionaryAcl) {
@@ -59,12 +63,12 @@ public static class FabricTempRootDevice {
         @{ type = [int]$ace.AceType; flags = [int]$ace.AceFlags; sid = $sid; mask = $mask }
       })
     }
-    @{ path = $directory; attributes = [int]$item.Attributes; owner = $raw.Owner.Value; dacl = $dacl }
+    @{ path = $directory; attributes = $attributes; owner = $raw.Owner.Value; dacl = $dacl }
   })
   @{ userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; device = $device; directories = $directories } | ConvertTo-Json -Compress -Depth 8
 } catch {
   [Console]::Error.WriteLine($_.Exception.Message)
-  exit 1
+  throw
 }
 `;
 
@@ -88,12 +92,7 @@ export const windowsDataRoot = (root: string, options: { private?: boolean } = {
   }
   let snapshot: unknown;
   try {
-    const command = windowsSecurityPowerShell(INSPECT_ACLS, { ...process.env, PI_FABRIC_ACL_CHAIN: JSON.stringify(chain) });
-    const output = childProcess.execFileSync(command.file, command.args, {
-      env: command.env,
-      encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const output = inspectWindowsAclChain(INSPECT_ACLS, { ...process.env, PI_FABRIC_ACL_CHAIN: JSON.stringify(chain) });
     snapshot = JSON.parse(output);
   } catch {
     return fail(directory, "could not prove native Windows ACL safety (directories must already exist)");

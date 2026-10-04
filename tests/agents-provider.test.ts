@@ -1908,6 +1908,35 @@ const lifecycleSubscription = (
   });
 
   describe("AgentsProvider lifecycle coalescing", () => {
+    it.each(["main", "session:test"])("delivers exactly one local completion notification to %s during a directory outage", async (to) => {
+      const request = vi.fn();
+      const { provider, participants, mainAgent, mainDeliveries } = setup([], [], { request } as unknown as FabricControlPlane);
+      const refreshRoutingView = vi.fn(async () => { throw new Error("probe failed"); });
+      Object.assign(participants, {
+        routingUnavailable: () => "heartbeat failed",
+        refreshRoutingView,
+        get: vi.fn(() => { throw new Error("directory read failed"); }),
+      });
+      // Exercise the provider's local-Main grouping path as well as its router.
+      Object.assign(mainAgent, { supportsProvenance: () => true });
+      const errors = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const event = lifecycleEvent({ status: "completed" });
+      try {
+        await provider.deliverLifecycle(lifecycleSubscription({ to }), event);
+        await provider.flushLifecycleDeliveries();
+        await provider.flushLifecycleDeliveries();
+        expect(mainDeliveries).toHaveLength(1);
+        expect(mainDeliveries[0]).toMatchObject({ delivery: "followUp", data: event, triggerTurn: true });
+        expect(errors).not.toHaveBeenCalled();
+        expect(refreshRoutingView).not.toHaveBeenCalled();
+        await expect(provider.routeMessage("session:remote", "do not publish", undefined, "followUp"))
+          .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+        expect(refreshRoutingView).toHaveBeenCalledOnce();
+        expect(request).not.toHaveBeenCalled();
+        expect(mainDeliveries).toHaveLength(1);
+      } finally { errors.mockRestore(); }
+    });
     it("coalesces a burst of followUp lifecycle events into one wake delivery", async () => {
       const { provider, mainDeliveries } = setup();
       for (let index = 0; index < 5; index += 1) {

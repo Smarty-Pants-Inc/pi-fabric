@@ -286,6 +286,44 @@ describe("directory availability for live Mains (#2386)", () => {
     expect(refreshRoutingView).not.toHaveBeenCalled();
   });
 
+  it.each(["followUp", "steer"] as const)("delivers canonical local Main/tasks without probing an unavailable directory (%s)", async (kind) => {
+    const refreshRoutingView = vi.fn(async () => { throw new Error("probe failed"); });
+    const get = vi.fn(() => { throw new Error("directory read failed"); });
+    const request = vi.fn();
+    const manager = {
+      status: vi.fn((id: string) => {
+        if (id === "child") return { id, name: "Child", runner: "pi" };
+        throw new Error(`Unknown Fabric agent: ${id}`);
+      }),
+      steer: vi.fn(() => ({ messageId: "local-task" })),
+      followUp: vi.fn(() => ({ messageId: "local-task" })),
+    } as unknown as Ports[0];
+    const send = router(manager, [], { request }, {
+      get, scheduleRefresh: vi.fn(), routingUnavailable: () => "heartbeat failed", refreshRoutingView,
+    });
+    await expect(send.value.routeMessage(identity.id, "local Main", undefined, kind)).resolves.toMatchObject({ routed: "main" });
+    await expect(send.value.routeMessage("child", "local task", undefined, kind)).resolves.toMatchObject({ routed: "local" });
+    expect(send.main.deliverAgent).toHaveBeenCalledOnce();
+    expect(kind === "steer" ? manager.steer : manager.followUp).toHaveBeenCalledOnce();
+    expect(refreshRoutingView).not.toHaveBeenCalled();
+    await expect(send.value.routeMessage("session:remote", "no publication", undefined, kind))
+      .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
+    expect(refreshRoutingView).toHaveBeenCalledOnce();
+    expect(request).not.toHaveBeenCalled();
+    expect(send.main.deliverAgent).toHaveBeenCalledOnce();
+  });
+
+  it("does not publish remotely when a proven-local task disappears during delivery", async () => {
+    const status = vi.fn().mockReturnValueOnce({ id: "child", name: "Child" })
+      .mockImplementation(() => { throw new Error("Unknown Fabric agent: child"); });
+    const get = vi.fn();
+    const request = vi.fn();
+    const send = router({ status } as unknown as Ports[0], [], { request }, { get, scheduleRefresh: vi.fn() });
+    await expect(send.value.routeMessage("child", "no fallback", undefined, "steer")).rejects.toThrow("Unknown Fabric agent: child");
+    expect(get).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("only a fresh view proves an actor id absent, and healthy actor routes are unchanged", async () => {
     const f = await mainLeaseFixture(false);
     const send = router(unknown, [], undefined, f.directory);

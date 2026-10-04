@@ -252,9 +252,30 @@ export class AgentMessageRouter {
     return root.id;
   }
 
+  /** Exact process-owned targets need no shared-directory authority or freshness. */
+  #provenLocalTarget(id: string): boolean {
+    if (this.mainAgent.local && this.mainAgent.matches(id)) return true;
+    // UUID aliases and published names still require directory selector precedence.
+    if (id.trim().startsWith("session:") || SESSION_UUID.test(id.trim())) return false;
+    try { return this.manager.status(id).id === id; }
+    // A name/prefix ambiguity is not local proof: preserve directory selector
+    // precedence, then let ordinary task resolution report its original error.
+    catch { return false; }
+  }
+
+  #localMainNonInteractive(): boolean {
+    if (this.mainAgent.interactive === false) return true;
+    // Preserve legacy directory-only non-interactive flags when readable, but never
+    // probe shared writability to deliver to the process's own Main controller.
+    try {
+      return (this.participants.get(this.mainAgent.id) ??
+        this.participants.get(this.mainAgent.id, undefined, { fresh: true }))?.interactive === false;
+    } catch { return false; }
+  }
+
   /** Use the same target resolution as delivery when grouping lifecycle sources. */
   isLocalMainTarget(id: string): boolean {
-    return this.mainAgent.local && this.mainAgent.matches(this.#messageTarget(id));
+    return this.mainAgent.local && (this.mainAgent.matches(id) || this.mainAgent.matches(this.#messageTarget(id)));
   }
 
   async routeMessage(
@@ -280,8 +301,13 @@ export class AgentMessageRouter {
     // Capture before routing yields; a queued incoming turn cannot change this send.
     if (context) context = snapshotFabricInvocation(context);
     options = { ...options, principal: context ? invocationFabricPrincipal(context) : undefined };
-    const result = await this.#withDirectory(() =>
-      this.#withDurableRecovery(id, () => this.#route(id, message, data, kind, context, options)));
+    // Task-local `main` remains its immutable immediate return address.
+    if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
+    const provenLocal = this.#provenLocalTarget(id);
+    const result = provenLocal
+      ? await this.#route(id, message, data, kind, context, options, true)
+      : await this.#withDirectory(() =>
+        this.#withDurableRecovery(id, () => this.#route(id, message, data, kind, context, options)));
     // smarty-dev#1826: an ack alone hid a Main whose held followUps no boundary would release.
     // Older owners never report `stalled`, so their results pass unchanged.
     if (kind === "followUp" && result?.stalled) {
@@ -362,12 +388,13 @@ export class AgentMessageRouter {
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
     } = {},
+    provenLocal = false,
   ): Promise<FabricAgentMessageResult> {
     context?.signal?.throwIfAborted();
     const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
     // In a task child, main is the immutable immediate return address, not a role lookup.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
-    id = this.#messageTarget(id);
+    if (!provenLocal) id = this.#messageTarget(id);
     if (options.deadlineMs !== undefined) {
       // Do not silently lose the requested guarantee on a Main/actor/remote route.
       let task: ReturnType<typeof this.manager.status> | undefined;
@@ -377,7 +404,7 @@ export class AgentMessageRouter {
       if (!task || task.runner !== "pi") throw new Error("Delivery deadlines require a local Pi task agent");
     }
     const isMain = this.mainAgent.matches(id);
-    const remoteRoot = isMain ? undefined : this.#rootRouteSnapshot(id);
+    const remoteRoot = isMain || provenLocal ? undefined : this.#rootRouteSnapshot(id);
     // Project members include peer roots, not just this host's Main and actors.
     // Resolve their current owner through the same capability/control path.
     if (isMain || remoteRoot?.kind === "root") {
@@ -385,7 +412,7 @@ export class AgentMessageRouter {
       if (remoteRoot?.interactive === false) throw new FabricParticipantNonInteractiveError(remoteRoot.id);
       if (isMain && this.mainAgent.local) {
         // Local delivery needs no remote authority snapshot, but print/JSON Main is never interactive.
-        if (this.mainAgent.interactive === false || this.#get(this.mainAgent.id)?.interactive === false) {
+        if (this.#localMainNonInteractive()) {
           throw new FabricParticipantNonInteractiveError(this.mainAgent.id);
         }
         context?.activity?.({
@@ -462,6 +489,10 @@ export class AgentMessageRouter {
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
     }
+
+    // A process-owned task that disappeared during delivery must not fall through
+    // into directory-backed publication outside the availability wrapper.
+    if (provenLocal) throw new Error(`Unknown Fabric agent: ${id}`);
 
     // An agent another host owns (a durable child in its spawner's resident host, or a peer's
     // task agent) takes steer and follow-up through its owner (smarty-dev#1323).
@@ -616,7 +647,7 @@ export class AgentMessageRouter {
       }
     }
     if (this.mainAgent.local && this.mainAgent.matches(command.targetId)) {
-      if (this.mainAgent.interactive === false || this.#get(this.mainAgent.id)?.interactive === false) {
+      if (this.#localMainNonInteractive()) {
         return { accepted: false, error: new FabricParticipantNonInteractiveError(this.mainAgent.id).message };
       }
       let result: FabricAgentMessageResult;

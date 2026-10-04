@@ -34,15 +34,40 @@ const setup = () => {
   return { root, meshRoot, recipient, result, file, receipt, journal, seed, mesh };
 };
 
-// Instrument the scan generator itself; event-loop delay also observes unrelated test/GC work.
-const measureIdleSlices = async (operation: () => Promise<void>) => {
-  const observed: number[] = [];
-  setCompletionJournalSliceObserver(durationMs => observed.push(durationMs));
-  const start = performance.now();
+// The concurrent timer is independent of generator bookkeeping. Measure the full
+// gap between 1 ms ticks (without subtracting timer resolution), so a synchronous
+// consumer block cannot disappear behind an async-generator/microtask yield.
+const measureIdleSlices = async (label: string, operation: () => Promise<void>) => {
+  const gaps: number[] = [], slices: number[] = [];
+  const delayedTicks: { gapMs: number; sliceSamples: number; sinceSliceMs: number }[] = [];
+  let lastSliceAt = performance.now();
+  let lastTick = performance.now();
+  let onTick: (() => void) | undefined;
+  const nextTick = () => new Promise<void>(resolve => { onTick = resolve; });
+  const timer = setInterval(() => {
+    const now = performance.now();
+    const gapMs = now - lastTick;
+    gaps.push(gapMs);
+    if (gapMs >= 16) delayedTicks.push({ gapMs, sliceSamples: slices.length, sinceSliceMs: now - lastSliceAt });
+    lastTick = now;
+    const resolve = onTick; onTick = undefined; resolve?.();
+  }, 1);
+  setCompletionJournalSliceObserver(durationMs => { slices.push(durationMs); lastSliceAt = performance.now(); });
   try {
+    await nextTick(); // Arm the probe before any scan work starts.
+    const start = performance.now();
     await operation();
-    return { maxMs: Math.max(...observed), samples: observed.length, passMs: performance.now() - start };
-  } finally { setCompletionJournalSliceObserver(undefined); }
+    const passMs = performance.now() - start;
+    await nextTick(); // Include a block in the final consumer/final small slice.
+    const measured = { maxMs: Math.max(...gaps), samples: gaps.length, passMs,
+      sliceMaxMs: Math.max(0, ...slices), sliceSamples: slices.length, delayedTicks };
+    console.info("[completion-journal latency]", JSON.stringify({ label, ...measured }));
+    return measured;
+  } finally { clearInterval(timer); setCompletionJournalSliceObserver(undefined); }
+};
+const assertIdleLatency = (measured: Awaited<ReturnType<typeof measureIdleSlices>>): void => {
+  expect(measured.samples).toBeGreaterThan(0);
+  expect(measured.maxMs).toBeLessThan(16); // Independent timer gaps, NOT sliceObserver.
 };
 
 describe("completion journal idle scans", () => {
@@ -100,11 +125,58 @@ describe("completion journal idle scans", () => {
   it.each([2, 3])("yields between two-entry slices but not after a small final slice (%s entries)", async count => {
     const h = setup();
     for (let index = 1; index <= count; index++) h.seed(index);
-    const timer = vi.spyOn(globalThis, "setTimeout");
+    const turn = vi.spyOn(globalThis, "setImmediate");
     await h.journal().drain(false);
-    if (count === 2) expect(timer).not.toHaveBeenCalled();
-    else expect(timer).toHaveBeenCalled();
+    if (count === 2) expect(turn).not.toHaveBeenCalled();
+    else expect(turn).toHaveBeenCalled();
     expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(count);
+  });
+
+  it("includes consumer work in the budget and runs a real event-loop turn before the next entry", async () => {
+    const h = setup(); const a = h.seed(1), b = h.seed(2);
+    const bodies = new Set([h.file(a.id), h.file(b.id)]);
+    const events: string[] = [];
+    let turn: ReturnType<typeof setImmediate> | undefined;
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: any[]) => {
+      if (bodies.has(String(target))) {
+        if (events.length === 0) {
+          events.push("first body");
+          turn = setImmediate(() => events.push("event-loop turn"));
+          const start = performance.now();
+          while (performance.now() - start < 6) { /* Exceed the 4 ms budget on the first entry. */ }
+        } else events.push("next body");
+      }
+      return (read as any)(target, ...args);
+    }) as typeof fs.readFileSync);
+    const enqueue = vi.fn();
+    try {
+      await h.journal(enqueue).drain();
+      expect(events).toEqual(["first body", "event-loop turn", "next body"]);
+      expect(enqueue).toHaveBeenCalledTimes(2); // The final single entry still reaches admission.
+      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(2);
+    } finally { clearImmediate(turn); }
+  });
+
+  it("rejects a synchronous 20 ms consumer block with the independent latency detector", async () => {
+    const h = setup(); const result = h.seed(1);
+    const read = fs.readFileSync;
+    let blocked = false;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: any[]) => {
+      if (!blocked && String(target) === h.file(result.id)) {
+        blocked = true;
+        const start = performance.now();
+        while (performance.now() - start < 20) { /* Negative control in pendingCompletion's body read. */ }
+      }
+      return (read as any)(target, ...args);
+    }) as typeof fs.readFileSync);
+    const enqueue = vi.fn();
+    const measured = await measureIdleSlices("negative control: 20 ms consumer", () => h.journal(enqueue).drain());
+    expect(blocked).toBe(true);
+    expect(measured.maxMs).toBeGreaterThanOrEqual(20);
+    expect(() => assertIdleLatency(measured)).toThrow(); // The very same <16 ms regression rejects it.
+    expect(measured.sliceMaxMs).toBeGreaterThanOrEqual(20); // Also covers the final slice's observer.
+    expect(enqueue).toHaveBeenCalledTimes(1);
   });
 
   it("a queued delivery callback cannot restore a forgotten result", async () => {
@@ -130,9 +202,9 @@ describe("completion journal idle scans", () => {
     const sync = vi.spyOn(fs, "fsyncSync");
     const asyncOpen = vi.spyOn(fs.promises, "open");
     expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(2);
-    const slices = await measureIdleSlices(async () => { await journal.drain(); await journal.drain(); });
-    expect(slices.samples).toBeGreaterThan(0);
-    expect(slices.maxMs).toBeLessThan(16);
+    const slices = await measureIdleSlices("consumed and pending", async () => { await journal.drain(); await journal.drain(); });
+    assertIdleLatency(slices);
+    expect(slices.sliceSamples).toBeGreaterThan(0);
     expect(sync).not.toHaveBeenCalled(); expect(asyncOpen).toHaveBeenCalled();
     expect(enqueue.mock.calls.map(([result]) => result.id)).toEqual(expect.arrayContaining([a.id, b.id]));
     expect(enqueue).toHaveBeenCalledTimes(2);
@@ -160,20 +232,25 @@ describe("completion journal idle scans", () => {
     const expected = pendingCompletions(h.meshRoot, h.root).map(envelope => envelope.result.id);
     const enqueue = vi.fn(); const journal = h.journal(enqueue);
     const read = fs.readFileSync;
-    const slowRead = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: any[]) => {
+    let reads = 0;
+    // Do not retain every large body in a spy's result history: the latency probe
+    // should measure the journal's real reads/parsing, not instrumentation GC.
+    fs.readFileSync = ((target: fs.PathOrFileDescriptor, ...args: any[]) => {
+      reads++;
       const start = performance.now();
       while (performance.now() - start < 0.3) { /* Emulate a slower local filesystem. */ }
       return (read as any)(target, ...args);
-    }) as typeof fs.readFileSync);
+    }) as typeof fs.readFileSync;
     const sync = vi.spyOn(fs, "fsyncSync");
-    const slices = await measureIdleSlices(() => journal.drain());
-    expect(slowRead.mock.calls.length).toBeGreaterThanOrEqual(100);
-    expect(slices.passMs).toBeGreaterThan(30); // A whole-pass timer would incorrectly reject this scan.
-    expect(slices.samples).toBeGreaterThan(0);
-    expect(slices.maxMs).toBeLessThan(16);
-    expect(sync).not.toHaveBeenCalled();
-    expect(enqueue.mock.calls.map(([result]) => result.id)).toEqual(expected); // Preserve directory order.
-    slowRead.mockRestore();
+    try {
+      const slices = await measureIdleSlices(state, () => journal.drain());
+      expect(reads).toBeGreaterThanOrEqual(100);
+      expect(slices.passMs).toBeGreaterThan(30); // A whole-pass timer would incorrectly reject this scan.
+      assertIdleLatency(slices);
+      expect(slices.sliceSamples).toBeGreaterThan(0);
+      expect(sync).not.toHaveBeenCalled();
+      expect(enqueue.mock.calls.map(([result]) => result.id)).toEqual(expected); // Preserve directory order.
+    } finally { fs.readFileSync = read; }
     if (state === "consumed leftovers") {
       const envelopes = fs.readdirSync(path.dirname(h.file(h.result(1).id))).filter(file => file.endsWith(".json"));
       expect(envelopes).toHaveLength(132); // Still cap destructive pruning at 128 per pass.

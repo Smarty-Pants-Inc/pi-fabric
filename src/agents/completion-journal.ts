@@ -71,8 +71,8 @@ const files = (dir: string): string[] => {
   try { return fs.readdirSync(dir).filter(isJournalFile); } catch { return []; }
 };
 // Idle scans must yield on inspected entries, not just successful cleanup/delivery.
-// A timer turn lets timers/IO run between slices rather than chaining adjacent immediate
-// callbacks. Keep both a time budget and an entry cap: one slow read must not make a
+// A setImmediate turn lets timers/IO run between slices without chaining microtasks.
+// Keep both a time budget and an entry cap: one slow read must not make a
 // slice unbounded, while the cap protects against cheap work starving the event loop.
 const SCAN_SLICE_BUDGET_MS = 4;
 const SCAN_SLICE_ENTRY_LIMIT = 2;
@@ -88,17 +88,18 @@ async function* scanSlices<T>(entries: Iterable<T>): AsyncGenerator<T> {
     sliceObserver?.(performance.now() - sliceStartedAt);
   };
   for (const entry of entries) {
+    // The previous consumer's synchronous reads/parsing count toward this budget.
+    // Generator resumes and resolved promises are not event-loop turns: reset the
+    // clock only after our setImmediate runs. Actual consumer IO waits may
+    // conservatively cause an extra turn, but must not hide synchronous work.
     if (scanned > 0 && (scanned >= SCAN_SLICE_ENTRY_LIMIT || performance.now() - sliceStartedAt >= SCAN_SLICE_BUDGET_MS)) {
       finishSlice();
-      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      await new Promise<void>(resolve => setImmediate(resolve));
       sliceStartedAt = performance.now();
       scanned = 0;
     }
     scanned++;
     yield entry;
-    // The consumer may await between entries; that is a separate event-loop turn,
-    // so do not charge its idle time to this generator slice.
-    sliceStartedAt = performance.now();
   }
   if (scanned > 0) finishSlice();
 }

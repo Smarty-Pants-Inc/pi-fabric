@@ -291,6 +291,8 @@ export interface FabricMeshConfig {
   maxEventBytes: number;
   maxReadEvents: number;
   actorPollMs: number;
+  /** Maximum age of idle observational mesh/participant snapshots; 0 disables reuse. */
+  idleReadCoalesceMs: number;
   /** Admission window for commands routed over a mesh bridge, minimum 30 s. */
   bridgeControlTimeoutMs: number;
   actorQueueLimit: number;
@@ -548,6 +550,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     maxEventBytes: 256 * 1024,
     maxReadEvents: 500,
     actorPollMs: 250,
+    idleReadCoalesceMs: 5_000,
     bridgeControlTimeoutMs: 30_000,
     actorQueueLimit: 32,
     eventContextChars: 40_000,
@@ -1281,6 +1284,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         mesh.actorPollMs,
         DEFAULT_FABRIC_CONFIG.mesh.actorPollMs,
         50,
+        10_000,
+      ),
+      idleReadCoalesceMs: boundedInteger(
+        mesh.idleReadCoalesceMs,
+        DEFAULT_FABRIC_CONFIG.mesh.idleReadCoalesceMs,
+        0,
         10_000,
       ),
       bridgeControlTimeoutMs: boundedInteger(

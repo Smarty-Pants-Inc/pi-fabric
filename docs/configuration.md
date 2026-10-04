@@ -201,6 +201,7 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "maxEventBytes": 262144,
     "maxReadEvents": 500,
     "actorPollMs": 250,
+    "idleReadCoalesceMs": 5000,
     "actorQueueLimit": 32,
     "eventContextChars": 40000,
     "followUpFlushMs": 120000,
@@ -624,6 +625,13 @@ The owning host's existing committed presence heartbeat also checks runtime stal
 Native `new`/`resume` session replacement records its explicit `targetSessionFile` after closing the old drainer. Only that exact successor inherits undelivered Main messages. A durable per-message claim precedes source removal; successor admission reuses the original native message ID and the existing journal/delivery-ID receipt machinery. A crash between move, admission and receipt is recoverable without delivery into both inboxes. The sender receives `rerouted: <old> -> <new>` through `fleet.work.inbox-receipts`, the existing root inbox and bridge work-event path. Recorded native deliveries never move. Reload does not rotate; labels, cwd matches and missing leases cannot invent a successor. The pre-switch abort boundary cannot flush to the old inbox; if another extension cancels a switch, explicit owner input reopens that inbox.
 
 `mesh.eventContextChars` bounds the sanitized JSON context attached to each host-event activation. Fabric extracts images first. It stores redacted image descriptors in the mailbox and registry, then sends the raw images to the actor out of band. The character limit never truncates image base64 because base64 is not part of that JSON context.
+
+Idle observations of shared state and participant files reuse a snapshot for at most
+`mesh.idleReadCoalesceMs` (default 5000 ms; range 0–10000, 0 disables reuse). File changes and
+UI remote-generation checks do not bypass that window while Main is idle. A running turn or
+pending Main message reads on demand; explicit fresh reads for CAS, ownership and delivery
+always bypass it. Listings can lag by this window; expiration does not slide on cache hits.
+The mesh file format and writer cadence are unchanged, including for legacy/mixed fleets.
 
 Mesh topics, shared state, and the participant directory remain project-scoped. Every runtime publishes one short-lived host lease and records for the roots, agents, and actors it owns. `agents.members()` and `mesh.members()` read those records. `agents.main()` and `agents.peers()` project roots. When a lease expires, its records leave normal discovery together. A host that stops without a clean shutdown leaves them in the shared state, so each runtime removes, every 15 minutes, the records of hosts whose lease expired more than 6 hours ago. Each removal is checked against the record's version. `mesh.actorPollMs` controls fallback polling for actor events and owner-addressed commands when filesystem notifications are unavailable.
 

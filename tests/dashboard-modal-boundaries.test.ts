@@ -20,6 +20,7 @@ const snapshot = (): FabricDashboardSnapshot => ({
   peers: [], runs: [], agents: [], state: [], events: [],
   componentGraph: { components: [], edges: [], cycles: [] },
   actors: [{
+    filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
     id: "actor-1", scope: "project", name: "advisor", status: "idle", runner: "pi",
     events: [], topics: [], delivery: "mailbox", responseMode: "text", triggerTurn: false,
     coalesce: true, queued: 0, messages: 0, createdAt: 0, updatedAt: 1000,

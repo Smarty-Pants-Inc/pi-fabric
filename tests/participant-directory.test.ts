@@ -643,6 +643,7 @@ describe("ParticipantDirectory actor operational counters", () => {
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
       await store.put({ key: LIVENESS_POLICY_KEY, value: policy, identity });
       const actor: FabricActorInfo = {
+        filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
         id: "actor:running", scope: "project", name: "running", rootId: identity.id,
         status: "running", residency: "durable", runner: "pi", events: [], topics: [],
         delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false,

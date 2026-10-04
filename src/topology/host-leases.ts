@@ -197,7 +197,8 @@ export const readHostLeaseSnapshot = (meshRoot: string, hostId: string): {
   }
   const known = cache.get(dir) ?? new Map();
   cache.set(dir, known);
-  return { lease: cachedLease(known, dir, name, stat), mtimeMs: stat.mtimeMs };
+  // Recovery compares this timestamp with numeric owner.updatedAt; keep cache identities bigint.
+  return { lease: cachedLease(known, dir, name, stat), mtimeMs: Number(stat.mtimeMs) };
 };
 
 type LeaseSlots = Map<string, Pick<fs.BigIntStats, "dev" | "ino" | "size" | "mtimeNs" | "ctimeNs"> & {

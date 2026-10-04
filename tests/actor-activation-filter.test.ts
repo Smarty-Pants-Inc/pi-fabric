@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import {
   activationFilterSkip,
   normalizeActorActivationFilter,
@@ -39,6 +40,32 @@ const skip = (filter: FabricActorActivationFilter, item: { source: string; paylo
 const BOTH: FabricActorActivationFilter = ["hold", "never-message-events"];
 
 describe("activation filter rules on real envelopes", () => {
+  it("keeps absent filter telemetry absent after a current-host reload for rollback", async () => {
+    const first = setup();
+    const actor = await first.actors.create({ name: "untouched", instructions: "x", topics: ["github.demo"] });
+    const registryPath = path.join(first.root, "actors", "actors.json");
+    const before = JSON.parse(fs.readFileSync(registryPath, "utf8")) as { actors: Array<Record<string, unknown>> };
+    const beforeRow = before.actors.find(row => row.id === actor.id)!;
+    expect(beforeRow).not.toHaveProperty("filterSkipped");
+    await first.actors.close();
+    closers.length = 0;
+    await first.agents.close();
+
+    const second = setup(first.root);
+    expect(second.actors.status(actor.id).filterSkipped).toEqual({ count: 0, lastKey: null, lastTopic: null, lastAt: null });
+    await waitFor(() => {
+      const row = (JSON.parse(fs.readFileSync(registryPath, "utf8")) as { actors: Array<Record<string, unknown>> }).actors.find(value => value.id === actor.id);
+      return row !== undefined && typeof row.updatedAt === "number" && row.updatedAt > (beforeRow.updatedAt as number);
+    });
+    const after = JSON.parse(fs.readFileSync(registryPath, "utf8")) as { actors: Array<Record<string, unknown>> };
+    const afterRow = after.actors.find(row => row.id === actor.id)!;
+    expect(afterRow).not.toHaveProperty("filterSkipped");
+    const stable = (row: Record<string, unknown>) => {
+      const { status: _status, updatedAt: _updatedAt, messages: _messages, ...settings } = row;
+      return settings;
+    };
+    expect(stable(afterRow)).toEqual(stable(beforeRow));
+  });
   it("R7 never-message-events skips the five observed silent event types", () => {
     expect(skip(BOTH, envelope("issues.field_added"))).toBe("never-message-events/issues.field_added");
     expect(skip(BOTH, envelope("issues.typed"))).toBe("never-message-events/issues.typed");
@@ -255,6 +282,7 @@ describe("actor activation filter in ActorManager", () => {
       ["in", "mesh:ops.owner", "filtered: never-message-events/ops.owner:actions.minutes"],
     ]);
     const status = actors.status(actor.id);
+    expect(status.filterSkipped).toMatchObject({ count: 4, lastTopic: "ops.owner", lastKey: expect.any(String), lastAt: status.lastFilteredAt });
     expect(status.filteredCount).toBe(4);
     expect(status.lastFilteredAt).toBeGreaterThan(0);
     expect(status.queued).toBe(0);
@@ -283,9 +311,11 @@ describe("actor activation filter in ActorManager", () => {
     const markers = runTasks(root, actor.id).map((task) => task.match(/"marker": "([^"]+)"/)?.[1]).filter(Boolean);
     expect(markers).toEqual(["one-b", "three", "two-released"]);
     expect(filtered(actors, actor.id).map((m) => m.reason)).toEqual(["filtered: hold", "filtered: hold"]);
+    expect(actors.status(actor.id).filterSkipped).toMatchObject({ count: 2, lastTopic: "github.demo", lastKey: JSON.stringify(["mesh", "github.demo", 4]) });
     expect(actors.status(actor.id).filteredCount).toBe(2);
     // A direct message is never filtered, even by a rule its fields match.
     await actors.setActivationFilter(actor.id, [{ id: "any-message", where: [{ path: "message", exists: true }] }]);
+    expect(actors.status(actor.id).filterSkipped).toEqual({ count: 0, lastKey: null, lastTopic: null, lastAt: null });
     const runs = runDirs(root, actor.id).length;
     actors.tell(actor.id, "direct work");
     await waitFor(() => runDirs(root, actor.id).length === runs + 1);
@@ -326,9 +356,11 @@ describe("actor activation filter in ActorManager", () => {
     expect(actors.status(actor.id).activationFilter).toBeUndefined();
     const set = await actors.setActivationFilter(actor.id, ["never-message-events"]);
     expect(set.activationFilter).toEqual(["never-message-events"]);
-    await publish(mesh, envelope("issues.typed"), "github.demo");
+    const rejected = await publish(mesh, envelope("issues.typed"), "github.demo");
     await waitFor(() => filtered(actors, actor.id).length === 1);
     expect(runDirs(root, actor.id)).toHaveLength(0);
+    const skipped = actors.status(actor.id).filterSkipped;
+    expect(skipped).toMatchObject({ count: 1, lastTopic: "github.demo", lastKey: rejected.id, lastAt: expect.any(Number) });
     // A restart keeps the filter and the count.
     await actors.close();
     closers.length = 0;
@@ -337,10 +369,66 @@ describe("actor activation filter in ActorManager", () => {
     const reloaded = again.status(actor.id);
     expect(reloaded.activationFilter).toEqual(["never-message-events"]);
     expect(reloaded.filteredCount).toBe(1);
+    expect(reloaded.filterSkipped).toEqual(skipped);
     const cleared = await again.setActivationFilter(actor.id, null);
     expect(cleared.activationFilter).toBeUndefined();
     expect(cleared.filteredCount).toBe(1);
+    expect(cleared.filterSkipped).toEqual({ count: 0, lastKey: null, lastTopic: null, lastAt: null });
+    expect(again.messages(actor.id)).toContainEqual(expect.objectContaining({ reason: "activationFilter cleared: explicit" }));
   }, 30_000);
+
+  it("coalesces a burst of host skips into one soft registry write without fsync", async () => {
+    const { root, actors } = setup();
+    const actor = await actors.create({ name: "burst", instructions: "x", events: ["tool_error"], activationFilter: BOTH });
+    const writes = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const syncs = vi.spyOn(fs, "fsyncSync");
+    try {
+      for (let i = 0; i < 30; i++) actors.dispatchHostEvent("tool_error", envelope("host:tool_error").payload);
+      expect(actors.status(actor.id).filterSkipped).toMatchObject({ count: 30, lastKey: "host:tool_error", lastTopic: "tool_error" });
+      expect(writes).not.toHaveBeenCalled();
+      await waitFor(() => {
+        const record = JSON.parse(fs.readFileSync(path.join(root, "actors/actors.json"), "utf8")).actors.find((a: { id: string }) => a.id === actor.id);
+        return record.filterSkipped?.count === 30;
+      });
+      expect(writes).toHaveBeenCalledTimes(1);
+      expect(writes.mock.calls[0]?.[1]).toMatchObject({ durable: false });
+      expect(syncs).not.toHaveBeenCalled();
+    } finally { writes.mockRestore(); syncs.mockRestore(); }
+  });
+
+  it("expires on the next host event, resets telemetry, and audits the clear", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "expiry", instructions: "x", events: ["tool_error"] });
+    await actors.setActivationFilter(actor.id, BOTH);
+    actors.dispatchHostEvent("tool_error", envelope("host:tool_error").payload);
+    expect(actors.status(actor.id).filterSkipped.count).toBe(1);
+    await actors.setActivationFilter(actor.id, BOTH, undefined, Date.now() - 1);
+    actors.dispatchHostEvent("tool_error", envelope("host:tool_error").payload);
+    expect(actors.status(actor.id).activationFilter).toBeUndefined();
+    expect(actors.status(actor.id).filterSkipped).toEqual({ count: 0, lastKey: null, lastTopic: null, lastAt: null });
+    expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ reason: "activationFilter cleared: expired" }));
+  });
+
+  it("persists expiry across a restart and clears on an idle poll without new events", async () => {
+    const { root, actors, agents } = setup();
+    const actor = await actors.create({ name: "restart-expiry", instructions: "x", topics: ["github.demo"] });
+    const expiresAt = Date.now() + 500;
+    await actors.setActivationFilter(actor.id, BOTH, undefined, expiresAt);
+    await actors.close();
+    closers.length = 0;
+    await agents.close();
+    const again = setup(root).actors;
+    expect(again.status(actor.id).activationFilterExpiresAt).toBe(expiresAt);
+    await waitFor(() => again.status(actor.id).activationFilter === undefined);
+    expect(Date.now()).toBeGreaterThanOrEqual(expiresAt);
+    expect(again.status(actor.id).filterSkipped.count).toBe(0);
+    expect(again.messages(actor.id).filter(m => m.reason === "activationFilter cleared: expired")).toHaveLength(1);
+    await expect(again.setActivationFilter(actor.id, BOTH, undefined, NaN)).rejects.toThrow("expiresAt");
+    await again.setActivationFilter(actor.id, BOTH, undefined, Date.now() + 10_000);
+    const reset = await again.setActivationFilter(actor.id, []);
+    expect(reset.activationFilterExpiresAt).toBeUndefined();
+    expect(reset.filterSkipped.count).toBe(0);
+  });
 });
 
 // review/astra F2 on #106: an unreadable stored filter must never drop or rewrite its actor.

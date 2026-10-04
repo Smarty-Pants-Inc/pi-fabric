@@ -728,12 +728,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "setActivationFilter",
-    description: "Set or clear (null or []) the actor's skip-only activation filter: preset names (hold, never-message-events) or rule objects. Invalid rules are rejected. It applies from the next queued event on.",
+    description: "Set or clear (null or []) the actor's skip-only activation filter: preset names (hold, never-message-events) or rule objects. Invalid rules are rejected. Applies from the next queued event and resets filterSkipped. Optional expiresAt (epoch ms, live actors only) clears on the next event or poll, with an actor audit message.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
         activationFilter: { anyOf: [activationFilterSchema, { type: "null" }] },
+        expiresAt: { type: "number", description: "Epoch milliseconds; clear at/after this time on the next event or poll. Live actors only." },
         scope: { type: "string", enum: ["project", "global"] },
       },
       required: ["id", "activationFilter"],

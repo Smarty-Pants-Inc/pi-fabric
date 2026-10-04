@@ -1481,10 +1481,16 @@ export class AgentsProvider implements FabricProvider {
       case "setActivationFilter": {
         if (args.activationFilter === undefined) throw new Error("activationFilter is required (a list of presets or rules, or null to clear)");
         const activationFilter = args.activationFilter === null ? null : normalizeActorActivationFilter(args.activationFilter);
-        if (args.scope === "global") return this.globalActors.update(String(args.id), { activationFilter });
+        const expiresAt = args.expiresAt;
+        if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
+        if (args.scope === "global") {
+          if (expiresAt !== undefined) throw new Error("expiresAt is only supported for live actors");
+          return this.globalActors.update(String(args.id), { activationFilter });
+        }
+        const expiry = expiresAt === undefined ? {} : { expiresAt };
         const resident = this.#residentActorOwner(String(args.id));
-        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter }, context);
-        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit);
+        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry }, context);
+        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined);
       }
       case "setEvents": {
         const events = Array.isArray(args.events)

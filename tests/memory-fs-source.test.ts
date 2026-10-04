@@ -166,8 +166,12 @@ describe("filesystem memory source adapter", () => {
     const dir = path.join(root, "nested");
     const file = writeSessionFile(dir, "s.jsonl", recordsFor("safe", "/work", ["safe"]));
     writeSessionFile(outside, "s.jsonl", recordsFor("secret", "/private", ["private session"]));
+    const source = createFileSystemMemorySource({ id: "late-race", root });
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     Object.defineProperty(process, "platform", { value: "darwin" });
+    expect(() => createFileSystemMemorySource({ id: "disabled", root })).toThrow(
+      "Filesystem memory sources are disabled on non-Linux hosts",
+    );
     const stat = fs.statSync.bind(fs), open = fs.openSync.bind(fs), realpath = fs.realpathSync.bind(fs);
     let swapped = false, opened = false, restored = false;
     const swap = () => {
@@ -192,7 +196,7 @@ describe("filesystem memory source adapter", () => {
     }) as typeof fs.realpathSync);
     const readSpy = vi.spyOn(fs, "readFileSync");
     try {
-      expect(await createFileSystemMemorySource({ id: "late-race", root }).loadSession("nested/s.jsonl", {})).toBeNull();
+      expect(await source.loadSession("nested/s.jsonl", {})).toBeNull();
       expect(swapped).toBe(true);
       expect(readSpy).not.toHaveBeenCalled();
     } finally {

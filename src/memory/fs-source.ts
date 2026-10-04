@@ -219,8 +219,11 @@ const parseRecords = (content: string): MemorySourceRecord[] => {
 /** Build a filesystem adapter for one configured source entry. */
 export const createFileSystemMemorySource = (
   options: FileSystemMemorySourceOptions,
-): PortableMemorySource =>
-  defineMemorySource({
+): PortableMemorySource => {
+  if (process.platform !== "linux") {
+    throw new Error("Filesystem memory sources are disabled on non-Linux hosts: safe openat/O_NOFOLLOW component confinement is unavailable");
+  }
+  return defineMemorySource({
     interfaceVersion: MEMORY_SOURCE_INTERFACE_VERSION,
     id: options.id,
     async listSessions({ limit, signal }) {
@@ -282,6 +285,7 @@ export const createFileSystemMemorySource = (
       } satisfies MemorySourceSnapshot;
     },
   });
+};
 
 /** Build a source registry from validated fabric.json entries. The kind
  *  dispatch lives here so the runtime wiring stays a single call. */

@@ -475,6 +475,7 @@ describe("agents provider seeds and confinement", () => {
     const manager = {
       config: DEFAULT_FABRIC_CONFIG.agents,
       assertModelAllowed: AgentManager.prototype.assertModelAllowed,
+      assertExplicitModelReason: AgentManager.prototype.assertExplicitModelReason,
       defaultModel: AgentManager.prototype.defaultModel,
       resolveKernel: () => undefined,
       resolvePythonRuntime: () => "monty",

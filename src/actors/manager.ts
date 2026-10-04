@@ -28,7 +28,7 @@ import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/
 import type { ModelRouteDecision } from "../agents/model-route.js";
 
 import { readJsonlPage } from "../log-tail.js";
-import { ActorChildCompletionStore } from "./child-completions.js";
+import { ActorChildCompletionStore, ChildCompletionClaimLostError } from "./child-completions.js";
 import { pruneActorSessionBackups } from "../storage/retention.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
@@ -61,7 +61,7 @@ import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { ModelRoutePinError } from "../core/model-refresh.js";
 
 export interface ActorModelRouteInput {
-  routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown;
+  routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown; modelReason?: string;
   parentSessionId: string; actorId: string; activationId: string;
 }
 import type { FabricMessageSender, FabricScope } from "../protocol.js";
@@ -367,6 +367,7 @@ export class ActorManager {
   // Accepted active work (preparing, waiting, or running), retained durably until settlement (#878).
   readonly #inFlight = new Map<string, ActorQueueItem>();
   readonly #deferredHandoffs = new Map<string, ActorQueueItem[]>();
+  readonly #pendingHandoffConsumption = new Map<string, Set<string>>();
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
@@ -878,6 +879,7 @@ export class ActorManager {
     model: string | undefined,
     scope: FabricActorBindingScope = "session",
     beforeCommit?: (id: string) => void,
+    modelReason?: string,
   ): Promise<FabricActorInfo> {
     if (scope !== "session" && scope !== "project") {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
@@ -899,13 +901,15 @@ export class ActorManager {
     }
     // Fence after model refresh and (for session scope) binding-lock acquisition.
     if (scope === "session") {
-      await this.#bindings.setModel(actor.id, resolved, beforeCommit);
+      await this.#bindings.setModel(actor.id, resolved, beforeCommit, modelReason);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
     beforeCommit?.(actor.id);
     if (resolved) actor.model = resolved;
     else delete actor.model;
+    if (resolved && modelReason !== undefined) actor.modelReason = modelReason;
+    else delete actor.modelReason;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -2223,12 +2227,37 @@ export class ActorManager {
     return store;
   }
 
+  /** Bound the actual pretty-printed UTF-8 context, independently of the runnable FIFO. */
+  #handoffSnapshot(actor: ManagedActor): ActorQueueItem[] {
+    const snapshot: ActorQueueItem[] = [];
+    const encode = (items: ActorQueueItem[]): string => JSON.stringify(items.map(({ id, source, payload, activation }) =>
+      ({ id, source, payload, activation })), null, 2);
+    for (const original of this.#deferredHandoffs.get(actor.id) ?? []) {
+      if (snapshot.length === 16) break;
+      if (this.#pendingHandoffConsumption.get(actor.id)?.has(original.id) ||
+          this.#childCompletionStore(actor).handoffConsumed(original.id)) continue;
+      let item = original;
+      // One oversized summary must not starve itself or later outcomes. The full
+      // archive remains accessible, while this context carries only its reference.
+      if (Buffer.byteLength(encode([item]), "utf8") > 32 * 1024) {
+        item = { ...original, payload: {
+          message: "Unread child outcome; read the full archived result.",
+          data: { resultFile: this.#childCompletionStore(actor).resultFile(original.id) },
+        } };
+      }
+      if (Buffer.byteLength(encode([...snapshot, item]), "utf8") > 32 * 1024) break;
+      snapshot.push(item);
+    }
+    return snapshot;
+  }
+
   // Once its spawning activation ends, an unread child result belongs to the
   // actor's next activation. Stopped/removed actors keep the spool; never reroute to Main.
   #reconcileChildCompletions(): void {
     if (!this.#persistent || this.#closing) return;
     for (const actor of this.#actors.values()) {
       if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) continue;
+      this.#flushHandoffConsumption(actor);
       const store = this.#childCompletionStore(actor);
       for (const { spawner, result } of store.pending({ actorId: actor.id, ...(actor.inFlightRun ? { inFlightRunId: actor.inFlightRun.id } : {}) })) {
         try {
@@ -2249,9 +2278,27 @@ export class ActorManager {
             store.acknowledge(id, { handoff: true });
             this.#ensureDrain(actor);
           }
-        } catch { /* The actor-addressed file stays pending for the next owner poll. */ }
+        } catch (error) {
+          if (error instanceof ChildCompletionClaimLostError) {
+            this.#forgetClaimedChild(actor, result.id);
+            this.#ensureDrain(actor);
+          } // Other I/O failures leave the actor-addressed envelope pending for retry.
+        }
       }
     }
+  }
+
+  #forgetClaimedChild(actor: ManagedActor, id: string): void {
+    const keep = (item: ActorQueueItem): boolean => item.source !== "child-completion" || item.id !== id;
+    actor.queue = actor.queue.filter(keep);
+    for (const held of [this.#overflow, this.#parked, this.#deferredHandoffs]) {
+      const items = held.get(actor.id)?.filter(keep);
+      if (items?.length) held.set(actor.id, items);
+      else held.delete(actor.id);
+    }
+    this.#refill(actor);
+    if (!this.#inFlight.has(actor.id) && actor.status !== "stopped") actor.status = actor.queue.length ? "queued" : "idle";
+    this.#persistQueue(actor.id, true);
   }
 
   #enqueue(
@@ -2488,8 +2535,11 @@ export class ActorManager {
         // If receipt I/O failed, even an unrelated new message must not drain it;
         // the next poll retries the same queued id before opening this gate.
         const head = actor.queue[0];
-        if (head?.source === "child-completion" &&
-          !this.#childCompletionStore(actor).received(head.id)) break;
+        if (head?.source === "child-completion") {
+          const store = this.#childCompletionStore(actor);
+          if (!store.received(head.id)) break;
+          if (!store.mailboxClaimed(head.id)) { this.#forgetClaimedChild(actor, head.id); continue; }
+        }
         const item = actor.queue.shift();
         this.#refill(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
@@ -2532,7 +2582,7 @@ export class ActorManager {
           }
           // The current activation is fresh; retained outcomes are labelled context,
           // not retried activations with rewritten freshness facts.
-          item.handoffContext = this.#deferredHandoffs.get(actor.id)?.slice() ?? [];
+          item.handoffContext = this.#handoffSnapshot(actor);
           if (actor.requirements.length > 0 && this.#acquireCapabilityView) {
             capabilityLease = await this.#prepare(actor, "capabilities", () => this.#acquireCapabilityView!(
               actor.requirements,
@@ -2569,11 +2619,12 @@ export class ActorManager {
             ? await this.#prepare(actor, "binding", () => {
               if (!this.#prepareModelRoute) throw new Error("Actor shadow routing host unavailable");
               return this.#prepareModelRoute({ routeClass: actor.routeClass!, protected: actor.protected,
-                pinModel: binding.model, pinThinking: binding.thinking, parentSessionId: this.sessionId,
+                pinModel: binding.model, pinThinking: binding.thinking,
+                ...(binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}), parentSessionId: this.sessionId,
                 actorId: actor.id, activationId: item.id }, abortController.signal);
             })
             : undefined;
-          const launchBinding = routeDecision ? { model: routeDecision.pin.model, thinking: routeDecision.pin.effort }
+          const launchBinding = routeDecision ? { ...binding, model: routeDecision.pin.model, thinking: routeDecision.pin.effort }
             : await this.#prepare(actor, "binding", () => this.#resolvedRunBinding(actor, binding));
           // Admission is held, but no child writer has launched yet. Repair/create
           // the native session before handing its path to the process.
@@ -2961,7 +3012,7 @@ export class ActorManager {
         : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(binding.model ? { model: binding.model } : {}),
-      ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
+      ...(binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}),
       ...(binding.thinking ? { thinking: binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -3216,12 +3267,12 @@ export class ActorManager {
   // Returns false when an owned receiver's queue was full; the monitor then offers the event
   // again while it catches up, and actors that already took it are skipped.
   #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
-    // One ownership refresh per event. Each decision reads the participant directory, and
-    // re-deciding for every actor per actor (and before the topic filter) cost 182 directory
-    // reads per event on a host with 13 actors and saturated its event loop (smarty-dev#784).
-    // The snapshot holds for this synchronous delivery (enqueue, drain start, message record);
-    // work that resumes later decides again.
-    this.#refreshOwnership();
+    // beforePoll already refreshed all owners for this synchronous page. No
+    // await separates that snapshot from dispatch, including archive catch-up.
+    // Re-refreshing per event or full-queue retry repeats directory reads without
+    // adding an authority boundary. Async activation continuations recheck their
+    // own target after every wait.
+
     this.#ownershipSnapshot = true;
     try {
       return this.#deliverMeshEvent(event);
@@ -3286,6 +3337,7 @@ export class ActorManager {
           ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
           .filter((item) => item?.source === "child-completion").map((item) => item!.id));
         for (const handoff of this.#inFlight.get(actor.id)?.handoffContext ?? []) keepIds.add(handoff.id);
+        for (const id of this.#pendingHandoffConsumption.get(actor.id) ?? []) keepIds.add(id);
         const store = this.#childCompletionStore(actor);
         store.prune(this.#logs.retention.actorRunArchiveMs, now, keepIds);
         // Deferred work shares the archive TTL, rather than exempting stale results
@@ -3878,12 +3930,26 @@ export class ActorManager {
     const kept = deferred.filter((handoff) => !consumedIds.has(handoff.id));
     if (kept.length) this.#deferredHandoffs.set(actorId, kept);
     else this.#deferredHandoffs.delete(actorId);
-    // Commit removal before deleting archives; failed persistence leaves them recoverable.
-    if (this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0) && actor) {
-      for (const id of consumedIds) {
-        try { this.#childCompletionStore(actor).releaseResult(id); } catch { /* The retention sweep retries cleanup. */ }
-      }
-    }
+    if (actor && consumedIds.size) {
+      const pending = this.#pendingHandoffConsumption.get(actorId) ?? new Set<string>();
+      for (const id of consumedIds) pending.add(id);
+      this.#pendingHandoffConsumption.set(actorId, pending);
+      this.#flushHandoffConsumption(actor);
+    } else this.#persistQueue(actorId, item.source === "child-completion" || context.length > 0);
+  }
+
+  #flushHandoffConsumption(actor: ManagedActor): void {
+    const pending = this.#pendingHandoffConsumption.get(actor.id);
+    if (!pending?.size) return;
+    const store = this.#childCompletionStore(actor);
+    try {
+      // Separate durable evidence survives a failed queue rewrite. Retain both
+      // fence and queue retries, and never offer an already inferred snapshot again.
+      for (const id of pending) store.markHandoffConsumed(id);
+      if (!this.#persistQueue(actor.id, true)) return;
+      for (const id of pending) store.releaseResult(id);
+      this.#pendingHandoffConsumption.delete(actor.id);
+    } catch { /* Keep original archives and retry each owner poll. */ }
   }
 
   #readQueue(file: string): unknown {
@@ -3955,6 +4021,16 @@ export class ActorManager {
       ) continue;
       // Include this snapshot's accepted IDs too, not only the work held on entry.
       held.add(value.id);
+      if (value.source === "child-completion" && this.#childCompletionStore(actor).handoffConsumed(value.id)) {
+        const pending = this.#pendingHandoffConsumption.get(actor.id) ?? new Set<string>();
+        pending.add(value.id);
+        this.#pendingHandoffConsumption.set(actor.id, pending);
+        continue;
+      }
+      if (value.source === "child-completion") {
+        const store = this.#childCompletionStore(actor);
+        if (store.received(value.id) && !store.mailboxClaimed(value.id)) continue;
+      }
       const deferredHandoff = value.source === "child-completion" && value.deferredHandoff === true;
       // New snapshots prove whether a worker actually launched since the last
       // restoration. Failed starts/preparation never consume accepted backlog.
@@ -4042,6 +4118,7 @@ export class ActorManager {
     }
     return {
       ...(model ? { model } : {}),
+      ...(model && binding.modelReason !== undefined ? { modelReason: binding.modelReason } : {}),
       ...(isFabricThinking(binding.thinking) ? { thinking: binding.thinking } : {}),
     };
   }
@@ -4053,9 +4130,11 @@ export class ActorManager {
     const session = this.#bindings.get(actor.id);
     const call = this.#validatedRunBinding(overrides);
     const model = call.model ?? session?.model ?? actor.model;
+    const modelReason = call.model ? call.modelReason : session?.model ? session.modelReason : actor.modelReason;
     const thinking = call.thinking ?? session?.thinking ?? actor.thinking;
     return {
       ...(model ? { model } : {}),
+      ...(modelReason !== undefined ? { modelReason } : {}),
       ...(thinking ? { thinking } : {}),
     };
   }
@@ -4094,17 +4173,20 @@ export class ActorManager {
       ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
       ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(effective.model ? { model: effective.model } : {}),
+      ...(effective.modelReason !== undefined ? { modelReason: effective.modelReason } : {}),
       ...(effective.thinking ? { thinking: effective.thinking } : {}),
       binding: {
         scope: "session",
         sessionId: this.sessionId,
         ...(session?.model ? { model: session.model } : {}),
+        ...(session?.modelReason !== undefined ? { modelReason: session.modelReason } : {}),
         ...(session?.thinking ? { thinking: session.thinking } : {}),
         ...(session ? { updatedAt: session.updatedAt } : {}),
       },
       projectDefaults: {
         scope: "project",
         ...(actor.model ? { model: actor.model } : {}),
+        ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
         ...(actor.thinking ? { thinking: actor.thinking } : {}),
       },
       ...(actor.tools ? { tools: [...actor.tools] } : {}),
@@ -4308,10 +4390,14 @@ export class ActorManager {
     this.#emitChange();
   }
 
-  #refreshOwnership(): void {
+  #refreshOwnership(id?: string): void {
     if (!this.#canManageActor || this.#reloadingOwnership) return;
     let acquired = false;
-    for (const actor of this.#actors.values()) {
+    // Async activation boundaries recheck their target, not every actor for
+    // every target. Polls and mesh delivery still refresh the complete snapshot.
+    const target = id === undefined ? undefined : this.#actors.get(id);
+    const actors = id === undefined ? this.#actors.values() : target ? [target] : [];
+    for (const actor of actors) {
       const previous = this.#ownership.get(actor.id) ?? false;
       const next = this.#ownershipDecision(actor.id);
       this.#ownership.set(actor.id, next);
@@ -4555,7 +4641,7 @@ export class ActorManager {
   }
 
   #canManage(id: string): boolean {
-    if (!this.#ownershipSnapshot) this.#refreshOwnership();
+    if (!this.#ownershipSnapshot) this.#refreshOwnership(id);
     return this.#canManageCached(id);
   }
 

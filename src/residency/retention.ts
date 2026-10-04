@@ -67,6 +67,7 @@ export class ResidentRequestRetention {
     readonly root: string,
     readonly actorRoots: readonly string[] = [],
     readonly retention: TerminalRunEventsRetention & { retainRuns?: boolean } = {},
+    readonly recoverRunArchives?: (directory: string) => void,
   ) {}
 
   due(now = Date.now()): boolean { return this.#scanning || now >= this.#nextSample; }
@@ -120,6 +121,10 @@ export class ResidentRequestRetention {
       if (kind === "runs") {
         // The request-proof wildcard is not an exit receipt for any particular run.
         const retainedRuns = this.#runReferences!.ids;
+        // Replay one untracked run (and its nested sources) under the host fence,
+        // before any compaction/deletion. Never walk the archive during startup
+        // or discharge the custody of a live manager's in-memory settlement.
+        if (entry.isDirectory() && !liveIds.has(entry.name)) this.recoverRunArchives?.(file);
         if (entry.isDirectory() && !liveIds.has(entry.name) &&
             !retainedRuns.has("*") && !retainedRuns.has(entry.name)) {
           // One complete safety-check + atomic replacement is the progress unit.

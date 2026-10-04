@@ -39,7 +39,8 @@ const runProperties = {
   protected: { type: "boolean", description: "Trusted issue/PR protection snapshot, never task text: true for review/security/audit/named passes/needs-security-pass; false only for known-clear state. Omitted stays unknown and excluded from routing." },
   modelReason: {
     type: "string",
-    description: "Reason for an explicit model selection, recorded on the run. Required and non-blank for cliproxyapi/gpt-6-astra; named passes use cliproxyapi/gpt-6.1-sol thinking max, otherwise omit model (role default).",
+    maxLength: 200,
+    description: "Named exception for an explicit model selection, recorded on the run/actor and spawn event. Required and non-blank for agents.modelPolicy.requireReason (default gpt-6-astra on any provider); omit model to use the role default. See smarty-dev#3134.",
   },
   persona: {
     type: "string",
@@ -722,6 +723,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
       properties: {
         id: { type: "string" },
         model: { type: "string" },
+        modelReason: runProperties.modelReason,
         scope: actorBindingScopeSchema,
       },
       required: ["id"],

@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import readline from "node:readline";
+import path from "node:path";
+import fs from "node:fs";
 
 // Launch-surface probe: reports the argv/env surface the Fabric worker gave
 // this child Pi without running any model. Speaks the same RPC handshake as
@@ -14,6 +16,14 @@ const flag = (name) => {
   const index = argv.indexOf(name);
   return index >= 0 ? argv[index + 1] : undefined;
 };
+const extensionPaths = argv.flatMap((arg, index) => arg === "-e" ? [argv[index + 1]] : []);
+const extensionDiscovery = !argv.includes("--no-extensions");
+// Native Pi's --no-extensions suppresses discovery, NOT explicit -e entries.
+// Report the Fabric surface independently of its discovery policy and of the
+// principal/session helper hooks that extensionless children still receive.
+const fabricExtensions = extensionPaths.filter(entry =>
+  ["index.ts", "index.js"].includes(path.basename(entry)) &&
+  ["src", "dist"].includes(path.basename(path.dirname(entry))));
 const surface = {
   cwd: process.cwd(),
   trustFlags: argv.filter((arg) => ["--approve", "--no-approve", "-a", "-na"].includes(arg)),
@@ -24,9 +34,11 @@ const surface = {
   depth: process.env.PI_FABRIC_DEPTH,
   mainAgentId: process.env.PI_FABRIC_MAIN_AGENT_ID,
   capabilityRequirements: JSON.parse(process.env.PI_FABRIC_CAPABILITY_REQUIREMENTS ?? "[]"),
-  extensions: !argv.includes("--no-extensions"),
+  extensions: extensionDiscovery || fabricExtensions.length > 0,
+  extensionDiscovery,
   extensionPath: flag("-e"),
-  extensionPaths: argv.flatMap((arg, index) => arg === "-e" ? [argv[index + 1]] : []),
+  extensionPaths,
+  explicitFabricExists: fabricExtensions.length > 0 && fabricExtensions.every(entry => fs.existsSync(entry)),
   tools: flag("--tools")?.split(",") ?? [],
   fullCodeModeEnv: process.env.PI_FABRIC_FULL_CODE_MODE,
   toolAllowlistEnv: process.env.PI_FABRIC_TOOL_ALLOWLIST

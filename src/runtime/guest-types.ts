@@ -66,7 +66,7 @@ interface FabricAgentRequest {
   runner?: FabricAgentRunner;
   transport?: FabricTransport;
   model?: string;
-  /** Required and non-blank when explicitly selecting cliproxyapi/gpt-6-astra. */
+  /** Named exception: non-blank and ≤200 chars for explicit models in the host requireReason list. */
   modelReason?: string;
   persona?: string;
   thinking?: FabricThinking;
@@ -244,6 +244,7 @@ type FabricLifecycleEventType =
   | "pi.agent_settled"
   | "pi.tool_error"
   | "pi.session_compact"
+  | "run.spawned"
   | "run.completed"
   | "run.failed"
   | "run.stopped"
@@ -292,6 +293,8 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  /** Canonical Fabric release actually selected for this process child. */
+  fabricRelease?: string;
   followUpDeliveries?: FabricFollowUpDelivery[];
   routeClass?: string;
   routeClassSource?: "explicit" | "derived";
@@ -709,7 +712,7 @@ interface FabricActorValidityFacts {
 }
 type FabricActorValidityDecision = boolean | { valid: boolean; reason?: string };
 type FabricActorBindingScope = "session" | "project";
-interface FabricActorRunBinding { model?: string; thinking?: FabricThinking }
+interface FabricActorRunBinding { model?: string; modelReason?: string; thinking?: FabricThinking }
 type FabricActorActivationFilterScalar = string | number | boolean | null;
 /** One test on a payload field; exactly one of equals, in, exists. A missing field never matches. */
 interface FabricActorActivationFilterPredicate {
@@ -756,7 +759,7 @@ interface FabricActorRequestBase {
   protected?: boolean;
   runner?: FabricAgentRunner;
   model?: string;
-  /** Required and non-blank when explicitly selecting cliproxyapi/gpt-6-astra. */
+  /** Named exception: non-blank and ≤200 chars for explicit models in the host requireReason list. */
   modelReason?: string;
   thinking?: FabricThinking;
   tools?: string[];
@@ -826,6 +829,8 @@ interface FabricActorInfo {
   lastFilteredAt?: number;
   /** The stored filter cannot be read: it is kept but not applied (every event is delivered). */
   activationFilterError?: string;
+  /** Named exception for the effective model, retained for metering. */
+  modelReason?: string;
   model?: string;
   thinking?: FabricThinking;
   routeClass?: "status-groom";
@@ -1011,7 +1016,7 @@ interface FabricAgentsApi {
   createActor(args: FabricActorRequest): Promise<FabricActorInfo>;
   /** Main setModel (own or remote) is refused; deferred to smarty-dev#4153. Actor bindings are unchanged. */
   setModel(args: { id: \`session:\${string}\`; model?: string; scope?: "session" }): Promise<never>;
-  setModel<Id extends string>(args: { id: Id; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
+  setModel<Id extends string>(args: { id: Id; model?: string; modelReason?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
   /** Only this session's own Main is supported; remote Main targets are refused. */
   setThinking(args: { id: \`session:\${string}\`; thinking: FabricThinking; scope?: "session" }): Promise<FabricMainAgentBindingResult>;

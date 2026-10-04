@@ -205,6 +205,40 @@ The trusted host's `<agentDir>/fabric.json` can set:
 
 These policy keys are ignored in project/workspace `.pi/fabric.json`, even in trusted projects. The default deny-list is empty. Fabric checks requested selectors and canonical selections case-insensitively, including aliases, inherited models and defaults, before spawn/create or model-setter mutation. A denial raises `FabricModelDeniedError` (`code: "FABRIC_MODEL_DENIED"`), names #2236 and the configured replacement, and never silently falls back to another model. Alternate runners also admit the backend selector produced by their argv normalizer (including `veda/`, `claude/` and `anthropic/` routing forms). Under active policy, Claude aliases must have an allowed native CLI catalog `resolvedModel` (checked as both a runtime ID and `anthropic/<id>`); Veda requires backend `pi` and an exact concrete `provider/model` resolved by the Pi registry. Unknown targets, Veda aliases/bare IDs/defaults and other Veda backends fail closed with the same typed refusal before queueing or durable submission. Allowed canonical targets, not unresolved selectors, are forwarded to workers. In-place Prewalk checks policy at manual/automatic arm and again before switching Main, and denied binding clears preserve the old binding when the actual owning-session fallback is denied. The fixed refusal code is preserved in public TypeScript guest catches; arbitrary host error properties are not transferred. Deploy the host policy to enforce the fleet list; rebuilding does not retroactively change existing workers or resident owners. See the [public-path CLI proof and installation-only owner gate](model-policy-acceptance.md).
 
+### Explicit model exceptions (#3134)
+
+`agents.spawn`, `agents.run`, `agents.create` (including `createActor`) and actor
+`agents.setModel` refuse an explicit Astra selector unless `modelReason` is a
+non-blank string of at most 200 JavaScript characters. The default match is
+`/(^|\/)gpt-6-astra/`: bare IDs and provider-qualified Astra variants are covered.
+No model is silently substituted. The error names the configured runner role
+default and tells the caller to omit `model` or supply a named exception:
+
+```ts
+await agents.spawn({ task: "Bounded compatibility probe", model: "cliproxyapi/gpt-6-astra",
+  modelReason: "Named exception: reproduce an Astra-specific parser failure" });
+```
+
+Only the trusted host's `<agentDir>/fabric.json` may override the list:
+
+```json
+{ "agents": { "modelPolicy": { "requireReason": ["cliproxyapi/gpt-6-astra"] } } }
+```
+
+Bare entries match a model-ID prefix on any provider; provider-qualified entries
+match that provider/model prefix. Matching is case-insensitive. The default list
+is `["gpt-6-astra"]`; `[]` disables the gate (rollback). Project/workspace policy
+entries are ignored even in trusted projects. Omitted `model`, inherited role or
+project defaults, Sol and other unlisted models are unaffected. Existing actors
+continue unchanged; an explicit `setModel` request needs its own exception.
+Aliases are tested as the explicitly requested selector, not their resolved target.
+
+The reason is retained verbatim on run records and actor definitions/session
+bindings, and follows the effective binding into activation run records. Clearing
+or replacing a binding clears its old reason. The `run.spawned` lifecycle event
+is emitted after actual worker registration (not queue admission) with
+`data.model` and, when supplied, `data.modelReason` for metering.
+
 ### Requested models are authoritative
 
 For Pi workers, Fabric reapplies the resolved `provider/model` over RPC **after startup extensions finish**, reapplies the requested thinking level, and independently reads `get_state` before sending the task. A successful `set_model` response alone is insufficient: it can echo the requested model even when an extension switches away during `model_select`. Thinking is reported at Pi's effective, capability-clamped level.

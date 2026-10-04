@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { build } from "esbuild";
-import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { buildLandlock } from "./build-landlock.mjs";
 
@@ -19,6 +19,7 @@ const primaryEntryPoints = [
   "src/runners.ts",
   // Opt-in durable Pi adapter; never reachable from the extension entry.
   "src/durable.ts",
+  "src/agents/worker-protocol.ts",
   "src/jev.ts",
   "src/assessment.ts",
   // Public `pi-fabric/scope`; also the extension's first-use scope parser.
@@ -125,6 +126,7 @@ const lazyEntryPoints = [
   "src/worker/recovery-watchdog.ts",
   "src/worker/retry-profile.ts",
   "src/worker/task-entry.ts",
+  "src/worker/release-entry.ts",
   "src/worker/run-log.ts",
   "src/worker/result.ts",
   "src/worker/run-record.ts",
@@ -159,6 +161,10 @@ const result = await build({
   metafile: true,
   logLevel: "info",
 });
+
+// Advertise the exact manager/worker contract without importing candidate code at spawn.
+const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
+writeFileSync("dist/worker-protocol.json", `${JSON.stringify({ version: WORKER_PROTOCOL_VERSION })}\n`);
 
 // Pi supplies these packages to extensions through its module aliases, so
 // they are peers and must never be bundled into code that Pi loads.

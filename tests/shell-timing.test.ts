@@ -14,9 +14,10 @@ function harness() {
   return { jobs, emit, bridge };
 }
 afterEach(async () => {
+  // Native scratch teardown must not inherit a test's frozen deadline clock.
+  vi.useRealTimers();
   for (const bridge of bridges.splice(0)) bridge.close();
   for (const jobs of stores.splice(0)) await jobs.close();
-  vi.useRealTimers();
 });
 
 describe("background shell timing bridge", () => {
@@ -64,7 +65,7 @@ describe("background shell timing bridge", () => {
     vi.spyOn(job, "readPid").mockResolvedValue(42);
     let complete!: (value: number) => void;
     const pending = new Promise<number>(resolve => { complete = resolve; });
-    expect(await raceShellHang({ execute: () => pending, parentSignal: undefined, hangMs: 0, immediate: true, job })).toEqual({ status: "spilled" });
+    expect(await raceShellHang({ execute: () => pending, parentSignal: undefined, hangMs: 0, immediate: true, job })).toEqual({ status: "spilled", auto: false });
     expect(emit).toHaveBeenCalledTimes(1);
     await job.finish(0);
     complete(0);
@@ -79,7 +80,7 @@ describe("background shell timing bridge", () => {
     const pending = new Promise<number>(resolve => { complete = resolve; });
     const result = raceShellHang({ execute: () => pending, parentSignal: undefined, hangMs: 100, job });
     await vi.advanceTimersByTimeAsync(100);
-    expect(await result).toEqual({ status: "spilled" });
+    expect(await result).toEqual({ status: "spilled", auto: true });
     expect(emit).toHaveBeenCalledTimes(1);
     complete(0);
     await job.finish(0);

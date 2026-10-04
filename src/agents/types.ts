@@ -186,6 +186,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Canonical Fabric package root selected for the process worker at spawn time. */
+  fabricRelease?: string;
   /** Always populated for new runs; optional for legacy records. */
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
@@ -290,6 +292,8 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  /** Canonical Fabric package root selected for the process worker at spawn time. */
+  fabricRelease?: string;
   followUpDeliveries?: AgentFollowUpDelivery[];
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
@@ -326,6 +330,8 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  /** Spawn-selected Fabric package root, retained in the durable run record. */
+  fabricRelease?: string;
   /** Host-created record metadata, independent of the route header/decision. */
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
@@ -447,6 +453,8 @@ export type AgentTransportObservation =
   | { state: "unknown"; reason: string };
 
 export interface AgentTransportHandle {
+  /** Actual worker release, not the parent manager's loaded generation. */
+  fabricRelease?: string;
   kind: AgentRunTransport;
   sessionId?: string;
   attachCommand?: string;
@@ -468,6 +476,8 @@ export interface AgentTransportHandle {
   waitForClose?(): Promise<void>;
   /** Bounded diagnostic tail for workers that fail before writing a status record. */
   readStderr?(): string;
+  /** Passive native close notification; wakes monitoring, never itself grants collection. */
+  closed?: Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;
 }

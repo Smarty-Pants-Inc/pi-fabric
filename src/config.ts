@@ -213,6 +213,8 @@ export interface FabricAgentConfig {
   model?: string;
   /** Host-only fleet policy; workspace configuration cannot override these keys. */
   deniedModels: string[];
+  /** Host-only explicit-selection exception policy; [] disables the reason gate. */
+  modelPolicy: { requireReason: string[] };
   deniedModelReplacement?: string;
   /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
   instructionsRoot?: string;
@@ -556,6 +558,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     runner: "pi",
     transport: "process",
     deniedModels: [],
+    modelPolicy: { requireReason: ["gpt-6-astra"] },
     claude: { binary: "claude" },
     veda: { binary: "veda", backend: "agy", persona: "navigator-chat" },
     thinking: DEFAULT_FABRIC_THINKING,
@@ -1269,6 +1272,13 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
             };
           })() }
         : {}),
+      modelPolicy: {
+        requireReason: [...new Set((Array.isArray(objectValue(agents.modelPolicy).requireReason)
+          ? objectValue(agents.modelPolicy).requireReason as unknown[]
+          : DEFAULT_FABRIC_CONFIG.agents.modelPolicy.requireReason)
+          .filter((model): model is string => typeof model === "string" && !!model.trim())
+          .map(model => model.trim().toLowerCase()))],
+      },
       deniedModels: [...new Set((Array.isArray(agents.deniedModels) ? agents.deniedModels : [])
         .filter((model): model is string => typeof model === "string" && !!model.trim())
         .map((model) => model.trim().toLowerCase()))],
@@ -1811,6 +1821,7 @@ const resolveFabricConfig = (
     const document = { ...plan.document };
     if (plan === projectPlan) {
       const agents = { ...objectValue(document.agents) };
+      delete agents.modelPolicy;
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;
       delete agents.instructionsRoot;

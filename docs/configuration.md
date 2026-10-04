@@ -559,6 +559,8 @@ Workers require Node.js 24+ (or Bun) and report an explicit startup failure on o
 
 Other agent settings:
 
+- `modelPolicy.requireReason`: trusted-host-only model prefixes requiring a named `modelReason` on explicit `agents.spawn`, `run`, `create` and actor `setModel` requests. Defaults to `["gpt-6-astra"]` (any provider); provider-qualified entries restrict that provider/model prefix. Reasons must be non-blank and at most 200 characters, and are recorded on run/actor records and `run.spawned` lifecycle events. Omitted models/defaults are unchanged; no silent fallback. Workspace configuration cannot override this list. Set `[]` in the host agent directory's `fabric.json` to roll back. See [explicit model exceptions](agents.md#explicit-model-exceptions-3134).
+
 - `thinking`: default reasoning effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), default `medium`.
 - `maxConcurrent`: child concurrency semaphore. A session spawn beyond this limit returns a `queued` handle immediately. Queued children start in FIFO order as slots become free; `queuePosition` in list/status is one-based. Queued receipts are session-only for now: saturated durable spawns cancel their queue entry, safely reject, and return no queued handle.
 - `maxPerExecution`: hard cap on accepted child launches per `fabric_exec` invocation, including queued spawns. Cancelling a queued child does not refund that invocation's launch count.

@@ -155,6 +155,65 @@ describe("public resident route feedback and config rollback", () => {
     expect(rows().find(row => row.type === "quality")).toMatchObject({ runId: first.runId, routeQuality: "fail" });
   }, 20000);
 
+  it("keeps denied A archive custody through normal host close/restart and repairs before source collection", async () => {
+    const retain = ActorLogStore.prototype.retainRun;
+    let failedRun: string | undefined, denied = true;
+    vi.spyOn(ActorLogStore.prototype, "retainRun").mockImplementation(async function (this: ActorLogStore, actor, runId, directory) {
+      failedRun ??= runId;
+      if (denied && runId === failedRun) throw new Error("Denied A archive before receipt copy");
+      return retain.call(this, actor, runId, directory);
+    });
+    const state = await fixture();
+    const a = await state.host.actors.ask(state.actor.id, "ECHO_MODEL", "test");
+    await vi.waitFor(() => expect(state.host.actors.status(state.actor.id).status).toBe("idle"));
+    const source = state.host.agents.runDirectory(a.runId!)!;
+    const marker = path.join(source, "actor-run-archive-pending.json");
+    expect(fs.existsSync(marker)).toBe(true);
+    await state.activate(); // B succeeds; A's only receipt remains in its source.
+    await state.host.close();
+    expect(fs.existsSync(path.join(source, "route-quality-receipt.json"))).toBe(true);
+    expect(fs.existsSync(marker)).toBe(true);
+    expect(fs.existsSync(path.join(state.actor.logDir!, a.runId!, "route-quality-receipt.json"))).toBe(false);
+    const restored = new ResidentHost(state.config, () => {}, { getAvailable: () => available });
+    closers.push(() => restored.close()); await restored.start();
+    expect(restored.agents.runDirectory(a.runId!)).toBeUndefined(); // No old live handle/map.
+    expect(restored.agents.actorArchiveSources(state.actor.id, state.actor.sessionFile!).get(a.runId!)).toBe(source);
+    denied = false;
+    await expect(state.makeProvider({ ...state.mainAgent, id: "session:foreign" }).invoke("routeOutcome", { id: a.runId, routeQuality: "fail" }, state.context))
+      .rejects.toMatchObject({ code: "RESIDENT_ACTOR_FORBIDDEN" });
+    await expect(state.provider.invoke("routeOutcome", { id: a.runId, routeQuality: "fail" }, state.context))
+      .resolves.toEqual({ id: a.runId, routeQuality: "fail" });
+    expect(fs.existsSync(marker)).toBe(true); // Feedback commits before source collection.
+    const next = await restored.actors.ask(state.actor.id, "ECHO_MODEL", "test"); expect(next.text).toContain(pin.model);
+    await vi.waitFor(() => expect(restored.actors.status(state.actor.id).status).toBe("idle"));
+    expect(fs.existsSync(path.join(state.actor.logDir!, a.runId!, "route-quality-receipt.json"))).toBe(true);
+    expect(fs.existsSync(source)).toBe(false);
+    expect(rows().filter(row => row.type === "quality" && row.runId === a.runId)).toHaveLength(1);
+    expect(rows().filter(row => row.type === "decision").at(-1)).toMatchObject({ mode: "shadow", reasonCode: "class-reverted" });
+  }, 20000);
+
+  it("pins fresh resident and Main admission after a full writable safety journal refuses public FAIL", async () => {
+    const state = await fixture(), first = await state.activate();
+    const journal = path.join(root, "profile/fabric/model-routing-pending.jsonl");
+    const prefix = JSON.stringify({ type: "committed", receiptId: "capacity-fixture", at: 1, padding: "" });
+    const row = prefix.slice(0, -2) + "x".repeat(64 * 1024 - Buffer.byteLength(prefix) - 1) + '"}\n';
+    fs.writeFileSync(journal, row.repeat(1024));
+    expect(fs.statSync(journal).size).toBe(64 * 1024 * 1024);
+    const fd = fs.openSync(journal, "a"); fs.fsyncSync(fd); fs.closeSync(fd);
+    await expect(state.provider.invoke("routeOutcome", { id: first.runId, routeQuality: "fail" }, state.context)).rejects.toThrow();
+    await state.host.close();
+    const restored = new ResidentHost(state.config, () => {}, { getAvailable: () => available });
+    closers.push(() => restored.close()); await restored.start();
+    expect((await restored.actors.ask(state.actor.id, "ECHO_MODEL", "test")).text).toContain(pin.model);
+    const main = await state.provider.invoke("spawn", { task: "ECHO_MODEL", model: "auto", routeClass: "status-groom", protected: false }, state.context) as { id: string };
+    expect(await state.provider.invoke("wait", { id: main.id }, state.context)).toMatchObject({ model: pin.model });
+    // Retire only committed fixture rows; durable refused FAIL must survive repair.
+    fs.truncateSync(journal, 0);
+    expect((await restored.actors.ask(state.actor.id, "ECHO_MODEL", "test")).text).toContain(pin.model);
+    expect(rows().filter(row => row.type === "quality" && row.runId === first.runId)).toHaveLength(1);
+    expect(isRouteClassReverted("status-groom")).toBe(true);
+  }, 30000);
+
   it("rereads same-generation empty allowlist and fresh per-class reset on the next activation without replacing its host", async () => {
     const state = await fixture(); const ownerPath = path.join(state.config.residencyRoot, "owner.json"); const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
     const first = await state.activate(); expect(first.text).toContain(cheap.model);

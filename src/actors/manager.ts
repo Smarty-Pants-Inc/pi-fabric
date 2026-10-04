@@ -837,7 +837,7 @@ export class ActorManager {
     for (const actor of this.listOwned()) {
       if (!actor.sessionFile) continue;
       const archive = path.join(path.dirname(actor.sessionFile), "runs", runId, "route-quality-receipt.json");
-      const runDirectory = this.agents.runDirectory(runId);
+      const runDirectory = this.agents.runDirectory(runId) ?? this.agents.actorArchiveSources(actor.id, actor.sessionFile).get(runId);
       const receipt = (fs.existsSync(archive) ? readRouteQualityReceipt(archive) : undefined) ?? (runDirectory
         ? readRouteQualityReceipt(path.join(runDirectory, "route-quality-receipt.json")) : undefined);
       if (receipt?.runId === runId && receipt.decision.actorId === actor.id) return { actor, receipt };
@@ -2215,6 +2215,13 @@ export class ActorManager {
         await this.agents.close();
         await Promise.race([drains, timer(this.#closeGraceMs)]);
       }
+      // Retry every durable join before AgentManager.close. Failed sinks keep
+      // their source veto on disk for the next execution owner.
+      for (const actor of owned) {
+        const pending = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
+          ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
+        for (const runId of pending) await this.#retainRunLog(actor, runId).catch(() => undefined);
+      }
       for (const actor of owned) {
         if (actor.status !== "stopped") actor.status = "idle";
         actor.updatedAt = Date.now();
@@ -2853,7 +2860,8 @@ export class ActorManager {
           }
           // Release the in-memory handle and tmp run dir for completed runs;
           // failed runs are retained for agents.status(actor.lastRunId).
-          const priorArchives = new Set(this.#pendingRunArchives.get(actor.id));
+          const priorArchives = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
+            ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
           if (previousRunId && previousRunId !== runId) priorArchives.add(previousRunId);
           for (const priorRunId of priorArchives) {
             if (priorRunId === runId) continue;
@@ -3323,7 +3331,9 @@ export class ActorManager {
     let pending = this.#pendingRunArchives.get(actor.id);
     if (!pending) this.#pendingRunArchives.set(actor.id, pending = new Set());
     pending.add(runId);
-    await this.#logs.retainRun(actor, runId, this.agents.runDirectory(runId));
+    const source = this.agents.runDirectory(runId) ?? this.agents.actorArchiveSources(actor.id, actor.sessionFile).get(runId);
+    await this.#logs.retainRun(actor, runId, source);
+    if (source) await this.agents.commitActorArchive(runId, actor.id, actor.sessionFile);
     pending.delete(runId);
     if (!pending.size) this.#pendingRunArchives.delete(actor.id);
   }

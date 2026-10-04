@@ -212,6 +212,60 @@ describe("live model routing", () => {
     expect(await prepareModelRoute(input)).toMatchObject({ mode: "live", reasonCode: "live-choice" });
     run.dispatch.outcome({ status: "completed" }); expect(rows().filter(row => row.type === "outcome")).toHaveLength(1);
   });
+  it.each([0, 128])("fails closed across fresh owners when the writable safety journal has only %s bytes left", async remaining => {
+    const decision = await prepareModelRoute(input), m = manager();
+    const run = await m.spawn({ task: "ECHO_MODEL", routeDecision: decision }); await m.wait(run.id);
+    const journal = path.join(path.dirname(state()), "model-routing-pending.jsonl");
+    const prefix = JSON.stringify({ type: "committed", receiptId: "capacity-fixture", at: 1, padding: "" });
+    const row = prefix.slice(0, -2) + "x".repeat(64 * 1024 - Buffer.byteLength(prefix) - 1) + '"}\n';
+    expect(Buffer.byteLength(row)).toBe(64 * 1024);
+    // Safe committed rows; append-open/fsync succeeds, an actual intent cannot.
+    fs.writeFileSync(journal, row.repeat(1024));
+    if (remaining) fs.truncateSync(journal, 64 * 1024 * 1024 - 64 * 1024);
+    if (remaining) {
+      const tail = JSON.stringify({ type: "committed", receiptId: "tail", at: 1, padding: "" });
+      fs.appendFileSync(journal, tail.slice(0, -2) + "x".repeat(64 * 1024 - remaining - Buffer.byteLength(tail) - 1) + '"}\n');
+    }
+    const fd = fs.openSync(journal, "a"); fs.fsyncSync(fd); fs.closeSync(fd);
+    expect(fs.statSync(journal).size).toBe(64 * 1024 * 1024 - remaining);
+    expect(() => m.reportRouteQuality(run.id, "fail")).toThrow(/oversized/);
+    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "revert-state-error" });
+    const fresh = spawnSync("bun", ["-e", `import {prepareModelRoute} from ${JSON.stringify(path.resolve("src/agents/model-route-prepare.ts"))};
+      console.log(JSON.stringify(await prepareModelRoute({routeClass:"status-groom",protected:false,pinModel:"test/sol",pinThinking:"high",parentSessionId:"fresh-main",
+        registry:{getAvailable:()=>[{provider:"test",id:"sol"},{provider:"test",id:"luna"}]},aliases:{},config:${JSON.stringify(config)},assertModelAllowed(){},evaluate:async()=>(${JSON.stringify(answer())})})));`], { encoding: "utf8", env: process.env });
+    expect(fresh.status, fresh.stderr).toBe(0);
+    expect(JSON.parse(fresh.stdout.trim())).toMatchObject({ ...pin, mode: "shadow", reasonCode: "revert-state-error" });
+    const refused = path.join(path.dirname(state()), "model-routing-refused.jsonl");
+    expect(JSON.parse(fs.readFileSync(refused, "utf8").trim())).toMatchObject({ decision: { decisionId: decision.decisionId }, result: { routeQuality: "fail" } });
+    // Explicit reconciliation retires ONLY these committed capacity-fixture rows.
+    // The refused assertion must replay from disk in a fresh owner, not be erased.
+    fs.truncateSync(journal, 0); restartedSwitch();
+    expect(rows().filter(row => row.type === "quality")).toHaveLength(1);
+    expect(rows().find(row => row.type === "quality")).toMatchObject({ runId: run.id, routeQuality: "fail" });
+    expect(isRouteClassReverted("status-groom")).toBe(true); restartedSwitch();
+    expect(rows().filter(row => row.type === "quality")).toHaveLength(1);
+  }, 30000);
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("orders repaired A-success before B-failure and C-stop from three pre-admitted runs", async () => {
+    const a = await dispatch(), b = await dispatch(), c = await dispatch();
+    for (const run of [a, b, c]) expect(run.decision.mode).toBe("live");
+    fs.writeFileSync(state(), "", { mode: 0o400 }); fs.chmodSync(state(), 0o400);
+    expect(() => a.dispatch.outcome({ status: "completed" })).toThrow();
+    fs.chmodSync(state(), 0o600); b.dispatch.outcome({ status: "failed" });
+    fs.chmodSync(state(), 0o400); expect(() => c.dispatch.outcome({ status: "stopped" })).toThrow();
+    restartedSwitch();
+    fs.chmodSync(state(), 0o600); restartedSwitch(); // Fresh owner repairs, in physical B/A/C order.
+    const saved = fs.readFileSync(state(), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(saved.map(row => row.decisionId)).toEqual([b.decision.decisionId, a.decision.decisionId, c.decision.decisionId]);
+    expect([...saved].sort((x, y) => x.at - y.at).map(row => row.status)).toEqual(["completed", "failed", "stopped"]);
+    expect(await prepareModelRoute(input)).toMatchObject({ ...pin, mode: "shadow", reasonCode: "class-reverted" });
+    a.dispatch.outcome({ status: "completed" }); b.dispatch.outcome({ status: "failed" }); c.dispatch.outcome({ status: "stopped" });
+    restartedSwitch();
+    expect(fs.readFileSync(state(), "utf8").trim().split("\n")).toHaveLength(3);
+    expect(rows().filter(row => row.type === "outcome")).toHaveLength(3);
+    expect(rows().filter(row => row.type === "revert")).toHaveLength(1);
+  });
+
   it("keeps non-live quality feedback audit-only without poisoning live admission", async () => {
     const shadow = await prepareModelRoute({ ...input, routeClass: "critical-read", protected: true });
     const report = prepareRouteDispatch(shadow, undefined, path.join(root, shadow.decisionId), shadow.decisionId);

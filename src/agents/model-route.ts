@@ -210,7 +210,9 @@ function readRouteState(): Array<Record<string, unknown>> {
 function revertReason(rows: Array<Record<string, unknown>>, routeClass: string, reset: string): "quality-fail" | "consecutive-failures" | undefined {
   const seen = new Set<string>();
   let failures = 0;
-  for (const row of rows) {
+  // Storage repair can append an older success after newer failures. Fold the
+  // original terminal order, never the journal's retry/append order.
+  for (const row of [...rows].sort((a, b) => Number(a.at) - Number(b.at))) {
     if (row.routeClass !== routeClass || row.reset !== reset) continue;
     if (row.routeQuality === "fail") return "quality-fail";
     if (row.type !== "result" || typeof row.decisionId !== "string" || seen.has(row.decisionId)) continue;
@@ -231,6 +233,9 @@ interface PendingRouteSave extends RouteQualityReceipt {
   record?: Record<string, unknown>;
 }
 const safetyFile = () => path.join(resolveAgentDir(), "fabric", "model-routing-pending.jsonl");
+// A refused first append must not leave its only assertion in a process-local map.
+// This independent journal is also checked by every new owner at admission.
+const refusedFile = () => path.join(resolveAgentDir(), "fabric", "model-routing-refused.jsonl");
 // Write-ahead safety obligations precede BOTH quality-intent and terminal writes.
 // Every execution owner reads/replays this host-owned journal at admission.
 const unsavedSafety = new Map<string, Map<string, PendingRouteSave>>();
@@ -242,8 +247,18 @@ const safetyObligations = (journal: string): Map<string, PendingRouteSave> => {
 
 function beginRouteSave(intent: PendingRouteSave): void {
   safetyObligations(safetyFile()).set(intent.receiptId, intent);
-  if (!readRouteRecords(safetyFile()).some(row => row.type === "pending" && row.receiptId === intent.receiptId)) {
-    appendRouteRecord(safetyFile(), intent);
+  try {
+    if (!readRouteRecords(safetyFile()).some(row => row.type === "pending" && row.receiptId === intent.receiptId)) appendRouteRecord(safetyFile(), intent);
+  } catch (error) {
+    try {
+      if (!readRouteRecords(refusedFile()).some(row => row.type === "pending" && row.receiptId === intent.receiptId)) appendRouteRecord(refusedFile(), intent);
+    } catch {
+      // Even a record-size refusal has a bounded durable class fence. If all
+      // storage is unavailable, the admission probes below fail closed too.
+      appendRouteRecord(refusedFile(), { type: "refused", receiptId: intent.receiptId,
+        routeClass: intent.decision.routeClass, reset: intent.decision.revertReset ?? "", at: intent.at });
+    }
+    throw error;
   }
 }
 
@@ -253,7 +268,7 @@ function commitRouteSave(intent: PendingRouteSave): void {
     if (!readRouteRecords(ledger).some(row => row.type === "outcome" && row.decisionId === decision.decisionId)) {
       appendRouteRecord(ledger, intent.record);
     }
-    saveRouteOutcome(decision, result, ledger);
+    saveRouteOutcome(decision, result, ledger, Number(intent.record.at));
   } else {
     const quality: PendingQuality = { decision, ledger, runId: intent.runId, type: "pending",
       receiptId: intent.receiptId, routeQuality: result.routeQuality!, at: intent.at };
@@ -268,12 +283,19 @@ function commitRouteSave(intent: PendingRouteSave): void {
 }
 
 function replayRouteSaves(routeClass: string, reset: string): boolean {
-  const rows = readRouteRecords(safetyFile());
+  const rows = [...readRouteRecords(safetyFile()), ...readRouteRecords(refusedFile())];
   const pending = new Map<string, PendingRouteSave>();
+  const refused = new Set<string>();
   const committed = new Set<string>();
   for (const row of rows) {
     if (typeof row.receiptId !== "string" || !row.receiptId || typeof row.at !== "number" || !Number.isFinite(row.at) ||
-      (row.type !== "pending" && row.type !== "committed")) throw new Error("Malformed routing safety fence");
+      (row.type !== "pending" && row.type !== "committed" && row.type !== "refused")) throw new Error("Malformed routing safety fence");
+    if (row.type === "refused") {
+      if (typeof row.routeClass !== "string" || !ROUTABLE_CLASSES.includes(row.routeClass) ||
+        typeof row.reset !== "string" || row.reset.length > 128) throw new Error("Malformed routing refusal fence");
+      if (row.routeClass === routeClass && row.reset === reset) refused.add(row.receiptId);
+      continue;
+    }
     if (row.type === "committed") { committed.add(row.receiptId); continue; }
     const intent = row as unknown as PendingRouteSave;
     if (!intent.decision || intent.decision.mode !== "live" || !ROUTABLE_CLASSES.includes(intent.decision.routeClass) ||
@@ -282,13 +304,14 @@ function replayRouteSaves(routeClass: string, reset: string): boolean {
       typeof intent.ledger !== "string" || typeof intent.runId !== "string" || !intent.result ||
       (intent.result.routeQuality !== undefined && intent.result.routeQuality !== "pass" && intent.result.routeQuality !== "fail") ||
       (intent.record ? intent.record.type !== "outcome" || intent.record.decisionId !== intent.decision.decisionId ||
-        intent.record.runId !== intent.runId || intent.record.status !== intent.result.status ||
+        intent.record.runId !== intent.runId || typeof intent.record.at !== "number" || !Number.isFinite(intent.record.at) ||
+        intent.record.status !== intent.result.status ||
         !["completed", "failed", "stopped", "timed_out"].includes(String(intent.result.status)) :
         intent.result.status !== undefined || intent.result.routeQuality === undefined)) throw new Error("Malformed routing safety intent");
     pending.set(intent.receiptId, intent);
   }
   for (const [id, intent] of safetyObligations(safetyFile())) if (!pending.has(id)) pending.set(id, intent);
-  let fenced = false;
+  let fenced = [...refused].some(id => !committed.has(id) && !pending.has(id));
   for (const intent of pending.values()) {
     if (committed.has(intent.receiptId) || intent.decision.routeClass !== routeClass || (intent.decision.revertReset ?? "") !== reset) continue;
     try { beginRouteSave(intent); commitRouteSave(intent); } catch { fenced = true; }
@@ -302,7 +325,7 @@ function commitQuality(intent: PendingQuality): void {
     appendRouteRecord(ledger, { type: "quality", receiptId: intent.receiptId, decisionId: decision.decisionId,
       runId, routeClass: decision.routeClass, routeQuality, at: intent.at });
   }
-  saveRouteOutcome(decision, { routeQuality }, ledger);
+  saveRouteOutcome(decision, { routeQuality }, ledger, intent.at);
   appendRouteRecord(qualityFile(), { type: "committed", receiptId: intent.receiptId, at: Date.now() });
 }
 
@@ -337,9 +360,20 @@ export function isRouteClassReverted(routeClass: string, reset = ""): boolean {
   let rows = readRouteState();
   // If even the write-ahead journal cannot accept intents, every owner refuses
   // live admission (including a fresh process with no local failed-write map).
-  const fd = fs.openSync(safetyFile(), fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT |
-    fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
-  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  for (const journal of [safetyFile(), refusedFile()]) {
+    const fd = fs.openSync(journal, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT |
+      fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    try {
+      const stat = fs.fstatSync(fd);
+      // Reserve the maximum accepted intent AND its commit record. Open/fsync
+      // alone succeeds on a full journal and is not write-ahead capacity.
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 64 * 1024 * 1024 - 2 * 64 * 1024 ||
+        (process.platform !== "win32" && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0))) {
+        throw new Error("Routing write-ahead storage is unsafe or capacity exhausted");
+      }
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+  }
   let fenced = replayRouteSaves(routeClass, reset);
   rows = readRouteState();
   const journal = qualityFile();
@@ -373,7 +407,7 @@ export function isRouteClassReverted(routeClass: string, reset = ""): boolean {
 
 /** Append-only replay makes counters durable and avoids process-local lost updates.
  * Retries deduplicate by decisionId. Reset generations isolate old in-flight outcomes. */
-function saveRouteOutcome(decision: ModelRouteDecision, result: { status?: string; routeQuality?: "pass" | "fail" }, ledger: string): void {
+function saveRouteOutcome(decision: ModelRouteDecision, result: { status?: string; routeQuality?: "pass" | "fail" }, ledger: string, at: number): void {
   if (decision.mode !== "live") return;
   const file = routeStateFile();
   const reset = decision.revertReset ?? "";
@@ -381,7 +415,7 @@ function saveRouteOutcome(decision: ModelRouteDecision, result: { status?: strin
   let rows = readRouteState();
   if (!rows.some(row => row.type === type && row.decisionId === decision.decisionId &&
     (type !== "quality" || row.routeQuality === result.routeQuality))) {
-    const event: RouteStateEvent = { type, routeClass: decision.routeClass, reset, decisionId: decision.decisionId, ...result, at: Date.now() };
+    const event: RouteStateEvent = { type, routeClass: decision.routeClass, reset, decisionId: decision.decisionId, ...result, at };
     appendRouteRecord(file, event);
     rows = readRouteState();
   }
@@ -440,12 +474,15 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
         admittedEffort: result.admittedThinking ?? (result.status === "completed" ? result.thinking ?? null : null),
         observedModel: result.model ?? null,
         ...(decision.modelReason !== undefined ? { modelReason: decision.modelReason } : {}),
-        tokens: result.usage ?? null, routeQuality: result.routeQuality ?? null, reasonCode: decision.reasonCode, at: Date.now() };
+        tokens: result.usage ?? null, routeQuality: result.routeQuality ?? null, reasonCode: decision.reasonCode,
+        // Capture at the original terminal callback, not at a later storage retry.
+        // Sub-millisecond precision preserves same-tick results across owners.
+        at: performance.timeOrigin + performance.now() };
       try {
         if (decision.mode === "live") {
           safetyIntent ??= { type: "pending", receiptId: allocateDecisionId(), decision, ledger: file, runId: childId,
             result: { status: result.status, ...(result.routeQuality ? { routeQuality: result.routeQuality } : {}) },
-            record: pendingRecord, at: Date.now() };
+            record: pendingRecord, at: Number(pendingRecord.at) };
           beginRouteSave(safetyIntent);
         }
         if (result.routeQuality && !qualityCommitted) {

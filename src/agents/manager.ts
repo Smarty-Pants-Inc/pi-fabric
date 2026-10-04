@@ -11,7 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import {
@@ -41,7 +41,7 @@ import { tokenUsagePayloadFromValue } from "../lifecycle/types.js";
 import type { FabricTokenUsagePayload } from "../lifecycle/types.js";
 import { AgentAdmission, assertAgentTask, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, type AgentLifecycleState } from "./lifecycle.js";
 import { removeTree } from "./rm.js";
-import { ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, type PendingRunArchive } from "./archive-custody.js";
+import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, type PendingRunArchive } from "./archive-custody.js";
 import { ActorChildCompletionStore } from "../actors/child-completions.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
@@ -1181,6 +1181,12 @@ export class AgentManager {
           ...(process.env.PI_FABRIC_ACTOR_SESSION_FILE && this.#spawner?.kind === "actor" ? { actorSessionFile: process.env.PI_FABRIC_ACTOR_SESSION_FILE, spawner: this.#spawner, notify: this.config.notifyOnComplete, actorOnly: !routeDispatch } : {}) }, { durable: true });
         if (process.env.PI_FABRIC_ACTOR_SESSION_FILE && this.#spawner?.kind === "actor") new ActorChildCompletionStore(process.env.PI_FABRIC_ACTOR_SESSION_FILE).trackArchiveSource(id, runDirectory);
       }
+      // Actor-log custody is a separate sink from the terminal routing save.
+      // Establish it before dispatch; only a confirmed archive can release it.
+      if (routedActor && request.sessionFile) {
+        writeJsonAtomic(path.join(runDirectory, ACTOR_RUN_ARCHIVE_PENDING_FILE), { format: 1, runId: id,
+          actorId: request.actorId, sessionFile: request.sessionFile }, { durable: true });
+      }
       if (this.#managedTempRoot && !this.#retentionTimer) {
         this.#retentionTimer = setInterval(() => this.#scheduleRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
         this.#retentionTimer.unref();
@@ -2023,6 +2029,34 @@ export class AgentManager {
 
   runDirectory(id: string): string | undefined {
     return this.#runs.get(id)?.runDirectory;
+  }
+
+  /** Discharge actor-log custody only after the owning archive succeeded. */
+  async commitActorArchive(runId: string, actorId: string, sessionFile: string): Promise<void> {
+    const directory = this.actorArchiveSources(actorId, sessionFile).get(runId);
+    if (!directory) return;
+    fs.rmSync(path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE));
+    syncDirectoryChain(directory);
+    // A restarted owner has no live handle, but the saved native exit and all
+    // other archive fences still govern collection of this exact source.
+    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await removeTree(directory);
+  }
+  /** Recover only this actor's fenced sources under the configured host run root. */
+  actorArchiveSources(actorId: string, sessionFile: string): Map<string, string> {
+    const sources = new Map<string, string>();
+    if (!ownedStat(this.#runRoot)?.isDirectory()) return sources;
+    for (const runId of fs.readdirSync(this.#runRoot)) {
+      if (!/^[a-f0-9]{32}$/.test(runId)) continue;
+      const directory = path.join(this.#runRoot, runId);
+      const file = path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE);
+      if (!ownedStat(directory)?.isDirectory() || !ownedStat(file)?.isFile()) continue;
+      try {
+        if (fs.statSync(file).size > 4096) continue;
+        const marker = JSON.parse(fs.readFileSync(file, "utf8"));
+        if (marker.format === 1 && marker.runId === runId && marker.actorId === actorId && marker.sessionFile === sessionFile) sources.set(runId, directory);
+      } catch { /* Unreadable custody stays a collection veto, never authority. */ }
+    }
+    return sources;
   }
 
   worktreeGitRoot(id: string): string | undefined {

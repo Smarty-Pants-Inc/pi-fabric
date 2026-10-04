@@ -125,6 +125,8 @@ const runTreeVeto = (
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
     if (preserveArchives && fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
+    if (preserveArchives && fs.existsSync(path.join(directory, "actor-run-archive-pending.json"))) return "actor run receipt archive is pending";
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (fs.existsSync(path.join(directory, UNRESOLVED_WORKER_FILE))) return "its worker may still be running (unresolved worker marker)";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     const statusFile = path.join(directory, "status.json");

@@ -84,10 +84,15 @@ const readConfinedFile = (root: string, file: string): ConfinedFile | null => {
   }
   let fd: number | undefined;
   try {
+    const expected = fs.statSync(canonical);
     const noFollow = fs.constants.O_NOFOLLOW ?? 0;
     fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile()) return null;
+    if (!stat.isFile() || stat.dev !== expected.dev || stat.ino !== expected.ino) return null;
+    // Linux exposes the opened handle's actual target. A parent may have been
+    // replaced after lexical/component checks; never read that escaped handle.
+    if (process.platform === "linux" && !isInside(rootReal, fs.realpathSync(`/proc/self/fd/${fd}`))) return null;
+    if (fs.realpathSync(file) !== canonical) return null;
     return { content: fs.readFileSync(fd, "utf8"), mtimeMs: stat.mtimeMs };
   } catch {
     return null;

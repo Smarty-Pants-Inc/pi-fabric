@@ -138,6 +138,28 @@ describe("filesystem memory source adapter", () => {
     expect(afterAppend.sessions[0]!.revision).not.toBe(before.revision);
   });
 
+  it("rejects a parent replacement between validation and open without reading the escaped handle", async () => {
+    const root = track(rootDir("race"));
+    const outside = track(rootDir("race-outside"));
+    const dir = path.join(root, "nested");
+    const file = writeSessionFile(dir, "s.jsonl", recordsFor("safe", "/work", ["safe"]));
+    writeSessionFile(outside, "s.jsonl", recordsFor("secret", "/private", ["secret"]));
+    const open = fs.openSync.bind(fs);
+    const read = vi.spyOn(fs, "readFileSync");
+    const spy = vi.spyOn(fs, "openSync").mockImplementation(((target: any, flags: any, mode: any) => {
+      if (target === file) {
+        fs.renameSync(dir, dir + "-original");
+        fs.symlinkSync(outside, dir, "dir");
+      }
+      return open(target, flags, mode);
+    }) as typeof fs.openSync);
+    try {
+      const source = createFileSystemMemorySource({ id: "race", root });
+      expect(await source.loadSession("nested/s.jsonl", {})).toBeNull();
+      expect(read).not.toHaveBeenCalled();
+    } finally { spy.mockRestore(); read.mockRestore(); }
+  });
+
   it("loads sessions with normalizeSession-compatible parsing and no filesystem escape", async () => {
     const root = track(rootDir("loads"));
     const outside = track(rootDir("loads-outside"));

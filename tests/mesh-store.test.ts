@@ -58,6 +58,45 @@ afterEach(() => {
 });
 
 describe("MeshStore", () => {
+  it("#4383 traces only successful commits with changed keys and the originating caller", async () => {
+    const store = createStore();
+    const trace = path.join(store.root, "trace.jsonl");
+    vi.stubEnv("PI_FABRIC_COMMIT_TRACE", trace);
+    await store.put({ key: "authority/owner", value: { epoch: 1 }, identity });
+    await store.writeBatch({ identity, ops: [
+      { kind: "put", key: "authority/owner", value: { epoch: 2 } },
+      { kind: "put", key: "authority/receipt", value: { accepted: true } },
+      { kind: "delete", key: "missing" },
+    ] });
+    await store.delete({ key: "authority/receipt" });
+    await store.delete({ key: "missing" });
+    await expect(store.put({ key: "authority/owner", value: {}, identity, ifVersion: 0 })).rejects.toThrow();
+    const commits = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(commits.map(commit => commit.keys)).toEqual([
+      ["authority/owner"], ["authority/owner", "authority/receipt"], ["authority/receipt"],
+    ]);
+    for (const commit of commits) {
+      expect(commit.pid).toBe(process.pid);
+      expect(commit.statePath).toBe(path.join(store.root, "state.json"));
+      expect(commit.bytes).toBeGreaterThan(0);
+      expect(commit.caller.join("\n")).toContain("mesh-store.test.ts");
+      expect(JSON.stringify(commit)).not.toContain("accepted"); // no stored values
+    }
+    vi.stubEnv("PI_FABRIC_COMMIT_TRACE", path.join(store.root, "missing", "trace"));
+    await expect(store.put({ key: "authority/owner", value: { epoch: 3 }, identity })).resolves.toMatchObject({ value: { epoch: 3 } });
+  });
+
+  it("#4383 identical explicit authority writes still commit and advance their CAS fence immediately", async () => {
+    const store = createStore();
+    const trace = path.join(store.root, "trace.jsonl");
+    vi.stubEnv("PI_FABRIC_COMMIT_TRACE", trace);
+    const first = await store.put({ key: "authority/owner", value: { epoch: 1 }, identity });
+    const second = await store.put({ key: first.key, value: first.value, identity, ifVersion: first.version });
+    expect(second.version).toBeGreaterThan(first.version);
+    await expect(store.put({ key: first.key, value: { epoch: 2 }, identity, ifVersion: first.version })).rejects.toThrow();
+    expect(fs.readFileSync(trace, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
   it("publishes durable ordered events and reads from a cursor", async () => {
     const store = createStore();
     const initialOffset = store.latestOffset();
@@ -193,6 +232,7 @@ describe("MeshStore", () => {
       const snapshot = store.stateToken();
       fs.writeFileSync(path.join(store.root, "state.json"), damaged);
       expect(() => store.get("shared/missing", { strict: true })).toThrow("Failed to read Fabric mesh state");
+      expect(() => store.get("shared/missing", { strict: true, snapshot })).toThrow("Failed to read Fabric mesh state");
       expect(() => store.listAll("shared/", { strict: true, snapshot })).toThrow("Failed to read Fabric mesh state");
       expect(() => store.listAllShared("shared/", { strict: true })).toThrow("Failed to read Fabric mesh state");
       expect(() => store.stateToken({ strict: true })).toThrow("Failed to read Fabric mesh state");

@@ -91,7 +91,14 @@ export interface MeshStoreOptions {
    * default) re-reads whenever the file changed.
    */
   readCacheMs?: number;
+  /** A live turn/pending operation bypasses the idle reuse window on demand. */
+  readActive?: () => boolean;
 }
+
+// Opt-in commit diagnostics: no values or stacks are collected on the normal path.
+// Capture before entering the async lock so the actual writer survives the await boundary.
+const commitTraceCaller = (): string[] | undefined => process.env.PI_FABRIC_COMMIT_TRACE
+  ? new Error().stack?.split("\n").slice(2, 10).map(line => line.trim()) : undefined;
 
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
@@ -111,9 +118,11 @@ const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
  * Read-cache age for non-fresh reads in a Fabric runtime and its resident host. Fresh protocol
  * decisions always read canonical state (smarty-dev#2355); ordinary polls reuse a recent parse
  * (smarty-dev#251: ~50 processes previously parsed every change, about 10 times a second).
- * ponytail: listings may lag other hosts by up to 2 s; leases are 15 s and heartbeats 5 s.
+ * Idle observers coalesce for 5 s by default (mesh.idleReadCoalesceMs). Active turns and pending
+ * Main messages bypass the window; CAS, ownership and delivery still request canonical freshness.
+ * This is a reader policy only: no on-disk format or writer cadence change (mixed fleets).
  */
-export const RUNTIME_MESH_READ_CACHE_MS = 2_000;
+export const RUNTIME_MESH_READ_CACHE_MS = 5_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
@@ -561,6 +570,7 @@ export class MeshStore {
   readonly #lockTimeoutMs: number;
   readonly #staleLockMs: number;
   readonly #readCacheMs: number;
+  readonly #readActive: (() => boolean) | undefined;
   /**
    * Line ends (sequence, offset) that recent read({ after }) scans passed, by rising sequence. A
    * read starts at the last one at or below its cursor. One remembered point was not enough:
@@ -615,6 +625,7 @@ export class MeshStore {
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
     this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
+    this.#readActive = options.readActive;
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   }
 
@@ -624,7 +635,12 @@ export class MeshStore {
 
   /** The reuse window of reads (MeshStoreOptions.readCacheMs), for readers of files beside the state. */
   get readCacheMs(): number {
-    return this.#readCacheMs;
+    return this.#readActive?.() ? 0 : this.#readCacheMs;
+  }
+
+  /** Time until an idle observer may revalidate; hits do not slide this deadline. */
+  get readCacheRemainingMs(): number {
+    return this.#stateCache ? Math.max(0, this.readCacheMs - (Date.now() - this.#stateCache.parsedAt)) : 0;
   }
 
   async publish(input: {
@@ -1120,7 +1136,12 @@ export class MeshStore {
   // decides a protocol step rather than a listing.
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
-    const entries = this.#readStateForRead(options).entries;
+    const state = options.strict === true
+      ? this.#readStateForRead(options)
+      : options.fresh === true || options.snapshot === undefined
+      ? this.#readCachedState(options.fresh === true)
+      : options.snapshot as MeshStateFile;
+    const entries = state.entries;
     return Object.hasOwn(entries, key) ? jsonClone(entries[key]) : undefined;
   }
 
@@ -1186,7 +1207,8 @@ export class MeshStore {
   #signalledState(prefix: string): MeshStateFile | undefined {
     const cached = this.#stateCache;
     const namespace = keyNamespace(prefix);
-    if (!cached || !namespace || this.#readCacheMs <= 0 || Date.now() - cached.parsedAt < this.#readCacheMs) return undefined;
+    const readCacheMs = this.readCacheMs;
+    if (!cached || !namespace || readCacheMs <= 0 || Date.now() - cached.parsedAt < readCacheMs) return undefined;
     const before = statStamp(this.#statePath);
     if (!before) return undefined;
     // The canonical header decides, not the stat (which can repeat): an unchanged generation is
@@ -1277,7 +1299,7 @@ export class MeshStore {
   // The commit's new readGeneration is serialized FIRST and atomically with the payload (the
   // previous one is dropped from the copy), so the canonical header alone identifies the commit
   // whether or not the optional signal is published afterwards. The stamped copy is cached.
-  #commitState(state: MeshStateFile, reuse?: Map<string, EncodedStateEntry>): void {
+  #commitState(state: MeshStateFile, reuse?: Map<string, EncodedStateEntry>, keys: string[] = [], caller?: string[]): void {
     const payload: MeshStateFile = { ...state };
     delete payload.readGeneration;
     const generation = randomUUID();
@@ -1291,6 +1313,13 @@ export class MeshStore {
     if (stamp !== undefined) this.#writeSignal(encoded.entries, stamp, generation);
     if (stamp === undefined || !this.#cacheState(stamped, stamp)) this.#stateCache = undefined;
     this.#writeEncodings = { serialized: encoded.serialized.toString("utf8"), entries: encoded.entries };
+    const trace = process.env.PI_FABRIC_COMMIT_TRACE;
+    if (trace) {
+      try {
+        fs.appendFileSync(trace, JSON.stringify({ at: Date.now(), pid: process.pid, statePath: this.#statePath,
+          generation, bytes: encoded.serialized.byteLength, keys: [...new Set(keys)], caller }) + "\n");
+      } catch { /* Diagnostics must never fail a durable commit. */ }
+    }
   }
 
   // Best effort, after a commit: a failure leaves an older signal whose generation no longer
@@ -1328,6 +1357,7 @@ export class MeshStore {
     ifVersion?: number;
   }): Promise<MeshStateEntry> {
     const { key, value, identity, ifVersion } = input;
+    const caller = commitTraceCaller();
     this.#validateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
     return this.#withLock(() => {
@@ -1352,7 +1382,7 @@ export class MeshStore {
       state.highWater = plan.highWater;
       state.tombstoneOrder = (state.tombstoneOrder ?? []).filter((key) => key !== plan.key);
       compactStateTombstones(state, this.#maxStateTombstones);
-      this.#commitState(state, reuse);
+      this.#commitState(state, reuse, [plan.key], caller);
       return jsonClone(entry);
     });
   }
@@ -1382,6 +1412,7 @@ export class MeshStore {
     ifVersion?: number;
   }): Promise<{ deleted: boolean; version?: number }> {
     const { key, ifVersion } = input;
+    const caller = commitTraceCaller();
     this.#validateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
     return this.#withLock(() => {
@@ -1408,7 +1439,7 @@ export class MeshStore {
         plan.key,
       ];
       compactStateTombstones(state, this.#maxStateTombstones);
-      this.#commitState(state, reuse);
+      this.#commitState(state, reuse, [plan.key], caller);
       return { deleted: true, version: plan.version };
     });
   }
@@ -1429,6 +1460,7 @@ export class MeshStore {
     prepare?: (view: MeshBatchView) => MeshBatchOperation[];
     afterCommit?: (view: MeshBatchView) => void;
   }): Promise<MeshBatchResult[]> {
+    const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit) return [];
     return this.#withLock(() => {
@@ -1503,7 +1535,7 @@ export class MeshStore {
       } else {
         state.tombstoneOrder = [...tombstones];
         compactStateTombstones(state, this.#maxStateTombstones);
-        this.#commitState(state, reuse);
+        this.#commitState(state, reuse, results.filter(result => result.applied).map(result => result.key), caller);
       }
       input.afterCommit?.(view);
       return results;
@@ -1561,7 +1593,8 @@ export class MeshStore {
 
   #readCachedState(fresh = false, canonical = fresh): MeshStateFile {
     const recent = this.#stateCache;
-    if (!fresh && recent && this.#readCacheMs > 0 && Date.now() - recent.parsedAt < this.#readCacheMs) {
+    const readCacheMs = this.readCacheMs;
+    if (!fresh && recent && readCacheMs > 0 && Date.now() - recent.parsedAt < readCacheMs) {
       return recent.state;
     }
     let before: string;

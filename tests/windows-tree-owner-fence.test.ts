@@ -15,6 +15,16 @@ vi.mock("node:child_process", async importOriginal => {
 });
 
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+
+async function joinTreeStopEntry(killer: EventEmitter): Promise<void> {
+  // Public stop first joins a possible relaunch. Flush that join without
+  // advancing the helper deadline, then prove event listeners are installed.
+  await vi.advanceTimersByTimeAsync(0);
+  expect(spawn).toHaveBeenCalledTimes(2);
+  expect(vi.mocked(spawn).mock.calls[1]?.[0]).toBe("taskkill");
+  expect(killer.listenerCount("error")).toBe(1);
+  expect(killer.listenerCount("close")).toBe(1);
+}
 afterEach(() => {
   Object.defineProperty(process, "platform", platform);
   vi.useRealTimers(); vi.restoreAllMocks(); vi.clearAllMocks();
@@ -264,6 +274,8 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
         return schedule(callback, delay, ...args);
       });
       stopping = manager.stop(handle.id);
+      await joinTreeStopEntry(killer);
+      expect(helperTimeout, "the pending helper must own its timeout before worker exit").toBeTypeOf("function");
       exited = true; worker.emit("exit", 0); worker.emit("close", 0);
       let reported = false;
       waiting = manager.wait(handle.id).then(() => { reported = true; });
@@ -347,6 +359,7 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
         let stopped = false;
         if (outcome === "resume-error") fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ ...record, status: "stopped", finishedAt: Date.now() }));
         const stopping = (outcome === "resume-error" ? manager.wait(handle.id) : manager.stop(handle.id)).then(() => { stopped = true; });
+        if (outcome !== "resume-error" && outcome !== "spawn-throw") await joinTreeStopEntry(killer);
         if (outcome === "resume-error") {
           // The automatic resume path also invokes stop. Its bounded return is
           // not exit proof: an uncertain prior tree must never launch a replacement.

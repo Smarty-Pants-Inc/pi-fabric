@@ -96,7 +96,7 @@ const syncCompletionFile = (file: string, value: unknown): void => {
     syncPathNamespace(file, stat);
   } finally { fs.closeSync(fd); }
 };
-const readReceipt = (file: string, id?: string): CompletionReceipt | undefined => {
+const readReceiptRecord = (file: string, id?: string): CompletionReceipt | undefined => {
   const value = readReplayFence<CompletionReceipt>(file);
   if (value === undefined) return undefined;
   if (!value || typeof value.id !== "string" || (id !== undefined && value.id !== id) ||
@@ -104,7 +104,11 @@ const readReceipt = (file: string, id?: string): CompletionReceipt | undefined =
     typeof value.consumedAt !== "number" || !Number.isFinite(value.consumedAt) || value.consumedAt <= 0) {
     throw new Error(`Completion replay fence is invalid at ${file}; retain the outcome for repair`);
   }
-  syncCompletionFile(file, value);
+  return value;
+};
+const readReceipt = (file: string, id?: string): CompletionReceipt | undefined => {
+  const value = readReceiptRecord(file, id);
+  if (value !== undefined) syncCompletionFile(file, value);
   return value;
 };
 export const completionConsumed = (meshRoot: string, id: string): boolean =>
@@ -207,11 +211,20 @@ export const legacyCompletionConsumed = (meshRoot: string, rootId: string, id: s
   }
   return metadata.completionConsumedAt !== undefined;
 };
-export const pendingCompletions = (meshRoot: string, projectRoot: string): CompletionEnvelope[] => {
+export const pendingCompletions = (meshRoot: string, projectRoot: string): CompletionEnvelope[] =>
+  pendingCompletionsExcept(meshRoot, projectRoot);
+const pendingCompletionsExcept = (meshRoot: string, projectRoot: string, consumed?: ReadonlySet<string>): CompletionEnvelope[] => {
   promoteOrphans(meshRoot, projectRoot);
   return files(directory(meshRoot)).flatMap(file => {
-    // Completed payloads can be large. Read only their small receipt during idle scans.
-    if (readReceipt(path.join(directory(meshRoot), "receipts", file))) return [];
+    // Already consumed by this journal: suppress replay without using a
+    // cached receipt as durability authority for claim retirement or storage.
+    if (consumed?.has(file)) return [];
+    // Candidate scans only suppress delivery; a visible valid receipt is enough
+    // to leave its source alone. They do not consume a body or retire a claim.
+    // Those authority paths independently reconfirm file AND namespace barriers.
+    // Avoid O(n²) fsyncs of old receipts on every idle journal drain.
+    const receipt = path.join(directory(meshRoot), "receipts", file);
+    if (consumed ? readReceiptRecord(receipt) : readReceipt(receipt)) return [];
     const value = read<CompletionEnvelope>(path.join(directory(meshRoot), file));
     if (value?.format !== 1 || !value.recipient || !value.result ||
       typeof value.recipient.rootId !== "string" || typeof value.recipient.sessionId !== "string" ||
@@ -233,6 +246,13 @@ export const pendingCompletionResult = (envelope: CompletionEnvelope): AgentRunR
 
 export class CompletionJournal {
   readonly #enqueued = new Set<string>();
+  // A monotonic local suppression fence, not a cached durability confirmation.
+  // Destructive claim retirement continues to reopen/sync its exact receipt.
+  readonly #consumed = new Set<string>();
+  #rememberConsumed(id: string): void {
+    this.#consumed.add(`${key(id)}.json`);
+    if (this.#consumed.size > 1024) this.#consumed.delete(this.#consumed.values().next().value!);
+  }
   constructor(readonly meshRoot: string, readonly recipientSource: CompletionRecipient | (() => CompletionRecipient),
     readonly participants: FabricParticipantSource, readonly mesh: MeshStore,
     readonly enqueue: (result: AgentRunResult, delivered: () => void) => void) {}
@@ -257,12 +277,13 @@ export class CompletionJournal {
     const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id);
     if (envelope && !this.#canRead(envelope)) return;
     consumeCompletion(this.meshRoot, id, this.recipient.sessionId);
+    this.#rememberConsumed(id);
     fs.rmSync(envelopePath(this.meshRoot, id), { force: true });
     fs.rmSync(candidatePath(this.meshRoot, id), { force: true });
     this.#enqueued.delete(id);
     void this.#retireClaim(id).catch(() => undefined); // A crash/failure is reconciled by drain.
   }
-  pending(): CompletionEnvelope[] { return pendingCompletions(this.meshRoot, this.recipient.projectRoot); }
+  pending(): CompletionEnvelope[] { return pendingCompletionsExcept(this.meshRoot, this.recipient.projectRoot, this.#consumed); }
   result(id: string): AgentRunResult | CompletionSummary | undefined {
     const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id);
     if (!envelope) return undefined;
@@ -283,6 +304,7 @@ export class CompletionJournal {
     // failed/delayed journal publication. Observer status/wait cannot forge an early receipt.
     if (envelope ? !this.#canRead(envelope) : !localRunSettled) return false;
     consumeCompletion(this.meshRoot, id, this.recipient.sessionId);
+    this.#rememberConsumed(id);
     this.#enqueued.delete(id);
     void this.#retireClaim(id).catch(() => undefined);
     return true;
@@ -322,6 +344,7 @@ export class CompletionJournal {
         } : {}) }, () => {
           try {
             consumeCompletion(this.meshRoot, envelope.result.id, this.recipient.sessionId);
+            this.#rememberConsumed(envelope.result.id);
             void this.#retireClaim(envelope.result.id).catch(() => undefined);
           } finally { this.#enqueued.delete(envelope.result.id); }
         });

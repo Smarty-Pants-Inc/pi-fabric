@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { ChildCompletionClaimLostError } from "../result-consumption.js";
 import { syncPathNamespace } from "../core/atomic-write.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRunResult } from "./types.js";
@@ -265,7 +266,13 @@ export class AgentCompletionInbox {
         ].join("\n\n");
         try {
           this.commitBatch?.(group.map(({ result }) => result.id));
-        } catch { this.#schedule(); return; }
+        } catch (error) {
+          if (error instanceof ChildCompletionClaimLostError) {
+            // Another owner won. Suppress only losing notices, never its archive/receipt.
+            for (const id of error.ids) { this.#pending.delete(id); this.#acknowledged.add(id); }
+          }
+          this.#schedule(); return;
+        }
         const claimed = !!this.commitBatch || group.some(({ prepare }) => !!prepare);
         let sent = false;
         try {

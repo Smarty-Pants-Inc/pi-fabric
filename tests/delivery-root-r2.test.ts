@@ -143,6 +143,13 @@ describe("Security R2 S2 terminal lineage versus runtime disposal", () => {
     await state.bootstrap(context); await state.ensure(context);
     const actor = await state.actors.create({ name: "session-orphan", instructions: "Keep original lineage.", residency: "session" });
     const pid = process.pid, session = context.sessionManager.getSessionId();
+    // Seed after the old runtime's startup sweep; only the replacement may prune.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const expiredRun = path.join(config.actorRoot, actor.id, "runs", "expired-before-reload");
+    fs.mkdirSync(expiredRun, { recursive: true });
+    fs.writeFileSync(path.join(expiredRun, "status.json"), JSON.stringify({ status: "completed",
+      transport: "process", sessionId: "2147483646", finishedAt: 1 }));
     registerFabricCommand(pi, { state, capturedTools, fabricUi: { stop: vi.fn() } as unknown as FabricUiController, applyFabricMode: vi.fn(), suspendToolCapture: vi.fn() });
     const registry = path.join(config.actorRoot, "actors.json");
     const entered = deferred(), release = deferred();
@@ -172,6 +179,7 @@ describe("Security R2 S2 terminal lineage versus runtime disposal", () => {
       next.listOwned(); await new Promise(r => setTimeout(r, 100));
       expect(next.owns(actor.id)).toBe(false); expect(next.status(actor.id).rootId).toBe(original);
       expect(fs.readFileSync(registry, "utf8")).toBe(before);
+      expect(fs.existsSync(expiredRun)).toBe(true);
       expect(mesh.get(key("topology/lineage-closures/"), { fresh: true })).toBeUndefined();
     } finally { release.resolve(); await pending; }
     if (fail) expect(await pending).toBeInstanceOf(Error);
@@ -179,11 +187,29 @@ describe("Security R2 S2 terminal lineage versus runtime disposal", () => {
     // Replacement may already have admitted the first envelope to the SAME
     // Main's durable journal. That is not mailbox loss or cross-root delivery.
     const followups = path.join(mesh.root, "main-followups");
-    const journal = fs.existsSync(followups) ? fs.readdirSync(followups).map(file => fs.readFileSync(path.join(followups, file), "utf8")).join("\n") : "";
+    const journalFile = path.join(followups, `${encodeURIComponent(session)}.json`);
+    const readJournal = () => fs.existsSync(journalFile) ? fs.readFileSync(journalFile, "utf8") : "";
     const retained = mesh.listAll(residentDeliveryPrefix(original), { fresh: true }).some(e => (e.value as { id: string }).id === firstId);
-    expect(retained || journal.includes(firstId)).toBe(true);
+    expect(retained || readJournal().includes(firstId)).toBe(true);
     send(host, "after-replacement");
-    await vi.waitFor(() => expect(mesh.listAll(residentDeliveryPrefix(original), { fresh: true }).some(e => (e.value as { message: string }).message === "after-replacement")).toBe(true));
+    // Windows can admit/delete an envelope between observer polls. Yield past
+    // the drainer's cache window and check same-root durable custody, not a
+    // transient mailbox snapshot (successful publication must permit delivery).
+    if (!fail) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      await new Promise(resolve => setTimeout(resolve, 2_200));
+    }
+    await vi.waitFor(() => {
+      const retained = mesh.listAll(residentDeliveryPrefix(original), { fresh: true })
+        .some(e => (e.value as { message: string }).message === "after-replacement");
+      const journal = readJournal();
+      const admitted = journal ? (JSON.parse(journal) as { items: { message: string; deliveryId?: string }[] }).items
+        .some(item => item.message === "after-replacement" && item.deliveryId?.startsWith(`resident:${original}:`)) : false;
+      expect(retained || admitted).toBe(true);
+      if (!fail) expect(admitted).toBe(true); // Exercise the previously missed destination.
+    });
+    if (!fail) await vi.waitFor(() => expect(fs.existsSync(expiredRun)).toBe(false));
+    else expect(fs.existsSync(expiredRun)).toBe(true);
     expect(mesh.listAll(residentDeliveryPrefix(successor), { fresh: true })).toHaveLength(0);
     expect(host.participants.lineageAlive(original)).toBe(true);
     expect(mesh.get(key("topology/lineage-closures/"), { fresh: true })).toBeUndefined();

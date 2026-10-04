@@ -53,6 +53,58 @@ describe("AgentManager close storage", () => {
     expect(fs.existsSync(root)).toBe(false);
   });
 
+  it.each(["EBUSY", "EPERM"])("retries transient %s when removing an owned empty root", async (code) => {
+    const { manager, root } = setup(false);
+    const rmdir = fs.rmdirSync;
+    let attempts = 0;
+    vi.spyOn(fs, "rmdirSync").mockImplementation((directory) => {
+      if (directory === root && attempts++ === 0) {
+        expect(fs.readdirSync(root)).toEqual([]);
+        throw Object.assign(new Error("Windows directory handle is still closing"), { code });
+      }
+      return rmdir(directory);
+    });
+    await manager.close();
+    expect(attempts).toBe(2);
+    expect(fs.existsSync(root)).toBe(false);
+  });
+
+  it("bounds retries for a persistently busy owned empty root", async () => {
+    const { manager, root } = setup(false);
+    const rmdir = fs.rmdirSync;
+    let attempts = 0;
+    vi.spyOn(fs, "rmdirSync").mockImplementation((directory) => {
+      if (directory === root) {
+        attempts++;
+        throw Object.assign(new Error("directory remains busy"), { code: "EBUSY" });
+      }
+      return rmdir(directory);
+    });
+    const started = Date.now();
+    await manager.close();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(2_000);
+    expect(attempts).toBeGreaterThan(1);
+    expect(attempts).toBeLessThanOrEqual(42);
+    expect(fs.existsSync(root)).toBe(true);
+    expect(fs.readdirSync(root)).toEqual([]);
+  });
+
+  it("preserves unknown contents appearing during an empty-root retry", async () => {
+    const { manager, root } = setup(false);
+    const rmdir = fs.rmdirSync;
+    let attempts = 0;
+    vi.spyOn(fs, "rmdirSync").mockImplementation((directory) => {
+      if (directory === root && attempts++ === 0) {
+        fs.writeFileSync(path.join(root, "unrelated"), "not an agent artifact");
+        throw Object.assign(new Error("directory handle is still closing"), { code: "EBUSY" });
+      }
+      return rmdir(directory);
+    });
+    await manager.close();
+    expect(attempts).toBe(2);
+    expect(fs.readFileSync(path.join(root, "unrelated"), "utf8")).toBe("not an agent artifact");
+  });
+
   it("retains closed managed run artifacts by default", async () => {
     const { manager, root } = setup(true);
     await manager.run({ task: "hello", runner: "pi", extensions: false });

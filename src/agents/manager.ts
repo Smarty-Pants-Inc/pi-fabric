@@ -2483,7 +2483,21 @@ export class AgentManager {
             if (this.#managedTempRoot && fs.readdirSync(this.#runRoot).every((name) => name === ".fabric-owner.json")) {
               fs.unlinkSync(path.join(this.#runRoot, ".fabric-owner.json"));
             }
-            fs.rmdirSync(this.#runRoot); // Never recursively remove an untracked directory.
+            // Windows can keep an exited worker's directory handle briefly after
+            // its run files are gone. Retry only the owned empty root, not tree
+            // deletion: rmdir still protects any newly appearing unknown contents.
+            const removeDeadline = Date.now() + 2_000;
+            for (;;) {
+              try {
+                fs.rmdirSync(this.#runRoot); // Never recursively remove an untracked directory.
+                break;
+              } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code;
+                const remaining = removeDeadline - Date.now();
+                if (!this.#managedTempRoot || (code !== "EBUSY" && code !== "EPERM") || remaining <= 0) throw error;
+                await delay(Math.min(50, remaining));
+              }
+            }
           } catch { /* nonempty, missing, or unsafe roots are retained */ }
         }
       } else if (this.#managedTempRoot) {

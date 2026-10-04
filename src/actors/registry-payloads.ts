@@ -4,7 +4,6 @@ import path from "node:path";
 import { syncPathNamespace, writeFileAtomic } from "../core/atomic-write.js";
 
 const HISTORY_LIMIT = 100;
-const INLINE_INSTRUCTIONS_BYTES = 1_024;
 
 export interface ActorMessageHistory {
   version: 1;
@@ -30,11 +29,75 @@ const history = (value: unknown): ActorMessageHistory | undefined => {
 
 /** Append-only history transactions. The atomic registry selects a committed head;
  * failed/unpublished appends are harmless archives, never a predecessor of a later
- * commit. Instructions are immutable, content-addressed files. Payload barriers
- * precede the registry rename, including the first migration from inline records. */
+ * commit. Instructions stay inline for mixed-release readers. A durable per-actor
+ * checkpoint preserves accepted heads when an old owned-row serializer drops
+ * unknown fields. Payload barriers precede the registry rename. */
 export class ActorRegistryPayloads {
   readonly #rings = new Map<string, { head: string; messages: unknown[] }>();
-  readonly #instructions = new Map<string, { file: string; text: string }>();
+
+  savedHead(id: string): ActorMessageHistory | undefined {
+    try { return history(JSON.parse(fs.readFileSync(path.join(this.directory(id), "messages-head.json"), "utf8"))); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  /** Missing registry references never select an arbitrary (possibly orphan) tail. */
+  count(row: Row): number {
+    const ref = history(row.messageHistory);
+    if (ref) return ref.count;
+    if (typeof row.id === "string" && this.savedHead(row.id)) return this.messages(row).length;
+    return Math.min(HISTORY_LIMIT, Array.isArray(row.messages) ? row.messages.length : 0);
+  }
+
+  mergeLegacy(before: unknown[], inline: unknown): unknown[] {
+    if (!Array.isArray(inline) || inline.length === 0) return before;
+    const identity = (message: unknown): string => {
+      if (typeof message === "object" && message !== null && "id" in message) {
+        const row = message as Row;
+        return JSON.stringify([row.id, row.direction]);
+      }
+      return JSON.stringify(message);
+    };
+    const known = new Set(before.map(identity));
+    return [...before, ...inline.filter(message => {
+      const key = identity(message);
+      if (known.has(key)) return false;
+      known.add(key);
+      return true;
+    })].slice(-HISTORY_LIMIT);
+  }
+
+  /** Complete before acknowledging the registry commit, under its shared lock.
+   * Explicit registry heads still win, including during an interrupted publish.
+   * Failed publishes restore checkpoints as well as the registry. */
+  publishHeads(rows: readonly Row[]): void {
+    const updates: Array<{ file: string; previous: string | undefined; next: string }> = [];
+    for (const row of rows) {
+      const ref = history(row.messageHistory);
+      if (!ref || typeof row.id !== "string") continue;
+      const file = path.join(this.directory(row.id), "messages-head.json");
+      let previous: string | undefined;
+      try { previous = fs.readFileSync(file, "utf8"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      const next = JSON.stringify(ref);
+      if (previous !== next) updates.push({ file, previous, next });
+    }
+    const attempted: typeof updates = [];
+    try {
+      for (const update of updates) {
+        attempted.push(update);
+        writeFileAtomic(update.file, update.next, { durable: true });
+      }
+    } catch (error) {
+      for (const update of attempted.reverse()) {
+        if (update.previous !== undefined) writeFileAtomic(update.file, update.previous, { durable: true });
+        else { fs.rmSync(update.file, { force: true }); syncPathNamespace(path.dirname(update.file)); }
+      }
+      throw error;
+    }
+  }
 
   constructor(readonly actorRoot: string) {}
 
@@ -55,8 +118,10 @@ export class ActorRegistryPayloads {
   }
 
   messages(row: Row, limit = HISTORY_LIMIT): unknown[] {
-    const ref = history(row.messageHistory);
+    const explicit = history(row.messageHistory);
+    const ref = explicit ?? (typeof row.id === "string" ? this.savedHead(row.id) : undefined);
     if (!ref) return Array.isArray(row.messages) ? row.messages.slice(-limit) : [];
+    if (!explicit) return this.mergeLegacy(this.messages({ id: row.id, messageHistory: ref }), row.messages).slice(-limit);
     if (typeof row.id !== "string") throw new Error("Invalid actor message identity");
     const key = JSON.stringify(ref);
     const cached = this.#rings.get(row.id);
@@ -117,29 +182,15 @@ export class ActorRegistryPayloads {
     const id = row.id;
     const compact = { ...row };
     delete compact.registryMessageAppend;
-    if (typeof row.instructions === "string" && row.instructionsFile === undefined &&
-        Buffer.byteLength(row.instructions, "utf8") > INLINE_INSTRUCTIONS_BYTES) {
-      const hash = createHash("sha256").update(row.instructions).digest("hex");
-      const file = path.join(this.directory(id), `instructions-${hash}.txt`);
-      const cached = this.#instructions.get(id);
-      if (cached?.file !== file || cached.text !== row.instructions) {
-        if (!fs.existsSync(file)) writeFileAtomic(file, row.instructions, { durable: true });
-        else {
-          if (fs.readFileSync(file, "utf8") !== row.instructions) throw new Error("Corrupt actor instructions payload");
-          // A previous barrier may have failed after rename. Existence is not a
-          // durability receipt; retry the file and namespace before publishing it.
-          const fd = fs.openSync(file, "r");
-          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-          syncPathNamespace(file);
-        }
-        this.#instructions.set(id, { file, text: row.instructions });
-      }
-      compact.instructionsFile = hash;
-      compact.instructions = "[External actor instructions: upgrade pi-fabric or run scripts/actor-registry-downgrade.ts before executing this actor.]";
-    }
+    delete compact.registryMessageReset;
+    // Read the previous PR layout once, but never publish an instructions stub.
+    if (row.instructionsFile !== undefined) compact.instructions = this.instructions(row);
+    delete compact.instructionsFile;
     let ref = history(row.messageHistory);
     if (!ref) {
-      ref = history(previous?.messageHistory);
+      const saved = this.savedHead(id);
+      const legacyRewrite = row.registryMessageReset !== true && previous?.messageHistory === undefined && saved !== undefined;
+      ref = history(previous?.messageHistory) ?? saved;
       // Archive ALL legacy messages, not only the manager's in-memory last 100.
       const pending = Array.isArray(row.registryMessageAppend) ? row.registryMessageAppend : [];
       const legacy = Array.isArray(previous?.messages) ? previous.messages :
@@ -148,9 +199,11 @@ export class ActorRegistryPayloads {
       // The manager retains unsaved additions separately from its bounded ring:
       // even a synchronous burst larger than 100 must archive every addition.
       if (pending.length) ref = this.#append(id, pending, ref);
+      if (row.registryMessageReset === true) ref = this.#append(id, [], ref, true);
       if (Array.isArray(row.messages)) {
-        const messages = row.messages.slice(-HISTORY_LIMIT);
         const before = ref ? this.messages({ id, messageHistory: ref }) : [];
+        // Missing references are a legacy save, NOT a request to clear history.
+        const messages = legacyRewrite ? this.mergeLegacy(before, row.messages) : row.messages.slice(-HISTORY_LIMIT);
         const encoded = messages.map((message) => JSON.stringify(message));
         const old = before.map((message) => JSON.stringify(message));
         if (JSON.stringify(encoded) !== JSON.stringify(old)) {

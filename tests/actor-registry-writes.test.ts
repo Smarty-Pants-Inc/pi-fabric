@@ -36,6 +36,21 @@ function setup(records: Record<string, unknown>[] = [], actorQueueLimit = DEFAUL
 }
 
 describe("actor registry lazy/status writes (#3752, #4383)", () => {
+  it("honors an explicit clear after a legacy save strips the history reference", async () => {
+    const id = "a".repeat(32), messages = [{ id: "m", source: "direct", createdAt: 1, direction: "in", text: "keep until clear" }];
+    const f = setup([{ id, name: "mixed-clear", rootId: "session:test", instructions: "Review.", messages, createdAt: 1, status: "idle" }]);
+    const record = f.store.records()[0]!;
+    delete record.messageHistory;
+    fs.writeFileSync(path.join(f.actorRoot, "actors.json"), JSON.stringify({ actors: [record] }));
+    expect(f.manager.messages(id, 100)).toEqual(messages);
+    await f.manager.clearMessages(id);
+    expect(f.manager.messages(id, 100)).toEqual([]);
+    expect(f.store.messages(f.store.records()[0]!)).toEqual([]);
+    await f.manager.close();
+    expect(new ActorRegistryStore(f.actorRoot).messages(f.store.records()[0]!)).toEqual([]);
+  });
+
+
   it("loads histories only for their first consumer, not list/status/config saves/close", async () => {
     const id = "b".repeat(32), messages = Array.from({ length: 100 }, (_, i) => ({ id: `m-${i}`, source: "direct", createdAt: i, direction: "in", text: "x".repeat(1_100) }));
     const read = vi.spyOn(ActorRegistryStore.prototype, "messages");

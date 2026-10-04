@@ -2,10 +2,9 @@
 
 `actors/<root>/actors.json` remains a format-1 metadata registry. Direct readers
 (residency, retention and ownership fences) still see current ids, custody,
-configuration and status. It no longer embeds growing message histories. Short
-instructions (at most 1 KiB) remain inline; longer instructions are immutable
-`<actor-id>/registry/instructions-<sha256>.txt` files. The metadata contains an
-`instructionsFile` digest and a small string compatibility stub.
+configuration and status. **Instructions always remain inline**, including large
+instructions. Only growing message histories move out. Each row retains an empty
+inline `messages` array so old loaders can accept and save it safely.
 
 ## History and crash safety
 
@@ -13,21 +12,31 @@ instructions (at most 1 KiB) remain inline; longer instructions are immutable
 new messages and a backwards reference to its accepted predecessor. The
 registry's `messageHistory` selects an exact byte range and records the active
 count (at most 100). Only the last 100 are loaded, at first history use. Listing,
-status, registry saves, idle reloads and foreign-row merges do not read history.
-Older messages stay archived in the same JSONL file. A reset starts a new active
-history without deleting its earlier archive. Existing actor/root retention and
-removal delete these files together with the actor directory; this change adds
-no periodic archive rewrite or new retention job.
+status, registry saves, idle reloads and foreign-row merges do not read history
+on the normal new-release layout. Older messages stay archived in the same JSONL
+file. A reset starts a new active history without deleting its earlier archive.
+Existing actor/root retention and removal delete these files together with the
+actor directory; this change adds no periodic archive rewrite or retention job.
 
-An append or instruction file is synced, including namespace barriers, before
-publishing its reference. New payload heads, custody and removal decisions are
-committed immediately with the existing durable atomic registry rename and
-rollback protocol. A failed/unpublished append may leave archived bytes, but
-later commits link to the previous accepted head, never the abandoned tail. A
-leading newline isolates a torn tail; history readers select exact committed
-ranges rather than parsing the whole growing log. Invalid/truncated history is
-an error, not an empty guessed history to save back. No path in a stored reference
-is trusted: paths are derived from the actor id and instruction digest.
+An append is synced, including namespace barriers, before publishing its
+reference. New payload heads, custody and removal decisions are committed
+immediately with the existing durable atomic registry rename and rollback
+protocol. Before acknowledging a save, the writer also durably checkpoints each
+changed accepted head to `<actor-id>/registry/messages-head.json`, under the same
+registry lock. This small checkpoint is independent of unknown registry fields:
+it survives a legacy owned-row save that removes `messageHistory`. Unchanged
+checkpoints are not rewritten. A checkpoint failure rolls back changed
+checkpoints and the registry; later commits never select an abandoned append.
+
+Explicit registry references take precedence over checkpoints, so interrupted
+publication remains readable by new releases. If a process dies between the
+registry rename and completion of checkpoint publication, an old release may
+obscure that **unacknowledged** head; the previously checkpointed, acknowledged
+history remains recoverable. Checkpoint completion is part of acknowledgment,
+not background work. A leading newline isolates a torn append; readers select
+exact committed ranges rather than parsing the whole growing log. Invalid or
+truncated history/checkpoints are errors, not empty guessed histories to save
+back. Paths are derived from actor ids, never from a stored path.
 
 Only rebuildable status/time changes are coalesced in a five-second window.
 Creation, stop/start, messages, instructions/configuration, adoption, removals
@@ -36,29 +45,39 @@ the registry lock using fresh ownership and foreign rows. Shutdown cancels the
 timer, joins a save already running, then flushes the latest owned state. Presence
 publication remains immediate; this window is not an authority/lease cache.
 
-## Migration and downgrade
+## Migration, mixed releases and downgrade
 
 Inline format-1 registries still load. The first save archives **all** embedded
 legacy messages, even when more than 100 exist, before replacing the registry
-with metadata. Instructions move only when larger than 1 KiB. Foreign inline
-rows migrate without losing unknown fields. Migration/new references require
-both payload and registry durability barriers.
+with metadata. Foreign inline rows migrate without losing unknown fields.
+Instruction sidecars from the initial PR layout are supported for reading and
+hydrated back inline on the next save; no new instruction sidecars are created.
 
 Release `6b15d905` accepts format 1, a string `instructions` and an array
-`messages`; it ignores the new reference fields. The string/empty-array stubs
-prevent a read-time crash, but **do not provide transparent downgrade behavior**:
-it sees no retained messages and, for large instructions, only an upgrade warning.
-Its next owned-row save would drop references. Do not run an old release on the
-new layout without restoring inline records first:
+`messages`. Its store preserves unknown fields when directly saving raw records,
+but its manager constructs owned rows from known fields only, dropping new
+references. Therefore a stub-only layout was unsafe for mixed-release saves.
+The current layout needs **no restore helper for preservation during rollout**:
+old releases retain the original inline instructions, and their empty messages
+save cannot delete the history file or its independent checkpoint. The new reader
+recovers the accepted checkpoint when `messageHistory` is absent and merges old
+inline additions by message id and direction, retaining the normal last-100 ring.
+A missing reference or empty legacy stub is never interpreted as a history reset.
+New-release `clearMessages` carries an explicit reset intent, including across
+registry reloads. An old release cannot clear externalized history by saving `[]`.
+
+Old releases do not themselves display externalized history. To give a fully
+downgraded owner the last 100 messages inline, the optional helper remains:
 
 ```sh
-# Stop every writer for this root; use the new checkout before downgrading.
+# Stop every writer for this root before restoring the full inline view.
 bun scripts/actor-registry-downgrade.ts /absolute/path/to/actors/root
 ```
 
-The helper locks the registry, hydrates original instructions and the last 100
-active messages, removes reference fields, and durably atomically restores
-format 1. It fails without guessing if a referenced file is missing/corrupt.
-Sidecar archives remain, including legacy entries beyond the old loader's
-100-message ring. Re-upgrading migrates the inline records again. No old release
-is expected to understand archived history outside its existing ring semantics.
+The helper locks the registry, hydrates instructions and the last 100 active
+messages, removes reference fields, and durably atomically restores format 1.
+It fails without guessing if a referenced file is missing/corrupt. Sidecar
+archives and checkpoints remain, including legacy entries beyond the old
+loader's 100-message ring. Re-upgrading merges the inline ring back without
+truncating the archive. No old release is expected to understand archived history
+outside its existing ring semantics.

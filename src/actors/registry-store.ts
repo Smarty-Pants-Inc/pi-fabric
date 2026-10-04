@@ -67,7 +67,7 @@ export class ActorRegistryStore {
     }
   }
 
-  /** Payloads are read only by an operational instruction/history consumer. */
+  /** Instructions remain inline; prior PR sidecars are accepted for migration. */
   instructions(record: Record<string, unknown>): unknown {
     return this.#payloads.instructions(record);
   }
@@ -76,8 +76,12 @@ export class ActorRegistryStore {
     return this.#payloads.messages(record, limit);
   }
 
-  /** Stop all writers first. Restore format-1 inline payloads before an old release
-   * takes ownership; its loader cannot follow sidecar references. Archives remain. */
+  messageCount(record: Record<string, unknown>): number {
+    return this.#payloads.count(record);
+  }
+
+  /** Optional full-ring downgrade view. Mixed-release saves are safe without it;
+   * old releases otherwise see an empty inline ring. Stop writers first. */
   async restoreInlineForDowngrade(): Promise<number> {
     return this.withLock(() => {
       const previous = fs.readFileSync(this.#registryPath, "utf8");
@@ -210,13 +214,9 @@ export class ActorRegistryStore {
         JSON.stringify(actor.messageHistory) !== JSON.stringify(before?.messageHistory);
     });
     const serialized = JSON.stringify({ format: 1, actors: metadata }, null, 2);
-    if (!durable) {
-      // Status/time without a custody or payload-head change are rebuildable soft metadata.
-      this.#writer.write(serialized);
-      return;
-    }
     try {
-      this.#writer.write(serialized, { durable: true });
+      this.#writer.write(serialized, { durable });
+      this.#payloads.publishHeads(metadata);
     } catch (error) {
       // The post-rename barrier may fail after replacement. Restore an accepted
       // earlier decision with its barriers; never acknowledge the failed commit.

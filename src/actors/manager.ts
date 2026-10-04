@@ -484,6 +484,7 @@ export class ActorManager {
   #savedActors: { owned: string; critical: string; fingerprint: string | undefined } | undefined;
   readonly #lazyMessages = new WeakMap<ManagedActor, Record<string, unknown>>();
   readonly #unarchivedMessages = new WeakMap<ManagedActor, FabricActorMessage[]>();
+  readonly #resetMessages = new WeakSet<ManagedActor>();
   #registrySaveTimer: NodeJS.Timeout | undefined;
   #registrySavePending: Promise<void> | undefined;
   #lastRegistrySaveAt = 0;
@@ -1099,6 +1100,7 @@ export class ActorManager {
   async clearMessages(id: string): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     actor.messages = [];
+    this.#resetMessages.add(actor);
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -3722,6 +3724,7 @@ export class ActorManager {
           ? { messageHistory: this.#lazyMessages.get(actor)!.messageHistory }
           : { messages: this.#lazyMessages.get(actor)!.messages ?? [] }
         : { messages: actor.messages }),
+      ...(this.#resetMessages.has(actor) ? { registryMessageReset: true } : {}),
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
@@ -3758,8 +3761,7 @@ export class ActorManager {
   #messageCount(actor: ManagedActor): number {
     const source = this.#lazyMessages.get(actor);
     if (!source) return actor.messages.length;
-    const ref = source.messageHistory as { count?: number } | undefined;
-    return Math.min(MESSAGE_HISTORY_LIMIT, ref?.count ?? (Array.isArray(source.messages) ? source.messages.length : 0));
+    return this.#registry.messageCount(source);
   }
 
   #criticalRegistryState(rows: Record<string, unknown>[]): string {
@@ -3821,7 +3823,10 @@ export class ActorManager {
       }))];
       this.#registry.write(actors, { durable: removedIds.size > 0 || options?.durable === true });
       this.#registryFingerprint = this.#registry.fingerprint();
-      for (const actor of owned) this.#unarchivedMessages.delete(actor);
+      for (const actor of owned) {
+        this.#unarchivedMessages.delete(actor);
+        this.#resetMessages.delete(actor);
+      }
       this.#lastRegistrySaveAt = Date.now();
       this.#savedActors = { owned: JSON.stringify(rows), critical: this.#criticalRegistryState(rows),
         fingerprint: this.#registryFingerprint };
@@ -4785,9 +4790,14 @@ export class ActorManager {
       live.latestActivationSequence = Math.max(live.latestActivationSequence, old.latestActivationSequence);
       // An unread history has no local additions to carry and must stay lazy.
       if (this.#lazyMessages.has(old)) continue;
-      const known = new Set(live.messages.map((message) => message.id));
-      for (const message of old.messages) {
-        if (!known.has(message.id)) this.#recordMessage(live, message);
+      if (this.#resetMessages.has(old)) {
+        live.messages = structuredClone(old.messages);
+        this.#resetMessages.add(live);
+      } else {
+        const known = new Set(live.messages.map((message) => message.id));
+        for (const message of old.messages) {
+          if (!known.has(message.id)) this.#recordMessage(live, message);
+        }
       }
       // Additions that already fell out of the ring still need archival after a
       // reload. Do not put them back in the active ring or reorder newer messages.

@@ -33,8 +33,8 @@ export class FabricDirectoryUnavailableError extends Error {
   override readonly name = "FabricDirectoryUnavailableError";
   readonly code = "FABRIC_DIRECTORY_UNAVAILABLE";
   readonly retryable = true;
-  constructor(reason: string) {
-    super(`Fabric directory unavailable (retry): ${reason}`);
+  constructor(reason: string, cause?: unknown) {
+    super(`Fabric directory unavailable (retry): ${reason}`, { cause });
   }
 }
 
@@ -132,7 +132,7 @@ export class AgentMessageRouter {
       return value;
     } catch (error) {
       if (error instanceof FabricDirectoryUnavailableError) throw error;
-      throw new FabricDirectoryUnavailableError(error instanceof Error ? error.message : String(error));
+      throw new FabricDirectoryUnavailableError(error instanceof Error ? error.message : String(error), error);
     }
   }
 
@@ -163,7 +163,7 @@ export class AgentMessageRouter {
       const unavailable = this.#directoryUnavailable();
       if (unavailable) throw new Error(unavailable);
     } catch (error) {
-      throw new FabricDirectoryUnavailableError(error instanceof Error ? error.message : String(error));
+      throw new FabricDirectoryUnavailableError(error instanceof Error ? error.message : String(error), error);
     }
   }
 
@@ -316,8 +316,8 @@ export class AgentMessageRouter {
     const provenLocal = this.isProcessOwnedTarget(id);
     const result = provenLocal
       ? await this.#route(id, message, data, kind, context, options, true)
-      : await this.#withDirectory(() =>
-        this.#withDurableRecovery(id, () => this.#route(id, message, data, kind, context, options)));
+      : await this.#withDurableRecovery(id, () =>
+        this.#withDirectory(() => this.#route(id, message, data, kind, context, options)));
     // smarty-dev#1826: an ack alone hid a Main whose held followUps no boundary would release.
     // Older owners never report `stalled`, so their results pass unchanged.
     if (kind === "followUp" && result?.stalled) {
@@ -339,9 +339,17 @@ export class AgentMessageRouter {
     for (;;) {
       try { return await operation(); }
       catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "FABRIC_MESH_LOCK_TIMEOUT") ||
+        const lockError = error instanceof FabricDirectoryUnavailableError ? error.cause : error;
+        if (!(lockError instanceof Error && "code" in lockError && lockError.code === "FABRIC_MESH_LOCK_TIMEOUT") ||
             !this.residency || !kernelFenceAvailable()) throw error;
-        const { actor, participant } = this.resolveActorTarget(id);
+        // Retained ownership proves only eligibility to wait for lock recovery,
+        // never permission to publish. The retried operation revalidates routing.
+        let actor: FabricActorInfo | undefined;
+        try { actor = this.actorManager.status(id); }
+        catch (lookupError) {
+          if (!(lookupError instanceof Error && /Unknown Fabric actor/.test(lookupError.message))) throw error;
+        }
+        const participant = this.participants.get(actor?.id ?? id);
         if ((actor?.residency ?? participant?.residency) !== "durable" ||
             (actor && (this.actorManager.owns?.(actor.id) ?? participant?.local)) ||
             !(actor?.rootId === this.residency.options.config.rootId || participant?.ownerHostId === this.residency.hostId)) throw error;
@@ -743,6 +751,11 @@ export class AgentMessageRouter {
       return this.resolveActorTarget(actor?.id ?? participant!.id);
     }
     return target;
+  }
+
+  /** Async callers revalidate an overdue/uninitialized view before resolving ownership. */
+  async resolveActorTargetFresh(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+    return this.#withDirectory(async () => this.resolveActorTarget(id));
   }
 
   resolveActorTarget(id: string): {

@@ -243,6 +243,27 @@ describe("directory availability for live Mains (#2386)", () => {
     expect(send.actors.status).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])("revalidates actor ownership before lookup, retaining failed probe causes (fails=%s)", async (fails) => {
+    let unavailable: string | undefined = "no confirmed view";
+    const target = remote("actor:resident", "idle", "actor");
+    const get = vi.fn(() => target);
+    const lockError = Object.assign(new Error("ownerless mesh lock"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    const refreshRoutingView = vi.fn(async () => {
+      if (fails) throw lockError;
+      unavailable = undefined;
+    });
+    const send = router(unknown, [], undefined, { get, scheduleRefresh: vi.fn(), routingUnavailable: () => unavailable, refreshRoutingView });
+    const lookup = send.value.resolveActorTargetFresh(target.id);
+    if (fails) {
+      await expect(lookup).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", cause: lockError });
+      expect(get).not.toHaveBeenCalled();
+    } else {
+      await expect(lookup).resolves.toMatchObject({ participant: target });
+      expect(get).toHaveBeenCalledOnce();
+    }
+    expect(refreshRoutingView).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])("bounds recovery of a read failure after a healthy preflight (probe fails=%s)", async (fails) => {
     let failed = true;
     const target = remote("session:live", "running", "root");

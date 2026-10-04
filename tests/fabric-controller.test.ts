@@ -589,6 +589,7 @@ describe("FabricUiController dashboard wiring", () => {
     const reads = vi.spyOn(fs, "readFileSync");
     const count = () => reads.mock.calls.filter(([file]) => String(file) === path.join(root, "state.json")).length;
     const shown = () => controller.snapshot().state.find(entry => entry.key === "status")?.value;
+    const observe = vi.spyOn(mesh, "cachedStateStamp");
     try {
       state.config.ui.refreshMs = 500;
       controller.start(context);
@@ -604,6 +605,10 @@ describe("FabricUiController dashboard wiring", () => {
       await vi.advanceTimersByTimeAsync(2_000); // Fixed deadline, not another full 5 s poll.
       expect(shown()).toBe("after");
       expect(count()).toBe(before + 1);
+      // Idle metadata observation must not independently parse at expiry before snapshot
+      // consumers use the shared reader (#4383); active demand has separate coverage below.
+      expect(observe).toHaveBeenCalledWith(false, false);
+      expect(observe.mock.calls.some(([fresh]) => fresh === true)).toBe(false);
       expect(context.ui.notify).not.toHaveBeenCalled();
     } finally {
       controller.stop(); vi.restoreAllMocks(); vi.useRealTimers();

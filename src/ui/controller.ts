@@ -799,7 +799,7 @@ export class FabricUiController {
         // revalidates now. Record the stamp actually consumed, never the disk's newer stamp.
         const remoteRebuild = !force && !this.#dashboardOpen && !this.#conversationOpen && remote !== this.#builtRemote;
         const readActive = main.status === "running" || main.pendingMessages;
-        if (remoteRebuild && this.state.config.mesh.enabled) this.state.mesh.cachedStateStamp?.(true, readActive);
+        if (remoteRebuild && this.state.config.mesh.enabled) this.state.mesh.cachedStateStamp?.(readActive, readActive);
         if (remoteRebuild && participantsRoot) readParticipantFiles(participantsRoot, {
           maxAgeMs: readActive ? 0 : this.state.mesh.readCacheMs,
         });

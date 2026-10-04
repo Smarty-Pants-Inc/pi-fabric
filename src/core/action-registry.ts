@@ -155,6 +155,8 @@ export interface FabricRegistryInvocationContext extends FabricInvocationContext
   trace?: FabricExecutionTraceRecorder;
   traceOperation?: FabricExecutionTraceOperationHandle;
   observeInvocation?(event: FabricRegistryActivityEvent): void;
+  /** Host-owned settlement accounting, before proxies or bounded guest projection. Not a delivery receipt. */
+  observeResult?(value: unknown): void;
 }
 
 /**
@@ -1138,6 +1140,7 @@ export class ActionRegistry {
       } finally {
         if (!providerInvoked) this.#activeEffects.delete(nestedToolCallId);
       }
+      context.observeResult?.(providerValue);
       throwIfExecutionExpired(context);
       const value = this.toolResultProxy
         ? await runAbortable(context.signal, () => this.toolResultProxy!.proxy({

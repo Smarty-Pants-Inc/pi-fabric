@@ -36,6 +36,25 @@ const fixture = () => {
 };
 
 describe("saved program enclosing budgets", () => {
+  it.each((["quickjs", "node-process"] as const).flatMap(runtime => (["direct", "saved"] as const).map(route => [runtime, route] as const)))(
+    "A20 debits oversized %s agent results through the %s route before guest processing fails", async (runtime, route) => {
+      const f = fixture(); f.config.executor.runtime = runtime; f.config.executor.timeoutMs = 3000; f.config.agents.timeoutMs = 3000;
+      f.config.executor.maxNestedResultChars = 512;
+      const run = vi.fn().mockResolvedValueOnce({ status: "completed", text: "small", usage: { input: 1, output: 1 } })
+        .mockResolvedValue({ status: "completed", text: "x".repeat(4096), usage: { input: 3, output: 2 } });
+      const descriptor = { name: "run", description: "fake agent", risk: "agent" as const, inputSchema: { type: "object", additionalProperties: true } };
+      f.registry.register({ name: "agents", description: "agents", async list() { return [descriptor]; }, async describe() { return descriptor; }, invoke: run });
+      await f.store.save({ name: "oversized", code: 'await workflow.agent("oversized"); throw new Error("after spending");' }, "typescript");
+      const oversized = route === "saved" ? 'await programs.run({ref:"oversized"});' : 'await workflow.agent("oversized");';
+      const result = await f.run(`await workflow.agent("small"); const before = workflow.budget.spent(); let failed = false;
+        try { ${oversized} } catch { failed = true; }
+        const spent = workflow.budget.spent(); const remaining = workflow.budget.remaining(); let denied = false;
+        try { await workflow.agent("must not launch"); } catch (error) { denied = /token budget exhausted/.test(String(error)); }
+        return {before, failed, spent, remaining, denied};`, undefined, 7);
+      expect(result.success, result.error).toBe(true);
+      expect(result.value).toEqual({ before: 2, failed: true, spent: 7, remaining: 0, denied: true });
+      expect(run).toHaveBeenCalledTimes(2);
+    });
   it.each(["quickjs", "node-process"] as const)("A11 shares sequential saved-program spending and observations in %s", async runtime => {
     const f = fixture(); f.config.executor.runtime = runtime; f.config.executor.timeoutMs = 3000; f.config.agents.timeoutMs = 3000;
     const run = vi.fn(async () => ({ status: "completed", text: "ok", usage: { input: 3, output: 2 } }));

@@ -661,6 +661,7 @@ export class FabricExecutionService {
       ref: string,
       args: Record<string, unknown>,
       callContext: typeof baseContext & { signal: AbortSignal },
+      observeResult?: (value: unknown) => void,
     ): Promise<unknown> => {
       const traceOperation = traceRecorder.issueCall(ref, args);
       try {
@@ -722,6 +723,7 @@ export class FabricExecutionService {
         maxResultChars: this.config.executor.maxNestedResultChars,
         traceOperation,
         observeInvocation,
+        ...(observeResult ? { observeResult } : {}),
       });
     };
     let sandboxResult: FabricSandboxResult;
@@ -983,12 +985,13 @@ export class FabricExecutionService {
               return workflowSpentTokens;
             case "fabric.$workflowRun": {
               if (workflowSpentTokens >= workflowTokenBudget) throw new FabricTraceSafeError("Fabric workflow token budget exhausted");
-              const result = await invokeAction("agents.run", args, callContext);
-              const usage = result && typeof result === "object" ? (result as { usage?: { input?: number; output?: number } }).usage : undefined;
-              for (const tokens of [usage?.input, usage?.output]) {
-                if (typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0) workflowSpentTokens += tokens;
-              }
-              return result;
+              return invokeAction("agents.run", args, callContext, result => {
+                // Known host spend survives result truncation, proxy failure and nested guest failure.
+                const usage = result && typeof result === "object" ? (result as { usage?: { input?: number; output?: number } }).usage : undefined;
+                for (const tokens of [usage?.input, usage?.output]) {
+                  if (typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0) workflowSpentTokens += tokens;
+                }
+              });
             }
             case "fabric.$providers":
               return traceAttempt(

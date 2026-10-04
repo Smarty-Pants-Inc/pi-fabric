@@ -8,7 +8,11 @@ export default function (pi: ExtensionAPI) {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 4096 })),
   });
   pi.on("before_agent_start", (event, context) => {
-    fs.appendFileSync(process.env.ROUTER_PROOF_TRANSCRIPT!, JSON.stringify({ type: "native_activation", pid: process.pid,
+    const processStartTime = process.platform === "linux" ? (() => {
+      const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+    })() : undefined;
+    fs.appendFileSync(process.env.ROUTER_PROOF_TRANSCRIPT!, JSON.stringify({ type: "native_activation", pid: process.pid, processStartTime,
       actorId: process.env.PI_FABRIC_ACTOR_ID ?? null, runId: process.env.PI_FABRIC_PARENT_RUN ?? null,
       runDirectory: process.env.PI_FABRIC_AGENT_RUN_DIR ?? null, sessionId: context.sessionManager.getSessionId(),
       sessionFile: context.sessionManager.getSessionFile(), mode: context.mode,

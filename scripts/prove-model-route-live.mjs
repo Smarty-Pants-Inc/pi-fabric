@@ -7,11 +7,12 @@ import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { prepareProofPaths, processStartTime, registerOwnedProcess, ownedProcessAlive, signalOwnedProcess } from './proof-process-ownership.mjs';
 const [cli, scratchArg, outArg] = process.argv.slice(2);
 assert(cli && scratchArg && outArg, 'INSTALLED_PI_CLI SCRATCH OUTPUT required');
 const lane = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const scratch = path.resolve(scratchArg), out = path.resolve(outArg), candidate = path.join(lane, 'dist/index.js');
-fs.mkdirSync(scratch, { recursive: true, mode: 0o700 }); fs.mkdirSync(out, { recursive: true, mode: 0o700 });
+prepareProofPaths(scratch, out);
 const cwd = path.join(scratch, 'workspace'), home = path.join(scratch, 'home'), profile = path.join(scratch, 'profile'), mesh = path.join(scratch, 'mesh');
 for (const directory of [cwd, home, profile]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
 const transcript = path.join(out, 'transcript.jsonl'), queue = path.join(scratch, 'queue.json'), failJev = path.join(scratch, 'fail-jev'), fullJournals = path.join(scratch, 'full-journals');
@@ -118,9 +119,11 @@ record({ type: 'proof_command', executable: process.execPath, args, cwd, env: { 
   piVersion: execFileSync(process.execPath, [cli, '--version'], { env, encoding: 'utf8' }).trim(), config });
 let child, exited;
 const events = [], pending = new Map(); let buffer = '', serial = 0, stderr = '', failure, proof;
+const ownedPids = new Map();
 function launchMain() {
   child = spawn(process.execPath, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
   const instance = child;
+  registerOwnedProcess(ownedPids, instance.pid, processStartTime(instance.pid));
   exited = new Promise(resolve => instance.once('close', (code, signal) => resolve({ code, signal, pid: instance.pid })));
 child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
 child.stderr.on('data', text => { stderr += text; record({ type: 'stderr', text }); });
@@ -170,7 +173,6 @@ const owners = () => files(mesh).filter(file => path.basename(file) === 'owner.j
 const live = pid => { try { const text = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); return !['Z', 'X'].includes(text.slice(text.lastIndexOf(')') + 2).split(' ')[0]); } catch { return false; } };
 const ledgerPath = path.join(profile, 'fabric/model-routing.jsonl');
 const ledger = () => fs.readFileSync(ledgerPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-const ownedPids = new Set();
 try {
   const state = await request({ type: 'get_state' }); assert.equal(state.model.provider + '/' + state.model.id, pin);
   const diagnostic = await guest(`try { return { evaluation: await tools.call({ref: 'jev.evaluate', args: {state: {routeClass: 'task:exact-checks', mode: 'shadow', protection: 'clear'}, questions: {route: {type: 'choice', instructions: 'Offline proof', criteria: {'candidate-0': {model: '${pin}', effort: 'high'}, 'candidate-1': {model: '${cheap}', effort: 'medium'}}}}}}) }; } catch(error) { return {error: String(error), stack: error.stack}; }`); record({type:'jev_diagnostic',diagnostic}); assert.ok(diagnostic.evaluation && !diagnostic.error, JSON.stringify(diagnostic));
@@ -200,37 +202,39 @@ try {
     if (!args.includes('--session')) args.push('--session',mainSession.sessionFile);
     child.stdin.end();
     const exit = await exited; mainExits.push(exit); assert.equal(exit.code, 0);
-    if (reset) config.agents.modelRouting.revertReset = { 'status-groom': reset };
+    if (reset && config.agents.modelRouting) config.agents.modelRouting.revertReset = { 'status-groom': reset };
     fs.writeFileSync(path.join(profile, 'fabric.json'), JSON.stringify(config));
-    record({type:'fresh_main',reset:config.agents.modelRouting.revertReset,liveClasses:config.agents.modelRouting.liveClasses,pid:exit.pid,args,sessionId:mainSession.sessionId});
+    record({type:'fresh_main',reset:config.agents.modelRouting?.revertReset ?? null,liveClasses:config.agents.modelRouting?.liveClasses ?? null,pid:exit.pid,args,sessionId:mainSession.sessionId});
     buffer = ''; launchMain();
     const state = await request({type:'get_state'}); assert.equal(state.model.provider + '/' + state.model.id, pin);
   };
   const createActor = async name => guest(`return await agents.create({ name: '${name}', instructions: 'Bounded status checks only', residency: 'durable', runner: 'pi', transport: 'process', model: '${pin}', thinking: 'high', routeClass: 'status-groom', protected: false, tools: [], extensions: true, events: [], topics: [], delivery: 'mailbox', triggerTurn: false });`);
   const ask = (id, message) => guest(`return await agents.ask({id:'${id}',message:'${message}'});`);
-  const mainRun = message => guest(`const h = await agents.spawn({task:'${message}',model:'auto',routeClass:'status-groom',protected:false}); const result = await agents.wait({id:h.id}); return {handle:h,result};`);
+  const mainRun = (message, pinned = false) => guest(`const h = await agents.spawn({task:'${message}',model:'auto',routeClass:'status-groom',protected:false${pinned ? `,pinModel:'${pin}',pinThinking:'high'` : ''}}); const result = await agents.wait({id:h.id}); return {handle:h,result};`);
   const checkPin = run => { const result = run.result ?? run; assert.match(result.text, /gpt-5-pin/); if (run.result) { assert.equal(result.model,pin); assert.equal(result.thinking,'high'); } };
   const safetyJournal = path.join(profile,'fabric/model-routing-pending.jsonl');
   const safetyRows = () => fs.readFileSync(safetyJournal,'utf8').trim().split('\n').map(line=>JSON.parse(line));
 
-  // F4/manual rollback: a fresh Main publishes empty liveClasses to the already
-  // running resident. Neither PID nor owner token may change.
-  config.agents.modelRouting.liveClasses = [];
-  await restartMain('round8-manual-revert');
-  const manualMain = await mainRun('PROOF_MANUAL_MAIN_PIN'); checkPin(manualMain);
+  // F4/manual rollback: remove the whole optional policy from a fresh Main.
+  // Neither the resident PID nor owner token may change, and the resident must
+  // fail closed exactly as it does for an explicit empty allowlist.
+  const originalRouting = config.agents.modelRouting;
+  delete config.agents.modelRouting;
+  await restartMain('round8-manual-revert-removed-policy');
+  const manualMain = await mainRun('PROOF_MANUAL_MAIN_PIN', true); checkPin(manualMain);
   const manualResident = await ask(actor.actor.id,'PROOF_MANUAL_RESIDENT_PIN'); checkPin(manualResident);
   const rollbackOwner = owners(); assert.equal(rollbackOwner[0].owner.pid,residentOwner[0].owner.pid);
   assert.equal(rollbackOwner[0].owner.token,residentOwner[0].owner.token);
-  // Class isolation: opting tasks back in does not restore the actor class.
-  config.agents.modelRouting.liveClasses = ['task:exact-checks']; await restartMain();
+  // Explicit later re-enable still works, while class isolation remains intact.
+  config.agents.modelRouting = { ...originalRouting, liveClasses: ['task:exact-checks'] }; await restartMain();
   const isolatedTask = await guest(`const h=await agents.spawn({task:'PROOF_ISOLATED_TASK',model:'auto',routeClass:'task:exact-checks',protected:false});return await agents.wait({id:h.id});`);
   assert.equal(isolatedTask.model,cheap); checkPin(await ask(actor.actor.id,'PROOF_ISOLATED_ACTOR_PIN'));
-  config.agents.modelRouting.liveClasses = ['status-groom','task:exact-checks'];
+  config.agents.modelRouting = { ...originalRouting, liveClasses: ['status-groom','task:exact-checks'] };
   await restartMain('round8-live-again');
   assert.match((await ask(actor.actor.id,'PROOF_MANUAL_REENABLE')).text,/gpt-5-cheap/);
   assert.equal(owners()[0].owner.token,residentOwner[0].owner.token);
-  safetyScenarios.push({finding:'F4-manual-revert',passed:true,liveClasses:[],mainRunId:manualMain.handle.id,
-    residentRunId:manualResident.runId,unchangedResidentOwner:rollbackOwner[0].owner,classIsolation:true});
+  safetyScenarios.push({finding:'F4-manual-revert',passed:true,removedModelRouting:true,liveClasses:[],mainRunId:manualMain.handle.id,
+    residentRunId:manualResident.runId,unchangedResidentOwner:rollbackOwner[0].owner,classIsolation:true,explicitReenable:true});
 
   // Admission safety: writable journals whose real appends fail cannot grant LIVE.
   await restartMain('astra-r6-F1-full-journals');
@@ -363,33 +367,40 @@ try {
   console.log('PASS: installed Pi RPC + built Fabric; LIVE task/actor, manual Main/resident rollback, class isolation, Jev fallback, F2 custody, F5 repair, modelReason and native HTTP joins.');
 } catch (error) { failure = error; record({ type: 'proof_failure', error: String(error), stack: error.stack }); console.error(error); }
 finally {
-  const native = fs.readFileSync(transcript, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-  for (const row of native.filter(row => row.type === 'native_activation')) if (row.pid !== child.pid) ownedPids.add(row.pid);
+  const native = fs.readFileSync(transcript, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  // Require a recorded native /proc incarnation before cleanup; a reused PID
+  // or an owner record without identity is never kill authority.
+  for (const row of native.filter(row => row.type === 'native_activation' && row.pid !== child.pid)) {
+    registerOwnedProcess(ownedPids, row.pid, row.processStartTime ?? processStartTime(row.pid));
+  }
   for (const { file, owner } of owners()) {
-    ownedPids.add(owner.pid); if (owner.handover?.launcher?.pid) ownedPids.add(owner.handover.launcher.pid);
+    registerOwnedProcess(ownedPids, owner.pid, owner.processStartTime);
+    registerOwnedProcess(ownedPids, owner.handover?.launcher?.pid, owner.handover?.launcher?.processStartTime);
     const log = path.join(path.dirname(file), 'launcher.log');
     if (fs.existsSync(log)) for (const line of fs.readFileSync(log, 'utf8').trim().split('\n')) {
-      try { const row = JSON.parse(line); if (row.event === 'launcher-started' && Number.isInteger(row.pid)) ownedPids.add(row.pid); } catch {}
+      try { const row = JSON.parse(line); if (row.event === 'launcher-started') registerOwnedProcess(ownedPids, row.pid, row.processStartTime); } catch {}
     }
     fs.cpSync(path.dirname(file), path.join(out, 'resident-state'), { recursive: true });
   }
   if (fs.existsSync(path.join(mesh, 'actors'))) fs.cpSync(path.join(mesh, 'actors'), path.join(out, 'actor-state'), { recursive: true });
   if (fs.existsSync(path.join(profile, 'fabric'))) fs.cpSync(path.join(profile, 'fabric'), path.join(out, 'routing-state'), { recursive: true });
   if (fs.existsSync(path.join(scratch, 'sessions'))) fs.cpSync(path.join(scratch, 'sessions'), path.join(out, 'main-sessions'), { recursive: true });
-  // Only PIDs learned from this isolated proof root. Never target a preexisting host.
-  for (const pid of [...ownedPids].reverse()) if (live(pid)) { try { process.kill(pid, 'SIGTERM'); } catch {} }
-  const until = Date.now() + 15000; while ([...ownedPids].some(live) && Date.now() < until) await sleep(25);
-  for (const pid of ownedPids) if (live(pid)) { try { process.kill(pid, 'SIGKILL'); } catch {} }
-  const killUntil = Date.now() + 5000; while ([...ownedPids].some(live) && Date.now() < killUntil) await sleep(25);
-  if ([...ownedPids].some(live)) failure ??= new Error('Isolated resident processes did not exit');
+  registerOwnedProcess(ownedPids, child?.pid, processStartTime(child?.pid));
+  const claimedPids = [...ownedPids.keys()];
+  for (const pid of [...claimedPids].reverse()) signalOwnedProcess(ownedPids, pid, 'SIGTERM');
+  const until = Date.now() + 15000; while (claimedPids.some(pid => ownedProcessAlive(ownedPids, pid)) && Date.now() < until) await sleep(25);
+  for (const pid of claimedPids) signalOwnedProcess(ownedPids, pid, 'SIGKILL');
+  const killUntil = Date.now() + 5000; while (claimedPids.some(pid => ownedProcessAlive(ownedPids, pid)) && Date.now() < killUntil) await sleep(25);
+  if (claimedPids.some(pid => ownedProcessAlive(ownedPids, pid))) failure ??= new Error('Isolated resident processes did not exit with verified identities');
   if (child.exitCode === null && child.signalCode === null) child.stdin.end();
-  const kill = setTimeout(() => child.kill('SIGTERM'), 10000); const mainExit = await exited; clearTimeout(kill); mainExits.push(mainExit);
+  const kill = setTimeout(() => signalOwnedProcess(ownedPids, child.pid, 'SIGTERM'), 10000); const mainExit = await exited; clearTimeout(kill); mainExits.push(mainExit);
   for (const waiter of pending.values()) { clearTimeout(waiter.timer); waiter.reject(new Error('Proof exited')); } pending.clear();
   await new Promise(resolve => server.close(resolve));
   fs.writeFileSync(path.join(out, 'stderr.log'), stderr);
-  const cleanup = { type: 'proof_cleanup', mainExit, mainExits, ownedPids: [...ownedPids], allExited: [...ownedPids, ...mainExits.map(row => row.pid)].every(pid => !live(pid)) }; record(cleanup);
+  const allExited = claimedPids.every(pid => !ownedProcessAlive(ownedPids, pid));
+  const cleanup = { type: 'proof_cleanup', mainExit, mainExits, ownedPids: [...ownedPids.entries()].map(([pid, startTime]) => ({ pid, startTime })), allExited }; record(cleanup);
   fs.writeFileSync(path.join(out, 'summary.json'), JSON.stringify({ passed: !failure, head, error: failure ? String(failure) : null, ...cleanup }, null, 2));
   fs.writeFileSync(path.join(out, 'bundle-manifest.json'), JSON.stringify(files(path.join(lane, 'dist')).filter(file => /\.(js|mjs)$/.test(file)).map(file => ({ path: path.relative(lane, file), sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex') })), null, 2));
-  fs.rmSync(scratch, { recursive: true, force: true });
+  if (allExited) fs.rmSync(scratch, { recursive: true, force: true });
 }
 if (failure) process.exitCode = 1;

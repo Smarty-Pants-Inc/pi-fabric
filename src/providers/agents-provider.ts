@@ -896,7 +896,7 @@ export class AgentsProvider implements FabricProvider {
         const id = String(args.id);
         if (this.mainAgent.matches(id)) {
           if (this.mainAgent.local) return this.mainAgent.info(context.extensionContext);
-          const root = this.participants.get(this.mainAgent.id);
+          const root = await this.#router.resolveParticipantFresh(this.mainAgent.id);
           if (!root) throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, this.mainAgent.id, "Fabric Main participant");
           return root;
         }
@@ -926,7 +926,7 @@ export class AgentsProvider implements FabricProvider {
           }
           return result;
         }
-        const known = this.participants.get(id);
+        const known = await this.#router.resolveParticipantFresh(id);
         if (known && !known.local) return known;
         try {
           return this.actorManager.status(id);
@@ -1290,6 +1290,7 @@ export class AgentsProvider implements FabricProvider {
           args.data,
           "steer",
           context,
+          { ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
         );
       case "cancelFollowUp":
         return this.manager.cancelFollowUp(String(args.id), String(args.messageId));
@@ -1300,7 +1301,8 @@ export class AgentsProvider implements FabricProvider {
           args.data,
           "followUp",
           context,
-          { ...(typeof args.deadlineMs === "number" ? { deadlineMs: args.deadlineMs } : {}) },
+          { ...(typeof args.deadlineMs === "number" ? { deadlineMs: args.deadlineMs } : {}),
+            ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
         );
       case "setSteeringMode":
         return this.manager.setSteeringMode(String(args.id), this.#steeringMode(args.mode));
@@ -1634,6 +1636,7 @@ export class AgentsProvider implements FabricProvider {
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
+      idempotencyKey?: string;
     } = {},
   ): Promise<FabricAgentMessageResult> {
     // Host-authored lifecycle routing has no sender invocation/history. Check

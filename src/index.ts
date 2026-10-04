@@ -53,6 +53,7 @@ import {
 import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
 import { COMPACTION_FAILED_ALARM, registerCompactionRecovery } from "./compaction/recovery.js";
 import { compactAtConfiguredThreshold } from "./compaction/threshold.js";
+import { recoverCompactResume } from "./core/compact-resume.js";
 import {
   createToolOwnershipReassertion,
   FabricToolLifecycle,
@@ -734,6 +735,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       // Hold the lease through activation, actor re-arm and reporting, even on failure.
       releaseSlot?.();
     }
+    recoverCompactResume(pi, context, true);
   });
 
   // Branch changes move the leaf: emitted echoes and spent reminder budget

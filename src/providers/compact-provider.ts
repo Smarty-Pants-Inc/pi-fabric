@@ -7,7 +7,8 @@ import {
   MAX_PRESERVE_ITEM_CHARS,
   MAX_PRESERVE_ITEMS,
 } from "../compaction/instructions.js";
-import { CompactController } from "../core/compact-controller.js";
+import { CompactController, MAX_COMPACT_RESUME_CHARS } from "../core/compact-controller.js";
+import { inferCompactResume } from "../core/compact-resume.js";
 import type {
   FabricActionDescriptor,
   FabricInvocationContext,
@@ -23,6 +24,10 @@ import { actionArgNormalizer } from "./arg-normalization.js";
 // guard) — it is a first-principles primitive, not an optional capability.
 
 const requestSchema = Type.Object({
+  resume: Type.Optional(Type.String({
+    maxLength: MAX_COMPACT_RESUME_CHARS,
+    description: "Next step to deliver as one follow-up user turn after successful compaction. Set this for self-requested compaction with unfinished work. Defaults to the follow-on part of the last compound compact user/steer instruction; empty text disables resumption.",
+  })),
   reason: Type.Optional(Type.String({
     maxLength: 1024,
     description: "Short human-readable reason for the compaction",
@@ -45,6 +50,7 @@ const requestSchema = Type.Object({
 }, { additionalProperties: false });
 
 interface CompactRequestArguments {
+  resume?: string;
   reason?: string;
   instructions?: string;
   preserve?: string[];
@@ -86,7 +92,7 @@ const descriptors: FabricActionDescriptor[] = [
   {
     name: "request",
     description:
-      "Request an advisory compaction of the host session's context at the next safe boundary (agent_settled). The host commits it only between turns, never mid-turn. A new request replaces any pending one.",
+      "Request an advisory compaction of the host session's context at the next safe boundary (agent_settled). The host commits it only between turns, never mid-turn. A new request replaces any pending one. Use resume for unfinished work; compaction alone does not continue the agent.",
     inputSchema: requestSchema as unknown as Record<string, unknown>,
     risk: "write",
   },
@@ -153,7 +159,9 @@ export class CompactProvider implements FabricProvider {
     switch (actionName) {
       case "request": {
         const input = checkedRequestArguments(args);
+        const resume = input.resume ?? inferCompactResume(context.extensionContext);
         const intent = this.controller.request({
+          ...(resume !== undefined ? { resume } : {}),
           ...(input.reason !== undefined ? { reason: input.reason } : {}),
           ...(input.instructions !== undefined ? { instructions: input.instructions } : {}),
           ...(input.preserve !== undefined ? { preserve: input.preserve } : {}),

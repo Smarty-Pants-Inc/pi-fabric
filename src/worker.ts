@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import { CompactResumeDelivery } from "./compaction/resume-delivery.js";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -996,6 +997,7 @@ const main = async (): Promise<void> => {
   });
 
   let compactControl = createCompactControl();
+  const compactResumeDelivery = new CompactResumeDelivery();
 
   // Preemptive per-child token guard. timeoutMs bounds wall time and budgetUsd
   // bounds cost, but a single runaway child can still blow its own context
@@ -1309,6 +1311,7 @@ const main = async (): Promise<void> => {
       return;
     }
     runLog.event(line, event);
+    compactResumeDelivery.observe(event);
     if (options.runner === "claude") {
       processClaudeEvent(event);
       return;
@@ -1542,7 +1545,8 @@ const main = async (): Promise<void> => {
         // sendUserMessage may still be in asynchronous input admission. A
         // completed native boundary is not proof that tracked payloads were
         // consumed. Keep stdin alive for their deferred native turn/cancellation.
-        deferredFollowUpSettle = piSettledSuccessfully && hasUnsettledFollowUps();
+        deferredFollowUpSettle = piSettledSuccessfully &&
+          (hasUnsettledFollowUps() || compactResumeDelivery.pending);
         if (!deferredFollowUpSettle) compactControl.childSettled();
       }
       return;
@@ -1711,7 +1715,7 @@ const main = async (): Promise<void> => {
   };
   const steerTimer = options.steerFile ? setInterval(() => {
     pollSteer();
-    if (deferredFollowUpSettle && !nativeActivity && !hasUnsettledFollowUps()) {
+    if (deferredFollowUpSettle && !nativeActivity && !hasUnsettledFollowUps() && !compactResumeDelivery.pending) {
       deferredFollowUpSettle = false;
       compactControl.childSettled();
     }
@@ -1919,6 +1923,7 @@ const main = async (): Promise<void> => {
     contextAdmission = undefined;
     modelControl = createModelControl();
     compactControl = createCompactControl();
+    compactResumeDelivery.reset();
     child = spawnChild();
     retainExecutionCustody(child);
     childExited = false;

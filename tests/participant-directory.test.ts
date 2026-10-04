@@ -1953,16 +1953,41 @@ describe("ParticipantDirectory lease reads", () => {
   };
   afterEach(() => vi.restoreAllMocks());
 
-  it("keep a peer whose file lease was renewed after the read and before its old expiry", async () => {
-    const { lease, renew, seesPeer } = await setup();
-    const clock = vi.spyOn(Date, "now");
-    clock.mockReturnValue(lease.expiresAt - 5_000);
-    expect(seesPeer()).toBe(true);                                   // fills the lease read
-    renew(lease.expiresAt - 2_000);                                  // file-only renewal
-    clock.mockReturnValue(lease.expiresAt + 1);                      // old expiry passed, read reused
-    expect(seesPeer()).toBe(true);
-    clock.mockReturnValue(lease.expiresAt + 5_000);
-    expect(seesPeer()).toBe(true);
+  it.each(["native", "win32"])("keep a peer whose file lease was renewed after the read and before its old expiry (%s)", async (target) => {
+    const { readerDirectory, lease, renew, seesPeer } = await setup();
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    let renewed = false;
+    try {
+      if (target === "win32") {
+        Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+        // NTFS file IDs can exceed Number's exact integer range. Model two distinct
+        // IDs that round to the same number, with equal size and timestamps.
+        const file = path.join(readerDirectory.mesh.root, "host-leases",
+          createHash("sha256").update(peer.id).digest("hex").slice(0, 32) + ".json");
+        const stat = fs.statSync.bind(fs);
+        const before = stat(file);
+        const beforeBig = stat(file, { bigint: true });
+        vi.spyOn(fs, "statSync").mockImplementation(((name: fs.PathLike, options?: fs.StatOptions) => {
+          const current = stat(name, options);
+          if (String(name) !== file) return current;
+          const ino = 2n ** 54n + (renewed ? 1n : 0n);
+          return Object.assign(current!, options?.bigint
+            ? { ...beforeBig, ino }
+            : { ...before, ino: Number(ino) });
+        }) as typeof fs.statSync);
+      }
+      const clock = vi.spyOn(Date, "now");
+      clock.mockReturnValue(lease.expiresAt - 5_000);
+      expect(seesPeer()).toBe(true);                                   // fills the lease read
+      renew(lease.expiresAt - 2_000);                                  // file-only renewal
+      renewed = true;
+      clock.mockReturnValue(lease.expiresAt + 1);                      // old expiry passed, read reused
+      expect(seesPeer()).toBe(true);
+      clock.mockReturnValue(lease.expiresAt + 5_000);
+      expect(seesPeer()).toBe(true);
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
   });
 
   it("drop a peer whose lease lapsed and was not renewed", async () => {

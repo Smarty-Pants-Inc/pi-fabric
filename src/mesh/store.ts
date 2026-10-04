@@ -4,7 +4,7 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic, syncPathNamespace, MeshLockTimeoutError } from "../core/atomic-write.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
@@ -26,6 +26,8 @@ export interface MeshEvent {
   verification?: "mesh" | "bridge";
   id: string;
   sequence: number;
+  /** Host-only once-publication identity; never accepted from the public mesh provider. */
+  dedupeKey?: string;
   topic: string;
   kind: string;
   from: MeshIdentity;
@@ -617,6 +619,8 @@ export class MeshStore {
 
   async publish(input: {
     topic: string;
+    /** Host-only durable publication receipt (alarms and inbox disposition receipts). */
+    dedupeKey?: string;
     kind?: string;
     from: MeshIdentity;
     to?: string;
@@ -638,11 +642,42 @@ export class MeshStore {
       this.#repairEventLog();
       const archive = MeshArchive.fromRoot(this.root);
       if (archive) this.#recoverArchive(archive);
+      const receiptPath = input.dedupeKey ? path.join(this.root, "event-receipts",
+        createHash("sha256").update(input.dedupeKey).digest("hex") + ".json") : undefined;
+      const confirmFile = (file: string): void => {
+        const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
+        try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
+      };
+      if (receiptPath) {
+        try {
+          const prior = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as MeshEvent;
+          if (prior.dedupeKey !== input.dedupeKey || typeof prior.id !== "string" || !Number.isSafeInteger(prior.sequence)) throw new Error("Invalid event publication receipt");
+          // A visible rename whose final barrier failed is not yet a durable receipt.
+          confirmFile(receiptPath);
+          return prior;
+        } catch (error) {
+          if (errorCode(error) !== "ENOENT") throw error;
+        }
+        // A crash after the append but before its receipt must not publish twice. The
+        // append and receipt share the existing mesh lock; compaction comes afterwards.
+        for (let after = 0;;) {
+          const page = this.read({ after, limit: this.maxReadEvents });
+          const prior = page.find(event => event.dedupeKey === input.dedupeKey);
+          if (prior) {
+            confirmFile(this.#eventsPath);
+            writeFileAtomic(receiptPath, JSON.stringify(prior), { durable: true });
+            return prior;
+          }
+          if (!page.length) break;
+          after = page.at(-1)!.sequence;
+        }
+      }
       const createdAt = Date.now();
       const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
       const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
       const event: MeshEvent = {
         id: randomUUID(),
+        ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
         sequence,
         topic: input.topic,
         kind: input.kind?.trim() || "message",
@@ -677,6 +712,10 @@ export class MeshStore {
         throw error;
       }
       if (pending) archive!.commit(pending);
+      if (receiptPath) {
+        confirmFile(this.#eventsPath);
+        writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
+      }
       this.#compactEventLog();
       return event;
     });

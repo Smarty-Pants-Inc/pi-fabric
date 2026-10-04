@@ -459,7 +459,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     fabricUi.start(context);
     installHaltOnEscape(context);
     installShellHangKeys(context);
-  }, cleanupActivationSideEffects);
+  }, cleanupActivationSideEffects, cleanupActivationSideEffects);
 
   // Continual entropy reduction runs off the interaction path. Session-tree
   // discovery and JSONL ingestion use async I/O, scoring yields in fixed trace
@@ -1247,7 +1247,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     directToolApproval.clear();
     toolDisplay.clear();
     try {
-      await state.shutdown(reason);
+      await state.shutdown(reason, event?.targetSessionFile);
     } finally {
       uninstallHaltOnEscape();
       uninstallShellHangKeys();

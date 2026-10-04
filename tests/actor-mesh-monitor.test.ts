@@ -576,7 +576,9 @@ describe("ActorManager idle checkpoints", () => {
       expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(3);
     } finally {
       s.release();
-      await s.actors.close();
+      const closing = s.actors.close();
+      await vi.advanceTimersByTimeAsync(1); // Join the deferred setImmediate retention slice.
+      await closing;
       await s.agents.close();
     }
   });
@@ -608,7 +610,9 @@ describe("ActorManager idle checkpoints", () => {
       )).toEqual(events.map((event) => event.id));
     } finally {
       s.release();
-      await s.actors.close();
+      const closing = s.actors.close();
+      await vi.advanceTimersByTimeAsync(1); // Join the deferred setImmediate retention slice.
+      await closing;
       await s.agents.close();
     }
   });

@@ -436,6 +436,10 @@ export class ResidentHost {
       const participant = this.participants.get(id);
       return participant ? participant.ownerHostId === this.hostId : undefined;
     };
+    const snapshotActorOwnership = (): ReadonlyMap<string, boolean> => new Map(
+      this.participants.list({ scope: "project", fresh: true })
+        .map((participant) => [participant.id, participant.ownerHostId === this.hostId]),
+    );
     const lineageAlive = (rootId: string): boolean =>
       this.participants.lineageAlive(rootId);
     const actorRoots = residentActorRoots(config);
@@ -482,6 +486,7 @@ export class ResidentHost {
         canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
         persistent: true,
         canManageActor,
+        snapshotActorOwnership,
         lineageAlive,
         claimResidency: "durable",
         rootId: config.rootId,

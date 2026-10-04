@@ -358,6 +358,21 @@ export class ActorChildCompletionStore {
     }
   }
 
+  /** Admission uses the same newest-file TTL as pruning, without deleting active context. */
+  retained(id: string, retentionMs: number, now = Date.now()): boolean {
+    if (!ID.test(id)) return false;
+    try {
+      // A handoff must still have its full outcome. Missing/unreadable evidence
+      // cannot authorize restored context while asynchronous maintenance is pending.
+      let newest = fs.statSync(this.resultFile(id)).mtimeMs;
+      for (const suffix of [".json", ".receipt", ".live-receipt"]) {
+        try { newest = Math.max(newest, fs.statSync(path.join(this.directory, `${id}${suffix}`)).mtimeMs); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+      }
+      return now - newest < retentionMs;
+    } catch { return false; }
+  }
+
   resultFile(id: string): string {
     if (!ID.test(id)) throw new Error("Invalid actor child completion id");
     return path.join(this.directory, `${id}.result.json`);

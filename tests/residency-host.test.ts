@@ -4,6 +4,8 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorLogStore } from "../src/actors/log-store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -44,6 +46,74 @@ const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}, canon
   const host = new ResidentHost(config, idle);
   return { root, config, host, idle };
 };
+
+describe("fresh startup ownership batches", () => {
+  it("a file-only writer between cached batches vetoes prune/manage and the locked registry merge", async () => {
+    const { root, config, host } = fixture();
+    const peerIdentity = { id: "session:peer-owner", name: "peer", kind: "main" as const };
+    const peer = new ParticipantDirectory(new MeshStore(config.meshRoot, 65536, 100), {
+      enabled: true, hostId: peerIdentity.id, rootId: config.rootId, identity: peerIdentity,
+    });
+    const sweeps: Array<() => void> = [];
+    const interval = globalThis.setInterval;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms: number, ...args: unknown[]) => {
+      if (ms === 15 * 60 * 1000) sweeps.push(callback);
+      return interval(callback, ms, ...args);
+    }) as typeof setInterval);
+    try {
+      await host.start(); await peer.start();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const actors: Awaited<ReturnType<typeof host.actors.create>>[] = [];
+      for (let i = 0; i < 10; i++) actors.push(await host.actors.create({ name: `owner-${i}`, instructions: "local", residency: "durable" }));
+      await host.participants.refresh(); // Publish every actor before priming the reader cache.
+      const victim = actors[9]!;
+      const expiredRun = path.join(path.dirname(victim.sessionFile!), "runs", "expired");
+      fs.mkdirSync(expiredRun, { recursive: true });
+      fs.writeFileSync(path.join(expiredRun, "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483646", finishedAt: 1 }));
+      const registry = new ActorRegistryStore(config.actorRoot);
+      const publishOwner = (target: typeof victim) => {
+        const prior = host.participants.list({ scope: "project", fresh: true }).find((record) => record.id === target.id)!;
+        expect(prior.ownerHostId).toBe(host.hostId);
+        const key = "topology/participants/" + createHash("sha256").update(target.id).digest("hex");
+        const entry = { format: 1, key, version: 2, updatedAt: Date.now() + 1000, updatedBy: peerIdentity,
+          value: { ...prior, ownerHostId: peerIdentity.id, ownerIdentityId: peerIdentity.id, updatedAt: Date.now() + 1000 } };
+        const file = path.join(config.meshRoot, "participants", key.split("/").at(-1)! + ".json");
+        // A different process must not invalidate this reader's production 2s cache.
+        execFileSync(process.execPath, ["-e", "const fs=require('node:fs');fs.writeFileSync(process.argv[1]+'.new',process.argv[2]);fs.renameSync(process.argv[1]+'.new',process.argv[1]);", file, JSON.stringify(entry)]);
+        expect(host.participants.list({ scope: "project" }).find((record) => record.id === target.id)?.ownerHostId).toBe(host.hostId);
+        registry.write(registry.records().map((record) => record.id === target.id ? { ...record, instructions: "remote-owner-state" } : record));
+      };
+      let published = false, writerError: unknown;
+      const prune = ActorLogStore.prototype.pruneRuns;
+      vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function(this: ActorLogStore, actor, now) {
+        prune.call(this, actor, now);
+        if (actor.sessionFile === actors[7]!.sessionFile && !published) {
+          setImmediate(() => {
+            try { publishOwner(victim); published = true; }
+            catch (error) { writerError = error; }
+          });
+        }
+      });
+      expect(sweeps).toHaveLength(2); for (const sweep of sweeps) sweep();
+      for (let i = 0; i < 5; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(writerError).toBeUndefined();
+      expect(published).toBe(true);
+      expect(fs.existsSync(expiredRun)).toBe(true);
+      host.actors.resumeQueued();
+      expect(host.actors.owns(victim.id)).toBe(false);
+      const saveVictim = actors[0]!;
+      await host.actors.create({ name: "save-trigger", instructions: "save", residency: "durable" }, {
+        asRegistryOwner: true, beforeCommit: () => publishOwner(saveVictim),
+      });
+      for (const id of [victim.id, saveVictim.id]) {
+        expect(registry.records().find((record) => record.id === id)?.instructions).toBe("remote-owner-state");
+      }
+    } finally {
+      vi.restoreAllMocks(); await peer.close(); await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("resident activation filter telemetry", () => {
   it("returns owning-host skips and expiry through the Main's resident status path", async () => {

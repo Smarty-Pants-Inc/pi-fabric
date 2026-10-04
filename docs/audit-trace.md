@@ -114,7 +114,7 @@ Identifiers (`ref`, `provider`, `action`), outcomes, failure stage, operation se
 
 With `trace.assessment: true` (default `false`), the details envelope also carries a separate, non-deterministic `assessment`. `FabricExecutionTraceV1` stays byte-for-byte what it would be without it.
 
-```ts
+```ts host
 interface FabricAssessmentTraceV1 {
   kind: "pi-fabric.assessment";
   version: 1;

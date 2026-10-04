@@ -488,7 +488,7 @@ For an opt-in implementation backed by the experimental Pi durable harness, see 
 
 A Pi extension can add a runner through the `pi-fabric/runners` subpath. The subpath is never loaded by the Fabric extension at startup.
 
-```ts
+```ts host
 import { registerAgentRunner, listAgentRunners, getAgentRunner } from "pi-fabric/runners";
 
 const unregister = registerAgentRunner(adapter); // FabricWorkerRunner | FabricHostedRunner
@@ -503,13 +503,15 @@ Two kinds exist:
 
 The hosted `reporter` has `progress({ turns, toolCalls, currentTool, text })`, `usage(total)` with the cumulative run usage (Fabric records the increase, which feeds budgets and `tokens.usage` lifecycle events), `transcript(event)`, `question(q)`, `finish({ status, output, structured? })`, and `fail({ error, retryable })`. `question` routes like a Pi child dialog: direct UI when the parent has one, otherwise a [decision](decisions.md#routed-child-questions), and only with `agents.childQuestions: "route"`. The run record shows `blockedOn` while it waits.
 
+A hosted adapter returns `{ confirmed: true }` from `stop` only after execution has ceased and its workers no longer use the run's files. An accepted stop request, terminal result, or liveness response does not establish custody release. Fabric durably records an explicit confirmation in `hosted-exit.json`, bound to the run, runner, directory, start time, and prepared locator. Collection still checks native descendants and retains indeterminate, missing, changed, or linked receipts. Completed hosted runs without this explicit confirmation remain retained.
+
 Fabric never relaunches or re-prompts a hosted run. A `sleeping` run stays `running` with `sleeping: true`. When liveness reports `interrupted` or `unknown` (or `settled` without a result), the run settles `failed` with `outcome: "indeterminate"`. The same outcome marks a stop the adapter did not confirm, and a durable spawn request the resident host was processing when it restarted. Hosted runs work with `agents.run`, `spawn`, `wait`, `status`, `stop`, `steer`, `followUp`, the dashboard, budgets, and `residency: "durable"`. Persistent actors need a worker runner.
 
 Registration is process-local. The resident host runs Pi with `--no-extensions`, so a durable run of a custom runner requires `residentModule`: an absolute path to an ES module that registers the adapter when imported. Fabric refuses a durable spawn without it. The resident host imports the module before launch. On restart it imports it again and calls `attach(locator, context, reporter)` for every unfinished hosted run; a run whose runner cannot be loaded settles indeterminate. When the resident host shuts down, durable hosted runs are detached; they keep running and are re-attached on the next start. Session hosted runs are stopped with the session.
 
 An illustrative daemon-backed adapter:
 
-```ts
+```ts host
 import { registerAgentRunner, type FabricHostedRunner } from "pi-fabric/runners";
 
 const daemon = "http://127.0.0.1:7777"; // hypothetical job daemon

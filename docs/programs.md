@@ -12,7 +12,7 @@ Fabric keeps programs in the project state directory, `<project>/.pi/fabric/prog
 - `index.json` maps each name to its digests and creation times.
 - `.lock` serializes every write. A lock left by a crashed writer is reaped after 30 seconds.
 
-```ts
+```text
 {
   version: 1,
   digest,                          // sha256 over the content, see below
@@ -100,7 +100,7 @@ Slash commands:
 
 Daemons and embedders in the same Pi process emit the program run event:
 
-```ts
+```ts host
 import { FABRIC_PROGRAM_RUN_EVENT, type FabricProgramRunReplyV1 } from "pi-fabric/protocol";
 
 pi.events.emit(FABRIC_PROGRAM_RUN_EVENT, {

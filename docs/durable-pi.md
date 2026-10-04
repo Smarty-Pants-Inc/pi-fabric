@@ -19,7 +19,7 @@ Install the optional peers only in a host that uses this adapter:
 bun add @earendil-works/pi-durable@1.0.0 @earendil-works/chord@1.0.0
 ```
 
-```ts
+```ts host
 import { createPiDurableRunner } from "pi-fabric/durable";
 import { registerAgentRunner } from "pi-fabric/runners";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
@@ -93,7 +93,7 @@ this adapter does not promise power-loss-proof filesystem metadata.
 
 ### Host-provided storage
 
-```ts
+```ts host
 storage: {
   kind: "factory",
   identity: "tenant-a-durable-v1", // stable opaque identity, no secret required

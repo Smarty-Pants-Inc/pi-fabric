@@ -27,7 +27,7 @@ Fabric emits `pi-fabric:shell:timing:v1` on the owning session's `pi.events` bus
 `pi-fabric/protocol`; optional consumers may mirror the contract without importing
 Fabric. The payload contains only:
 
-```ts
+```text
 { version: 1, sessionId, taskId, tool: "bash" | "powershell",
   phase: "started" | "finished", timestamp }
 ```
@@ -218,6 +218,7 @@ of the machine is survived; no exactly-once execution or rollback.
 Any background task, including durable and adopted ones, can be read and filtered after launch, with jev-fabric's records:
 
 ```ts
+const id = "task-id-from-the-launch-result";
 const page = await tools.call({ref: "tasks.read", args: {id, offset: 0, waitMs: 5000}});
 // {id, stream:"output", offset, bytes, omittedBytes, text, next, eof, state}
 const seen = await tools.call({ref: "tasks.watch", args: {id, match: "listening on", after: 0, timeoutMs: 30000}});

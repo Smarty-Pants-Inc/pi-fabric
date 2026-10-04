@@ -12,7 +12,7 @@ Three sources raise decisions:
 
 Decisions live under the reserved mesh key prefix `decisions/<id>`. `mesh.get` and `mesh.list` can read them, and `mesh.put` and `mesh.delete` refuse the prefix.
 
-```ts
+```text
 {
   id: "dec_…",
   kind: "approval" | "question" | "escalation",

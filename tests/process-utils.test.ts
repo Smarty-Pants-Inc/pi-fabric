@@ -8,6 +8,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { processIsAlive, spawnDetached } from "../src/agents/transports/process-utils.js";
 import { same, startTime } from "./helpers/owned-processes.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as runScratch from "../src/storage/run-scratch.js";
+import { launchWithScratchPlatform, scratchPlatforms } from "./fixtures/run-scratch-platform.js";
 import { taskReturnAddressArguments } from "../src/agents/task-return-address.js";
 
 // Preserve native spawn, but capture its exact ChildProcess before it can close.
@@ -175,25 +177,36 @@ fs.writeFileSync("env.json", JSON.stringify({role:process.env.SMARTY_ROLE,overri
 });
 
 describe("process private scratch (#3076)", () => {
-  it.each([{ args: [] }, { args: ["--actor-name", "scratch-review"] }])("overrides TMPDIR only in the task/actor worker environment (%j)", async ({ args }) => {
-    const parentTmpdir = process.env.TMPDIR;
-    const parentTmp = process.env.TMP;
-    const parentTemp = process.env.TEMP;
-    await withOwnedWorker(`import fs from "node:fs";
+  for (const platform of scratchPlatforms) {
+    it.each([{ args: [] }, { args: ["--actor-id", "scratch-review"] }])(`preserves the task/actor worker temp contract (${platform.label}; %j)`, async ({ args }) => {
+      const parentTemp = { tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() };
+      const allocate = vi.spyOn(runScratch, "allocateRunTmpDirectory");
+      if (platform.simulate) vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
+        return launchWithScratchPlatform(this, request, true);
+      });
+      await withOwnedWorker(`import fs from "node:fs";
 import os from "node:os";
-fs.writeFileSync("env.json", JSON.stringify({tmpdir:process.env.TMPDIR,osTmpdir:os.tmpdir(),tmp:process.env.TMP,temp:process.env.TEMP,mode:fs.statSync(process.env.TMPDIR).mode & 0o777}));
+fs.writeFileSync("env.json", JSON.stringify({tmpdir:process.env.TMPDIR,osTmpdir:os.tmpdir(),tmp:process.env.TMP,temp:process.env.TEMP,mode:fs.statSync(os.tmpdir()).mode & 0o777}));
 setInterval(() => {}, 1000);`, async (_handle, root) => {
-      await vi.waitFor(() => expect(fs.existsSync(path.join(root, "env.json"))).toBe(true));
-      const report = JSON.parse(fs.readFileSync(path.join(root, "env.json"), "utf8"));
-      expect(report.tmpdir).toBe(path.join(root, "tmp"));
-      expect(report.osTmpdir).toBe(report.tmpdir);
-      if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
-      else expect(report.mode).toBe(0o700);
-      expect(process.env.TMPDIR).toBe(parentTmpdir);
-      expect(process.env.TMP).toBe(parentTmp);
-      expect(process.env.TEMP).toBe(parentTemp);
-    }, args);
-  });
+        await vi.waitFor(() => expect(fs.existsSync(path.join(root, "env.json"))).toBe(true));
+        const report = JSON.parse(fs.readFileSync(path.join(root, "env.json"), "utf8"));
+        if (platform.windows) {
+          expect({ tmpdir: report.tmpdir, tmp: report.tmp, temp: report.temp, osTmpdir: report.osTmpdir }).toEqual(parentTemp);
+          expect(fs.existsSync(path.join(root, "tmp"))).toBe(false);
+          expect(fs.existsSync(path.join(root, "unresolved-scratch.json"))).toBe(false);
+          expect(allocate).not.toHaveBeenCalled();
+        } else {
+          expect(report.tmpdir).toBe(path.join(root, "tmp"));
+          expect(report.osTmpdir).toBe(report.tmpdir);
+          expect(report.mode).toBe(0o700);
+        }
+        expect({ tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() }).toEqual(parentTemp);
+      }, args);
+      // withOwnedWorker joins the captured child's native close before returning.
+      if (platform.windows) expect(fs.existsSync(parentTemp.osTmpdir)).toBe(true);
+      expect({ tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() }).toEqual(parentTemp);
+    });
+  }
 });
 
 describe.skipIf(process.platform !== "linux")("owned execution snapshot", () => {

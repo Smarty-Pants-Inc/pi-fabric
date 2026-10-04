@@ -298,7 +298,7 @@ switch (behavior) {
       ? fs.mkdtempSync(path.join(os.tmpdir(), "ordinary-temp-"))
       : execFileSync("mktemp", [], { encoding: "utf8" }).trim();
     const report = { tmpdir, osTmpdir: os.tmpdir(), tmp: process.env.TMP, temp: process.env.TEMP,
-      mode: fs.statSync(tmpdir).mode & 0o777, scratch };
+      mode: fs.statSync(os.tmpdir()).mode & 0o777, scratch };
     // Keep concurrent worker runs overlapped; the runner must own separate roots.
     setTimeout(() => {
       emit({ type: "message_end", message: { role: "assistant", content: JSON.stringify(report) } });

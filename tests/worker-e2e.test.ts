@@ -3,7 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { markUnresolvedWorker } from "../src/storage/retention.js";
+import * as scratchScopes from "../src/storage/process-scratch-scope.js";
+import * as runScratch from "../src/storage/run-scratch.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { launchWithScratchPlatform, scratchPlatforms } from "./fixtures/run-scratch-platform.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { directiveSchema } from "../src/actors/manager.js";
@@ -25,6 +28,8 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
 
   afterEach(async () => {
     await Promise.all(managers.splice(0).map((m) => m.close()));
+    vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.unstubAllEnvs();
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
@@ -42,11 +47,16 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     return manager.run({ task, transport: "process" });
   };
 
-  it("gives concurrent real worker/Pi runs distinct private TMPDIRs and collects terminal scratch", async () => {
-    process.env.FAKE_PI_BEHAVIOR = "run-tmpdir";
+  it.each(scratchPlatforms)("preserves the concurrent real worker/Pi scratch contract ($label)", async ({ windows, simulate }) => {
+    vi.stubEnv("FAKE_PI_BEHAVIOR", "run-tmpdir");
     const parentTmpdir = process.env.TMPDIR;
     const parentTmp = process.env.TMP;
     const parentTemp = process.env.TEMP;
+    const parentOsTmpdir = os.tmpdir();
+    const allocate = vi.spyOn(runScratch, "allocateRunTmpDirectory");
+    if (simulate) vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
+      return launchWithScratchPlatform(this, request, true);
+    });
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, maxConcurrent: 2, retainRuns: true }, {
@@ -60,55 +70,96 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
         expect(result.status).toBe("completed");
         const report = JSON.parse(result.text);
         const runDirectory = manager.runDirectory(result.id)!;
-        expect(report.tmpdir).toBe(path.join(runDirectory, "tmp"));
-        expect(report.osTmpdir).toBe(report.tmpdir);
-        expect(path.dirname(report.scratch)).toBe(report.tmpdir); // real ordinary mktemp, without -p
-        if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
-        else expect(report.mode).toBe(0o700);
-        // Main's POSIX execution fence joins native exit before completion.
-        // Windows may still publish before its bounded native-close join.
-        // The post-close assertions below require scratch disposal on both.
+        if (windows) {
+          expect([report.tmpdir, report.tmp, report.temp, report.osTmpdir]).toEqual([parentTmpdir, parentTmp, parentTemp, parentOsTmpdir]);
+          expect(fs.existsSync(path.join(runDirectory, "tmp"))).toBe(false);
+          expect(fs.existsSync(path.join(runDirectory, "unresolved-scratch.json"))).toBe(false);
+          expect(allocate).not.toHaveBeenCalled();
+        } else {
+          expect(report.tmpdir).toBe(path.join(runDirectory, "tmp"));
+          expect(report.osTmpdir).toBe(report.tmpdir);
+          expect(report.mode).toBe(0o700);
+        }
+        expect(path.dirname(report.scratch)).toBe(report.osTmpdir); // real ordinary mktemp, without -p
         return report;
       });
-      expect(reports[0].tmpdir).not.toBe(reports[1].tmpdir);
+      if (windows) expect(reports[0].osTmpdir).toBe(reports[1].osTmpdir);
+      else expect(reports[0].tmpdir).not.toBe(reports[1].tmpdir);
       expect(process.env.TMPDIR).toBe(parentTmpdir);
       expect(process.env.TMP).toBe(parentTmp);
       expect(process.env.TEMP).toBe(parentTemp);
+      await manager.close(); // Native close is joined before checking disposal/inheritance.
+      for (const result of results) {
+        const report = JSON.parse(result.text);
+        const runDirectory = manager.runDirectory(result.id)!;
+        expect(fs.existsSync(report.osTmpdir)).toBe(windows);
+        expect(fs.existsSync(report.scratch)).toBe(windows);
+        expect(fs.existsSync(path.join(runDirectory, "tmp"))).toBe(false);
+        expect(fs.existsSync(path.join(runDirectory, "unresolved-scratch.json"))).toBe(false);
+        expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8")).sessionId).toBe(result.sessionId);
+        expect(fs.existsSync(path.join(runDirectory, "events.jsonl"))).toBe(true);
+      }
+      expect([process.env.TMPDIR, process.env.TMP, process.env.TEMP]).toEqual([parentTmpdir, parentTmp, parentTemp]);
+      if (windows) expect(allocate).not.toHaveBeenCalled();
     } finally {
-      // Close joins native close AND scratch disposal on both platforms.
       await manager.close();
-    }
-    for (const result of results) {
-      const report = JSON.parse(result.text);
-      const runDirectory = manager.runDirectory(result.id)!;
-      expect(fs.existsSync(report.tmpdir)).toBe(false);
-      expect(fs.existsSync(report.scratch)).toBe(false);
-      expect(fs.existsSync(path.join(runDirectory, "unresolved-scratch.json"))).toBe(false);
-      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8")).sessionId).toBe(result.sessionId);
-      expect(fs.existsSync(path.join(runDirectory, "events.jsonl"))).toBe(true);
+      // Only remove this test's ordinary temp files, never the inherited caller root.
+      if (windows) for (const result of results) if (result.status === "completed") fs.rmSync(JSON.parse(result.text).scratch, { recursive: true, force: true });
     }
   });
 
-  it("retains run artifacts when worker custody is unsettled, disposing scratch only with an independent scope receipt", async () => {
-    process.env.FAKE_PI_BEHAVIOR = "run-tmpdir";
+  it.skipIf(process.platform !== "linux")("retains unscoped scratch after a worker exits with a live detached descendant and unresolved custody", async () => {
+    // Exercise the unsupported-scope contract even on a delegated CI host.
+    vi.spyOn(scratchScopes, "createProcessScratchScope").mockReturnValue(undefined);
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, retainRuns: false }, {
-      workerPath, piBinary, runRoot: root,
+      workerPath: path.resolve("tests/fixtures/unresolved-custody-worker.mjs"), runRoot: root,
     });
     managers.push(manager);
-    let scoped = false;
-    const result = await manager.run({ task: "scratch with unsettled descendant", transport: "process" }, undefined, handle => {
-      scoped = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "unresolved-scratch.json"), "utf8")).version === 2;
-      markUnresolvedWorker(manager.runDirectory(handle.id)!, "descendant exit is unsettled");
-    });
-    expect(result.status).toBe("completed");
-    const report = JSON.parse(result.text);
-    // Scoped disposal also owes the owned native close, not just the result.
-    await manager.close();
-    expect(fs.existsSync(report.tmpdir)).toBe(!scoped);
-    expect(fs.existsSync(report.scratch)).toBe(!scoped);
-    await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track|still be running|exit is unconfirmed/);
+    let descendant: { pid: number; started: string } | undefined;
+    const executing = (owned: { pid: number; started: string }) => {
+      try {
+        const stat = fs.readFileSync(`/proc/${owned.pid}/stat`, "utf8");
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        return fields[19] === owned.started && !["Z", "X"].includes(fields[0]!);
+      } catch (error) {
+        if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
+        throw error;
+      }
+    };
+    try {
+      const handle = await manager.spawn({ task: "scratch with unsettled descendant", transport: "process" });
+      const runDirectory = manager.runDirectory(handle.id)!;
+      await vi.waitFor(() => expect(fs.existsSync(path.join(runDirectory, "descendant.json"))).toBe(true));
+      descendant = JSON.parse(fs.readFileSync(path.join(runDirectory, "descendant.json"), "utf8"));
+      expect(executing(descendant!)).toBe(true);
+      const result = await manager.wait(handle.id);
+      expect(result.status).toBe("completed");
+      const report = JSON.parse(result.text);
+      expect(report.tmpdir).toBe(path.join(runDirectory, "tmp"));
+      expect(report.pid).toBe(descendant!.pid);
+      expect(fs.existsSync(`/proc/${result.sessionId}`)).toBe(false); // Actual custodian exit, not a status-only proof.
+      expect(executing(descendant!)).toBe(true);
+      expect(fs.existsSync(path.join(runDirectory, "unresolved-worker.json"))).toBe(true); // Emitted by real transport/manager debt.
+      // Advance only the existing owner observation window AFTER native close.
+      // No OS process is mocked: the detached descendant remains genuinely live.
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      const closing = manager.close();
+      await vi.advanceTimersByTimeAsync(7_000);
+      await closing;
+      vi.useRealTimers();
+      expect(executing(descendant!)).toBe(true);
+      expect(fs.existsSync(report.tmpdir)).toBe(true);
+      expect(fs.existsSync(report.scratch)).toBe(true);
+      expect(fs.existsSync(path.join(runDirectory, "unresolved-scratch.json"))).toBe(true);
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track|still be running|exit is unconfirmed/);
+    } finally {
+      vi.useRealTimers();
+      if (descendant && executing(descendant)) process.kill(descendant.pid, "SIGKILL");
+      if (descendant) await vi.waitFor(() => expect(executing(descendant!)).toBe(false));
+      await manager.close();
+    }
   });
   it("persists the spawn-selected compatible installed release in the real worker record", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-installed-e2e-"));

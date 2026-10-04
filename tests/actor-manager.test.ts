@@ -12,6 +12,8 @@ import type { FabricMainAgentDeliveryRequest } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as runScratch from "../src/storage/run-scratch.js";
+import { launchWithScratchPlatform, scratchPlatforms } from "./fixtures/run-scratch-platform.js";
 import { closeWithActors } from "../src/actors/close-order.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
@@ -2703,27 +2705,55 @@ describe("ActorManager", () => {
     expect(listener).toHaveBeenCalledTimes(beforeUnsubscribedUpdate);
   });
 
-  it("allocates distinct private scratch per actor activation and collects terminal scratch", async () => {
+  it.each(scratchPlatforms)("preserves the scratch contract per real actor activation ($label)", async ({ windows, simulate }) => {
+    const parentTemp = { tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() };
+    const allocate = vi.spyOn(runScratch, "allocateRunTmpDirectory");
+    if (simulate) vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
+      return launchWithScratchPlatform(this, request, true);
+    });
     const { actors, agents, root } = setup(false, undefined, undefined, undefined, {}, { retainRuns: true });
     const actor = await actors.create({ name: "scratch-reviewer", instructions: "REPORT_RUN_TMPDIR", responseMode: "text", transport: "process" });
-    const reports: Array<{ tmpdir: string; scratch: string }> = [];
-    for (const message of ["first review", "second review"]) {
-      const reply = await actors.ask(actor.id, `REPORT_RUN_TMPDIR ${message}`);
-      const report = JSON.parse(reply.text!);
-      expect(report.tmpdir).toBe(path.join(root, "runs", reply.runId!, "tmp"));
-      if (process.platform === "win32") expect([report.tmp, report.temp]).toEqual([report.tmpdir, report.tmpdir]);
-      else expect(report.mode).toBe(0o700);
-      expect(path.dirname(report.scratch)).toBe(report.tmpdir);
-      expect(fs.existsSync(report.tmpdir)).toBe(false);
-      expect(fs.existsSync(path.join(path.dirname(report.tmpdir), "unresolved-scratch.json"))).toBe(false);
-      reports.push(report);
-      await waitFor(() => actors.status(actor.id).status === "idle");
+    const reports: Array<{ tmpdir: string; osTmpdir: string; scratch: string }> = [];
+    try {
+      for (const message of ["first review", "second review"]) {
+        const reply = await actors.ask(actor.id, `REPORT_RUN_TMPDIR ${message}`);
+        const report = JSON.parse(reply.text!);
+        reports.push(report);
+        const run = path.join(root, "runs", reply.runId!);
+        if (windows) {
+          expect({ tmpdir: report.tmpdir, tmp: report.tmp, temp: report.temp, osTmpdir: report.osTmpdir }).toEqual(parentTemp);
+          expect(allocate).not.toHaveBeenCalled();
+          expect(fs.existsSync(path.join(run, "tmp"))).toBe(false);
+          expect(fs.existsSync(report.osTmpdir)).toBe(true);
+          expect(fs.existsSync(report.scratch)).toBe(true);
+        } else {
+          expect(report.tmpdir).toBe(path.join(run, "tmp"));
+          expect(report.mode).toBe(0o700);
+          expect(fs.existsSync(report.tmpdir)).toBe(false);
+        }
+        expect(path.dirname(report.scratch)).toBe(report.osTmpdir);
+        expect(fs.existsSync(path.join(run, "unresolved-scratch.json"))).toBe(false);
+        await waitFor(() => actors.status(actor.id).status === "idle");
+      }
+      if (windows) expect(reports[0]!.osTmpdir).toBe(reports[1]!.osTmpdir);
+      else expect(reports[0]!.tmpdir).not.toBe(reports[1]!.tmpdir);
+      // Actor lifecycle copies logs and collects terminal originals even when
+      // the AgentManager alone would retain them.
+      expect(actors.readLog(actor.id, { type: "all" }).retainedRuns).toHaveLength(2);
+      expect(agents.list()).toEqual([]);
+      await actors.close();
+      await agents.close();
+      expect({ tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() }).toEqual(parentTemp);
+      if (windows) {
+        expect(fs.existsSync(parentTemp.osTmpdir)).toBe(true);
+        expect(allocate).not.toHaveBeenCalled();
+        for (const report of reports) expect(fs.existsSync(report.scratch)).toBe(true);
+      }
+    } finally {
+      await actors.close();
+      await agents.close();
+      if (windows) for (const report of reports) fs.rmSync(report.scratch, { recursive: true, force: true });
     }
-    expect(reports[0]!.tmpdir).not.toBe(reports[1]!.tmpdir);
-    // Actor lifecycle copies logs and collects terminal originals even when
-    // the AgentManager alone would retain them.
-    expect(actors.readLog(actor.id, { type: "all" }).retainedRuns).toHaveLength(2);
-    expect(agents.list()).toEqual([]);
   });
 
   it("keeps a persistent actor identity and processes direct mailbox messages", async () => {

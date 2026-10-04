@@ -21,6 +21,8 @@ import {
 } from "../src/agents/budget-ledger.js";
 import type { AgentRunRecord, AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as runScratch from "../src/storage/run-scratch.js";
+import { launchWithScratchPlatform, scratchPlatforms } from "./fixtures/run-scratch-platform.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -2087,19 +2089,20 @@ describe("AgentManager", () => {
     } finally { release(); spy.mockRestore(); }
   });
 
-  it("joins deadline scratch release for existing and late result observers", async () => {
+  it.each(scratchPlatforms)("joins deadline release without changing the scratch platform contract ($label)", async ({ windows, simulate }) => {
+    const parentTemp = { tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() };
+    const allocate = vi.spyOn(runScratch, "allocateRunTmpDirectory");
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 1_000, retainRuns: false, budgetUsd: 0 }, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
     });
     managers.push(manager);
-    const launch = ProcessTransport.prototype.launch;
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     let joining = false;
     const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
-      const transport = await launch.call(new ProcessTransport(), request);
+      const transport = await launchWithScratchPlatform(new ProcessTransport(), request, simulate);
       return { ...transport, async waitForClose() {
         joining = true;
         await gate;
@@ -2108,8 +2111,21 @@ describe("AgentManager", () => {
     });
     const results: Array<Promise<unknown>> = [];
     try {
-      const handle = await manager.spawn({ task: "HANG until deadline", transport: "process" });
+      const handle = await manager.spawn({ task: "HANG REPORT_RUN_TMPDIR until deadline", transport: "process" });
       const run = manager.runDirectory(handle.id)!;
+      let report!: { tmpdir: string; tmp?: string; temp?: string; osTmpdir: string };
+      await vi.waitFor(() => {
+        const record = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+        expect(record.status).toBe("running");
+        report = JSON.parse(record.text);
+      });
+      if (windows) {
+        expect(report).toEqual(parentTemp);
+        expect(allocate).not.toHaveBeenCalled();
+      } else {
+        expect(report.tmpdir).toBe(path.join(run, "tmp"));
+        expect(report.osTmpdir).toBe(report.tmpdir);
+      }
       let early = false, late = false, joined = false;
       results.push(manager.wait(handle.id).then(result => { early = true; return result; }));
       await vi.waitFor(() => expect(joining).toBe(true), { timeout: 10_000 });
@@ -2119,8 +2135,8 @@ describe("AgentManager", () => {
       results.push(manager.join(handle.id).then(() => { joined = true; }));
       await Promise.resolve();
       expect([early, late, joined], "a claimed settlement cannot bypass the owned release").toEqual([false, false, false]);
-      expect(fs.existsSync(path.join(run, "tmp"))).toBe(true);
-      expect(fs.existsSync(path.join(run, "unresolved-scratch.json"))).toBe(true);
+      expect(fs.existsSync(path.join(run, "tmp"))).toBe(!windows);
+      expect(fs.existsSync(path.join(run, "unresolved-scratch.json"))).toBe(!windows);
       await expect(manager.checkpointForRelease()).rejects.toThrow(/pending/);
       release();
       expect(await Promise.all(results)).toEqual([expect.objectContaining({ status: "timed_out" }), expect.objectContaining({ status: "timed_out" }), undefined]);
@@ -2129,6 +2145,11 @@ describe("AgentManager", () => {
       await expect(manager.checkpointForRelease()).resolves.toBeUndefined();
       await manager.close();
       expect(fs.existsSync(root)).toBe(false);
+      expect({ tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() }).toEqual(parentTemp);
+      if (windows) {
+        expect(fs.existsSync(report.osTmpdir)).toBe(true);
+        expect(allocate).not.toHaveBeenCalled();
+      }
     } finally {
       release();
       await Promise.allSettled(results);

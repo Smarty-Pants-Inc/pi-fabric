@@ -11,7 +11,7 @@ const root = () => { const dir = fs.realpathSync.native(fs.mkdtempSync(path.join
 
 // A stand-in binary answering capabilities (or only --version, like 0.4.0).
 const fake = (dir: string, answer: { capabilities?: object; version: string }) => {
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
   const file = path.join(dir, "jev-fabric");
   const capabilities = answer.capabilities ? `[ "$2" = capabilities ] && { echo '${JSON.stringify(answer.capabilities)}'; exit 0; }\n` : `[ "$2" = capabilities ] && { echo 'unknown command' >&2; exit 2; }\n`;
   fs.writeFileSync(file, `#!/bin/sh\n${capabilities}[ "$2" = --version ] && { echo '${answer.version}'; exit 0; }\nexit 2\n`, { mode: 0o755 });
@@ -31,29 +31,29 @@ describe.skipIf(process.platform === "win32")("jev-fabric binary resolution", ()
     const dir = root();
     const workspace = path.join(dir, "repo");
     fake(path.join(workspace, "bin"), current);
-    const user = fake(path.join(dir, "home", "bin"), current);
-    const found = userCandidates(workspace, { PATH: [path.join(workspace, "bin"), "relative/bin", path.join(dir, "home", "bin")].join(path.delimiter) }, dir);
+    const user = fake(path.join(dir, ".local", "bin"), current);
+    const found = userCandidates(workspace, { PATH: [path.join(workspace, "bin"), "relative/bin", path.join(dir, ".local", "bin")].join(path.delimiter) }, dir);
     expect(found.found[0]).toBe(user);
     expect(found.skipped).toEqual([{ path: path.join(workspace, "bin", "jev-fabric"), reason: "inside the workspace" }]);
   });
 
   it("prefers a compatible user install, including a newer one", async () => {
     const dir = root();
-    const user = fake(path.join(dir, "user"), newer);
+    const user = fake(path.join(dir, ".local", "bin"), newer);
     const bundled = fake(path.join(dir, "bundled"), current);
-    const resolution = await resolveJevFabric({ configured: "", cwd: path.join(dir, "repo"), agentDir: dir, home: dir, requirement: "sessions", env: { PATH: path.join(dir, "user") }, bundled: () => bundled });
+    const resolution = await resolveJevFabric({ configured: "", cwd: path.join(dir, "repo"), agentDir: dir, home: dir, requirement: "sessions", env: { PATH: path.join(dir, ".local", "bin") }, bundled: () => bundled });
     expect(resolution).toMatchObject({ path: user, source: "user", capabilities: { version: "0.7.0-native" } });
     expect(jevFabricStatus()).toContain("(yours)");
   });
 
   it("falls back to the bundled binary when the user's is too old, and says why", async () => {
     const dir = root();
-    const user = fake(path.join(dir, "user"), { version: "0.4.0-native" });
+    const user = fake(path.join(dir, ".local", "bin"), { version: "0.4.0-native" });
     const bundled = fake(path.join(dir, "bundled"), current);
-    const resolution = await resolveJevFabric({ configured: "auto", cwd: path.join(dir, "repo"), agentDir: dir, home: dir, requirement: "sessions", env: { PATH: path.join(dir, "user") }, bundled: () => bundled });
+    const resolution = await resolveJevFabric({ configured: "auto", cwd: path.join(dir, "repo"), agentDir: dir, home: dir, requirement: "sessions", env: { PATH: path.join(dir, ".local", "bin") }, bundled: () => bundled });
     expect(resolution).toMatchObject({ path: bundled, source: "bundled", skipped: [{ path: user, source: "user", reason: "protocol 1 < 2 (0.4.0-native)" }] });
     // The same old binary still serves durable tasks, which protocol 1 covers.
-    expect(await resolveJevFabric({ configured: "", cwd: path.join(dir, "repo"), agentDir: dir, home: dir, requirement: "durable", env: { PATH: path.join(dir, "user") }, bundled: () => bundled })).toMatchObject({ path: user, source: "user" });
+    expect(await resolveJevFabric({ configured: "", cwd: path.join(dir, "repo"), agentDir: dir, home: dir, requirement: "durable", env: { PATH: path.join(dir, ".local", "bin") }, bundled: () => bundled })).toMatchObject({ path: user, source: "user" });
   });
 
   it("stages the bundled binary at a versioned path that survives package upgrades", () => {

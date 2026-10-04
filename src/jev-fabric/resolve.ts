@@ -73,35 +73,77 @@ const unmet = (capabilities: JevFabricCapabilities, requirement: JevFabricRequir
 
 const inside = (child: string, parent: string): boolean => {
   const relative = path.relative(parent, child);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 };
 const real = (file: string): string => { try { return fs.realpathSync.native(file); } catch { return file; } };
 const executable = (file: string): boolean => {
   try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); } catch { return false; }
 };
 
+// A linked worktree has a .git file, not a directory. Do not invoke repository
+// code (or git) to discover this boundary. Include outer roots of nested projects.
+const enclosingRoot = (directory: string, project = false): string | undefined => {
+  const markers = project ? [".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod"] : [".git"];
+  let root: string | undefined;
+  for (let current = path.resolve(directory); ; current = path.dirname(current)) {
+    if (markers.some(marker => {
+      try { fs.lstatSync(path.join(current, marker)); return true; } catch { return false; }
+    })) root = current;
+    if (path.dirname(current) === current) return root;
+  }
+};
+
+const workspaceRoots = (cwd: string): string[] =>
+  [path.resolve(cwd), real(path.resolve(cwd))].map(directory => enclosingRoot(directory, true) ?? directory);
+
+/** Canonical installation identity, established BEFORE capabilities or credentials. */
+const installedBinary = (file: string, roots: string[], workspaces: string[]): { path?: string; reason?: string } => {
+  try {
+    if (!path.isAbsolute(file)) return { reason: "relative PATH entry" };
+    const resolved = fs.realpathSync.native(file);
+    if (workspaces.some(workspace => inside(file, workspace) || inside(resolved, workspace))) return { reason: "inside the workspace" };
+    if (enclosingRoot(path.dirname(file)) || enclosingRoot(path.dirname(resolved))) return { reason: "inside a repository or worktree" };
+    // Roots come only from host installation locations, never cwd, PATH or a
+    // repository manifest. A redirected release root does not become an allowlist.
+    const root = roots.find(root => inside(resolved, root) && fs.realpathSync.native(root) === root);
+    if (!root) return { reason: "outside trusted installation roots; use an explicit trusted binary setting for custom installs" };
+    const uid = process.getuid?.();
+    for (let current = resolved; ; current = path.dirname(current)) {
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink() || (current === resolved ? !stat.isFile() : !stat.isDirectory()) ||
+          (stat.mode & 0o022) !== 0 || (uid !== undefined && stat.uid !== uid && stat.uid !== 0)) {
+        return { reason: "installation is not host-owned or is group/world-writable" };
+      }
+      if (current === root) break;
+    }
+    return { path: resolved };
+  } catch {
+    return { reason: "cannot establish installed executable provenance" };
+  }
+};
+
 /**
- * The user's own installs: PATH entries plus the installer's default
- * `~/.local/bin`, which GUI-launched Pi often lacks. Anything inside the
- * workspace is skipped: a repository must not be able to supply the binary
- * that receives Jev credentials and runs every durable command.
+ * PATH is only a locator, not provenance. Automatic candidates must resolve to
+ * host-owned installer/release locations outside EVERY repository/worktree.
+ * Custom installation prefixes require the existing trusted explicit setting.
  */
 export function userCandidates(cwd: string, env: NodeJS.ProcessEnv = process.env, home = os.homedir()): { found: string[]; skipped: Array<{ path: string; reason: string }> } {
-  const workspace = real(cwd);
+  const workspaces = workspaceRoots(cwd);
+  const hostHome = real(path.resolve(home));
+  const roots = [path.join(hostHome, ".local", "share", "jev-fabric"), path.join(hostHome, ".local", "bin"), "/usr/local/bin", "/usr/bin"];
   const directories = (env.PATH ?? "").split(path.delimiter).filter(Boolean);
-  directories.push(path.join(home, ".local", "bin"));
+  directories.push(path.join(hostHome, ".local", "bin"));
   const found: string[] = [];
   const skipped: Array<{ path: string; reason: string }> = [];
   const seen = new Set<string>();
   for (const directory of directories) {
     const file = path.join(directory, "jev-fabric");
     if (!executable(file)) continue;
-    const resolved = real(file);
-    if (seen.has(resolved)) continue;
-    seen.add(resolved);
-    if (!path.isAbsolute(directory)) skipped.push({ path: file, reason: "relative PATH entry" });
-    else if (inside(file, workspace) || inside(resolved, workspace)) skipped.push({ path: file, reason: "inside the workspace" });
-    else found.push(file);
+    const identity = installedBinary(file, roots, workspaces);
+    if (!identity.path) { skipped.push({ path: file, reason: identity.reason! }); continue; }
+    if (seen.has(identity.path)) continue;
+    seen.add(identity.path);
+    found.push(identity.path);
   }
   return { found, skipped };
 }
@@ -188,8 +230,13 @@ export async function resolveJevFabric(options: {
   }
   const bundled = (options.bundled ?? (() => stageBundledJevFabric(options.agentDir)))();
   if (bundled) {
-    const resolution = await tryCandidate(bundled, "bundled");
-    if (resolution) return finish(resolution);
+    const root = real(path.resolve(options.agentDir));
+    const identity = installedBinary(bundled, [root], workspaceRoots(options.cwd));
+    if (!identity.path) skipped.push({ path: bundled, source: "bundled", reason: identity.reason! });
+    else {
+      const resolution = await tryCandidate(identity.path, "bundled");
+      if (resolution) return finish(resolution);
+    }
   }
   const tried = skipped.length ? ` Tried: ${skipped.map(s => `${s.path} (${s.reason})`).join("; ")}.` : "";
   setJevFabricStatus(`unavailable for ${options.requirement}${tried}`);

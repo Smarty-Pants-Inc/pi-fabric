@@ -91,7 +91,9 @@ const readConfinedFile = (root: string, file: string): ConfinedFile | null => {
     // stat through parents which an attacker can redirect immediately before open.
     if (!expected?.isFile()) return null;
     const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+    // A leaf can become a FIFO after lstat. O_NONBLOCK lets descriptor type /
+    // identity checks reject it without blocking Pi's event loop in openSync.
+    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow | fs.constants.O_NONBLOCK);
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || stat.dev !== expected.dev || stat.ino !== expected.ino) return null;
     // Linux exposes the opened handle's actual target. A parent may have been

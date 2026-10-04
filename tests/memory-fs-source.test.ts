@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -159,6 +160,40 @@ describe("filesystem memory source adapter", () => {
       const source = createFileSystemMemorySource({ id: "race", root });
       expect(await source.loadSession("nested/s.jsonl", {})).toBeNull();
       expect(read).not.toHaveBeenCalled();
+    } finally { spy.mockRestore(); read.mockRestore(); }
+  });
+
+  it.skipIf(process.platform !== "linux").each(["load", "list"])("SR-12 rejects a FIFO swapped immediately before %s open without blocking event-loop cancellation", async (operation) => {
+    const root = track(rootDir("fifo-race"));
+    const file = writeSessionFile(root, "s.jsonl", recordsFor("safe", "/work", ["safe"]));
+    const source = createFileSystemMemorySource({ id: "fifo-race", root });
+    const controller = new AbortController();
+    const open = fs.openSync.bind(fs);
+    const read = vi.spyOn(fs, "readFileSync");
+    let swapped = false;
+    const spy = vi.spyOn(fs, "openSync").mockImplementation(((target: any, flags: any, mode: any) => {
+      if (target === file && !swapped) {
+        // Fail before entering the kernel if the nonblocking flag regresses:
+        // a test timeout cannot interrupt a synchronous blocking FIFO open.
+        expect(flags & fs.constants.O_NONBLOCK).not.toBe(0);
+        expect(flags & fs.constants.O_NOFOLLOW).not.toBe(0);
+        fs.unlinkSync(file);
+        execFileSync("mkfifo", [file]);
+        swapped = true;
+      }
+      return open(target, flags, mode);
+    }) as typeof fs.openSync);
+    const tick = new Promise<void>(resolve => setImmediate(() => { controller.abort(); resolve(); }));
+    const start = Date.now();
+    try {
+      if (operation === "load") expect(await source.loadSession("s.jsonl", { signal: controller.signal })).toBeNull();
+      else expect(asArray(await source.listSessions({ limit: 1, signal: controller.signal })).sessions).toEqual([]);
+      expect(swapped).toBe(true);
+      expect(read).not.toHaveBeenCalled();
+      await tick;
+      expect(controller.signal.aborted).toBe(true);
+      expect(Date.now() - start).toBeLessThan(2_000);
+      await expect(source.loadSession("s.jsonl", { signal: controller.signal })).rejects.toThrow();
     } finally { spy.mockRestore(); read.mockRestore(); }
   });
 

@@ -770,7 +770,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     if (method === "abort") ac.abort();
     else expect((await manager.stop(handle.id)).status).toBe("stopped");
     const result = await manager.wait(handle.id);
-    expect(result.status, result.error).toBe("stopped");
+    expect(result.status, JSON.stringify(result)).toBe("stopped");
     expect(manager.status(handle.id).status).toBe("stopped");
   });
 

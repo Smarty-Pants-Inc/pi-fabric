@@ -116,7 +116,10 @@ async function supervise(configPath: string): Promise<void> {
       env: { ...process.env, PI_FABRIC_RESIDENT_CONFIG: snapshot,
         PI_FABRIC_RESIDENT_LAUNCHER: spec ? JSON.stringify(launcher) : "",
         PI_FABRIC_RESIDENT_SPEC_DIGEST: spec?.digest ?? "",
-        PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "" },
+        PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "",
+        // Per-attempt argument, never shared config another client may rewrite.
+        PI_FABRIC_RESIDENT_LAUNCH_TOKEN: process.argv.includes("--launch-token")
+          ? process.argv[process.argv.indexOf("--launch-token") + 1] ?? "" : "" },
     });
     const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child),
       seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };

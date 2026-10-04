@@ -56,7 +56,7 @@ const decision = await decisions.wait({ id });          // resolves on answer, e
 if (decision.answer?.optionId === "go") { /* … */ }
 ```
 
-Python uses the same calls, for example `await decisions.raise(title="Deploy?", input="confirm")`.
+Python uses generic dispatch for `raise`, which is a Python keyword: `await tools.call(ref="decisions.raise", args={"title": "Deploy?", "input": "confirm"})`. Other decision actions use the ordinary calls.
 
 | Action | Risk | Result |
 | --- | --- | --- |

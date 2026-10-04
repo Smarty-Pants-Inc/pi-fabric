@@ -2523,7 +2523,14 @@ export class ActorManager {
           }
           // The current activation is fresh; retained outcomes are labelled context,
           // not retried activations with rewritten freshness facts.
-          item.handoffContext = this.#deferredHandoffs.get(actor.id)?.slice() ?? [];
+          const deferred = this.#deferredHandoffs.get(actor.id) ?? [];
+          const store = this.#childCompletionStore(actor);
+          item.handoffContext = deferred.filter((handoff) => store.retained(handoff.id, this.#logs.retention.actorRunArchiveMs));
+          if (item.handoffContext.length !== deferred.length) {
+            if (item.handoffContext.length) this.#deferredHandoffs.set(actor.id, item.handoffContext.slice());
+            else this.#deferredHandoffs.delete(actor.id);
+            this.#persistQueue(actor.id);
+          }
           if (actor.requirements.length > 0 && this.#acquireCapabilityView) {
             capabilityLease = await this.#prepare(actor, "capabilities", () => this.#acquireCapabilityView!(
               actor.requirements,
@@ -3991,6 +3998,7 @@ export class ActorManager {
         preparationAttempts: counter(value.preparationAttempts),
       } as ActorQueueItem & { attempts: number };
       if (deferredHandoff) {
+        if (!this.#childCompletionStore(actor).retained(value.id, this.#logs.retention.actorRunArchiveMs)) continue;
         const deferred = this.#deferredHandoffs.get(actor.id) ?? [];
         deferred.push({ ...item, deferredHandoff: true });
         this.#deferredHandoffs.set(actor.id, deferred);

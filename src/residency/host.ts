@@ -427,7 +427,7 @@ export class ResidentHost {
       return participant ? participant.ownerHostId === this.hostId : undefined;
     };
     const snapshotActorOwnership = (): ReadonlyMap<string, boolean> => new Map(
-      this.participants.list({ scope: "project" })
+      this.participants.list({ scope: "project", fresh: true })
         .map((participant) => [participant.id, participant.ownerHostId === this.hostId]),
     );
     const lineageAlive = (rootId: string): boolean =>

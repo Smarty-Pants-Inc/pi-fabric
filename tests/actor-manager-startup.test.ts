@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
+import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -50,7 +52,7 @@ function fixture(count: number) {
     }); managers.push(value); return value;
   };
   const runDir = (actor: number, run: number) => path.join(actorRoot, records[actor]!.id, "runs", `run-${actor}-${run}`);
-  return { actorRoot, records, make, runDir };
+  return { actorRoot, records, make, runDir, agents: manager };
 }
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -120,6 +122,50 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     expect(manager.listOwned()).toEqual([]);
     expect(lineageAlive).toHaveBeenCalledTimes(1);
     expect(fs.existsSync(f.runDir(0, 0))).toBe(true);
+  });
+
+  it.each(["restore", "admission"] as const)("rejects expired context in a later batch before maintenance, but protects a fresh active snapshot (%s)", async (phase) => {
+    const f = fixture(17), actor = f.records[16]!;
+    new ActorRegistryStore(f.actorRoot).write(f.records.map((record) => ({ ...record, status: "idle" })));
+    const sessionFile = path.join(f.actorRoot, actor.id, "session.jsonl");
+    const store = new ActorChildCompletionStore(sessionFile);
+    const expired = "e".repeat(32), fresh = "f".repeat(32);
+    const old = new Date(Date.now() - DEFAULT_FABRIC_CONFIG.retention.actorRunArchiveMs - 1000);
+    fs.mkdirSync(store.directory, { recursive: true });
+    for (const id of [expired, fresh]) {
+      fs.writeFileSync(store.resultFile(id), JSON.stringify({ id, text: id }));
+      store.consume(id, { handoff: true });
+      if (id === expired && phase === "restore") for (const suffix of [".result.json", ".receipt"]) fs.utimesSync(path.join(store.directory, id + suffix), old, old);
+    }
+    const key = createHash("sha256").update(["session:startup", "session"].join("\0")).digest("hex").slice(0, 16);
+    fs.writeFileSync(path.join(f.actorRoot, actor.id, `queue-${key}.json`), JSON.stringify({ format: 1, cleanHandover: true,
+      items: [expired, fresh].map((id) => ({ id, source: "child-completion", deferredHandoff: true, createdAt: Date.now(),
+        activation: { kind: "direct", source: "child-completion", sequence: 1 }, payload: { resultFile: store.resultFile(id) } })) }));
+    let release!: () => void, started!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const running = new Promise<void>((resolve) => { started = resolve; });
+    const tasks: string[] = [];
+    vi.spyOn(f.agents, "run").mockImplementation(async (request) => {
+      tasks.push(request.task); started(); await gate; throw new Error("fixture ended");
+    });
+    // Freeze only maintenance turns, not promise/lock I/O. This proves admission
+    // happens before the last actor's retention slice, rather than relying on timing.
+    vi.useFakeTimers({ toFake: ["setImmediate", "clearImmediate"] });
+    try {
+      const manager = f.make();
+      // Also cover a restored handoff that expires after loading but before drain.
+      if (phase === "admission") for (const suffix of [".result.json", ".receipt"]) fs.utimesSync(path.join(store.directory, expired + suffix), old, old);
+      manager.tell(actor.id, "immediate post-restart activation");
+      await running;
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]).not.toContain(store.resultFile(expired));
+      expect(tasks[0]).toContain(store.resultFile(fresh));
+      expect(fs.existsSync(store.resultFile(expired))).toBe(true); // No sweep yet.
+      for (const suffix of [".result.json", ".receipt"]) fs.utimesSync(path.join(store.directory, fresh + suffix), old, old);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(fs.existsSync(store.resultFile(expired))).toBe(false);
+      expect(fs.existsSync(store.resultFile(fresh))).toBe(true); // Already-active context is fenced.
+    } finally { release(); vi.useRealTimers(); }
   });
 
   it("does not consume archives when the resident lease is lost before the deferred sweep", async () => {

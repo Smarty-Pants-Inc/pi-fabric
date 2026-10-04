@@ -837,7 +837,7 @@ export class FabricRuntimeState {
       return participant ? participant.ownerHostId === hostId : undefined;
     };
     const snapshotActorOwnership = (): ReadonlyMap<string, boolean> => new Map(
-      (this.#participants?.list({ scope: "project" }) ?? [])
+      (this.#participants?.list({ scope: "project", fresh: true }) ?? [])
         .map((participant) => [participant.id, participant.ownerHostId === hostId]),
     );
     const lineageAlive = (rootId: string): boolean =>

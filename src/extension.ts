@@ -17,7 +17,7 @@ import {
 } from "./ui/code-preview-shell.js";
 import { registerFabricActorHostEventObservers } from "./actors/host-event-observer.js";
 import { CapturedToolCatalog } from "./capture/catalog.js";
-import { isSelectedNativeMcpTool } from "./core/native-mcp-identity.js";
+import { isSelectedNativeMcpTool, nativeMcpIdentity } from "./core/native-mcp-identity.js";
 import { installRegisteredToolCapture } from "./capture/interceptor.js";
 import { registerFabricCommand } from "./commands/fabric.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
@@ -284,6 +284,18 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     pi,
     () => state.config,
     state.sessionApprovals,
+    undefined,
+    undefined,
+    (toolName, config) => {
+      const definition = pi.getAllTools().find((tool) => tool.name === toolName);
+      const namespace = definition?.namespace?.name;
+      const selected = namespace?.startsWith("mcp__") && (config.mcp.nativeServers ?? []).includes(namespace.slice(5));
+      if (!selected) return undefined;
+      const registered = capturedTools.registeredTools().find((entry) => entry.definition.name === toolName);
+      const identity = nativeMcpIdentity(registered?.definition);
+      if (!identity) throw new Error(`Unsupported Pi MCP identity metadata for ${toolName}; refusing native dispatch`);
+      return identity;
+    },
   );
   const pendingHandoffs = new Map<string, PendingFabricHandoff>();
   const toolOwnership = new FabricToolOwnership(pi);

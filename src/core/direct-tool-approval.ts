@@ -5,6 +5,9 @@ import type {
   ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { FabricConfig } from "../config.js";
+
+export interface NativeMcpApprovalIdentity { server: string; tool: string }
+export type ResolveNativeMcpApprovalIdentity = (toolName: string, config: FabricConfig) => NativeMcpApprovalIdentity | undefined;
 import type { ResolvedFabricAction } from "./action-registry.js";
 import type { FabricAutoApprovalAudit } from "./approval-controller.js";
 import type { FabricSessionApprovals } from "./session-approvals.js";
@@ -52,6 +55,7 @@ export class FabricDirectToolApproval {
       audit: FabricAutoApprovalAudit,
       decision?: FabricAutoApprovalDecision,
     ) => void,
+    readonly resolveNativeMcpIdentity?: ResolveNativeMcpApprovalIdentity,
   ) {}
 
   async approve(event: ToolCallEvent, context: ExtensionContext): Promise<void> {
@@ -86,9 +90,11 @@ export class FabricDirectToolApproval {
   #resolve(toolName: string, config: FabricConfig): ResolvedFabricAction {
     const metadata = this.pi.getAllTools().find((tool) => tool.name === toolName);
     const builtin = metadata?.sourceInfo.source === "builtin";
-    const provider = builtin ? "pi" : "extensions";
+    const nativeMcp = this.resolveNativeMcpIdentity?.(toolName, config);
+    const provider = nativeMcp ? "mcp" : (builtin ? "pi" : "extensions");
+    const ref = nativeMcp ? `mcp.${nativeMcp.server}.${nativeMcp.tool}` : provider + "." + toolName;
     return {
-      ref: provider + "." + toolName,
+      ref,
       provider,
       name: toolName,
       description: metadata?.description ?? "Direct Pi tool: " + toolName,

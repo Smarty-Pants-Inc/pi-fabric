@@ -155,42 +155,44 @@ describe("F3059 absent lineage death proof", () => {
 
   it("requires known actor presence older than ten minutes, never absence alone", async () => {
     const { directory, id, at } = await seed();
-    expect(directory.lineageAlive(id, at + 20_000)).toBe(true);
-    expect(directory.lineageAlive(id, at + 600_000)).toBe(true);
-    expect(directory.lineageAlive(id, at + 600_001)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 20_000)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 600_000)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 600_001)).toBe(true);
+    expect(directory.lineageAlive(id, at + 600_001)).toBe(true); // Aged absence is not routing death.
     expect(directory.lineageAlive("session:never-known", at + 86_400_000)).toBe(true);
+    expect(directory.lineageAdoptable("session:never-known", at + 86_400_000)).toBe(false);
   });
 
   it("waits twice the longest host/presence TTL, even with a shortened test grace", async () => {
     const { directory, id, at } = await seed(400_000);
     directory.options.lineageDeathGraceMs = 1;
-    expect(directory.lineageAlive(id, at + 799_999)).toBe(true);
-    expect(directory.lineageAlive(id, at + 800_001)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 799_999)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 800_001)).toBe(true);
   });
 
   it("fresh actor presence restarts the grace, rather than using actor creation time", async () => {
     const { directory, id, at, identity } = await seed();
-    expect(directory.lineageAlive(id, at + 700_000)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 700_000)).toBe(true);
     const clock = vi.spyOn(Date, "now").mockReturnValue(at + 700_000);
     try { await directory.mesh.put({ key: "actors/absent/actor", identity, value: { id: "actor", name: "retained", runner: "pi", status: "idle", rootId: id, createdAt: 1 } }); }
     finally { clock.mockRestore(); }
-    expect(directory.lineageAlive(id, at + 700_001)).toBe(true);
+    expect(directory.lineageAdoptable(id, at + 700_001)).toBe(false);
   });
 
   it("retains invalid and unreadable host leases, rather than interpreting skipped data as absence", async () => {
     const { directory, id, at } = await seed();
     const dir = path.join(directory.mesh.root, "host-leases"); fs.mkdirSync(dir);
     const file = path.join(dir, "broken.json"); fs.writeFileSync(file, "{torn");
-    expect(directory.lineageAlive(id, at + 700_000)).toBe(true);
+    expect(directory.lineageAdoptable(id, at + 700_000)).toBe(false);
     fs.unlinkSync(file);
     const read = fs.readdirSync;
     const spy = vi.spyOn(fs, "readdirSync").mockImplementation((...args: Parameters<typeof fs.readdirSync>) => {
       if (String(args[0]) === dir) throw Object.assign(new Error("denied"), { code: "EACCES" });
       return read(...args);
     });
-    try { expect(directory.lineageAlive(id, at + 700_000)).toBe(true); }
+    try { expect(directory.lineageAdoptable(id, at + 700_000)).toBe(false); }
     finally { spy.mockRestore(); }
-    expect(directory.lineageAlive(id, at + 700_000)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 700_000)).toBe(true);
   });
 
   it("retains unreadable/invalid actor participant files and read errors during the second proof scan", async () => {
@@ -198,7 +200,7 @@ describe("F3059 absent lineage death proof", () => {
     const hash = createHash("sha256").update("actor:unknown").digest("hex");
     const dir = path.join(directory.mesh.root, "participants"); fs.mkdirSync(dir);
     const file = path.join(dir, hash + ".json"); fs.writeFileSync(file, "{torn");
-    expect(directory.lineageAlive(id, at + 700_000)).toBe(true);
+    expect(directory.lineageAdoptable(id, at + 700_000)).toBe(false);
     fs.unlinkSync(file);
     const list = directory.mesh.listAll.bind(directory.mesh);
     let reads = 0;
@@ -206,7 +208,7 @@ describe("F3059 absent lineage death proof", () => {
       if (prefix === "actors/" && ++reads === 2) throw new Error("second scan unreadable");
       return list(prefix, options);
     });
-    expect(directory.lineageAlive(id, at + 700_000)).toBe(true);
+    expect(directory.lineageAdoptable(id, at + 700_000)).toBe(false);
   });
 
   it("uses retained modern actor presence, but never child-agent history alone, as an absence proof", async () => {
@@ -215,16 +217,16 @@ describe("F3059 absent lineage death proof", () => {
     const actorId = "actor:retained", key = "topology/participants/" + createHash("sha256").update(actorId).digest("hex");
     const participant = { ...rootRecord(actorId, id, "absent"), rootId: id, kind: "agent" as const, updatedAt: at };
     writeParticipantFile(directory.mesh.root, { key, version: 1, updatedBy: identity, updatedAt: at, value: participant });
-    expect(directory.lineageAlive(id, at + 700_000)).toBe(true);
+    expect(directory.lineageAdoptable(id, at + 700_000)).toBe(false);
     writeParticipantFile(directory.mesh.root, { key, version: 2, updatedBy: identity, updatedAt: at, value: { ...participant, kind: "actor" } });
-    expect(directory.lineageAlive(id, at + 20_000)).toBe(true);
-    expect(directory.lineageAlive(id, at + 700_000)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 20_000)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 700_000)).toBe(true);
   });
 
   it("malformed retained legacy actor evidence is unknown, not a death proof", async () => {
     const { directory, id, at, identity } = await seed();
     await directory.mesh.put({ key: "actors/absent/actor", identity, value: { id: "actor", rootId: id } });
-    expect(directory.lineageAlive(id, at + 700_000)).toBe(true);
+    expect(directory.lineageAdoptable(id, at + 700_000)).toBe(false);
   });
 
   it("production cannot shorten the ten-minute floor with test seams", async () => {
@@ -232,8 +234,8 @@ describe("F3059 absent lineage death proof", () => {
     directory.options.lineageDeathGraceMs = 1;
     vi.stubEnv("NODE_ENV", "production"); vi.stubEnv("PI_FABRIC_TEST_LINEAGE_DEATH_GRACE_MS", "1");
     try {
-      expect(directory.lineageAlive(id, at + 120_000)).toBe(true);
-      expect(directory.lineageAlive(id, at + 600_001)).toBe(false);
+      expect(directory.lineageAdoptable(id, at + 120_000)).toBe(false);
+      expect(directory.lineageAdoptable(id, at + 600_001)).toBe(true);
     } finally { vi.unstubAllEnvs(); }
   });
 
@@ -241,19 +243,32 @@ describe("F3059 absent lineage death proof", () => {
     const { directory, id, at } = await seed();
     writeHostLease(directory.mesh.root, { id, rootId: id, identityId: id, updatedAt: at, expiresAt: at + 400_000 });
     directory.options.lineageDeathGraceMs = 1;
-    expect(directory.lineageAlive(id, at + 1_199_999)).toBe(true);
-    expect(directory.lineageAlive(id, at + 1_200_001)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 1_199_999)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 1_200_001)).toBe(true);
+  });
+
+  it("recognizes explicit routing closure while a live resident still vetoes adoption", async () => {
+    const { directory, id, identity } = await seed();
+    await directory.mesh.put({
+      key: "topology/lineage-closures/" + createHash("sha256").update(id).digest("hex"), identity,
+      value: { format: 1, rootId: id, ownerHostId: id, ownerIdentityId: id, closedAt: Date.now() },
+    });
+    writeHostLease(directory.mesh.root, { id: "resident:live", rootId: id, identityId: "resident:live", updatedAt: Date.now(), expiresAt: Date.now() + 15_000 });
+    expect(directory.lineageAlive(id)).toBe(false);
+    expect(directory.lineageAdoptable(id)).toBe(false);
   });
 
   it("fences absent-root resume even without a clean-close receipt", async () => {
     const { directory, id, at } = await seed();
     const resumed = new ParticipantDirectory(directory.mesh, { enabled: true, hostId: id, rootId: id, identity: { id, name: "main", kind: "main" } });
     directories.push(resumed);
-    expect(directory.lineageAlive(id, at + 700_000)).toBe(false);
+    expect(directory.lineageAdoptable(id, at + 700_000)).toBe(true);
+    const custody = vi.spyOn(directory.mesh, "exclusive");
     const batch = vi.spyOn(directory.mesh, "writeBatch");
     await resumed.resumeLineage();
-    expect(batch).toHaveBeenCalledTimes(1);
-    expect(directory.lineageAlive(id)).toBe(true);
+    expect(custody).toHaveBeenCalledTimes(1);
+    expect(batch).not.toHaveBeenCalled();
+    expect(directory.lineageAdoptable(id)).toBe(false);
   });
 });
 

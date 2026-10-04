@@ -854,6 +854,8 @@ export class FabricRuntimeState {
     const canConsumeActorMesh = () => actorParticipants.canConsumeMesh();
     const lineageAlive = (rootId: string): boolean =>
       this.#participants?.lineageAlive(rootId) ?? true;
+    const lineageAdoptable = (rootId: string): boolean =>
+      this.#participants?.lineageAdoptable(rootId) ?? false;
     const actorRoots = {
       project: path.join(meshRoot, "actors"),
       session: path.join(meshRoot, "actors", fabricSessionId),
@@ -897,6 +899,7 @@ export class FabricRuntimeState {
             canConsumeMesh: canConsumeActorMesh,
             isOwnResidentActor: (id) => isOwnResidentActor(this.#participants!, id, mainAgentId),
             lineageAlive,
+            lineageAdoptable,
             claimResidency: "session",
             rootId: mainAgentId,
             project: participantProject(context.cwd),
@@ -919,6 +922,7 @@ export class FabricRuntimeState {
             snapshotActorOwnership,
             canConsumeMesh: canConsumeActorMesh,
             lineageAlive,
+            lineageAdoptable,
             claimResidency: "session",
             rootId: mainAgentId,
             project: participantProject(context.cwd),

@@ -851,19 +851,42 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   /**
-   * Raw Main presence (even stale/invalid) vetoes inheritance. An absent Main needs
-   * either its clean-close receipt or aged actor presence, AND no live lineage host.
-   * Never infer death from lease-filtered get/lastKnown snapshots (#4623).
+   * Strict delivery liveness. Live, stale, and unknown roots are not confirmed dead; only a
+   * root-owned clean-close receipt, with no conflicting presence, proves death.
+   * The aged-absence proof below is deliberately not used here.
    */
-  lineageAlive(rootId: string, now = Date.now()): boolean {
-    if (!this.options.enabled || !Number.isFinite(now)) return true;
+  lineageAlive(rootId: string, _now = Date.now()): boolean {
+    if (!this.options.enabled) return true;
+    const target = rootId === "main" ? this.options.rootId : rootId;
+    const key = keyFor(PARTICIPANT_PREFIX, target);
+    try {
+      if (participantFilePresent(this.mesh.root, key)) return true;
+      if (this.mesh.get(key, { fresh: true }) !== undefined) return true;
+      if (target.startsWith("session:") && this.mesh.get(LEGACY_SESSION_PREFIX + target.slice(8), { fresh: true }) !== undefined) return true;
+      const entry = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, target), { fresh: true });
+      const receipt = entry?.value;
+      if (!(isObject(receipt) && receipt.format === 1 && receipt.rootId === target &&
+        receipt.ownerHostId === target && receipt.ownerIdentityId === target &&
+        entry?.updatedBy.id === target && entry.updatedBy.kind === "main" &&
+        typeof receipt.closedAt === "number" && Number.isFinite(receipt.closedAt))) return true;
+      if (participantFilePresent(this.mesh.root, key) || this.mesh.get(key, { fresh: true }) !== undefined) return true;
+      if (target.startsWith("session:") && this.mesh.get(LEGACY_SESSION_PREFIX + target.slice(8), { fresh: true }) !== undefined) return true;
+      return this.mesh.get(entry.key, { fresh: true })?.version !== entry.version;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Adoption-only relaxed proof. True means the absent lineage is safe to adopt. */
+  lineageAdoptable(rootId: string, now = Date.now()): boolean {
+    if (!this.options.enabled || !Number.isFinite(now)) return false;
     const target = rootId === "main" ? this.options.rootId : rootId;
     try {
-      // Read the entire proof twice: file-only publishers can renew without the mesh
-      // lock. The final adoption decision still runs under registry + mesh custody.
-      return this.#absentLineageMayBeAlive(target, now) || this.#absentLineageMayBeAlive(target, now);
+      // Both scans must prove death; a file-only publisher can renew without the
+      // mesh lock. Adoption rechecks again under registry + mesh custody.
+      return !this.#absentLineageMayBeAlive(target, now) && !this.#absentLineageMayBeAlive(target, now);
     } catch {
-      return true; // Unknown/unreadable/malformed is never positive proof.
+      return false;
     }
   }
 
@@ -1140,7 +1163,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const rootKey = keyFor(PARTICIPANT_PREFIX, this.options.rootId);
     if (!this.#localRecords.has(this.options.rootId) ||
       (!participantFilePresent(this.mesh.root, rootKey) && this.mesh.get(rootKey, { fresh: true }) === undefined)) {
-      await this.mesh.writeBatch({ identity: this.options.identity, ops: [], afterCommit: () => { this.#renewFileLease(); } });
+      await this.mesh.exclusive(() => { this.#renewFileLease(); });
     }
     const closure = this.mesh.get(keyFor(LINEAGE_CLOSURE_PREFIX, this.options.rootId), { fresh: true });
     if (closure) await this.mesh.delete({ key: closure.key, ifVersion: closure.version });

@@ -414,6 +414,7 @@ export class ActorManager {
   readonly #resolvePiModel: ((model: string, requiredPin?: boolean) => string | Promise<string>) | undefined;
   readonly #prepareModelRoute: ((input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
+  readonly #lineageAdoptable: ((rootId: string) => boolean) | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
   readonly #project: string | undefined;
@@ -505,6 +506,8 @@ export class ActorManager {
       /** Host-owned shared shadow preparation; never supplied by public actor arguments. */
       prepareModelRoute?: (input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>;
       lineageAlive?: (rootId: string) => boolean;
+      /** Adoption-only relaxed proof; never use this for message delivery. */
+      lineageAdoptable?: (rootId: string) => boolean;
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
       rootId?: string;
@@ -554,6 +557,7 @@ export class ActorManager {
     this.#resolvePiModel = options.resolvePiModel;
     this.#prepareModelRoute = options.prepareModelRoute;
     this.#lineageAlive = options.lineageAlive;
+    this.#lineageAdoptable = options.lineageAdoptable;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
     this.#rootId = options.rootId ?? identity.id;
@@ -4430,7 +4434,9 @@ export class ActorManager {
 
   #lineageMayBeAlive(rootId: string): boolean {
     try {
-      // As with delivery, only explicit confirmed death authorizes cross-root inheritance.
+      // Only adoption may use aged absence. Keep the old callback as a
+      // compatibility seam for embedders that provide explicit death only.
+      if (this.#lineageAdoptable) return this.#lineageAdoptable(rootId) !== true;
       return this.#lineageAlive?.(rootId) !== false;
     } catch {
       return true;

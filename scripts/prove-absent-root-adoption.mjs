@@ -88,7 +88,7 @@ try {
   await wait(async () => { await reapDeadHostRecords(mesh, { id: 'isolated-reaper', name: 'proof', kind: 'main' }, { ownHostId: 'isolated-reaper', deadAfterMs: 0 }); return mesh.get(rootKey, { fresh: true }) === undefined && !fs.existsSync(path.join(meshRoot, 'participants', rootKey.slice('topology/participants/'.length) + '.json')); }, 'native root reaping', 40000);
   assert.equal(mesh.get('topology/lineage-closures/' + createHash('sha256').update(oldRoot).digest('hex')), undefined);
   const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: 'proof-observer', rootId: 'proof-observer', identity: { id: 'proof-observer', name: 'observer', kind: 'main' }, reapDeadHosts: false });
-  assert.equal(directory.lineageAlive(oldRoot), true, 'Grace must still veto immediately after host stop');
+  assert.equal(directory.lineageAdoptable(oldRoot), false, 'Grace must still veto immediately after host stop');
   record('absent-before-grace', { oldRoot, actorId, rootAbsent: true, closureAbsent: true, stillAlive: true, legacyPresence: mesh.listAll('actors/').filter(entry => entry.value?.rootId === oldRoot) });
   const b = await make('main-b'), bootstrap = await invoke(b, { create: true, name: 'successor-host-bootstrap' }), newRoot = bootstrap.main.id;
   assert.notEqual(oldRoot, newRoot); assert.equal(directory.get(newRoot, Date.now(), { fresh: true })?.role, 'project-agent'); assert.equal(created.actor.project, bootstrap.actor.project);
@@ -99,7 +99,8 @@ try {
   assert.ok(registryPath);
   await wait(() => json(registryPath)?.actors?.find(row => row.id === actorId)?.rootId === newRoot && directory.get(actorId, Date.now(), { fresh: true })?.rootId === newRoot, 'same-project native adoption');
   const adopted = (await invoke(b, { status: true, id: actorId })).actor;
-  assert.equal(directory.lineageAlive(oldRoot), false); assert.equal(adopted.id, actorId);
+  assert.equal(directory.lineageAlive(oldRoot), true, 'Aged absence must remain unknown for routing');
+  assert.equal(directory.lineageAdoptable(oldRoot), true); assert.equal(adopted.id, actorId);
   await invoke(b, { event: true });
   await wait(() => files(created.actor.logDir).some(file => path.basename(file) === 'status.json' && json(file)?.status === 'completed'), 'adopted native worker completion');
   const messages = await invoke(b, { messages: true, id: actorId });

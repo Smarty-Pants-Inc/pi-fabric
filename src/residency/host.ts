@@ -436,6 +436,8 @@ export class ResidentHost {
     );
     const lineageAlive = (rootId: string): boolean =>
       this.participants.lineageAlive(rootId);
+    const lineageAdoptable = (rootId: string): boolean =>
+      this.participants.lineageAdoptable(rootId);
     const actorRoots = residentActorRoots(config);
     this.#routeOwner = new ShadowRouteOwner(() => currentConfig().shadowRouting ?? config.shadowRouting);
     this.actors = new ActorDirectory([
@@ -482,6 +484,7 @@ export class ResidentHost {
         canManageActor,
         snapshotActorOwnership,
         lineageAlive,
+        lineageAdoptable,
         claimResidency: "durable",
         rootId: config.rootId,
         // Recorded on every actor it creates, and the only project whose orphans it adopts, and

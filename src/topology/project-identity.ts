@@ -225,7 +225,7 @@ export const deliveryRoot = (
   liveRoots: readonly ProjectRoot[],
   project: string,
   options: {
-    /** The same lineage test used by orphan adoption, not a lease-filtered root listing. */
+    /** Strict delivery lineage test, not the adoption-only aged-absence proof or a lease-filtered listing. */
     lineageAlive?: (rootId: string) => boolean;
     /** Read launch metadata only after confirmed death, never during idle registration. */
     boundIntegrator?: () => { repository?: string; leadId?: string };

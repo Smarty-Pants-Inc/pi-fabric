@@ -63,6 +63,7 @@ const fixture = async () => {
       actorRoot: path.join(root, "actors"), persistent: true, rootId, project, role, claimResidency: "durable", adoptionGraceMs: 0,
       canManageActor: id => { const participant = directory.get(id, Date.now(), { fresh: true }); return participant ? participant.ownerHostId === hostId : undefined; },
       lineageAlive: id => directory.lineageAlive(id),
+      lineageAdoptable: id => directory.lineageAdoptable(id),
     });
     cleanups.push(() => manager.close());
     return manager;
@@ -73,7 +74,8 @@ const fixture = async () => {
 describe("F3059 aged absent-root adoption", () => {
   it("reaps the root, then two same-project project-agent hosts adopt and run one event exactly once", async () => {
     const f = await fixture();
-    expect(f.directory.lineageAlive(oldRoot)).toBe(false);
+    expect(f.directory.lineageAlive(oldRoot)).toBe(true);
+    expect(f.directory.lineageAdoptable(oldRoot)).toBe(true);
     const writes = vi.spyOn(ActorRegistryStore.prototype, "write");
     const candidates = await Promise.all([f.candidate("candidate-a"), f.candidate("candidate-b")]);
     await wait(() => candidates.filter(manager => manager.owns(f.actor.id)).length === 1);
@@ -93,7 +95,7 @@ describe("F3059 aged absent-root adoption", () => {
     const f = await fixture();
     const hostId = residentHostId(oldRoot), expiry = Date.now() + (mode === "fresh" ? 15_000 : -20_000);
     writeHostLease(f.mesh.root, { id: hostId, rootId: oldRoot, identityId: hostId, updatedAt: expiry - 15_000, expiresAt: expiry });
-    expect(f.directory.lineageAlive(oldRoot)).toBe(true);
+    expect(f.directory.lineageAdoptable(oldRoot)).toBe(false);
     const next = await f.candidate("candidate");
     await new Promise(resolve => setTimeout(resolve, 100));
     expect(next.owns(f.actor.id)).toBe(false); expect(next.status(f.actor.id).rootId).toBe(oldRoot);
@@ -106,11 +108,24 @@ describe("F3059 aged absent-root adoption", () => {
     expect(next.owns(f.actor.id)).toBe(false); expect(next.status(f.actor.id).rootId).toBe(oldRoot);
   });
 
+  it.each(["unknown", "throwing"] as const)("does not adopt with a %s adoption proof, even if routing reports death", async mode => {
+    const f = await fixture();
+    vi.spyOn(f.directory, "lineageAlive").mockReturnValue(false);
+    vi.spyOn(f.directory, "lineageAdoptable").mockImplementation(() => {
+      if (mode === "throwing") throw new Error("unreadable adoption proof");
+      return undefined as unknown as boolean;
+    });
+    const next = await f.candidate("candidate");
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(next.owns(f.actor.id)).toBe(false);
+    expect(next.status(f.actor.id).rootId).toBe(oldRoot);
+  });
+
   it("vetoes renewal appearing only inside the registry + mesh locked recheck", async () => {
     const f = await fixture();
-    const guard = f.directory.lineageAlive.bind(f.directory);
+    const guard = f.directory.lineageAdoptable.bind(f.directory);
     let calls = 0;
-    vi.spyOn(f.directory, "lineageAlive").mockImplementation(id => {
+    vi.spyOn(f.directory, "lineageAdoptable").mockImplementation(id => {
       if (id === oldRoot && ++calls === 2) {
         expect(fs.existsSync(path.join(f.root, "actors", "actors.json.lock", "owner"))).toBe(true);
         expect(fs.existsSync(path.join(f.mesh.root, ".lock", "owner"))).toBe(true);

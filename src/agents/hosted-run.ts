@@ -50,6 +50,8 @@ export interface HostedRunState {
   context: FabricHostedRunContext;
   /** Execution custody is independent of terminal result settlement. */
   stopObligation?: { runId: string; owner: string };
+  stopRetryAt?: number;
+  stopAttempts?: number;
   /** An abandoned prepared locator was never submitted. */
   neverSubmitted?: true;
 }
@@ -138,6 +140,8 @@ export class HostedRun {
   #shutdown = false;
   readonly #stopOwner: string;
   #custodyDeadline: ReturnType<typeof setTimeout> | undefined;
+  #stopRetryAt: number | undefined;
+  #stopAttempts = 0;
   #stopping: Promise<void> | undefined;
   #pendingQuestions = 0;
   #deliveries: Promise<void> = Promise.resolve();
@@ -196,6 +200,8 @@ export class HostedRun {
   ): HostedRun {
     const run = new HostedRun(adapter, state.locator, state.context, files, { ...record, hosted: { locator: state.locator } }, hooks, state.stopObligation?.owner);
     run.#released = state.neverSubmitted === true || confirmedHostedRelease(state.context.runDirectory, record);
+    run.#stopRetryAt = typeof state.stopRetryAt === "number" ? state.stopRetryAt : undefined;
+    run.#stopAttempts = typeof state.stopAttempts === "number" ? Math.max(0, Math.floor(state.stopAttempts)) : 0;
     run.#closed = run.terminal;
     if (!run.#released) run.#persistCustody();
     return run;
@@ -213,13 +219,28 @@ export class HostedRun {
 
   #persistCustody(neverSubmitted = false): void {
     const state: HostedRunState = { version: 1, runner: this.adapter.id, locator: this.locator, context: this.context,
-      ...(neverSubmitted ? { neverSubmitted: true as const } : { stopObligation: { runId: this.context.id, owner: this.#stopOwner } }) };
+      ...(neverSubmitted ? { neverSubmitted: true as const } : {
+        stopObligation: { runId: this.context.id, owner: this.#stopOwner },
+        ...(this.#stopRetryAt !== undefined ? { stopRetryAt: this.#stopRetryAt } : {}),
+        ...(this.#stopAttempts > 0 ? { stopAttempts: this.#stopAttempts } : {}),
+      }) };
     writeJsonAtomic(this.files.stateFile, state, { space: 2, durable: true });
   }
 
   /** Restore a deadline owner even if observation already has a terminal result. */
   async resumeCustody(): Promise<void> {
-    if (this.#released || this.#detached) return;
+    if (this.#released) return;
+    const retryAt = this.#stopRetryAt;
+    if (retryAt !== undefined) {
+      const delay = Math.max(0, retryAt - Date.now());
+      this.#custodyDeadline ??= setTimeout(() => {
+        this.#custodyDeadline = undefined;
+        void this.stop().catch(() => undefined);
+      }, Math.min(2_147_483_647, delay));
+      this.#custodyDeadline.unref?.();
+      return;
+    }
+    if (this.#detached) return;
     if (Date.now() >= this.context.deadlineAt) { await this.stop(); return; }
     this.#custodyDeadline ??= setTimeout(() => {
       this.#custodyDeadline = undefined;
@@ -231,8 +252,12 @@ export class HostedRun {
 
   /** Join any deadline stop before transferring the obligation to the next host. */
   async suspendCustody(): Promise<void> {
-    clearTimeout(this.#custodyDeadline);
-    this.#custodyDeadline = undefined;
+    // An unconfirmed stop is still live custody. Keep its durable retry receipt
+    // and timer; process exit is safe because recovery uses stopRetryAt.
+    if (this.#released) {
+      clearTimeout(this.#custodyDeadline);
+      this.#custodyDeadline = undefined;
+    }
     await this.#stopping;
   }
 
@@ -308,7 +333,19 @@ export class HostedRun {
       await withTimeout(() => this.adapter.abort!(this.locator, reason), `${this.adapter.id}.abort`).catch(() => undefined);
     }
     this.#released = confirmed;
-    if (confirmed) { clearTimeout(this.#custodyDeadline); this.#custodyDeadline = undefined; }
+    if (confirmed) {
+      this.#stopRetryAt = undefined;
+      clearTimeout(this.#custodyDeadline);
+      this.#custodyDeadline = undefined;
+      this.#persistCustody();
+    } else {
+      clearTimeout(this.#custodyDeadline);
+      this.#custodyDeadline = undefined;
+      this.#stopAttempts += 1;
+      this.#stopRetryAt = Date.now() + Math.min(30_000, 1_000 * 2 ** Math.min(5, this.#stopAttempts - 1));
+      this.#persistCustody();
+      await this.resumeCustody();
+    }
     if (this.terminal) return;
     const base = reason === "timeout"
       ? `Agent timed out after ${Math.max(0, this.context.deadlineAt - this.#record.startedAt)}ms`

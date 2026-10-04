@@ -285,7 +285,8 @@ describe("hosted runners", () => {
   });
 
   it("SR-6 restores stop custody for terminal unconfirmed durable runs without resubmitting", async () => {
-    const root = tempRoot();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-runs-sr6-"));
+    cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
     const fake = fakeHosted("uncertain-stop", { stopConfirmed: false });
     const stoppedLocators: unknown[] = [];
     const stop = fake.adapter.stop;
@@ -295,7 +296,7 @@ describe("hosted runners", () => {
     const handle = await first.spawn({ task: "Retain control", runner: "uncertain-stop", residency: "durable" });
     expect(await first.stop(handle.id)).toMatchObject({ status: "stopped", outcome: "indeterminate" });
     await first.close();
-    const second = managerFor(root, {}, { fabricSessionId: "replacement-owner" });
+    const second = managerFor(tempRoot(), {}, { fabricSessionId: "replacement-owner" });
     expect(await second.recoverHostedRuns()).toEqual([handle.id]);
     expect(await second.wait(handle.id)).toMatchObject({ status: "stopped", outcome: "indeterminate" });
     expect(await second.stop(handle.id)).toMatchObject({ status: "stopped", outcome: "indeterminate" });

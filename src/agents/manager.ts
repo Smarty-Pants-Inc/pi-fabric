@@ -2106,16 +2106,23 @@ export class AgentManager {
    * cannot vouch for settles failed with outcome "indeterminate".
    */
   async recoverHostedRuns(): Promise<string[]> {
-    let entries: string[];
+    // Normal sessions get fresh temporary roots. A persisted hosted stop must
+    // therefore be discoverable by a successor without an owner-supplied root.
+    const roots = new Set<string>([path.resolve(this.#runRoot)]);
     try {
-      entries = fs.readdirSync(this.#runRoot);
-    } catch {
-      return [];
-    }
+      for (const entry of fs.readdirSync(fabricDataRoot(), { withFileTypes: true })) {
+        if (entry.isDirectory() && entry.name.startsWith("pi-fabric-runs-")) {
+          roots.add(path.resolve(fabricDataRoot(), entry.name));
+        }
+      }
+    } catch { /* The current root remains a valid recovery scope. */ }
     const recovered: string[] = [];
-    for (const entry of entries) {
+    for (const root of roots) {
+      let entries: string[];
+      try { entries = fs.readdirSync(root); } catch { continue; }
+      for (const entry of entries) {
       if (this.#closing || this.#runs.has(entry) || !/^[0-9a-f]{32}$/.test(entry)) continue;
-      const runDirectory = path.join(this.#runRoot, entry);
+      const runDirectory = path.join(root, entry);
       const statusFile = path.join(runDirectory, "status.json");
       const record = readRecord(statusFile);
       const state = readHostedRunState(path.join(runDirectory, HOSTED_STATE_FILE));
@@ -2178,7 +2185,8 @@ export class AgentManager {
       // preserve the result, and never attach/resubmit a settled observation.
       if (!hosted.terminal) await hosted.attach();
       void this.#monitor(managed, Math.max(0, state.context.deadlineAt - Date.now()));
-      recovered.push(entry);
+        recovered.push(entry);
+      }
     }
     return recovered;
   }
@@ -3030,7 +3038,8 @@ export class AgentManager {
     // the next fenced owner whenever tree-wide exit evidence is incomplete.
     // An archive failure protects that run's full source, not another exited
     // worker's files. Native uncertainty still fences the entire shared tree.
-    const unresolved = all.some((managed) => managed.processStopPending || managed.nativeReleasePending || managed.lostContact || runTreeResourceVeto(managed.runDirectory, 0, undefined, true)) ||
+    const unresolved = all.some((managed) => managed.processStopPending || managed.nativeReleasePending || managed.lostContact ||
+      (managed.hosted && !managed.hosted.executionReleased) || runTreeResourceVeto(managed.runDirectory, 0, undefined, true)) ||
       [...this.#queued.values()].some((queued) => queued.cleanupPending) ||
       runRootHasExitVeto(this.#runRoot, new Set([...this.#queued.values()].filter(queued => queued.terminal && !queued.cleanupPending).map(queued => queued.info.id)));
     // A failed stop is not authority to delete a child's working files.

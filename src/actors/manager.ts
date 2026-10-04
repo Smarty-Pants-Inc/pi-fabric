@@ -157,6 +157,8 @@ interface ManagedActor {
   capabilityDigest?: string;
   missingCapabilities?: string[];
   activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** Durable alarm deduplication for the uninterrupted activation failure streak. */
+  failureStreak?: { count: number; notified: boolean };
   validWhile?: FabricActorValidWhileSource;
   latestActivationSequence: number;
   sessionFile: string;
@@ -353,7 +355,6 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
 
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
-  readonly #failureStreaks = new Map<string, { count: number; notified: boolean }>();
   /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
   readonly #parked = new Map<string, ActorQueueItem[]>();
   // Accepted active work (preparing, waiting, or running), retained durably until settlement (#878).
@@ -2547,7 +2548,6 @@ export class ActorManager {
         }
         this.#inFlight.set(actor.id, item);
         const inferenceContext = actor.inferenceContext;
-        this.#assertActivationCapabilities(inferenceContext);
         actor.status = "preparing";
         actor.preparing = { phase: "presence", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
         actor.updatedAt = Date.now();
@@ -2566,6 +2566,7 @@ export class ActorManager {
         let workerLaunched = false;
         const preparationAbort = new AbortController();
         try {
+          this.#assertActivationCapabilities(inferenceContext);
           await this.#publishDrainPresence(actor);
           const beforeRun = await this.#prepare(actor, "validity", () => this.#validity(actor, item));
           if (!beforeRun.valid) {
@@ -2722,7 +2723,7 @@ export class ActorManager {
           if (principal) message.principal = principal;
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
-          this.#failureStreaks.delete(actor.id);
+          delete actor.failureStreak;
           delete actor.activationBlocked;
           actor.updatedAt = Date.now();
           const beforeDelivery = await this.#validity(actor, item);
@@ -2898,10 +2899,10 @@ export class ActorManager {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
-    const streak = this.#failureStreaks.get(actor.id) ?? { count: 0, notified: false };
-    // Retry exhaustion must still alarm after recreation discarded the in-memory streak.
+    const streak = actor.failureStreak ?? { count: 0, notified: false };
+    // Retry exhaustion must still alarm immediately when its finite budget is spent.
     streak.count = Math.max(streak.count + 1, countFloor);
-    this.#failureStreaks.set(actor.id, streak);
+    actor.failureStreak = streak;
     const reason = error.split("\n")[0]!.slice(0, 300);
     const code = error.includes("turnProvenance") ? "host-capability-missing:turnProvenance" : "activation-failed";
     const previous = actor.activationBlocked;
@@ -3536,6 +3537,7 @@ export class ActorManager {
       requirements: actor.requirements,
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
       ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
+      ...(actor.failureStreak ? { failureStreak: { ...actor.failureStreak } } : {}),
       ...(actor.validWhile ? { validWhile: actor.validWhile } : {}),
       sessionFile: actor.sessionFile,
       messages: actor.messages,
@@ -3755,6 +3757,10 @@ export class ActorManager {
         ...(typeof record.activationBlocked?.reason === "string" && typeof record.activationBlocked?.code === "string" &&
           typeof record.activationBlocked?.since === "number" && typeof record.activationBlocked?.count === "number"
           ? { activationBlocked: { reason: record.activationBlocked.reason, code: record.activationBlocked.code, since: record.activationBlocked.since, count: record.activationBlocked.count } }
+          : {}),
+        ...(Number.isSafeInteger(record.failureStreak?.count) && (record.failureStreak?.count ?? 0) > 0 &&
+          typeof record.failureStreak?.notified === "boolean"
+          ? { failureStreak: { count: record.failureStreak.count, notified: record.failureStreak.notified } }
           : {}),
         ...(record.validWhile?.version === 1 && typeof record.validWhile.source === "string"
           ? { validWhile: record.validWhile }

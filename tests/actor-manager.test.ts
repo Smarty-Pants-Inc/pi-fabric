@@ -2840,6 +2840,72 @@ describe("ActorManager", () => {
       .rejects.toThrow(/turnProvenance.*reload or rotate/i);
   });
 
+  it("settles restored unsupported activation asks and callerless work without stranded in-flight items", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "restored", instructions: "Activate.", inferenceContext: "activation", coalesce: false });
+    await s.actors.close();
+    const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "actors"), persistent: true, supportsTurnProvenance: false,
+    });
+    actorManagers.push(restored);
+    const rejected = restored.ask(actor.id, "caller").then(() => "unexpected success", error => String(error));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([rejected, new Promise<string>(resolve => { timer = setTimeout(() => resolve("unsettled"), 2000); })]);
+      expect(result).toMatch(/turnProvenance.*reload or rotate/i);
+    } finally { clearTimeout(timer); }
+    await restored.tell(actor.id, "event-one");
+    await restored.tell(actor.id, "event-two");
+    await waitFor(() => restored.status(actor.id).status === "idle");
+    expect(restored.status(actor.id)).toMatchObject({ queued: 0, activationBlocked: { count: 3 } });
+    expect(restored.messages(actor.id).filter(message => message.direction === "out" && message.error?.includes("turnProvenance"))).toHaveLength(3);
+    // Closing persists the queue: no abandoned in-flight work may reappear on restart.
+    await restored.close();
+    const next = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "actors"), persistent: true, supportsTurnProvenance: false,
+    });
+    actorManagers.push(next);
+    expect(next.status(actor.id)).toMatchObject({ status: "idle", queued: 0, activationBlocked: { count: 3 } });
+    await expect(next.ask(actor.id, "next caller")).rejects.toThrow(/turnProvenance/);
+    await waitFor(() => next.status(actor.id).status === "idle");
+    expect(next.status(actor.id).activationBlocked?.count).toBe(4);
+  });
+
+  it("persists the failure budget and one alarm per uninterrupted streak across restarts", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "restart-streak", instructions: "Respond.", responseMode: "text" });
+    let manager = s.actors;
+    const restart = async () => {
+      await waitFor(() => manager.status(actor.id).status === "idle");
+      await manager.close();
+      manager = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+        actorRoot: path.join(s.root, "actors"), persistent: true,
+      });
+      actorManagers.push(manager);
+    };
+    const fail = async () => {
+      await expect(manager.ask(actor.id, "FAIL_DIRECTIVE")).rejects.toThrow();
+      await waitFor(() => manager.status(actor.id).status === "idle");
+    };
+    const alarms = () => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 });
+    await fail(); await fail();
+    const since = manager.status(actor.id).activationBlocked!.since;
+    expect(alarms()).toHaveLength(0);
+    await restart(); await fail();
+    await waitFor(() => alarms().length === 1);
+    expect(manager.status(actor.id).activationBlocked).toMatchObject({ since, count: 3 });
+    await restart();
+    await fail(); await fail(); await fail();
+    expect(manager.status(actor.id).activationBlocked).toMatchObject({ since, count: 6 });
+    expect(alarms()).toHaveLength(1);
+    await manager.ask(actor.id, "recover");
+    await waitFor(() => manager.status(actor.id).status === "idle");
+    expect(manager.status(actor.id).activationBlocked).toBeUndefined();
+    await restart(); await fail(); await fail(); await fail();
+    await waitFor(() => alarms().length === 2);
+    expect(manager.status(actor.id).activationBlocked?.count).toBe(3);
+  }, 60_000);
+
   // dev-lead review of #34: interrupted activations (ESC) are not failures, and no notice
   // may start a turn while the halt holds.
   it("does not count interrupted activations toward the owner notice", async () => {

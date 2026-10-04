@@ -7,6 +7,7 @@ import {
 import { ownedStat, processAlive } from "./scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
+import { confirmedHostedExit } from "../agents/hosted-exit.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -29,6 +30,10 @@ interface RunRootOwner {
   childrenStopped?: boolean;
 }
 interface RunRecordSummary {
+  id?: string;
+  runner?: string;
+  startedAt?: number;
+  outcome?: string;
   status?: string;
   actorId?: string;
   finishedAt?: number;
@@ -153,7 +158,9 @@ export const runTreeExitVeto = (
     // or absent unresolved marker does not prove the root writer has exited.
     // Recordless pre-launch rollback uses the non-retention mode explicitly;
     // missing persisted status is never evidence for an admitted worker.
-    if (requirePersistedExit) {
+    if (record?.transport === "hosted") {
+      if (!confirmedHostedExit(directory, record)) return `hosted worker exit is unconfirmed (${directory})`;
+    } else if (requirePersistedExit) {
       const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
         ? Number(record.sessionId) : undefined;
       const worker = depth > 0 ? "descendant" : "root";
@@ -204,6 +211,7 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 const runFiles = new Set([
   "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
   "reply.json", "relaunches.jsonl", "completion-recipient.json", "route-session.jsonl",
+  "hosted.json", "hosted-exit.json",
   // Native session of an unrouted process Pi task (worker.ts persistentPiTask); owned file only.
   "session.jsonl",
 ]);

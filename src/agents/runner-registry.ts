@@ -216,6 +216,8 @@ export interface FabricHostedRunner extends FabricRunnerBase {
   start(locator: unknown, context: FabricHostedRunContext, reporter: FabricHostedReporter): void | Promise<void>;
   attach(locator: unknown, context: FabricHostedRunContext, reporter: FabricHostedReporter): void | Promise<void>;
   liveness(locator: unknown): FabricHostedLiveness | Promise<FabricHostedLiveness>;
+  /** confirmed means execution has ceased and the adapter/its workers no longer use this run's files.
+   * Returning a terminal result or an accepted stop request is not confirmation. */
   stop(locator: unknown, reason: FabricRunStopReason): { confirmed: boolean } | Promise<{ confirmed: boolean }>;
   abort?(locator: unknown, reason: FabricRunStopReason): void | Promise<void>;
   sleep?(locator: unknown): void | Promise<void>;

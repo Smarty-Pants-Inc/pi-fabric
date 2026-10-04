@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { writeConfirmedHostedExit } from "./hosted-exit.js";
 import type {
   FabricHostedLiveness,
   FabricHostedReporter,
@@ -240,7 +241,12 @@ export class HostedRun {
     let failure: string | undefined;
     try {
       const result = await withTimeout(() => this.adapter.stop(this.locator, reason), `${this.adapter.id}.stop`);
-      confirmed = result?.confirmed === true;
+      if (result?.confirmed === true) {
+        // A result/status alone is not exit. Persist this explicit adapter-owned
+        // release bound to the exact prepared locator before allowing collection.
+        writeConfirmedHostedExit(this.context.runDirectory, this.#record, this.locator, reason);
+        confirmed = true;
+      }
     } catch (error) {
       failure = message(error);
     }

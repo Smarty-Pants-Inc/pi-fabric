@@ -134,7 +134,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     fs.mkdirSync(store.directory, { recursive: true });
     for (const id of [expired, fresh]) {
       fs.writeFileSync(store.resultFile(id), JSON.stringify({ id, text: id }));
-      store.consume(id, { handoff: true });
+      store.consume(id, { handoff: true, mailbox: true });
       if (id === expired && phase === "restore") for (const suffix of [".result.json", ".receipt"]) fs.utimesSync(path.join(store.directory, id + suffix), old, old);
     }
     const key = createHash("sha256").update(["session:startup", "session"].join("\0")).digest("hex").slice(0, 16);

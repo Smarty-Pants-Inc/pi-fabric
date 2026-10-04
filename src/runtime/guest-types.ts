@@ -275,6 +275,8 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  /** Canonical Fabric release actually selected for this process child. */
+  fabricRelease?: string;
   followUpDeliveries?: FabricFollowUpDelivery[];
   routeClass?: string;
   routeClassSource?: "explicit" | "derived";

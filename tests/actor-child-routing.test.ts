@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
+import * as atomicWrites from "../src/core/atomic-write.js";
+import { runTreeExitVeto } from "../src/storage/retention.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
@@ -31,7 +33,7 @@ afterEach(async () => {
 // Real provider -> AgentManager -> process worker, with the environment an actor's
 // activation worker supplies. Both session (Main owned) and durable (resident owned)
 // actors must keep their child results within the actor, not its lineage Main.
-const setup = async (residency: "session" | "durable", notifyOnComplete = true, validWhile?: FabricActorValidWhileSource, responseMode: "text" | "directive" = "text", ownerMaxConcurrent = DEFAULT_FABRIC_CONFIG.agents.maxConcurrent) => {
+const setup = async (residency: "session" | "durable", notifyOnComplete = true, validWhile?: FabricActorValidWhileSource, responseMode: "text" | "directive" = "text", ownerMaxConcurrent = DEFAULT_FABRIC_CONFIG.agents.maxConcurrent, childMaxConcurrent = DEFAULT_FABRIC_CONFIG.agents.maxConcurrent) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-child-"));
   roots.push(root);
   const rootId = "session:root-main";
@@ -117,7 +119,7 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true, 
   await runtime.initialize(context, normalizeFabricConfig({
     fullCodeMode: true, mesh: { enabled: true, actorPollMs: 20 },
     mcp: { enabled: false, cache: { enabled: false } }, memory: { enabled: false },
-    agents: { notifyOnComplete }, residency: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false },
+    agents: { notifyOnComplete, maxConcurrent: childMaxConcurrent }, residency: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false },
   }));
   cleanups.push(() => runtime.shutdown());
   const boundary = () => {
@@ -127,6 +129,17 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true, 
     task, name: "review-subtask", transport: "process", model: "fixture/review",
   }, invocation) as Promise<AgentHandleInfo>;
   return { actor, actorRunId, owner, ownerAgents, mesh, runtime, invocation, rootDeliveries, sendMessage, boundary, spawn, endActivation, makeOwner, resolveModel };
+};
+
+// Windows omits unsupported directory fsync. Exercise the same uncertain writer
+// rejection there, while Unix probes keep their physical post-rename fsync fault.
+const failPostRenameOnWindows = (target: (file: string) => boolean, fail: () => void) => {
+  if (process.platform !== "win32") return;
+  const write = atomicWrites.writeJsonAtomic;
+  return vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, value, options) => {
+    write(file, value, options);
+    if (target(file)) fail();
+  });
 };
 
 describe.each(["session", "durable"] as const)("%s actor process children", (residency) => {
@@ -139,6 +152,39 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     });
     await vi.waitFor(() => { h.boundary(); expect(h.sendMessage).toHaveBeenCalledOnce(); }, { timeout: 5000 });
     expect(h.sendMessage.mock.calls[0]![0].content).toContain("fake worker complete");
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("retains a failed child archive through ancestor cleanup and recovers it after both custodians close", async () => {
+    const h = await setup(residency);
+    const enqueue = ActorChildCompletionStore.prototype.enqueue;
+    const refused = vi.spyOn(ActorChildCompletionStore.prototype, "enqueue").mockImplementation(function(this: ActorChildCompletionStore, result, ...args) {
+      if (result.name === "review-subtask") throw new Error("archive storage unavailable");
+      return enqueue.call(this, result, ...args);
+    });
+    const child = await h.spawn("HANG_WITH_PROGRESS");
+    await vi.waitFor(() => expect(h.runtime.agents.status(child.id)).toMatchObject({ turns: 3 }), { timeout: 5000 });
+    const source = h.runtime.agents.runDirectory(child.id)!;
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await h.runtime.shutdown();
+    const closing = h.owner.close(); h.endActivation(); await closing;
+    expect(fs.existsSync(path.join(source, "archive-pending.json"))).toBe(true);
+    const ancestor = path.join(path.dirname(source), "ancestor");
+    const moved = path.join(ancestor, "nested", child.id);
+    fs.mkdirSync(path.dirname(moved), { recursive: true });
+    fs.writeFileSync(path.join(ancestor, "status.json"), JSON.stringify({ status: "completed" }));
+    fs.renameSync(source, moved);
+    store.trackArchiveSource(child.id, moved);
+    expect(runTreeExitVeto(ancestor)).toMatch(/archive is pending/);
+    refused.mockRestore();
+    const recovered = new ActorChildCompletionStore(h.actor.sessionFile!);
+    expect(recovered.pending({ actorId: h.actor.id })).toMatchObject([{ result: { id: child.id, status: "stopped" } }]);
+    expect(runTreeExitVeto(ancestor)).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(recovered.resultFile(child.id), "utf8"))).toMatchObject({ id: child.id, turns: 3, spawner: { id: h.actor.id } });
+    const restarted = h.makeOwner(); cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "resume after source recovery");
+    await vi.waitFor(() => expect(restarted.messages(h.actor.id).filter(m => m.id === child.id && m.direction === "in")).toHaveLength(1), { timeout: 5000 });
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 
@@ -277,6 +323,274 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 
+  it.each(["active", "queued"] as const)("guest stop consumes the %s child's result without a mailbox replay after restart", async (mode) => {
+    const h = await setup(residency, true, undefined, "text", undefined, mode === "queued" ? 1 : undefined);
+    let blocker: AgentHandleInfo | undefined;
+    if (mode === "queued") {
+      blocker = await h.spawn("HANG_WITH_PROGRESS");
+      await vi.waitFor(() => expect(h.runtime.agents.status(blocker!.id)).toMatchObject({ turns: 3 }), { timeout: 5000 });
+    }
+    const child = await h.spawn("HANG_WITH_PROGRESS");
+    if (mode === "active") await vi.waitFor(() => expect(h.runtime.agents.status(child.id)).toMatchObject({ turns: 3 }), { timeout: 5000 });
+    else expect(child.status).toBe("queued");
+    const execution = await h.runtime.execution.execute({
+      code: `return await agents.stop({id:${JSON.stringify(child.id)}});`,
+      context: h.invocation.extensionContext, signal: undefined, parentToolCallId: "guest-stop", onPartial() {},
+    });
+    expect(execution.success, execution.error).toBe(true);
+    const result = execution.value as AgentRunResult;
+    expect(result).toMatchObject({ id: child.id, status: "stopped", spawner: { id: h.actor.id, runId: h.actorRunId } });
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    expect(store.received(child.id)).toBe(true);
+    if (blocker) await h.runtime.agents.stop(blocker.id);
+    await h.runtime.shutdown();
+    const closing = h.owner.close();
+    h.endActivation();
+    await closing;
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "next unrelated activation");
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id)).toEqual([]);
+    expect(store.pending()).toEqual([]);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it.each(["live", "mailbox"] as const)("an overlapping old activation and replacement owner deliver once when %s wins the claim", async (winner) => {
+    const h = await setup(residency);
+    const child = await h.spawn();
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    const acknowledge = ActorChildCompletionStore.prototype.acknowledge;
+    let overlap = false;
+    const race = vi.spyOn(ActorChildCompletionStore.prototype, "acknowledge").mockImplementation(function(this: ActorChildCompletionStore, id, options) {
+      if (id !== child.id || !options?.handoff) return acknowledge.call(this, id, options);
+      overlap = true;
+      if (winner === "live") h.boundary();
+      acknowledge.call(this, id, options);
+      if (winner === "mailbox") h.boundary();
+    });
+    h.endActivation(); // The worker is still live while its replacement owner reconciles.
+    await vi.waitFor(() => {
+      expect(overlap).toBe(true);
+      expect(h.owner.status(h.actor.id).status).toBe("idle");
+      expect(h.owner.inFlightCount()).toBe(0);
+    }, { timeout: 5000 });
+    race.mockRestore();
+    const mailbox = h.owner.messages(h.actor.id).filter((m) => m.source === "child-completion" && m.direction === "out" && !m.error);
+    expect(h.sendMessage.mock.calls.length + mailbox.length).toBe(1);
+    expect(h.sendMessage).toHaveBeenCalledTimes(winner === "live" ? 1 : 0);
+    expect(mailbox).toHaveLength(winner === "mailbox" ? 1 : 0);
+    await h.runtime.shutdown();
+    await h.owner.close();
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "next unrelated activation");
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(store.pending()).toEqual([]);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it.each(["agents.wait", "agents.status", "agents.stop"])("%s restores unread ownership when publication is cancelled after the foreground fence", async (action) => {
+    const h = await setup(residency);
+    const child = await h.spawn();
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    const abort = new AbortController();
+    const atomicWrite = atomicWrites.writeJsonAtomic;
+    let rollbackAttempts = 0;
+    const rollbackFailure = vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, value, options) => {
+      if (file === path.join(store.directory, `${child.id}.receipt`) && (value as { unread?: boolean }).unread && ++rollbackAttempts === 1) {
+        throw new Error("transient abandonment write failure");
+      }
+      return atomicWrite(file, value, options);
+    });
+    const consume = ActorChildCompletionStore.prototype.consume;
+    const fence = vi.spyOn(ActorChildCompletionStore.prototype, "consume").mockImplementation(function(this: ActorChildCompletionStore, id, options) {
+      consume.call(this, id, options);
+      if (id === child.id) abort.abort(new Error("discard host result after fence"));
+    });
+    await expect(h.runtime.registry.invoke(action, { id: child.id }, { ...h.invocation, signal: abort.signal })).rejects.toThrow("discard host result after fence");
+    fence.mockRestore();
+    expect(rollbackAttempts).toBeGreaterThanOrEqual(2);
+    rollbackFailure.mockRestore();
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    await h.runtime.shutdown(); // Close before any replacement live notice is delivered.
+    const closing = h.owner.close();
+    h.endActivation();
+    await closing;
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "next unrelated activation");
+    await vi.waitFor(() => expect(restarted.messages(h.actor.id).filter((m) =>
+      m.id === child.id && m.direction === "in")).toHaveLength(1), { timeout: 5000 });
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(restarted.messages(h.actor.id).filter((m) => m.source === "child-completion" && m.direction === "out" && !m.error)).toHaveLength(1);
+    await vi.waitFor(() => expect(fs.existsSync(store.resultFile(child.id))).toBe(false), { timeout: 5000 });
+    expect(store.pending()).toEqual([]);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it.each(["agents.wait", "agents.status", "agents.stop"])("%s preserves archive custody through failed archival, cancelled publication and failed abandonment until restart", async (action) => {
+    const h = await setup(residency);
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    const atomicWrite = atomicWrites.writeJsonAtomic;
+    let archiveAttempts = 0;
+    let rollbackAttempts = 0;
+    const failedStorage = vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, value, options) => {
+      if (file.startsWith(store.directory + path.sep) && file.endsWith(".result.json")) {
+        archiveAttempts++;
+        throw new Error("full-result archive unavailable");
+      }
+      if (file.startsWith(store.directory + path.sep) && file.endsWith(".receipt") && (value as { unread?: boolean }).unread) {
+        rollbackAttempts++;
+        throw new Error("unread receipt rewrite unavailable through close");
+      }
+      return atomicWrite(file, value, options);
+    });
+    const child = await h.spawn("LARGE_RESULT");
+    await vi.waitFor(() => {
+      expect(h.runtime.agents.status(child.id).status).toBe("completed");
+      expect(archiveAttempts).toBeGreaterThan(0);
+    }, { timeout: 5000 });
+    const source = h.runtime.agents.runDirectory(child.id)!;
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+    expect(fs.existsSync(path.join(store.directory, `${child.id}.json`))).toBe(false);
+    expect(runTreeExitVeto(source)).toMatch(/archive is pending/);
+    const abort = new AbortController();
+    const consume = ActorChildCompletionStore.prototype.consume;
+    const fence = vi.spyOn(ActorChildCompletionStore.prototype, "consume").mockImplementation(function(this: ActorChildCompletionStore, id, options) {
+      consume.call(this, id, options);
+      if (id === child.id && options?.publication) abort.abort(new Error("cancel unpublished archive observation"));
+    });
+    await expect(h.runtime.registry.invoke(action, { id: child.id }, { ...h.invocation, signal: abort.signal }))
+      .rejects.toThrow("cancel unpublished archive observation");
+    fence.mockRestore();
+    expect(rollbackAttempts).toBeGreaterThanOrEqual(3);
+    expect(JSON.parse(fs.readFileSync(path.join(store.directory, `${child.id}.receipt`), "utf8")).publication).toBeTruthy();
+    expect(fs.existsSync(path.join(store.directory, `${child.id}.abandon`))).toBe(true);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    await h.runtime.shutdown();
+    const closing = h.owner.close(); h.endActivation(); await closing;
+    expect(rollbackAttempts).toBeGreaterThanOrEqual(6);
+    expect(fs.existsSync(source)).toBe(true);
+    expect(fs.existsSync(path.join(source, "archive-pending.json"))).toBe(true);
+    expect(runTreeExitVeto(source)).toMatch(/archive is pending/);
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+    failedStorage.mockRestore();
+    const recovered = new ActorChildCompletionStore(h.actor.sessionFile!);
+    expect(recovered.pending({ actorId: h.actor.id })).toMatchObject([{ result: { id: child.id, status: "completed" } }]);
+    const saved = JSON.parse(fs.readFileSync(recovered.resultFile(child.id), "utf8"));
+    expect(saved.text).toHaveLength(100000);
+    expect(saved.value).toEqual({ output: "x".repeat(100000) });
+    expect(saved.spawner).toEqual({ id: h.actor.id, kind: "actor", runId: h.actorRunId });
+    expect(fs.existsSync(path.join(source, "archive-pending.json"))).toBe(false);
+    expect(runTreeExitVeto(source)).toBeUndefined();
+    expect(fs.existsSync(path.join(store.directory, `${child.id}.abandon`))).toBe(false);
+    const restarted = h.makeOwner(); cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "recover combined storage failure");
+    await vi.waitFor(() => expect(restarted.messages(h.actor.id).filter(m => m.id === child.id && m.direction === "in")).toHaveLength(1), { timeout: 5000 });
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(restarted.messages(h.actor.id).filter(m => m.source === "child-completion" && m.direction === "out" && !m.error)).toHaveLength(1);
+    restarted.tell(h.actor.id, "unrelated activation must not replay");
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(restarted.messages(h.actor.id).filter(m => m.id === child.id && m.direction === "in")).toHaveLength(1);
+    expect(recovered.pending()).toEqual([]);
+    expect(fs.existsSync(recovered.resultFile(child.id))).toBe(false);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("does not replay consumed deferred context after a failed queue commit and owner restart", async () => {
+    const h = await setup(residency);
+    const child = await h.spawn("LARGE_RESULT");
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    await h.runtime.shutdown();
+    h.resolveModel.mockRejectedValue(new Error("defer before inference"));
+    h.endActivation();
+    await vi.waitFor(() => {
+      expect(store.received(child.id)).toBe(true);
+      expect(h.owner.status(h.actor.id).status).toBe("idle");
+    }, { timeout: 5000 });
+    const directory = path.dirname(h.actor.sessionFile!);
+    const queueFile = path.join(directory, fs.readdirSync(directory).find((file) => file.startsWith("queue-"))!);
+    const staleQueue = fs.readFileSync(queueFile, "utf8");
+    expect(JSON.parse(staleQueue).items).toEqual([expect.objectContaining({ id: child.id, deferredHandoff: true })]);
+    h.resolveModel.mockImplementation(async (model) => model);
+    const run = AgentManager.prototype.run.bind(h.ownerAgents);
+    let inferred = false;
+    const tasks: string[] = [];
+    vi.spyOn(h.ownerAgents, "run").mockImplementation(async (...args) => {
+      tasks.push(args[0].task);
+      const result = await run(...args);
+      inferred = true;
+      return result;
+    });
+    const rename = fs.renameSync;
+    const remove = fs.rmSync;
+    const failedWrite = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (inferred && to === queueFile) throw new Error("post-inference queue commit failed");
+      rename(from, to);
+    });
+    const failedRemoval = vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (inferred && file === queueFile) throw new Error("post-inference queue removal failed");
+      remove(file, options);
+    });
+    await h.owner.ask(h.actor.id, "consume deferred context once");
+    await vi.waitFor(() => expect(h.owner.inFlightCount()).toBe(0), { timeout: 5000 });
+    expect(tasks[0]).toContain(JSON.stringify(store.resultFile(child.id)));
+    expect(JSON.parse(fs.readFileSync(queueFile, "utf8")).items.some((item: { id: string }) => item.id === child.id)).toBe(true);
+    await h.owner.close(); // No later successful queue checkpoint before restart.
+    failedWrite.mockRestore();
+    failedRemoval.mockRestore();
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "unrelated following activation");
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(tasks.slice(1).every((task) => !task.includes(JSON.stringify(store.resultFile(child.id))))).toBe(true);
+    expect(store.pending()).toEqual([]);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it.each(["count", "bytes", "oversized"] as const)("bounds deferred handoff snapshots by %s, consuming only each snapshot", async (budget) => {
+    const h = await setup(residency, true, { version: 1, source: '({activation}) => activation.source !== "child-completion"' });
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    const ids = Array.from({ length: budget === "oversized" ? 2 : 40 }, (_, i) => (i + 1).toString(16).padStart(32, "0"));
+    const now = Date.now();
+    for (const id of ids) store.enqueue({
+      id, name: budget === "oversized" ? "界".repeat(12000) : "large deferred child", task: "child", status: "completed",
+      text: budget === "bytes" ? "界".repeat(4000) : "short result",
+      startedAt: now, updatedAt: now, finishedAt: now, value: { output: id },
+    } as AgentRunResult, { id: h.actor.id, kind: "actor", runId: h.actorRunId });
+    await h.runtime.shutdown();
+    h.endActivation();
+    await vi.waitFor(() => {
+      expect(ids.every((id) => store.received(id))).toBe(true);
+      expect(h.owner.status(h.actor.id).status).toBe("idle");
+      expect(h.owner.status(h.actor.id).queued).toBe(0);
+    }, { timeout: 10000 });
+    h.resolveModel.mockImplementation(async (model) => model);
+    const tasks: string[] = [];
+    const run = AgentManager.prototype.run.bind(h.ownerAgents);
+    vi.spyOn(h.ownerAgents, "run").mockImplementation(async (...args) => { tasks.push(args[0].task); return run(...args); });
+    const seen = new Set<string>();
+    for (let activation = 0; seen.size < ids.length && activation < ids.length; activation++) {
+      await h.owner.ask(h.actor.id, `fresh activation ${activation}`);
+      await vi.waitFor(() => expect(h.owner.inFlightCount()).toBe(0), { timeout: 5000 });
+      const json = tasks.at(-1)!.split("context only, not current activation facts):\n\n")[1]!;
+      const context = JSON.parse(json) as Array<{ id: string }>;
+      expect(context.length).toBeGreaterThan(0);
+      expect(context.length).toBeLessThanOrEqual(16);
+      expect(Buffer.byteLength(json, "utf8")).toBeLessThanOrEqual(32768);
+      for (const item of context) { expect(seen.has(item.id)).toBe(false); seen.add(item.id); }
+      for (const id of ids) expect(fs.existsSync(store.resultFile(id))).toBe(!seen.has(id));
+    }
+    expect(seen.size).toBe(ids.length);
+    await h.owner.ask(h.actor.id, "no context remains");
+    expect(tasks.at(-1)).not.toContain("context only, not current activation facts");
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  }, 30000);
+
   it("terminal agents.status consumption deletes the full result and envelope", async () => {
     const h = await setup(residency);
     const child = await h.spawn("LARGE_RESULT");
@@ -367,6 +681,97 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
       // Outgoing messages precede asynchronous run-log retention and cleanup.
       await vi.waitFor(() => expect(fs.existsSync(store.resultFile(child.id))).toBe(false), { timeout: 5000 });
     }
+    expect(store.pending()).toEqual([]);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("Q4 recovers every unsent live notice exactly once after a post-rename barrier failure and worker close", async () => {
+    const h = await setup(residency);
+    const children = [await h.spawn("LARGE_RESULT"), await h.spawn("LARGE_RESULT")];
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(2), { timeout: 5000 });
+    const directory = fs.statSync(store.directory);
+    const rename = fs.renameSync;
+    const sync = fs.fsyncSync;
+    let markerRenamed = false;
+    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (String(to).endsWith(".live-receipt")) markerRenamed = true;
+    });
+    const failed = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const stat = fs.fstatSync(fd);
+      if (markerRenamed && stat.dev === directory.dev && stat.ino === directory.ino) throw new Error("live barrier after rename");
+      sync(fd);
+    });
+    const windowsFailure = failPostRenameOnWindows((file) => file.endsWith(".live-receipt"), () => { throw new Error("live barrier after rename"); });
+    h.boundary();
+    expect(markerRenamed).toBe(true);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    await h.runtime.shutdown();
+    const closing = h.owner.close();
+    h.endActivation();
+    await closing;
+    failed.mockRestore();
+    renamed.mockRestore();
+    windowsFailure?.mockRestore();
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "recover unsent notices");
+    await vi.waitFor(() => expect(restarted.messages(h.actor.id).filter((m) => m.source === "child-completion" && m.direction === "out" && !m.error)).toHaveLength(2), { timeout: 5000 });
+    for (const child of children) {
+      expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id && m.direction === "in")).toHaveLength(1);
+      await vi.waitFor(() => expect(fs.existsSync(store.resultFile(child.id))).toBe(false));
+    }
+    expect(store.pending()).toEqual([]);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("Q6 returns no foreground value until post-rename barriers complete and never replays after recovery", async () => {
+    const h = await setup(residency);
+    const child = await h.spawn();
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    const directory = fs.statSync(store.directory);
+    const rename = fs.renameSync;
+    const sync = fs.fsyncSync;
+    let receiptRenamed = false;
+    let blocked = true;
+    let failures = 0;
+    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (String(to) === path.join(store.directory, `${child.id}.receipt`)) receiptRenamed = true;
+    });
+    const failed = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const stat = fs.fstatSync(fd);
+      if (receiptRenamed && blocked && stat.dev === directory.dev && stat.ino === directory.ino) {
+        failures++;
+        throw new Error("foreground barrier after rename");
+      }
+      sync(fd);
+    });
+    failPostRenameOnWindows((file) => file === path.join(store.directory, `${child.id}.receipt`), () => {
+      if (blocked) { failures++; throw new Error("foreground barrier after rename"); }
+    });
+    const execution = await h.runtime.execution.execute({
+      code: `try { return await agents.wait({id:${JSON.stringify(child.id)}}); } catch { return "NO-FOREGROUND-VALUE"; }`,
+      context: h.invocation.extensionContext, signal: undefined, parentToolCallId: "barrier-fence", onPartial() {},
+    });
+    expect(execution.success, execution.error).toBe(true);
+    expect(execution.value).toBe("NO-FOREGROUND-VALUE");
+    expect(failures).toBeGreaterThanOrEqual(2);
+    blocked = false;
+    expect(await h.runtime.registry.invoke("agents.wait", { id: child.id }, h.invocation)).toMatchObject({ id: child.id, status: "completed" });
+    failed.mockRestore();
+    renamed.mockRestore();
+    await h.runtime.shutdown();
+    const closing = h.owner.close();
+    h.endActivation();
+    await closing;
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    restarted.tell(h.actor.id, "after barrier recovery");
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id)).toEqual([]);
     expect(store.pending()).toEqual([]);
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
@@ -705,6 +1110,31 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(store.pending()).toEqual([expect.objectContaining({ result: expect.objectContaining({ id: child.id }) })]);
     expect(h.owner.messages(h.actor.id).filter((message) =>
       message.direction === "in" && JSON.stringify(message.data).includes(child.id))).toEqual([]);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("retries shutdown archival per outcome without skipping later children", async () => {
+    const h = await setup(residency);
+    const a = await h.spawn("HANG_WITH_PROGRESS");
+    const b = await h.spawn("HANG_WITH_PROGRESS");
+    await vi.waitFor(() => expect(h.runtime.agents.status(b.id)).toMatchObject({ turns: 3 }), { timeout: 5000 });
+    const enqueue = ActorChildCompletionStore.prototype.enqueue;
+    const attempts = new Map<string, number>();
+    const fail = vi.spyOn(ActorChildCompletionStore.prototype, "enqueue").mockImplementation(function(this: ActorChildCompletionStore, result, spawner, notify) {
+      attempts.set(result.id, (attempts.get(result.id) ?? 0) + 1);
+      // Fail managed settlement and the first shutdown attempt for only A.
+      if (result.id === a.id && attempts.get(a.id)! <= 2) throw new Error("first shutdown archive unavailable");
+      enqueue.call(this, result, spawner, notify);
+    });
+    await h.runtime.shutdown();
+    fail.mockRestore();
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    expect(attempts.get(a.id)).toBeGreaterThanOrEqual(3);
+    expect(attempts.get(b.id)).toBeGreaterThanOrEqual(2); // Settlement plus shutdown, despite A's enqueue fault.
+    expect(store.pending().map(({ result }) => result.id).sort()).toEqual([a.id, b.id].sort());
+    for (const child of [a, b]) expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8"))).toMatchObject({ id: child.id, status: "stopped", turns: 3, toolCalls: 1, usage: { input: 30, output: 10 } });
+    h.endActivation();
+    await vi.waitFor(() => expect(h.owner.messages(h.actor.id).filter((m) => m.source === "child-completion" && m.direction === "out" && !m.error)).toHaveLength(2), { timeout: 5000 });
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 

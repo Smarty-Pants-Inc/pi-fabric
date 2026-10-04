@@ -102,12 +102,10 @@ const agentLines = (
   ];
 };
 
+// Only the host reply needs a stable above-editor height. Children can outlive
+// that reply, but must not keep its reservation alive once Main has ended.
 export const isFabricWidgetStreaming = (snapshot: FabricDashboardSnapshot): boolean =>
-  snapshot.main.status === "running" ||
-  snapshot.runs.some((run) => run.status === "running") ||
-  ownAgents(snapshot).some((agent) => isActiveStatus(agent.status)) ||
-  snapshot.actors.some((actor) => actor.status !== "stopped" && isActiveStatus(actor.status)) ||
-  snapshot.shells?.some((job) => job.finishedAt === undefined) === true;
+  snapshot.main.status === "running";
 
 export const shouldShowFabricWidget = (
   snapshot: FabricDashboardSnapshot,

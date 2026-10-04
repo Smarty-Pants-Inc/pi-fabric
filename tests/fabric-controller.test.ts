@@ -769,6 +769,13 @@ describe("FabricUiController dashboard wiring", () => {
       expect(controller.snapshot().main.status).toBe("idle");
       expect(widget!.render(80).length).toBeLessThan(6);
       expect(setWidget.mock.calls.filter(([, content]) => content === undefined)).toHaveLength(2);
+      // A child may outlive Main; it must not extend the host's reservation.
+      activity.start("outlives-host");
+      controller.setHostStreaming(true);
+      expect(widget!.render(80)).toHaveLength(6);
+      controller.setHostStreaming(false);
+      expect(controller.snapshot().runs[0]!.status).toBe("running");
+      expect(widget!.render(80).length).toBeLessThan(6);
       expect(context.ui.notify).not.toHaveBeenCalled();
     } finally {
       controller.stop();
@@ -803,6 +810,7 @@ describe("FabricUiController dashboard wiring", () => {
   it("immediately shrinks a controller-owned streaming reservation on terminal resize", () => {
     const state = stubState();
     Object.assign(state.config.ui, { widget: "always", maxRows: 6 });
+    vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "running" });
     vi.mocked(state.actors.list).mockReturnValue([{ ...state.actors.list()[0]!, status: "running" }]);
     let widget: FabricWidget | undefined;
     const terminal = { rows: 24 };
@@ -838,6 +846,7 @@ describe("FabricUiController dashboard wiring", () => {
     state.config.ui.widget = "auto";
     state.config.ui.refreshMs = 500;
     state.config.ui.maxRows = 6;
+    vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "running" });
     vi.mocked(state.actors.list).mockReturnValue([]);
     const activity = new FabricActivityStore();
     Object.assign(state, { activity });
@@ -886,6 +895,7 @@ describe("FabricUiController dashboard wiring", () => {
       expect(second).toMatch(/6s/);
       expect(requestRender).toHaveBeenCalled();
       activity.finish("live", true);
+      vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "idle" });
       await vi.advanceTimersByTimeAsync(110);
       expect(widget!.render(80).length).toBeLessThan(reserved.length);
     } finally {

@@ -2,7 +2,11 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { ResidentRequestRetention } from "../src/residency/retention.js";
+import { acknowledgeResidentResponse, commitResidentRequest, type ResidentCommand } from "../src/residency/protocol.js";
+import { newResidentRequestId } from "../src/residency/request-expiry.js";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { setImmediate as yieldTurn } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -40,6 +44,114 @@ describe("bounded retention reference preparation", () => {
     scan.close();
   });
 
+  it("reconciles a run added while the final cached actor-hint phase is suspended", async () => {
+    const root = temporary();
+    for (let i = 0; i < 4; i++) run(root, `history-${i}`, { sessionId: "2147483647" });
+    const runRoot = path.join(root, "runs");
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, { runRoot });
+    let clock = 0, suspended = false;
+    const timing = vi.spyOn(performance, "now").mockImplementation(() => clock);
+    const close = fs.Dir.prototype.closeSync;
+    const cursor = vi.spyOn(fs.Dir.prototype, "closeSync").mockImplementation(function(this: fs.Dir) {
+      close.call(this);
+      if (this.path === runRoot && !suspended) { suspended = true; clock = 101; }
+    });
+    try {
+      expect(manager.retentionReferences({ now, budgetMs: 100, maxEntries: 64 }).has("*")).toBe(true);
+      expect(suspended).toBe(true);
+      run(root, "late-run", { status: "running", sessionId: "2147483647", actorId: "late-actor" });
+      const refs = manager.retentionReferences({ now, budgetMs: 100, maxEntries: 64 });
+      expect(refs.has("*")).toBe(false);
+      expect(refs.has("late-run")).toBe(true); expect(refs.has("late-actor")).toBe(true);
+      expect(manager.retentionCustodyVeto("late-actor")).toBe(true);
+    } finally { timing.mockRestore(); cursor.mockRestore(); await manager.close(); }
+  });
+
+  it("historical tail progresses under new runs and UI/status activity, then safely expires an acknowledged exchange", async () => {
+    const root = temporary(), count = 4096;
+    for (let i = 0; i < count; i++) run(root, `history-${i}`, { sessionId: "2147483647" });
+    const cursor = fs.opendirSync(path.join(root, "runs")); let tail = "";
+    try { let entry: fs.Dirent | null; while ((entry = cursor.readSync())) tail = entry.name; } finally { cursor.closeSync(); }
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true }, {
+      runRoot: path.join(root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+    });
+    const reads = new Map<string, number>(), original = fs.readFileSync;
+    fs.readFileSync = ((...args: Parameters<typeof original>) => {
+      const file = String(args[0]);
+      if (file.startsWith(path.join(root, "runs", "history-")) && path.basename(file) === "status.json") reads.set(file, (reads.get(file) ?? 0) + 1);
+      return original(...args);
+    }) as typeof original;
+    const completedAt = now - 25 * 60 * 60 * 1000, requestId = newResidentRequestId(completedAt);
+    const command = { format: 3, requestId, rootId: "session:activity", operation: "cleanup", id: tail, deleteBranch: false, createdAt: completedAt } as ResidentCommand;
+    commitResidentRequest(root, command, tail, "host");
+    const response = { format: 1 as const, requestId, ok: true, completedAt };
+    fs.mkdirSync(path.join(root, "responses"), { recursive: true });
+    fs.writeFileSync(path.join(root, "responses", `${requestId}.json`), JSON.stringify(response));
+    acknowledgeResidentResponse(root, response, completedAt, 3);
+    const retention = new ResidentRequestRetention(root, [], {}, undefined, { run: id => manager.hasRunCustody(id), reference: id => manager.retentionCustodyVeto(id) });
+    let complete = false, lastRefs = new Set<string>();
+    try {
+      const K = 1024;
+      for (let slice = 0; slice < K; slice++) {
+        if (slice % 64 === 0) run(root, `new-${slice}`, { sessionId: "2147483647" });
+        if (slice % 32 === 0) {
+          const outcome = await manager.run({ task: `ordinary UI/status activity ${slice}`, transport: "process" });
+          manager.status(outcome.id); manager.listForUi();
+        }
+        const live = manager.retentionReferences({ now, budgetMs: 2, maxEntries: 64 }); lastRefs = live;
+        if (!live.has("*")) {
+          complete = true;
+          expect(manager.retentionCustodyVeto(tail)).toBe(false);
+          retention.sweep(now, live, 100);
+          break;
+        }
+      }
+      expect(complete, JSON.stringify({ visited: reads.size, refs: [...lastRefs].slice(0, 20), reads: [...reads.values()].reduce((a, b) => a + b, 0) })).toBe(true);
+      expect(reads.has(path.join(root, "runs", tail, "status.json"))).toBe(true);
+      expect(fs.existsSync(path.join(root, "decisions", `${requestId}.json`))).toBe(false);
+      // Initial record/tree/removability checks plus the fresh resident sweep
+      // are bounded. Activity does not repeat historical ownership preparation.
+      expect(reads.get(path.join(root, "runs", "history-0", "status.json"))).toBeLessThanOrEqual(8);
+      const historicalReads = [...reads.values()].reduce((a, b) => a + b, 0);
+      for (let slice = 0; slice < 8; slice++) {
+        run(root, `after-${slice}`, { sessionId: "2147483647" });
+        manager.listForUi();
+        manager.retentionReferences({ now, budgetMs: 100, maxEntries: 64 });
+      }
+      expect([...reads.values()].reduce((a, b) => a + b, 0)).toBe(historicalReads);
+      // New pending sources retain their fresh, target-specific veto regardless
+      // of a completed historical watermark.
+      const held = run(root, "new-pending", { sessionId: "2147483647" });
+      fs.writeFileSync(path.join(held, "archive-pending.json"), "{}");
+      expect(manager.retentionCustodyVeto("new-pending")).toBe(true);
+    } finally { fs.readFileSync = original; retention.close(); await manager.close(); }
+  }, 30_000);
+
+  it("crossing the refresh interval mid-walk preserves the prepared historical prefix", async () => {
+    const root = temporary();
+    for (let i = 0; i < 256; i++) run(root, `history-${i}`, { sessionId: "2147483647" });
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, { runRoot: path.join(root, "runs") });
+    const reads = new Map<string, number>(), original = fs.readFileSync;
+    fs.readFileSync = ((...args: Parameters<typeof original>) => {
+      const file = String(args[0]);
+      if (file.startsWith(path.join(root, "runs") + path.sep) && path.basename(file) === "status.json") reads.set(file, (reads.get(file) ?? 0) + 1);
+      return original(...args);
+    }) as typeof original;
+    try {
+      expect(manager.retentionReferences({ now, budgetMs: 100, maxEntries: 64 }).has("*")).toBe(true);
+      const prefixReads = [...reads.values()].reduce((sum, count) => sum + count, 0);
+      let complete = false;
+      for (let slice = 0; slice < 16; slice++) {
+        if (!manager.retentionReferences({ now: now + 60_001, budgetMs: 100, maxEntries: 64 }).has("*")) { complete = true; break; }
+      }
+      expect(complete).toBe(true); expect(reads.size).toBe(256);
+      // Status + persisted exit + removability proof: exactly five reads per
+      // run, including the prefix inspected before the interval boundary.
+      expect(prefixReads).toBe(64 * 5);
+      expect([...reads.values()].every(count => count === 5)).toBe(true);
+    } finally { fs.readFileSync = original; await manager.close(); }
+  });
+
   it("20,000 disk runs never restart the prefix, unchanged polls read zero statuses and the loop remains below 50 ms p99", async () => {
     const root = temporary();
     for (let i = 0; i < 20_000; i++) run(root, `run-${String(i).padStart(5, "0")}`);
@@ -49,7 +161,7 @@ describe("bounded retention reference preparation", () => {
     // Count without retaining 20,000 Vitest spy call/result objects: their GC
     // would contaminate the event-loop histogram during the later archive phase.
     fs.readFileSync = ((...args: Parameters<typeof original>) => {
-      if (String(args[0]).startsWith(path.join(root, "runs") + "/") && String(args[0]).endsWith("/status.json")) reads++;
+      if (String(args[0]).startsWith(path.join(root, "runs") + path.sep) && path.basename(String(args[0])) === "status.json") reads++;
       return original(...args);
     }) as typeof original;
     const histogram = monitorEventLoopDelay({ resolution: 10 }); histogram.enable();
@@ -88,7 +200,40 @@ describe("bounded retention reference preparation", () => {
   }, 90_000);
 });
 
+it("Windows has no /proc archival proof and safely leaves every legacy byte in place", async () => {
+  const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const root = temporary(), directory = run(root, "windows-retained"), before = fs.readFileSync(path.join(directory, "events.jsonl"));
+  const idle = vi.fn(async () => true);
+  Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
+  const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false, processFilesIdle: idle });
+  try {
+    expect(await linuxRunFilesIdle([directory], path.join(root, "absent-proc"))).toBe(false);
+    await archive.sweep(now, 32, 1000);
+    expect(idle).not.toHaveBeenCalled(); expect(archive.health.archived).toBe(0);
+    expect(fs.readFileSync(path.join(directory, "events.jsonl"))).toEqual(before);
+    expect(fs.existsSync(path.join(root, "archive"))).toBe(false);
+  } finally { await archive.close(); Object.defineProperty(process, "platform", nativePlatform); }
+});
+
 describe.skipIf(process.platform !== "linux")("legacy run archive proof", () => {
+  it("inspects every live task and every fd, including a private table after an unrelated descriptor", async () => {
+    const root = temporary(), dir = run(root, "task-private-fd"), proc = emptyProc(root);
+    const group = path.join(proc, "123"), stat = (id: number) => `${id} (fixture) ${["S", ...Array(18).fill("0"), "100"].join(" ")}`;
+    fs.mkdirSync(group); fs.writeFileSync(path.join(group, "stat"), stat(123));
+    for (const tid of [123, 124]) {
+      const task = path.join(group, "task", String(tid)); fs.mkdirSync(path.join(task, "fd"), { recursive: true });
+      fs.writeFileSync(path.join(task, "stat"), stat(tid)); fs.writeFileSync(path.join(task, "maps"), "");
+      fs.symlinkSync(root, path.join(task, "cwd")); fs.symlinkSync("/", path.join(task, "root"));
+      fs.symlinkSync(path.join(root, "unrelated"), path.join(task, "fd", "0"));
+    }
+    expect(await linuxRunFilesIdle([dir], proc)).toBe(true);
+    fs.symlinkSync(path.join(dir, "events.jsonl"), path.join(group, "task", "124", "fd", "9"));
+    expect(await linuxRunFilesIdle([dir], proc)).toBe(false);
+    const archive = archiver(root, proc);
+    try { await archive.sweep(now, 32, 1000); expect(archive.health.archived).toBe(0); expect(fs.existsSync(dir)).toBe(true); }
+    finally { await archive.close(); }
+  });
+
   it("rejects young/nonterminal/unknown/pending/nested/live-identity runs and restores every file byte-for-byte", async () => {
     const root = temporary(), proc = emptyProc(root);
     const good = run(root, "good"); run(root, "failed", { status: "failed" }); run(root, "stopped", { status: "stopped" });
@@ -109,6 +254,46 @@ describe.skipIf(process.platform !== "linux")("legacy run archive proof", () => 
     const restored = path.join(root, "restore"); fs.mkdirSync(restored);
     execFileSync("tar", ["--ignore-zeros", "-xzf", path.join(root, "archive", new Date(now).toISOString().slice(0, 10) + ".tar.gz"), "-C", restored]);
     for (const [name, bytes] of before) expect(fs.readFileSync(path.join(restored, "good", name))).toEqual(bytes);
+  });
+
+  it("a zombie leader with a surviving task is held, even when the leader fd view is unavailable", async () => {
+    const root = temporary(), dir = run(root, "thread-held"), proc = emptyProc(root);
+    const pid = path.join(proc, "123"), task = path.join(pid, "task", "124");
+    fs.mkdirSync(task, { recursive: true });
+    const stat = (id: number, state: string) => `${id} (fixture) ${[state, ...Array(18).fill("0"), "100"].join(" ")}`;
+    fs.writeFileSync(path.join(pid, "stat"), stat(123, "Z"));
+    fs.writeFileSync(path.join(task, "stat"), stat(124, "S"));
+    fs.mkdirSync(path.join(task, "fd")); fs.symlinkSync(path.join(dir, "events.jsonl"), path.join(task, "fd", "3"));
+    expect(await linuxRunFilesIdle([dir], proc)).toBe(false);
+    const archive = archiver(root, proc);
+    try { await archive.sweep(now, 32, 1000); expect(archive.health.archived).toBe(0); expect(fs.existsSync(dir)).toBe(true); }
+    finally { await archive.close(); }
+  });
+
+  it("keeps a real pthread_exit zombie-leader run until the surviving file-holder is joined", async () => {
+    // The synthetic task regression above is unconditional on Linux. Exercise
+    // the real kernel state too wherever a C compiler is installed.
+    try { execFileSync("cc", ["--version"], { stdio: "ignore", timeout: 5000 }); } catch { return; }
+    const root = temporary(), dir = run(root, "pthread-held"), proc = emptyProc(root), binary = path.join(root, "holder");
+    execFileSync("cc", ["-pthread", fileURLToPath(new URL("./fixtures/zombie-leader.c", import.meta.url)), "-o", binary], { timeout: 10_000 });
+    const child = spawn(binary, [path.join(dir, "events.jsonl")], { stdio: "ignore" });
+    const closed = new Promise<void>((resolve, reject) => { child.once("error", reject); child.once("exit", () => resolve()); });
+    try {
+      expect(child.pid).toBeDefined();
+      fs.symlinkSync(`/proc/${child.pid}`, path.join(proc, String(child.pid)));
+      let states: string[] = [];
+      for (let retry = 0; retry < 200; retry++) {
+        states = fs.readdirSync(`/proc/${child.pid}/task`).map(tid => fs.readFileSync(`/proc/${child.pid}/task/${tid}/stat`, "utf8").split(") ")[1]!.split(" ")[0]!);
+        if (states.includes("Z") && states.some(state => !["Z", "X"].includes(state))) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(states).toContain("Z"); expect(states.some(state => !["Z", "X"].includes(state))).toBe(true);
+      expect(await linuxRunFilesIdle([dir], proc)).toBe(false);
+      const archive = archiver(root, proc);
+      try { await archive.sweep(now, 32, 1000); expect(archive.health.archived).toBe(0); expect(fs.existsSync(dir)).toBe(true); }
+      finally { await archive.close(); }
+    } finally { child.kill("SIGKILL"); await closed; }
+    expect(await linuxRunFilesIdle([dir], proc)).toBe(true);
   });
 
   it("checks real open descriptors, cwd and mmap paths and fails closed for incomplete /proc", async () => {

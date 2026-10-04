@@ -2,8 +2,11 @@
 
 The 50 ms request/claim loop does not prepare retention references. Independent
 100 ms maintenance ticks advance one persistent ownership cursor, at most 64
-handles/runs and 2 ms per tick. Snapshots invalidate on the managed generation or
-`runs/` directory identity/mtime/ctime; otherwise they refresh no more often than
+handles/runs and 2 ms per tick. Native custody changes and `runs/` directory
+changes queue a delta pass, never restart an in-flight historical cursor. An
+identity watermark avoids repeating historical status/tree reads on ordinary
+run creation or UI progress. Periodic revalidation starts at a factory boundary,
+not halfway through a suspended walk; snapshots refresh no more often than
 60 seconds after completion. Incomplete, unreadable, overflowing or time-limited
 proofs veto collection with `*`. No prefix restart, no unbounded snapshot copy.
 The cached set is never collection authority: expiring an exchange performs a
@@ -12,8 +15,13 @@ fresh targeted writer/tree proof (including indexed actor runs) within its own
 without a run-set mtime change. Regular compaction/deletion retains the existing
 native worker-exit, descendant, result preservation and actor-reference fences.
 A unit interrupted after reference preparation/recovery can retry on two later
-ticks; permanently oversized units are skipped without starving later entries. A legacy archive is a separate,
-reversible policy, **not** permission to weaken native exit/deletion guards.
+ticks; oversized tree-proof units are retained without starving later entries.
+Pending full-result custody records have **no** 1-MiB protocol cutoff: recovery
+retains its nested DFS continuation and reads one source in 64-KiB chunks across
+count/time slices. Parsing and atomic sink discharge use a one-record slow path.
+Source identity/length/timestamp changes veto publication; successful settlement
+and shutdown sinks discharge only their own exact outcomes. A legacy archive is
+a separate, reversible policy, **not** permission to weaken native exit/deletion guards.
 
 ## Policy
 
@@ -48,9 +56,11 @@ All of the following are required:
 - No live manager handle, actor latest/in-flight run, removal marker, unjoined
   legacy resident admission handle, pending request/processing or delivery-outbox.
   Reference generations are checked before staging and after compression/append.
-- **Complete Linux /proc visibility**: no process descriptor, cwd/root or memory
-  mapping references the run tree. Permission errors are uncertainty, not proof
-  of absence. The process census is rechecked for newly born/reused PIDs. A
+- **Complete Linux /proc visibility**: every task in every thread group has its
+  descriptors, cwd/root and memory mappings inspected, not just the leader. A
+  zombie leader with surviving tasks vetoes archival. Permission errors are
+  uncertainty, not proof of absence. The census is rechecked for newly born or
+  reused task identities (TIDs), including threads with private fd tables. A
   1-second/32,768-entry proof limit yields a veto, not partial authorization.
   Unsupported platforms and restricted /proc skip automatically.
 

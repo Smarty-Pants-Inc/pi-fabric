@@ -51,7 +51,9 @@ export class RetentionReferenceScan {
     const started = performance.now();
     const expired = () => performance.now() - started >= (options.budgetMs ?? 2);
     this.#expired = expired;
-    if (options.refresh || generation !== this.#generation || (this.#complete && now >= this.#nextRefresh)) {
+    // Activity queues a delta pass, never discards an in-flight historical
+    // cursor. The factory must reconcile changes before it finishes.
+    if (options.refresh || (!this.#cursor && generation !== this.#generation) || (this.#complete && now >= this.#nextRefresh)) {
       this.close(); this.#generation = generation; this.#refs = new Set(); this.#complete = false;
     }
     if (!this.#complete && !this.#cursor) {
@@ -68,6 +70,9 @@ export class RetentionReferenceScan {
     try {
       for (let count = 0; this.#cursor && count < (options.maxEntries ?? 64) && !expired(); count++) {
         if (this.#cursor.next().done) {
+          // Keep the generation captured when the cursor started. A change
+          // during preparation queues a fresh delta on the next call, even if
+          // the factory has already reconciled filesystem additions.
           this.#cursor = undefined; this.#complete = true; this.#nextRefresh = now + this.intervalMs;
         }
       }

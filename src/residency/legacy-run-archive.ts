@@ -94,63 +94,76 @@ export const linuxRunFilesIdle = async (directories: readonly string[], procRoot
   let inspected = 0;
   const expired = () => ++inspected > 32_768 || performance.now() - started > 1_000;
   const births = new Map<string, string>();
-  try {
+  const fields = async (directory: string) => {
+    const stat = await fsp.readFile(path.join(directory, "stat"), "utf8");
+    const value = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/);
+    if (!value[0] || !/^\d+$/.test(value[19] ?? "") || !Number.isSafeInteger(Number(value[6]))) throw new Error("unknown task identity");
+    return value;
+  };
+  const census = async (verify: boolean): Promise<boolean> => {
     const processes = await fsp.opendir(procRoot);
     for await (const entry of processes) {
       if (!/^\d+$/.test(entry.name)) continue;
       if (expired()) return false;
-      await yieldTurn();
       const processDir = path.join(procRoot, entry.name);
       try {
-        // Zombies have already released files/fs/mm; kernel threads have no
-        // userspace file-table custody. Missing cwd for any other process is
-        // still uncertainty, not permission to ignore it.
-        const stat = await fsp.readFile(path.join(processDir, "stat"), "utf8");
-        const fields = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/);
-        if (!/^\d+$/.test(fields[19] ?? "")) return false;
-        births.set(entry.name, fields[19]!);
-        if (fields[0] === "Z" || fields[0] === "X" || (Number(fields[6]) & 0x00200000) !== 0) continue;
-        if (!fields[0] || !Number.isSafeInteger(Number(fields[6]))) return false;
-        for (const name of ["cwd", "root"]) if (contains(await fsp.readlink(path.join(processDir, name)))) return false;
-        const descriptors = await fsp.opendir(path.join(processDir, "fd"));
-        for await (const fd of descriptors) {
+        const leader = await fields(processDir);
+        const deadLeader = leader[0] === "Z" || leader[0] === "X";
+        const tasks = await fsp.opendir(path.join(processDir, "task"));
+        let taskCount = 0;
+        for await (const task of tasks) {
+          if (!/^\d+$/.test(task.name)) continue;
           if (expired()) return false;
           await yieldTurn();
-          try { if (contains(await fsp.readlink(path.join(processDir, "fd", fd.name)))) return false; }
-          catch (error) { if (!gone(error)) throw error; }
+          const taskDir = path.join(processDir, "task", task.name), key = `${entry.name}/${task.name}`;
+          try {
+            const identity = await fields(taskDir);
+            taskCount++;
+            if (verify) {
+              if (births.get(key) !== identity[19]) return false;
+              // A formerly dead task cannot become live without invalidating
+              // the proof, even when its leader's identity has not changed.
+              if (deadLeader && identity[0] !== "Z" && identity[0] !== "X") return false;
+              continue;
+            }
+            births.set(key, identity[19]!);
+            // pthread_exit can leave a zombie leader with surviving writers.
+            // Such a group is held, never inferred dead from leader stat/fd.
+            if (deadLeader && identity[0] !== "Z" && identity[0] !== "X") return false;
+            if (identity[0] === "Z" || identity[0] === "X" || (Number(identity[6]) & 0x00200000) !== 0) continue;
+            for (const name of ["cwd", "root"]) if (contains(await fsp.readlink(path.join(taskDir, name)))) return false;
+            const descriptors = await fsp.opendir(path.join(taskDir, "fd"));
+            for await (const fd of descriptors) {
+              if (expired()) return false;
+              await yieldTurn();
+              try { if (contains(await fsp.readlink(path.join(taskDir, "fd", fd.name)))) return false; }
+              catch (error) { if (!gone(error)) throw error; }
+            }
+            const mapsFile = path.join(taskDir, "maps");
+            if ((await fsp.stat(mapsFile)).size > 16 * 1024 * 1024) return false;
+            const maps = await fsp.readFile(mapsFile, "utf8");
+            if (maps.length > 16 * 1024 * 1024) return false;
+            for (const line of maps.split("\n")) {
+              const target = /^\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(.*)$/.exec(line)?.[1];
+              if (target && contains(target.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8))))) return false;
+            }
+          } catch (error) {
+            try { await fsp.stat(taskDir); } catch (missing) { if (gone(missing)) continue; }
+            return false;
+          }
         }
-        const mapsFile = path.join(processDir, "maps");
-        if ((await fsp.stat(mapsFile)).size > 16 * 1024 * 1024) return false;
-        const maps = await fsp.readFile(mapsFile, "utf8");
-        if (maps.length > 16 * 1024 * 1024) return false;
-        for (const line of maps.split("\n")) {
-          const target = /^\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(.*)$/.exec(line)?.[1];
-          if (target && contains(target.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8))))) return false;
-        }
+        if (!taskCount) return false;
       } catch (error) {
-        // An exited process cannot hold files. A missing cwd/fd/maps in a still
-        // present process, unlike a descriptor closing during enumeration, is
-        // incomplete proof (including zombies/kthreads with inaccessible data).
         try { await fsp.stat(processDir); } catch (missing) { if (gone(missing)) continue; }
         return false;
       }
     }
-    // A new/reused PID may have opened a run after the first directory cursor
-    // passed its slot. Require the second census to contain no new identities;
-    // vanished processes have released their file tables and are harmless.
-    const current = await fsp.opendir(procRoot);
-    for await (const entry of current) {
-      if (!/^\d+$/.test(entry.name)) continue;
-      if (expired()) return false;
-      await yieldTurn();
-      try {
-        const stat = await fsp.readFile(path.join(procRoot, entry.name, "stat"), "utf8");
-        const birth = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/)[19];
-        if (!birth || births.get(entry.name) !== birth) return false;
-      } catch (error) { if (!gone(error)) return false; }
-    }
-    return !expired();
-  } catch { return false; }
+    return true;
+  };
+  // Both censuses include TIDs, not only process leaders. New/reused tasks
+  // invalidate the proof; disappeared tasks have released their custody.
+  try { return await census(false) && await census(true) && !expired(); }
+  catch { return false; }
 };
 
 interface ArchiveOptions {

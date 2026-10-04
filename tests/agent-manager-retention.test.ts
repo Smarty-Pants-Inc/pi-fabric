@@ -1,0 +1,49 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { expect, it, vi } from "vitest";
+import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { writeJsonAtomic } from "../src/core/atomic-write.js";
+
+it("Windows native-close discharge invalidates cached completed-run custody, not ordinary UI progress", async () => {
+  const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "manager-retention-close-"));
+  let release!: () => void, exited = false;
+  const joined = new Promise<void>(resolve => { release = () => { exited = true; resolve(); }; });
+  const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockResolvedValue({
+    kind: "process", sessionId: "2147483647", isAlive: async () => !exited,
+    waitForClose: () => joined, stop: async () => { release(); },
+  });
+  const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true }, {
+    runRoot: path.join(root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+  });
+  const now = Date.now();
+  try {
+    const handle = await manager.spawn({ task: "native join custody", transport: "process", extensions: false });
+    const file = path.join(manager.runDirectory(handle.id)!, "status.json");
+    writeJsonAtomic(file, {
+      ...handle, id: handle.id, task: "native join custody", status: "completed", transport: "process", sessionId: "2147483647",
+      startedAt: now, updatedAt: now, finishedAt: now, text: "exact saved outcome", turns: 1, toolCalls: 0,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    });
+    expect(await manager.wait(handle.id)).toMatchObject({ status: "completed", text: "exact saved outcome" });
+    const snapshot = () => manager.retentionReferences({ now, budgetMs: 100, maxEntries: 128 });
+    expect(snapshot().has(handle.id)).toBe(true);
+    expect(manager.retentionCustodyVeto(handle.id)).toBe(true);
+    manager.listForUi(); manager.status(handle.id);
+    expect(snapshot().has(handle.id)).toBe(true);
+    release();
+    // No artificial 60-second clock advance or forced refresh: the real native
+    // close/debt-discharge transition must invalidate the protective cache.
+    await vi.waitFor(() => expect(snapshot().has(handle.id)).toBe(false));
+    expect(manager.retentionCustodyVeto(handle.id)).toBe(false);
+    expect(fs.existsSync(file)).toBe(true);
+  } finally {
+    release(); await manager.close(); launch.mockRestore();
+    Object.defineProperty(process, "platform", nativePlatform);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

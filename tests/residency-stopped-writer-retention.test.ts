@@ -133,6 +133,9 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     expect(await control.request(client.hostId, writer.id, "stop", {}, client.hostId)).toMatchObject({ acknowledged: true });
     await waitFor(() => host.actors.inFlightCount() === 0);
     expect(host.agents.status(writer.id).status).toBe("stopped");
+    // Like the recovered-descendant cases below, finish a fresh offline proof:
+    // idle snapshots may retain an exited writer until the 60-second refresh.
+    expect(host.agents.retentionReferences({ refresh: true, budgetMs: 100 }).has(actor.id)).toBe(false);
     const before = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);

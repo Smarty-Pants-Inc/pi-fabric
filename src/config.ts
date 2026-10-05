@@ -265,9 +265,9 @@ export interface FabricRetentionConfig {
   terminalRunEventsAgeMs: number;
   /** Total retained events.jsonl bytes, including the truncation marker. */
   terminalRunEventsMaxBytes: number;
-  /** Reversibly archive eligible identity-less legacy resident runs on Linux. */
+  /** Move eligible identity-less legacy runs into runs-retired/; never delete their bytes. */
   legacyRunArchiveEnabled?: boolean;
-  /** Minimum terminal finishedAt age before legacy archival (default 48 hours). */
+  /** Minimum terminal finishedAt age before legacy retirement (default 48 hours). */
   legacyRunArchiveAgeMs?: number;
 }
 

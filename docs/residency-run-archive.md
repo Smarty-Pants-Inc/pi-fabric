@@ -1,4 +1,4 @@
-# Resident runs: bounded references and reversible legacy archives
+# Resident runs: bounded references and permanent legacy retirement
 
 The 50 ms request/claim loop does not prepare retention references. Independent
 100 ms maintenance ticks advance one persistent ownership cursor, at most 64
@@ -12,8 +12,9 @@ proofs veto collection with `*`. No prefix restart, no unbounded snapshot copy.
 The cached set is never collection authority: expiring an exchange performs a
 fresh targeted writer/tree proof (including indexed actor runs) within its own
 2-ms/64-run budget. In-place nested/status changes are therefore fenced even
-without a run-set mtime change. Regular compaction/deletion retains the existing
-native worker-exit, descendant, result preservation and actor-reference fences.
+without a run-set mtime change. Regular native compaction/deletion retains the
+existing worker-exit, descendant, result preservation and actor-reference guards;
+the separate legacy policy below grants **no deletion authority**.
 An interrupted proof resumes at its failed predicate, not at the initial status
 read. Each predicate can retry on two later ticks; timed-out units veto the
 current snapshot and retry on the next completed delta pass rather than becoming
@@ -23,10 +24,30 @@ Pending full-result custody records have **no** 1-MiB protocol cutoff: recovery
 retains its nested DFS continuation and reads one source in 64-KiB chunks across
 count/time slices. Parsing and atomic sink discharge use a one-record slow path.
 Source identity/length/timestamp changes veto publication; successful settlement
-and shutdown sinks discharge only their own exact outcomes. A legacy archive is
-a separate, reversible policy, **not** permission to weaken native exit/deletion guards.
+and shutdown sinks discharge only their own exact outcomes.
 
-## Policy
+## Scope cut: no automatic legacy source deletion
+
+Linux can keep a writable file reference in an **unreceived `SCM_RIGHTS` message**
+after the sender closes its descriptor. No task's fd table, cwd/root or maps need
+show that file. A stable, completely visible `/proc` census therefore cannot
+prove absence of writable file custody. Compressing a snapshot and then deleting
+the source can lose later writes through that queued descriptor.
+
+This policy does **not compress, copy, unlink, recursively remove, or expire**
+legacy source trees. It only moves them with same-filesystem `rename(2)` into
+`runs-retired/YYYY-MM-DD/slice-*/RUN_ID/`, inside the residency root. Rename keeps
+the directory and file inodes linked. A hidden descriptor received later still
+writes into the moved file; the retained bytes are not a stale compressed copy.
+There is no `/proc` census, mount/namespace completeness proof, compression child,
+bundle append, manifest or deletion transaction in this worker anymore.
+
+The hot `runs/` directory shrinks, reducing startup and sweep work. **Total disk
+usage does not shrink.** Deletion is cut from this PR: a follow-up needs an
+independently reviewed opaque-custody proof or an owner-run offline step that
+actually discharges outstanding custody. More `/proc` visibility is not that proof.
+
+## Policy and live writers
 
 ```json
 {
@@ -37,86 +58,65 @@ a separate, reversible policy, **not** permission to weaken native exit/deletion
 }
 ```
 
-Default age is 48 hours from **finishedAt**, not directory mtime. Normalized ages
-range from one hour to 365 days. `legacyRunArchiveEnabled: false` disables new
-archival (including rechecking a changed policy before publication/deletion).
-The host shares its live policy overlay with the archive worker.
+The legacy public class and policy names are retained for compatibility; their
+meaning is now rename-only retirement. Default age is 48 hours from **finishedAt**,
+not directory mtime. Normalized ages range from one hour to 365 days. The worker
+shares the host's live overlay; `legacyRunArchiveEnabled: false` disables moves.
 
 An independent 250 ms background tick discovers at most 32 runs/20 ms, yielding
-between asynchronous filesystem operations. Only one compression child runs at
-a time. Host shutdown joins that child and its current slice.
+between asynchronous filesystem operations. Only one slice runs at a time.
+Shutdown joins the current slice. Discovery holds a directory cursor, not a
+snapshot of all historical run names. Empty slices may remain; they hold no run
+bytes and are never automatically removed.
 
-All of the following are required:
+Rename preserves descriptor writes, but a **known live writer that reopens by
+original path** must not lose that path. These guards remain:
 
-- Owned private run directories, ordinary owned single-link allowlisted files.
-- Legacy root has **no** worker sessionId/PID or processStartTime. Status is
-  completed, failed or stopped, and a valid finishedAt is older than the age.
-- Every nested run has the same terminal/age proof; any saved descendant PID is
-  confirmed absent. Unknown status, transports, metadata, links, unresolved
-  worker markers and unknown contents veto. Oversized trees are skipped.
-- No deliveries/follow-ups remain; queued results, completion-recipient markers
-  and cleanup obligations are not inferred delivered from terminal status.
-- No live manager handle, actor latest/in-flight run, removal marker, unjoined
-  legacy resident admission handle, pending request/processing or delivery-outbox.
-  Reference generations are checked before staging and after compression/append.
-- **Complete Linux /proc visibility**: every task in every thread group has its
-  descriptors, cwd/root and memory mappings inspected, not just the leader. A
-  zombie leader with surviving tasks vetoes archival. Permission errors are
-  uncertainty, not proof of absence. The census is rechecked for newly born or
-  reused task identities (TIDs), including threads with private fd tables. A
-  1-second/32,768-entry proof limit yields a veto, not partial authorization.
-  Before and around both censuses, a procfs mount/namespace fence requires an
-  actual procfs, an unfiltered mount rooted at `/`, initial Linux PID/user/cgroup
-  namespaces, and the same mount namespace as host PID 1. `hidepid` other than
-  zero, `subset`, process-subtree overmounts, private/container namespaces and
-  unreadable topology all veto; two stable visible PID lists are not completeness
-  evidence. Mount/namespace changes during either census veto as well.
-  Unsupported platforms and restricted /proc skip automatically.
+- Owned private, unaliased source/destination directories and ordinary owned,
+  single-link allowlisted files. Unsupported filesystem moves fail, never copy.
+- The legacy root has **no** worker sessionId/PID or processStartTime, and a valid
+  completed/failed/stopped status with sufficiently old finishedAt.
+- Every nested run needs terminal/age evidence; any saved descendant PID must be
+  absent (a zombie leader is not inferred dead). Unknown status, transports,
+  metadata, links, unresolved workers, unknown contents and oversized trees veto.
+- Pending deliveries/follow-ups, results, completion recipients and cleanup
+  obligations veto. Terminal status alone does not infer publication.
+- Manager custody, actor latest/in-flight run, removal markers, unjoined resident
+  admission handles, pending requests/processing and delivery-outbox veto.
+- Fresh tree identity and reference-generation checks bracket the move. If known
+  custody appears after rename, move back without overwriting an existing run ID.
+  A conflicting ID or namespace fault leaves the moved bytes retained and reports
+  an error rather than destroying either copy.
 
-`archive-retention.json` records checked/archived/skipped counts, incomplete
-process proofs and the latest error. A failed global visibility preflight defers
-legacy discovery for 60 seconds, avoiding fruitless per-run tree scans. It is
-only a veto; no successful preflight is cached as authorization.
-Restricted multi-user hosts may therefore
-archive nothing: do not pretend that looking only at this user's PIDs proves
-that no privileged process has a file open. An appropriately privileged,
-independently reviewed process-proof service is future work, not a bypass here.
+The guards are conservative protection for known live/path-based owners, **not**
+a claim that all potential writers are discoverable. Unknown descriptor custody
+is safe for bytes because the inode remains linked. Retirement applies on Windows
+too, without pretending `/proc` exists; a rejected rename leaves the source intact.
+Directory fsync is performed on platforms supporting it. `archive-retention.json`
+keeps checked/archived/skipped counters and the latest error; the historical
+`archived` label now counts moved runs.
 
-## Bundle format and restore
+## Inspect and restore
 
-Eligible directories are atomically moved from `runs/` into a private
-`archive/.staging-*` directory. `tar` compresses the entire byte-preserved tree
-outside the Node event loop. The fragment is appended and fsynced to the one UTC
-daily `archive/YYYY-MM-DD.tar.gz` bundle, followed by a fsynced manifest line per
-run in `YYYY-MM-DD.manifest.jsonl`. The archive directory is fsynced before the
-staged source is removed. Process, tree and custody proofs are checked again.
-Manifest records include run ID/status/finishedAt, archive time and the gzip
-member offset/length. No archive TTL/deletion is imposed.
-
-The daily file concatenates complete gzip-compressed tar members. GNU tar's
-`--ignore-zeros` is **required** to read all slices (not just the first member):
+Retired runs are ordinary directories. No tar tooling or decompression is needed.
+Stop the owning resident and inspect the selected retained tree, then move it back
+into an **empty** original slot. Never overwrite a live run with the same ID.
+For example, in the stopped resident's root:
 
 ```sh
-# Stop the resident first; restore into an empty temporary directory to inspect.
-mkdir -m 700 restored-runs
-tar --ignore-zeros -xzf /path/to/residency/archive/2026-10-04.tar.gz -C restored-runs
-# Inspect, then move selected ID directories back to residency/runs/.
-# Do not overwrite an existing live run with the same ID.
+# Inspect the exact dated slice and ID first.
+ls runs-retired/2026-10-04/slice-EXAMPLE/RUN_ID/
+# Verify runs/RUN_ID does not exist; restore on the SAME filesystem.
+test ! -e runs/RUN_ID && mv -T runs-retired/2026-10-04/slice-EXAMPLE/RUN_ID runs/RUN_ID
 ```
 
-Or list: `tar --ignore-zeros -tzf ...tar.gz`. A normal `tar -xzf` without
-`--ignore-zeros` may silently restore only the first slice. File contents are
-unchanged; tar preserves file names and mode/mtime. Restore is operator-driven.
+The `mv -T` example uses GNU coreutils; on other platforms use an equivalent
+non-overwriting directory rename while the owner is stopped. Unique private
+slice directories keep repeated run IDs from overwriting previously retired
+bytes. A partial failure or restart needs no compressed-tail recovery: each
+completed rename already leaves a complete ordinary source directory. The next
+collector scans only remaining hot runs and never deletes older slices.
 
-## Interrupted slices
-
-Any failure retains the original directory bytes in `.staging-*`; no automatic
-cleanup discards these recovery sources. `pending.json` records the intended
-bundle, append offset/length and IDs; the complete compressed fragment remains
-alongside them. On an interrupted append, stop the host and inspect the manifest
-and journal. Copy all artifacts first. A corrupt uncommitted bundle tail can be
-trimmed to the journal's **offset** before retrying a restore of committed members.
-If the bundle/manifest committed but source removal did not, both copies exist;
-choose one, do not restore duplicate IDs over existing directories. Recovery of
-staged source directories can simply move each ID back to an empty `runs/` slot.
-The worker never automatically resumes an ambiguous interrupted transaction.
+Any pre-existing `archive/` bundles or `.staging-*` bytes from the older branch
+implementation are untouched. Inspect/recover those manually; this worker
+neither resumes nor cleans up that superseded compression protocol.

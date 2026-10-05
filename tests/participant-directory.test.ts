@@ -94,6 +94,63 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("ParticipantDirectory routing freshness (#2386)", () => {
+  const fixture = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-routing-view-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:observer", name: "Observer", kind: "main" };
+    return createDirectory(path.join(root, "mesh"), identity, identity.id, () => [], { heartbeatMs: 60_000, leaseMs: 120_000 });
+  };
+
+  it("distinguishes missing, fresh and overdue views, and does not upgrade read evidence to lease admission", async () => {
+    const directory = fixture();
+    expect(directory.routingUnavailable()).toContain("no confirmed view");
+    expect(directory.canConsumeMesh()).toBe(false);
+    const read = vi.spyOn(directory.mesh, "exclusive");
+    await directory.refreshRoutingView();
+    expect(read).toHaveBeenCalledWith(expect.any(Function), 250);
+    expect(directory.routingUnavailable()).toBeUndefined();
+    expect(directory.canConsumeMesh()).toBe(false);
+    await directory.refresh();
+    expect(directory.routingUnavailable()).toBeUndefined();
+    expect(directory.routingUnavailable(directory.confirmedAt() + 120_000)).toContain("overdue");
+    const confirmed = directory.confirmedAt();
+    await directory.refreshRoutingView();
+    expect(directory.confirmedAt()).toBe(confirmed);
+  });
+
+  it("invalidates prior routing confirmation after any failed refresh and recovers with one canonical read", async () => {
+    const directory = fixture();
+    await directory.refresh();
+    await directory.refreshRoutingView();
+    const failure = new Error("directory refresh read failed");
+    const heartbeat = vi.spyOn(directory.mesh, "confirmWritable").mockRejectedValueOnce(failure);
+    await expect(directory.refresh()).rejects.toBe(failure);
+    heartbeat.mockRestore();
+    expect(directory.routingUnavailable()).toBe(failure.message);
+    const confirmed = directory.confirmedAt();
+    await directory.refreshRoutingView();
+    expect(directory.routingUnavailable()).toBeUndefined();
+    expect(directory.confirmedAt()).toBe(confirmed);
+    expect(directory.canConsumeMesh()).toBe(false);
+    // A canonical read failure cannot leave behind successful routing evidence.
+    const read = vi.spyOn(directory.mesh, "stateToken").mockImplementation(() => { throw new Error("unreadable canonical view"); });
+    await expect(directory.refreshRoutingView()).rejects.toThrow("unreadable canonical view");
+    expect(directory.routingUnavailable()).toBeDefined();
+    read.mockRestore();
+    await directory.refreshRoutingView();
+    expect(directory.routingUnavailable()).toBeUndefined();
+  });
+
+  it("does not refresh a closed directory", async () => {
+    const directory = fixture();
+    await directory.refresh();
+    await directory.close();
+    expect(directory.routingUnavailable()).toContain("closed");
+    await expect(directory.refreshRoutingView()).rejects.toThrow("closed");
+  });
+});
+
 describe("#3662 ParticipantDirectory lineage liveness", () => {
   it("shares preparation reads across cache expiry but freshens after the confirmation fence (#4383)", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-refresh-snapshot-"));
@@ -749,11 +806,17 @@ describe("ParticipantDirectory host leases", () => {
       const hostAfter = mesh.listAll("topology/hosts/", { fresh: true }).find(entry => (entry.value as { id: string }).id === identity.id)!;
       const legacyAfter = mesh.get("sessions/delayed", { fresh: true })!;
       if (legacy) {
-        expect(writes).toHaveBeenCalledOnce(); // legacy host + session in one locked commit
-        expect(hostAfter.version).toBeGreaterThan(hostBefore.version);
-        expect(hostAfter.value).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
-        expect(legacyAfter.version).toBeGreaterThan(legacyBefore.version);
-        expect(legacyAfter.updatedAt).toBe(now);
+        const hostDue = policy ? delayMs >= STATE_LEASE_RENEW_MS : delayMs >= leaseMs / 2;
+        const sessionDue = !policy && delayMs >= 7_500;
+        expect(writes).toHaveBeenCalledTimes(hostDue || sessionDue ? 1 : 0);
+        if (hostDue) {
+          expect(hostAfter.version).toBeGreaterThan(hostBefore.version);
+          expect(hostAfter.value).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
+        } else expect(hostAfter).toEqual(hostBefore);
+        if (sessionDue) {
+          expect(legacyAfter.version).toBeGreaterThan(legacyBefore.version);
+          expect(legacyAfter.updatedAt).toBe(now);
+        } else expect(legacyAfter).toEqual(legacyBefore);
       } else {
         // Thresholds no longer require state commits when every live reader uses lease files.
         expect(writes).not.toHaveBeenCalled();
@@ -761,7 +824,8 @@ describe("ParticipantDirectory host leases", () => {
         expect(legacyAfter).toEqual(legacyBefore);
       }
       expect(readHostLeases(mesh.root).get(identity.id)).toMatchObject({ updatedAt: now, expiresAt: now + leaseMs });
-      expect(sessionLiveness(legacyAfter, mesh.root)).toEqual({ updatedAt: now, expiresAt: now + 15_000 });
+      if (policy) expect(legacyAfter).toBeUndefined();
+      else expect(sessionLiveness(legacyAfter, mesh.root)).toEqual({ updatedAt: now, expiresAt: now + 15_000 });
       expect(mesh.listAll("topology/participants/", { fresh: true })[0]).toEqual(participantBefore);
       expect(directory.confirmedAt()).toBe(now);
     } finally {
@@ -2027,16 +2091,41 @@ describe("ParticipantDirectory lease reads", () => {
   };
   afterEach(() => vi.restoreAllMocks());
 
-  it("keep a peer whose file lease was renewed after the read and before its old expiry", async () => {
-    const { lease, renew, seesPeer } = await setup();
-    const clock = vi.spyOn(Date, "now");
-    clock.mockReturnValue(lease.expiresAt - 5_000);
-    expect(seesPeer()).toBe(true);                                   // fills the lease read
-    renew(lease.expiresAt - 2_000);                                  // file-only renewal
-    clock.mockReturnValue(lease.expiresAt + 1);                      // old expiry passed, read reused
-    expect(seesPeer()).toBe(true);
-    clock.mockReturnValue(lease.expiresAt + 5_000);
-    expect(seesPeer()).toBe(true);
+  it.each(["native", "win32"])("keep a peer whose file lease was renewed after the read and before its old expiry (%s)", async (target) => {
+    const { readerDirectory, lease, renew, seesPeer } = await setup();
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    let renewed = false;
+    try {
+      if (target === "win32") {
+        Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+        // NTFS file IDs can exceed Number's exact integer range. Model two distinct
+        // IDs that round to the same number, with equal size and timestamps.
+        const file = path.join(readerDirectory.mesh.root, "host-leases",
+          createHash("sha256").update(peer.id).digest("hex").slice(0, 32) + ".json");
+        const stat = fs.statSync.bind(fs);
+        const before = stat(file);
+        const beforeBig = stat(file, { bigint: true });
+        vi.spyOn(fs, "statSync").mockImplementation(((name: fs.PathLike, options?: fs.StatOptions) => {
+          const current = stat(name, options);
+          if (String(name) !== file) return current;
+          const ino = 2n ** 54n + (renewed ? 1n : 0n);
+          return Object.assign(current!, options?.bigint
+            ? { ...beforeBig, ino }
+            : { ...before, ino: Number(ino) });
+        }) as typeof fs.statSync);
+      }
+      const clock = vi.spyOn(Date, "now");
+      clock.mockReturnValue(lease.expiresAt - 5_000);
+      expect(seesPeer()).toBe(true);                                   // fills the lease read
+      renew(lease.expiresAt - 2_000);                                  // file-only renewal
+      renewed = true;
+      clock.mockReturnValue(lease.expiresAt + 1);                      // old expiry passed, read reused
+      expect(seesPeer()).toBe(true);
+      clock.mockReturnValue(lease.expiresAt + 5_000);
+      expect(seesPeer()).toBe(true);
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
   });
 
   it("drop a peer whose lease lapsed and was not renewed", async () => {

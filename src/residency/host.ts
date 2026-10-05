@@ -43,6 +43,7 @@ import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
+import { rootPresenceAlarms } from "../topology/stall-alarms.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
   RESIDENT_HOST_FORMAT,
@@ -69,7 +70,7 @@ import {
   type ResidentHostOwner,
 } from "./protocol.js";
 import { completionRecipientFromRun, saveCompletion } from "../agents/completion-journal.js";
-import { deliveryRoot, projectOf, recordedProjectLead, repositoryOf } from "../topology/project-identity.js";
+import { projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { canRemoveTerminalRun, compactTerminalRunEvents, retainedActorRunIds, runTreeExitVeto, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
@@ -279,6 +280,8 @@ export class ResidentHost {
       rootId: config.rootId,
       identity: this.identity,
       reapDeadHosts: false,                                    // its session's runtime sweeps
+      presencePass: () => rootPresenceAlarms(this.mesh, this.identity, this.hostId,
+        this.participants.list({ scope: "project", includeStale: true, fresh: true }), config.mesh.rootPresenceAlarmMs),
     });
     this.control = new FabricControlPlane(this.mesh, this.identity, {
       enabled: true,
@@ -303,12 +306,25 @@ export class ResidentHost {
     const currentConfig = (): Partial<ResidentHostConfig> => {
       const desired = readJson<Partial<ResidentHostConfig>>(guidanceConfigPath);
       // Desired B/C is NOT an effective A overlay or an A rollback snapshot.
+      // Once accepted, however, the snapshot is authoritative: omission of an
+      // optional policy is an explicit revocation, not permission to fall back
+      // to the constructor's startup policy.
       return desired?.fabricExtensionPath === config.fabricExtensionPath && desired.workerPath === config.workerPath &&
         desired.rootId === config.rootId && desired.sessionId === config.sessionId ? desired : config;
     };
+    const currentModelRouting = (): ResidentHostConfig["agents"]["modelRouting"] => {
+      const overlay = currentConfig();
+      return overlay === config ? config.agents.modelRouting : overlay.agents?.modelRouting;
+    };
     this.#effectiveConfig = () => {
       const overlay = currentConfig();
+      const acceptedAgents = { ...config.agents };
+      if (overlay.agents?.modelRouting) acceptedAgents.modelRouting = overlay.agents.modelRouting;
+      else delete acceptedAgents.modelRouting;
       return { ...config,
+        // An accepted snapshot that omits modelRouting must clear the startup
+        // value. Invalid/unavailable snapshots still use the startup config.
+        ...(overlay === config ? {} : { agents: acceptedAgents }),
         ...(overlay.piModels ? { piModels: overlay.piModels } : {}),
         ...(overlay.modelGuidance ? { modelGuidance: overlay.modelGuidance } : {}),
         ...(overlay.kernel ? { kernel: overlay.kernel } : {}),
@@ -450,7 +466,6 @@ export class ResidentHost {
         if (!message.text) return;
         const mode = delivery === "steer" ? "steer" : "followUp";
         const triggers = delivery === "nextTurn" ? false : triggerTurn;
-        const project = actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd));
         this.#trackPublication(this.#queueDelivery(
           { id: actor.id, name: actor.name, kind: "actor" },
           message.text,
@@ -458,20 +473,9 @@ export class ResidentHost {
           triggers,
           message.data,
           undefined,
-          // smarty-dev#3662: lease lapse is not death; only the exact recorded integrator may inherit.
-          () => deliveryRoot(
-            config.rootId,
-            this.participants.list({ scope: "project", kinds: ["root"] }),
-            project,
-            {
-              lineageAlive,
-              boundIntegrator: () => {
-                const repository = repositoryOf(project);
-                const leadId = recordedProjectLead(config.cwd);
-                return { ...(repository ? { repository } : {}), ...(leadId ? { leadId } : {}) };
-              },
-            },
-          ),
+          // #471: actor output is bound to the exact owning root; a dead root is retained,
+          // never re-homed to another Main selected by cwd, project, or launch metadata.
+          config.rootId,
           message.source === "fabric-host" ? undefined : message.principal,
           message.source === "fabric-host" ? "fabric-host" : "actor-output",
         ));
@@ -497,8 +501,9 @@ export class ResidentHost {
         resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
         prepareModelRoute: async (input, signal) => {
           const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
-          return prepareModelRoute({ ...input, signal, config: config.agents.modelRouting,
-            registry: residentRouteRegistry(), aliases: normalizeModelAliases((currentConfig().piModels ?? config.piModels)?.aliases),
+          const overlay = currentConfig();
+          return prepareModelRoute({ ...input, signal, config: currentModelRouting(),
+            registry: residentRouteRegistry(), aliases: normalizeModelAliases((overlay.piModels ?? config.piModels)?.aliases),
             assertModelAllowed: model => this.agents.assertModelAllowed(model, "pi"),
             evaluate: (request, routeSignal) => this.#routeOwner!.evaluate(request, routeSignal) });
         },
@@ -875,16 +880,20 @@ export class ResidentHost {
       if (!record || record.format !== RESIDENT_HOST_FORMAT || `${record.id}.json` !== entry) {
         throw new Error(`Invalid resident delivery outbox item: ${file}`);
       }
-      const key = `${residentDeliveryPrefix(record.rootId)}${record.id}`;
+      // Actor output is owned by the host that produced it. Older hosts could have
+      // persisted an inferred successor root; never replay that stale target.
+      const ownerRoot = record.from.kind === "actor" ? this.config.rootId : record.rootId;
+      const publish = ownerRoot === record.rootId ? record : { ...record, rootId: ownerRoot };
+      const key = `${residentDeliveryPrefix(ownerRoot)}${record.id}`;
       try {
-        await this.mesh.put({ key, value: record, identity: this.identity, ifVersion: 0 });
+        await this.mesh.put({ key, value: publish, identity: this.identity, ifVersion: 0 });
       } catch (error) {
         // A restart after put but before unlink replays the SAME private UUID. A CAS
         // conflict (including a consumed tombstone) means it was handed off already.
         if (!(error instanceof Error && error.message.startsWith(`Mesh compare-and-swap failed for ${key}: expected version 0,`))) {
           if (isMeshLockTimeout(error)) throw error;
           await this.mesh.put({
-            key, value: { ...record, message: record.message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
+            key, value: { ...publish, message: publish.message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
             identity: this.identity, ifVersion: 0,
           });
         }

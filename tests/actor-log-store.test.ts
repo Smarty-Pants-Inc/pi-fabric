@@ -86,6 +86,21 @@ describe("ActorLogStore", () => {
     expect(store.retainedRunIds(actor)).toEqual(["active", "latest", "recent", "unknown"]);
   });
 
+  it("archives matching dispatch receipts and rejects a receipt for another run", async () => {
+    const { root, actor, store } = setup();
+    const source = path.join(root, "source");
+    fs.mkdirSync(source, { mode: 0o700 });
+    const receipt = { runId: "latest", ledger: path.join(root, "ledger.jsonl"),
+      decision: { decisionId: "decision", routeClass: "bounded-lookup", mode: "live" } };
+    const file = path.join(source, "route-dispatch-receipt.json");
+    fs.writeFileSync(file, JSON.stringify(receipt), { mode: 0o600 });
+    await store.retainRun(actor, "latest", source);
+    expect(JSON.parse(fs.readFileSync(path.join(root, "actor", "runs", "latest", "route-dispatch-receipt.json"), "utf8"))).toEqual(receipt);
+    await expect(store.retainRun(actor, "other", source)).rejects.toThrow("Mismatched route dispatch receipt");
+    expect(fs.existsSync(path.join(root, "actor", "runs", "other", "route-dispatch-receipt.json"))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(receipt);
+  });
+
   it("copies the archive protocol and nested runs, tolerating missing sources and nested-copy failure", async () => {
     const { root, actor, store } = setup();
     await store.retainRun(actor, "missing", undefined);

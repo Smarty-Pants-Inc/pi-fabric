@@ -13,7 +13,7 @@ import type { MeshStateEntry } from "../mesh/store.js";
 /**
  * Host-reserved historical policy key (also used for participant-file migration).
  * Directory liveness now negotiates file-only renewals through livenessLeaseFiles: 1;
- * a live older peer always restores half-life state renewal, without an operator switch.
+ * a live older peer restores only the legacy session cadence; the host record keeps this policy cadence.
  */
 export const LIVENESS_POLICY_KEY = "topology/liveness";
 /**
@@ -101,9 +101,9 @@ export const readHostLeases = (meshRoot: string, options: { strict?: boolean } =
   for (const name of names) {
     if (!name.endsWith(".json")) continue;
     present.add(name);
-    let stat: fs.Stats;
+    let stat: fs.BigIntStats;
     try {
-      stat = fs.statSync(path.join(dir, name));
+      stat = fs.statSync(path.join(dir, name), { bigint: true });
     } catch (error) {
       if (options.strict && (error as { code?: unknown }).code !== "ENOENT") throw error;
       continue;
@@ -134,9 +134,9 @@ export const hostLeasesStamp = (meshRoot: string): string | undefined => {
 export const readHostLease = (meshRoot: string, hostId: string): FabricHostLease | undefined => {
   const dir = path.join(meshRoot, LEASE_DIR);
   const name = fileName(hostId);
-  let stat: fs.Stats;
+  let stat: fs.BigIntStats;
   try {
-    stat = fs.statSync(path.join(dir, name));
+    stat = fs.statSync(path.join(dir, name), { bigint: true });
   } catch {
     return undefined;
   }
@@ -145,20 +145,22 @@ export const readHostLease = (meshRoot: string, hostId: string): FabricHostLease
   return cachedLease(known, dir, name, stat);
 };
 
-type LeaseSlots = Map<string, Pick<fs.Stats, "dev" | "ino" | "size" | "mtimeMs" | "ctimeMs"> & {
+type LeaseSlots = Map<string, Pick<fs.BigIntStats, "dev" | "ino" | "size" | "mtimeNs" | "ctimeNs"> & {
   lease: FabricHostLease | undefined;
 }>;
 
-const cachedLease = (known: LeaseSlots, dir: string, name: string, stat: fs.Stats): FabricHostLease | undefined => {
+const cachedLease = (known: LeaseSlots, dir: string, name: string, stat: fs.BigIntStats): FabricHostLease | undefined => {
   const slot = known.get(name);
-  // Atomic replacement can preserve size and mtime. Compare file identity too; timestamps
-  // remain the fallback on filesystems (including Windows) without useful dev/ino values.
+  // Atomic replacement can preserve size and timestamps. Keep the exact file identity:
+  // NTFS IDs can exceed Number.MAX_SAFE_INTEGER, so distinct replacements can have the
+  // same numeric ino. Nanosecond timestamps also avoid rounding away a change when a
+  // filesystem lacks useful dev/ino values.
   if (slot && slot.dev === stat.dev && slot.ino === stat.ino && slot.size === stat.size &&
-    slot.mtimeMs === stat.mtimeMs && slot.ctimeMs === stat.ctimeMs) return slot.lease;
+    slot.mtimeNs === stat.mtimeNs && slot.ctimeNs === stat.ctimeNs) return slot.lease;
   const parsed = parseLease(path.join(dir, name), name);
   if (!parsed.read) return slot?.lease;                     // unreadable for now: keep the last answer
   known.set(name, {
-    dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs,
+    dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs,
     lease: parsed.lease,
   });
   return parsed.lease;

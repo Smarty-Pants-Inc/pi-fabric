@@ -12,8 +12,8 @@ import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { rootParticipantName } from "../src/topology/participant-name.js";
 
-// Astra round 4 P1: return addresses must carry the same normalized Pi session name that
-// presence publishes, so a named lane successor (not an unnamed same-cwd Main) recovers results.
+// #3178: preserve normalized admission names as metadata, never as successor authority.
+// Named and unnamed lanes both require the exact spawn-time root/session.
 const main = (cwd: string, sessionId: string, sessionName?: string) => {
   const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
   const sessionFile = path.join(cwd, `${sessionId}.jsonl`);
@@ -115,8 +115,8 @@ describe("named lane completion succession through FabricRuntimeState", () => {
       await a.runtime.shutdown(); started.shift();
       await pause(20);
 
-      // For an unnamed admission, the unnamed lane IS the authorized successor.
-      // For a named admission, an unrelated unnamed Main is a bystander too.
+      // #3178: an unnamed or identically named new root is still a bystander.
+      // The old expectations inferred authority from name; no adoption record exists.
       const bystanderNames = admittedName ? [undefined, "other-lane", "probe-lane"] : ["other-lane", "probe-lane"];
       for (const [index, name] of bystanderNames.entries()) {
         const bystander = main(root, `bystander-${index}`, name); started.push(bystander);
@@ -138,19 +138,22 @@ describe("named lane completion succession through FabricRuntimeState", () => {
       }
       const successor = main(root, "dddddddd-0000-4000-8000-00000000000d", admittedName); started.push(successor);
       await successor.runtime.initialize(successor.context, config);
-      if (missing) {
-        await pause(400); successor.turn();
-        expect(successor.texts().join("\n")).not.toContain(queued.id);
-        expect(await successor.status(queued.id)).not.toContain(privateTask);
-        expect(completionConsumed(meshRoot, queued.id)).toBe(false);
-        expect(pendingCompletions(meshRoot, root).some(value => value.result.id === queued.id)).toBe(false);
-      } else {
-        await vi.waitFor(() => { successor.turn(); expect(successor.texts().join("\n")).toContain(queued.id); }, { timeout: 8000, interval: 50 });
-        expect(await successor.status(queued.id)).toContain(privateTask);
+      // #3178: equal normalized name is not adoption; no body, notice, or receipt for B.
+      await pause(400); successor.turn();
+      expect(successor.texts().join("\n")).not.toContain(queued.id);
+      expect(await successor.status(queued.id)).not.toContain(privateTask);
+      expect(completionConsumed(meshRoot, queued.id)).toBe(false);
+      expect(pendingCompletions(meshRoot, root).some(value => value.result.id === queued.id)).toBe(!missing);
+      if (!missing) {
+        // Only the exact bound root/session resumes; a changed name does not revoke ownership.
+        const returned = main(root, "aaaaaaaa-0000-4000-8000-00000000000a", "returned-name"); started.push(returned);
+        await returned.runtime.initialize(returned.context, config);
+        await vi.waitFor(() => { returned.turn(); expect(returned.texts().join("\n")).toContain(queued.id); }, { timeout: 8000, interval: 50 });
+        expect(await returned.status(queued.id)).toContain(privateTask);
         await vi.waitFor(() => expect(completionConsumed(meshRoot, queued.id)).toBe(true), { timeout: 8000, interval: 50 });
-        successor.turn(); await pause(100);
-        expect(successor.texts().filter(text => text.includes(queued.id))).toHaveLength(1);
-        for (const bystander of bystanders) expect(await bystander.status(queued.id)).not.toContain(privateTask);
+        returned.turn(); await pause(100);
+        expect(returned.texts().filter(text => text.includes(queued.id))).toHaveLength(1);
+        for (const bystander of [...bystanders, successor]) expect(await bystander.status(queued.id)).not.toContain(privateTask);
       }
     } finally {
       for (const value of started.reverse()) await value.runtime.shutdown();
@@ -225,20 +228,29 @@ describe("named lane completion succession through FabricRuntimeState", () => {
       const successor = main(root, "dddddddd-0000-4000-8000-00000000000d"); started.push(successor);
       await successor.runtime.initialize(successor.context, config);
       successor.rename("probe-lane");
+      // #3178: renaming another root to the admission name does not transfer authority.
+      await pause(400); successor.turn();
+      expect(successor.sendMessage).not.toHaveBeenCalled();
+      for (const value of results) {
+        expect(await successor.status(value.result.id)).not.toContain(value.result.text!);
+        expect(completionConsumed(meshRoot, value.result.id)).toBe(false);
+      }
+      expect(pendingCompletions(meshRoot, root)).toHaveLength(2);
+      const returned = main(root, "aaaaaaaa-0000-4000-8000-00000000000a", "post-spawn-lane"); started.push(returned);
+      await returned.runtime.initialize(returned.context, config);
       await vi.waitFor(() => {
-        successor.turn();
-        for (const value of results) expect(successor.texts().join("\n")).toContain(value.result.text);
+        returned.turn();
+        for (const value of results) expect(returned.texts().join("\n")).toContain(value.result.text);
       }, { timeout: 8_000, interval: 50 });
       await vi.waitFor(() => {
         for (const value of results) expect(completionConsumed(meshRoot, value.result.id)).toBe(true);
       }, { timeout: 8_000, interval: 50 });
-      successor.turn(); successor.turn(); await pause(200); unnamed.turn(); other.turn();
+      returned.turn(); returned.turn(); await pause(200); unnamed.turn(); other.turn(); successor.turn();
       for (const value of results) {
-        expect(await successor.status(value.result.id)).toContain(value.result.text!);
-        expect(successor.texts().filter(text => text.includes(value.result.id))).toHaveLength(1);
-        for (const bystander of [unnamed, other]) expect(await bystander.status(value.result.id)).not.toContain(value.result.text!);
+        expect(await returned.status(value.result.id)).toContain(value.result.text!);
+        expect(returned.texts().filter(text => text.includes(value.result.id))).toHaveLength(1);
       }
-      expect(unnamed.sendMessage).not.toHaveBeenCalled(); expect(other.sendMessage).not.toHaveBeenCalled();
+      for (const bystander of [unnamed, other, successor]) expect(bystander.sendMessage).not.toHaveBeenCalled();
     } finally {
       await host?.close();
       for (const value of started.reverse()) await value.runtime.shutdown();
@@ -250,7 +262,7 @@ describe("named lane completion succession through FabricRuntimeState", () => {
     for (const value of [undefined, "", "  ", "bad/name", "a".repeat(61)]) expect(rootParticipantName(value)).toBe("main");
   });
 
-  it("a named successor receives ordinary and durable orphan results once; unnamed and differently named Mains on the cwd do not", async () => {
+  it("named, unnamed and other-named roots get no orphan results; exact root resumes once", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-named-successor-"))); roots.push(root);
     for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
@@ -309,18 +321,28 @@ describe("named lane completion succession through FabricRuntimeState", () => {
 
       const successor = main(root, "dddddddd-0000-4000-8000-00000000000d", "probe-lane"); started.push(successor);
       await successor.runtime.initialize(successor.context, config);
+      // #3178: identical names still identify different principals, not explicit successors.
+      await pause(400); successor.turn();
+      expect(successor.sendMessage).not.toHaveBeenCalled();
+      for (const value of [ordinary, durable]) {
+        expect(await successor.status(value.id)).not.toContain(value.text!);
+        expect(completionConsumed(meshRoot, value.id)).toBe(false);
+      }
+      expect(pendingCompletions(meshRoot, root)).toHaveLength(2);
+      const returned = main(root, "aaaaaaaa-0000-4000-8000-00000000000a", "renamed-owner"); started.push(returned);
+      await returned.runtime.initialize(returned.context, config);
       await vi.waitFor(() => {
-        successor.turn();
-        const delivered = successor.texts().join("\n");
+        returned.turn();
+        const delivered = returned.texts().join("\n");
         expect(delivered).toContain(ordinary.text); expect(delivered).toContain(durable.text);
       }, { timeout: 8000, interval: 50 });
       await vi.waitFor(() => { for (const value of [ordinary, durable]) expect(completionConsumed(meshRoot, value.id)).toBe(true); },
         { timeout: 8000, interval: 50 });
-      for (const value of [ordinary, durable]) expect(await successor.status(value.id)).toContain(value.text!);
-      successor.turn(); successor.turn(); await pause(200); unnamed.turn(); other.turn();
+      for (const value of [ordinary, durable]) expect(await returned.status(value.id)).toContain(value.text!);
+      returned.turn(); returned.turn(); await pause(200); unnamed.turn(); other.turn(); successor.turn();
       for (const value of [ordinary, durable])
-        expect(successor.texts().filter(text => text.includes(value.text!))).toHaveLength(1);
-      expect(unnamed.sendMessage).not.toHaveBeenCalled(); expect(other.sendMessage).not.toHaveBeenCalled();
+        expect(returned.texts().filter(text => text.includes(value.text!))).toHaveLength(1);
+      for (const bystander of [unnamed, other, successor]) expect(bystander.sendMessage).not.toHaveBeenCalled();
     } finally {
       for (const value of started.reverse()) await value.runtime.shutdown();
     }

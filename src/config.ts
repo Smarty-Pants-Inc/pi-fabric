@@ -302,6 +302,12 @@ export interface FabricMeshConfig {
   followUpFlushMs: number;
   /** A Main idle with a held followUp this old tells its senders the queue is stalled; 0 disables. */
   followUpStallSeconds: number;
+  /** Owning-host root absence alarm, independent of actor status (default 15 min). */
+  rootPresenceAlarmMs: number;
+  /** Undelivered Main message alarm to sender and target owner (default 30 min). */
+  undeliveredAlarmMs: number;
+  /** Explicit undeliverable receipt after root absence without a successor (default 2 h). */
+  rootGoneTtlMs: number;
 }
 
 interface FabricRepairsConfig {
@@ -551,6 +557,9 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     actorContextEntries: 14,
     followUpFlushMs: 120_000,
     followUpStallSeconds: 600,
+    rootPresenceAlarmMs: 15 * 60_000,
+    undeliveredAlarmMs: 30 * 60_000,
+    rootGoneTtlMs: 2 * 60 * 60_000,
   },
   models: {
     aliases: {},
@@ -1068,6 +1077,21 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
             if (routing.live !== undefined && routing.live !== false) throw new Error("Live model routing requires measured parity and Paul's floor approval (#2236); unavailable in shadow mode");
             return {
               live: false as const,
+              liveClasses: (() => {
+                if (routing.liveClasses === undefined) return [];
+                if (!Array.isArray(routing.liveClasses) || !routing.liveClasses.every(value => typeof value === "string" && /^[a-z][a-z0-9:-]{0,63}$/.test(value))) {
+                  throw new Error("Invalid agents.modelRouting.liveClasses");
+                }
+                return [...new Set(routing.liveClasses as string[])];
+              })(),
+              revertReset: (() => {
+                if (routing.revertReset === undefined) return {};
+                if (!routing.revertReset || typeof routing.revertReset !== "object" || Array.isArray(routing.revertReset) ||
+                  !Object.values(routing.revertReset).every(value => typeof value === "string" && value.length <= 128)) {
+                  throw new Error("Invalid agents.modelRouting.revertReset");
+                }
+                return { ...routing.revertReset as Record<string, string> };
+              })(),
               ...(typeof routing.pinModel === "string" ? { pinModel: routing.pinModel } : {}),
               ...(isFabricThinking(routing.pinThinking) ? { pinThinking: routing.pinThinking } : {}),
               shadowCandidates: Array.isArray(routing.shadowCandidates)
@@ -1319,6 +1343,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         0,
         7 * 24 * 60 * 60,
       ),
+      rootPresenceAlarmMs: boundedInteger(mesh.rootPresenceAlarmMs, DEFAULT_FABRIC_CONFIG.mesh.rootPresenceAlarmMs, 1, 7 * 24 * 60 * 60_000),
+      undeliveredAlarmMs: boundedInteger(mesh.undeliveredAlarmMs, DEFAULT_FABRIC_CONFIG.mesh.undeliveredAlarmMs, 1, 7 * 24 * 60 * 60_000),
+      rootGoneTtlMs: boundedInteger(mesh.rootGoneTtlMs, DEFAULT_FABRIC_CONFIG.mesh.rootGoneTtlMs, 1, 7 * 24 * 60 * 60_000),
     },
     models: {
       aliases: normalizeModelAliases(modelsSection.aliases),

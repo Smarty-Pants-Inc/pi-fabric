@@ -1110,12 +1110,14 @@ describe("mesh bridge", () => {
     await bridge.start();
     await hub.publish({ topic: "fleet.work.smarty-dev.2004", kind: "ask", from: factory, to: sid("forge-main"), text: "w" });
     await hub.publish({ topic: "ops.owner", kind: "pr.wake", from: factory, to: sid("forge-main"), data: { rootId: sid("forge-main") } });
+    await hub.publish({ topic: "ops.owner", kind: "inbox.age.alarm", from: factory, to: sid("forge-main"), data: { messageId: "held" } });
+    await hub.publish({ topic: "fleet.work.inbox-receipts", kind: "rerouted", from: factory, to: sid("forge-main"), text: "rerouted: old -> new" });
     await hub.publish({ topic: "ops.owner", kind: "drift", from: factory, to: sid("forge-main") });
     await hub.publish({ topic: "github.pull_request", kind: "opened", from: factory, to: sid("forge-main") });
     await hub.publish({ topic: "fleet.work.smarty-dev.1", kind: "ask", from: factory, to: "someone-local", text: "stays" });
-    expect(await bridge.step()).toMatchObject({ toRemote: 2 });
+    expect(await bridge.step()).toMatchObject({ toRemote: 4 });
     expect(far.read({ after: 0, limit: 100 }).map((e) => `${e.topic}/${e.kind}`))
-      .toEqual(["fleet.work.smarty-dev.2004/ask", "ops.owner/pr.wake"]);
+      .toEqual(["fleet.work.smarty-dev.2004/ask", "ops.owner/pr.wake", "ops.owner/inbox.age.alarm", "fleet.work.inbox-receipts/rerouted"]);
   });
 
   it("reads past more than one page of events it does not carry", async () => {

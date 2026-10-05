@@ -216,31 +216,25 @@ interface ProjectRoot {
 }
 
 /**
- * A resident actor's messages stay at its root until its lineage is provably dead. A lease
- * lapse is not death (smarty-dev#3662). Only an exact launch-bound integrator may inherit;
- * without an available binding the record still waits in the root's mailbox. Never elect.
+ * A resident actor's messages stay at its exact owner root. A lease lapse is not death
+ * (smarty-dev#3662), and confirmed death still does not authorize role/name-based succession:
+ * the old root mailbox is the only safe recipient. Never elect another Main here.
  */
 export const deliveryRoot = (
   rootId: string,
   liveRoots: readonly ProjectRoot[],
-  project: string,
-  options: {
-    /** Strict delivery lineage test, not the adoption-only aged-absence proof or a lease-filtered listing. */
+  _project: string,
+  _options: {
+    /** Retained for source compatibility; delivery never elects a successor. */
     lineageAlive?: (rootId: string) => boolean;
-    /** Read launch metadata only after confirmed death, never during idle registration. */
+    /** Retained for source compatibility; an actor output is not re-homed by metadata. */
     boundIntegrator?: () => { repository?: string; leadId?: string };
   } = {},
 ): string => {
-  if (liveRoots.some((root) => root.id === rootId)) return rootId;
-  try {
-    if (options.lineageAlive?.(rootId) !== false) return rootId;
-    const binding = options.boundIntegrator?.();
-    if (!binding?.leadId) return rootId;
-    return resolveProjectAgent(liveRoots, project, binding).id;
-  } catch {
-    // Unknown liveness or invalid/unavailable metadata must never elect another project agent.
-    return rootId;
-  }
+  // Keep the parameters for callers from older releases, but deliberately do not inspect
+  // liveness, cwd, project, repository or launch markers: those are selectors, not custody.
+  void liveRoots;
+  return rootId;
 };
 
 export class FabricProjectAgentUnresolvedError extends Error {

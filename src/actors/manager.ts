@@ -3019,7 +3019,8 @@ export class ActorManager {
     const text =
       `Fabric host notice: actor ${actor.name} failed its last ${streak.count} activations, so it is not acting on its events. ` +
       `Last error: ${reason}${runId ? ` (run ${runId})` : ""}. ` +
-      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it.` +
+      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it. ` +
+      `Reconcile any prepared external effects from the failed runs before rerouting their work.` +
       (contextOverflow ? ` This activation was not retried; reduce its input or reset the session on its owning host with agents.resetSession({ id: ${JSON.stringify(actor.name)} }).` : "");
     const notice: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
@@ -3034,7 +3035,8 @@ export class ActorManager {
     void this.#publishNotification({
       topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
       data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code,
-        since: actor.activationBlocked?.since, count: actor.activationBlocked?.count, ...(runId ? { runId } : {}) },
+        since: actor.activationBlocked?.since, count: actor.activationBlocked?.count,
+        routingStatus: this.#publicInfo(actor).status, pendingEffects: "reconcile-required", ...(runId ? { runId } : {}) },
     }).catch(() => undefined);
     try {
       this.onDeliver({
@@ -4451,7 +4453,10 @@ export class ActorManager {
       // against a rendered role without reading the registry file (smarty-dev#918).
       instructionsDigest: createHash("sha256").update(actor.instructions).digest("hex"),
       instructionsLength: actor.instructions.length,
-      status: actor.status === "stopped" ? "stopped" : actor.preparing
+      // Failed is a routing view, not a destructive stop: retained events and
+      // explicit repair/probe asks can still run. Success clears the durable streak.
+      status: actor.status === "stopped" ? "stopped"
+        : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER ? "failed" : actor.preparing
         ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status,
       ...(actor.preparing ? { preparing: { ...actor.preparing,
         ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),

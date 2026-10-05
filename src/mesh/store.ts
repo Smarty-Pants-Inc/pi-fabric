@@ -83,6 +83,9 @@ export interface MeshStoreOptions {
   maxStateBytes?: number;
   maxStateTombstones?: number;
   lockTimeoutMs?: number;
+  /** Host-owned lifetime of advisory writes. Abort stops acquisition without
+   * bypassing ownership checks or rolling back an admitted synchronous commit. */
+  writeSignal?: AbortSignal;
   /** Grace for an empty ownerless directory; recorded live owners never expire. Default 30 s. */
   staleLockMs?: number;
   /**
@@ -138,8 +141,23 @@ export const meshCursorGeneration = (cursor: number): number => Math.floor(curso
 /** The cursor at the start of a generation's log. */
 export const meshCursorAtStart = (generation: number): number => generation * CURSOR_OFFSET_BASE;
 
-const delay = (milliseconds: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, milliseconds));
+// Keep the normal global timer seam (including diagnostic/test clocks). An
+// aborted lifetime clears its referenced retry timer instead of awaiting the lock.
+const delay = (milliseconds: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 
 const errorCode = (error: unknown): string | undefined =>
   error instanceof Error && "code" in error && typeof error.code === "string"
@@ -565,6 +583,7 @@ export class MeshStore {
   readonly #maxStateBytes: number;
   readonly #maxStateTombstones: number;
   readonly #lockTimeoutMs: number;
+  readonly #writeAbortSignal: AbortSignal | undefined;
   readonly #staleLockMs: number;
   readonly #readCacheMs: number;
   readonly #readActive: (() => boolean) | undefined;
@@ -599,6 +618,7 @@ export class MeshStore {
     const lockProtocol = options.lockProtocol === undefined ? 1 : options.lockProtocol;
     if (lockProtocol !== 1 && lockProtocol !== 2) throw new Error("mesh.lockProtocol must be 1 or 2");
     this.#lockProtocol = lockProtocol;
+    this.#writeAbortSignal = options.writeSignal;
     this.#eventsPath = path.join(root, "events.jsonl");
     this.#statePath = path.join(root, "state.json");
     this.#counterPath = path.join(root, "sequence");
@@ -1885,6 +1905,7 @@ export class MeshStore {
   }
 
   async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
+    this.#writeAbortSignal?.throwIfAborted();
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, lockTimeoutMs));
     const token = randomUUID();
@@ -1911,6 +1932,7 @@ export class MeshStore {
     let lastAttemptAt = Date.now();
     let retryAttempt = 0;
     while (true) {
+      this.#writeAbortSignal?.throwIfAborted();
       const attemptAt = Date.now();
       if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
       attempts += 1;
@@ -1976,10 +1998,11 @@ export class MeshStore {
         }
         // Full jitter spreads a fleet after a stalled holder resumes. The original
         // absolute deadline still bounds every sleep (including a zero draw).
-        await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()));
+        await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
       }
     }
     try {
+      this.#writeAbortSignal?.throwIfAborted();
       return operation();
     } catch (error) {
       // A failed write (a version conflict above all) means this store's view is behind: the

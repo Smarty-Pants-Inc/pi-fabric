@@ -769,7 +769,7 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   validWhile?: { version: 1; source: string };
 };
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
-type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped";
+type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed";
 interface FabricActorInfo {
   /** Resolution marker (alias name or closest); does not replace the effective model. */
   via?: string;

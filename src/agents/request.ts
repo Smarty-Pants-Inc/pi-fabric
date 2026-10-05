@@ -38,6 +38,9 @@ export const normalizeAgentRunRequest = (
     : inheritedModel && isFabricThinking(defaults.inheritedThinking) ? defaults.inheritedThinking
     : aliasThinking(defaults.models?.aliases, requestedModel ?? "");
   const tools = stringArray(args.tools);
+  if (args.needs !== undefined && (!Array.isArray(args.needs) || !args.needs.every(entry => typeof entry === "string" && !!entry.trim()))) {
+    throw new Error("Invalid agent needs: expected nonempty capability strings");
+  }
   const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > defaults.timeoutMs ? args.timeoutMs : undefined;
   const kernel = checkedKernel(args.kernel);
   const nice = parseAgentNice(args.nice);
@@ -64,6 +67,7 @@ export const normalizeAgentRunRequest = (
     ...(thinking ? { thinking } : {}),
     ...(nice !== undefined ? { nice } : {}),
     ...(tools ? { tools } : {}),
+    ...(args.needs !== undefined ? { needs: [...args.needs as string[]] } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(typeof args.extensions === "boolean"
       ? { extensions: args.extensions }

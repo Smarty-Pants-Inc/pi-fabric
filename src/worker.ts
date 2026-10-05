@@ -44,6 +44,7 @@ import { retryableProviderError } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
+import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -725,6 +726,7 @@ const main = async (): Promise<void> => {
   let sawAgentError = false;
   let retryPending = false;
   let piSettledSuccessfully = false;
+  let piSettlementDurable = false;
   let hasFinalText = false;
   let hasFinalResult = false;
   let producedFinalAnswer = false;
@@ -778,7 +780,7 @@ const main = async (): Promise<void> => {
       // fabric_reply writes after assistant message_end; inspect the durable
       // reply now too. Post-drain reply/schema validation remains authoritative.
       hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
-      if (piSettledSuccessfully && hasFinalResult && modelControl.ready && !terminalStatus &&
+      if (piSettledSuccessfully && (hasFinalResult || piSettlementDurable) && modelControl.ready && !terminalStatus &&
           !terminalError && !sawAgentError && !lostResult) {
         const warning = `${error}; preserving final result and terminating child`;
         record.warnings = [...(record.warnings ?? []), warning].slice(-20);
@@ -1410,6 +1412,7 @@ const main = async (): Promise<void> => {
       });
       retryPending = false;
       piSettledSuccessfully = false;
+      piSettlementDurable = false;
       hasFinalText = false;
       hasFinalResult = false;
       // Starting a retry is not proof of acceptance: preserve the error and timer
@@ -1546,6 +1549,16 @@ const main = async (): Promise<void> => {
         // Older Pi frames omit outcome; retain their existing result checks.
         piSettledSuccessfully = event.outcome !== "error" && event.outcome !== "aborted" && !sawAgentError && !terminalError;
         providerAborted ||= event.outcome === "aborted";
+        piSettlementDurable = false;
+        if (piSettledSuccessfully && event.outcome === "completed" && modelControl.ready && !terminalStatus && !lostResult) {
+          try {
+            savePiSettlementReceipt(path.join(path.dirname(options.statusFile), "settlement.json"), options.id, record.text);
+            piSettlementDurable = true;
+          } catch (error) {
+            failStalledChild(`Cannot persist Pi settlement receipt: ${String(error)}`);
+            return;
+          }
+        }
         // Tool-only assistant events precede the tool's durable reply write.
         hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
         // Pull controls that landed with the final stream events before deciding
@@ -1925,6 +1938,7 @@ const main = async (): Promise<void> => {
     retryPending = false;
     terminalError = undefined;
     piSettledSuccessfully = false;
+    piSettlementDurable = false;
     stderr = "";
     activationWindowReady = false;
     outputDecoder = new StringDecoder("utf8");

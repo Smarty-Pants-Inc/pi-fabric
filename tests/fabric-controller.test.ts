@@ -617,7 +617,9 @@ describe("FabricUiController dashboard wiring", () => {
         }
         await vi.advanceTimersByTimeAsync(order === "an event-driven rebuild" ? 5_500 : 2_000);
         expect(shown()).toBe("B");
-        expect(readCount()).toBe(afterWrite + 1); // New generation needs exactly ONE canonical parse.
+        // The journal replays B into a new snapshot; showing the remote value no longer
+        // requires another full canonical parse after the writer's locked read.
+        expect(readCount()).toBe(afterWrite);
       } finally {
         controller.stop();
         vi.restoreAllMocks();
@@ -659,7 +661,8 @@ describe("FabricUiController dashboard wiring", () => {
       expect(count()).toBe(before); // Generation change must NOT force an idle parse.
       await vi.advanceTimersByTimeAsync(2_000); // Fixed deadline, not another full 5 s poll.
       expect(shown()).toBe("after");
-      expect(count()).toBe(before + 1);
+      // Expiry observes the new generation via the journal, not a redundant full parse.
+      expect(count()).toBe(before);
       // Idle metadata observation must not independently parse at expiry before snapshot
       // consumers use the shared reader (#4383); active demand has separate coverage below.
       expect(observe).toHaveBeenCalledWith(false, false);
@@ -770,9 +773,11 @@ describe("FabricUiController dashboard wiring", () => {
         expect(shown()).toBe("A0");
         await writer.put({ key: "status", value: "A", identity });
         const afterWrite = readCount();
-        const consumedToken = mesh.stateToken(); // Ordinary topology/poll reader already paid for A.
+        const consumedToken = mesh.stateToken(); // Ordinary reader already consumed A via replay.
         expect(mesh.get("status")?.value).toBe("A");
-        expect(readCount()).toBe(afterWrite + 1);
+        // The committed journal supplies A without a full canonical read; the later rebuild
+        // must still reuse exactly this consumed snapshot, including the legacy-marker case.
+        expect(readCount()).toBe(afterWrite);
         const consumedStamp = mesh.cachedStateStamp();
         if (order === "legacy unrelated writer copied marker") {
           // A pre-generation writer replaces real canonical bytes under the real lock, retaining UUID.

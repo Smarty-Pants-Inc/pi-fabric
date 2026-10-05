@@ -442,6 +442,8 @@ export class ActorManager {
   // Adoption compares against this snapshot so two racing adopters cannot
   // both move the same dead lineage: only the first fenced write succeeds.
   readonly #persistedRoots = new Map<string, string>();
+  readonly #persistedLineages = new Map<string, string>();
+  readonly #displacedLineages = new Set<string>();
   // In-flight fenced adoption attempts, one per actor.
   readonly #adoptionPending = new Map<string, Promise<void>>();
   readonly #adoptionGraceMs: number;
@@ -954,7 +956,7 @@ export class ActorManager {
     if (resolved && modelReason !== undefined) actor.modelReason = modelReason;
     else delete actor.modelReason;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -988,7 +990,7 @@ export class ActorManager {
     if (next) actor.thinking = next;
     else delete actor.thinking;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1005,7 +1007,7 @@ export class ActorManager {
     beforeCommit?.(actor.id);
     actor.tools = next;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1016,7 +1018,7 @@ export class ActorManager {
     if (inferenceContext === undefined) throw new Error("inferenceContext is required");
     actor.inferenceContext = inferenceContext;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
   /** Set future runs' niceness (smarty-dev#1579); it only raises agents.nice, never lowers it. */
@@ -1026,7 +1028,7 @@ export class ActorManager {
     if (parsed === undefined) throw new Error("nice is required");
     actor.nice = parsed;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
   /** Set or clear (null) the queue coalesce key for mesh events (smarty-dev#705). */
@@ -1039,7 +1041,7 @@ export class ActorManager {
       this.#mergeCoalesced(actor);                              // work queued before the key (smarty-dev#1065)
     }
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1060,7 +1062,7 @@ export class ActorManager {
     actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
     if (!filter.length) this.#recordFilterClear(actor, "explicit");
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1078,7 +1080,7 @@ export class ActorManager {
     }
     actor.events = next;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1096,7 +1098,7 @@ export class ActorManager {
     actor.delivery = policy.delivery;
     actor.triggerTurn = policy.triggerTurn;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1110,7 +1112,7 @@ export class ActorManager {
     actor.messages = [];
     this.#resetMessages.add(actor);
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1134,7 +1136,7 @@ export class ActorManager {
     }
     options.beforeCommit?.(actor.id);
     this.#archiveSession(actor, "requested");
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1167,7 +1169,7 @@ export class ActorManager {
       waiters?.forEach((waiter) => waiter.reject(failure));
       return undefined;
     }
-    return this.#publishDrainPresence(live).then(
+    return this.#publishDrainPresence(live, waiters !== undefined).then(
       () => waiters?.forEach((waiter) => waiter.resolve(this.#publicInfo(this.#liveActor(live)))),
       (error: unknown) => {
         this.#recordPreparationFailure(live, error);
@@ -1286,7 +1288,7 @@ export class ActorManager {
     beforeCommit?.(actor.id);
     actor.instructions = instructions;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
 
@@ -1773,7 +1775,7 @@ export class ActorManager {
     }
     this.#drop(actor, [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
-    await this.#publishPresence(actor);
+    await this.#publishPresence(actor, true);
     await this.#publishNotification({
         topic: "fabric.actor.lifecycle",
         kind: "stopped",
@@ -1928,7 +1930,7 @@ export class ActorManager {
       // The marker is the durable revocation: a restarted owner finishes the removal from it. The
       // removal is accepted only once it is saved (review round 1 on pi-fabric#160).
       try {
-        await this.#saveActors(new Set(), { durable: true });
+        await this.#saveActors(new Set(), { durable: true, requiredActor: actor });
       } catch (error) {
         delete actor.removal;
         throw new Error(`Fabric actor ${actor.name} (${actor.id}) is stopped, but its removal was not saved: ` +
@@ -2156,7 +2158,7 @@ export class ActorManager {
     if (this.#actors.has(actor.id)) {
       this.#actors.delete(actor.id);
       try {
-        await this.#saveActors(new Set([actor.id]));
+        await this.#saveActors(new Set([actor.id]), { removedLineages: new Map([[actor.id, this.#lineage(actor)]]) });
         if (!this.#registryRevoked(actor.id)) throw new Error(`Fabric actor ${actor.id}: registry revocation did not commit`);
       } catch (error) {
         // Not revoked: retain the actor and any accepted-removal marker for a later attempt.
@@ -2541,11 +2543,15 @@ export class ActorManager {
     }
   }
 
-  async #publishDrainPresence(actor: ManagedActor): Promise<void> {
-    if (!this.#canManage(actor.id)) return;
+  async #publishDrainPresence(actor: ManagedActor, requireCommit = false): Promise<void> {
+    if (!this.#canManage(actor.id) || (requireCommit && this.#actors.get(actor.id) !== actor)) {
+      if (requireCommit) throw new ActorRegistryOwnershipError();
+      return;
+    }
     this.#emitChange();
     // Preparation is an admission boundary, not a coalescible worker status pulse.
-    await this.#prepare(actor, "registry", () => this.#saveActors(new Set(), { flush: true }));
+    await this.#prepare(actor, "registry", () => this.#saveActors(new Set(), { flush: true,
+      ...(requireCommit ? { requiredActor: actor } : {}) }));
     // Do not break presence serialization or retry a late write out of order. Once a join
     // timed out, the pending publisher still owes the latest state, but is not launch authority.
     if (this.#stalledPresence.has(actor.id) && this.#presenceChains.has(actor.id)) {
@@ -3019,7 +3025,8 @@ export class ActorManager {
     const text =
       `Fabric host notice: actor ${actor.name} failed its last ${streak.count} activations, so it is not acting on its events. ` +
       `Last error: ${reason}${runId ? ` (run ${runId})` : ""}. ` +
-      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it.` +
+      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it. ` +
+      `Reconcile any prepared external effects from the failed runs before rerouting their work.` +
       (contextOverflow ? ` This activation was not retried; reduce its input or reset the session on its owning host with agents.resetSession({ id: ${JSON.stringify(actor.name)} }).` : "");
     const notice: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
@@ -3034,7 +3041,8 @@ export class ActorManager {
     void this.#publishNotification({
       topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
       data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code,
-        since: actor.activationBlocked?.since, count: actor.activationBlocked?.count, ...(runId ? { runId } : {}) },
+        since: actor.activationBlocked?.since, count: actor.activationBlocked?.count,
+        routingStatus: this.#publicInfo(actor).status, pendingEffects: "reconcile-required", ...(runId ? { runId } : {}) },
     }).catch(() => undefined);
     try {
       this.onDeliver({
@@ -3547,10 +3555,18 @@ export class ActorManager {
     }
   }
 
-  async #publishPresence(actor: ManagedActor): Promise<void> {
-    if (!this.#canManage(actor.id)) return;
+  async #publishPresence(actor: ManagedActor, requireCommit = false): Promise<void> {
+    if (!this.#canManage(actor.id) || (requireCommit && this.#actors.get(actor.id) !== actor)) {
+      if (requireCommit) throw new ActorRegistryOwnershipError();
+      return;
+    }
     this.#emitChange();
-    await this.#saveActors();
+    // Global order: actor registries (sorted path), then mesh. The registry
+    // mutation finishes/releases before presence takes the mesh lock; callers
+    // must not wrap this async setter/create/remove path in mesh.exclusive.
+    // Maintenance may skip a displaced actor, but an acknowledged mutation must
+    // prove its selected object/generation survived inside the commit fence.
+    await this.#saveActors(new Set(), requireCommit ? { requiredActor: actor } : undefined);
     await this.#writePresence(actor.id);
   }
 
@@ -3805,27 +3821,66 @@ export class ActorManager {
     return false;
   }
 
-  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean; flush?: boolean }): Promise<void> {
+  #lineage(record: object): string {
+    const { rootId, adoptedAt, adoptedFrom } = record as { rootId?: unknown; adoptedAt?: unknown; adoptedFrom?: unknown };
+    return JSON.stringify([rootId, adoptedAt ?? null, adoptedFrom ?? []]);
+  }
+
+  #rememberLineages(records: readonly unknown[]): void {
+    for (const value of records) {
+      if (typeof value !== "object" || value === null) continue;
+      const record = value as { id?: unknown; rootId?: unknown; adoptedAt?: unknown; adoptedFrom?: unknown };
+      if (typeof record.id !== "string" || typeof record.rootId !== "string") continue;
+      const lineage = this.#lineage(record);
+      const actor = this.#actors.get(record.id);
+      if (actor && this.#lineage(actor) !== lineage) {
+        this.#displacedLineages.add(record.id);
+        this.#ownership.set(record.id, false);
+      }
+      this.#persistedRoots.set(record.id, record.rootId);
+      this.#persistedLineages.set(record.id, lineage);
+    }
+  }
+
+  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: {
+    durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
+  }): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
-    if (removedIds.size === 0 && !options?.durable && this.#savedActors) {
+    if (removedIds.size === 0 && !options?.durable && !options?.requiredActor && this.#savedActors) {
       const owned = [...this.#actors.values()].filter((actor) =>
         !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id));
       if (this.#deferSoftRegistrySave(owned.map((actor) => this.#serializedActor(actor)), options?.flush === true)) return;
     }
     const committed = await this.#registry.withLock(() => this.#withOwnershipRead(() => {
+      // Reload custody under the mutation fence, not before its asynchronous lock wait.
+      const current = this.#registry.records();
+      this.#rememberLineages(current);
       // Finalization fences reloads and serialization, but only this save's explicit ids
       // are authorized to revoke: their own durable write-ahead markers already exist.
       // Preserve every other finalizer's current registry row, prepared or not.
       const owned = [...this.#actors.values()].filter((actor) =>
         !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id),
       );
+      if (options?.requiredActor && !owned.includes(options.requiredActor)) {
+        // Do not acknowledge a mutation filtered out by a custody change during
+        // the lock wait. Refuse before any write; the successor's full row stays intact.
+        throw new ActorRegistryOwnershipError();
+      }
       const rows = owned.map((actor) => this.#serializedActor(actor));
       // Recheck after the lock wait: concurrent soft callers share one commit window.
-      if (this.#deferSoftRegistrySave(rows, removedIds.size > 0 || options?.durable === true || options?.flush === true)) return false;
+      if (this.#deferSoftRegistrySave(rows, removedIds.size > 0 || options?.durable === true ||
+        options?.flush === true || options?.requiredActor !== undefined)) return false;
       if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
       this.#registrySaveTimer = undefined;
-      const replaced = new Set([...removedIds, ...owned.map((actor) => actor.id)]);
-      const preserved = this.#registry.records().filter((record) => !replaced.has(record.id));
+      const revoked = [...removedIds].filter((id) => {
+        const record = current.find((row) => row.id === id);
+        const owner = this.#removalCleanup.get(id)?.owner;
+        return !record || (owner && record.rootId === owner.rootId &&
+          (record.residency ?? "session") === owner.residency &&
+          this.#lineage(record) === options?.removedLineages?.get(id));
+      });
+      const replaced = new Set([...revoked, ...owned.map((actor) => actor.id)]);
+      const preserved = current.filter((record) => !replaced.has(record.id));
       const actors = [...preserved, ...rows.map((row, index) => ({ ...row,
         registryMessageAppend: this.#unarchivedMessages.get(owned[index]!) ?? [],
       }))];
@@ -3838,11 +3893,11 @@ export class ActorManager {
       this.#lastRegistrySaveAt = Date.now();
       this.#savedActors = { owned: JSON.stringify(rows), critical: this.#criticalRegistryState(rows),
         fingerprint: this.#registryFingerprint };
-      for (const id of removedIds) this.#persistedRoots.delete(id);
-      for (const actor of owned) this.#persistedRoots.set(actor.id, actor.rootId);
-      for (const record of preserved) {
-        if (typeof record.rootId === "string") this.#persistedRoots.set(record.id, record.rootId);
+      for (const id of revoked) {
+        this.#persistedRoots.delete(id);
+        this.#persistedLineages.delete(id);
       }
+      this.#rememberLineages(actors);
       return true;
     }));
     if (!committed) return;
@@ -3866,6 +3921,8 @@ export class ActorManager {
     const fingerprint = this.#registry.fingerprint();
     if (!fingerprint || fingerprint === this.#registryFingerprint) return;
     this.#registryFingerprint = fingerprint;
+    // A still-live predecessor participant cannot outrank a durable custody move.
+    this.#rememberLineages(this.#registry.records());
     const ownsAny = [...this.#actors.keys()].some((id) => this.#ownershipDecision(id));
     if (!ownsAny) {
       const previous = [...this.#actors.values()];
@@ -3934,13 +3991,7 @@ export class ActorManager {
     this.#registryIds = new Set(records.flatMap((value) =>
       typeof value === "object" && value !== null && typeof (value as { id?: unknown }).id === "string"
         ? [(value as { id: string }).id] : []));
-    for (const value of records) {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
-      const record = value as Partial<ManagedActor>;
-      if (typeof record.id === "string" && typeof record.rootId === "string") {
-        this.#persistedRoots.set(record.id, record.rootId);
-      }
-    }
+    this.#rememberLineages(records);
     for (const value of records) {
       if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
       const source = value as Record<string, unknown>;
@@ -4451,7 +4502,10 @@ export class ActorManager {
       // against a rendered role without reading the registry file (smarty-dev#918).
       instructionsDigest: createHash("sha256").update(actor.instructions).digest("hex"),
       instructionsLength: actor.instructions.length,
-      status: actor.status === "stopped" ? "stopped" : actor.preparing
+      // Failed is a routing view, not a destructive stop: retained events and
+      // explicit repair/probe asks can still run. Success clears the durable streak.
+      status: actor.status === "stopped" ? "stopped"
+        : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER ? "failed" : actor.preparing
         ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status,
       ...(actor.preparing ? { preparing: { ...actor.preparing,
         ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),
@@ -4550,6 +4604,11 @@ export class ActorManager {
   #ownershipDecision(id: string, fresh = true): boolean {
     if (this.#ceded.has(id)) return false;
     const actor = this.#actors.get(id);
+    const lineage = this.#persistedLineages.get(id);
+    // A directory opinion may precede successor publication by an entire heartbeat.
+    // It can never authorize the cached predecessor after registry custody moved.
+    if (this.#displacedLineages.has(id) ||
+      (actor && lineage !== undefined && lineage !== this.#lineage(actor))) return false;
     const decision = this.#directoryOwnership ? this.#directoryOwnership.get(id)
       : fresh ? this.#canManageActor?.(id) : this.#canManageActor?.(id, false);
 
@@ -4635,9 +4694,10 @@ export class ActorManager {
     try {
       if (this.#closing) return;
       const expectedRootId = actor.rootId;
-      // Lock order: registry, then mesh. Resume invalidates death proof under
-      // the mesh lock; retain both fences from the fresh recheck through commit.
-      const adopted = await this.#registry.withLock(() => this.mesh.exclusive(() => {
+      // Global order: actor registries (sorted path), then mesh, matching resident
+      // publication and mutation. Resume invalidates death proof under the mesh
+      // lock; retain both fences from the fresh recheck through custody commit.
+      const adopted = await ActorRegistryStore.withLocks([this.#registry], () => this.mesh.exclusive(() => {
         // Both custody waits may outlive this owner. No mutation is authorized
         // once close begins, even when the previous lineage is provably dead.
         if (this.#closing) return false;
@@ -4658,9 +4718,7 @@ export class ActorManager {
         }
         // Directory hooks above are synchronous but may re-enter shutdown.
         if (this.#closing) return false;
-        for (const record of records) {
-          if (typeof record.rootId === "string") this.#persistedRoots.set(record.id, record.rootId);
-        }
+        this.#rememberLineages(records);
         // The claim and the queue copy cannot commit together, so the claim names the roots whose
         // files still hold work; the copy completes on adoption, or on this lineage's next load.
         const earlier = Array.isArray(current.adoptedFrom) ? current.adoptedFrom : [];
@@ -4680,16 +4738,19 @@ export class ActorManager {
       // resumes us. Do not take over queues or resync/notify a disposed owner.
       if (this.#closing) return;
       if (adopted) {
-        this.#persistedRoots.set(actor.id, this.#rootId);
+        // Only our own fresh registry+mesh claim can regain a displaced lineage.
+        this.#displacedLineages.delete(actor.id);
+        this.#rememberLineages([actor]);
         this.#takeOverPredecessors(this.#actors.get(actor.id) ?? actor);
       } else {
         const current = this.#registry.records().find((record) => record.id === actor.id);
         if (!current) {
           this.#persistedRoots.delete(actor.id);
+          this.#persistedLineages.delete(actor.id);
         } else if (typeof current.rootId === "string" && current.rootId !== this.#rootId) {
           // Resync to the lineage the racing winner persisted; its fresh
           // adoptedAt then fences our retry for the grace window.
-          this.#persistedRoots.set(actor.id, current.rootId);
+          this.#rememberLineages([current]);
           actor.rootId = current.rootId;
           if (typeof current.adoptedAt === "number") actor.adoptedAt = current.adoptedAt;
         }

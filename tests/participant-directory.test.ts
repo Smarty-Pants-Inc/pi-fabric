@@ -222,7 +222,7 @@ describe("#3662 ParticipantDirectory lineage liveness", () => {
         await directory.refresh();
         expect(crossed).toBe(true);
         const stateReads = reads.mock.calls.filter(([file]) => String(file) === path.join(mesh.root, "state.json"));
-        expect(stateReads).toHaveLength(1); // Post-lock recheck only, not a second preparation parse.
+        expect(stateReads).toHaveLength(0); // The post-lock recheck gates unchanged metadata, not another payload parse.
         const hostKey = "topology/hosts/" + createHash("sha256").update(identity.id).digest("hex");
         const hostReads = get.mock.calls.filter(([key]) => key === hostKey);
         expect(hostReads).toHaveLength(4); // file writer and renewal decision both validate canonical ownership

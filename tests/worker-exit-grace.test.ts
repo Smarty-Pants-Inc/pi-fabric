@@ -134,12 +134,36 @@ describe("settled Pi exit grace", () => {
     for (const event of events.filter(event => event.type === "fake_child_pid")) expect(isRunning(event.pid)).toBe(false);
   }, 45_000);
 
+  it.each(["empty-slow-exit", "empty-never-exit"])("keeps an explicitly successful empty settlement durable through %s", async behavior => {
+    const { result } = await run(behavior);
+    expect(result).toMatchObject({ status: "completed", text: "" });
+    expect(result.error).toBeUndefined();
+    expect(result.warnings).toHaveLength(1);
+    const events = readEvents(result.logFile!);
+    const receipt = { version: 1, runId: result.id, outcome: "completed", text: "" };
+    // Native success was fsynced before EOF, not inferred from child exit or text.
+    expect(events.find(event => event.type === "fake_stdin_eof")).toMatchObject({ receipt });
+    if (process.platform !== "win32") expect(events.find(event => event.type === "fake_term_snapshot"))
+      .toMatchObject({ status: "running", receipt });
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(result.logFile!), "settlement.json"), "utf8"))).toEqual(receipt);
+    for (const event of events.filter(event => ["fake_child_pid", "fake_descendant_pid"].includes(event.type))) {
+      expect(isRunning(event.pid)).toBe(false);
+    }
+  }, 45_000);
+
+  it("fails closed when the explicit-success receipt cannot be persisted", async () => {
+    const { result } = await run("receipt-unwritable");
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("Cannot persist Pi settlement receipt");
+    expect(result.warnings ?? []).toEqual([]);
+  }, 45_000);
+
   it("keeps a missing tool-only reply failed after slow exit", async () => {
     const { result } = await run("reply-missing", directiveSchema, true);
     expect(result.status).toBe("failed");
-    expect(result.error).toContain("did not exit after stdin closed");
+    expect(result.error).toContain("Directive reply missing");
     expect(result.value).toBeUndefined();
-    expect(result.warnings ?? []).toEqual([]);
+    expect(result.warnings).toHaveLength(1);
   }, 45_000);
 
   it.each([

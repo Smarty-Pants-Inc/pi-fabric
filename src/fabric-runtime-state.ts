@@ -136,7 +136,7 @@ import {
   type FabricProvider,
   type FabricProviderDiscovery,
 } from "./protocol.js";
-import { participantProject, participantRole } from "./topology/project-identity.js";
+import { participantProject, ParticipantRoleGrant } from "./topology/project-identity.js";
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
 import { ActorChildCompletionStore } from "./actors/child-completions.js";
@@ -177,6 +177,7 @@ import { captureLoadedFileIdentity, type FabricLoadedFileIdentity } from "./buil
 const FABRIC_RUNTIME_MODULE_IDENTITY = captureLoadedFileIdentity(import.meta.url);
 
 export interface FabricRuntimeStateOptions {
+  roleGrant?: ParticipantRoleGrant;
   managedHost?: FabricManagedHost;
   activity?: FabricActivityStore;
   prewalk?: PrewalkController;
@@ -200,6 +201,7 @@ const notifyDetached = (context: ExtensionContext, message: string): void => {
 };
 
 export class FabricRuntimeState {
+  readonly #roleGrant: ParticipantRoleGrant;
   #registry: ActionRegistry | undefined;
   #config: FabricConfig | undefined;
   #execution: FabricExecutionService | undefined;
@@ -216,6 +218,7 @@ export class FabricRuntimeState {
   #records: Promise<RecordsService> | undefined;
   #openRecords: (() => Promise<RecordsService>) | undefined;
   #mesh: MeshStore | undefined;
+  #actorMeshWrites: AbortController | undefined;
   #backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
   readonly #inboxRetry = new MeshBackgroundRetry("root inbox cursor");
   #identity: MeshIdentity | undefined;
@@ -259,6 +262,7 @@ export class FabricRuntimeState {
     readonly capturedTools: CapturedToolCatalog,
     options: FabricRuntimeStateOptions = {},
   ) {
+    this.#roleGrant = options.roleGrant ?? new ParticipantRoleGrant();
     this.activity = options.activity ?? new FabricActivityStore();
     this.prewalk = options.prewalk ?? new PrewalkController();
     this.prewalkDrift = options.prewalkDrift ?? new PrewalkDriftTracker();
@@ -563,6 +567,7 @@ export class FabricRuntimeState {
       return;
     }
     const sessionId = context.sessionManager.getSessionId();
+    const role = this.#roleGrant.roleFor(sessionId, context.cwd);
     const { identity, mainAgentId } = resolveFabricIdentity(sessionId);
     await builtins.install(createProviderComponent({
       provider: "cache",
@@ -593,6 +598,7 @@ export class FabricRuntimeState {
         ? path.resolve(projectRoot, configuredMeshRoot)
         : path.join(projectRoot, ".pi", "fabric", "mesh"));
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
+    this.#actorMeshWrites = identity.kind === "actor" ? new AbortController() : undefined;
     this.#mesh = new MeshStore(
       meshRoot,
       this.#config.mesh.maxEventBytes,
@@ -602,6 +608,7 @@ export class FabricRuntimeState {
         readActive: () => !context.isIdle() || context.hasPendingMessages() ||
           (this.#agents?.runningCount() ?? 0) > 0 || (this.#actors?.inFlightCount() ?? 0) > 0,
         lockProtocol: this.#config.mesh.lockProtocol,
+        ...(this.#actorMeshWrites ? { writeSignal: this.#actorMeshWrites.signal } : {}),
       },
     );
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
@@ -767,7 +774,7 @@ export class FabricRuntimeState {
       hostId,
       identityId: identity.id,
       ...(ownsPersistentActorRegistry ? { completionRecipient: () => ({
-        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.()), role: participantRole(),
+        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.()), role,
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
       }) } : {}),
       spawnerSessionId: sessionId,
@@ -936,7 +943,7 @@ export class FabricRuntimeState {
             claimResidency: "session",
             rootId: mainAgentId,
             project: participantProject(context.cwd),
-            role: participantRole(),
+            role,
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
@@ -958,7 +965,7 @@ export class FabricRuntimeState {
             claimResidency: "session",
             rootId: mainAgentId,
             project: participantProject(context.cwd),
-            role: participantRole(),
+            role,
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
@@ -998,7 +1005,7 @@ export class FabricRuntimeState {
             projectRoot,
             mainName: rootParticipantName(this.pi.getSessionName?.()),
             mainStartedAt: mainAgent.info(context).startedAt ?? Date.now(),
-            ...(participantRole() ? { role: participantRole()! } : {}),
+            ...(role ? { role } : {}),
             project: participantProject(context.cwd),
             meshRoot,
             actorRoot: actorRoots.project,
@@ -1037,7 +1044,7 @@ export class FabricRuntimeState {
     if (mainAgent.local) {
       this.#participants.registerSource(() => [
         // The existing presence heartbeat rereads the Pi name, including renames and clearing.
-        this.#participants!.root(mainAgent.info(context), mainAgent.interactive, this.pi.getSessionName?.()),
+        this.#participants!.root(mainAgent.info(context), mainAgent.interactive, this.pi.getSessionName?.(), { role }),
       ]);
     }
     this.#participants.registerSource(() =>
@@ -1656,6 +1663,11 @@ export class FabricRuntimeState {
   }
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
+    // A disposable actor's result/journal belongs to its worker, not to this
+    // runtime's advisory presence/heartbeat writes. EOF must not convoy behind
+    // the shared mesh lock before local teardown can stop its timers (#5256).
+    // Main/resident custody and reload checkpoints retain their normal joins.
+    if (reason === "exit" || reason === "quit") this.#actorMeshWrites?.abort();
     if (reason === "reload") {
       // Stop admission synchronously, before the first await. In-flight handlers may only journal.
       this.#mainAgent?.prepareReload();

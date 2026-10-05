@@ -40,7 +40,11 @@ const setup = async (bulk = 0) => {
   let offset = 0;
   vi.spyOn(Date, "now").mockImplementation(() => now() + offset);
   const advance = (ms: number) => { offset += ms; };
-  const writer = new MeshStore(root, 64 * 1024, 100);
+  // Isolate failed namespace hints and the no-high-resolution-identity fallback. A journal
+  // chain head is optional and disappears under this frozen-stat adapter, changing byte size
+  // by 85 bytes; disable it here so the equal-size adversarial premise stays meaningful.
+  // Journal gaps/publication faults are covered in mesh-state-read-gate.test.ts.
+  const writer = new MeshStore(root, 64 * 1024, 100, { writeReadJournal: false });
   const cached = () => new MeshStore(root, 64 * 1024, 100, { readCacheMs: WINDOW_MS });
   await writer.writeBatch({
     identity: writerId,

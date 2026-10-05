@@ -735,9 +735,13 @@ Idle observations of shared state and participant files reuse a snapshot for at 
 UI remote-generation checks do not bypass that window while Main is idle. A running turn or
 pending Main message reads on demand; explicit fresh reads for CAS, ownership and delivery
 always bypass it. Listings can lag by this window; expiration does not slide on cache hits.
-The mesh file format and writer cadence are unchanged, including for legacy/mixed fleets.
+Fresh readers revalidate canonical physical generation instead of parsing an unchanged file
+again. Stores share parsed reader snapshots within a process, and a bounded optional read
+journal advances changed snapshots incrementally. Missing/legacy/invalid journals fall back
+to canonical reads. The added UUID/hash fields and sidecar remain backward-compatible;
+writer cadence and CAS revisions are unchanged. See [mesh state read gates](mesh-state-reads.md).
 
-Mesh topics, shared state, and the participant directory remain project-scoped. Every runtime publishes one short-lived host lease and records for the roots, agents, and actors it owns. `agents.members()` and `mesh.members()` read those records. `agents.main()` and `agents.peers()` project roots. When a lease expires, its records leave normal discovery together. A host that stops without a clean shutdown leaves them in the shared state, so each runtime removes, every 15 minutes, the records of hosts whose lease expired more than 6 hours ago. Each removal is checked against the record's version. `mesh.actorPollMs` controls fallback polling for actor events and owner-addressed commands when filesystem notifications are unavailable.
+Mesh topics, shared state, and the participant directory remain project-scoped. Every runtime publishes one short-lived host lease and records for the roots, agents, and actors it owns. `agents.members()` and `mesh.members()` read those records. `agents.main()` and `agents.peers()` project roots. When a lease expires, its records leave normal discovery together. A host that stops without a clean shutdown leaves them in the shared state, so each runtime removes, every 15 minutes, the records of hosts whose lease expired more than 6 hours ago. Each removal is checked against the record's version. Existing needed directory writes also compact at most 64 expired native/resident host records per batch, without touching participant or delivery retention. `mesh.actorPollMs` controls fallback polling for actor events and owner-addressed commands when filesystem notifications are unavailable.
 
 Shared state keeps a persistent revision clock (`highWater` in the mesh `state.json`). A new key takes the next clock revision, and an update takes its key's version plus one. Compare revisions only through `ifVersion`; a new key seldom starts at 1. Fabric builds from before this clock can still write to a shared root. A newer Fabric then raises its clock to the highest retained revision, so both can use one root.
 

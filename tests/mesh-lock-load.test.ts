@@ -57,6 +57,55 @@ afterEach(() => {
 });
 
 describe("#4383 participant expiry and background receipt compaction", () => {
+  it.each([true, false])("expiry advances the generation and preserves reader tokens (journal=%s)", async writeReadJournal => {
+    const { root } = setup();
+    const mesh = new MeshStore(root, 64 * 1024, 100, { writeReadJournal });
+    const id = "expired-reader-peer", p = key("topology/participants/", id);
+    const fixture = (await topologyFixtures(root, [id])).get(id)!;
+    seed(root, [[p, fixture.participant.value], [key("topology/hosts/", id), fixture.host.value]]);
+    vi.mocked(Date.now).mockReturnValue(old);
+    await tick(mesh); // Establish a canonical generation while the records are still recent.
+    const reader = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 5000 });
+    const token = reader.stateToken({ fresh: true });
+    const file = path.join(root, "state.json");
+    const generation = JSON.parse(fs.readFileSync(file, "utf8")).readGeneration;
+    expect(reader.get(p, { snapshot: token })).toBeDefined();
+    vi.mocked(Date.now).mockReturnValue(now);
+    await mesh.put({ key: "probe/tick", value: 2, identity });
+    const canonical = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(canonical.readGeneration).not.toBe(generation);
+    const reads = vi.spyOn(fs, "readFileSync");
+    const next = reader.stateToken({ fresh: true });
+    expect(next).toEqual(canonical);
+    expect(reader.get(p, { fresh: true })).toBeUndefined();
+    expect(reader.get(p, { snapshot: token })).toBeDefined();
+    expect(new MeshStore(root, 64 * 1024, 100).stateToken({ fresh: true })).toBe(next);
+    if (writeReadJournal) expect(reads.mock.calls.filter(([target, encoding]) =>
+      String(target) === file && encoding === "utf8")).toHaveLength(0);
+  });
+
+  it.each([true, false])("receipt compaction advances the generation and preserves reader tokens (journal=%s)", async writeReadJournal => {
+    const { root } = setup();
+    const mesh = new MeshStore(root, 64 * 1024, 100, { writeReadJournal });
+    const k = deliveryKey("generation-receipt");
+    seed(root, [[k, settledDelivery(root, "generation-receipt")]]);
+    await tick(mesh); // Foreground writes never confirm/remove receipts.
+    const reader = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 5000 });
+    const token = reader.stateToken({ fresh: true });
+    const file = path.join(root, "state.json");
+    const generation = JSON.parse(fs.readFileSync(file, "utf8")).readGeneration;
+    expect(await mesh.compactReceipts()).toBe(1);
+    const canonical = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(canonical.readGeneration).not.toBe(generation);
+    const reads = vi.spyOn(fs, "readFileSync");
+    const next = reader.stateToken({ fresh: true });
+    expect(next).toEqual(canonical);
+    expect(reader.get(k, { fresh: true })).toBeUndefined();
+    expect(reader.get(k, { snapshot: token })).toBeDefined();
+    expect(new MeshStore(root, 64 * 1024, 100).stateToken({ fresh: true })).toBe(next);
+    if (writeReadJournal) expect(reads.mock.calls.filter(([target, encoding]) =>
+      String(target) === file && encoding === "utf8")).toHaveLength(0);
+  });
   it("retains status flags without a durable receipt, terminal results and unknown custody", async () => {
     const { root, mesh } = setup();
     seed(root, [

@@ -646,6 +646,16 @@ describe("resident retention config reload", () => {
     const { root, config, host } = fixture(initial);
     const initialRetention = { ...config.retention };
     let client: ResidencyClient | undefined;
+    let elapsed = 0;
+    if (process.platform === "win32") {
+      // This is a policy-reload test, not a native filesystem throughput test.
+      // A cold Windows status read can exhaust the 2-ms reference-proof slice
+      // and keep a protective live hint for this safely terminal fixture. Freeze
+      // the monotonic clock from the first scan; only injected recovery below
+      // advances it. Date.now/finishedAt and the host poll stay real; the 2-ms
+      // reference and 5-ms sweep budget values are unchanged.
+      vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    }
     try {
       await host.start();
       const ownerPath = path.join(config.residencyRoot, "owner.json");
@@ -672,9 +682,10 @@ describe("resident retention config reload", () => {
       // no wall-clock sleep, age/mtime adjustment, open handle, or rename failure.
       // Keep the native host poll and the unchanged production 5-ms slice.
       if (recoveryMs) {
-        let elapsed = 0;
-        const nativeNow = performance.now.bind(performance);
-        vi.spyOn(performance, "now").mockImplementation(() => nativeNow() + elapsed);
+        if (process.platform !== "win32") {
+          const nativeNow = performance.now.bind(performance);
+          vi.spyOn(performance, "now").mockImplementation(() => nativeNow() + elapsed);
+        }
         const recover = host.agents.recoverPendingArchives.bind(host.agents);
         vi.spyOn(host.agents, "recoverPendingArchives").mockImplementation((...args) => {
           const result = recover(...args);

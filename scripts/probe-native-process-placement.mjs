@@ -2,13 +2,15 @@
 // Opt-in integration proof: REAL fleet launcher + installed Pi + built Fabric.
 // Never run in the test suite. The caller Main is offline; only the launcher
 // starts one real inference task with the work host's existing native profile.
-// No authentication files are read/copied and no real credentials are used.
+// No authentication files are read/copied. Optional host model metadata is
+// symlinked into scratch only; it is never copied into the kept evidence.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { assertMainProofCaller, assertWorkHostRoutes, linkProofModels } from "./lib/native-placement-proof.mjs";
 
 const [piPackageInput, outputInput, launcherInput, host, mapInput, mode] = process.argv.slice(2);
 assert(piPackageInput && outputInput && launcherInput && host && mapInput && ["local", "ssh"].includes(mode),
@@ -18,9 +20,10 @@ for (const input of [piPackageInput, launcherInput, mapInput]) {
 }
 const piPackage = fs.realpathSync(piPackageInput), launcher = fs.realpathSync(launcherInput);
 const aliases = JSON.parse(fs.readFileSync(mapInput, "utf8"));
+assertWorkHostRoutes(aliases);
 assert(/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(host) && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(aliases[host] ?? ""), "host must have a safe work-hosts.json alias");
 assert(mode !== "local" || os.hostname().split(".")[0] === host, "local receipts require the selected work host");
-assert(mode !== "ssh" || os.hostname().split(".")[0] === "ryzen1", "SSH evidence is a Ryzen 1 owner action only");
+if (mode === "ssh") assertMainProofCaller(os.hostname(), aliases);
 assert(fs.existsSync(path.join(piPackage, "dist/index.js")), "installed Pi SDK missing");
 const extension = path.resolve("dist/index.js");
 assert(fs.existsSync(extension), "fresh built extension required");
@@ -28,6 +31,7 @@ fs.accessSync(launcher, fs.constants.X_OK);
 process.umask(0o077);
 const output = path.resolve(outputInput);
 fs.mkdirSync(output, { recursive: true, mode: 0o700 });
+const hostProfile = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "native-placement-proof-"));
 const profile = path.join(scratch, "profile"), cwd = path.join(scratch, "cwd");
 fs.mkdirSync(profile); fs.mkdirSync(cwd);
@@ -46,7 +50,8 @@ const placement = {
   cancelCommand: [launcher, "--host", "{host}", "--cancel", "{id}"], pollIntervalMs: 1000, commandTimeoutMs: 30000,
 };
 // Keep HOME unchanged: the real launcher resolves its factory installation
-// through it. agentDir/settings/credentials are explicitly isolated below.
+// through it. agentDir/settings/credentials are explicitly isolated below;
+// capture the host profile before replacing PI_CODING_AGENT_DIR.
 process.env.PI_CODING_AGENT_DIR = profile;
 process.env.PI_FABRIC_TMPDIR = path.join(scratch, "tmp");
 process.env.PI_FABRIC_RUNS_ROOT = path.join(scratch, "runs");
@@ -62,14 +67,15 @@ const evidence = { head, dirty, callerHostname: os.hostname(), piPackage, extens
 fs.writeFileSync(path.join(output, "invocation.json"), JSON.stringify({ argv: process.argv, ...evidence }, null, 2));
 let session;
 try {
+  const modelsPath = linkProofModels(profile, hostProfile, process.env.PROOF_MODELS_FROM_PROFILE === "1");
   const { createAgentSession, DefaultResourceLoader, ModelRuntime, SettingsManager, SessionManager } = await import(pathToFileURL(path.join(piPackage, "dist/index.js")).href);
   // This installed SDK does not re-export its empty in-memory storage helper.
   const { AuthStorage } = await import(pathToFileURL(path.join(piPackage, "dist/core/auth-storage.js")).href);
-  const runtime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
+  const runtime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath, refreshOnCreate: false, allowModelNetwork: false });
   // Metadata only: the public inert literal satisfies Pi availability checks.
   // It is not a credential, never persisted, and never sent over the network.
   // The launcher uses the work host's existing profile, not this caller value.
-  runtime.registerProvider("cliproxyapi", { api: "openai-completions", baseUrl: "http://invalid.invalid", apiKey: "offline-main-metadata-not-a-credential", models: [{ id: "gpt-6.1-sol", name: "Native placement metadata", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }] });
+  if (!modelsPath) runtime.registerProvider("cliproxyapi", { api: "openai-completions", baseUrl: "http://invalid.invalid", apiKey: "offline-main-metadata-not-a-credential", models: [{ id: "gpt-6.1-sol", name: "Native placement metadata", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }] });
   const settingsManager = SettingsManager.inMemory({ packages: [], extensions: [], skills: [], promptTemplates: [], themes: [] });
   const loader = new DefaultResourceLoader({ cwd, agentDir: profile, settingsManager, additionalExtensionPaths: [extension], noSkills: true, noPromptTemplates: true, noThemes: true });
   await loader.reload();
@@ -114,8 +120,11 @@ try {
   evidence.passed = true;
   console.log(JSON.stringify({ passed: true, head, id: value.handle.id, hostname: value.result.text, evidence: path.join(output, "evidence.json") }));
 } catch (error) {
-  evidence.error = String(error);
-  console.error(JSON.stringify({ passed: false, head, error: String(error), evidence: path.join(output, "evidence.json") }));
+  // Provider initialization errors may quote private model configuration.
+  // Never persist/print those diagnostics when host models are enabled.
+  evidence.error = process.env.PROOF_MODELS_FROM_PROFILE === "1"
+    ? "Native proof failed with host models enabled; private diagnostics omitted" : String(error);
+  console.error(JSON.stringify({ passed: false, head, error: evidence.error, evidence: path.join(output, "evidence.json") }));
   process.exitCode = 1;
 } finally {
   fs.writeFileSync(path.join(output, "evidence.json"), JSON.stringify(evidence, null, 2));

@@ -2832,6 +2832,7 @@ describe("ActorManager", () => {
   it.each(scratchPlatforms)("preserves the scratch contract per real actor activation ($label)", async ({ windows, simulate }) => {
     const parentTemp = { tmpdir: process.env.TMPDIR, tmp: process.env.TMP, temp: process.env.TEMP, osTmpdir: os.tmpdir() };
     const allocate = vi.spyOn(runScratch, "allocateRunTmpDirectory");
+    const dispose = vi.spyOn(runScratch, "disposeRunTmpDirectory");
     if (simulate) vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
       return launchWithScratchPlatform(this, request, true);
     });
@@ -2853,6 +2854,9 @@ describe("ActorManager", () => {
         } else {
           expect(report.tmpdir).toBe(path.join(run, "tmp"));
           expect(report.mode).toBe(0o700);
+          // POSIX replies must join the owned disposal, not rely on actor
+          // archival/cleanup eventually running after ask() has resolved.
+          expect(dispose).toHaveBeenCalledWith(run);
           expect(fs.existsSync(report.tmpdir)).toBe(false);
         }
         expect(path.dirname(report.scratch)).toBe(report.osTmpdir);

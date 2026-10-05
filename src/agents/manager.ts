@@ -3376,11 +3376,15 @@ export class AgentManager {
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
     const reported = this.#withTransportMetadata(result, managed) as AgentRunResult;
-    // Ordinary completion remains observable before native close. An explicit
-    // stop (including the run deadline) already owns teardown, so its result
-    // also joins generation-bound scratch disposal before callers can release
-    // the manager. This is the same bounded obligation stop()/close() join.
-    if (managed.stopRequested && managed.transport.kind === "process") await managed.nativeReleasePending;
+    // Ordinary task completion remains observable before native close. POSIX
+    // actors already join execution exit before settlement; preserve their
+    // scratch-disposal boundary before a reply resumes the activation drain.
+    // Windows keeps its separate native-release join and no scratch disposal.
+    // Explicit stop (including the deadline) joins this same owned obligation.
+    if (managed.transport.kind === "process" &&
+        (managed.stopRequested || (managed.actorId && process.platform !== "win32"))) {
+      await managed.nativeReleasePending;
+    }
     finishAgentSettlement(managed, reported);
     managed.task = "";
     this.#notifyBackgroundComplete(managed, reported);

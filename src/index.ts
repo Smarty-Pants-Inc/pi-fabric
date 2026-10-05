@@ -361,7 +361,6 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     },
   });
   registerHandoffCompletionRenderer(pi);
-  registerIncomingMessageRenderers(pi, () => principalViewIncomingMode(state.provisionalConfig().ui.principalView));
   pi.registerTool(fabricTool);
 
   const applyFabricMode = (): void => {
@@ -739,6 +738,10 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       releaseSlot?.();
     }
   });
+
+  // Keep activation/reload startup first; the renderer's session_start hook
+  // only snapshots display history and must not replace that entry point.
+  registerIncomingMessageRenderers(pi, () => principalViewIncomingMode(state.provisionalConfig().ui.principalView));
 
   // Branch changes move the leaf: emitted echoes and spent reminder budget
   // must track it exactly. Rewind removes abandoned-branch residue.

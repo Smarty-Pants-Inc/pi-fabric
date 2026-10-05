@@ -15,6 +15,17 @@ vi.mock("../src/storage/windows-temp-root.js", async importOriginal => {
       return fs.realpathSync(root);
     } };
 });
+// A mocked custody branch is not a foreign filesystem. Windows has no getuid
+// and must not run POSIX root admission merely because the test selects Linux.
+// These tests mock launch completely; retain actual POSIX admission on POSIX.
+vi.mock("../src/storage/run-scratch.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/storage/run-scratch.js")>();
+  return { ...actual, prepareRunRoot: process.getuid ? actual.prepareRunRoot : (root: string) => {
+    if (!path.isAbsolute(root)) throw new Error("Test run root must be absolute");
+    fs.mkdirSync(root, { recursive: true });
+    return fs.realpathSync(root);
+  } };
+});
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";

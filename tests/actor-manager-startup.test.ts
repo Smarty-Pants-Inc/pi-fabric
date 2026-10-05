@@ -7,6 +7,7 @@ import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorLogStore } from "../src/actors/log-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -70,9 +71,15 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     const write = vi.spyOn(ActorRegistryStore.prototype, "write");
     await turn();
     let previous = performance.now(), longest = 0, active = true;
+    let prunedSinceBeat = 0, largestBatch = 0;
+    const prune = ActorLogStore.prototype.pruneRuns;
+    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function (this: ActorLogStore, ...args) {
+      prunedSinceBeat++; return prune.apply(this, args);
+    });
     let heartbeat: NodeJS.Immediate;
     const beat = () => {
       const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
+      largestBatch = Math.max(largestBatch, prunedSinceBeat); prunedSinceBeat = 0;
       if (active) heartbeat = setImmediate(beat);
     };
     heartbeat = setImmediate(beat);
@@ -90,6 +97,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       await eventually(() => !fs.existsSync(f.runDir(199, 8)));
       await turn();
       expect(longest).toBeLessThan(250);
+      expect(largestBatch).toBeLessThanOrEqual(process.platform === "win32" ? 1 : 8);
       for (let actor = 0; actor < 200; actor++) {
         for (let run = 0; run < 9; run++) expect(fs.existsSync(f.runDir(actor, run))).toBe(false);
         expect(fs.existsSync(f.runDir(actor, 9))).toBe(true); // lastRunId fence survives
@@ -180,10 +188,10 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       expect(tasks[0]).toContain(JSON.stringify(store.resultFile(fresh)).slice(1, -1));
       expect(fs.existsSync(store.resultFile(expired))).toBe(true); // No sweep yet.
       for (const suffix of [".result.json", ".receipt"]) fs.utimesSync(path.join(store.directory, fresh + suffix), old, old);
-      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(process.platform === "win32" ? f.records.length + 1 : 10);
       expect(fs.existsSync(store.resultFile(expired))).toBe(false);
       expect(fs.existsSync(store.resultFile(fresh))).toBe(true); // Already-active context is fenced.
-    } finally { release(); await vi.advanceTimersByTimeAsync(10); vi.useRealTimers(); }
+    } finally { release(); await vi.advanceTimersByTimeAsync(process.platform === "win32" ? f.records.length + 1 : 10); vi.useRealTimers(); }
   });
 
   it.each(["resumeQueued", "resumeAfterRelease", "poll"] as const)("retries deferred startup retention after publication through %s", async boundary => {

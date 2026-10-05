@@ -16,6 +16,24 @@ vi.mock("../src/agents/transports/process-utils.js", async importOriginal => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 describe("Windows per-run scratch scope cut (#4800)", () => {
+  it.each(["absent", "tmp", "unresolved-scratch.json"] as const)("offline scratch inspection never disposes inherited temp and keeps legacy %s custody", artifact => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-win-off-retention-"));
+    if (artifact === "tmp") fs.mkdirSync(path.join(root, artifact));
+    if (artifact === "unresolved-scratch.json") fs.writeFileSync(path.join(root, artifact), JSON.stringify({ version: 3,
+      runDirectory: path.resolve(root), allocatedAt: 1, lastLaunchAt: 1, launchNonce: "legacy" }));
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const read = vi.spyOn(fs, "readFileSync");
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    const rm = vi.spyOn(fs, "rmSync");
+    const acl = vi.spyOn(windowsRoots, "windowsDataRoot");
+    try {
+      expect(scratch.runScratchExitVeto(root)).toEqual(artifact === "absent" ? undefined : expect.stringContaining("scratch writer exit is unconfirmed"));
+      expect(read).not.toHaveBeenCalled();
+      expect(mkdir).not.toHaveBeenCalled();
+      expect(rm).not.toHaveBeenCalled();
+      expect(acl).not.toHaveBeenCalled();
+    } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
   it("keeps manager admission on main's mkdir path without ACL or scratch inspection", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-windows-off-manager-"));
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, sessionExport: false }, {

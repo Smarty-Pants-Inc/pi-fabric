@@ -121,7 +121,10 @@ interface RootHarness {
 }
 
 const rootHarness = async (name: string): Promise<RootHarness> => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fabric-${name}-`));
+  // The logical identity keeps the descriptive name below. On Windows, keep
+  // the physical fixture short: inherited TEMP plus Git's .git/worktrees/<id>
+  // bookkeeping otherwise exceeds its MAX_PATH guard before cleanup is tested.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), process.platform === "win32" ? "r-" : `pi-fabric-${name}-`));
   roots.push(root);
   const meshRoot = path.join(root, "mesh");
   const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 };

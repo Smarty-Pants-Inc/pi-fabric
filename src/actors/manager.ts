@@ -3485,10 +3485,14 @@ export class ActorManager {
     // and again after every bounded actor batch. Intervals cannot overlap a sweep.
     await new Promise<void>((resolve) => setImmediate(resolve));
     const actors = [...this.#actors.values()];
-    for (let offset = 0; offset < actors.length; offset += 8) {
+    // NTFS metadata/deletion is substantially more expensive than POSIX. Keep
+    // the same ownership/publication checks, but yield after each Windows actor
+    // rather than combining 80 run-tree inspections on one synchronous turn.
+    const batchSize = process.platform === "win32" ? 1 : 8;
+    for (let offset = 0; offset < actors.length; offset += batchSize) {
       if (this.#closing || this.#canConsumeMesh?.() === false) return;
       this.#withOwnershipRead(() => {
-        for (const actor of actors.slice(offset, offset + 8)) {
+        for (const actor of actors.slice(offset, offset + batchSize)) {
           if (this.#closing || this.#canConsumeMesh?.() === false) return;
           // Reload/removal, cede and a newly published owner all veto maintenance.
           if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;

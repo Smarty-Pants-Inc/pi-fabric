@@ -174,7 +174,10 @@ export const disposeRunTmpDirectory = (runDirectory: string, expired: () => bool
 };
 
 export const runScratchExitVeto = (runDirectory: string, expired: () => boolean = () => false, disposeScratch = true): string | undefined => {
-  if (disposeScratch) disposeRunTmpDirectory(runDirectory, expired);
+  // Windows inherits the caller TEMP and has no per-run scratch allocation or
+  // disposal. Do not try POSIX/legacy disposal here. Existing scratch artifacts
+  // still veto collection below; the inheritance gate is not an exit receipt.
+  if (disposeScratch && process.platform !== "win32") disposeRunTmpDirectory(runDirectory, expired);
   for (const name of [UNRESOLVED_SCRATCH_FILE, RUN_TMP_DIRECTORY]) {
     try { fs.lstatSync(path.join(runDirectory, name)); }
     catch (error) {

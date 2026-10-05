@@ -63,9 +63,22 @@ describe("resident recovery startup and lease fence (#3864)", () => {
       fs.mkdirSync(run, { recursive: true });
       fs.copyFileSync(status, path.join(run, "status.json"));
       const fd = fs.openSync(path.join(run, "events.jsonl"), "w");
-      fs.ftruncateSync(fd, 800_000); // sparse: 8 GB logical archive, cheap physical fixture
+      // POSIX truncation is sparse. NTFS does not make SetEndOfFile sparse:
+      // filling 8 GB here tests fixture I/O, not lease publication. On Windows
+      // use empty real files with synthetic logical sizes below instead.
+      if (process.platform !== "win32") fs.ftruncateSync(fd, 800_000);
       fs.closeSync(fd);
     }
+    const lstat = fs.lstatSync;
+    const sizes = process.platform === "win32" ? vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
+      const stat = lstat(...args);
+      if (stat && String(args[0]).startsWith(runs + path.sep) && path.basename(String(args[0])) === "events.jsonl") {
+        return Object.assign(stat, { size: 800_000 });
+      }
+      return stat;
+    }) as typeof fs.lstatSync) : undefined;
+    expect(fs.lstatSync(path.join(runs, "archived-0", "events.jsonl")).size).toBe(800_000);
+    expect(fs.readdirSync(runs)).toHaveLength(10_000);
     const read = fs.readFileSync;
     let archiveReads = 0, beforeLease = 0;
     const spy = vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
@@ -85,7 +98,7 @@ describe("resident recovery startup and lease fence (#3864)", () => {
       expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(true);
       await vi.waitFor(() => expect(archiveReads).toBeGreaterThan(0));
       expect(beforeLease).toBe(0);
-    } finally { spy.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { spy.mockRestore(); sizes?.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it.each(["confirmWritable", "writeBatch"] as const)("stops actor, control and lifecycle cursor reads on failed %s renewal, then replays after recovery", async (renewal) => {

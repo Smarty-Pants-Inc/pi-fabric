@@ -13,8 +13,12 @@ The cached set is never collection authority: expiring an exchange performs a
 fresh targeted writer/tree proof (including indexed actor runs) within its own
 2-ms/64-run budget. In-place nested/status changes are therefore fenced even
 without a run-set mtime change. Regular native compaction/deletion retains the
-existing worker-exit, descendant, result preservation and actor-reference guards;
-the separate legacy policy below grants **no deletion authority**.
+existing worker-exit, descendant, result preservation and actor-reference guards.
+The resident collector also retains every still-managed run tree until the
+manager releases its custody, even after checked worker exit: exchange debt can
+clear first, but deleting that tree would destroy the next fresh exit proof for
+a deferred stopped-actor exchange. The separate legacy policy below grants
+**no deletion authority**.
 An interrupted proof resumes at its failed predicate, not at the initial status
 read. Each predicate can retry on two later ticks; timed-out units veto the
 current snapshot and retry on the next completed delta pass rather than becoming

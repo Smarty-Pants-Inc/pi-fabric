@@ -527,7 +527,8 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   }
 
   it("cleanup that times out behind a real wait is fenced before file/worktree mutation", { timeout: 10_000 }, async () => {
-    // Worker admission is setup, not the abandonment deadline being tested.
+    // Worker/cold spawn admission is setup, not the abandonment deadline being tested.
+    // Keep the 500ms cleanup deadline, but do not spend it loading a new worker.
     const state = await harness(false, undefined, 5_000);
     const original = AgentManager.prototype.join;
     const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
@@ -681,9 +682,11 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   });
 
   it("a committed cleanup failure remains unknown and cannot fall through to offline cleanup", async () => {
-    const state = await harness(false);
+    // Separate cold spawn setup from the cleanup operation under test.
+    const state = await harness(false, undefined, 5_000);
     try {
       const handle = await state.client.spawnAgent({ task: "settle before cleanup", model: state.model });
+      state.client.options.commandTimeoutMs = 500;
       vi.spyOn(AgentManager.prototype, "cleanup").mockRejectedValue(new Error("Unknown Fabric agent after cleanup commit"));
       const error = await state.client.cleanupAgent(handle.id).catch((error: Error) => error);
       expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", id: handle.id, operation: "cleanup" });

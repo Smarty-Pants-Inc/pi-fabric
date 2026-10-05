@@ -4070,7 +4070,12 @@ describe("ActorManager", () => {
     });
     const registry = fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8");
     expect(registry).not.toContain(data);
-    expect(registry).toContain('"redacted": true');
+    const store = new ActorRegistryStore(path.join(root, "actors"));
+    const persisted = JSON.stringify(store.messages(store.records().find(record => record.id === actor.id)!));
+    expect(persisted).not.toContain(data);
+    expect(persisted).toContain('"redacted":true');
+    const archive = fs.readFileSync(path.join(root, "actors", actor.id, "registry", "messages.jsonl"), "utf8");
+    expect(archive).not.toContain(data);
   });
 
   it("setEvents replaces an actor's host-event subscriptions and dedupes", async () => {

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorManager } from "../src/actors/manager.js";
+import { ACTOR_RETENTION_BATCH_SIZE, ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -62,12 +62,84 @@ async function eventually(predicate: () => boolean) {
 }
 
 describe("ActorManager bounded startup (#4250 item 4)", () => {
-  it("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in slices below 250ms", async () => {
+  it("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in bounded event-loop slices", async () => {
     const f = fixture(200);
     const rawOwnership = vi.fn(() => true);
     const snapshot = vi.fn(() => new Map(f.records.map((record) => [record.id, true])));
     const read = vi.spyOn(ActorRegistryStore.prototype, "read");
     const write = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const runsPerActor = 10; // Includes the lastRunId fence in fixture().
+    const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
+    const runDirectories = new Set(f.records.map((_, actor) => path.dirname(f.runDir(actor, 0))));
+    const readdir = fs.readdirSync;
+    let runsThisTurn = 0, totalRuns = 0;
+    const runsPerTurn: number[] = [];
+    // Observe real archive enumeration, not elapsed time or a mocked pruning result.
+    vi.spyOn(fs, "readdirSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      const entries = Reflect.apply(readdir, fs, [file, ...args]);
+      if (runDirectories.has(String(file))) {
+        runsThisTurn += entries.length;
+        totalRuns += entries.length;
+      }
+      return entries;
+    }) as never);
+    await turn();
+    let previous = performance.now(), longest = 0, active = true;
+    let heartbeat: NodeJS.Immediate;
+    const beat = () => {
+      const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
+      if (runsThisTurn) runsPerTurn.push(runsThisTurn);
+      runsThisTurn = 0;
+      if (active) heartbeat = setImmediate(beat);
+    };
+    heartbeat = setImmediate(beat);
+    try {
+      const started = performance.now();
+      f.make({ canManageActor: rawOwnership, snapshotActorOwnership: snapshot });
+      const construction = performance.now() - started;
+      expect(construction).toBeLessThan(2_000); // Gross-regression sanity, not a shared-runner performance SLA.
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(write).not.toHaveBeenCalled();
+      expect(snapshot).toHaveBeenCalledTimes(1);
+      expect(rawOwnership).not.toHaveBeenCalled();
+      // No archive traversal or deletion on the constructor stack.
+      expect(totalRuns).toBe(0);
+      expect(fs.existsSync(f.runDir(0, 0))).toBe(true);
+      await eventually(() => !fs.existsSync(f.runDir(199, 8)));
+      await turn();
+      // A recurring setImmediate observes every maintenance turn. A microtask
+      // yield (or no yield) cannot reset the counter, even on a fast filesystem.
+      expect(totalRuns).toBe(f.records.length * runsPerActor);
+      expect(Math.max(...runsPerTurn)).toBeGreaterThan(0);
+      expect(Math.max(...runsPerTurn)).toBeLessThanOrEqual(batchSize * runsPerActor);
+      expect(runsPerTurn.length).toBeGreaterThanOrEqual(Math.ceil(f.records.length / batchSize));
+      expect(longest).toBeLessThan(2_000); // Allow CI descheduling/GC; work per turn is the regression gate.
+      for (let actor = 0; actor < 200; actor++) {
+        for (let run = 0; run < 9; run++) expect(fs.existsSync(f.runDir(actor, run))).toBe(false);
+        expect(fs.existsSync(f.runDir(actor, 9))).toBe(true); // lastRunId fence survives
+      }
+      process.stdout.write(JSON.stringify({ probe: "ActorManager 200/2000", constructorMs: construction,
+        longestSliceMs: longest, totalRuns, maxRunsPerTurn: Math.max(...runsPerTurn),
+        runsPerTurnLimit: batchSize * runsPerActor, workTurns: runsPerTurn.length }) + "\n");
+    } finally { active = false; clearImmediate(heartbeat!); }
+  });
+
+  it("yields Windows startup maintenance between actors without adding per-run filesystem work", async () => {
+    const f = fixture(17);
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const lstat = fs.lstatSync;
+    let statusProbes = 0;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (path.basename(String(file)) === "status.json" && String(file).includes(`${path.sep}runs${path.sep}run-`)) {
+        statusProbes++;
+        // Controlled metadata latency, independent of whether this host has NTFS.
+        // Eight actors share 72 candidates: four status probes/run at 2 ms each
+        // exceed the existing heartbeat bound. One actor still does identical work.
+        const until = performance.now() + 2;
+        while (performance.now() < until) { /* slow filesystem metadata */ }
+      }
+      return Reflect.apply(lstat, fs, [file, ...args]);
+    }) as never);
     await turn();
     let previous = performance.now(), longest = 0, active = true;
     let heartbeat: NodeJS.Immediate;
@@ -77,25 +149,40 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     };
     heartbeat = setImmediate(beat);
     try {
-      const started = performance.now();
-      f.make({ canManageActor: rawOwnership, snapshotActorOwnership: snapshot });
-      const construction = performance.now() - started;
-      expect(construction).toBeLessThan(250);
-      expect(read).toHaveBeenCalledTimes(1);
-      expect(write).not.toHaveBeenCalled();
-      expect(snapshot).toHaveBeenCalledTimes(1);
-      expect(rawOwnership).not.toHaveBeenCalled();
-      // No archive traversal or deletion on the constructor stack.
-      expect(fs.existsSync(f.runDir(0, 0))).toBe(true);
-      await eventually(() => !fs.existsSync(f.runDir(199, 8)));
+      f.make();
+      await eventually(() => !fs.existsSync(f.runDir(16, 8)));
       await turn();
+      process.stdout.write(JSON.stringify({ probe: "Windows startup metadata latency", statusProbes, longestSliceMs: longest }) + "\n");
+      expect(statusProbes).toBe(17 * 9 * 4); // Same four status metadata probes per candidate as main.
       expect(longest).toBeLessThan(250);
-      for (let actor = 0; actor < 200; actor++) {
-        for (let run = 0; run < 9; run++) expect(fs.existsSync(f.runDir(actor, run))).toBe(false);
-        expect(fs.existsSync(f.runDir(actor, 9))).toBe(true); // lastRunId fence survives
-      }
-      console.log(`ActorManager 200/2000: constructor=${construction.toFixed(1)}ms longestSlice=${longest.toFixed(1)}ms`);
+      for (let actor = 0; actor < 17; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
     } finally { active = false; clearImmediate(heartbeat!); }
+  });
+
+  it.each(["ownership", "publication"] as const)("rechecks Windows %s between actor maintenance turns", async (fence) => {
+    const f = fixture(3);
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const ownership = new Map(f.records.map(record => [record.id, true]));
+    let published = true;
+    const manager = f.make({ canManageActor: id => ownership.get(id), snapshotActorOwnership: () => new Map(ownership),
+      canConsumeMesh: () => published });
+    await turn();
+    expect(fs.existsSync(f.runDir(0, 8))).toBe(false);
+    expect(fs.existsSync(f.runDir(1, 8))).toBe(true);
+    if (fence === "ownership") {
+      ownership.set(f.records[1]!.id, false);
+      await eventually(() => !fs.existsSync(f.runDir(2, 8)));
+      expect(fs.existsSync(f.runDir(1, 8))).toBe(true);
+    } else {
+      published = false;
+      await turn(); await turn();
+      expect(fs.existsSync(f.runDir(1, 8))).toBe(true);
+      expect(fs.existsSync(f.runDir(2, 8))).toBe(true);
+      published = true; manager.resumeAfterRelease();
+      await eventually(() => !fs.existsSync(f.runDir(2, 8)));
+      expect(fs.existsSync(f.runDir(1, 8))).toBe(false);
+    }
+    for (let actor = 0; actor < 3; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
   });
 
   it("does not build a directory snapshot for an empty manager's idle ownership refresh", () => {
@@ -153,6 +240,9 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
 
   it.each(["restore", "admission"] as const)("rejects expired context in a later batch before maintenance, but protects a fresh active snapshot (%s)", async (phase) => {
     const f = fixture(17), actor = f.records[16]!;
+    const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
+    // One initial yield, then one turn per batch, including the final completion yield.
+    const maintenanceTurns = Math.ceil(f.records.length / batchSize) + 1;
     new ActorRegistryStore(f.actorRoot).write(f.records.map((record) => ({ ...record, status: "idle" })));
     const sessionFile = path.join(f.actorRoot, actor.id, "session.jsonl");
     const store = new ActorChildCompletionStore(sessionFile);
@@ -189,10 +279,10 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       expect(tasks[0]).toContain(JSON.stringify(store.resultFile(fresh)).slice(1, -1));
       expect(fs.existsSync(store.resultFile(expired))).toBe(true); // No sweep yet.
       for (const suffix of [".result.json", ".receipt"]) fs.utimesSync(path.join(store.directory, fresh + suffix), old, old);
-      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(maintenanceTurns);
       expect(fs.existsSync(store.resultFile(expired))).toBe(false);
       expect(fs.existsSync(store.resultFile(fresh))).toBe(true); // Already-active context is fenced.
-    } finally { release(); await vi.advanceTimersByTimeAsync(10); vi.useRealTimers(); }
+    } finally { release(); await vi.advanceTimersByTimeAsync(maintenanceTurns); vi.useRealTimers(); }
   });
 
   it.each(["resumeQueued", "resumeAfterRelease", "poll"] as const)("retries deferred startup retention after publication through %s", async boundary => {

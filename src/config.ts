@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
 import type { LandlockSettings } from "./core/landlock.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
 import { DEFAULT_RECORDS_CONFIG, normalizeRecordsConfig, type FabricRecordsConfig } from "./records/config.js";
@@ -175,6 +176,8 @@ export interface FabricAgentConfig {
   transport: FabricAgentTransport;
   /** Host-only Linux user scope slice; unset launches workers directly. */
   processSlice?: string;
+  /** Host-only opt-in process task placement; workspace files cannot override it. */
+  placement?: AgentPlacementConfig;
   model?: string;
   /** Host-only fleet policy; workspace configuration cannot override these keys. */
   deniedModels: string[];
@@ -799,6 +802,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const mcpJev = objectValue(mcp.jev);
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
+  const placement = normalizeAgentPlacement(agents.placement);
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);
   const capture = objectValue(input.capture);
@@ -1083,6 +1087,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
         ? { processSlice: agents.processSlice } : {}),
+      ...(placement ? { placement } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
         ? { modelRouting: (() => {
@@ -1656,6 +1661,7 @@ const resolveFabricConfig = (
       delete agents.deniedModelReplacement;
       delete agents.instructionsRoot;
       delete agents.processSlice;
+      delete agents.placement;
       document.agents = agents;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

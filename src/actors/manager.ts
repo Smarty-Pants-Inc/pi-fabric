@@ -3546,6 +3546,9 @@ export class ActorManager {
   async #publishPresence(actor: ManagedActor): Promise<void> {
     if (!this.#canManage(actor.id)) return;
     this.#emitChange();
+    // Global order: actor registries (sorted path), then mesh. The registry
+    // mutation finishes/releases before presence takes the mesh lock; callers
+    // must not wrap this async setter/create/remove path in mesh.exclusive.
     await this.#saveActors();
     await this.#writePresence(actor.id);
   }
@@ -4663,9 +4666,10 @@ export class ActorManager {
     try {
       if (this.#closing) return;
       const expectedRootId = actor.rootId;
-      // Lock order: registry, then mesh. Resume invalidates death proof under
-      // the mesh lock; retain both fences from the fresh recheck through commit.
-      const adopted = await this.#registry.withLock(() => this.mesh.exclusive(() => {
+      // Global order: actor registries (sorted path), then mesh, matching resident
+      // publication and mutation. Resume invalidates death proof under the mesh
+      // lock; retain both fences from the fresh recheck through custody commit.
+      const adopted = await ActorRegistryStore.withLocks([this.#registry], () => this.mesh.exclusive(() => {
         // Both custody waits may outlive this owner. No mutation is authorized
         // once close begins, even when the previous lineage is provably dead.
         if (this.#closing) return false;

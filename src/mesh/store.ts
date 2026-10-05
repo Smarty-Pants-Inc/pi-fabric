@@ -1847,6 +1847,9 @@ export class MeshStore {
     }
   }
 
+  // Global actor-custody order: actor registries (sorted path), then mesh.
+  // Mesh critical sections are synchronous: never await a registry mutation
+  // here or wrap resident async controls in this second/innermost lock.
   async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, lockTimeoutMs));

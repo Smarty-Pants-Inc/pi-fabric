@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../src/mesh/store.js";
 import { hostLeasePath, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
+import { publishTopologyFixture } from "./helpers/mesh-topology-fixture.js";
 import { sweepParticipantLockLeftovers } from "../src/topology/participant-files.js";
 
 const roots: string[] = [];
@@ -22,12 +23,30 @@ const setup = () => {
 };
 const seed = (root: string, values: Array<[string, unknown, number?]>) => {
   const entries: Record<string, MeshStateEntry> = {};
-  values.forEach(([k, value, at = old], index) => { entries[k] = { key: k, value, version: index + 1, updatedAt: at, updatedBy: identity }; });
+  values.forEach(([k, value, at = old], index) => {
+    const record = value as { identity?: MeshIdentity; ownerIdentityId?: string };
+    const writer = record.identity ?? (record.ownerIdentityId ? { ...identity, id: record.ownerIdentityId } : identity);
+    entries[k] = { key: k, value, version: index + 1, updatedAt: at, updatedBy: writer };
+  });
   fs.writeFileSync(path.join(root, "state.json"), JSON.stringify({ format: 1, entries }));
   return entries;
 };
-const participant = (id: string, hostId = id) => ({ format: 1, id, rootId: hostId, ownerHostId: hostId, ownerIdentityId: hostId });
-const host = (id: string, expiresAt = old) => ({ format: 1, id, rootId: id, identity: { ...identity, id }, startedAt: old - 1_000, updatedAt: old, expiresAt });
+const topologyFixtures = async (root: string, ids: string[]) => {
+  const fixtures = new Map<string, Awaited<ReturnType<typeof publishTopologyFixture>>>();
+  for (const id of ids) {
+    vi.mocked(Date.now).mockReturnValue(old - 1_000);
+    const fixture = await publishTopologyFixture(path.join(root, "fixtures", id), id);
+    fixtures.set(id, fixture);
+  }
+  vi.mocked(Date.now).mockReturnValue(now);
+  return fixtures;
+};
+const settledDelivery = (root: string, id: string) => {
+  const dir = path.join(root, "agent-completions", "receipts");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${hash(id)}.json`), JSON.stringify({ id, sessionId: "session", consumedAt: old }));
+  return delivery(id, { from: { id, kind: "agent" }, agentCompletionId: id });
+};
 const deliveryKey = (id: string) => `residency/deliveries/${hash("recipient").slice(0, 32)}/${id}`;
 const delivery = (id: string, extra = {}) => ({ format: 1, id, rootId: "recipient", createdAt: old, from: { id: "agent:run", kind: "agent" }, message: "durable", ...extra });
 const tick = (mesh: MeshStore) => mesh.put({ key: "probe/tick", value: 1, identity });
@@ -38,7 +57,7 @@ afterEach(() => {
 });
 
 describe("#4383 bounded expiry inside the existing mesh write", () => {
-  it("drops only old settled envelopes; terminal result payloads and unknown custody survive", async () => {
+  it("retains status flags without a durable receipt, terminal results and unknown custody", async () => {
     const { root, mesh } = setup();
     seed(root, [
       [deliveryKey("terminal"), delivery("terminal", { status: "completed" })],
@@ -57,7 +76,7 @@ describe("#4383 bounded expiry inside the existing mesh write", () => {
       ["residency/deliveries/wrong-key", delivery("wrong", { status: "completed" })],
     ]);
     await tick(mesh);
-    for (const id of ["terminal", "ack", "ack-at"]) expect(mesh.get(deliveryKey(id))).toBeUndefined();
+    for (const id of ["terminal", "ack", "ack-at"]) expect(mesh.get(deliveryKey(id))).toBeDefined();
     for (const id of ["pending", "result", "running", "recent-write", "recent-ack", "recent-complete", "recent-terminal-ack", "invalid-time", "boundary", "malformed"]) expect(mesh.get(deliveryKey(id)), id).toBeDefined();
     expect(mesh.get("residency/deliveries/wrong-key")).toBeDefined();
   });
@@ -79,9 +98,10 @@ describe("#4383 bounded expiry inside the existing mesh write", () => {
   it("retains live leases, recent records, orphans, mismatched and unreadable ownership", async () => {
     const { root, mesh } = setup();
     const ids = ["gone", "live-state", "live-file", "recent", "orphan", "mismatch", "corrupt", "unreadable", "boundary", "takeover"];
+    const fixtures = await topologyFixtures(root, ids);
     seed(root, ids.flatMap(id => [
-      [key("topology/participants/", id), participant(id), id === "recent" ? now : old] as [string, unknown, number],
-      ...(id === "orphan" ? [] : [[key("topology/hosts/", id), host(id, id === "live-state" ? now + 15_000 : id === "boundary" ? now - sixHours : old)] as [string, unknown]]),
+      [key("topology/participants/", id), fixtures.get(id)!.participant.value, id === "recent" ? now : old] as [string, unknown, number],
+      ...(id === "orphan" ? [] : [[key("topology/hosts/", id), { ...fixtures.get(id)!.host.value as object, expiresAt: id === "live-state" ? now + 15_000 : id === "boundary" ? now - sixHours : old }] as [string, unknown]]),
     ]));
     for (const id of ["live-file", "mismatch", "unreadable", "takeover"]) writeHostLease(root, {
       id, rootId: id, identityId: id === "mismatch" ? "different" : id, startedAt: id === "takeover" ? now : old - 1_000,
@@ -102,7 +122,8 @@ describe("#4383 bounded expiry inside the existing mesh write", () => {
   it("rechecks host files inside the locked write after an expired cached selection", async () => {
     const { root, mesh } = setup();
     const id = "renewed", p = key("topology/participants/", id);
-    seed(root, [[p, participant(id)], [key("topology/hosts/", id), host(id)]]);
+    const fixture = (await topologyFixtures(root, [id])).get(id)!;
+    seed(root, [[p, fixture.participant.value], [key("topology/hosts/", id), fixture.host.value]]);
     writeHostLease(root, { id, rootId: id, identityId: id, startedAt: old - 1_000, updatedAt: old, expiresAt: old });
     readHostLeases(root);
     expect(mesh.get(p)).toBeDefined(); // selection before the renewal
@@ -113,7 +134,7 @@ describe("#4383 bounded expiry inside the existing mesh write", () => {
 
   it.each(["put", "delete", "batch"])("compacts under %s and preserves CAS allocation after tombstone eviction", async operation => {
     const { root, mesh } = setup();
-    const original = seed(root, Array.from({ length: 3 }, (_, n) => [deliveryKey(String(n)), delivery(String(n), { status: "completed" })]));
+    const original = seed(root, Array.from({ length: 3 }, (_, n) => [deliveryKey(String(n)), settledDelivery(root, String(n))]));
     if (operation === "put") await tick(mesh);
     else if (operation === "delete") await mesh.delete({ key: deliveryKey("0") });
     else await mesh.writeBatch({ identity, ops: [{ kind: "put", key: "probe/tick", value: 1 }] });
@@ -127,11 +148,71 @@ describe("#4383 bounded expiry inside the existing mesh write", () => {
 
   it("bounds expiry to 500 records per commit and converges without a new daemon", async () => {
     const { root, mesh } = setup();
-    seed(root, Array.from({ length: 510 }, (_, n) => [deliveryKey(String(n)), delivery(String(n), { acknowledged: true })]));
+    // Cardinality/allocation probe; real durability and failed barriers are covered below.
+    vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
+    seed(root, Array.from({ length: 510 }, (_, n) => [deliveryKey(String(n)), settledDelivery(root, String(n))]));
     await tick(mesh);
     expect(mesh.listAll("residency/deliveries/")).toHaveLength(10);
     await tick(mesh);
     expect(mesh.listAll("residency/deliveries/")).toEqual([]);
+  });
+});
+
+describe("Astra R1 durable receipt and canonical ownership", () => {
+  it.each(["put", "delete", "batch"])("retains a visible old receipt with failed file/namespace barriers during unrelated %s", async operation => {
+    const { root, mesh } = setup();
+    const id = "visible-failed-rename";
+    seed(root, [[deliveryKey(id), settledDelivery(root, id)], ...Array.from({ length: 4 }, (_, n) => [`unrelated/deletable-${n}`, 1] as [string, unknown])]);
+    const receipt = path.join(root, "agent-completions", "receipts", `${hash(id)}.json`);
+    const original = fs.readFileSync(receipt, "utf8");
+    const sync = fs.fsyncSync.bind(fs);
+    let failure: "file" | "namespace" | undefined = "file";
+    const receiptInode = fs.statSync(receipt).ino;
+    let confirmedFile = 0, confirmedDirectory = 0;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const stat = fs.fstatSync(fd);
+      if ((failure === "file" && stat.ino === receiptInode) ||
+        (failure === "namespace" && stat.isDirectory())) throw new Error("receipt durability barrier failed");
+      if (stat.ino === receiptInode) confirmedFile++;
+      if (stat.isDirectory()) confirmedDirectory++;
+      sync(fd);
+    });
+    let deletion = 0;
+    const commit = async () => {
+      if (operation === "put") await tick(mesh);
+      else if (operation === "delete") await mesh.delete({ key: `unrelated/deletable-${deletion++}` });
+      else await mesh.writeBatch({ identity, ops: [{ kind: "put", key: "probe/tick", value: 1 }] });
+    };
+    for (const barrier of (process.platform === "win32" ? ["file", "file"] : ["file", "namespace", "file"]) as Array<"file" | "namespace">) {
+      failure = barrier;
+      await commit();
+      expect(mesh.get(deliveryKey(id)), barrier).toBeDefined();
+      expect(fs.readFileSync(receipt, "utf8")).toBe(original);
+    }
+    failure = undefined;
+    await commit();
+    expect(mesh.get(deliveryKey(id))).toBeUndefined();
+    expect(confirmedFile).toBeGreaterThan(0);
+    if (process.platform !== "win32") expect(confirmedDirectory).toBeGreaterThan(0);
+  });
+
+  it("retains wrong-writer and malformed host/participant incarnations as unknown ownership", async () => {
+    const { root, mesh } = setup();
+    const ids = ["valid", "wrong-writer", "missing-start", "missing-name", "wrong-kind", "malformed-participant"];
+    const fixtures = await topologyFixtures(root, ids);
+    const entries = seed(root, ids.flatMap(id => {
+      const fixture = fixtures.get(id)!;
+      return [[fixture.host.key, fixture.host.value], [fixture.participant.key, fixture.participant.value]] as Array<[string, unknown]>;
+    }));
+    entries[fixtures.get("wrong-writer")!.host.key]!.updatedBy = identity;
+    delete (entries[fixtures.get("missing-start")!.host.key]!.value as Record<string, unknown>).startedAt;
+    delete ((entries[fixtures.get("missing-name")!.host.key]!.value as { identity: Record<string, unknown> }).identity).name;
+    (entries[fixtures.get("wrong-kind")!.host.key]!.value as { identity: Record<string, unknown> }).identity.kind = "unknown";
+    delete (entries[fixtures.get("malformed-participant")!.participant.key]!.value as Record<string, unknown>).runner;
+    fs.writeFileSync(path.join(root, "state.json"), JSON.stringify({ format: 1, entries }));
+    await tick(mesh);
+    expect(mesh.get(fixtures.get("valid")!.participant.key)).toBeUndefined();
+    for (const id of ids.slice(1)) expect(mesh.get(fixtures.get(id)!.participant.key), id).toBeDefined();
   });
 });
 

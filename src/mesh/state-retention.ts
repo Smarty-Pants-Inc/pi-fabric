@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { syncPathNamespace } from "../core/atomic-write.js";
+import { hostFromEntry, participantFromEntry } from "../topology/record-validation.js";
 import type { MeshStateEntry } from "./store.js";
 import type { FabricHostLease } from "../topology/host-leases.js";
 
@@ -9,7 +11,6 @@ const MAX_EXPIRED_PER_COMMIT = 500;
 const PARTICIPANTS = "topology/participants/";
 const HOSTS = "topology/hosts/";
 const DELIVERIES = "residency/deliveries/";
-const terminal = new Set(["completed", "failed", "stopped", "timed_out", "cancelled"]);
 const hash = (id: string): string => createHash("sha256").update(id).digest("hex");
 const record = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -31,22 +32,29 @@ const readHostLeaseForExpiry = (root: string, id: string): { uncertain: boolean;
   }
 };
 
-// A terminal RESULT in data is still pending delivery. Only envelope disposition or a
-// validated durable consumption receipt proves that custody has ended. Receipt layout is
-// the completion-journal.ts contract; do not import its replay engine into the mesh graph.
-const deliverySettledAt = (root: string, value: Record<string, unknown>): number | undefined => {
-  if ((value.completedAt !== undefined && !time(value.completedAt)) ||
-    (value.acknowledgedAt !== undefined && !time(value.acknowledgedAt))) return undefined;
-  const dispositionAt = Math.max(time(value.completedAt) ? value.completedAt : 0, time(value.acknowledgedAt) ? value.acknowledgedAt : 0);
-  if (typeof value.status === "string" && terminal.has(value.status)) return dispositionAt;
-  if (value.acknowledged === true || value.status === "acknowledged" || time(value.acknowledgedAt)) return dispositionAt;
+const fingerprint = (stat: fs.Stats): string => JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
+// A terminal result or a status flag is not an acknowledgement. Like confirmReceipt
+// in completion-journal.ts, every destructive cleanup confirms the opened receipt
+// AND its complete reopenable namespace afresh. A visible failed rename is retained.
+const deliverySettledAt = (root: string, value: Record<string, unknown>, cutoff: number): number | undefined => {
   const from = record(value.from);
   const id = value.agentCompletionId;
   if (typeof id !== "string" || from?.kind !== "agent" || from.id !== id) return undefined;
+  const file = path.join(root, "agent-completions", "receipts", `${hash(id)}.json`);
+  let fd: number | undefined;
   try {
-    const receipt = record(JSON.parse(fs.readFileSync(path.join(root, "agent-completions", "receipts", `${hash(id)}.json`), "utf8")));
-    if (receipt?.id === id && typeof receipt.sessionId === "string" && receipt.sessionId && time(receipt.consumedAt)) return receipt.consumedAt;
-  } catch { /* absent, unreadable or malformed receipt is not acknowledgement */ }
+    fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) return undefined;
+    const receipt = record(JSON.parse(fs.readFileSync(fd, "utf8")));
+    if (receipt?.id !== id || typeof receipt.sessionId !== "string" || !receipt.sessionId ||
+      !time(receipt.consumedAt) || receipt.consumedAt >= cutoff) return undefined;
+    fs.fsyncSync(fd);
+    syncPathNamespace(file, stat);
+    if (fingerprint(fs.fstatSync(fd)) !== fingerprint(stat)) return undefined;
+    return receipt.consumedAt;
+  } catch { /* absent, malformed or unconfirmed durability never authorizes expiry */ }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
   return undefined;
 };
 
@@ -63,26 +71,25 @@ export const expiredStateKeys = (entries: Record<string, MeshStateEntry>, root: 
       if (typeof value.id !== "string" || typeof value.rootId !== "string" ||
         key !== `${DELIVERIES}${hash(value.rootId).slice(0, 32)}/${value.id}` ||
         !time(value.createdAt) || value.createdAt >= cutoff) continue;
-      const settledAt = deliverySettledAt(root, value);
+      const settledAt = deliverySettledAt(root, value, cutoff);
       if (settledAt !== undefined && settledAt < cutoff) expired.push(key);
     } else if (key.startsWith(PARTICIPANTS)) {
-      if (typeof value.id !== "string" || key !== PARTICIPANTS + hash(value.id) ||
-        typeof value.ownerHostId !== "string" || typeof value.ownerIdentityId !== "string" ||
-        typeof value.rootId !== "string") continue;
-      const hostEntry = entries[HOSTS + hash(value.ownerHostId)];
-      const host = record(hostEntry?.value);
-      const identity = record(host?.identity);
-      // Absence, malformed host, takeover or publication gap is uncertainty, not death.
-      if (!host || host.format !== 1 || host.id !== value.ownerHostId || host.rootId !== value.rootId ||
-        identity?.id !== value.ownerIdentityId || !time(host.expiresAt) || host.expiresAt >= cutoff ||
+      const participant = participantFromEntry(entry);
+      if (!participant) continue;
+      const hostEntry = entries[HOSTS + hash(participant.ownerHostId)];
+      const host = hostEntry && hostFromEntry(hostEntry);
+      // Absence, malformed host, wrong writer, takeover or publication gap is uncertainty.
+      if (!host || host.id !== participant.ownerHostId || host.rootId !== participant.rootId ||
+        host.identity.id !== participant.ownerIdentityId || !time(host.startedAt) ||
+        !time(host.expiresAt) || host.expiresAt >= cutoff ||
         !time(host.updatedAt) || host.updatedAt >= cutoff ||
-        !time(hostEntry?.updatedAt) || hostEntry.updatedAt >= cutoff) continue;
+        !time(hostEntry.updatedAt) || hostEntry.updatedAt >= cutoff) continue;
       // An uncached read immediately before selection: failed reads cannot reuse stale expiry.
-      const observation = readHostLeaseForExpiry(root, value.ownerHostId);
+      const observation = readHostLeaseForExpiry(root, participant.ownerHostId);
       if (observation.uncertain) continue;
       const lease = observation.lease;
       // Even a mismatched/incarnation file is retained conservatively; no takeover inference.
-      if (lease && (lease.rootId !== value.rootId || lease.identityId !== value.ownerIdentityId ||
+      if (lease && (lease.rootId !== participant.rootId || lease.identityId !== participant.ownerIdentityId ||
         (lease.startedAt !== undefined && lease.startedAt !== host.startedAt) ||
         lease.expiresAt >= cutoff || lease.updatedAt >= cutoff)) continue;
       expired.push(key);

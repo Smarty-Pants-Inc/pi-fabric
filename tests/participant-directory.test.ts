@@ -11,7 +11,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
-import { LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -92,6 +92,48 @@ const createDirectory = (
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => directory.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("ParticipantDirectory canonical host renewal (Astra R1)", () => {
+  it.each(["wrong-writer", "missing-start", "missing-name", "wrong-kind"])("never confirms a lock-free no-change renewal from %s ownership", async corruption => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-canonical-host-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:canonical", name: "main", kind: "main", sessionId: "canonical" };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000);
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity,
+      heartbeatMs: 60_000, leaseMs: 120_000, reapDeadHosts: false,
+    });
+    directories.push(directory);
+    const main = new MainAgentController({ getThinkingLevel: () => "off" } as ExtensionAPI, identity.id, true, root, "canonical");
+    directory.registerSource(() => [directory.root(main.info())]);
+    await directory.refresh();
+    const hostKey = "topology/hosts/" + createHash("sha256").update(identity.id).digest("hex");
+    const entry = mesh.get(hostKey)!;
+    const value = structuredClone(entry.value) as Record<string, unknown>;
+    if (corruption === "missing-start") delete value.startedAt;
+    if (corruption === "missing-name") delete (value.identity as Record<string, unknown>).name;
+    if (corruption === "wrong-kind") (value.identity as Record<string, unknown>).kind = "unknown";
+    await mesh.put({ key: hostKey, value, identity: corruption === "wrong-writer" ? { ...identity, id: "intruder" } : identity });
+    const write = vi.spyOn(mesh, "writeBatch");
+    const confirm = vi.spyOn(mesh, "confirmWritable");
+    const leaseFile = hostLeasePath(mesh.root, identity.id);
+    const priorLease = fs.readFileSync(leaseFile, "utf8");
+    try {
+      write.mockRejectedValueOnce(new Error("mutation fence unavailable"));
+      await expect(directory.refresh()).rejects.toThrow("mutation fence unavailable");
+      expect(fs.readFileSync(leaseFile, "utf8")).toBe(priorLease); // no lock-free lease write for invalid ownership
+      expect(confirm).not.toHaveBeenCalled();
+      write.mockClear();
+      await directory.refresh();
+      expect(confirm).not.toHaveBeenCalled();
+      expect(write).toHaveBeenCalledOnce(); // a changed host is repaired only under the mutation fence
+      const repaired = mesh.get(hostKey, { fresh: true })!;
+      expect(repaired.updatedBy).toEqual(identity);
+      const canonical = entry.value as Record<string, unknown>;
+      expect(repaired.value).toMatchObject({ ...canonical, updatedAt: expect.any(Number), expiresAt: expect.any(Number) });
+    } finally { vi.restoreAllMocks(); }
+  });
 });
 
 describe("ParticipantDirectory routing freshness (#2386)", () => {
@@ -183,9 +225,10 @@ describe("#3662 ParticipantDirectory lineage liveness", () => {
         expect(stateReads).toHaveLength(1); // Post-lock recheck only, not a second preparation parse.
         const hostKey = "topology/hosts/" + createHash("sha256").update(identity.id).digest("hex");
         const hostReads = get.mock.calls.filter(([key]) => key === hostKey);
-        expect(hostReads).toHaveLength(2);
-        expect(hostReads[0]![1]?.snapshot).toBeDefined();
-        expect(hostReads[1]![1]?.snapshot).toBeUndefined();
+        expect(hostReads).toHaveLength(4); // file writer and renewal decision both validate canonical ownership
+        expect(hostReads.slice(0, 2).every(([, options]) => options?.snapshot !== undefined)).toBe(true);
+        expect(hostReads[2]![1]?.fresh).toBe(true);
+        expect(hostReads[3]![1]?.snapshot).toBeUndefined();
       } finally { get.mockRestore(); reads.mockRestore(); }
     } finally { clock.mockRestore(); }
   });

@@ -15,6 +15,7 @@ import type {
   FabricPeerInfo,
 } from "./types.js";
 
+import { hostFromEntry, participantFromEntry } from "./record-validation.js";
 import { reapDeadHostRecords } from "./host-reaper.js";
 import { effectiveLiveness } from "./liveness.js";
 import { isLiveLegacyRootEntry, sessionLiveness, LEGACY_ROOT_LEASE_MS as PARTICIPANT_LEASE_MS } from "./legacy-root-liveness.js";
@@ -119,28 +120,6 @@ const isMeshLockTimeout = (error: unknown): error is Error =>
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const participantKind = (value: unknown): FabricParticipantKind | undefined =>
-  value === "root" || value === "agent" || value === "actor" ? value : undefined;
-
-const transports = new Set([
-  "host",
-  "auto",
-  "process",
-  "tmux",
-  "screen",
-  "localterm",
-  "herdr",
-]);
-const capabilities = new Set([
-  "steer",
-  "followUp",
-  "stop",
-  "ask",
-  "actor-bindings",
-  "attach",
-  "fabric",
-]);
-
 interface ParsedDirectory {
   hosts: MeshStateEntry[];
   participants: FabricParticipantRecord[];
@@ -156,77 +135,6 @@ const deepFreeze = <T>(value: T): T => {
     for (const child of Object.values(value)) deepFreeze(child);
   }
   return value;
-};
-
-// A host name the mesh bridge marks mirrored records with (smarty-dev#2004). Absent: a record
-// this mesh's own hosts wrote. Present but invalid: the record is rejected.
-const REMOTE_HOST = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
-const remoteHostValid = (value: unknown): boolean =>
-  value === undefined || (typeof value === "string" && REMOTE_HOST.test(value));
-
-const optionalStrings = (value: Record<string, unknown>, keys: readonly string[]): boolean =>
-  keys.every((key) => value[key] === undefined || typeof value[key] === "string");
-
-const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
-  if (!isObject(entry.value) || entry.value.format !== 1) return undefined;
-  const value = entry.value as Partial<FabricParticipantRecord> & Record<string, unknown>;
-  const kind = participantKind(value.kind);
-  if (
-    !kind ||
-    (value.interactive !== undefined && typeof value.interactive !== "boolean") ||
-    !remoteHostValid(value.remoteHost) ||
-    // Optional fields that consumers read as strings (peer cards, labels, leader selection):
-    // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId"]) ||
-    // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
-    (value.remoteHost !== undefined && kind !== "root") ||
-    typeof value.id !== "string" ||
-    entry.key !== keyFor(PARTICIPANT_PREFIX, value.id) ||
-    typeof value.rootId !== "string" ||
-    typeof value.ownerHostId !== "string" ||
-    typeof value.ownerIdentityId !== "string" ||
-    entry.updatedBy.id !== value.ownerIdentityId ||
-    typeof value.name !== "string" ||
-    typeof value.status !== "string" ||
-    (value.runner !== "pi" && value.runner !== "claude" && value.runner !== "veda") ||
-    typeof value.transport !== "string" ||
-    !transports.has(value.transport) ||
-    !Array.isArray(value.capabilities) ||
-    !value.capabilities.every(
-      (capability) => typeof capability === "string" && capabilities.has(capability),
-    ) ||
-    typeof value.startedAt !== "number" ||
-    typeof value.updatedAt !== "number" ||
-    value.controlProtocol !== "v1" &&
-    value.controlProtocol !== "legacy"
-  ) {
-    return undefined;
-  }
-  return value as FabricParticipantRecord;
-};
-
-const hostFromEntry = (entry: MeshStateEntry): FabricHostRecord | undefined => {
-  if (!isObject(entry.value) || entry.value.format !== 1) return undefined;
-  const value = entry.value as Partial<FabricHostRecord>;
-  if (
-    typeof value.id !== "string" ||
-    entry.key !== keyFor(HOST_PREFIX, value.id) ||
-    !remoteHostValid(value.remoteHost) ||
-    typeof value.rootId !== "string" ||
-    !isObject(value.identity) ||
-    typeof value.identity.id !== "string" ||
-    typeof value.identity.name !== "string" ||
-    entry.updatedBy.id !== value.identity.id ||
-    (value.identity.kind !== "main" &&
-      value.identity.kind !== "agent" &&
-      value.identity.kind !== "actor") ||
-    typeof value.startedAt !== "number" ||
-    typeof value.updatedAt !== "number" ||
-    typeof value.expiresAt !== "number"
-  ) {
-    return undefined;
-  }
-  return value as FabricHostRecord;
 };
 
 // Explicit root names take precedence; unnamed roots keep their stable short peer labels.
@@ -1479,7 +1387,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     // Renew before ANY per-key cleanup/write/copy, including migration and retry copies.
     // Heartbeat calls keep renewing while #retryFile is waiting on a contended key.
-    if (!this.#quiescing || this.#reloadUntil !== undefined) this.#renewFileLease();
+    if (!this.#quiescing || this.#reloadUntil !== undefined) this.#renewFileLease(snapshot);
     for (const entry of fileEntries) {
       const participant = ownParticipant(entry);
       if (participant && !desired.has(participant.id)) {
@@ -1541,13 +1449,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const decideRenewal = (leaseAt: number, snapshot?: object): { skip: boolean; host: boolean; session: boolean } => {
         const read = snapshot ? { snapshot } : {};
         const own = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), read);
-        const host = own && hostFromEntry(own);
-        const hostValid = !!host &&
-          host.remoteHost === undefined &&
-          host.rootId === this.options.rootId &&
-          JSON.stringify(host.identity) === JSON.stringify(this.options.identity) &&
-          host.startedAt === this.#startedAt;
-        if (!hostValid) return { skip: false, host: true, session: false };
+        const host = own && this.#canonicalOwnHost(own);
+        if (!host) return { skip: false, host: true, session: false };
         if (!this.#legacyRenewalsRequired(leaseAt, snapshot)) return { skip: true, host: false, session: false };
         const legacy = root && legacySessionKey ? this.mesh.get(legacySessionKey, read) : undefined;
         // The host retains its configured policy cadence (10 min under hostLeases: files).
@@ -1611,6 +1514,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const results = await this.mesh.writeBatch({ identity: this.options.identity, ops,
       afterCommit: () => { committedAt = this.#absenceConfirmedAt = Date.now(); } });
     if (!filesOnly) this.#recordsWrittenAt = Date.now();
+    // Invalid/missing prior ownership could not renew outside the mutation fence.
+    // Only the freshly committed canonical host authorizes its next file renewal.
+    if (renewHost && (!this.#quiescing || this.#reloadUntil !== undefined)) this.#renewFileLease();
     // Each record the shared state committed goes to its file too, for runtimes that read files.
     for (const result of results) {
       if (result.applied && statePuts.has(result.key)) await this.#copyCommitted(result.key, result.version);
@@ -1648,8 +1554,21 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }));
   }
 
-  #renewFileLease(): number {
+  #canonicalOwnHost(entry: MeshStateEntry): FabricHostRecord | undefined {
+    const host = hostFromEntry(entry);
+    return host && host.remoteHost === undefined && host.rootId === this.options.rootId &&
+      JSON.stringify(host.identity) === JSON.stringify(this.options.identity) && host.startedAt === this.#startedAt
+      ? host : undefined;
+  }
+
+  #renewFileLease(snapshot?: object): number {
     const leaseAt = Date.now();
+    const own = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), snapshot ? { snapshot } : { fresh: true });
+    // A present noncanonical/wrong-writer owner is never permission to renew this
+    // host's file. Missing initial registration is the existing publication gap:
+    // its first file precedes participant files, but an established host must repair
+    // disappeared ownership under the mutation fence before renewing again.
+    if (own ? !this.#canonicalOwnHost(own) : this.#leaseConfirmed) return leaseAt;
     const root = this.#localRecords.get(this.options.rootId);
     writeHostLease(this.mesh.root, {
       id: this.options.hostId,

@@ -16,15 +16,18 @@ fs.writeFileSync(path.join(profile,'settings.json'),JSON.stringify({extensions:[
 fs.mkdirSync(path.join(cwd,'.pi'),{recursive:true});
 fs.writeFileSync(path.join(cwd,'.pi','fabric.json'),JSON.stringify({enabled:true}));
 const transcript = path.join(cwd,'transcript.jsonl'); fs.writeFileSync(transcript,'');
-const fresh = mode === 'restart-fresh-actor';
+const fresh = mode === 'restart-fresh-actor' || mode === 'restart-foreign-principal';
 const freshTask = 'Fresh mailbox task B: write item-B.txt containing B completed';
 const task = fresh ? freshTask : mode === 'plain' ? 'Compact. Keep the failing test name in the summary.' : mode.startsWith('restart') || mode === 'receipt' ? 'Continue the task from the existing session. Do not repeat completed work.' : 'Compact first, then start item X';
 fs.writeFileSync(path.join(cwd,'task.txt'),task);
+// Fresh B has its own private worker admission. A's old journal must never be
+// bundled into this envelope, regardless of an unsupported principal field.
+if(fresh) fs.writeFileSync(path.join(cwd,'task.txt.provenance.json'),JSON.stringify({v:1,channel:'fabric',sender:{id:'actor:requester',kind:'actor',verified:'mesh'},via:'actor',principal:{id:'principal-B',binding:'herdr-client'}}));
 const manager = SessionManager.create(cwd,path.join(cwd,'sessions'));
 manager.appendMessage({role:'user',content:'Inspect failing test test_X; pause before implementation.\n' + 'Historical inspection evidence; no runnable work here. '.repeat(200),timestamp:Date.now()});
 manager.appendMessage({role:'assistant',content:[{type:'text',text:'Inspected test_X; work remains.'}], api:'compact-proof-api',provider:'compact-proof',model:'offline',timestamp:Date.now(),stopReason:'stop',usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}});
 if(mode.startsWith('restart') || mode === 'receipt') {
-  manager.appendCustomEntry('fabric-compact-resume',{id:'12345678-1234-1234-1234-123456789abc',resume:'start item X',state:'pending'});
+  manager.appendCustomEntry('fabric-compact-resume',{id:'12345678-1234-1234-1234-123456789abc',resume:'start item X',state:'pending', ...(mode === 'restart-foreign-principal' ? {principal:{id:'principal-A',binding:'herdr-client'}} : {})});
   manager.appendCompaction('Committed; continuation not admitted',manager.getBranch()[0].id,1000);
   fs.appendFileSync(transcript,JSON.stringify({type:'seed-committed',at:Date.now()})+'\n');
   if(mode === 'receipt') manager.appendMessage({role:'user',content:'Resume after compaction: already admitted\n\n[Fabric continuation: 12345678-1234-1234-1234-123456789abc]',timestamp:Date.now()});
@@ -54,7 +57,7 @@ const contextAdmitted = contextIndex >= 0 && contextIndex < assistantIndex;
 const errors = [];
 if((mode === 'restart-actor' || fresh) && !contextAdmitted) errors.push('native actor context admission must precede the first assistant');
 if(result.status !== 0 || status?.status !== 'completed') errors.push('worker failed: '+(status?.error ?? result.stderr ?? result.error));
-if(mode === 'compound' || mode.startsWith('restart')) {
+if(mode === 'compound') {
   if(x.length !== 1 || status?.text !== 'X completed') errors.push('expected exactly one completed continuation');
   if(!fs.existsSync(path.join(cwd,'item-X.txt')) || fs.readFileSync(path.join(cwd,'item-X.txt'),'utf8') !== 'X completed') errors.push('X must execute the real write tool');
   if(!complete || !x[0] || x[0].at-complete.at > 60000) errors.push('X must start within one minute of compaction');
@@ -62,21 +65,26 @@ if(mode === 'compound' || mode.startsWith('restart')) {
 if(mode === 'receipt' && (x.length || prompts.length !== 1)) errors.push('persisted receipt must not replay its continuation');
 if(mode === 'plain' && (x.length || prompts.length !== 1 || !complete)) errors.push('plain compaction must stay idle after its initial prompt');
 if(mode.startsWith('restart') && (prompts.length !== 1 || events.some(e=>e.type === 'input-preflight' && e.at < startup?.at))) errors.push('restart preflight must follow delayed startup with only one admitted prompt');
+if(mode.startsWith('restart')) {
+  const refusal = wire.find(e=>e.type === 'fabric_compact_resume_refused');
+  if(refusal?.count !== 1 || !refusal.message.includes('original admission cannot be proven')) errors.push('startup must explicitly refuse unprovable recovery');
+  if(!status?.warnings?.some(warning=>warning.includes('restart recovery refused'))) errors.push('caller-visible worker result must retain the refusal warning');
+  if(x.length || fs.existsSync(path.join(cwd,'item-X.txt'))) errors.push('refused A must never run');
+  if(prompts.some(e=>e.prompt.includes('Resume after compaction:') || e.prompt.includes('[Fabric continuation:'))) errors.push('fresh input must not coalesce refused A');
+  const branch = SessionManager.open(manager.getSessionFile()).getBranch();
+  if(!branch.some(e=>e.type === 'custom' && e.customType === 'fabric-compact-resume' && e.data.state === 'cancelled' && e.data.reason?.includes('original admission cannot be proven'))) errors.push('refusal must be durable');
+}
 if(fresh) {
-  const admitted = prompts[0]?.prompt ?? '';
-  const selected = events.find(e=>e.type === 'X-selected');
-  if(!admitted.includes(freshTask) || !selected?.prompt.includes(freshTask)) errors.push('fresh task B must reach native admitted prompt and model context');
-  if(admitted.split('Resume after compaction:').length !== 2 || admitted.split('[Fabric continuation:').length !== 2 || (selected?.prompt ?? '').split('[Fabric continuation:').length !== 2) errors.push('recovered continuation must be admitted exactly once');
-  const persisted = SessionManager.open(manager.getSessionFile()).getBranch().filter(e=>e.type === 'message' && e.message.role === 'user').map(e=>JSON.stringify(e.message));
-  const receipts = persisted.filter(text=>text.includes('[Fabric continuation: 12345678-1234-1234-1234-123456789abc]'));
-  if(receipts.length !== 1 || !receipts[0].includes(freshTask) || receipts[0].split('[Fabric continuation:').length !== 2) errors.push('one durable native user message must retain both fresh B and recovered A');
+  if(prompts[0]?.prompt !== freshTask || status?.text !== 'B completed') errors.push('only fresh B must reach native input and run');
   if(!fs.existsSync(path.join(cwd,'item-B.txt')) || fs.readFileSync(path.join(cwd,'item-B.txt'),'utf8') !== 'B completed') errors.push('fresh task B must execute its real write tool');
+  const persisted = SessionManager.open(manager.getSessionFile()).getBranch().filter(e=>e.type === 'message' && e.message.role === 'user').map(e=>JSON.stringify(e.message));
+  if(persisted.filter(text=>text.includes(freshTask)).length !== 1 || persisted.some(text=>text.includes('[Fabric continuation:'))) errors.push('one durable native input must retain B alone');
 }
 if(mode === 'restart-inherited') {
   if(prompts[0]?.model !== 'offline') errors.push('native configured default model must be inherited');
-  const recoveryIndex = wire.findIndex(e=>e.type === 'fabric_compact_resume_ready');
+  const recoveryIndex = wire.findIndex(e=>e.type === 'fabric_compact_resume_refused');
   const startupIndex = wire.findIndex(e=>e.type === 'response' && e.command === 'get_state' && e.success && String(e.id).startsWith('fabric-model:'));
-  if(recoveryIndex < 0 || startupIndex <= recoveryIndex || startupIndex >= assistantIndex) errors.push('inherited model recovery must precede native startup admission and inference');
+  if(recoveryIndex < 0 || startupIndex <= recoveryIndex || startupIndex >= assistantIndex) errors.push('inherited model refusal must precede native startup admission and inference');
 }
 const summary = {mode,pi,worker,fabric,freshTaskAdmitted: fresh ? prompts[0]?.prompt.includes(freshTask) : undefined, fabricModelSelector: flags.model ?? null,actorContextAdmitted: contextAdmitted,exitCode:result.status,status:status?.status,text:status?.text,error:status?.error,compactionCompletionAt:complete?.at,xStartAt:x[0]?.at,latencyMs:x[0]&&complete ? x[0].at-complete.at : null,prompts:prompts.length,continuations:x.length,errors,transcript};
 fs.writeFileSync(path.join(cwd,'result.json'),JSON.stringify(summary,null,2)+'\n'); console.log(JSON.stringify(summary,null,2));

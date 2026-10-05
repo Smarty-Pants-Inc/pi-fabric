@@ -53,7 +53,7 @@ import {
 import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
 import { COMPACTION_FAILED_ALARM, registerCompactionRecovery } from "./compaction/recovery.js";
 import { compactAtConfiguredThreshold } from "./compaction/threshold.js";
-import { recoverCompactResume, resumeCompactInput } from "./core/compact-resume.js";
+import { recoverCompactResume } from "./core/compact-resume.js";
 import {
   createToolOwnershipReassertion,
   FabricToolLifecycle,
@@ -735,13 +735,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       // Hold the lease through activation, actor re-arm and reporting, even on failure.
       releaseSlot?.();
     }
-    const resume = recoverCompactResume(pi, context, true, "stage");
-    if (resume && context.mode === "rpc" && process.env.PI_FABRIC_PARENT_RUN) {
-      // Announce only: ordinary RPC commands remain blocked until all startup
-      // handlers finish. The worker selects model/effort and admits this exact
-      // context before sending its one initial/resume prompt.
-      writeSync(1, `${JSON.stringify({ type: "fabric_compact_resume_ready", protocol: 1,
-        runId: process.env.PI_FABRIC_PARENT_RUN, message: resume })}\n`);
+    const refused = recoverCompactResume(pi, context, true);
+    if (refused) {
+      const message = "Compaction restart recovery refused: original admission cannot be proven. Re-submit the pending work explicitly.";
+      if (context.hasUI) context.ui.notify(message, "warning");
+      if (context.mode === "rpc") {
+        writeSync(1, `${JSON.stringify({ type: "fabric_compact_resume_refused", protocol: 1,
+          runId: process.env.PI_FABRIC_PARENT_RUN, count: refused, message })}\n`);
+      }
     }
   });
 
@@ -758,14 +759,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("input", async (event, context) => {
-    const recovery = resumeCompactInput(pi, context, event.text);
-    if (!state.initialized) return recovery;
-    state.prewalk.observeTask(
-      context.sessionManager.getSessionId(),
-      recovery?.text ?? event.text,
-    );
-    await state.publishHostLifecycle("pi.input", recovery ? { ...event, text: recovery.text } : event);
-    return recovery;
+    if (!state.initialized) return;
+    state.prewalk.observeTask(context.sessionManager.getSessionId(), event.text);
+    await state.publishHostLifecycle("pi.input", event);
   });
 
   pi.on("agent_start", async (event) => {

@@ -48,9 +48,11 @@ process.stdin.on('data', chunk => {
 });
 process.stdin.on('end', () => process.exit(0));
 `;
-const run = async (task: string) => {
+const run = async (task: string, legacyRecovery = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-worker-resume-")); roots.push(root);
-  const binary = path.join(root, "fake-pi.mjs"); fs.writeFileSync(binary, fakePi, { mode: 0o755 });
+  const binary = path.join(root, "fake-pi.mjs");
+  const script = legacyRecovery ? fakePi.replace("process.stdin.on('data'", "emit({type:'fabric_compact_resume_ready', protocol:1, runId:process.env.PI_FABRIC_PARENT_RUN, message:'Resume after compaction: foreign A'});\nprocess.stdin.on('data'") : fakePi;
+  fs.writeFileSync(binary, script, { mode: 0o755 });
   const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 15_000, budgetUsd: 0 }, {
     workerPath: path.resolve(process.env.FABRIC_COMPACT_RESUME_WORKER ?? "src/worker.ts"), piBinary: binary, runRoot: root,
   });
@@ -61,6 +63,14 @@ const run = async (task: string) => {
 };
 
 describe("worker compaction resume shutdown fence", () => {
+  it("refuses an older child's startup recovery announcement instead of bundling it with fresh work", async () => {
+    const { result, events } = await run("fresh B", true);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("restart recovery refused: original admission cannot be proven");
+    expect(events.some(event => event.type === "message_end")).toBe(false);
+    expect(events.some(event => event.type === "agent_start")).toBe(false);
+  }, 25_000);
+
   it("keeps stdin open past settled and its timer until the one resume user turn finishes", async () => {
     const { result, events } = await run("resume");
     expect(result.status).toBe("completed");

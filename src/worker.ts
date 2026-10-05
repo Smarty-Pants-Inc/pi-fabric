@@ -690,13 +690,8 @@ const main = async (): Promise<void> => {
   let retainedPiQueues: { steering: string[]; followUp: string[] } | undefined;
   let providerResumeAttempts = 0;
   let resumePrompt = false;
-  let startupCompactResume: string | undefined;
-  const initialPiMessage = (): string => {
-    // Only a provider retry generates a replaceable generic resume prompt. A
-    // fresh activation (including a mailbox event) must survive startup recovery.
-    if (startupCompactResume) return resumePrompt ? startupCompactResume : `${task}\n\n${startupCompactResume}`;
-    return resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task;
-  };
+  const initialPiMessage = (): string => resumePrompt
+    ? "Continue the task from the existing session. Do not repeat completed work." : task;
   let providerAborted = false;
   let cancelResumeWait: (() => void) | undefined;
   let stderr = "";
@@ -915,8 +910,8 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
-  // Even an inherited model must wait for native RPC startup: Fabric may
-  // announce committed recovery during session_start, before input opens.
+  // Even an inherited model must wait for native RPC session_start handlers
+  // and the correlated startup admission response before input opens.
   }, activationWindow, true, Boolean(options.routeHeader));
   let modelControl = createModelControl();
 
@@ -1335,10 +1330,18 @@ const main = async (): Promise<void> => {
       }
       return;
     }
+    if (event.type === "fabric_compact_resume_refused") {
+      if (event.protocol === 1 && event.runId === options.id && Number.isSafeInteger(event.count) && Number(event.count) > 0) {
+        const warning = "Compaction restart recovery refused: original admission cannot be proven. Re-submit the pending work explicitly.";
+        record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+        update();
+      }
+      return;
+    }
     if (event.type === "fabric_compact_resume_ready") {
-      if (event.protocol === 1 && event.runId === options.id && !modelControl.ready &&
-          typeof event.message === "string" && event.message.trim()) startupCompactResume = event.message;
-      else modelControl.fail("compaction recovery readiness arrived outside startup admission");
+      // Fail closed when an older child generation attempts startup bundling.
+      // Its journal cannot prove an original sender or parent output lineage.
+      modelControl.fail("compaction restart recovery refused: original admission cannot be proven; re-submit pending work explicitly");
       return;
     }
     compactControl.observe(event);
@@ -1923,7 +1926,6 @@ const main = async (): Promise<void> => {
     // --session <exact path> is Pi's noninteractive resume selector. --continue
     // alone selects the most recent session, which may belong to another task.
     resumePrompt = true;
-    startupCompactResume = undefined;
     retainedPiQueues = record.pendingMessages ? {
       steering: [...record.pendingMessages.steering], followUp: [...record.pendingMessages.followUp],
     } : undefined;

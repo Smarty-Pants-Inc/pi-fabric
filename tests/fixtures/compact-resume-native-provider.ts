@@ -13,10 +13,10 @@ export default function(pi: ExtensionAPI) {
     const resumed = !summary && prompt.includes('Resume after compaction:');
     const tool = !summary && context.messages.at(-1)?.role !== 'toolResult' && !prompt.includes('already admitted');
     if (resumed && tool) receipt('X-selected', {prompt});
-    const fresh = resumed && prompt.includes('Fresh mailbox task B:');
-    const code = resumed ? 'await pi.write({ path: "item-X.txt", text: "X completed" }); ' + (fresh ? 'await pi.write({ path: "item-B.txt", text: "B completed" }); ' : '') + 'return "X completed";'
+    const fresh = !summary && prompt.includes('Fresh mailbox task B:');
+    const code = fresh && !resumed ? 'await pi.write({ path: "item-B.txt", text: "B completed" }); return "B completed";' : resumed ? 'await pi.write({ path: "item-X.txt", text: "X completed" }); ' + (fresh ? 'await pi.write({ path: "item-B.txt", text: "B completed" }); ' : '') + 'return "X completed";'
       : 'await compact.request({ instructions: "Keep the failing test name in the summary" }); return "compaction requested";';
-    const message: AssistantMessage = {role:'assistant', provider:selected.provider, model:selected.id, api:selected.api, timestamp:Date.now(), content:tool ? [{type:'toolCall', id:resumed ? 'item-X-call' : 'compact-proof-call', name:'fabric_exec', arguments:{code}}] : [{type:'text', text:summary ? 'Compacted. Preserve failing test test_X. Pending work: start item X only if requested.' : resumed ? 'X completed' : 'Compaction requested; idle unless continuation is admitted.'}], stopReason:tool ? 'toolUse' : 'stop', usage:{input:0, output:0, cacheRead:0, cacheWrite:0, totalTokens:0, cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}};
+    const message: AssistantMessage = {role:'assistant', provider:selected.provider, model:selected.id, api:selected.api, timestamp:Date.now(), content:tool ? [{type:'toolCall', id:resumed ? 'item-X-call' : 'compact-proof-call', name:'fabric_exec', arguments:{code}}] : [{type:'text', text:summary ? 'Compacted. Preserve failing test test_X. Pending work: start item X only if requested.' : resumed ? 'X completed' : fresh ? 'B completed' : 'Compaction requested; idle unless continuation is admitted.'}], stopReason:tool ? 'toolUse' : 'stop', usage:{input:0, output:0, cacheRead:0, cacheWrite:0, totalTokens:0, cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}};
     output.push({type:'start', partial:message});
     if(tool) output.push({type:'toolcall_end', contentIndex:0, toolCall:message.content[0] as Extract<AssistantMessage['content'][number],{type:'toolCall'}>, partial:message});
     output.push({type:'done', reason:message.stopReason as 'stop'|'toolUse', message}); output.end(); return output;

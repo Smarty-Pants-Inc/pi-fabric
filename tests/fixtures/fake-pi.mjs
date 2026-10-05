@@ -7,25 +7,50 @@ import fs from "node:fs";
 const behavior = process.env.FAKE_PI_BEHAVIOR || "success";
 const emit = (event) => process.stdout.write(JSON.stringify(event) + "\n");
 
-// Drain the prompt the worker writes so its stdin write does not block.
-process.stdin.resume();
+// Behaviors represent task outcomes, not startup. Complete the worker's real
+// correlated RPC admission before running any behavior (including early exit).
+// Keep listening through model/effort selection and begin only on its prompt.
+let initialPrompt;
+await new Promise((resolve) => {
+  let buffer = "";
+  let model = { provider: "fixture", id: "offline" };
+  let thinkingLevel = "off";
+  const onEnd = () => process.exit(0);
+  const onData = chunk => {
+    buffer += chunk.toString("utf8");
+    let newline;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const frame = JSON.parse(buffer.slice(0, newline));
+      buffer = buffer.slice(newline + 1);
+      emit({ type: "fake_received", frame });
+      if (frame.type === "prompt") {
+        initialPrompt = frame;
+        process.stdin.removeListener("data", onData);
+        process.stdin.removeListener("end", onEnd);
+        resolve();
+        return;
+      }
+      if (frame.type === "set_model") model = { provider: frame.provider, id: frame.modelId };
+      if (frame.type === "set_thinking_level") thinkingLevel = frame.level;
+      const data = frame.type === "get_state" ? { model, thinkingLevel, isStreaming: false, isCompacting: false }
+        : frame.type === "get_available_models" ? { models: [model] }
+        : frame.type === "set_model" ? model : undefined;
+      emit({ type: "response", id: frame.id, command: frame.type, success: true, data });
+    }
+  };
+  process.stdin.on("data", onData);
+  process.stdin.once("end", onEnd);
+});
+// Some lifecycle behaviors keep the process alive after the initial prompt.
 process.stdin.on("data", () => {});
 
 const capturePrompt = () => {
-  process.stdin.removeAllListeners("data");
-  let buffer = "";
-  process.stdin.on("data", (chunk) => {
-    buffer += chunk.toString("utf8");
-    const newline = buffer.indexOf("\n");
-    if (newline < 0) return;
-    const frame = JSON.parse(buffer.slice(0, newline).replace(/\r$/, ""));
-    if (process.env.FAKE_PI_PROMPT_LOG) {
-      fs.writeFileSync(process.env.FAKE_PI_PROMPT_LOG, JSON.stringify(frame));
-    }
-    emit({ type: "message_end", message: { role: "assistant", content: "captured prompt" } });
-    emit({ type: "agent_settled" });
-    process.exit(0);
-  });
+  if (process.env.FAKE_PI_PROMPT_LOG) {
+    fs.writeFileSync(process.env.FAKE_PI_PROMPT_LOG, JSON.stringify(initialPrompt));
+  }
+  emit({ type: "message_end", message: { role: "assistant", content: "captured prompt" } });
+  emit({ type: "agent_settled" });
+  process.exit(0);
 };
 
 const runCompactionLifecycle = (fail) => {
@@ -69,6 +94,7 @@ const runCompactionLifecycle = (fail) => {
       }
     }
   });
+  process.stdin.emit("data", Buffer.from(JSON.stringify(initialPrompt) + "\n"));
 };
 
 const terminated = () => {

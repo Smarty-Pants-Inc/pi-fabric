@@ -1553,10 +1553,16 @@ export class MeshStore {
     delete payload.readJournalHash;
     const generation = randomUUID();
     const unstamped: MeshStateFile = { readGeneration: generation, ...payload };
-    const journal = this.#writeReadJournal ? prepareStateJournal(unstamped, this.#journalBase, keys) : undefined;
-    const stamped: MeshStateFile = journal
+    const canonical = encodeState(unstamped, reuse);
+    let journal = this.#writeReadJournal ? prepareStateJournal(unstamped, this.#journalBase, keys, canonical.entries) : undefined;
+    let stamped: MeshStateFile = journal
       ? { readGeneration: generation, readJournalHash: journal.hash, ...payload } : unstamped;
-    const encoded = encodeState(stamped, reuse);
+    let encoded = journal ? encodeState(stamped, canonical.entries) : canonical;
+    // An optional accelerator must not reject a write whose canonical payload fits.
+    // Omit the chain head/record at the cap; readers safely fall back to canonical bytes.
+    if (journal && encoded.serialized.byteLength > this.#maxStateBytes) {
+      journal = undefined; stamped = unstamped; encoded = canonical;
+    }
     if (encoded.serialized.byteLength > this.#maxStateBytes) {
       throw new Error(`Fabric mesh state exceeds ${this.#maxStateBytes} bytes`);
     }
@@ -1851,11 +1857,12 @@ export class MeshStore {
       return recent.state;
     }
     let before: string;
+    let beforeIdentity: string | undefined;
     try {
       const observed = fs.statSync(this.#statePath);
       if (observed.size > this.#maxStateBytes) throw new Error(`Failed to read Fabric mesh state: state exceeds ${this.#maxStateBytes} bytes`);
       before = stampOf(observed);
-      const identity = stateReadIdentity(this.#statePath);
+      const identity = beforeIdentity = stateReadIdentity(this.#statePath);
       const generation = this.#canonicalGeneration();
       const cached = this.#stateCache;
       // Nanosecond ctime/inode also detect an older writer that copies the UUID or writes
@@ -1868,7 +1875,9 @@ export class MeshStore {
         if (confirmed) this.#stateCache = { ...cached, parsedAt: Date.now() };
         return cached.state;
       }
-      if (!canonical && cached?.stamp === before && (cached.generation !== undefined || fresh) &&
+      // A copied marker/rounded stat cannot override a changed high-resolution identity.
+      // Only adapters without that identity retain the historical nonfresh fallback.
+      if (identity === undefined && !canonical && cached?.stamp === before && (cached.generation !== undefined || fresh) &&
         cached.generation === generation) return cached.state;
       const shared = processReadSnapshots.get(path.resolve(this.#statePath))?.deref();
       if (shared && matches(shared)) {
@@ -1882,7 +1891,7 @@ export class MeshStore {
         const replay = replayStateJournal(this.root, base.state, generation, identity, before, base.identity,
           this.#canonicalHeader?.generation === generation ? this.#canonicalHeader.journalHash : undefined, base.journalCursor);
         if (replay && stateReadIdentity(this.#statePath) === identity && this.#canonicalGeneration() === generation &&
-          this.#cacheState(replay.state, before)) {
+          this.#cacheState(replay.state, before, true, identity)) {
           this.#stateCache!.journalCursor = replay.cursor;
           rememberReadSnapshot(path.resolve(this.#statePath), this.#stateCache!);
           return replay.state;
@@ -1900,7 +1909,7 @@ export class MeshStore {
     for (let attempt = 0; ; attempt++) {
       let readable = false;
       const state = readState(this.#statePath, this.#maxStateBytes, true, () => { readable = true; });
-      if (this.#cacheState(state, before, readable)) {
+      if (this.#cacheState(state, before, readable, beforeIdentity)) {
         rememberReadSnapshot(path.resolve(this.#statePath), this.#stateCache!);
         return state;
       }
@@ -1910,15 +1919,20 @@ export class MeshStore {
         return state;
       }
       before = next;
+      beforeIdentity = stateReadIdentity(this.#statePath);
     }
   }
 
   // Under the lock (writes) no expected stamp is needed; lock-free reads pass the pre-read stamp.
   // The entry is labelled with the payload's own canonical generation.
-  #cacheState(state: MeshStateFile, expectedStamp: string | undefined, canonicalReadable = true): boolean {
+  #cacheState(state: MeshStateFile, expectedStamp: string | undefined, canonicalReadable = true, expectedIdentity?: string): boolean {
     try {
       const stat = fs.statSync(this.#statePath);
       if (expectedStamp !== undefined && stampOf(stat) !== expectedStamp) return false;
+      const identity = stateReadIdentity(this.#statePath);
+      // Pin both physical endpoints: a same-marker replacement during a full parse must
+      // never label older bytes with the replacement's identity, even when the stat repeats.
+      if (expectedIdentity !== undefined && identity !== expectedIdentity) return false;
       this.#stateCache = {
         device: stat.dev,
         inode: stat.ino,
@@ -1928,7 +1942,7 @@ export class MeshStore {
         parsedAt: Date.now(),
         state,
         generation: generationOf(state),
-        identity: stateReadIdentity(this.#statePath),
+        identity,
         canonicalReadable,
       };
       return true;

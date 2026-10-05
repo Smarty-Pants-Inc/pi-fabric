@@ -5,8 +5,10 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, assertMeshStateReadable } from "../src/mesh/store.js";
 import { writeFileAtomic } from "../src/core/atomic-write.js";
+import { replayStateJournal, stateReadIdentity } from "../src/mesh/read-journal.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 const roots: string[] = [];
+const readFile = fs.readFileSync.bind(fs);
 const identity = { id: "session:writer", name: "writer", kind: "main" as const };
 const fixture = async (options: ConstructorParameters<typeof MeshStore>[3] = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "state-read-gate-")); roots.push(root);
@@ -85,6 +87,66 @@ describe("process-wide physical state read gate (#4383)", () => {
     expect(f.reader.listAll("", { fresh: true })).toEqual([]);
     expect(() => assertMeshStateReadable(f.root)).toThrow("invalid state format");
   });
+  it("a copied-marker replacement during a full read cannot certify older bytes under the newer physical identity", async () => {
+    const f = await fixture(), state = f.disk();
+    state.entries["field/heartbeat/writer"].value = 1;
+    writeFileAtomic(f.file, JSON.stringify(state));
+    const stat = fs.statSync.bind(fs), read = readFile, frozen = stat(f.file);
+    // Keep the lossy tuple fixed while real bigint inode/ctime identity still changes.
+    vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, ...args: unknown[]) =>
+      String(target) === f.file && !(args[0] as { bigint?: boolean } | undefined)?.bigint
+        ? frozen : (stat as (...args: unknown[]) => fs.Stats)(target, ...args)) as typeof fs.statSync);
+    let replaced = false;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      const bytes = (read as (...args: unknown[]) => unknown)(target, ...args);
+      if (String(target) === f.file && !replaced) {
+        replaced = true; state.entries["field/heartbeat/writer"].value = 2;
+        writeFileAtomic(f.file, JSON.stringify(state));
+      }
+      return bytes;
+    }) as typeof fs.readFileSync);
+    expect(f.reader.get("field/heartbeat/writer", { fresh: true })?.value).toBe(2);
+    expect(replaced).toBe(true);
+    expect(f.reader.get("field/heartbeat/writer", { fresh: true })?.value).toBe(2);
+  });
+  it("an expired ordinary read detects changed physical identity even if a legacy marker and lossy stat repeat", async () => {
+    vi.useFakeTimers({ now: 1000000 });
+    const f = await fixture(), state = f.disk();
+    const stat = fs.statSync.bind(fs), frozen = stat(f.file);
+    state.entries["field/heartbeat/writer"].value = 9;
+    writeFileAtomic(f.file, JSON.stringify(state));
+    vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, ...args: unknown[]) =>
+      String(target) === f.file && !(args[0] as { bigint?: boolean } | undefined)?.bigint
+        ? frozen : (stat as (...args: unknown[]) => fs.Stats)(target, ...args)) as typeof fs.statSync);
+    vi.setSystemTime(1005000);
+    expect(f.reader.get("field/heartbeat/writer")?.value).toBe(9);
+  });
+  it("every mutating put, delete, batch and prepare path bumps generation and invalidates local and peer snapshots", async () => {
+    const f = await fixture();
+    const writes = [
+      () => f.writer.put({ key: "field/heartbeat/writer", value: 1, identity }),
+      () => f.writer.delete({ key: "field/heartbeat/writer" }),
+      () => f.writer.writeBatch({ identity, ops: [{ kind: "put" as const, key: "field/batch/a", value: "batch" }] }),
+      () => f.writer.writeBatch({ identity, ops: [], prepare: () => [{ kind: "put" as const, key: "field/prepared/a", value: "prepared" }] }),
+      () => f.writer.writeBatch({ identity, ops: [{ kind: "delete" as const, key: "field/batch/a" }] }),
+      () => f.writer.writeBatch({ identity, ops: [], prepare: () => [{ kind: "delete" as const, key: "field/prepared/a" }] }),
+    ];
+    for (const write of writes) {
+      const old = f.reader.stateToken({ fresh: true }), before = f.disk();
+      await write();
+      const after = f.disk();
+      expect(after.readGeneration).not.toBe(before.readGeneration);
+      expect(f.writer.stateToken({ fresh: true })).toEqual(after);
+      expect(f.reader.stateToken({ fresh: true })).toEqual(after);
+      expect(f.reader.stateToken()).not.toBe(old);
+      expect(old).toEqual(before); // Write transactions and replay never mutate captured tokens.
+    }
+    const generation = f.disk().readGeneration;
+    await f.writer.delete({ key: "field/missing/a" });
+    await f.writer.writeBatch({ identity, ops: [{ kind: "delete", key: "field/missing/a" }] });
+    await f.writer.confirmWritable();
+    expect(f.disk().readGeneration).toBe(generation); // No state writes occurred.
+  });
   it("confirmWritable revalidates without discarding unchanged bytes", async () => {
     const f = await fixture(), token = f.reader.stateToken(); await f.reader.confirmWritable();
     expect(f.reader.stateToken()).toBe(token); expect(f.count()).toBe(0);
@@ -108,6 +170,26 @@ describe("incremental state read journal", () => {
     const before = f.count(), next = new MeshStore(f.root, 256 * 1024, 1000);
     expect(next.get("field/heartbeat/writer", { fresh: true })?.value).toBe(4);
     expect(f.count()).toBe(before);
+  });
+  it("a replay cursor advances only through the consumed UTF-8 prefix, not a later canonical generation", async () => {
+    const f = await fixture(), base = f.disk(), baseIdentity = stateReadIdentity(f.file);
+    const stamp = () => { const stat = fs.statSync(f.file);
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`; };
+    await f.writer.put({ key: "field/heartbeat/writer", value: "雪😀", identity });
+    const first = f.disk(), firstIdentity = stateReadIdentity(f.file)!;
+    const firstStamp = stamp();
+    const firstOffset = fs.statSync(f.journal).size;
+    await f.writer.put({ key: "field/heartbeat/writer", value: "latest雪😀", identity });
+    const last = f.disk(), lastIdentity = stateReadIdentity(f.file)!;
+    // A writer may append a later record after the reader captured its canonical endpoint.
+    // The helper must not skip that unseen record when returning its incremental cursor.
+    const replay = replayStateJournal(f.root, base, first.readGeneration, firstIdentity, firstStamp, baseIdentity, first.readJournalHash)!;
+    expect(replay.state).toEqual(first);
+    expect(replay.cursor.offset).toBe(firstOffset);
+    const next = replayStateJournal(f.root, replay.state, last.readGeneration, lastIdentity, stamp(),
+      firstIdentity, last.readJournalHash, replay.cursor);
+    expect(next?.state).toEqual(last);
+    expect(next?.cursor.offset).toBe(fs.statSync(f.journal).size);
   });
   it("reads only appended bytes after its first replay", async () => {
     const f = await fixture(); await f.writer.put({ key: "field/heartbeat/writer", value: 1, identity });

@@ -198,6 +198,8 @@ describe("MeshStore one-pass entry encoding", () => {
     const capped = new MeshStore(directory, Math.floor(before.length / 2), 100, { maxStateBytes: before.length });
     await expect(capped.put(request)).resolves.toBeDefined(); // same byte size, despite multibyte characters
     const canonical = fs.readFileSync(path.join(directory, "state.json"));
+    // The optional 85-byte chain head cannot turn a fitting canonical write into a rejection.
+    expect(JSON.parse(canonical.toString("utf8")).readJournalHash).toBeUndefined();
     const signal = fs.readFileSync(path.join(directory, "state.read-signal.json"));
     await expect(capped.put({ ...request, value: request.value + "雪" })).rejects.toThrow("Fabric mesh state exceeds");
     expect(fs.readFileSync(path.join(directory, "state.json"))).toEqual(canonical);

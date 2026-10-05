@@ -25,7 +25,9 @@ version/timestamp labels to conceal a legacy name/ownership edit.
 
 A strict readability check only shares a snapshot known to come from a valid canonical
 envelope. A tolerant dashboard parse of `{}`/damaged bytes cannot certify routing absence.
-Size budgets still apply before any shared or incremental snapshot is served.
+Size budgets still apply before any shared or incremental snapshot is served. Full parses
+validate both pre-read and post-read physical identities; a copied-marker replacement during
+a read cannot label the earlier payload with the replacement's metadata.
 
 ## Optional incremental journal
 
@@ -41,10 +43,15 @@ Readers replay from their existing snapshot, read only appended bytes after a su
 replay, and publish a new snapshot only when the final UUID, canonical hash and physical
 identity all match. Recomputed sidecar checksums alone cannot authorize a forged payload.
 Unchanged entry objects survive replay, keeping derived directory indexes inexpensive.
+Cursors advance only through the consumed UTF-8 prefix, not a later record appended after
+the reader captured its canonical endpoint. Changed entry encodings are reused by the
+canonical payload, namespace signal and journal, rather than traversing values again.
 
 History rotates atomically at 2 MiB; an individual record is capped at 256 KiB. Missing,
 stale, truncated, corrupt, oversized, disconnected or mismatched journals fall back to a
 canonical read. A failed sidecar append cannot fail a committed write or hide a commit.
+If the optional chain head would exceed the canonical byte budget, omit the head and
+record rather than rejecting an otherwise fitting write.
 Rotation or an older writer can break the chain; the next successful full read reestablishes
 the base. Older writers copying an existing UUID still invalidate the physical endpoint.
 

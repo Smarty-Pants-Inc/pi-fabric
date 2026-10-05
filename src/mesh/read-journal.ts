@@ -51,27 +51,31 @@ export const journalBase = (state: JournalState, file: string): JournalBase => (
   tombstoneOrder: JSON.stringify(state.tombstoneOrder),
 });
 
-interface PreparedStateJournal { hash: string; delta: Record<string, unknown> }
+interface PreparedStateJournal { hash: string; text: string }
 /** Prepare a hash chain before the canonical rename. Its hash is committed IN state.json's
  * bounded header, so a forged/self-checksummed sidecar cannot supply fresh authority. */
 export const prepareStateJournal = (state: JournalState, base: JournalBase | undefined,
-  changedKeys: readonly string[]): PreparedStateJournal | undefined => {
+  changedKeys: readonly string[], encodedEntries: ReadonlyMap<string, { entry: Buffer }>): PreparedStateJournal | undefined => {
   try {
     if (!base?.generation || !base.identity || !uuid(state.readGeneration)) return undefined;
-    const entries: Record<string, MeshStateEntry | null> = Object.create(null);
+    // Reuse the exact canonical entry bytes: neither chain hashing nor publication should
+    // traverse changed payloads again (including large batches and UTF-8/escaped keys).
+    const entries: Record<string, string> = Object.create(null);
     const versions: Record<string, number | null> = Object.create(null);
     for (const key of new Set(changedKeys)) {
-      entries[key] = own(state.entries, key) ? state.entries[key]! : null;
+      entries[key] = own(state.entries, key) ? encodedEntries.get(key)!.entry.toString("utf8") : "null";
       versions[key] = state.versions?.[key] ?? null;
     }
     for (const key of base.versionKeys) if (!own(state.versions ?? {}, key)) versions[key] = null;
     const { entries: _entries, versions: _versions, readGeneration: _generation, readJournalHash: _hash, tombstoneOrder, ...envelope } = state;
-    const delta = { format: 1, previous: base.generation, previousIdentity: base.identity, previousHash: base.hash ?? null,
-      generation: state.readGeneration, envelope, entries, versions,
-      ...(JSON.stringify(tombstoneOrder) === base.tombstoneOrder ? {} : { tombstoneOrder: tombstoneOrder ?? [] }) };
-    const text = JSON.stringify(delta);
+    const head = JSON.stringify({ format: 1, previous: base.generation, previousIdentity: base.identity, previousHash: base.hash ?? null,
+      generation: state.readGeneration, envelope });
+    const members = Object.keys(entries).map(key => `${JSON.stringify(key)}:${entries[key]}`).join(",");
+    const tombstones = JSON.stringify(tombstoneOrder);
+    const text = `${head.slice(0, -1)},"entries":{${members}},"versions":${JSON.stringify(versions)}` +
+      (tombstones === base.tombstoneOrder ? "" : `,"tombstoneOrder":${tombstones ?? "[]"}`) + "}";
     if (Buffer.byteLength(text) > MAX_RECORD_BYTES - 1024) return undefined;
-    return { hash: digest(text), delta };
+    return { hash: digest(text), text };
   } catch { return undefined; }
 };
 
@@ -82,8 +86,8 @@ export const appendStateJournal = (root: string, prepared: PreparedStateJournal 
     if (!prepared) return;
     const identity = stateReadIdentity(path.join(root, "state.json"));
     if (!identity) return;
-    const delta = { ...prepared.delta, identity, stamp };
-    const line = JSON.stringify({ checksum: digest(JSON.stringify(delta)), delta }) + "\n";
+    const delta = `${prepared.text.slice(0, -1)},"identity":${JSON.stringify(identity)},"stamp":${JSON.stringify(stamp)}}`;
+    const line = `{"checksum":"${digest(delta)}","delta":${delta}}\n`;
     if (Buffer.byteLength(line) > MAX_RECORD_BYTES) return;
     const file = journalPath(root);
     let size = 0;
@@ -112,8 +116,11 @@ export const replayStateJournal = (root: string, base: JournalState, generation:
     if (!text.endsWith("\n")) return undefined;
     let state = base, last: Record<string, unknown> | undefined;
     let previousIdentity = baseIdentity;
+    let consumed = 0;
     for (const line of text.slice(0, -1).split("\n")) {
-      if (Buffer.byteLength(line) > MAX_RECORD_BYTES) return undefined;
+      const bytes = Buffer.byteLength(line);
+      if (bytes > MAX_RECORD_BYTES) return undefined;
+      consumed += bytes + 1;
       const row: unknown = JSON.parse(line);
       if (!record(row) || !record(row.delta) || row.checksum !== digest(JSON.stringify(row.delta))) return undefined;
       const delta = row.delta;
@@ -155,7 +162,9 @@ export const replayStateJournal = (root: string, base: JournalState, generation:
     // The descriptor must still contain exactly the captured prefix (no in-place truncation).
     const after = fs.fstatSync(fd);
     if (after.ino !== stat.ino || after.size < stat.size) return undefined;
-    return { state, cursor: { inode, offset: stat.size } };
+    // The captured journal can include a later writer's record. Advance only through the
+    // endpoint actually replayed, so the next read cannot skip that unconsumed UTF-8 tail.
+    return { state, cursor: { inode, offset: offset + consumed } };
   } catch { return undefined; }
   finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ } }
 };

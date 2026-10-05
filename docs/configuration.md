@@ -9,6 +9,72 @@ Pi Fabric reads configuration from two JSON files. Project values override globa
 
 `configVersion` versions each configuration document. Fabric migrates each applicable file independently before it applies global/project precedence, then rewrites migrated files atomically. Version 0, the historical unversioned format, renames `subagents` to `agents`. Versions 2 and 3 rename legacy UI settings. Version 4 repairs `prewalk.enabled` string booleans emitted by the settings UI in affected builds. When both legacy and canonical sections exist, canonical values win conflicts and non-conflicting values survive. Fabric migrates trusted project files, and it never reads or rewrites untrusted project files. Add future schema changes as sequential migrations. Avoid runtime aliases.
 
+## Process task placement
+
+`agents.placement` is **host-only**: put it in the selected `PI_CODING_AGENT_DIR/fabric.json`, never a workspace override. Absent means unchanged local spawns. When configured, `default` is `"local"` unless explicitly `"remote"`. A remote Main task launches through `command` rather than the local worker; `needs?: string[]` on spawn/run routes unmet needs locally. `capabilities` defaults to `[]` and must describe guarantees on every target selected by the launcher.
+
+Ryzen 1 example (the existing fleet launcher, **not executed by the offline tests**):
+
+```json
+{
+  "agents": {
+    "placement": {
+      "default": "remote",
+      "command": [
+        "/home/paul/.local/bin/smarty-task-ryzen2",
+        "{id}",
+        "--host",
+        "auto",
+        "--minutes",
+        "{minutes}",
+        "--cwd",
+        "{cwd}",
+        "--model",
+        "{model}",
+        "--thinking",
+        "{thinking}",
+        "--",
+        "{task}"
+      ],
+      "capabilities": [],
+      "resultCommand": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "{host}-agent",
+        "python3 -c 'import json, pathlib, sys; p=pathlib.Path(\"/srv/scratch/paul/tasks/direct\")/sys.argv[1]; rc=p/\"rc\"; print(json.dumps({\"rc\":rc.read_text().strip(),\"text\":(p/\"result.md\").read_text(),\"stderr\":(p/\"stderr.log\").read_text() if (p/\"stderr.log\").exists() else \"\"} if rc.exists() else {\"rc\":None}))' {id}"
+      ],
+      "cancelCommand": [
+        "/home/paul/.local/bin/smarty-task-ryzen2",
+        "--host",
+        "{host}",
+        "--cancel",
+        "{id}"
+      ],
+      "pollIntervalMs": 1000,
+      "commandTimeoutMs": 30000
+    }
+  }
+}
+```
+
+This example uses the fleet's existing host aliases and normal SSH host-key verification, with only read-only result polling added. Verify the aliases and target-local cwd before enabling it. For a target without `python3`, use an equivalent host-owned reader that implements the JSON contract below. The hook itself does not call SSH implicitly or retrieve a remote file as if it were local. The launcher selects the host; its `RYZEN2_TASK_ACCEPTED <id> on <host> ...` line must match the Fabric run ID. `{host}` in polling/cancellation comes from that receipt, not from `auto`.
+
+All commands are **argv arrays**, passed to `execFile` without a shell. Template substitution occurs once; task quotes/newlines/metacharacters remain a single argument. Available placeholders are `{id}`, `{cwd}`, `{task}`, `{minutes}` (rounded up from the run timeout), `{model}`, `{thinking}`; after acceptance, `{host}` and `{resultDir}` (when configured) are available. `{host}`/`{resultDir}` cannot be used on the launch command. Model and effort must be included to preserve the caller's selection. The adapter exports the parent Fabric session as `PI_SESSION_ID` for the launcher's existing completion/inbox binding.
+
+Configure exactly one result source:
+
+- `resultDirectory`: an **absolute** local/shared directory template, such as `/srv/shared/tasks/{id}`. Poll `rc` first, then `result.md` and optional `stderr.log`. The fleet's default result directory is target-local, **not** automatically shared with Ryzen 1.
+- `resultCommand`: a bounded read-only argv template whose stdout is only JSON: `{"rc":null}` while pending, or `{"rc":0,"text":"full final result","stderr":"optional"}` after native execution exits. Integer/string exit receipts are supported. Nonzero rc maps to `failed`; 124 or a timeout string maps to `timed_out`. The reader must never emit terminal rc before the remote task/process tree is actually stopped. Poll failures are retried only until the task deadline; they do not relaunch the task.
+
+`cancelCommand` is required and requests cancellation; a successful command alone does not prove exit. The adapter waits up to `min(commandTimeoutMs, 5000)` for the final receipt. Missing receipt retains exit debt and files/admission, and reports the stop/timeout with a warning instead of inventing successful cleanup. Launch errors or mismatched acceptance retain conservative custody (except a missing executable, which is known unlaunched). Remote launches are never automatically retried or replaced by a local spawn.
+
+`pollIntervalMs` defaults to 1000 (range 10–60000). `commandTimeoutMs` defaults to 30000 (range 100–120000). No polling starts during registration or idle lifecycle hooks; the adapter is a stable lazy entry loaded at actual first remote use. The manager owns polling/cancellation, with no extra detached watcher in Fabric. The fleet launcher still has its own existing inbox watcher; this does not replace Fabric's wait result.
+
+One-shot placement supports ordinary Main Pi tasks (up to 240 minutes, launcher-supported effort low/medium/high/xhigh/max). Actor/nested/durable/inherited/routed runs, non-Pi or Python kernels, recursive/worktree requests, custom tools/schema/images/system prompt, extensions disabled, per-run niceness, and active token/cost ceilings remain local rather than dropping required semantics. Those decisions append `placement.local` with their reason to the run event log. Remote runs do not preserve streaming, controls, telemetry/usage/cost, local transcript export/recovery, host instruction/permission/tool profile parity, native session identity or return-address/mesh bridge features. See [agents](agents.md#opt-in-process-task-placement).
+
 ## Execution kernels
 
 `executor.kernel` selects the exclusive language for every `fabric_exec` call: `"typescript"` (default) or `"python"`. There is no per-call kernel selector or automatic language switching. Selecting Python is explicit opt-in; no additional enabled flag is required. `executor.pythonRuntime` defaults to `"monty"`, a sandboxed Python subset with VM-enforced resource limits and no ambient OS access. Monty is not CPython and cannot import arbitrary libraries; use the host bridge for I/O. Missing or invalid backend values choose Monty, and missing native Monty dependencies fail loudly without falling back. Set `executor.pythonRuntime: "cpython"` explicitly for the trusted native escape hatch, analogous to TypeScript's Node/Bun backends. `executor.cpython.binary` defaults to `"python3"` and accepts a CPython **3.10+** executable name or path, not shell arguments. Invalid kernel values fall back to TypeScript; absent, blank, or non-string binaries fall back to `python3`.

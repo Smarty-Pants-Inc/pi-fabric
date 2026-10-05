@@ -28,6 +28,23 @@ Fabric injections carry structured [turn provenance](turn-provenance.md) on capa
 
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. In an interactive Main (TUI or RPC; not a task agent, actor, or print/JSON run), the bound is 60 seconds and reaching it is not an error: the wait returns the child's live status record (`status: "running"`) with `waitTimedOut: true`, so Main is back at a tool boundary where held followUps land (smarty-dev#2119). Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
+### Opt-in process task placement
+
+A Main can route ordinary `transport: "process"` Pi task agents through a host-configured external launcher. Unconfigured hosts remain local. See [process placement configuration](configuration.md#process-task-placement) for the `smarty-task-ryzen2 --host auto` example and polling contract.
+
+Declare locality requirements explicitly, for example:
+
+```ts
+const handle = await agents.spawn({ task: "Inspect the private corpus", transport: "process", needs: ["corpus"] });
+const result = await agents.wait({ id: handle.id });
+```
+
+Any need absent from the configured target's guaranteed capabilities keeps the task local. Do not claim capabilities that `--host auto` cannot guarantee on **every** candidate host. Each configured local fallback appends one `placement.local` JSON line with its reason to the run's existing `events.jsonl`; remote launches append `placement.remote` and their terminal `placement.result`. Actor activations, routed/inherited sessions, recursive or durable runs, non-Pi runners, and unsupported worker features stay local. This is the Main task path, not actor-pass offload.
+
+Remote handles still use `agents.status`, `wait`, `run`, and `stop`. `wait` bounds still detach observations without cancelling the task. A terminal native `rc` receipt—not a partial `result.md`—settles the run. Launcher failures never cause local fallback or automatic relaunch. Ambiguous launch/exit outcomes retain execution custody and local run files. The configured cancellation command requests stop; only the terminal receipt confirms exit.
+
+One-shot placement does **not** stream text/tools, report token usage/cost, mirror native transcripts, implement local worker recovery, or provide steering/follow-up/compaction. Those controls reject explicitly. Model/effort are requested through argv, not independently attested on the remote host. The remote host's own Pi profile and launcher govern permissions, instructions, extension/tool availability, and temporary-directory policy. Keep needs accurate; this hook does not ship a workspace or grant target access.
+
 ### Background completion inbox
 
 `agents.spawn` validates the request and returns a handle. With a free concurrency slot, Fabric launches the worker and returns a `running` handle. When every slot is occupied, it returns a `queued` handle without waiting for admission. `agents.list` and `agents.status` show queued runs with a one-based `queuePosition`. Fabric admits them in FIFO order as running children finish. Queued spawns count against `maxPerExecution` and the calling program's `agentBudget`; cancelling one does not refund that count.

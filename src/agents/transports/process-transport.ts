@@ -12,6 +12,7 @@ import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
 import { findExecutable, spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
+import type { AgentPlacementConfig } from "../placement-config.js";
 
 const regularFile = (file: string): boolean => {
   try { return fs.statSync(file).isFile(); } catch { return false; }
@@ -49,7 +50,7 @@ export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
   #scopeWarningLogged = false;
 
-  constructor(private readonly processSlice?: string) {}
+  constructor(private readonly processSlice?: string, private readonly placement?: AgentPlacementConfig) {}
 
   #warnScope = (reason: string): void => {
     if (this.#scopeWarningLogged) return;
@@ -62,6 +63,20 @@ export class ProcessTransport implements AgentTransportAdapter {
   }
 
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
+    if (this.placement) {
+      const unmet = (request.needs ?? []).filter(need => !this.placement!.capabilities.includes(need));
+      const reason = this.placement.default === "local" ? "placement default is local"
+        : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
+      if (!reason) {
+        const { launchPlacedTask } = await import("./placement.js");
+        return launchPlacedTask(request, this.placement);
+      }
+      const args = new Map<string, string>();
+      for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
+      const log = args.get("--log-file");
+      if (!log) throw new Error("Placement audit requires a run event log");
+      fs.appendFileSync(log, JSON.stringify({ type: "placement.local", ts: Date.now(), id: request.id, reason, needs: request.needs ?? [] }) + "\n", { mode: 0o600 });
+    }
     const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
     if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const selected = selectWorkerRelease(request.workerPath);

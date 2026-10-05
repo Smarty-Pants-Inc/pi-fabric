@@ -1388,7 +1388,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const participant = entry && participantFromEntry(entry);
       return participant && isLocal(participant, this.options.hostId) ? participant : undefined;
     };
-    const stateEntries = this.mesh.listAll(PARTICIPANT_PREFIX, read);
+    // Read-only preparation from the pinned snapshot: cloning every retained actor payload
+    // on each idle heartbeat adds fleet-sized allocations and GC work (#2039). Mutations
+    // below still use CAS and fresh locked checks; no shared entry is modified here.
+    const stateEntries = this.mesh.listAllShared(PARTICIPANT_PREFIX, read);
     const stateByKey = new Map(stateEntries.map((entry) => [entry.key, entry]));
     const fileEntries = readParticipantFiles(this.mesh.root);
     const filesByKey = new Map(fileEntries.map((entry) => [entry.key, entry]));
@@ -1399,7 +1402,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const existingById = new Map(existing.map((item) => [item.participant.id, item]));
     const legacyRoots = new Map(
       this.mesh
-        .listAll(LEGACY_SESSION_PREFIX, read)
+        .listAllShared(LEGACY_SESSION_PREFIX, read)
         .flatMap((entry) => {
           const root = legacyRootFromEntry(entry, this.options.rootId, now, this.mesh.root);
           return root ? [[root.id, root] as const] : [];
@@ -1407,7 +1410,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     );
     const legacyActorOwners = new Map(
       this.mesh
-        .listAll(LEGACY_ACTOR_PREFIX, read)
+        .listAllShared(LEGACY_ACTOR_PREFIX, read)
         .flatMap((entry) => {
           const actor = legacyActorFromEntry(entry, legacyRoots);
           return actor ? [[actor.id, actor.ownerIdentityId] as const] : [];

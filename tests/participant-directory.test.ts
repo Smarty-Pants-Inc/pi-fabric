@@ -1907,6 +1907,35 @@ describe("ParticipantDirectory reads", () => {
   const identity: MeshIdentity = { id: "session:reader", name: "main", kind: "main", sessionId: "reader" };
   const writer: MeshIdentity = { id: "session:writer", name: "main", kind: "main", sessionId: "writer" };
 
+  it("prepares idle heartbeats from shared pinned entries without cloning retained actor payloads (#2039)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-heartbeat-shared-"));
+    roots.push(root);
+    const reader = createDirectory(path.join(root, "mesh"), identity, identity.id, () => [],
+      { heartbeatMs: 60_000, leaseMs: 120_000 });
+    const actorKey = "actors/foreign/actor";
+    await reader.mesh.put({ key: actorKey, value: { id: "actor", instructions: "x".repeat(30_000) }, identity: writer });
+    const cloned = vi.spyOn(reader.mesh, "listAll");
+    const original = reader.mesh.listAllShared.bind(reader.mesh);
+    const shared = vi.spyOn(reader.mesh, "listAllShared").mockImplementation((prefix, options) => {
+      const entries = original(prefix, options);
+      for (const entry of entries) {
+        if (typeof entry.value === "object" && entry.value !== null) Object.freeze(entry.value);
+        Object.freeze(entry);
+      }
+      return entries;
+    });
+    await reader.start();
+    const prefixes = ["topology/participants/", "sessions/", "actors/"];
+    const preparation = shared.mock.calls.filter(([prefix, options]) => prefixes.includes(prefix!) && options?.snapshot);
+    expect(preparation.map(([prefix]) => prefix)).toEqual(prefixes);
+    expect(new Set(preparation.map(([, options]) => options!.snapshot)).size).toBe(1);
+    // Compatibility liveness probes still scan sessions/participants separately; the large
+    // retained actor payloads must never be copied by this heartbeat preparation.
+    expect(cloned.mock.calls.filter(([prefix]) => prefix === "actors/")).toEqual([]);
+    expect(reader.mesh.get(actorKey, { fresh: true })?.value).toEqual({ id: "actor", instructions: "x".repeat(30_000) });
+    cloned.mockRestore(); shared.mockRestore();
+  });
+
   it("reuse one parse while the state is unchanged, and see a write at once", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
     roots.push(root);

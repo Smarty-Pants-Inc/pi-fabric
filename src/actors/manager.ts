@@ -348,6 +348,8 @@ export class ActorRegistryOwnershipError extends Error {
 
 /** A mesh write is normally bounded at 10s; give each actor setup await its own 30s ceiling. */
 export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
+/** Windows metadata work yields after each actor; other platforms retain bounded batches. */
+export const ACTOR_RETENTION_BATCH_SIZE = { win32: 1, other: 8 } as const;
 /** Three preparation requeues, independent of the owner-restoration/drop budget. */
 const ACTOR_PREPARATION_MAX_RETRIES = 3;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
@@ -3493,7 +3495,7 @@ export class ActorManager {
     // NTFS metadata/deletion can make eight actors (72 expired runs in the
     // startup fixture) monopolize a turn. Keep each run's work unchanged,
     // but re-enter the publication/ownership fences between Windows actors.
-    const batchSize = process.platform === "win32" ? 1 : 8;
+    const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
     for (let offset = 0; offset < actors.length; offset += batchSize) {
       if (this.#closing || this.#canConsumeMesh?.() === false) return;
       this.#withOwnershipRead(() => {

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorManager } from "../src/actors/manager.js";
+import { ACTOR_RETENTION_BATCH_SIZE, ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -214,6 +214,9 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
 
   it.each(["restore", "admission"] as const)("rejects expired context in a later batch before maintenance, but protects a fresh active snapshot (%s)", async (phase) => {
     const f = fixture(17), actor = f.records[16]!;
+    const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
+    // One initial yield, then one turn per batch, including the final completion yield.
+    const maintenanceTurns = Math.ceil(f.records.length / batchSize) + 1;
     new ActorRegistryStore(f.actorRoot).write(f.records.map((record) => ({ ...record, status: "idle" })));
     const sessionFile = path.join(f.actorRoot, actor.id, "session.jsonl");
     const store = new ActorChildCompletionStore(sessionFile);
@@ -250,10 +253,10 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       expect(tasks[0]).toContain(JSON.stringify(store.resultFile(fresh)).slice(1, -1));
       expect(fs.existsSync(store.resultFile(expired))).toBe(true); // No sweep yet.
       for (const suffix of [".result.json", ".receipt"]) fs.utimesSync(path.join(store.directory, fresh + suffix), old, old);
-      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(maintenanceTurns);
       expect(fs.existsSync(store.resultFile(expired))).toBe(false);
       expect(fs.existsSync(store.resultFile(fresh))).toBe(true); // Already-active context is fenced.
-    } finally { release(); await vi.advanceTimersByTimeAsync(10); vi.useRealTimers(); }
+    } finally { release(); await vi.advanceTimersByTimeAsync(maintenanceTurns); vi.useRealTimers(); }
   });
 
   it.each(["resumeQueued", "resumeAfterRelease", "poll"] as const)("retries deferred startup retention after publication through %s", async boundary => {

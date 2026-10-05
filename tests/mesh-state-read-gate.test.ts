@@ -19,22 +19,28 @@ const fixture = async (options: ConstructorParameters<typeof MeshStore>[3] = {})
   const disk = () => JSON.parse(fs.readFileSync(file, "utf8"));
   reader.stateToken();
   const reads = vi.spyOn(fs, "readFileSync");
-  const count = () => reads.mock.calls.filter(([target]) => String(target) === file).length;
-  return { root, writer, reader, file, journal, disk, count };
+  // Count full canonical parses, not Windows byte-hash observations.
+  const count = () => reads.mock.calls.filter(([target, encoding]) => String(target) === file && encoding === "utf8").length;
+  const byteReads = () => reads.mock.calls.filter(([target]) => String(target) === file).length;
+  return { root, writer, reader, file, journal, disk, count, byteReads };
 };
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 describe("process-wide physical state read gate (#4383)", () => {
-  it("fresh readers share one parsed snapshot and never reopen an unchanged canonical file", async () => {
-    const f = await fixture(), token = f.reader.stateToken({ fresh: true });
-    const others = [new MeshStore(f.root, 256 * 1024, 1000), new MeshStore(path.join(f.root, "."), 256 * 1024, 1000)];
-    const opens = vi.spyOn(fs, "openSync");
-    for (let poll = 0; poll < 100; poll++) for (const reader of [f.reader, ...others]) {
-      expect(reader.stateToken({ fresh: true })).toBe(token);
-      expect(reader.get("field/heartbeat/writer", { fresh: true })?.value).toBe(0);
-      expect(reader.listAll("field/", { fresh: true })).toHaveLength(1);
-    }
-    expect(f.count()).toBe(0);
-    expect(opens.mock.calls.filter(([target]) => String(target) === f.file).length).toBeLessThanOrEqual(2);
+  it.each(["native", "win32"])("fresh readers share one parsed snapshot and never reopen an unchanged canonical file (%s)", async mode => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    if (mode === "win32") Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      const f = await fixture(), token = f.reader.stateToken({ fresh: true });
+      const others = [new MeshStore(f.root, 256 * 1024, 1000), new MeshStore(path.join(f.root, "."), 256 * 1024, 1000)];
+      const opens = vi.spyOn(fs, "openSync");
+      for (let poll = 0; poll < 100; poll++) for (const reader of [f.reader, ...others]) {
+        expect(reader.stateToken({ fresh: true })).toBe(token);
+        expect(reader.get("field/heartbeat/writer", { fresh: true })?.value).toBe(0);
+        expect(reader.listAll("field/", { fresh: true })).toHaveLength(1);
+      }
+      expect(f.count()).toBe(0); expect(f.byteReads()).toBe(0);
+      expect(opens.mock.calls.filter(([target]) => String(target) === f.file).length).toBeLessThanOrEqual(2);
+    } finally { Object.defineProperty(process, "platform", platform); }
   });
   it("fresh lists override explicit snapshots; ordinary hits do not slide the idle window", async () => {
     vi.useFakeTimers({ now: 1000000 });
@@ -146,6 +152,16 @@ describe("process-wide physical state read gate (#4383)", () => {
     await f.writer.writeBatch({ identity, ops: [{ kind: "delete", key: "field/missing/a" }] });
     await f.writer.confirmWritable();
     expect(f.disk().readGeneration).toBe(generation); // No state writes occurred.
+  });
+  it("win32 identity hashing honors the read budget before opening payload bytes", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      const f = await fixture();
+      expect(stateReadIdentity(f.file, 1)).toBeUndefined();
+      expect(() => assertMeshStateReadable(f.root, 1)).toThrow("state exceeds 1 bytes");
+      expect(f.byteReads()).toBe(0);
+    } finally { Object.defineProperty(process, "platform", platform); }
   });
   it("confirmWritable revalidates without discarding unchanged bytes", async () => {
     const f = await fixture(), token = f.reader.stateToken(); await f.reader.confirmWritable();
@@ -333,25 +349,113 @@ describe("incremental state read journal", () => {
     expect(f.reader.get("field/heartbeat/writer", { fresh: true })?.value).toBe(1);
     expect(f.count()).toBe(before + 1);
   });
-  it.each(["short-read", "eio", "replacement"])("falls back when canonical payload verification encounters %s", async failure => {
-    const f = await fixture(); await f.writer.put({ key: "field/bulk/utf8", value: "雪😀".repeat(15000), identity });
-    const state = f.disk(), read = fs.readSync.bind(fs), before = f.count();
-    let injected = false;
-    vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: Buffer, offset: number, length: number, position: number) => {
-      if (!injected && length === 64 * 1024 && fs.fstatSync(fd).ino === fs.statSync(f.file).ino) {
-        injected = true;
-        if (failure === "short-read") return 0;
-        if (failure === "eio") throw Object.assign(new Error("verification EIO"), { code: "EIO" });
+  it.each(["native", "win32"].flatMap(platform => ["short-read", "eio", "replacement"].map(failure => ({ platform, failure }))))(
+    "falls back when canonical payload verification encounters $failure ($platform)", async ({ platform: mode, failure }) => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    if (mode === "win32") Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      const f = await fixture(); await f.writer.put({ key: "field/bulk/utf8", value: "雪😀".repeat(15000), identity });
+      const state = f.disk(), read = fs.readSync.bind(fs), before = f.count();
+      let injected = false;
+      const replace = () => {
         state.entries["field/heartbeat/writer"].value = "replacement";
         state.entries["field/heartbeat/writer"].updatedBy.id = "session:new-owner";
         writeFileAtomic(f.file, JSON.stringify(state));
+        expect(JSON.parse(readFile(f.file, "utf8")).entries["field/heartbeat/writer"].value).toBe("replacement");
+      };
+      if (process.platform === "win32") {
+        vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+          const bytes = (readFile as (...args: unknown[]) => unknown)(target, ...args);
+          // No-options Buffer read is verification, not identity hashing or JSON parsing.
+          if (!injected && String(target) === f.file && args.length === 0) {
+            injected = true;
+            if (failure === "short-read") return (bytes as Buffer).subarray(0, 100);
+            if (failure === "eio") throw Object.assign(new Error("verification EIO"), { code: "EIO" });
+            replace(); // The path read has closed its handle; replacement must succeed.
+          }
+          return bytes;
+        }) as typeof fs.readFileSync);
+      } else {
+        vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: Buffer, offset: number, length: number, position: number) => {
+          if (!injected && length === 64 * 1024 && fs.fstatSync(fd).ino === fs.statSync(f.file).ino) {
+            injected = true;
+            if (failure === "short-read") return 0;
+            if (failure === "eio") throw Object.assign(new Error("verification EIO"), { code: "EIO" });
+            replace();
+          }
+          return read(fd, buffer, offset, length, position);
+        }) as typeof fs.readSync);
       }
-      return read(fd, buffer, offset, length, position);
-    }) as typeof fs.readSync);
-    expect(f.reader.get("field/heartbeat/writer", { fresh: true })).toMatchObject(failure === "replacement"
-      ? { value: "replacement", updatedBy: { id: "session:new-owner" } } : { value: 0, updatedBy: { id: identity.id } });
-    expect(injected).toBe(true); expect(f.count()).toBeGreaterThan(before);
-    assertMeshStateReadable(f.root);
+      expect(f.reader.get("field/heartbeat/writer", { fresh: true })).toMatchObject(failure === "replacement"
+        ? { value: "replacement", updatedBy: { id: "session:new-owner" } } : { value: 0, updatedBy: { id: identity.id } });
+      expect(injected).toBe(true); expect(f.count()).toBeGreaterThan(before);
+      assertMeshStateReadable(f.root);
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+  it.each(["rename", "delete-create"])("win32 fallback reopens a successful %s replacement with repeated timestamps and size", async replacement => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      const f = await fixture();
+      await f.writer.put({ key: "field/bulk/utf8", value: "雪😀".repeat(15000), identity });
+      const state = f.disk(), before = f.count(), frozen = fs.statSync(f.file, { bigint: true });
+      const frozenStat = fs.statSync(f.file), stat = fs.statSync.bind(fs);
+      // An adapter with no usable file id and coarse, repeated timestamps must
+      // distinguish equal-sized content by hash, not certify stale ownership.
+      vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, ...args: unknown[]) =>
+        String(target) === f.file
+          ? (args[0] as { bigint?: boolean } | undefined)?.bigint ? { ...frozen, ino: 0n } : frozenStat
+          : (stat as (...args: unknown[]) => unknown)(target, ...args)) as typeof fs.statSync);
+      const oldIdentity = stateReadIdentity(f.file);
+      let injected = false;
+      const replace = () => {
+        injected = true;
+        state.entries["field/heartbeat/writer"].value = 9;
+        state.entries["field/heartbeat/writer"].updatedBy.id = "session:newone";
+        const text = JSON.stringify(state);
+        expect(BigInt(Buffer.byteLength(text))).toBe(frozen.size);
+        if (replacement === "rename") writeFileAtomic(f.file, text);
+        else { fs.unlinkSync(f.file); fs.writeFileSync(f.file, text); }
+        expect(JSON.parse(readFile(f.file, "utf8")).entries["field/heartbeat/writer"].value).toBe(9);
+      };
+      const descriptors = new Set<number>();
+      const open = fs.openSync.bind(fs), close = fs.closeSync.bind(fs), fstat = fs.fstatSync.bind(fs), read = fs.readSync.bind(fs);
+      const opens = vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...args: unknown[]) => {
+        const fd = (open as (...args: unknown[]) => number)(target, ...args);
+        if (String(target) === f.file) descriptors.add(fd);
+        return fd;
+      }) as typeof fs.openSync);
+      vi.spyOn(fs, "closeSync").mockImplementation(fd => { descriptors.delete(fd); close(fd); });
+      vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...args: unknown[]) =>
+        descriptors.has(fd) && (args[0] as { bigint?: boolean } | undefined)?.bigint
+          ? { ...frozen, ino: 0n } : (fstat as (...args: unknown[]) => unknown)(fd, ...args)) as typeof fs.fstatSync);
+      // Also intercept the old streaming verifier: the red baseline must observe
+      // an actual successful replacement, not merely miss the new path-read hook.
+      vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: Buffer, offset: number, length: number, position: number) => {
+        if (!injected && descriptors.has(fd) && length === 64 * 1024) replace();
+        return read(fd, buffer, offset, length, position);
+      }) as typeof fs.readSync);
+      vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+        const bytes = (readFile as (...args: unknown[]) => unknown)(target, ...args);
+        if (!injected && String(target) === f.file && args.length === 0) replace();
+        return bytes;
+      }) as typeof fs.readFileSync);
+      // Rebind the terminal physical endpoint to the adapter's identity. Its
+      // chain-bound payload hash is still the committed, older canonical hash.
+      const rows = fs.readFileSync(f.journal, "utf8").trimEnd().split("\n").map(line => JSON.parse(line));
+      const terminal = rows[rows.length - 1];
+      terminal.delta.identity = oldIdentity;
+      terminal.checksum = createHash("sha256").update(JSON.stringify(terminal.delta)).digest("hex");
+      fs.writeFileSync(f.journal, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+      const current = f.reader.get("field/heartbeat/writer", { fresh: true });
+      expect(injected).toBe(true);
+      expect(current).toMatchObject({ value: 9, updatedBy: { id: "session:newone" } });
+      expect(stateReadIdentity(f.file)).not.toBe(oldIdentity);
+      expect(f.count()).toBeGreaterThan(before);
+      expect(opens.mock.calls.some(([target]) => String(target) === f.file)).toBe(true); // Header only, never retained.
+      assertMeshStateReadable(f.root);
+      expect(f.reader.get("field/heartbeat/writer", { fresh: true })?.value).toBe(9);
+    } finally { Object.defineProperty(process, "platform", platform); }
   });
   it("an already advanced canonical endpoint cannot verify historical journal bytes", async () => {
     const f = await fixture(), base = f.disk(), baseIdentity = stateReadIdentity(f.file);

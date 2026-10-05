@@ -412,12 +412,12 @@ const statStamp = (filePath: string): string | undefined => {
  */
 export const assertMeshStateReadable = (root: string, maxBytes = DEFAULT_MAX_STATE_BYTES): void => {
   const file = path.resolve(root, "state.json");
-  const identity = stateReadIdentity(file);
+  const identity = stateReadIdentity(file, maxBytes);
   const shared = processReadSnapshots.get(file)?.deref();
   if (identity !== undefined && shared?.identity === identity && shared.canonicalReadable && shared.size <= maxBytes) return;
   let readable = false;
   const state = readState(file, maxBytes, false, () => { readable = true; });
-  if (identity !== undefined && stateReadIdentity(file) === identity) {
+  if (identity !== undefined && stateReadIdentity(file, maxBytes) === identity) {
     const stat = fs.statSync(file);
     rememberReadSnapshot(file, { device: stat.dev, inode: stat.ino, size: stat.size, modifiedAt: stat.mtimeMs,
       stamp: stampOf(stat), parsedAt: Date.now(), state, generation: generationOf(state), identity,
@@ -1503,7 +1503,7 @@ export class MeshStore {
   // The current signal's index: its bounded header every call, the full body only when the
   // generation differs from the memoized one (once per commit, across all namespaces).
   #readSignalIndex(): { generation: string; stamp: string; namespaces: Record<string, unknown> } | undefined {
-    const identity = stateReadIdentity(this.#signalPath);
+    const identity = stateReadIdentity(this.#signalPath, MAX_SIGNAL_BYTES);
     if (identity !== undefined && this.#signalIdentity === identity && this.#signalIndex) return this.#signalIndex;
     let descriptor: number | undefined;
     try {
@@ -1521,7 +1521,7 @@ export class MeshStore {
         signal?.generation !== generation || typeof signal.stamp !== "string" ||
         typeof namespaces !== "object" || namespaces === null || Array.isArray(namespaces)
       ) return undefined;
-      if (identity !== undefined && stateReadIdentity(this.#signalPath) === identity) this.#signalIdentity = identity;
+      if (identity !== undefined && stateReadIdentity(this.#signalPath, MAX_SIGNAL_BYTES) === identity) this.#signalIdentity = identity;
       return this.#signalIndex = { generation, stamp: signal.stamp, namespaces: namespaces as Record<string, unknown> };
     } catch {
       return undefined;
@@ -1533,7 +1533,7 @@ export class MeshStore {
   // Canonical commit UUID and optional journal hash: one bounded header per physical generation.
   // undefined: a legacy file without a marker; false: unreadable, which never matches a label.
   #canonicalGeneration(): string | undefined | false {
-    const identity = stateReadIdentity(this.#statePath);
+    const identity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
     if (identity !== undefined && this.#canonicalHeader?.identity === identity) return this.#canonicalHeader.generation;
     let descriptor: number | undefined;
     try {
@@ -1543,7 +1543,7 @@ export class MeshStore {
       const header = buffer.toString("latin1", 0, read);
       const generation = STATE_HEADER.exec(header)?.[1];
       const journalHash = /^\{"readGeneration":"[0-9a-f-]{36}","readJournalHash":"([0-9a-f]{64})"/.exec(header)?.[1];
-      if (identity !== undefined && stateReadIdentity(this.#statePath) === identity) this.#canonicalHeader = { identity, generation, journalHash };
+      if (identity !== undefined && stateReadIdentity(this.#statePath, this.#maxStateBytes) === identity) this.#canonicalHeader = { identity, generation, journalHash };
       return generation;
     } catch {
       return false;
@@ -1899,7 +1899,7 @@ export class MeshStore {
       const observed = fs.statSync(this.#statePath);
       if (observed.size > this.#maxStateBytes) throw new Error(`Failed to read Fabric mesh state: state exceeds ${this.#maxStateBytes} bytes`);
       before = stampOf(observed);
-      const identity = beforeIdentity = stateReadIdentity(this.#statePath);
+      const identity = beforeIdentity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
       const generation = this.#canonicalGeneration();
       const cached = this.#stateCache;
       // Nanosecond ctime/inode also detect an older writer that copies the UUID or writes
@@ -1927,7 +1927,7 @@ export class MeshStore {
       if (base && identity !== undefined && typeof generation === "string") {
         const replay = replayStateJournal(this.root, base.state, generation, identity, before, base.identity,
           this.#canonicalHeader?.generation === generation ? this.#canonicalHeader.journalHash : undefined, base.journalCursor);
-        if (replay && stateReadIdentity(this.#statePath) === identity && this.#canonicalGeneration() === generation &&
+        if (replay && stateReadIdentity(this.#statePath, this.#maxStateBytes) === identity && this.#canonicalGeneration() === generation &&
           this.#cacheState(replay.state, before, true, identity)) {
           this.#stateCache!.journalCursor = replay.cursor;
           rememberReadSnapshot(path.resolve(this.#statePath), this.#stateCache!);
@@ -1939,6 +1939,12 @@ export class MeshStore {
       if (errorCode(error) === "ENOENT") return emptyState();
       throw error;
     }
+    // Replay failure must not reuse its descriptor, header or pre-verification path
+    // identity. Windows may have replaced the canonical name while the verifier
+    // consumed the old bytes. readState always opens by path on every retry.
+    this.#canonicalHeader = undefined;
+    before = statStamp(this.#statePath) ?? before;
+    beforeIdentity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
     // A payload is cached only under the stamp seen both before and after its read: a commit
     // landing during the parse must not label the older payload with the newer file's stamp.
     // The label is the parsed payload's own canonical readGeneration, never a separately observed
@@ -1956,7 +1962,7 @@ export class MeshStore {
         return state;
       }
       before = next;
-      beforeIdentity = stateReadIdentity(this.#statePath);
+      beforeIdentity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
     }
   }
 
@@ -1966,7 +1972,7 @@ export class MeshStore {
     try {
       const stat = fs.statSync(this.#statePath);
       if (expectedStamp !== undefined && stampOf(stat) !== expectedStamp) return false;
-      const identity = stateReadIdentity(this.#statePath);
+      const identity = stateReadIdentity(this.#statePath, this.#maxStateBytes);
       // Pin both physical endpoints: a same-marker replacement during a full parse must
       // never label older bytes with the replacement's identity, even when the stat repeats.
       if (expectedIdentity !== undefined && identity !== expectedIdentity) return false;

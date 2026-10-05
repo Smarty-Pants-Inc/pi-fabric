@@ -29,18 +29,41 @@ const journalPath = (root: string): string => path.join(root, "state.read-journa
 const digest = (text: string | Buffer): string => createHash("sha256").update(text).digest("hex");
 const identityOf = (stat: fs.BigIntStats): string | undefined =>
   typeof stat.mtimeNs === "bigint" && typeof stat.ctimeNs === "bigint"
-    ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` : undefined;
+    ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.birthtimeNs}` : undefined;
 const uuid = (value: unknown): value is string => typeof value === "string" &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
 const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const own = (object: object, key: string): boolean => Object.hasOwn(object, key);
 
+// Windows replacement changes the file id/creation time, not necessarily its rounded
+// mtime or size. Bind that physical key to actual bytes too. Memoize only when the
+// adapter supplies a usable file id and change time; otherwise hash each observation.
+const windowsIdentities = new Map<string, { physical: string; identity: string }>();
 /** Nanosecond metadata includes rename/in-place identity, not just lossy mtime milliseconds.
  * If the filesystem/adapter cannot supply it, keep the conservative header/payload fallback. */
-export const stateReadIdentity = (file: string): string | undefined => {
+export const stateReadIdentity = (file: string, maxBytes = Number.POSITIVE_INFINITY): string | undefined => {
   try {
-    return identityOf(fs.statSync(file, { bigint: true }));
+    const stat = fs.statSync(file, { bigint: true });
+    if (stat.size > maxBytes) return undefined; // Do not hash past a caller's read budget.
+    const physical = identityOf(stat);
+    if (physical === undefined || process.platform !== "win32") return physical;
+    const key = path.resolve(file);
+    const reusable = stat.ino > 0n && stat.ctimeNs > 0n && stat.birthtimeNs > 0n;
+    const cached = reusable ? windowsIdentities.get(key) : undefined;
+    if (cached?.physical === physical) return cached.identity;
+    // A path read owns and closes its own handle. Never retain a descriptor across
+    // observations: a replaced path can name a different file on Windows.
+    const bytes = fs.readFileSync(file, { flag: "r" });
+    if (BigInt(bytes.length) !== stat.size || identityOf(fs.statSync(file, { bigint: true })) !== physical) return undefined;
+    const identity = `${physical}:${digest(bytes)}`;
+    if (reusable) {
+      if (windowsIdentities.size >= 64 && !windowsIdentities.has(key)) {
+        windowsIdentities.delete(windowsIdentities.keys().next().value!);
+      }
+      windowsIdentities.set(key, { physical, identity });
+    }
+    return identity;
   } catch { return undefined; }
 };
 
@@ -55,14 +78,28 @@ export const journalBase = (state: JournalState, file: string): JournalBase => (
 /** Verify the hash committed in the delta body against canonical bytes, NOT the sidecar's
  * self-checksum. Only the second-field readJournalHash is excluded to avoid self-reference;
  * every other byte (including UUID, envelope, entries, ordering and UTF-8) is covered.
- * Read once per changed physical generation, in bounded chunks without parsing/traversal.
- * Descriptor and path identities must stay pinned; races/failures only disable acceleration. */
+ * Read once per changed physical generation without parsing/traversal. POSIX streams
+ * bounded chunks; Windows closes a path read before validating the captured bytes.
+ * Descriptor/path identities stay pinned; races/failures only disable acceleration. */
 const verifyCanonicalPayload = (root: string, generation: string, chainHash: string,
   identity: string, expected: unknown): boolean => {
   if (typeof expected !== "string" || !/^[0-9a-f]{64}$/.test(expected)) return false;
   const file = path.join(root, "state.json");
   let fd: number | undefined;
   try {
+    if (process.platform === "win32") {
+      // Holding a target handle while verifying can prevent an atomic replacement.
+      // Read by path, close the handle, then validate/hash the captured bytes. The
+      // post-read identity rejects a successful replacement; fallback opens the
+      // canonical path anew after this function has released every handle.
+      if (stateReadIdentity(file) !== identity) return false;
+      const bytes = fs.readFileSync(file);
+      const generationField = `{"readGeneration":"${generation}"`;
+      const prefix = Buffer.from(`${generationField},"readJournalHash":"${chainHash}"`);
+      return bytes.subarray(0, prefix.length).equals(prefix) &&
+        createHash("sha256").update(generationField).update(bytes.subarray(prefix.length)).digest("hex") === expected &&
+        stateReadIdentity(file) === identity;
+    }
     fd = fs.openSync(file, "r");
     const stat = fs.fstatSync(fd, { bigint: true });
     if (identityOf(stat) !== identity || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) return false;

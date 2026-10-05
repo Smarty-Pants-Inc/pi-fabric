@@ -150,26 +150,31 @@ export class ResidentRequestRetention {
         // The targeted manager callback above independently checks handle custody.
         if (entry.isDirectory() && !liveIds.has(entry.name) &&
             !retainedRuns.has("*") && !retainedRuns.has(entry.name)) {
-          // One complete safety-check + atomic replacement is the progress unit.
-          // The poll's budget is soft at this boundary, like a synchronous file
-          // read: stop BETWEEN runs, not midway through every retry of a large
-          // tree. Never cache worker-exit proofs or skip either fresh safety walk.
-          if (!boundedRunTree(file, expired)) { if (expired()) { defer(); return; } continue; }
+          // One count-bounded safety-check + atomic replacement is the progress
+          // unit. Stop BETWEEN runs on the 5-ms slice deadline: retrying the
+          // whole transaction with that same deadline can starve even a three-
+          // file run forever on a slow filesystem. Both fresh safety walks are
+          // mandatory; no cached proof authorizes mutation. The 64-entry tree
+          // cap and predicate fuel also bound growth during those fresh walks.
+          let checks = 0;
+          const unitExpired = () => ++checks > 4096;
+          if (!boundedRunTree(file, unitExpired)) continue;
           const fingerprint = this.#runReferences!.fingerprint;
           // Same exit/result fences as the former startup sweep, now streaming
           // after the lease is up. A terminal marker alone is never exit evidence.
           const stat = ownedStat(file);
           if (this.retention.retainRuns === false && stat && now - stat.mtimeMs > 24 * 60 * 60 * 1_000 &&
-              !runTreeExitVeto(file, 0, expired, true) && canRemoveTerminalRun(file, expired) &&
+              !runTreeExitVeto(file, 0, unitExpired, true) && canRemoveTerminalRun(file, unitExpired) &&
               hasPreservedResidentResult(directory, entry.name) &&
+              boundedRunTree(file, unitExpired) && !unitExpired() &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
             try { fs.rmSync(file, { recursive: true, force: true }); } catch { /* retry next scan */ }
             continue;
           }
-          const compacted = compactTerminalRunEvents(file, { ...this.retention, now, expired,
+          const compacted = compactTerminalRunEvents(file, { ...this.retention, now, expired: unitExpired,
             // Another owner can publish a new latest run during a long safety
             // walk. Recheck the registry generation immediately before replace.
-            isRetained: () => actorReferenceFingerprint(this.actorRoots) !== fingerprint,
+            isRetained: () => actorReferenceFingerprint(this.actorRoots) !== fingerprint || !boundedRunTree(file, unitExpired),
           });
           if (!compacted && expired()) { defer(); return; }
         }

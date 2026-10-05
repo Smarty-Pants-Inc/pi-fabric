@@ -138,7 +138,15 @@ export class ResidentLegacyRunArchive {
   }
 
   async sweep(now = Date.now(), maxEntries = 32, budgetMs = 20): Promise<void> {
-    if (this.#closed || this.#blocked || !this.#enabled() || now < this.#nextScan) return;
+    if (this.#closed) return;
+    if (process.platform === "win32") {
+      // Unix mode bits are not an ownership/privacy proof on native Windows.
+      // Explicit platform cut: no discovery, destination creation or mutation.
+      // One audit line per pass, never a per-run skip storm.
+      console.info("[pi-fabric] Legacy run retirement pass: no-op on win32 (POSIX-only; smarty-dev#5132)");
+      return;
+    }
+    if (this.#blocked || !this.#enabled() || now < this.#nextScan) return;
     const runs = path.join(this.root, "runs");
     const started = performance.now(), candidates: Array<{ id: string; proof: TreeProof }> = [];
     try {
@@ -196,7 +204,7 @@ export class ResidentLegacyRunArchive {
         }
       }
       // Persist both sides of the rename on platforms supporting directory fsync.
-      if (process.platform !== "win32") for (const directory of [batch, day, retired, runs]) {
+      for (const directory of [batch, day, retired, runs]) {
         const handle = await fsp.open(directory, "r");
         try { await handle.sync(); } finally { await handle.close(); }
       }

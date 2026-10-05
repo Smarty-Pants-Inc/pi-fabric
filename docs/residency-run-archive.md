@@ -26,7 +26,25 @@ count/time slices. Parsing and atomic sink discharge use a one-record slow path.
 Source identity/length/timestamp changes veto publication; successful settlement
 and shutdown sinks discharge only their own exact outcomes.
 
-## Scope cut: no automatic legacy source deletion
+### Native event collection: bounded progress, not repeated deadline aborts
+
+Already bounded event tails return before mutation-only exit/removability walks;
+reading that suffix is not collection authority. Actual replacements retain both
+fresh native-exit/tree proofs, result/allowlist guards and latest-run generation
+checks. This removes four redundant status reads per no-op compaction, keeping
+historical prefix reads within the eight-read activity-test bound even when a
+native directory cursor visits that prefix during the run phase.
+
+A resident run transaction is a soft 5-ms slice boundary: the collector stops
+**between** complete transactions. Recovery and registry preparation remain
+resumable. A transaction has a 64-entry tree cap, fresh size checks at mutation
+boundaries and 4,096 predicate checks of fuel; oversized/changed/unknown trees
+still veto. A slow three-file run must not restart its fresh safety proof on every
+5-ms tick and remain over its byte cap forever. Status, reply and saved results
+remain unchanged; the event cap and the shared atomic-write retry path are not
+relaxed. This native compaction remains supported on Windows.
+
+## Scope cut: POSIX-only retirement, no automatic legacy source deletion
 
 Linux can keep a writable file reference in an **unreceived `SCM_RIGHTS` message**
 after the sender closes its descriptor. No task's fd table, cwd/root or maps need
@@ -34,8 +52,8 @@ show that file. A stable, completely visible `/proc` census therefore cannot
 prove absence of writable file custody. Compressing a snapshot and then deleting
 the source can lose later writes through that queued descriptor.
 
-This policy does **not compress, copy, unlink, recursively remove, or expire**
-legacy source trees. It only moves them with same-filesystem `rename(2)` into
+On POSIX, this policy does **not compress, copy, unlink, recursively remove, or
+expire** legacy source trees. It only moves them with same-filesystem `rename(2)` into
 `runs-retired/YYYY-MM-DD/slice-*/RUN_ID/`, inside the residency root. Rename keeps
 the directory and file inodes linked. A hidden descriptor received later still
 writes into the moved file; the retained bytes are not a stale compressed copy.
@@ -90,9 +108,30 @@ original path** must not lose that path. These guards remain:
 
 The guards are conservative protection for known live/path-based owners, **not**
 a claim that all potential writers are discoverable. Unknown descriptor custody
-is safe for bytes because the inode remains linked. Retirement applies on Windows
-too, without pretending `/proc` exists; a rejected rename leaves the source intact.
-Directory fsync is performed on platforms supporting it. `archive-retention.json`
+is safe for bytes because the inode remains linked.
+
+**Legacy retirement is POSIX-only in this PR. On `win32`, every retirement pass
+is an explicit no-op**, before opening a run cursor, checking candidates,
+creating a destination or moving/deleting bytes. It emits exactly one audit line
+per pass, not one skip line per run:
+
+```text
+[pi-fabric] Legacy run retirement pass: no-op on win32 (POSIX-only; smarty-dev#5132)
+```
+
+The Unix group/other permission-bit privacy checks stay intact on POSIX; native
+Windows mode bits and `mkdir({ mode: 0o700 })` are not that privacy proof. Neither
+a rejected Windows rename nor a simulated platform provides ownership evidence.
+The compatibility policy keys remain accepted on Windows, but enabling them does
+not enable retirement there. Native event compaction and acknowledged request
+expiry are separate and remain cross-platform. No legacy run is automatically
+deleted on any platform.
+
+Follow-up: Smarty-Pants-Inc/smarty-dev#5132 (P2 items 1 and 2; owner fabric-v2).
+It tracks the actor-specific bounded custody index and native Windows ownership/
+privacy evidence; it does not turn local simulation into native CI validation.
+
+Directory fsync is performed on POSIX. `archive-retention.json`
 keeps checked/archived/skipped counters and the latest error; the historical
 `archived` label now counts moved runs.
 

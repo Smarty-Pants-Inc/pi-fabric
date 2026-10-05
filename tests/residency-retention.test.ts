@@ -11,6 +11,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
 import * as expiry from "../src/residency/request-expiry.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
+import { compactTerminalRunEvents } from "../src/storage/retention.js";
 import { acknowledgeResidentResponse, abandonResidentRequest, commitResidentRequest, readResidentRequestDecision, registerResidentCancellation, residentHostId, residentRoot, residentHostStateNote, residentCommandForOwner, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 const roots: string[] = [];
@@ -45,6 +46,48 @@ describe("resident terminal event retention", () => {
     fs.writeFileSync(path.join(run, "reply.json"), '{"text":"keep reply"}');
     return run;
   };
+
+  it("does not repeat exit/removal status proofs for an already bounded historical event log", () => {
+    const dir = root(), run = make(dir, "history-0", "completed");
+    fs.writeFileSync(path.join(run, "events.jsonl"), '{"text":"small"}\n');
+    const read = fs.readFileSync; let reads = 0;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      if (String(args[0]) === path.join(run, "status.json")) reads++;
+      return read(...args);
+    });
+    const rename = vi.spyOn(fs, "renameSync");
+    expect(compactTerminalRunEvents(run, { now })).toBe(false);
+    expect(reads).toBe(1);
+    expect(rename).not.toHaveBeenCalled();
+  });
+
+  it.each(["age threshold", "byte cap"])("completes a bounded run transaction after live %s reload despite consistently slow status reads", change => {
+    const dir = root(), run = make(dir, "reload-retention", "completed", now - 8 * 60 * 60 * 1000);
+    const events = Buffer.from((JSON.stringify({ text: "x".repeat(3000) }) + "\n").repeat(100));
+    fs.writeFileSync(path.join(run, "events.jsonl"), events);
+    const policy = { terminalRunEventsAgeMs: change === "age threshold" ? 12 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000,
+      terminalRunEventsMaxBytes: change === "byte cap" ? 512 * 1024 : 128 * 1024 };
+    const collector = new ResidentRequestRetention(dir, [], policy);
+    let elapsed = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      const result = read(...args);
+      if (String(args[0]) === path.join(run, "status.json")) elapsed += 1;
+      return result;
+    });
+    const before = ["status.json", "reply.json"].map(name => fs.readFileSync(path.join(run, name)));
+    try {
+      for (let i = 0; i < 20 && collector.due(now); i++) collector.sweep(now, new Set(), 5);
+      expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(events);
+      policy.terminalRunEventsAgeMs = 6 * 60 * 60 * 1000;
+      policy.terminalRunEventsMaxBytes = 128 * 1024;
+      collector.resample();
+      for (let i = 0; i < 20 && collector.due(now + 60_001); i++) collector.sweep(now + 60_001, new Set(), 5);
+      expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(128 * 1024);
+      for (const [i, name] of ["status.json", "reply.json"].entries()) expect(fs.readFileSync(path.join(run, name))).toEqual(before[i]);
+    } finally { collector.close(); }
+  });
 
   it.each(([undefined, "unknown", "herdr", "localterm"] as const).flatMap(transport =>
     (["startup", "streaming"] as const).map(phase => ({ transport, phase }))))(
@@ -194,16 +237,22 @@ describe("resident terminal event retention", () => {
     const collector = new ResidentRequestRetention(dir, [actorRoot]);
     try {
       for (let slice = 0; slice < 100 && collector.due(now); slice++) collector.sweep(now, new Set(["live"]), 5);
-      if (slow === "slow safety walk") {
-        // An interrupted proof is not collection authority. Keep the original
-        // bytes, then retry when the full proof fits a later slice.
-        expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
-        vi.mocked(fs.readFileSync).mockRestore();
-        for (let slice = 0; slice < 100 && collector.due(now + 60001); slice++) collector.sweep(now + 60001, new Set(["live"]), 5);
-      }
+      // Even consistently slow safety reads complete a count-bounded unit.
+      // A deadline alone must not restart the same fresh proof forever.
       expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
       for (const run of [latest, live, worker]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
       expect(registryReads).toBeGreaterThan(0);
+    } finally { collector.close(); }
+  });
+
+  it("retains an oversized run transaction without starving the next small run", () => {
+    const dir = root(), large = make(dir, "large", "completed"), small = make(dir, "small", "completed");
+    for (let i = 0; i < 65; i++) fs.writeFileSync(path.join(large, `oversized-event-prefix-${i}.txt`), "keep");
+    const collector = new ResidentRequestRetention(dir);
+    try {
+      for (let i = 0; i < 100 && collector.due(now); i++) collector.sweep(now, new Set(), 5);
+      expect(fs.readFileSync(path.join(large, "events.jsonl")).equals(log)).toBe(true);
+      expect(fs.statSync(path.join(small, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
     } finally { collector.close(); }
   });
 

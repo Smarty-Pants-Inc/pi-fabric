@@ -11,10 +11,11 @@ import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 
-// Retention is write-only work: do not add its readers to registration/idle imports.
-let expiredStateKeys: typeof import("./state-retention.js").expiredStateKeys | undefined;
+// Retention stays lazy: foreground writes need participant validation; background
+// receipt passes load confirmation only when their delivery preflight finds work.
+let stateRetention: typeof import("./state-retention.js") | undefined;
 const loadStateRetention = async (): Promise<void> => {
-  expiredStateKeys ??= (await import("./state-retention.js")).expiredStateKeys;
+  stateRetention ??= await import("./state-retention.js");
 };
 
 export interface MeshIdentity {
@@ -594,6 +595,8 @@ export class MeshStore {
     }
     | undefined;
   #oldestLive: { identity: string; sequence: number | undefined } | undefined;
+  #receiptPass: Promise<number> | undefined;
+  #receiptCursor: string | undefined;
 
   constructor(
     readonly root: string,
@@ -1507,10 +1510,10 @@ export class MeshStore {
   // The commit's new readGeneration is serialized FIRST and atomically with the payload (the
   // previous one is dropped from the copy), so the canonical header alone identifies the commit
   // whether or not the optional signal is published afterwards. The stamped copy is cached.
-  #commitState(state: MeshStateFile, reuse?: Map<string, EncodedStateEntry>, keys: string[] = [], caller?: string[]): void {
+  #commitState(state: MeshStateFile, reuse?: Map<string, EncodedStateEntry>, keys: string[] = [], caller?: string[], receipts: string[] = []): void {
     // Expiry joins the existing write and uses the same verified delete allocator as
     // explicit deletes. Tombstone eviction must never reissue an old CAS token.
-    const expired = expiredStateKeys!(state.entries, this.root, Date.now());
+    const expired = [...stateRetention!.expiredStateKeys(state.entries, this.root, Date.now()), ...receipts];
     if (expired.length > 0) {
       const tombstones = new Set(state.tombstoneOrder ?? []);
       for (const key of expired) {
@@ -1590,7 +1593,7 @@ export class MeshStore {
     const caller = commitTraceCaller();
     this.#validateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
-    if (!expiredStateKeys) await loadStateRetention();
+    if (!stateRetention) await loadStateRetention();
     return this.#withLock(() => {
       const { state, reuse } = this.#readStateForWrite();
       const slot = stateSlot(state, request.key);
@@ -1616,6 +1619,47 @@ export class MeshStore {
       this.#commitState(state, reuse, [plan.key], caller);
       return jsonClone(entry);
     });
+  }
+
+  /** Host-only background maintenance, never awaited by put/delete/writeBatch.
+   * Coalesced per store; failed confirmations and the remaining backlog carry over
+   * to a later heartbeat. Receipt I/O and durability barriers precede the mesh lock. */
+  compactReceipts(): Promise<number> {
+    return this.#receiptPass ??= this.#compactReceipts().finally(() => { this.#receiptPass = undefined; });
+  }
+
+  async #compactReceipts(): Promise<number> {
+    // No retention import, lock acquisition or canonical parse on an empty idle cache hit.
+    if (this.listAllShared("residency/deliveries/").length === 0) return 0;
+    if (!stateRetention) await loadStateRetention();
+    const retention = stateRetention!;
+    const deadline = performance.now() + retention.RECEIPT_PASS_BUDGET_MS;
+    const entries = [...this.listAllShared("residency/deliveries/", { fresh: true })]
+      .sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+    const prepared = await retention.prepareReceiptCompaction(entries, this.root, Date.now(), this.#receiptCursor, deadline);
+    if (prepared.confirmed.length === 0) {
+      this.#receiptCursor = prepared.after;
+      return 0;
+    }
+    // One immediate attempt, not a normal 10 s wait. If occupied, retry selection and
+    // fresh confirmation on a later tick; do not cache durability across passes.
+    const removed = await this.#withLock(() => {
+      const { state, reuse } = this.#readStateForWrite();
+      const keys = prepared.confirmed.filter(candidate =>
+        retention.receiptCandidateUnchanged(candidate, state.entries[candidate.entry.key]))
+        .map(candidate => candidate.entry.key);
+      if (keys.length > 0) {
+        // Maintenance can be the first writer of a legacy snapshot. Use the same
+        // validated clock seeding as public mutations before verified deletes.
+        state.highWater = stateSlot(state, keys[0]!).highWater;
+        state.format = 1;
+        state.revisionFormat = 2;
+        this.#commitState(state, reuse, [], undefined, keys);
+      }
+      return keys.length;
+    }, 0);
+    this.#receiptCursor = prepared.after;
+    return removed;
   }
 
   /**
@@ -1652,7 +1696,7 @@ export class MeshStore {
     const caller = commitTraceCaller();
     this.#validateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
-    if (!expiredStateKeys) await loadStateRetention();
+    if (!stateRetention) await loadStateRetention();
     return this.#withLock(() => {
       const { state, reuse } = this.#readStateForWrite();
       const slot = stateSlot(state, request.key);
@@ -1701,7 +1745,7 @@ export class MeshStore {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit) return [];
-    if (!expiredStateKeys) await loadStateRetention();
+    if (!stateRetention) await loadStateRetention();
     return this.#withLock(() => {
       // Each operation takes the same verified transition as put()/delete(), so a batch
       // advances the persistent clock exactly as the single writes would, and damaged

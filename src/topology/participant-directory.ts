@@ -311,6 +311,8 @@ export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
 export class ParticipantDirectory implements FabricParticipantSource {
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh");
+  readonly #receiptRetry = new MeshBackgroundRetry("receipt compaction");
+  #receiptPass: Promise<unknown> | undefined;
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #startedAt = Date.now();
@@ -392,7 +394,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
           this.#backgroundRefresh.failure(error);
           return;
         }
-        void this.#backgroundRefresh.run(() => this.refresh(), false);
+        void this.#backgroundRefresh.run(() => this.refresh(), false).then(result => {
+          if (result === "done") this.#scheduleReceiptCompaction();
+        });
       }, this.#heartbeatMs);
       this.#timer.unref();
     }
@@ -1099,6 +1103,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
     };
   }
 
+  // The existing heartbeat timer owns one bounded background pass, independent of
+  // heartbeat/change refresh and notification delivery. Never run it from start(),
+  // refresh() or a foreground caller; no immediate drain of the remaining backlog.
+  #scheduleReceiptCompaction(): void {
+    if (!this.options.enabled || this.#closed || this.#quiescing || this.#receiptPass) return;
+    const pass = this.#receiptRetry.run(() => this.mesh.compactReceipts());
+    this.#receiptPass = pass.finally(() => { this.#receiptPass = undefined; });
+  }
+
   // After a committed heartbeat only: a host that cannot write gains nothing from a sweep.
   #sweepDeadHosts(): void {
     const reap = this.options.reapDeadHosts;
@@ -1156,6 +1169,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
     await this.#refreshing?.catch(() => undefined);
+    await this.#receiptPass;
     await this.#notifications.close();
     if (!this.options.enabled) return;
     const own = (entry: MeshStateEntry): boolean => {

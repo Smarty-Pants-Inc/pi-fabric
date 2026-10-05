@@ -56,7 +56,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe("#4383 bounded expiry inside the existing mesh write", () => {
+describe("#4383 participant expiry and background receipt compaction", () => {
   it("retains status flags without a durable receipt, terminal results and unknown custody", async () => {
     const { root, mesh } = setup();
     seed(root, [
@@ -76,6 +76,7 @@ describe("#4383 bounded expiry inside the existing mesh write", () => {
       ["residency/deliveries/wrong-key", delivery("wrong", { status: "completed" })],
     ]);
     await tick(mesh);
+    await mesh.compactReceipts();
     for (const id of ["terminal", "ack", "ack-at"]) expect(mesh.get(deliveryKey(id))).toBeDefined();
     for (const id of ["pending", "result", "running", "recent-write", "recent-ack", "recent-complete", "recent-terminal-ack", "invalid-time", "boundary", "malformed"]) expect(mesh.get(deliveryKey(id)), id).toBeDefined();
     expect(mesh.get("residency/deliveries/wrong-key")).toBeDefined();
@@ -91,6 +92,8 @@ describe("#4383 bounded expiry inside the existing mesh write", () => {
       id: id === "wrong-id" ? "other" : id, sessionId: id === "invalid" ? "" : "session", consumedAt: id === "recent" ? now : old,
     }));
     await tick(mesh);
+    expect(mesh.get(deliveryKey("consumed"))).toBeDefined(); // foreground write never confirms receipts
+    await mesh.compactReceipts();
     expect(mesh.get(deliveryKey("consumed"))).toBeUndefined();
     for (const id of ids.slice(1)) expect(mesh.get(deliveryKey(id)), id).toBeDefined();
   });
@@ -132,12 +135,13 @@ describe("#4383 bounded expiry inside the existing mesh write", () => {
     expect(mesh.get(p)).toBeDefined();
   });
 
-  it.each(["put", "delete", "batch"])("compacts under %s and preserves CAS allocation after tombstone eviction", async operation => {
+  it.each(["put", "delete", "batch"])("compacts after %s and preserves CAS allocation after tombstone eviction", async operation => {
     const { root, mesh } = setup();
     const original = seed(root, Array.from({ length: 3 }, (_, n) => [deliveryKey(String(n)), settledDelivery(root, String(n))]));
     if (operation === "put") await tick(mesh);
     else if (operation === "delete") await mesh.delete({ key: deliveryKey("0") });
     else await mesh.writeBatch({ identity, ops: [{ kind: "put", key: "probe/tick", value: 1 }] });
+    for (let pass = 0; pass < 6 && mesh.listAll("residency/deliveries/").length > 0; pass++) await mesh.compactReceipts();
     expect(mesh.listAll("residency/deliveries/")).toEqual([]);
     for (const entry of Object.values(original)) {
       await expect(mesh.put({ key: entry.key, value: "stale", identity, ifVersion: entry.version })).rejects.toThrow("compare-and-swap");
@@ -146,15 +150,29 @@ describe("#4383 bounded expiry inside the existing mesh write", () => {
     }
   });
 
-  it("bounds expiry to 500 records per commit and converges without a new daemon", async () => {
+  it("bounds successful AND failed receipt attempts per pass and carries the backlog forward", async () => {
     const { root, mesh } = setup();
-    // Cardinality/allocation probe; real durability and failed barriers are covered below.
-    vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
-    seed(root, Array.from({ length: 510 }, (_, n) => [deliveryKey(String(n)), settledDelivery(root, String(n))]));
+    const open = fs.promises.open.bind(fs.promises);
+    const receiptOpens: string[] = [];
+    vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      if (String(args[0]).endsWith(".json")) receiptOpens.push(String(args[0]));
+      return open(...args);
+    });
+    seed(root, Array.from({ length: 40 }, (_, n) => {
+      const id = String(n).padStart(2, "0");
+      return [deliveryKey(id), n < 20 ? delivery(id, { from: { id, kind: "agent" }, agentCompletionId: id }) : settledDelivery(root, id)];
+    }));
     await tick(mesh);
-    expect(mesh.listAll("residency/deliveries/")).toHaveLength(10);
-    await tick(mesh);
-    expect(mesh.listAll("residency/deliveries/")).toEqual([]);
+    expect(receiptOpens).toHaveLength(0);
+    await mesh.compactReceipts();
+    expect(receiptOpens.length).toBeGreaterThan(0);
+    expect(receiptOpens.length).toBeLessThanOrEqual(16); // failed opens consume the budget too
+    for (let pass = 0; pass < 40 && mesh.listAll("residency/deliveries/").length > 20; pass++) {
+      const before = receiptOpens.length;
+      await mesh.compactReceipts();
+      expect(receiptOpens.length - before).toBeLessThanOrEqual(16);
+    }
+    expect(mesh.listAll("residency/deliveries/")).toHaveLength(20);
   });
 });
 
@@ -165,23 +183,29 @@ describe("Astra R1 durable receipt and canonical ownership", () => {
     seed(root, [[deliveryKey(id), settledDelivery(root, id)], ...Array.from({ length: 4 }, (_, n) => [`unrelated/deletable-${n}`, 1] as [string, unknown])]);
     const receipt = path.join(root, "agent-completions", "receipts", `${hash(id)}.json`);
     const original = fs.readFileSync(receipt, "utf8");
-    const sync = fs.fsyncSync.bind(fs);
+    const open = fs.promises.open.bind(fs.promises);
     let failure: "file" | "namespace" | undefined = "file";
     const receiptInode = fs.statSync(receipt).ino;
     let confirmedFile = 0, confirmedDirectory = 0;
-    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
-      const stat = fs.fstatSync(fd);
-      if ((failure === "file" && stat.ino === receiptInode) ||
-        (failure === "namespace" && stat.isDirectory())) throw new Error("receipt durability barrier failed");
-      if (stat.ino === receiptInode) confirmedFile++;
-      if (stat.isDirectory()) confirmedDirectory++;
-      sync(fd);
+    vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      const sync = handle.sync.bind(handle);
+      handle.sync = async () => {
+        const stat = await handle.stat();
+        if ((failure === "file" && stat.ino === receiptInode) ||
+          (failure === "namespace" && stat.isDirectory())) throw new Error("receipt durability barrier failed");
+        if (stat.ino === receiptInode) confirmedFile++;
+        if (stat.isDirectory()) confirmedDirectory++;
+        await sync();
+      };
+      return handle;
     });
     let deletion = 0;
     const commit = async () => {
       if (operation === "put") await tick(mesh);
       else if (operation === "delete") await mesh.delete({ key: `unrelated/deletable-${deletion++}` });
       else await mesh.writeBatch({ identity, ops: [{ kind: "put", key: "probe/tick", value: 1 }] });
+      await mesh.compactReceipts();
     };
     for (const barrier of (process.platform === "win32" ? ["file", "file"] : ["file", "namespace", "file"]) as Array<"file" | "namespace">) {
       failure = barrier;

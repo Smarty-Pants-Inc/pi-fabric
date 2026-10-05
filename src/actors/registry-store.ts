@@ -80,7 +80,7 @@ export class ActorRegistryStore {
     return this.#payloads.count(record);
   }
 
-  /** Optional full-ring downgrade view. Mixed-release saves are safe without it;
+  /** Restore the full inline downgrade view. Checkpoint-only rows must be hydrated too;
    * old releases otherwise see an empty inline ring. Stop writers first. */
   async restoreInlineForDowngrade(): Promise<number> {
     return this.withLock(() => {
@@ -91,7 +91,9 @@ export class ActorRegistryStore {
         if (typeof value !== "object" || value === null || Array.isArray(value) ||
             typeof (value as { id?: unknown }).id !== "string") return value;
         const record = value as Record<string, unknown>;
-        if (record.instructionsFile === undefined && record.messageHistory === undefined) return record;
+        // Always pass rows through the common readers: an old owner may have
+        // removed both selecting fields while the accepted head survives only
+        // in messages-head.json. Those readers also fail closed on bad payloads.
         const restored = { ...record, instructions: this.instructions(record), messages: this.messages(record) };
         delete (restored as Record<string, unknown>).instructionsFile;
         delete (restored as Record<string, unknown>).messageHistory;

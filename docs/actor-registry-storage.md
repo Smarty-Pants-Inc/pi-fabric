@@ -85,12 +85,16 @@ residency locks. Restart only this release or newer against that root. A
 post-install benchmark is not evidence that old writers have stopped. For
 rollback with an old owner's full history view, stop all root writers again,
 run the locked inline restore below, verify the restored instructions and active
-ring, then resume the old release. For the two proven releases, concurrent saves
-preserve payloads without that helper, but old owners still cannot *see* the
+ring, then resume the old release. This step is required even when an old-owned
+row has removed both `messageHistory` and `instructionsFile`: the accepted ring
+may then survive only in `messages-head.json`, and the helper hydrates it through
+the same checkpoint-aware reader before writing the old layout. For the two
+proven releases, concurrent saves preserve payloads without that helper, but old
+owners still cannot *see* the
 externalized ring until inline restoration.
 
 Old releases do not themselves display externalized history. To give a fully
-downgraded owner the last 100 messages inline, the optional helper remains:
+downgraded owner the last 100 messages inline, use the required helper:
 
 ```sh
 # Stop every writer for this root before restoring the full inline view.
@@ -98,9 +102,10 @@ bun scripts/actor-registry-downgrade.ts /absolute/path/to/actors/root
 ```
 
 The helper locks the registry, hydrates instructions and the last 100 active
-messages, removes reference fields, and durably atomically restores format 1.
-It fails without guessing if a referenced file is missing/corrupt. Sidecar
-archives and checkpoints remain, including legacy entries beyond the old
+messages (including checkpoint-only rows), removes reference fields, and durably
+atomically restores format 1. Corrupt or truncated checkpoints fail closed before
+any registry bytes change. Sidecar archives and checkpoints remain, including
+legacy entries beyond the old
 loader's 100-message ring. Re-upgrading merges the inline ring back without
 truncating the archive. No old release is expected to understand archived history
 outside its existing ring semantics.

@@ -257,12 +257,37 @@ describe("compact actor registry payloads (#3752, #4383)", () => {
     const { store, id, file, log, root } = setup();
     await store.withLock(() => store.write([{ id, messages: messages(2), instructions: "i".repeat(2_000) }]));
     const record = store.records()[0]!;
+    // Match an old owned-row save: both selecting fields are gone, while the
+    // checkpoint remains the only source of the accepted history.
+    fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [{ ...record, messageHistory: undefined, instructionsFile: undefined, messages: [] }] }));
     fs.truncateSync(log, 1);
     const fresh = new ActorRegistryStore(root);
-    expect(() => fresh.messages(record)).toThrow("Truncated actor message history");
+    expect(() => fresh.messages(fresh.records()[0]!)).toThrow("Truncated actor message history");
     expect(() => fresh.instructions({ ...record, instructionsFile: "../../escape" })).toThrow("Invalid actor instructions reference");
     const before = fs.readFileSync(file, "utf8");
     await expect(fresh.restoreInlineForDowngrade()).rejects.toThrow("Truncated actor message history");
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+  });
+
+  it("restores checkpoint history together with legacy inline additions without duplication", async () => {
+    const { store, id, file, log } = setup();
+    await store.withLock(() => store.write([{ id, instructions: "legacy", messages: messages(110) }]));
+    const archive = fs.readFileSync(log, "utf8");
+    const inline = [messages(110)[109], messages(111)[110]];
+    fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [{ id, instructions: "legacy", messages: inline }] }));
+    await store.restoreInlineForDowngrade();
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).actors[0].messages).toEqual(messages(111).slice(-100));
+    expect(fs.readFileSync(log, "utf8")).toBe(archive);
+  });
+
+  it("rejects a corrupt checkpoint without changing an old-owned registry row", async () => {
+    const { store, id, file, root } = setup();
+    await store.withLock(() => store.write([{ id, messages: messages(2) }]));
+    const row = store.records()[0]!;
+    fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [{ ...row, messageHistory: undefined, instructionsFile: undefined, messages: [] }] }));
+    fs.writeFileSync(path.join(root, id, "registry", "messages-head.json"), "{corrupt");
+    const before = fs.readFileSync(file, "utf8");
+    await expect(store.restoreInlineForDowngrade()).rejects.toThrow();
     expect(fs.readFileSync(file, "utf8")).toBe(before);
   });
 
@@ -277,7 +302,13 @@ describe("compact actor registry payloads (#3752, #4383)", () => {
     expect(Array.isArray(stub.actors[0].messages)).toBe(true);
     expect(stub.actors[0].messages).toEqual([]);
     const archive = fs.readFileSync(log, "utf8");
+    // Simulate the actual old manager save, which drops both new selectors.
+    fs.writeFileSync(file, JSON.stringify({ format: 1, actors: [{ ...stub.actors[0], messageHistory: undefined, instructionsFile: undefined, messages: [] }] }));
+    const oldOwnedReader = new ActorRegistryStore(path.dirname(file));
+    expect(oldOwnedReader.messages(oldOwnedReader.records()[0]!)).toEqual(actor.messages.slice(-100));
     expect(await store.restoreInlineForDowngrade()).toBe(1);
+    const restored = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(restored.actors[0].messages).toEqual(actor.messages.slice(-100));
     expect(store.records()[0]).toEqual({ ...actor, messages: actor.messages.slice(-100) });
     expect(fs.readFileSync(log, "utf8")).toBe(archive);
     await store.withLock(() => store.write(store.records()));

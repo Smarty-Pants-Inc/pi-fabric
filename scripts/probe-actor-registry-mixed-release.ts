@@ -22,16 +22,20 @@ const id = "a".repeat(32), instructions = "i".repeat(20_000);
 const identity: MeshIdentity = { id: "session:mixed", name: "main", kind: "main", sessionId: "mixed" };
 const messages = Array.from({ length: 150 }, (_, i) => ({ id: `m-${i}`, source: "direct", direction: "in", createdAt: i, text: "x".repeat(1_100) }));
 
-if (process.argv[4] === "--old-worker") {
+if (process.argv[4] === "--old-worker" || process.argv[4] === "--old-resume") {
+  const mode = process.argv[4]!;
   const root = process.argv[3]!;
   const old = await import(pathToFileURL(oldBundle).href);
   const actorRoot = path.join(root, "actors"), store = new old.ActorRegistryStore(actorRoot);
   const original = store.records()[0];
-  assert.deepEqual(original.messages, []);
+  const expected = mode === "--old-resume" ? messages.slice(-100) : [];
+  assert.deepEqual(original.messages, expected);
   assert.equal(original.instructions, instructions);
-  // The store passes unknown fields through without projecting them.
-  await store.withLock(() => store.write(store.records()));
-  assert.deepEqual(store.records()[0].messageHistory, original.messageHistory);
+  if (mode === "--old-worker") {
+    // The store passes unknown fields through without projecting them.
+    await store.withLock(() => store.write(store.records()));
+    assert.deepEqual(store.records()[0].messageHistory, original.messageHistory);
+  }
   old.ActorMeshMonitor.prototype.start = () => {};
   old.ActorMeshMonitor.prototype.schedule = () => {};
   const mesh = new old.MeshStore(path.join(root, "old-mesh"), 256 * 1024, 100);
@@ -42,15 +46,19 @@ if (process.argv[4] === "--old-worker") {
   });
   try {
     assert.equal(manager.instructions(id), instructions);
-    assert.deepEqual(manager.messages(id, 100), []);
-    await manager.setNice(id, 7); // Actual old owned-row serializer -> old store.write.
+    assert.deepEqual(manager.messages(id, 100), expected);
+    if (mode === "--old-worker") await manager.setNice(id, 7); // Old owned-row serializer drops unknown fields.
   } finally { await manager.close(); await agents.close(); }
-  const rewritten = store.records()[0];
-  assert.equal(rewritten.messageHistory, undefined);
-  assert.equal(rewritten.instructionsFile, undefined);
-  assert.equal(rewritten.instructions, instructions);
-  assert.deepEqual(rewritten.messages, []);
-  console.log("PASS old compiled store preserved raw fields; old compiled manager/store then stripped reference fields and saved empty messages.");
+  if (mode === "--old-worker") {
+    const rewritten = store.records()[0];
+    assert.equal(rewritten.messageHistory, undefined);
+    assert.equal(rewritten.instructionsFile, undefined);
+    assert.equal(rewritten.instructions, instructions);
+    assert.deepEqual(rewritten.messages, []);
+    console.log("PASS old compiled store preserved raw fields; old compiled manager/store then stripped reference fields and saved empty messages.");
+  } else {
+    console.log("PASS old compiled manager resumed after inline restore with the full active history.");
+  }
 } else {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-mixed-release-"));
   let manager: ActorManager | undefined, agents: AgentManager | undefined;
@@ -67,6 +75,16 @@ if (process.argv[4] === "--old-worker") {
     assert.equal(fresh.instructions(row), instructions);
     assert.deepEqual(fresh.messages(row), messages.slice(-100));
     assert.equal(fs.readFileSync(log, "utf8"), archive);
+    // Roll back directly from the old-owned-save shape, then start the actual
+    // compiled 6b15d905 manager and verify that it sees the restored ring.
+    assert.equal(await fresh.restoreInlineForDowngrade(), 1);
+    const restored = fresh.records()[0]!;
+    assert.equal(restored.messageHistory, undefined);
+    assert.deepEqual(restored.messages, messages.slice(-100));
+    assert.equal(fs.readFileSync(log, "utf8"), archive);
+    const oldResumeOutput = childProcess.execFileSync("nice", ["-n", "19", process.execPath, import.meta.filename, oldBundle, root, "--old-resume"], {
+      encoding: "utf8", timeout: 60_000, env: process.env,
+    }).trim();
     ActorMeshMonitor.prototype.start = () => {};
     ActorMeshMonitor.prototype.schedule = () => {};
     const mesh = new MeshStore(path.join(root, "new-mesh"), 256 * 1024, 100);
@@ -81,9 +99,10 @@ if (process.argv[4] === "--old-worker") {
     await manager.setNice(id, 8);
     assert.equal(fs.readFileSync(log, "utf8"), archive);
     await manager.close(); await agents.close();
-    console.log(JSON.stringify({ passed: true, oldBundle, oldOutput, archivedMessagesPreserved: 150,
+    console.log(JSON.stringify({ passed: true, oldBundle, oldOutput, oldResumeOutput, archivedMessagesPreserved: 150,
       activeMessagesPreserved: 100, instructionsBytesPreserved: Buffer.byteLength(instructions),
-      oldOwnedSaveDroppedUnknownFields: true, historyArchiveByteIdentical: true, newManagerReloadAndSave: true }, null, 2));
+      oldOwnedSaveDroppedUnknownFields: true, downgradeRestoreVerified: true,
+      historyArchiveByteIdentical: true, newManagerReloadAndSave: true }, null, 2));
   } finally {
     await manager?.close(); await agents?.close();
     fs.rmSync(root, { recursive: true, force: true });

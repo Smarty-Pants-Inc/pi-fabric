@@ -50,6 +50,33 @@ const createArchivedStore = (): { store: MeshStore; archiveDir: string } => {
   return { store: new MeshStore(root, 64 * 1024, 100), archiveDir };
 };
 
+// A real child death bypasses rollback catches and leaves the archive-before-live state intact.
+const crashAfterArchiveBegin = async (store: MeshStore, packet: Parameters<MeshStore["publish"]>[0]): Promise<void> => {
+  const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-archive-before-live-crash.mjs"), store.root, JSON.stringify(packet)], {
+    cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN: "1" },
+  });
+  let stderr = "", timedOut = false;
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  child.stdout.resume();
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 10_000);
+  try {
+    const result = await closed;
+    expect(timedOut, stderr).toBe(false);
+    expect(stderr).toBe("");
+    expect(result.code).not.toBe(0);
+    if (process.platform !== "win32") expect(result.signal).toBe("SIGKILL");
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await closed.catch(() => undefined);
+  }
+};
+
 // A simulated native platform must not inherit the process-wide own-PID promise
 // from earlier real publication tests (notably on native Windows CI). Reload both
 // the reader and its importing store; production own-PID memoization is unchanged.
@@ -184,7 +211,7 @@ describe("MeshStore", () => {
     fs.writeFileSync(path.join(store.root, "events.jsonl"), JSON.stringify(later) + "\n");
     fs.writeFileSync(path.join(store.root, "sequence"), String(later.sequence));
     const scan = vi.spyOn(MeshArchive.prototype, "readAfter");
-    const lookup = vi.spyOn(MeshArchive.prototype, "lookup");
+    const lookup = vi.spyOn(MeshArchive.prototype, "lookupEntry");
     const reads = vi.spyOn(fs, "readFileSync");
     const dirs = vi.spyOn(fs, "readdirSync");
     expect(await store.publish(packet)).toEqual(event);
@@ -242,6 +269,95 @@ describe("MeshStore", () => {
     expect(archive.head()?.id).toBe(event.id);
     expect(archive.lookup(event.sequence)).toEqual(event);
   });
+
+  it.each(["retry-first", "unrelated-first", "overtaken-archive"] as const)("completes a real archive-before-live process death with normal cursor delivery (%s)", async ordering => {
+    const { store, archiveDir } = createArchivedStore();
+    const seed = await store.publish({ topic: "mesh.dedupe", from: identity, text: "seed" });
+    expect(seed.sequence).toBe(1);
+    const packet = { topic: "mesh.dedupe", from: identity, dedupeKey: "process-death-before-live", text: "once" };
+    const live = path.join(store.root, "events.jsonl");
+    const seedBytes = fs.readFileSync(live, "utf8");
+    let cursor = store.latestOffset();
+    await crashAfterArchiveBegin(store, packet);
+    const archive = MeshArchive.fromRoot(store.root)!;
+    const orphan = archive.lookupEntry(2)!;
+    expect(orphan).toMatchObject({ committed: false, event: { sequence: 2, dedupeKey: packet.dedupeKey } });
+    expect(archive.pending()?.id).toBe(orphan.event.id);
+    expect(fs.readFileSync(live, "utf8")).toBe(seedBytes); // No rollback catch ran, and nothing went live.
+    const base = path.join(store.root, "event-receipts", createHash("sha256").update(packet.dedupeKey).digest("hex"));
+    expect(fs.existsSync(base + ".pending.json")).toBe(true);
+    expect(fs.existsSync(base + ".json")).toBe(false);
+    const restarted = new MeshStore(store.root, store.maxEventBytes, store.maxReadEvents);
+    let unrelated;
+    const delivered = [];
+    if (ordering === "unrelated-first") {
+      unrelated = await restarted.publish({ topic: packet.topic, from: identity, text: "unrelated" });
+      expect(archive.lookup(2)).toBeUndefined(); // Ordinary recovery aborted the reservation: the gap stays a gap.
+    } else if (ordering === "overtaken-archive") {
+      // A mixed-version writer can leave the positive reservation but overwrite PENDING
+      // and advance both heads. Its live line and archive append never filled sequence 2.
+      unrelated = { ...seed, id: "later-mixed-writer", sequence: 3, text: "unrelated" };
+      const pending = archive.begin({ event: unrelated, line: JSON.stringify(unrelated) });
+      fs.appendFileSync(live, JSON.stringify(unrelated) + "\n");
+      fs.writeFileSync(path.join(store.root, "sequence"), "3");
+      archive.commit(pending);
+      expect(archive.pending()).toBeUndefined();
+      expect(archive.lookupEntry(2)?.committed).toBe(false);
+    }
+    if (unrelated) {
+      expect(restarted.read({ after: 1 })).toEqual([unrelated]);
+      expect(restarted.nextEventAfter(1)).toEqual(unrelated); // No archive-only event is visible before retry.
+      const beforeRetry = restarted.tail(cursor, 100);
+      delivered.push(...beforeRetry.events);
+      cursor = beforeRetry.nextOffset; // A normal consumer has already passed the reserved sequence.
+    }
+    const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
+    const history = vi.spyOn(restarted, "read");
+    const reads = vi.spyOn(fs, "readFileSync");
+    const recovered = await restarted.publish(packet);
+    expect(scans).not.toHaveBeenCalled();
+    expect(history).not.toHaveBeenCalled();
+    expect(reads.mock.calls.some(([file]) => String(file).startsWith(archiveDir) && String(file).endsWith(".jsonl"))).toBe(false);
+    scans.mockRestore(); history.mockRestore(); reads.mockRestore();
+    if (ordering === "retry-first") {
+      expect(recovered).toEqual(orphan.event);
+      expect(fs.readFileSync(live, "utf8")).toBe(seedBytes + orphan.line + "\n"); // Exact bytes and sequence restored.
+      unrelated = await restarted.publish({ topic: packet.topic, from: identity, text: "unrelated" });
+    } else {
+      expect(recovered.sequence).toBe(4);
+      expect(recovered.id).not.toBe(orphan.event.id);
+      expect(archive.lookup(2)).toBeUndefined();
+    }
+    expect(await restarted.publish({ ...packet, text: "retry again" })).toEqual(recovered);
+    expect(JSON.parse(fs.readFileSync(base + ".json", "utf8"))).toEqual(recovered);
+    expect(fs.existsSync(base + ".pending.json")).toBe(false);
+    for (const after of [0, 1]) {
+      const events = restarted.read({ after });
+      expect(events.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
+      expect(events.map(event => event.sequence)).toEqual(ordering === "retry-first" ? (after === 0 ? [1, 2, 3] : [2, 3]) : (after === 0 ? [1, 3, 4] : [3, 4]));
+    }
+    const tail = restarted.tail(cursor, 100);
+    delivered.push(...tail.events);
+    expect(delivered.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
+    expect(restarted.tail(tail.nextOffset, 100).events).toEqual([]);
+    const archived = archive.readAfter(1, restarted.latestSequence(), () => true, 100);
+    expect(archived.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
+    const normal = [];
+    for (let after = 1; ;) {
+      const next = restarted.nextEventAfter(after);
+      if (!next) break;
+      normal.push(next);
+      after = next.sequence;
+    }
+    expect(normal.filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
+    if (ordering === "overtaken-archive") {
+      // Compacted cursor reads must not rediscover the aborted archive line.
+      const compacting = new MeshStore(store.root, store.maxEventBytes, 100, { maxEventLogBytes: 70_000, retainedEventLogBytes: 65_537 });
+      for (let index = 0; index < 5; index++) await compacting.publish({ topic: packet.topic, from: identity, text: "x".repeat(20_000) });
+      expect(compacting.oldestSequence()).toBeGreaterThan(recovered.sequence);
+      expect(compacting.read({ after: 1 }).filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([recovered]);
+    }
+  }, 30_000);
 
   it("publishes when a direct archive reservation proves that the intent never appended", async () => {
     const { store } = createArchivedStore();

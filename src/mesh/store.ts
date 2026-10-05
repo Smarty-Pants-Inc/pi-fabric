@@ -712,18 +712,38 @@ export class MeshStore {
       throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive configuration is unavailable`);
     }
     if (!event && !prior && archive) {
-      let archived: MeshEvent | undefined;
-      try { archived = archive.lookup(intent.reservedSequence); }
+      let entry: (MeshArchiveEntry & { committed: boolean }) | undefined;
+      try { entry = archive.lookupEntry(intent.reservedSequence); }
       catch (error) {
         if (error instanceof MeshArchiveLookupUnavailableError) {
           throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive lookup is unavailable`, { cause: error });
         }
         throw error;
       }
+      const archived = entry?.event;
       if (archived && (archived.id !== intent.eventId || archived.dedupeKey !== intent.dedupeKey)) {
         throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: reserved archive identity does not match`);
       }
-      if (archived) {
+      if (entry && archived) {
+        this.#repairEventLog();
+        const lastLive = this.#readLastEventSequence();
+        if (lastLive < archived.sequence) {
+          // An archive append is not a publication. Restore its exact bytes before issuing
+          // a receipt, and update the anchor first so another death cannot append it twice.
+          let liveOffset = 0;
+          try { liveOffset = fs.statSync(this.#eventsPath).size; }
+          catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+          writeFileAtomic(file, JSON.stringify({ ...intent, liveOffset }), { durable: true });
+          fs.appendFileSync(this.#eventsPath, `${entry.line}\n`, { encoding: "utf8", mode: 0o600 });
+          this.#confirmEventFile(this.#eventsPath);
+          archive.confirmLive(archived.sequence, archived.id);
+        } else if (!entry.committed) {
+          // Never fill a missing reservation behind a reader's cursor. Abort its archive
+          // visibility first; publish() will reserve a fresh sequence for this same key.
+          archive.abort(entry);
+          this.#removeDedupeIntent(file);
+          return undefined;
+        }
         const pending = archive.pending();
         // Receipt recovery is direct metadata work. Leave closed-day sealing to the next
         // ordinary archive append, never scan history just to resolve this intent.
@@ -732,7 +752,12 @@ export class MeshStore {
       }
     }
     if (event && !prior) {
-      if (live) this.#confirmEventFile(this.#eventsPath);
+      if (live) {
+        this.#confirmEventFile(this.#eventsPath);
+        archive?.confirmLive(live.sequence, live.id);
+        const pending = archive?.pending();
+        if (pending?.id === live.id && pending.sequence === live.sequence) archive!.commit(pending, false);
+      }
       writeFileAtomic(this.#dedupePath(intent.dedupeKey, ".json"), JSON.stringify(event), { durable: true });
     }
     this.#removeDedupeIntent(file);
@@ -842,6 +867,8 @@ export class MeshStore {
         } satisfies MeshDedupeIntent), { durable: true });
       }
       const pending = archive?.begin({ event, line });
+      // Test-only process-death fence: unlike an append exception, no rollback can run.
+      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
       try {
         fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
       } catch (error) {
@@ -942,7 +969,7 @@ export class MeshStore {
         }
         atomicWrite(this.#counterPath, Math.max(this.#readSequence(), last.event.sequence));
       }
-      archive.recovered(last);
+      archive.recovered(last, recovery.promote);
     }
     const archived = archive.head()?.sequence ?? 0;
     if (archived < this.#readLastEventSequence()) archive.catchUp(this.#liveEntriesAfter(archived));

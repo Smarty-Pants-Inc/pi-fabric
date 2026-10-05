@@ -74,6 +74,47 @@ describe("mesh event archive", () => {
     expect(() => archive.lookup(2)).toThrow("sequence index is unavailable");
   });
 
+  it("hides an aborted reservation even if death interrupts its negative sidecar, including reboot promotion", async () => {
+    const { root, dir, store } = setup();
+    const seed = await store.publish({ topic: "indexed.abort", from, text: "seed" });
+    const archive = new MeshArchive(dir, root);
+    const event = { ...seed, id: "archive-only", sequence: 2, dedupeKey: "abort-after-overtake", text: "orphan" };
+    archive.begin({ event, line: JSON.stringify(event) });
+    expect(archive.lookupEntry(2)?.committed).toBe(false);
+    const later = { ...seed, id: "later-live", sequence: 3 };
+    const pending = archive.begin({ event: later, line: JSON.stringify(later) });
+    fs.appendFileSync(path.join(root, "events.jsonl"), JSON.stringify(later) + "\n");
+    archive.commit(pending); // Overwrite/remove PENDING, as a mixed-version writer can do.
+    expect(archive.readAfter(1, 3, () => true, 100)).toEqual([later]);
+    const negative = vi.spyOn(archive, "reserveLookup").mockImplementationOnce(() => { throw new Error("death before negative index"); });
+    expect(() => archive.abort({ event, line: JSON.stringify(event) })).toThrow("death before negative index");
+    negative.mockRestore();
+    const index = path.join(dir, "sequence-index", "0", "2.json");
+    expect(JSON.parse(fs.readFileSync(index, "utf8"))).toMatchObject({ id: event.id, committed: false });
+    expect(archive.lookup(2)).toBeUndefined(); // The durable abort marker takes precedence over the positive address.
+    expect(archive.readAfter(1, 3, () => true, 100)).toEqual([later]);
+    fs.writeFileSync(path.join(dir, "BOOT"), "earlier-boot");
+    const recovery = archive.recover(1);
+    expect(recovery.rebooted).toBe(true);
+    expect(recovery.promote.map(entry => entry.event)).toEqual([later]);
+    archive.recovered(recovery.promote.at(-1), recovery.promote);
+    expect(archive.readAfter(1, 3, () => true, 100)).toEqual([later]);
+  });
+
+  it("marks a keyed reboot promotion live before archive cursor readers can deliver it", async () => {
+    const { root, dir, store } = setup();
+    const seed = await store.publish({ topic: "indexed.reboot", from, text: "seed" });
+    const archive = new MeshArchive(dir, root);
+    const event = { ...seed, id: "synced-keyed", sequence: 2, dedupeKey: "reboot-promotion", text: "synced" };
+    archive.begin({ event, line: JSON.stringify(event) });
+    fs.writeFileSync(path.join(root, "sequence"), "2");
+    fs.writeFileSync(path.join(dir, "BOOT"), "earlier-boot");
+    await store.publish({ topic: seed.topic, from, text: "after reboot" });
+    expect(archive.lookupEntry(2)).toMatchObject({ event, committed: true });
+    expect(store.read({ after: 1 }).filter(item => item.dedupeKey === event.dedupeKey)).toEqual([event]);
+    expect(store.nextEventAfter(1)).toEqual(event);
+  });
+
   it("writes each event to its topic's file for its UTC day, with the live log's bytes", async () => {
     const { store, file, lines, live, dir } = setup();
     vi.useFakeTimers({ now: Date.parse("2026-09-27T23:59:59.500Z"), toFake: ["Date"] });

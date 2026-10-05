@@ -257,7 +257,7 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     expect(failures.filter((message) => (message.data as { attempts?: number } | undefined)?.attempts !== undefined)).toHaveLength(3);
     expect(notices).toHaveLength(1);
     expect(notices[0]).toContain("Fabric host notice");
-    expect(actors.status(actor.id)).toMatchObject({ status: "idle", queued: 0, lastError: expect.stringMatching(/preparation.*timed out/i) });
+    expect(actors.status(actor.id)).toMatchObject({ status: "failed", queued: 0, lastError: expect.stringMatching(/preparation.*timed out/i) });
     expect(fs.readdirSync(path.dirname(actor.sessionFile!)).filter((file) => file.startsWith("queue-"))).toEqual([]);
     gate.resolve(); await pause(250);
     expect(calls).toBe(4);
@@ -299,7 +299,7 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     expect(run).toHaveBeenCalledTimes(1);
     expect(notices).toHaveLength(1);
     expect(after.status(actor.id)).toMatchObject({
-      status: "idle", queued: 0, activationBlocked: { code: "unknown", count: 1 },
+      status: "failed", queued: 0, activationBlocked: { code: "unknown", count: 1 },
     });
     expect(after.messages(actor.id).filter(message => message.direction === "out" && message.error)).toHaveLength(4);
     expect(fs.readdirSync(directory).filter((file) => file.startsWith("queue-"))).toEqual([]);
@@ -315,7 +315,7 @@ describe("round-four launch-preparation recovery (#3167)", () => {
       }, { actorRoot: path.join(root, "actors"), persistent: true });
     cleanups.push(async () => { await next.close(); });
     await pause(200);
-    expect(next.status(actor.id)).toMatchObject({ status: "idle", queued: 0, activationBlocked: { code: "unknown", count: 1 } });
+    expect(next.status(actor.id)).toMatchObject({ status: "failed", queued: 0, activationBlocked: { code: "unknown", count: 1 } });
     expect(run).toHaveBeenCalledTimes(1); // Terminal work never returns after another restart.
     expect(notices).toHaveLength(1);
     expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toHaveLength(1);

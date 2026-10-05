@@ -334,7 +334,7 @@ describe("native activation window (offline; opted-in success needs exact native
     return `${JSON.stringify(result)}\n${log.slice(-12_000)}`;
   };
   const setup = async (toolRounds = 0, oversizedRound = 0, toolTask?: string,
-    api: "openai-completions" | "google-generative-ai" = "openai-completions", fabric = false) => {
+    api: "openai-completions" | "google-generative-ai" = "openai-completions", fabric = false, runtimeTool = false) => {
     const dir = root();
     const requests: Array<Record<string, any>> = [];
     let requestCount = 0;
@@ -352,14 +352,16 @@ describe("native activation window (offline; opted-in success needs exact native
         }
         const round = toolTask ? payload.messages.filter((m: {role: string}) => m.role === "tool").length + 1 : requests.length;
         const currentTask = JSON.stringify(payload.messages.findLast((m: {role: string}) => m.role === "user"));
-        const useTool = (!toolTask || currentTask?.includes(toolTask)) && (toolRounds ? round <= toolRounds : payload.tools?.length && !payload.messages.some((m: {role: string}) => m.role === "tool"));
+        const useTool = runtimeTool ? requests.length === 1
+          : (!toolTask || currentTask?.includes(toolTask)) && (toolRounds ? round <= toolRounds : payload.tools?.length && !payload.messages.some((m: {role: string}) => m.role === "tool"));
         response.writeHead(200, { "Content-Type": "text/event-stream" });
         const chunk = (delta: unknown, finish_reason: string | null = null) => response.write(`data: ${JSON.stringify({
           id: "offline", object: "chat.completion.chunk", created: 1, model: "offline",
           choices: [{ index: 0, delta, finish_reason }],
         })}\n\n`);
         if (useTool) {
-          chunk({ role: "assistant", tool_calls: [{ index: 0, id: toolRounds ? `read-${round}` : "read-current", type: "function", function: { name: "read", arguments: JSON.stringify({ path: path.join(dir, toolRounds ? `task-${round}.txt` : "task.txt") }) } }] });
+          chunk({ role: "assistant", tool_calls: [{ index: 0, id: toolRounds ? `read-${round}` : "read-current", type: "function", function: { name: runtimeTool ? "fabric_exec" : "read", arguments: JSON.stringify(runtimeTool
+            ? { code: "return 1" } : { path: path.join(dir, toolRounds ? `task-${round}.txt` : "task.txt") }) } }] });
           chunk({}, "tool_calls");
         } else {
           chunk({ role: "assistant", content: "useful current result" });
@@ -376,7 +378,7 @@ describe("native activation window (offline; opted-in success needs exact native
     // Fake local credentials only. No model or fleet credential is read.
     fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({ providers: {
       "window-test": { baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "offline-only", api, models: [{
-        id: "offline", name: "offline", reasoning: false, input: ["text"], contextWindow: fabric ? 128000 : 8000, maxTokens: 1024,
+        id: "offline", name: "offline", reasoning: false, input: ["text"], contextWindow: fabric || runtimeTool ? 128000 : 8000, maxTokens: 1024,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       }] },
     } }));
@@ -1149,6 +1151,47 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(compacted.entries.some(entry => entry.type === "compaction" || entry.type === "context_edit")).toBe(false);
     expectJournalAppended(journalFile, compacted, true);
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
+  }, TEST_GUARD_MS);
+
+  it.skipIf(!selectedNativeBinary)("5256 disposes an activated actor runtime without waiting on a live mesh holder at native EOF", async () => {
+    const s = await setup(0, 0, undefined, "openai-completions", false, true);
+    const meshRoot = path.join(s.dir, "mesh");
+    const marker = path.join(s.dir, "shutdown-lock-state.json");
+    fs.mkdirSync(meshRoot);
+    fs.writeFileSync(path.join(s.dir, "agent", "fabric.json"), JSON.stringify({
+      fullCodeMode: true, schema: { mode: "off" }, mesh: { enabled: true },
+      entropy: { compile: false }, jev: { enabled: false }, autoReload: false,
+    }));
+    const extension = path.resolve(process.env.FABRIC_ACTIVATION_TEST_EXTENSION ?? "dist/index.js");
+    // The test's own live owner holds the lock until AFTER runtime disposal. A
+    // deferred release is just a hang guard; success must observe it still held.
+    fs.writeFileSync(path.join(s.dir, "noop.ts"), `
+      import fs from 'node:fs'; import path from 'node:path';
+      import fabric from ${JSON.stringify(extension)};
+      export default async function(pi) {
+        const lock = ${JSON.stringify(path.join(meshRoot, ".lock"))};
+        const owner = 'owned-eof-fixture\\n' + process.pid + '\\n' + Date.now() + '\\n';
+        pi.on('session_shutdown', () => {
+          fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, 'owner'), owner);
+          setTimeout(() => { if (fs.existsSync(lock) && fs.readFileSync(path.join(lock, 'owner'), 'utf8') === owner)
+            fs.rmSync(lock, {recursive:true}); }, 20_000).unref();
+        });
+        await fabric(pi);
+        pi.on('session_shutdown', () => {
+          const held = fs.existsSync(lock) && fs.readFileSync(path.join(lock, 'owner'), 'utf8') === owner;
+          fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({held}));
+          if (held) fs.rmSync(lock, {recursive:true});
+        });
+      }
+    `);
+    const journal = path.join(s.dir, "actor.jsonl");
+    const result = await s.manager.run({ task: "Activate Fabric, then finish.", model: "window-test/offline",
+      actorId: "eof-actor", sessionFile: journal, inferenceContext: "activation", extensions: true,
+      tools: ["fabric_exec"], transport: "process", meshRoot });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    expect(result.warnings ?? [], explain(result)).toEqual([]);
+    expect(s.requests).toHaveLength(2); // Fabric execution initialized its real runtime.
+    expect(JSON.parse(fs.readFileSync(marker, "utf8"))).toEqual({ held: true });
   }, TEST_GUARD_MS);
 
   it.skipIf(!selectedNativeBinary)("3704 journals and replays full Fabric guidance during real actor activations", async () => {

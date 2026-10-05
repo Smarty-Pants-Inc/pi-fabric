@@ -32,6 +32,7 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
+import { ActorRegistryStore } from "../actors/registry-store.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
@@ -275,8 +276,17 @@ export class ResidentHost {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { readCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
+    // Global order: actor registries (sorted path), then mesh, for publication,
+    // adoption and controls. Retain registry custody from the fresh source read
+    // through shared commits AND per-key copies: releasing it before the mesh
+    // wait would let a delayed heartbeat republish a successor's adopted actor.
+    const registries = Object.values(residentActorRoots(config)).map((root) => new ActorRegistryStore(root));
+    const publishFenced = <T>(publish: () => Promise<T>): Promise<T> =>
+      ActorRegistryStore.withLocks(registries, publish);
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
+      renewActorParticipants: true,                            // host fence outlives its Main
+      withPublicationFence: publishFenced,
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,
@@ -1182,6 +1192,10 @@ export class ResidentHost {
       if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
         throw new Error(`Fabric residency request ${requestId} was abandoned before commit`);
       }
+      // Global order: actor registries (sorted path), then mesh. Dispatch controls
+      // OUTSIDE mesh.exclusive: create/remove/setters acquire their own registry
+      // mutation fence and only afterwards publish presence on the mesh. Holding
+      // mesh custody here would invert the heartbeat/adoption publication fence.
       response = await this.#executeOnce(command, boundaryAdmitted);
     } catch (error) {
       response = { format: RESIDENT_HOST_FORMAT, requestId, ok: false, error: errorMessage(error),

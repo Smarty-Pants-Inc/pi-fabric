@@ -55,13 +55,15 @@ describe("participant canonical snapshot", () => {
     });
     const reads = vi.spyOn(atomicWrite, "readFileRetrying");
     expect(directory.list({ fresh: true, includeStale: true }).find((p) => p.id === "p")?.name).toBe("before");
-    expect(reads).toHaveBeenCalledTimes(1);
+    // self() already captured the unchanged canonical bytes. Freshness validates physical
+    // identity and reuses that snapshot, without another parse for the directory scan.
+    expect(reads).toHaveBeenCalledTimes(0);
     expect(selections).toHaveBeenCalledTimes(4);
     const snapshot = selections.mock.calls[0]![1]!.snapshot;
     expect(snapshot).toBeDefined();
     expect(selections.mock.calls.every(([, options]) => options?.snapshot === snapshot)).toBe(true);
     expect(directory.list({ fresh: true, includeStale: true }).find((p) => p.id === "p")?.name).toBe("after");
-    expect(reads).toHaveBeenCalledTimes(2);
+    expect(reads).toHaveBeenCalledTimes(1); // The legacy replacement has no journal: one new parse.
     expect(selections.mock.calls[4]![1]!.snapshot).not.toBe(snapshot);
   });
 

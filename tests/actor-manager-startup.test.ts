@@ -62,17 +62,34 @@ async function eventually(predicate: () => boolean) {
 }
 
 describe("ActorManager bounded startup (#4250 item 4)", () => {
-  it("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in slices below 250ms", async () => {
+  it("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in bounded event-loop slices", async () => {
     const f = fixture(200);
     const rawOwnership = vi.fn(() => true);
     const snapshot = vi.fn(() => new Map(f.records.map((record) => [record.id, true])));
     const read = vi.spyOn(ActorRegistryStore.prototype, "read");
     const write = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const runsPerActor = 10; // Includes the lastRunId fence in fixture().
+    const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
+    const runDirectories = new Set(f.records.map((_, actor) => path.dirname(f.runDir(actor, 0))));
+    const readdir = fs.readdirSync;
+    let runsThisTurn = 0, totalRuns = 0;
+    const runsPerTurn: number[] = [];
+    // Observe real archive enumeration, not elapsed time or a mocked pruning result.
+    vi.spyOn(fs, "readdirSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      const entries = Reflect.apply(readdir, fs, [file, ...args]);
+      if (runDirectories.has(String(file))) {
+        runsThisTurn += entries.length;
+        totalRuns += entries.length;
+      }
+      return entries;
+    }) as never);
     await turn();
     let previous = performance.now(), longest = 0, active = true;
     let heartbeat: NodeJS.Immediate;
     const beat = () => {
       const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
+      if (runsThisTurn) runsPerTurn.push(runsThisTurn);
+      runsThisTurn = 0;
       if (active) heartbeat = setImmediate(beat);
     };
     heartbeat = setImmediate(beat);
@@ -80,21 +97,30 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       const started = performance.now();
       f.make({ canManageActor: rawOwnership, snapshotActorOwnership: snapshot });
       const construction = performance.now() - started;
-      expect(construction).toBeLessThan(250);
+      expect(construction).toBeLessThan(2_000); // Gross-regression sanity, not a shared-runner performance SLA.
       expect(read).toHaveBeenCalledTimes(1);
       expect(write).not.toHaveBeenCalled();
       expect(snapshot).toHaveBeenCalledTimes(1);
       expect(rawOwnership).not.toHaveBeenCalled();
       // No archive traversal or deletion on the constructor stack.
+      expect(totalRuns).toBe(0);
       expect(fs.existsSync(f.runDir(0, 0))).toBe(true);
       await eventually(() => !fs.existsSync(f.runDir(199, 8)));
       await turn();
-      expect(longest).toBeLessThan(250);
+      // A recurring setImmediate observes every maintenance turn. A microtask
+      // yield (or no yield) cannot reset the counter, even on a fast filesystem.
+      expect(totalRuns).toBe(f.records.length * runsPerActor);
+      expect(Math.max(...runsPerTurn)).toBeGreaterThan(0);
+      expect(Math.max(...runsPerTurn)).toBeLessThanOrEqual(batchSize * runsPerActor);
+      expect(runsPerTurn.length).toBeGreaterThanOrEqual(Math.ceil(f.records.length / batchSize));
+      expect(longest).toBeLessThan(2_000); // Allow CI descheduling/GC; work per turn is the regression gate.
       for (let actor = 0; actor < 200; actor++) {
         for (let run = 0; run < 9; run++) expect(fs.existsSync(f.runDir(actor, run))).toBe(false);
         expect(fs.existsSync(f.runDir(actor, 9))).toBe(true); // lastRunId fence survives
       }
-      console.log(`ActorManager 200/2000: constructor=${construction.toFixed(1)}ms longestSlice=${longest.toFixed(1)}ms`);
+      process.stdout.write(JSON.stringify({ probe: "ActorManager 200/2000", constructorMs: construction,
+        longestSliceMs: longest, totalRuns, maxRunsPerTurn: Math.max(...runsPerTurn),
+        runsPerTurnLimit: batchSize * runsPerActor, workTurns: runsPerTurn.length }) + "\n");
     } finally { active = false; clearImmediate(heartbeat!); }
   });
 

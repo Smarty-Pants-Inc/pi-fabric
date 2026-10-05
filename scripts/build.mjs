@@ -53,6 +53,7 @@ const lazyEntryPoints = [
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
   "src/agents/veda-cli.ts",
+  "src/agents/transports/placement.ts",
   "src/fabric-runtime-state.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",

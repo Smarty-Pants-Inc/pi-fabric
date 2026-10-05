@@ -76,7 +76,7 @@ export interface MeshReadOptions {
 }
 
 export interface MeshStoreOptions {
-  /** Captured at construction, never reloaded. Defaults to B68-compatible protocol 1. */
+  /** Captured at construction, never reloaded. Defaults to 1 pending the namespace-reader rollout. */
   lockProtocol?: MeshLockProtocol;
   maxEventLogBytes?: number;
   retainedEventLogBytes?: number;

@@ -15,11 +15,13 @@ afterEach(() => {
 // Exercise the real acquisition/reclaim path with a virtual age, not a configurable
 // production lease or two-minute sleep. All mesh roots are isolated temporary directories.
 describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity (#4383)", () => {
-  const setup = (lockProtocol: 1 | 2) => {
+  const setup = (lockProtocol?: 1 | 2) => {
     vi.useFakeTimers({ now: Date.now() });
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-lock-nspid-"));
     roots.push(root);
-    const store = new MeshStore(root, 65536, 100, { lockProtocol, lockTimeoutMs: 100 });
+    const store = new MeshStore(root, 65536, 100, {
+      ...(lockProtocol === undefined ? {} : { lockProtocol }), lockTimeoutMs: 100,
+    });
     const lock = path.join(root, ".lock");
     const ownerPath = path.join(lock, "owner");
     const namespace = fs.readlinkSync("/proc/self/ns/pid");
@@ -44,8 +46,10 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
     return { root, store, lock, ownerPath, namespace, foreign, receipt, hold, fences, timeout };
   };
 
-  for (const protocol of [1, 2] as const) {
-    it(`protocol ${protocol} records both Linux process identities`, async () => {
+  // The public default must preserve the same identity/reclaim guarantees as explicit selections.
+  for (const protocol of [undefined, 1, 2] as const) {
+    const label = protocol ?? "default (1)";
+    it(`protocol ${label} records both Linux process identities`, async () => {
       const h = setup(protocol);
       const start = await ownProcessIncarnation();
       await h.store.exclusive(() => {
@@ -58,7 +62,7 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
       expect(fs.existsSync(h.lock)).toBe(false);
     });
 
-    it(`protocol ${protocol} never reclaims a same-namespace live owner even beyond the age bound`, async () => {
+    it(`protocol ${label} never reclaims a same-namespace live owner even beyond the age bound`, async () => {
       const h = setup(protocol);
       const old = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS - 1000;
       const owner = h.receipt("live", process.pid, old, h.namespace, (await ownProcessIncarnation())!);
@@ -70,7 +74,27 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
       expect(h.fences()).toEqual([]);
     });
 
-    it(`protocol ${protocol} immediately reclaims a same-namespace dead owner`, async () => {
+    it(`protocol ${label} immediately reclaims a reused same-namespace PID with the five-line receipt`, async () => {
+      const h = setup(protocol);
+      const start = (await ownProcessIncarnation())!;
+      h.hold(h.receipt("reused", process.pid, Date.now(), h.namespace, String(BigInt(start) + 1n)), Date.now());
+      const operation = vi.fn(() => "recovered");
+      await expect(h.store.exclusive(operation)).resolves.toBe("recovered");
+      expect(operation).toHaveBeenCalledOnce();
+      expect(h.fences()).toHaveLength(1);
+    });
+
+    it(`protocol ${label} fails closed on a malformed fifth-line namespace even for a dead PID`, async () => {
+      const h = setup(protocol);
+      const at = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS - 1000;
+      const owner = h.receipt("malformed", 999999999, at, "not-a-pid-namespace");
+      h.hold(owner, at);
+      await h.timeout();
+      expect(fs.readFileSync(h.ownerPath, "utf8")).toBe(owner);
+      expect(h.fences()).toEqual([]);
+    });
+
+    it(`protocol ${label} immediately reclaims a same-namespace dead owner`, async () => {
       const h = setup(protocol);
       h.hold(h.receipt("dead", 999999999, Date.now(), h.namespace), Date.now());
       const operation = vi.fn(() => "recovered");
@@ -79,7 +103,7 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
       expect(h.fences()).toHaveLength(1);
     });
 
-    it.each([process.pid, 999999999])(`protocol ${protocol} protects a young foreign owner with local PID %s without any liveness probe`, async pid => {
+    it.each([process.pid, 999999999])(`protocol ${label} protects a young foreign owner with local PID %s without any liveness probe`, async pid => {
       const h = setup(protocol);
       await ownProcessIncarnation(); // populate own-start cache before auditing holder reads
       const at = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS + 1000;
@@ -95,7 +119,7 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
       expect(h.fences()).toEqual([]);
     });
 
-    it(`protocol ${protocol} reclaims an expired foreign owner exactly once across contenders`, async () => {
+    it(`protocol ${label} reclaims an expired foreign owner exactly once across contenders`, async () => {
       const h = setup(protocol);
       const at = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS - 1000;
       h.hold(h.receipt("foreign-old", process.pid, at), at);
@@ -104,7 +128,7 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
       const rename = vi.spyOn(fs, "renameSync");
       const operations = Array.from({ length: 16 }, () => vi.fn());
       const pending = operations.map(operation => new MeshStore(h.root, 65536, 100, {
-        lockProtocol: protocol, lockTimeoutMs: 1000,
+        ...(protocol === undefined ? {} : { lockProtocol: protocol }), lockTimeoutMs: 1000,
       }).exclusive(operation));
       await vi.advanceTimersByTimeAsync(1000);
       await Promise.all(pending);
@@ -115,7 +139,7 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
       expect(fs.existsSync(h.lock)).toBe(false);
     });
 
-    it(`protocol ${protocol} resets foreign-owner age when the token changes, even with a copied old timestamp`, async () => {
+    it(`protocol ${label} resets foreign-owner age when the token changes, even with a copied old timestamp`, async () => {
       const h = setup(protocol);
       const at = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS - 1000;
       h.hold(h.receipt("previous", process.pid, at), at);
@@ -129,7 +153,7 @@ describe.skipIf(process.platform !== "linux")("mesh lock PID namespace identity 
       expect(h.fences()).toHaveLength(1);
     });
 
-    it(`protocol ${protocol} refuses expired-owner reclaim if the token changes during the final comparison`, async () => {
+    it(`protocol ${label} refuses expired-owner reclaim if the token changes during the final comparison`, async () => {
       const h = setup(protocol);
       const at = Date.now() - FOREIGN_PID_NAMESPACE_LOCK_MS - 1000;
       h.hold(h.receipt("previous", process.pid, at), at);

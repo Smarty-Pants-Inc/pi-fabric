@@ -281,7 +281,7 @@ const meshLockProtocol = (value: unknown): MeshLockProtocol => {
 };
 
 export interface FabricMeshConfig {
-  /** Startup-only wire protocol; 1 preserves compatibility with B68 writers. */
+  /** Startup-only acquisition protocol; defaults to 1 pending the namespace-reader rollout. */
   lockProtocol: MeshLockProtocol;
   enabled: boolean;
   root?: string;

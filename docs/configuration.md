@@ -558,8 +558,12 @@ Sessions that share one `mesh.root` share one participant directory, so each see
 
 `mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing
-store. Protocol 1 keeps the B68 canonical-directory mkdir and leading token/PID/time
-fields. On Linux both protocols append the process start time (kernel clock ticks) and
+store. The default remains `1` because the fleet's older readers cannot safely recover
+namespace-bearing receipts; see the [mixed-version audit and rollout order](mesh-lock-rollout.md).
+Selecting `1` does **not** restore the old Linux wire: both protocols already append the
+namespace field. Do not mix these writers with the older readers listed in that audit.
+Protocol 1 keeps the B68 canonical-directory mkdir and leading token/PID/time fields.
+On Linux both protocols append the process start time (kernel clock ticks) and
 PID namespace identity (`/proc/self/ns/pid`, for example `pid:[4026531836]`). Elsewhere
 protocol 1 keeps its three-line wire: a reused live PID protects a dead owner's receipt
 until trusted repair after fencing all writers/cleaners.

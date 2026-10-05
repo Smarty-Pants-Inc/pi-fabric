@@ -68,7 +68,8 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       typeof value.identityId !== "string" ||
       typeof value.updatedAt !== "number" || !Number.isFinite(value.updatedAt) ||
       typeof value.expiresAt !== "number" || !Number.isFinite(value.expiresAt) ||
-      (value.startedAt !== undefined && (typeof value.startedAt !== "number" || !Number.isFinite(value.startedAt)))
+      (value.startedAt !== undefined && (typeof value.startedAt !== "number" || !Number.isFinite(value.startedAt))) ||
+      (value.session !== undefined && !validSession(value.session))
     ) return undefined;
     return {
       id: value.id, rootId: value.rootId, identityId: value.identityId,
@@ -111,6 +112,16 @@ export const readHostLeases = (meshRoot: string, options: { strict?: boolean } =
     const parsed = options.strict ? parseLease(path.join(dir, name), name) : undefined;
     if (options.strict && (!parsed?.read || !parsed.lease)) throw new Error("Unreadable or invalid host lease");
     const lease = options.strict ? parsed!.lease : cachedLease(known, dir, name, stat);
+    if (options.strict && lease) {
+      // Canonical Main/resident ids encode their root and cannot testify for another
+      // lineage. Generic hosts may legitimately have a distinct identity id.
+      const canonical = lease.id.startsWith("session:") || lease.id.startsWith("resident:");
+      const expected = lease.id.startsWith("resident:")
+        ? `resident:${createHash("sha256").update(lease.rootId).digest("hex").slice(0, 24)}` : lease.rootId;
+      if (canonical && (lease.id !== expected || lease.identityId !== lease.id)) {
+        throw new Error("Contradictory canonical host lease attribution");
+      }
+    }
     if (lease) leases.set(lease.id, lease);
   }
   for (const name of known.keys()) if (!present.has(name)) known.delete(name);

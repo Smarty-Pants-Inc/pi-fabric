@@ -208,7 +208,7 @@ const entryOf = (text: string, name: string): MeshStateEntry | undefined => {
     if (
       value?.format !== 1 ||
       value.key !== `${PREFIX}${name.slice(0, -5)}` ||
-      typeof value.updatedAt !== "number" ||
+      typeof value.updatedAt !== "number" || !Number.isFinite(value.updatedAt) ||
       typeof value.version !== "number" ||
       typeof updatedBy !== "object" || updatedBy === null || typeof updatedBy.id !== "string"
     ) return undefined;

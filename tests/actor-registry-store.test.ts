@@ -169,6 +169,26 @@ describe("ActorRegistryStore", () => {
     expect(store.records()).toEqual([record]);
   });
 
+  it("strict custody distinguishes an absent registry from unreadable or malformed evidence", () => {
+    const { store, actorRoot, registryPath } = setup();
+    expect(store.records({ strict: true })).toEqual([]);
+    fs.mkdirSync(actorRoot);
+    for (const raw of ["bad json", "null", "[]", '{"actors":{}}', '{"actors":[{"id":"actor"}]}',
+      '{"actors":[{"id":"actor","rootId":"root","ownershipToken":7}]}']) {
+      fs.writeFileSync(registryPath, raw);
+      expect(() => store.records({ strict: true })).toThrow();
+    }
+    const row = { id: "actor", rootId: "root", ownershipToken: "generation", future: true };
+    fs.writeFileSync(registryPath, JSON.stringify({ format: 1, actors: [row] }));
+    expect(store.records({ strict: true })).toEqual([row]);
+    const read = fs.readFileSync.bind(fs);
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(file) === registryPath) throw Object.assign(new Error("unreadable"), { code: "EACCES" });
+      return (read as (...args: unknown[]) => unknown)(file, ...args);
+    }) as typeof fs.readFileSync);
+    expect(() => store.records({ strict: true })).toThrow("unreadable");
+  });
+
   it("releases its lock on a throwing callback and propagates the original error", async () => {
     const { store, lockPath } = setup();
     const error = new Error("write failed");

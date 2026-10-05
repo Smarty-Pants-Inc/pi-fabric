@@ -189,8 +189,8 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !value.capabilities.every(
       (capability) => typeof capability === "string" && capabilities.has(capability),
     ) ||
-    typeof value.startedAt !== "number" ||
-    typeof value.updatedAt !== "number" ||
+    typeof value.startedAt !== "number" || !Number.isFinite(value.startedAt) ||
+    typeof value.updatedAt !== "number" || !Number.isFinite(value.updatedAt) ||
     value.controlProtocol !== "v1" &&
     value.controlProtocol !== "legacy"
   ) {
@@ -938,7 +938,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       return Math.max(2 * longestTtl, floor);
     };
     const remember = (at: number): void => {
-      if (!Number.isFinite(at)) throw new Error("Invalid lineage presence time");
+      if (!Number.isFinite(at) || at < 0 || at > now) throw new Error("Invalid lineage presence time");
       lastSeen = Math.max(lastSeen, at);
     };
     const leaseEvidence = (updatedAt: number, expiresAt: number): boolean => {
@@ -964,6 +964,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     for (const lease of readHostLeases(this.mesh.root, { strict: true }).values()) {
       if (lease.rootId !== target && lease.id !== target && lease.id !== residentId) continue;
+      if ((lease.id === target || lease.id === residentId) && lease.rootId !== target) return true;
+      remember(lease.updatedAt);
+      if (lease.startedAt !== undefined) remember(lease.startedAt);
+      if (lease.session) {
+        if (lease.session.id !== target) return true;
+        remember(lease.session.startedAt);
+        remember(lease.session.updatedAt);
+        if (leaseEvidence(lease.session.updatedAt, lease.session.expiresAt)) return true;
+      }
       if (leaseEvidence(lease.updatedAt, lease.expiresAt)) return true;
     }
 
@@ -989,7 +998,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (!participant || participant.remoteHost !== undefined || entry.key !== keyFor(PARTICIPANT_PREFIX, participant.id)) return true;
       // A root advertised under another key is conflicting evidence, not death.
       if (participant.kind === "root") return true;
-      remember(Math.max(entry.updatedAt, participant.updatedAt));
+      // Validate independently: Math.max can hide -Infinity behind a finite renewal.
+      remember(entry.updatedAt);
+      remember(participant.updatedAt);
+      remember(participant.startedAt);
       // Child/host presence can veto death, but only actor presence supplies
       // the required retained history when the Main record itself is absent.
       if (participant.kind === "actor") knownPresence = true;

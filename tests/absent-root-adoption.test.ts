@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -23,7 +24,7 @@ const wait = async (predicate: () => boolean) => {
   const end = Date.now() + 10_000;
   while (!predicate()) { if (Date.now() > end) throw new Error("Adoption observation timed out"); await new Promise(resolve => setTimeout(resolve, 20)); }
 };
-const fixture = async () => {
+const fixture = async (suspendedOwner = false, ownerOpinion?: () => boolean | undefined) => {
   const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "absent-adoption-"));
   cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -32,10 +33,12 @@ const fixture = async () => {
   const config = { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 };
   const owner = new ActorManager("absent-main", identity(oldRoot), mesh, config, agents, () => {}, {
     actorRoot: path.join(root, "actors"), persistent: true, rootId: oldRoot, project: root, role: "project-agent", claimResidency: "durable",
+    ...(ownerOpinion ? { canManageActor: ownerOpinion } : {}),
   });
   cleanups.push(() => owner.close());
   const actor = await owner.create({ name: "retained", instructions: "Handle exactly once.", residency: "durable", topics: ["absent.proof"], responseMode: "text" });
-  await owner.close();
+  if (suspendedOwner) owner.pauseForRelease();
+  else await owner.close();
   const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: "observer", rootId: "observer", identity: identity("observer"), reapDeadHosts: false });
   cleanups.push(() => directory.close());
   const old = Date.now() - 20 * 60_000;
@@ -69,7 +72,7 @@ const fixture = async () => {
     cleanups.push(() => manager.close());
     return manager;
   };
-  return { root, mesh, actor, directory, candidate, deliveries, agents };
+  return { root, mesh, actor, directory, candidate, deliveries, agents, owner };
 };
 
 const retainActorFile = (f: Awaited<ReturnType<typeof fixture>>) => {
@@ -81,10 +84,117 @@ const retainActorFile = (f: Awaited<ReturnType<typeof fixture>>) => {
       updatedAt: old, controlProtocol: "v1" },
   });
 };
+type AdoptionFixture = Awaited<ReturnType<typeof fixture>>;
+const participantPath = (f: AdoptionFixture) => path.join(f.mesh.root, "participants", key("topology/participants/", f.actor.id).slice("topology/participants/".length) + ".json");
+const leasePath = (f: AdoptionFixture, id: string) => path.join(f.mesh.root, "host-leases", createHash("sha256").update(id).digest("hex").slice(0, 32) + ".json");
+const rawTimestamp = (file: string, fields: string[], literal: string) => {
+  const value = JSON.parse(fs.readFileSync(file, "utf8"));
+  let cursor = value;
+  for (const field of fields.slice(0, -1)) cursor = cursor[field];
+  cursor[fields.at(-1)!] = "INVALID_TIME";
+  fs.writeFileSync(file, JSON.stringify(value).replace('"INVALID_TIME"', literal));
+};
+const fileEvidenceVeto = async (stage: "initial" | "locked", damage: (f: AdoptionFixture) => void) => {
+  const f = await fixture();
+  await f.mesh.delete({ key: "actors/absent-main/" + f.actor.id });
+  retainActorFile(f); // The only retained actor history is a file, not shared state.
+  expect(f.directory.lineageAdoptable(oldRoot)).toBe(true);
+  const writes = vi.spyOn(ActorRegistryStore.prototype, "write");
+  const guard = f.directory.lineageAdoptable.bind(f.directory);
+  let calls = 0;
+  if (stage === "initial") damage(f);
+  else vi.spyOn(f.directory, "lineageAdoptable").mockImplementation(id => {
+    if (id === oldRoot && ++calls === 2) {
+      expect(fs.existsSync(path.join(f.root, "actors", "actors.json.lock", "owner"))).toBe(true);
+      expect(fs.existsSync(path.join(f.mesh.root, ".lock", "owner"))).toBe(true);
+      damage(f);
+    }
+    return guard(id);
+  });
+  const next = await f.candidate("file-evidence-candidate");
+  if (stage === "locked") await wait(() => calls >= 2);
+  else await new Promise(resolve => setTimeout(resolve, 60));
+  expect(f.directory.lineageAdoptable(oldRoot)).toBe(false);
+  expect(next.owns(f.actor.id)).toBe(false);
+  expect(next.status(f.actor.id).rootId).toBe(oldRoot);
+  expect(writes.mock.calls.flatMap(([rows]) => rows).filter(row => row.id === f.actor.id && row.adoptedAt !== undefined)).toHaveLength(0);
+  expect(new ActorRegistryStore(path.join(f.root, "actors")).records().find(row => row.id === f.actor.id)?.rootId).toBe(oldRoot);
+  await next.close();
+};
 const damagedStates = ["{truncated", "", " \n\t", "{}", '{"format":1,"entries":{"hidden":{"key":"other"}}}',
   '{"format":1,"entries":{}}\n{"format":1,"entries":{}}'] as const;
 
 describe("F3059 aged absent-root adoption", () => {
+  it.each(["missing", "stale-positive"])("fences an existing suspended predecessor with %s directory opinion before the adopter publishes its participant", async mode => {
+    // Stop only A's polling, not its manager: its original actor and cached ownership
+    // survive the entire absence. B starts normally after the spy is restored.
+    let dispatch!: ActorMeshMonitor["callbacks"]["onEvent"];
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
+      dispatch = this.callbacks.onEvent;
+    });
+    let opinion: boolean | undefined;
+    const f = await fixture(true, mode === "stale-positive" ? () => opinion : undefined);
+    start.mockRestore();
+    expect(f.owner.owns(f.actor.id)).toBe(true);
+    const next = await f.candidate("suspended-successor");
+    await wait(() => next.owns(f.actor.id));
+    const store = new ActorRegistryStore(path.join(f.root, "actors"));
+    const committed = store.records().find(row => row.id === f.actor.id)!;
+    expect(committed.rootId).toBe("session:suspended-successor");
+    expect(committed.ownershipToken).toEqual(expect.any(String));
+    if (mode === "stale-positive") opinion = true; // stale A advertisement cannot overrule committed custody
+    // No successor actor participant yet: directory fallback must not revive A.
+    expect(f.directory.get(f.actor.id, Date.now(), { fresh: true })).toBeUndefined();
+    // A locked save before any list/status reload used to restore the stale A row.
+    await f.owner.checkpointForRelease();
+    expect(store.records().find(row => row.id === f.actor.id)).toEqual(committed);
+    f.owner.resumeAfterRelease();
+    expect(f.owner.listOwned()).toEqual([]);
+    expect(f.owner.owns(f.actor.id)).toBe(false);
+    expect(() => f.owner.tell(f.actor.id, "STALE_DIRECT")).toThrow("owned by another host");
+    await expect(f.owner.setInstructions(f.actor.id, "STALE_WRITE")).rejects.toThrow("owned by another host");
+    const event = await f.mesh.publish({ topic: "absent.proof", from: identity("sender"), text: "RESUMED_EVENT" });
+    expect(dispatch(event)).toBe("ignored");
+    await wait(() => next.messages(f.actor.id).some(message => message.direction === "out"));
+    // Passive message listings may mirror B's shared registry; dispatch's ignored
+    // result and the unchanged A presence, not that listing, prove no A consumption.
+    expect(next.messages(f.actor.id).filter(message => message.direction === "in" &&
+      JSON.stringify(message.data).includes("RESUMED_EVENT"))).toHaveLength(1);
+    expect(f.mesh.get("actors/absent-main/" + f.actor.id)?.updatedAt).toBeLessThan(Date.now() - 10 * 60_000);
+    await f.owner.close();
+    const retained = store.records().find(row => row.id === f.actor.id)!;
+    expect(retained).toMatchObject({ rootId: committed.rootId, ownershipToken: committed.ownershipToken, adoptedAt: committed.adoptedAt });
+    expect(retained.adoptedFrom).toEqual(committed.adoptedFrom);
+  });
+
+  it("rejects a predecessor registry/presence save that resumes custody acquisition after the claim", async () => {
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    const f = await fixture(true);
+    start.mockRestore();
+    const lock = ActorRegistryStore.prototype.withLock;
+    let entered = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const custody = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(async function <T>(this: ActorRegistryStore, operation: () => T | Promise<T>): Promise<T> {
+      if (!entered) { entered = true; await gate; }
+      return lock.call(this, operation) as Promise<T>;
+    });
+    // Admitted while A still owns the row; suspend before taking registry custody.
+    const staleSave = f.owner.setInstructions(f.actor.id, "STALE_PREDECESSOR_INSTRUCTIONS");
+    await wait(() => entered);
+    try {
+      const next = await f.candidate("custody-successor");
+      await wait(() => next.owns(f.actor.id));
+      const store = new ActorRegistryStore(path.join(f.root, "actors"));
+      const committed = store.records().find(row => row.id === f.actor.id)!;
+      expect(committed.instructions).not.toBe("STALE_PREDECESSOR_INSTRUCTIONS");
+      release();
+      await staleSave;
+      expect(store.records().find(row => row.id === f.actor.id)).toEqual(committed);
+      expect(f.owner.listOwned()).toEqual([]);
+      expect(f.mesh.get("actors/absent-main/" + f.actor.id)?.updatedAt).toBeLessThan(Date.now() - 10 * 60_000);
+    } finally { release(); await staleSave; custody.mockRestore(); }
+  });
+
   it("reaps the root, then two same-project project-agent hosts adopt and run one event exactly once", async () => {
     const f = await fixture();
     expect(f.directory.lineageAlive(oldRoot)).toBe(true);
@@ -102,6 +212,43 @@ describe("F3059 aged absent-root adoption", () => {
     expect(messages.filter(message => message.direction === "in" && JSON.stringify(message.data).includes("ADOPTED_EVENT"))).toHaveLength(1);
     expect(messages.filter(message => message.direction === "out")).toEqual([expect.objectContaining({ text: "fake worker complete", runId: expect.any(String) })]);
     expect(JSON.parse(fs.readFileSync(path.join(f.root, "actors", "actors.json"), "utf8")).actors).toHaveLength(1);
+  });
+
+  describe.each(["initial", "locked"] as const)("strict file evidence in the %s check", stage => {
+    it.each([oldRoot, residentHostId(oldRoot)].flatMap(hostId =>
+      ["wrong-root", "wrong-identity", "wrong-filename"].map(mode => [hostId, mode] as const)))
+      ("vetoes canonical lease %s with %s attribution", async (hostId, mode) => {
+        await fileEvidenceVeto(stage, f => {
+          const old = Date.now() - 20 * 60_000;
+          writeHostLease(f.mesh.root, { id: hostId, rootId: mode === "wrong-root" ? "session:other" : oldRoot,
+            identityId: mode === "wrong-identity" ? "session:other" : hostId, updatedAt: old, expiresAt: old + 15_000 });
+          if (mode === "wrong-filename") {
+            const file = leasePath(f, hostId);
+            const value = JSON.parse(fs.readFileSync(file, "utf8"));
+            value.id = "session:other";
+            fs.writeFileSync(file, JSON.stringify(value));
+          }
+        });
+      });
+
+    it.each(["entry", "value", "startedAt"].flatMap(field =>
+      ["-1e999", "1e999", "NaN", "999999999999999"].map(time => [field, time] as const)))
+      ("vetoes participant %s timestamp %s independently of its finite sibling", async (field, time) => {
+        await fileEvidenceVeto(stage, f => rawTimestamp(participantPath(f),
+          field === "entry" ? ["updatedAt"] : ["value", field === "value" ? "updatedAt" : "startedAt"], time));
+      });
+
+    it.each(["updatedAt", "expiresAt", "startedAt", "session.updatedAt"].flatMap(field =>
+      ["-1e999", "1e999", "NaN", "999999999999999"].map(time => [field, time] as const)))
+      ("vetoes host lease %s timestamp %s", async (field, time) => {
+        await fileEvidenceVeto(stage, f => {
+          const old = Date.now() - 20 * 60_000, hostId = residentHostId(oldRoot);
+          writeHostLease(f.mesh.root, { id: hostId, rootId: oldRoot, identityId: hostId, startedAt: old - 1000,
+            updatedAt: old, expiresAt: old + 15_000,
+            session: { id: oldRoot, startedAt: old - 1000, updatedAt: old, expiresAt: old + 15_000 } });
+          rawTimestamp(leasePath(f, hostId), field.split("."), time);
+        });
+      });
   });
 
   it.each(damagedStates)("vetoes damaged shared state %j despite retained old actor-file evidence", async damaged => {

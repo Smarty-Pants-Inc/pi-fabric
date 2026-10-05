@@ -118,6 +118,8 @@ interface ManagedActor {
   // this recently still has an adopter finding its footing — do not adopt
   // over it until ORPHAN_ADOPTION_RETRY_MS has elapsed.
   adoptedAt?: number;
+  /** Registry ownership incarnation; changes on every committed adoption (including ABA). */
+  ownershipToken?: string;
   // Roots whose queue files this lineage must take over (review/astra F5 on #79).
   adoptedFrom?: string[];
   // The creating root's project (smarty-dev#878): only that project's agent adopts the actor.
@@ -440,6 +442,9 @@ export class ActorManager {
   // Adoption compares against this snapshot so two racing adopters cannot
   // both move the same dead lineage: only the first fenced write succeeds.
   readonly #persistedRoots = new Map<string, string>();
+  readonly #persistedTokens = new Map<string, string | undefined>();
+  #custodyFingerprint: string | undefined;
+  #custodyRecords: Map<string, { rootId: unknown; ownershipToken: unknown }> | undefined;
   // In-flight fenced adoption attempts, one per actor.
   readonly #adoptionPending = new Map<string, Promise<void>>();
   readonly #adoptionGraceMs: number;
@@ -2162,7 +2167,7 @@ export class ActorManager {
     if (this.#actors.has(actor.id)) {
       this.#actors.delete(actor.id);
       try {
-        await this.#saveActors(new Set([actor.id]));
+        await this.#saveActors(new Set([actor.id]), { removalOwner: actor });
         if (!this.#registryRevoked(actor.id)) throw new Error(`Fabric actor ${actor.id}: registry revocation did not commit`);
       } catch (error) {
         // Not revoked: retain the actor and any accepted-removal marker for a later attempt.
@@ -3601,7 +3606,14 @@ export class ActorManager {
     const fence = actor ? undefined : this.#orphanPresence.get(id);
     try {
       if (actor) {
-        await this.mesh.put({ key: this.#presenceKey(id), value: this.#publicInfo(actor), identity: this.identity });
+        const publish = () => {
+          if (this.#actors.get(id) !== actor || !this.#registryOwns(actor) || !this.#ownershipDecision(id)) return;
+          return this.mesh.put({ key: this.#presenceKey(id), value: this.#publicInfo(actor), identity: this.identity });
+        };
+        // Same registry -> mesh lock order as adoption. A suspended presence writer
+        // cannot commit its old advertisement after a successor's registry claim.
+        if (this.#persistent) await this.#registry.withLock(publish);
+        else await publish();
       } else {
         await this.mesh.delete({ key: this.#presenceKey(id), ...(fence !== undefined ? { ifVersion: fence } : {}) });
       }
@@ -3671,6 +3683,7 @@ export class ActorManager {
       name: actor.name,
       rootId: actor.rootId,
       ...(actor.adoptedAt !== undefined ? { adoptedAt: actor.adoptedAt } : {}),
+      ...(actor.ownershipToken !== undefined ? { ownershipToken: actor.ownershipToken } : {}),
       ...(actor.adoptedFrom?.length ? { adoptedFrom: actor.adoptedFrom } : {}),
       ...(actor.project ? { project: actor.project } : {}),
       instructions: actor.instructions,
@@ -3723,7 +3736,7 @@ export class ActorManager {
     };
   }
 
-  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean }): Promise<void> {
+  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean; removalOwner?: ManagedActor }): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     if (removedIds.size === 0 && !options?.durable && this.#savedActors) {
       const owned = [...this.#actors.values()].filter((actor) =>
@@ -3731,7 +3744,21 @@ export class ActorManager {
       if (JSON.stringify(owned.map((actor) => this.#serializedActor(actor))) === this.#savedActors.owned &&
         this.#registry.fingerprint() === this.#savedActors.fingerprint) return;
     }
+    const removalCustody = new Map([...removedIds].map(id => [id, {
+      rootId: options?.removalOwner?.id === id ? options.removalOwner.rootId : this.#persistedRoots.get(id),
+      ownershipToken: options?.removalOwner?.id === id ? options.removalOwner.ownershipToken : this.#persistedTokens.get(id),
+    }]));
     await this.#registry.withLock(() => this.#withOwnershipRead(() => {
+      // Revalidate after custody acquisition: an adoption may have committed while
+      // this writer waited. Never revoke or overwrite a successor's incarnation.
+      const records = this.#registry.records({ strict: true });
+      this.#rememberCustody(records, this.#registry.fingerprint());
+      for (const id of removedIds) {
+        const current = records.find(record => record.id === id);
+        const expected = removalCustody.get(id)!;
+        if (current && (current.rootId !== expected.rootId ||
+          current.ownershipToken !== expected.ownershipToken)) throw new ActorRegistryOwnershipError();
+      }
       // Finalization fences reloads and serialization, but only this save's explicit ids
       // are authorized to revoke: their own durable write-ahead markers already exist.
       // Preserve every other finalizer's current registry row, prepared or not.
@@ -3739,14 +3766,18 @@ export class ActorManager {
         !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id),
       );
       const replaced = new Set([...removedIds, ...owned.map((actor) => actor.id)]);
-      const preserved = this.#registry.records().filter((record) => !replaced.has(record.id));
+      const preserved = records.filter((record) => !replaced.has(record.id));
       const actors = [...preserved, ...owned.map((actor) => this.#serializedActor(actor))];
       this.#registry.write(actors, { durable: removedIds.size > 0 || options?.durable === true });
       this.#registryFingerprint = this.#registry.fingerprint();
+      this.#rememberCustody(actors, this.#registryFingerprint);
       this.#savedActors = { owned: JSON.stringify(owned.map((actor) => this.#serializedActor(actor))),
         fingerprint: this.#registryFingerprint };
-      for (const id of removedIds) this.#persistedRoots.delete(id);
-      for (const actor of owned) this.#persistedRoots.set(actor.id, actor.rootId);
+      for (const id of removedIds) { this.#persistedRoots.delete(id); this.#persistedTokens.delete(id); }
+      for (const actor of owned) {
+        this.#persistedRoots.set(actor.id, actor.rootId);
+        this.#persistedTokens.set(actor.id, actor.ownershipToken);
+      }
       for (const record of preserved) {
         if (typeof record.rootId === "string") this.#persistedRoots.set(record.id, record.rootId);
       }
@@ -3826,6 +3857,9 @@ export class ActorManager {
     let added = 0;
     const firstLoads: ManagedActor[] = [];
     let parsed: unknown;
+    // Bind the snapshot to the identity observed BEFORE opening it: a rename
+    // during the read must not stamp old custody with the successor's fingerprint.
+    const loadedFingerprint = this.#registry.fingerprint();
     try {
       parsed = this.#registry.read();
     } catch (error) {
@@ -3835,6 +3869,7 @@ export class ActorManager {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
     const records = (parsed as { actors?: unknown }).actors;
     if (!Array.isArray(records)) return;
+    this.#rememberCustody(records, loadedFingerprint);
     // Every id the registry names, loadable or not: the orphan reaper's only evidence.
     this.#registryIds = new Set(records.flatMap((value) =>
       typeof value === "object" && value !== null && typeof (value as { id?: unknown }).id === "string"
@@ -3844,6 +3879,7 @@ export class ActorManager {
       const record = value as Partial<ManagedActor>;
       if (typeof record.id === "string" && typeof record.rootId === "string") {
         this.#persistedRoots.set(record.id, record.rootId);
+        this.#persistedTokens.set(record.id, typeof record.ownershipToken === "string" ? record.ownershipToken : undefined);
       }
     }
     for (const value of records) {
@@ -3887,6 +3923,7 @@ export class ActorManager {
         rootId: typeof record.rootId === "string" ? record.rootId : this.#rootId,
         ...(typeof record.project === "string" ? { project: record.project } : {}),
         ...(typeof record.adoptedAt === "number" ? { adoptedAt: record.adoptedAt } : {}),
+        ...(typeof record.ownershipToken === "string" ? { ownershipToken: record.ownershipToken } : {}),
         ...(Array.isArray(record.adoptedFrom)
           ? { adoptedFrom: record.adoptedFrom.filter((root): root is string => typeof root === "string") }
           : {}),
@@ -4069,7 +4106,7 @@ export class ActorManager {
   #persistQueue(actorId: string, durable = false, release = false): boolean {
     if (!this.#persistent || this.#closing) return false;
     const actor = this.#actors.get(actorId);
-    if (!actor) return false;
+    if (!actor || !this.#registryOwns(actor)) return false;
     const inFlight = this.#inFlight.get(actorId);
     const persistedIds = new Set<string>();
     const items = [
@@ -4460,9 +4497,50 @@ export class ActorManager {
     finally { this.#directoryOwnership = undefined; this.#directoryLineages = undefined; }
   }
 
+  #rememberCustody(records: unknown[], fingerprint: string | undefined): void {
+    if (!records.every(row => typeof row === "object" && row !== null &&
+      typeof (row as Record<string, unknown>).id === "string" &&
+      typeof (row as Record<string, unknown>).rootId === "string")) {
+      this.#custodyRecords = undefined;
+      return;
+    }
+    this.#custodyRecords = new Map(records.map(value => {
+      const row = value as Record<string, unknown>;
+      return [row.id as string, { rootId: row.rootId, ownershipToken: row.ownershipToken }];
+    }));
+    this.#custodyFingerprint = fingerprint;
+  }
+
+  /** Cheap stat on every authority boundary; parse once per registry incarnation. */
+  #registryOwns(actor: ManagedActor): boolean {
+    if (!this.#persistent || !this.meshConfig.enabled) return true;
+    const fingerprint = this.#registry.fingerprint();
+    if (!this.#custodyRecords || fingerprint !== this.#custodyFingerprint) {
+      try {
+        const parsed = this.#registry.read() as { actors?: Array<Record<string, unknown>> };
+        if (!Array.isArray(parsed?.actors) || !parsed.actors.every(row =>
+          row && typeof row.id === "string" && typeof row.rootId === "string")) return false;
+        this.#custodyRecords = new Map(parsed.actors.map(row => [row.id as string,
+          { rootId: row.rootId, ownershipToken: row.ownershipToken }]));
+        this.#custodyFingerprint = fingerprint;
+      } catch (error) {
+        // Only a never-persisted local creation may establish the first registry.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+        this.#custodyRecords = new Map();
+        this.#custodyFingerprint = fingerprint;
+      }
+    }
+    const current = this.#custodyRecords.get(actor.id);
+    if (!current) return this.#locallyCreated.has(actor.id) && !this.#persistedRoots.has(actor.id);
+    return current.rootId === actor.rootId && current.ownershipToken === actor.ownershipToken;
+  }
+
   #ownershipDecision(id: string, fresh = true): boolean {
     if (this.#ceded.has(id)) return false;
     const actor = this.#actors.get(id);
+    // Registry custody overrides even a stale-positive participant opinion.
+    if (actor && (!this.#registryOwns(actor) ||
+      (actor.ownershipToken !== undefined && actor.rootId !== this.#rootId))) return false;
     const decision = this.#directoryOwnership ? this.#directoryOwnership.get(id)
       : fresh ? this.#canManageActor?.(id) : this.#canManageActor?.(id, false);
 
@@ -4559,7 +4637,7 @@ export class ActorManager {
         const records = this.#registry.records();
         const current = records.find((record) => record.id === actor.id);
         // A racing adopter rewrote the lineage since we loaded it; they win.
-        if (!current || current.rootId !== expectedRootId) return false;
+        if (!current || current.rootId !== expectedRootId || current.ownershipToken !== actor.ownershipToken) return false;
         // A live owner opinion appeared while we waited for the lock.
         if (this.#canManageActor?.(actor.id) !== undefined) return false;
         // The lineage root turned out to be alive or unknown after all.
@@ -4585,10 +4663,12 @@ export class ActorManager {
           fs.existsSync(this.#queueFile(actor.id, root, actor.residency)));
         actor.rootId = this.#rootId;
         actor.adoptedAt = Date.now();
+        actor.ownershipToken = randomUUID();
         actor.updatedAt = Date.now();
         const preserved = records.filter((record) => record.id !== actor.id);
         this.#registry.write([...preserved, this.#serializedActor(actor)], { durable: true });
         this.#registryFingerprint = this.#registry.fingerprint();
+        this.#rememberCustody([...preserved, this.#serializedActor(actor)], this.#registryFingerprint);
         return true;
       }));
       // Close can also begin after the synchronous claim, before lock release
@@ -4596,6 +4676,7 @@ export class ActorManager {
       if (this.#closing) return;
       if (adopted) {
         this.#persistedRoots.set(actor.id, this.#rootId);
+        this.#persistedTokens.set(actor.id, actor.ownershipToken);
         this.#takeOverPredecessors(this.#actors.get(actor.id) ?? actor);
       } else {
         const current = this.#registry.records().find((record) => record.id === actor.id);
@@ -4870,6 +4951,9 @@ export class ActorManager {
   }
 
   #canManageCached(id: string): boolean {
+    const actor = this.#actors.get(id);
+    if (actor && (!this.#registryOwns(actor) ||
+      (actor.ownershipToken !== undefined && actor.rootId !== this.#rootId))) return false;
     return this.#ownership.get(id) ?? this.#ownershipDecision(id, false);
   }
 
@@ -4882,7 +4966,7 @@ export class ActorManager {
     let actor = this.#requireActor(id);
     this.#refreshOwnership();
     actor = this.#requireActor(actor.id);
-    if (!(this.#ownership.get(actor.id) ?? this.#ownershipDecision(actor.id))) {
+    if (!this.#canManageCached(actor.id)) {
       throw new Error(`Fabric actor is owned by another host: ${actor.id}`);
     }
     return actor;

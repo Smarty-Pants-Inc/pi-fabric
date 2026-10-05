@@ -45,11 +45,19 @@ export class ActorRegistryStore {
     this.#writer = new AtomicFileWriter(this.#registryPath);
   }
 
-  records(): Array<Record<string, unknown> & { id: string }> {
+  records(options: { strict?: boolean } = {}): Array<Record<string, unknown> & { id: string }> {
     try {
       const parsed = JSON.parse(fs.readFileSync(this.#registryPath, "utf8")) as {
         actors?: unknown;
       };
+      if (options.strict && (!Array.isArray(parsed?.actors) || !parsed.actors.every(record =>
+        typeof record === "object" && record !== null && !Array.isArray(record) &&
+        typeof (record as Record<string, unknown>).id === "string" &&
+        typeof (record as Record<string, unknown>).rootId === "string" &&
+        ((record as Record<string, unknown>).ownershipToken === undefined ||
+          typeof (record as Record<string, unknown>).ownershipToken === "string")))) {
+        throw new Error("Invalid actor registry custody");
+      }
       if (!Array.isArray(parsed.actors)) return [];
       return parsed.actors.flatMap((record) =>
         typeof record === "object" &&
@@ -59,7 +67,8 @@ export class ActorRegistryStore {
           ? [record as Record<string, unknown> & { id: string }]
           : [],
       );
-    } catch {
+    } catch (error) {
+      if (options.strict && errorCode(error) !== "ENOENT") throw error;
       return [];
     }
   }
@@ -157,7 +166,7 @@ export class ActorRegistryStore {
       if (Array.isArray(parsed?.actors)) previousActors = parsed.actors;
     } catch { /* Malformed bytes carry no accepted, recoverable decision. */ }
     const custody = (rows: readonly Record<string, unknown>[]): string => JSON.stringify(rows.map((row) =>
-      [row?.id, row?.rootId, row?.residency, row?.adoptedAt, row?.adoptedFrom]).sort((a, b) =>
+      [row?.id, row?.rootId, row?.residency, row?.adoptedAt, row?.adoptedFrom, row?.ownershipToken]).sort((a, b) =>
       String(a[0]).localeCompare(String(b[0]))));
     const durable = options?.durable === true || hasRemovalDecision(actors) ||
       actors.some((actor) => actor.adoptedAt !== undefined || actor.adoptedFrom !== undefined) ||

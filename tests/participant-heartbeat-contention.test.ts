@@ -55,6 +55,40 @@ const setup = async (files: boolean, leaseMs = 15_000, kind: MeshIdentity["kind"
 };
 
 describe("#3752 participant heartbeat contention", () => {
+  it.each([false, true])("#4383 no-change heartbeat takes no mesh lock even while a live writer holds it (policy: %s)", async files => {
+    const { root, directory, mesh, identity, advance, writes } = await setup(files);
+    const before = fs.readFileSync(path.join(root, "state.json"), "utf8");
+    const lock = path.join(root, ".lock");
+    fs.mkdirSync(lock);
+    const receipt = `held\n${process.pid}\n${Date.now()}\n`;
+    fs.writeFileSync(path.join(lock, "owner"), receipt);
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    const absenceBarrier = directory.confirmedAt();
+    advance(5_000);
+    await directory.refresh();
+    expect(writes).not.toHaveBeenCalled();
+    expect(mkdir.mock.calls.some(([file]) => String(file) === lock)).toBe(false);
+    expect(directory.confirmedAt()).toBe(absenceBarrier);
+    expect(directory.canConsumeMesh()).toBe(true);
+    expect(readHostLeases(root).get(identity.id)?.session?.expiresAt).toBe(Date.now() + 15_000);
+    expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(before);
+    expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(receipt);
+    fs.rmSync(lock, { recursive: true });
+    const stat = fs.lstatSync.bind(fs);
+    const uncertain = vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (String(file) === lock) throw Object.assign(new Error("unknown lock visibility"), { code: "EACCES" });
+      return (stat as (...args: unknown[]) => unknown)(file, ...args);
+    }) as typeof fs.lstatSync);
+    advance(5_000);
+    await directory.refresh();
+    expect(directory.confirmedAt()).toBe(absenceBarrier); // failed stat is not positive lock absence
+    expect(directory.canConsumeMesh()).toBe(true);
+    uncertain.mockRestore();
+    advance(5_000);
+    await directory.refresh();
+    expect(directory.confirmedAt()).toBe(Date.now());
+    expect(writes).not.toHaveBeenCalled();
+  });
   it.each([false, true])("all-new fleet renews both TTLs only in the small file (policy: %s)", async files => {
     const { root, directory, mesh, writes, advance, hostKey, participantKey, identity } = await setup(files, 120_000);
     const before = fs.readFileSync(path.join(root, "state.json"), "utf8");
@@ -76,7 +110,7 @@ describe("#3752 participant heartbeat contention", () => {
     expect(mesh.get(participantKey)).toEqual(participant);
     advance(15_001); // a crashed Main's session still lapses at the original fixed TTL
     if (session) expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(false);
-    await directory.refresh(); // lock-confirmed re-acquisition, without another identity rewrite
+    await directory.refresh(); // file-confirmed re-acquisition, without another identity rewrite
     if (session) expect(isLiveLegacyRootEntry(session, Date.now(), root)).toBe(true);
     expect(writes).not.toHaveBeenCalled();
   });

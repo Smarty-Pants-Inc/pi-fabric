@@ -37,6 +37,7 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/mesh/state-retention.ts",
   "src/residency/launcher-owner.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",

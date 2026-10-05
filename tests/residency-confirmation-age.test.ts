@@ -10,7 +10,7 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 
 vi.mock("../src/topology/participant-files.js", async original => ({ ...await original<typeof import("../src/topology/participant-files.js")>(), writeParticipantFileIf: vi.fn() }));
 const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
-it("file-only confirmation is stamped under the acquired lock, preserving delayed continuation age", async () => {
+it("file-only confirmation is stamped at probe completion, preserving delayed continuation age", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-confirmation-lock-"));
   const mesh = new MeshStore(root, 65536, 1000, { lockTimeoutMs: 2000 });
   const identity = { id: "owner", name: "owner", kind: "main" as const };
@@ -21,14 +21,15 @@ it("file-only confirmation is stamped under the acquired lock, preserving delaye
     let receipt = 0;
     const confirm = mesh.confirmWritable.bind(mesh);
     const fault = vi.spyOn(mesh, "confirmWritable").mockImplementation(async callback => {
+      await pause(340); // delayed filesystem probe, independent of the mesh lock
       await confirm(at => { receipt = at; callback?.(at); });
-      await pause(320); // successful acquisition, but delayed promise continuation
+      await pause(320); // successful probe, but delayed promise continuation
     });
     fs.mkdirSync(path.join(root, ".lock")); fs.writeFileSync(path.join(root, ".lock", "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
     const started = Date.now(); const renewing = directory.refresh();
     await pause(320); fs.rmSync(path.join(root, ".lock"), { recursive: true });
     await renewing;
-    expect(receipt).toBeGreaterThanOrEqual(started + 300); // not attempt start/pre-lock read
+    expect(receipt).toBeGreaterThanOrEqual(started + 300); // not attempt start/pre-probe read
     expect(directory.confirmedAt()).toBe(receipt); // not continuation end
     expect(directory.canConsumeMesh()).toBe(false);
     fault.mockRestore(); await directory.refresh(); expect(directory.canConsumeMesh()).toBe(true);

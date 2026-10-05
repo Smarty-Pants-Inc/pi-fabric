@@ -585,8 +585,8 @@ export const MESH_LOCK_TIMEOUT_CODE = "FABRIC_MESH_LOCK_TIMEOUT";
 /** A failed acquisition wrote nothing. Foreground callers must see this error, not a retry. */
 export class MeshLockTimeoutError extends Error {
   readonly code = MESH_LOCK_TIMEOUT_CODE;
-  constructor(readonly holder: string, readonly attempts: number, readonly maxGapMs: number) {
-    super(`${MESH_LOCK_TIMEOUT_CODE}: Timed out waiting for the Fabric mesh lock${holder} after ${attempts} attempts, largest gap between attempts ${maxGapMs} ms`);
+  constructor(readonly holder: string, readonly attempts: number, readonly maxGapMs: number, readonly waitedMs?: number) {
+    super(`${MESH_LOCK_TIMEOUT_CODE}: Timed out waiting for the Fabric mesh lock${holder}${waitedMs === undefined ? "" : `; this waiter waited ${waitedMs} ms`} after ${attempts} attempts, largest gap between attempts ${maxGapMs} ms`);
     this.name = "MeshLockTimeoutError";
   }
 }

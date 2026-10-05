@@ -11,6 +11,12 @@ import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 
+// Retention is write-only work: do not add its readers to registration/idle imports.
+let expiredStateKeys: typeof import("./state-retention.js").expiredStateKeys | undefined;
+const loadStateRetention = async (): Promise<void> => {
+  expiredStateKeys ??= (await import("./state-retention.js")).expiredStateKeys;
+};
+
 export interface MeshIdentity {
   id: string;
   name: string;
@@ -1484,6 +1490,27 @@ export class MeshStore {
   // previous one is dropped from the copy), so the canonical header alone identifies the commit
   // whether or not the optional signal is published afterwards. The stamped copy is cached.
   #commitState(state: MeshStateFile, reuse?: Map<string, EncodedStateEntry>, keys: string[] = [], caller?: string[]): void {
+    // Expiry joins the existing write and uses the same verified delete allocator as
+    // explicit deletes. Tombstone eviction must never reissue an old CAS token.
+    const expired = expiredStateKeys!(state.entries, this.root, Date.now());
+    if (expired.length > 0) {
+      const tombstones = new Set(state.tombstoneOrder ?? []);
+      for (const key of expired) {
+        const entry = state.entries[key]!;
+        const plan = captureStorageDelete({ key, ifVersion: entry.version })
+          .transition(true, entry.version, state.highWater!);
+        if (plan.kind !== "delete") throw new Error("Invalid verified retention delete plan");
+        delete state.entries[key];
+        state.versions ??= {};
+        state.versions[key] = plan.version;
+        state.highWater = plan.highWater;
+        tombstones.delete(key);
+        tombstones.add(key);
+      }
+      state.tombstoneOrder = [...tombstones];
+      compactStateTombstones(state, this.#maxStateTombstones);
+      keys = [...keys, ...expired];
+    }
     const payload: MeshStateFile = { ...state };
     delete payload.readGeneration;
     const generation = randomUUID();
@@ -1545,6 +1572,7 @@ export class MeshStore {
     const caller = commitTraceCaller();
     this.#validateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
+    if (!expiredStateKeys) await loadStateRetention();
     return this.#withLock(() => {
       const { state, reuse } = this.#readStateForWrite();
       const slot = stateSlot(state, request.key);
@@ -1581,15 +1609,21 @@ export class MeshStore {
   }
 
   /**
-   * Takes and releases the mesh lock without writing the state: evidence that the shared state is
-   * writable now, for a heartbeat that renewed only its file lease. Discards this store's cached
-   * snapshot so the next state read must read the canonical file, even if metadata is unchanged.
+   * Lock-free filesystem writability probe for a heartbeat that renewed only its file lease.
+   * This certifies write/rename access, not acquisition of the state mutation lock. Discards
+   * the cached snapshot even on failure: copied UUID/stat metadata cannot preserve ownership.
+   * The callback retains its historical name for compatibility, but receives probe completion.
    */
   async confirmWritable(onAcquired?: (at: number) => void): Promise<void> {
-    await this.#withLock(() => {
-      this.#stateCache = undefined;
-      onAcquired?.(Date.now());
-    });
+    this.#stateCache = undefined;
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    const probe = path.join(this.root, `.writable.${process.pid}.${randomUUID()}`);
+    try {
+      writeFileAtomic(probe, "");
+    } finally {
+      fs.rmSync(probe, { force: true });
+    }
+    onAcquired?.(Date.now());
   }
 
   async delete(input: {
@@ -1600,6 +1634,7 @@ export class MeshStore {
     const caller = commitTraceCaller();
     this.#validateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
+    if (!expiredStateKeys) await loadStateRetention();
     return this.#withLock(() => {
       const { state, reuse } = this.#readStateForWrite();
       const slot = stateSlot(state, request.key);
@@ -1648,6 +1683,7 @@ export class MeshStore {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit) return [];
+    if (!expiredStateKeys) await loadStateRetention();
     return this.#withLock(() => {
       // Each operation takes the same verified transition as put()/delete(), so a batch
       // advances the persistent clock exactly as the single writes would, and damaged
@@ -1831,11 +1867,13 @@ export class MeshStore {
 
   async #withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
-    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, lockTimeoutMs));
+    const waitingAt = Date.now();
+    const deadline = waitingAt + Math.min(this.#lockTimeoutMs, Math.max(0, lockTimeoutMs));
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
     const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
-    const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
+    let ownerRecord = "";
+    const receipt = (): string => `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     const releaseOwned = (): void => {
       try {
         if (fs.readFileSync(ownerPath, "utf8") === ownerRecord) {
@@ -1865,6 +1903,7 @@ export class MeshStore {
           // Keep the B68 three-line wire, but never overwrite an owner published by a
           // successor while this initializer was stopped after canonical mkdir.
           fs.mkdirSync(this.#lockPath, { mode: 0o700 });
+          ownerRecord = receipt(); // acquisition attempt, never the start of this waiter
           const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
             code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
           });
@@ -1891,6 +1930,7 @@ export class MeshStore {
           // resume its owner write through a name that legacy recovery gave to a successor.
           const staging = fs.mkdtempSync(`${this.#lockPath}.pending.${token}.`);
           try {
+            ownerRecord = receipt(); // timestamp this publication, not earlier failed attempts
             fs.writeFileSync(path.join(staging, "owner"), ownerRecord, {
               encoding: "utf8", flag: "wx", mode: 0o600,
             });
@@ -1917,7 +1957,7 @@ export class MeshStore {
           (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
         if (await this.#clearStaleLock(ownerPath)) continue;
         if (Date.now() >= deadline) {
-          throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+          throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs, Date.now() - waitingAt);
         }
         // Full jitter spreads a fleet after a stalled holder resumes. The original
         // absolute deadline still bounds every sleep (including a zero draw).

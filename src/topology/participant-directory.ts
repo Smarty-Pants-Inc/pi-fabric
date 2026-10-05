@@ -426,6 +426,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** Per-key waits must not stop the independent host heartbeat. */
   #fileWork = 0;
   #refreshedAt = Date.now();
+  /** Absence needs a state commit or a lock-clear observation, not just filesystem access. */
+  #absenceConfirmedAt = this.#refreshedAt;
   #refreshStartedAt: number | undefined;
   #refreshError: unknown;
   /** A bounded routing read is not a heartbeat/admission receipt. */
@@ -544,8 +546,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try {
       const committed = await operation;
       if (!committed) return;
-      // An unchanged change-refresh proves nothing about the lock. Only a committed
-      // write/confirmWritable acquisition ends the background path's lock outage.
+      // An unchanged change-refresh proves nothing about writability. A committed
+      // write or successful lock-free probe ends the background path's outage.
       if (this.options.enabled) this.#backgroundRefresh.success();
       // Preserve receipt age across post-commit copies and delayed continuations.
       this.#refreshedAt = committed;
@@ -1002,19 +1004,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
   }
 
-  // A stalled mesh writer (for example a signal-stopped lock holder, smarty-dev#266)
-  // stops every host lease from renewing, so peers soon look departed. This reports it;
+  // A stalled mutation writer can stop changed hosts renewing (smarty-dev#266).
+  // Idle hosts retain independent file liveness, but a lapse is still not departure;
   // the directory's own reads (get, list, sessions, peers) never throw, because timers,
   // the dashboard and local ownership checks consume them. User-facing listings and
   // "unknown participant" answers turn it into an error instead of an empty answer.
   // Two signals: this host's heartbeat failed on a mesh-lock timeout; or, before any
-  // timeout, a peer lease lapsed after this host's last committed heartbeat while that
-  // commit is two intervals overdue (or the heartbeat failed). The same lock may be what
+  // timeout, a peer lease lapsed after this host's last commit/lock-clear observation while
+  // that barrier is two intervals overdue (or the heartbeat failed). The same lock may be what
   // stopped the peer renewing, so the lapse is not a departure yet. Elapsed wait alone is
   // not a signal: a complete listing of fresh leases stays usable under long contention.
   // ponytail: before the commit is overdue a plain listing can still omit such a peer for
   // up to two intervals; peer-settle, the decision that acts on absence, waits for a later
-  // commit instead (confirmedAt). Revisit if another consumer acts on absence.
+  // absence barrier instead (confirmedAt). Revisit if another consumer acts on absence.
   writeStalled(now = Date.now()): Error | undefined {
     if (!this.options.enabled || this.#closed) return undefined;
     const error = this.#refreshError;
@@ -1024,7 +1026,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           `${Math.round((now - this.#refreshedAt) / 1000)} s, so peer visibility is unknown, not empty.`,
       );
     }
-    const confirmed = this.#refreshedAt;
+    const confirmed = this.#absenceConfirmedAt;
     const unconfirmed = error !== undefined || now - confirmed > 2 * this.#heartbeatMs;
     if (!unconfirmed) return undefined;
     const lapsed = this.#lapsedSince(confirmed, now);
@@ -1079,16 +1081,16 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#refreshError === undefined && now - this.#refreshedAt < this.#heartbeatMs * 2);
     // A resumed/suspended process (or a forward wall-clock adjustment) must not
     // wait a full heartbeat interval before trying to confirm its lapsed lease.
-    // This never grants admission: refresh still needs the real mesh lock.
+    // This never grants admission: refresh still needs a write or filesystem probe.
     if (!confirmed && !this.#closed && !this.#quiescing && this.#timer) {
       void this.#backgroundRefresh.run(() => this.refresh(), false);
     }
     return confirmed;
   }
 
-  /** When this host last committed its heartbeat: lapses before it happened on a working mesh. */
+  /** Absence barrier for peer-settle: a commit or a lock-free observation of no state writer. */
   confirmedAt(): number {
-    return this.#refreshedAt;
+    return this.#absenceConfirmedAt;
   }
 
   // Peer leases (host leases, and legacy session entries) that lapsed in (since, now].
@@ -1313,7 +1315,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     await this.#ensurePeerLabels(desired);
     this.#localRecords.clear();
     for (const [id, record] of desired) this.#localRecords.set(id, record);
-    if (!this.options.enabled) return Date.now();
+    if (!this.options.enabled) return this.#absenceConfirmedAt = Date.now();
 
     const root = [...desired.values()].find(
       (participant) => participant.kind === "root" && participant.id === this.options.rootId,
@@ -1558,14 +1560,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
         renewHost ||= decision.host;
         renewSession ||= decision.session;
         if (decision.skip) {
-          // The file shows only that this host is alive. A committed heartbeat also certifies
-          // that the shared state is writable (confirmedAt; peer-settle relies on it, #24), so
-          // take the lock once without a write: a stalled mesh still stops confirmation.
-          let acquiredAt = 0;
-          await this.mesh.confirmWritable(at => { acquiredAt = at; });
-          // Re-check after the lock: the threshold may have elapsed while confirming.
+          // Lease renewal already atomically replaces this host's own file. Certify
+          // filesystem writability without contending with unrelated state mutations.
+          // Actual record changes still require the shared write/ownership fences.
+          let confirmedAt = 0;
+          await this.mesh.confirmWritable(at => { confirmedAt = at; });
+          // Re-check after the probe: the compatibility threshold may have elapsed.
           decision = decideRenewal(this.#renewFileLease());
-          if (decision.skip) return acquiredAt;
+          if (decision.skip) {
+            // A held mutation lock may prevent a changed peer renewing. Keep peer-settle
+            // conservative about absence, while our independent lease/admission stays fresh.
+            try { fs.lstatSync(path.join(this.mesh.root, ".lock")); }
+            catch (error) {
+              if ((error as NodeJS.ErrnoException).code === "ENOENT") this.#absenceConfirmedAt = confirmedAt;
+            }
+            return confirmedAt;
+          }
           renewHost ||= decision.host;
           renewSession ||= decision.session;
         }
@@ -1596,7 +1606,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     });
     let committedAt = 0;
     const results = await this.mesh.writeBatch({ identity: this.options.identity, ops,
-      afterCommit: () => { committedAt = Date.now(); } });
+      afterCommit: () => { committedAt = this.#absenceConfirmedAt = Date.now(); } });
     if (!filesOnly) this.#recordsWrittenAt = Date.now();
     // Each record the shared state committed goes to its file too, for runtimes that read files.
     for (const result of results) {

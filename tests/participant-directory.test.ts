@@ -615,7 +615,7 @@ describe("ParticipantDirectory host leases", () => {
     expect(result).toBeUndefined();                                 // still waiting for the running peer
   });
 
-  // #411 R1: a lock acquisition can outlast the pre-confirmation renewal decision.
+  // #411 R1 / #4383: a delayed filesystem probe can outlast the renewal decision.
   it.each([
     { crossing: "host threshold", leaseMs: 4_000, delayMs: 2_001, policy: false, legacy: true },
     { crossing: "host expiry", leaseMs: 4_000, delayMs: 4_001, policy: false, legacy: true },
@@ -656,10 +656,12 @@ describe("ParticipantDirectory host leases", () => {
       const confirm = mesh.confirmWritable.bind(mesh);
       let entered!: () => void;
       const confirming = new Promise<void>((resolve) => { entered = resolve; });
+      let releaseProbe!: () => void;
+      const probeDelay = new Promise<void>(resolve => { releaseProbe = resolve; });
       const confirmations = vi.spyOn(mesh, "confirmWritable").mockImplementation(async onAcquired => {
-        const pending = confirm(onAcquired); // the real acquisition waits behind a live lock
         entered();
-        await pending;
+        await probeDelay; // filesystem/CPU delay, not acquisition of the mesh lock
+        await confirm(onAcquired);
       });
       fs.mkdirSync(lockPath, { mode: 0o700 });
       fs.writeFileSync(path.join(lockPath, "owner"), `delayed\n${process.pid}\n${now}\n`);
@@ -668,8 +670,9 @@ describe("ParticipantDirectory host leases", () => {
       await confirming;
       await new Promise((resolve) => setTimeout(resolve, 30));
       expect(settled).toBe(false);
-      now += delayMs; // deterministic elapsed time during the actual lock wait
+      now += delayMs; // deterministic elapsed time while the filesystem probe is delayed
       fs.rmSync(lockPath, { recursive: true, force: true });
+      releaseProbe();
       await refresh;
       expect(confirmations).toHaveBeenCalledOnce();
       const hostAfter = mesh.listAll("topology/hosts/", { fresh: true }).find(entry => (entry.value as { id: string }).id === identity.id)!;
@@ -1463,7 +1466,8 @@ describe("ParticipantDirectory", () => {
       roots.push(root);
       const identity: MeshIdentity = { id: "session:busy", name: "main", kind: "main", sessionId: "busy" };
       const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 100 });
-      const source = vi.fn(() => [rootRecord(identity.id, identity.id, "busy")]);
+      let status: "idle" | "running" = "idle";
+      const source = vi.fn(() => [{ ...rootRecord(identity.id, identity.id, "busy"), status }]);
       const directory = new ParticipantDirectory(mesh, {
         enabled: true, hostId: identity.id, rootId: identity.id, identity,
         heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false,
@@ -1477,7 +1481,7 @@ describe("ParticipantDirectory", () => {
         // Drive the real heartbeat callback without incidental ticks during backoff.
         const heartbeat = intervals.mock.calls[0]![0] as () => void;
         const runs = vi.spyOn(MeshBackgroundRetry.prototype, "run");
-        const confirmations = vi.spyOn(mesh, "confirmWritable");
+        const attempts = vi.spyOn(mesh, "writeBatch");
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
         const tick = async () => {
           heartbeat();
@@ -1486,6 +1490,7 @@ describe("ParticipantDirectory", () => {
           return await result;
         };
         const hold = () => {
+          status = status === "idle" ? "running" : "idle"; // real writes remain lock-fenced
           fs.mkdirSync(lockPath, { mode: 0o700 });
           fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
         };
@@ -1499,21 +1504,23 @@ describe("ParticipantDirectory", () => {
         await vi.advanceTimersByTimeAsync(retry.waitMs);
 
         const readsBefore = source.mock.calls.length;
+        status = "idle"; // matches the last durable snapshot: this change-refresh is a no-op
         directory.scheduleRefresh();
         await Promise.resolve(); // run the queued change-only refresh
         expect(await runs.mock.results.at(-1)!.value).toBe("done");
         expect(source.mock.calls.length).toBeGreaterThan(readsBefore);
-        expect(confirmations).toHaveBeenCalledOnce(); // unchanged snapshot took no mesh lock
+        expect(attempts).toHaveBeenCalledOnce(); // unchanged snapshot took no mesh lock
         expect(recovered).not.toHaveBeenCalled();
         expect(directory.writeStalled()).toBeDefined();
         expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(holder);
 
+        status = "running";
         expect(await tick()).toBe("retry");
         expect(warn).toHaveBeenCalledOnce(); // same live holder, same continuous outage
         expect(retry.waitMs).toBeGreaterThan(0); // second timeout retained the doubled delay
         heartbeat();
         expect(await runs.mock.results.at(-1)!.value).toBe("skipped");
-        expect(confirmations).toHaveBeenCalledTimes(2);
+        expect(attempts).toHaveBeenCalledTimes(2);
 
         fs.rmSync(lockPath, { recursive: true, force: true });
         await vi.advanceTimersByTimeAsync(retry.waitMs);
@@ -1710,7 +1717,8 @@ describe("ParticipantDirectory", () => {
   };
 
   it("reports a write-stalled mesh without throwing from its own reads, then recovers", async () => {
-    const { directory, mesh, identity } = stallDirectory("stall", () => [rootRecord("session:stall", "session:stall", "stall")]);
+    let status: "idle" | "running" = "idle";
+    const { directory, mesh, identity } = stallDirectory("stall", () => [{ ...rootRecord("session:stall", "session:stall", "stall"), status }]);
     await directory.start();
     expect(directory.sessions().map((session) => session.id)).toEqual([identity.id]);
     expect(directory.writeStalled()).toBeUndefined();
@@ -1719,6 +1727,8 @@ describe("ParticipantDirectory", () => {
     const lockPath = path.join(mesh.root, ".lock");
     fs.mkdirSync(lockPath, { mode: 0o700 });
     fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+    status = "running"; // real changes still need the mutation lock; idle heartbeats do not
+    directory.scheduleRefresh();
     await expect.poll(() => directory.writeStalled()?.message ?? "", { timeout: 5_000, interval: 50 })
       .toMatch(/^Fabric mesh is write-stalled: FABRIC_MESH_LOCK_TIMEOUT: Timed out waiting for the Fabric mesh lock/);
     // Timers, the dashboard and ownership checks read these: they must never throw.
@@ -1737,6 +1747,7 @@ describe("ParticipantDirectory", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
+    const statuses = new Map<string, "idle" | "running">();
     // The peer's identity is not "main": a main also writes a legacy session entry, whose fixed
     // 15 s lease (the production host lease) would outlive these scaled leases.
     const make = (name: string, timing: { heartbeatMs: number; leaseMs: number }) => {
@@ -1745,7 +1756,7 @@ describe("ParticipantDirectory", () => {
       const directory = new ParticipantDirectory(mesh, {
         enabled: true, hostId: identity.id, rootId: identity.id, identity, ...timing,
       });
-      directory.registerSource(() => [rootRecord(identity.id, identity.id, name)]);
+      directory.registerSource(() => [{ ...rootRecord(identity.id, identity.id, name), status: statuses.get(name) ?? "idle" }]);
       directories.push(directory);
       return directory;
     };
@@ -1758,16 +1769,18 @@ describe("ParticipantDirectory", () => {
         fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
       },
       release: () => fs.rmSync(lockPath, { recursive: true, force: true }),
+      change: () => { statuses.set("reader", "running"); statuses.set("peer", "running"); },
     };
   };
   const seesPeer = (directory: ParticipantDirectory) => directory.peers().some((peer) => peer.id === "session:peer");
 
   it("never settles a peer that lapsed behind a stalled lock, and reports it before the lock timeout", async () => {
-    const { reader, peer, hold, release } = meshPair({ heartbeatMs: 600, leaseMs: 20_000 }, { heartbeatMs: 100, leaseMs: 400 });
+    const { reader, peer, hold, release, change } = meshPair({ heartbeatMs: 600, leaseMs: 20_000 }, { heartbeatMs: 100, leaseMs: 400 });
     await Promise.all([reader.start(), peer.start()]);
     await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
     await vi.waitFor(() => expect(Date.now() - reader.confirmedAt()).toBeLessThan(40), { timeout: 5_000, interval: 5 });
     hold();                                                    // right after the reader's last commit
+    change(); // only real record changes wait for the held mesh lock (#4383)
     const started = Date.now();
     let result: PeerSettleResult | undefined;
     void awaitPeerSettle({

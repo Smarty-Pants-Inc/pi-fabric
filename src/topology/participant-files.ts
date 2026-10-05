@@ -345,27 +345,38 @@ export const participantFilePresent = (meshRoot: string, key: string): boolean =
  */
 export const sweepParticipantLockLeftovers = (
   mesh: ParticipantFileMesh, olderThanMs: number, now = Date.now(),
-): Promise<void> => mesh.exclusive(() => {
-  // Share recovery's lock for the entire scan/removal: never unlink the owner of
-  // a detached lock between recovery's rename and its compare/restore decision.
+): Promise<void> => {
   const locks = path.join(mesh.root, DIR, ".locks");
-  let names: string[];
+  // The periodic heartbeat sweep usually has nothing to do. A read-only preflight
+  // may defer concurrent new leftovers until the next sweep; it never authorizes removal.
   try {
-    names = fs.readdirSync(locks);
-  } catch {
-    return;
-  }
-  for (const name of names) {
-    if (!name.endsWith(".tmp") && !name.endsWith(".dead")) continue;
+    if (!fs.readdirSync(locks).some(name => {
+      if (!name.endsWith(".tmp") && !name.endsWith(".dead")) return false;
+      try { return now - fs.statSync(path.join(locks, name)).mtimeMs > olderThanMs; }
+      catch { return false; }
+    })) return Promise.resolve();
+  } catch { return Promise.resolve(); }
+  return mesh.exclusive(() => {
+    // Share recovery's lock for the entire authoritative scan/removal: never unlink the
+    // owner of a detached lock between recovery's rename and its compare/restore decision.
+    let names: string[];
     try {
-      if (now - fs.statSync(path.join(locks, name)).mtimeMs > olderThanMs) {
-        fs.rmSync(path.join(locks, name), { recursive: true, force: true });
-      }
+      names = fs.readdirSync(locks);
     } catch {
-      // Removed meanwhile.
+      return;
     }
-  }
-});
+    for (const name of names) {
+      if (!name.endsWith(".tmp") && !name.endsWith(".dead")) continue;
+      try {
+        if (now - fs.statSync(path.join(locks, name)).mtimeMs > olderThanMs) {
+          fs.rmSync(path.join(locks, name), { recursive: true, force: true });
+        }
+      } catch {
+        // Removed meanwhile.
+      }
+    }
+  });
+};
 
 /** Changes whenever a participant file is added, replaced or removed (not on Windows: see above). */
 export const participantFilesStamp = (meshRoot: string): string | undefined => {

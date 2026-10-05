@@ -45,6 +45,30 @@ afterEach(() => {
 });
 
 describe("persistent archive custody", () => {
+  it.each([
+    { status: "running" },
+    { cleanupPending: true },
+  ])("reobserves changed status after the public terminal precondition: %j", change => {
+    const directory = temporaryDirectory();
+    const record = { status: "completed", transport: "process", sessionId: "2147483647" };
+    writeStatus(directory, record);
+    const statusFile = path.join(directory, "status.json");
+    const read = fs.readFileSync;
+    let changed = false;
+    const probe = vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      const result = read(...args);
+      if (String(args[0]) === statusFile && !changed) {
+        changed = true;
+        writeStatus(directory, { ...record, ...change });
+      }
+      return result;
+    });
+    try {
+      expect(canRemoveTerminalRun(directory)).toBe(false);
+      expect(changed).toBe(true);
+      expect(fs.existsSync(directory)).toBe(true);
+    } finally { probe.mockRestore(); }
+  });
   it.each(["archive-pending.json", "actor-run-archive-pending.json"])("retains full terminal event sources until %s commit, then permits main compaction", pendingFile => {
     const directory = temporaryDirectory();
     writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" });

@@ -290,21 +290,18 @@ function* inspectFollowUps(directory: string, expired: Deadline): TreeWalk<boole
 function* inspectSafeRunTree(root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline,
   options: Pick<RunTreeExitOptions, "disposeScratch"> = {}, inspections?: Map<string, RunInspection>): TreeWalk<boolean> {
   if (expired() || depth > 32) return false;
-  // Scope cut: synchronous Windows collection uses main's existing custody
-  // path, not the PR's scratch sweep or snapshot-reuse optimization. Keep the
-  // original crossings so Windows per-run work is mechanically main-equivalent.
+  // Public synchronous proofs keep independent exit and allowlist observations.
+  // A reference-preparation cursor can suspend between these predicates; its
+  // previous exit/status evidence is not collection authority. Snapshot reuse
+  // is reserved for internal collection callers that supply inspections.
   let record: RunRecordSummary | undefined;
   let inspection: RunInspection | undefined;
-  if (process.platform === "win32" && !inspections) {
+  if (!inspections) {
     if (!(yield* treeOwnedStat(root))?.isDirectory()) return false;
     if (yield* inspectRunTree(root, 0, expired, true, true, true, options)) return false;
     record = yield* treeJson<RunRecordSummary>(path.join(root, "status.json"));
   } else {
-    // POSIX keeps this PR's single-inspection snapshot, never across a yield.
-    if (!inspections) {
-      inspections = new Map();
-      if (yield* inspectRunTree(root, 0, expired, true, true, true, options, false, inspections)) return false;
-    }
+    // Only internal collection callers supply an inspection snapshot.
     inspection = inspections.get(root);
     if (!inspection) return false;
     record = inspection.record;
@@ -371,13 +368,11 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
 /** Explicit resident roots require the same terminal/exit/allowlist proof. */
 export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline,
   options: Pick<RunTreeExitOptions, "disposeScratch"> = {}): boolean => {
-  if (process.platform === "win32") {
-    // Main's Windows wrapper independently rereads terminal status before its
-    // exit/allowlist walk; do not activate the POSIX snapshot optimization here.
-    const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-    return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, options);
-  }
-  return safeRunTree(directory, false, 0, expired, options);
+  // Keep the terminal precondition independent of the exit/allowlist proof on
+  // every platform. Reference preparation resumes at predicate boundaries and
+  // must still observe deadline/record changes at main's original crossings.
+  const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
+  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, options);
 };
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
   try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }

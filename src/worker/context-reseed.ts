@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { readPiSessionHeader } from "../core/pi-session-header.js";
+import { writeFileAtomic, syncDirectoryChain } from "../core/atomic-write.js";
 
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -27,23 +28,69 @@ export function summarizeActorState(messages: unknown[], maxChars = 16_384): str
   return excerpt(lines.join("\n\n"), Math.max(0, maxChars));
 }
 
-/** Oversized RPC histories need a bounded local fallback; never read the whole journal. */
+/** Oversized RPC histories need a bounded local fallback; never read the whole journal.
+ * Project only the known suffix of the native active parent chain. Earlier entries
+ * are deliberately unavailable, not inferred from raw append order. Context edits
+ * and the latest compaction have the same visibility rules as native Pi; when a
+ * retained-range boundary is outside this suffix, exclude the uncertain range.
+ */
 function recentJournalState(file: string): string {
   const fd = fs.openSync(file, "r");
   try {
     const size = fs.fstatSync(fd).size;
     const offset = Math.max(0, size - 65_536);
     const bytes = Buffer.alloc(size - offset);
-    fs.readSync(fd, bytes, 0, bytes.length, offset);
-    const lines = bytes.toString("utf8").split("\n");
+    const count = fs.readSync(fd, bytes, 0, bytes.length, offset);
+    const lines = bytes.subarray(0, count).toString("utf8").split("\n");
     if (offset) lines.shift(); // partial leading record (possibly a giant tool output)
-    const messages: unknown[] = [];
+    const entries: Array<Record<string, unknown>> = [];
+    const byId = new Map<string, number>();
     for (const line of lines) {
-      try {
-        const entry = record(JSON.parse(line));
-        if (entry?.type === "message") messages.push(entry.message);
-        else if (entry?.type === "compaction") messages.push({ role: "compactionSummary", summary: entry.summary });
-      } catch { /* partial/invalid records remain in the archive, not in model context */ }
+      let entry: Record<string, unknown> | undefined;
+      try { entry = record(JSON.parse(line)); } catch { continue; } // native skips malformed records
+      if (!entry || entry.type === "session") continue;
+      if (typeof entry.id !== "string" || !entry.id || byId.has(entry.id) ||
+          (entry.parentId !== null && typeof entry.parentId !== "string")) return "";
+      byId.set(entry.id, entries.length);
+      entries.push(entry);
+    }
+    const active: Array<Record<string, unknown>> = [];
+    let index: number | undefined = entries.length - 1;
+    while (index !== undefined && index >= 0) {
+      const entry: Record<string, unknown> = entries[index]!;
+      active.push(entry);
+      const parent: number | undefined = typeof entry.parentId === "string" ? byId.get(entry.parentId) : undefined;
+      if (parent !== undefined && parent >= index) return ""; // ambiguous/cyclic history
+      index = parent;
+    }
+    active.reverse();
+    let visible = active;
+    let compactionIndex = -1;
+    for (let i = 0; i < active.length; i++) if (active[i]!.type === "compaction") compactionIndex = i;
+    if (compactionIndex >= 0) {
+      const compaction = active[compactionIndex]!;
+      const firstKept = active.findIndex(entry => entry.id === compaction.firstKeptEntryId);
+      visible = [compaction,
+        ...(firstKept >= 0 && firstKept < compactionIndex ? active.slice(firstKept, compactionIndex) : []),
+        ...active.slice(compactionIndex + 1)];
+    }
+    const edits = new Map<unknown, unknown>();
+    for (const entry of visible) if (entry.type === "context_edit") edits.set(entry.targetId, entry.replacement);
+    const messages: unknown[] = [];
+    for (const entry of visible) {
+      if (entry.type === "message" || entry.type === "custom_message") {
+        const message = entry.type === "message" ? record(entry.message) : { role: "custom", content: entry.content };
+        if (!message) continue;
+        if (edits.has(entry.id) && ["user", "assistant", "toolResult", "custom"].includes(String(message.role))) {
+          const replacement = record(edits.get(entry.id));
+          if (!replacement || !("content" in replacement)) continue; // null omits, invalid cannot establish visibility
+          messages.push({ ...message, content: replacement.content });
+        } else messages.push(message);
+      } else if (entry.type === "compaction" && entry === visible[0]) {
+        messages.push({ role: "compactionSummary", summary: entry.summary });
+      } else if (entry.type === "branch_summary") {
+        messages.push({ role: "branchSummary", summary: entry.summary });
+      }
     }
     return summarizeActorState(messages);
   } finally { fs.closeSync(fd); }
@@ -73,23 +120,16 @@ export function reseedActorSession(file: string, cwd: string, options: {
     ...(seed ? [{ type: "message", id: randomUUID(), parentId: noteId, timestamp,
       message: { role: "user", content: seed, timestamp: Date.now() } }] : []),
   ];
-  const candidate = `${file}.${sessionId}.tmp`;
-  try {
-    // Copy, don't move: registered readers always see a complete old or new file.
-    fs.copyFileSync(file, archived, fs.constants.COPYFILE_EXCL);
-    fs.chmodSync(archived, 0o600);
-    const archiveFd = fs.openSync(archived, "r");
-    try { fs.fsyncSync(archiveFd); } finally { fs.closeSync(archiveFd); }
-    const fd = fs.openSync(candidate, "wx", 0o600);
-    try {
-      fs.writeFileSync(fd, entries.map(entry => JSON.stringify(entry)).join("\n") + "\n");
-      fs.fsyncSync(fd);
-    } finally { fs.closeSync(fd); }
-    fs.renameSync(candidate, file); // header, seed and durable attribution note publish together
-    if (process.platform !== "win32") {
-      const directory = fs.openSync(path.dirname(file), "r");
-      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
-    }
-  } finally { if (fs.existsSync(candidate)) fs.unlinkSync(candidate); }
+  // Copy, don't move: registered readers always see a complete old or new file.
+  fs.copyFileSync(file, archived, fs.constants.COPYFILE_EXCL);
+  fs.chmodSync(archived, 0o600);
+  // Windows FlushFileBuffers requires a writable handle, even for a copied file.
+  const archiveFd = fs.openSync(archived, "r+");
+  try { fs.fsyncSync(archiveFd); } finally { fs.closeSync(archiveFd); }
+  syncDirectoryChain(path.dirname(archived));
+  // The existing helper fsyncs a closed candidate and retries Windows sharing /
+  // destination-exists failures without unlinking the registered old session.
+  // Header, seed and #493 attribution publish in one durable atomic replacement.
+  writeFileAtomic(file, entries.map(entry => JSON.stringify(entry)).join("\n") + "\n", { durable: true, mode: 0o600 });
   return { oldSessionId: header.id, sessionId, archived };
 }

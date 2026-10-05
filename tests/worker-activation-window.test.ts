@@ -662,6 +662,52 @@ describe("native activation window (offline; opted-in success needs exact native
     }
   }, TEST_GUARD_MS);
 
+  it.skipIf(!selectedNativeBinary).each(["omit", "replace", "inactive-branch"] as const)("over-cap reseed dispatch preserves native-visible state and replacement binding (%s)", async mode => {
+    const s = await setup(0, 0, "NO_TOOL_ROUNDS");
+    const probesFile = installBindingProbe(s.dir, "refuse");
+    const journal = path.join(s.dir, "edited-over-cap-history.jsonl");
+    const session = SessionManager.open(journal);
+    const rootId = session.appendMessage(user("ACTIVE_ROOT " + "x".repeat(5_100_000)));
+    const removed = session.appendMessage(user("REMOVED_STATE_SENTINEL"));
+    if (mode === "omit") session.appendContextEdit(removed, null);
+    if (mode === "replace") session.appendContextEdit(removed, { content: "REPLACED_CURRENT_STATE" });
+    if (mode === "inactive-branch") session.branch(rootId);
+    session.appendMessage(user("CURRENT_PENDING_WORK at /tmp/report.md"));
+    session.appendMessage(assistant("Keep the current pending review."));
+    const nativeVisible = JSON.stringify(buildSessionContext(session.getBranch()).messages);
+    expect(nativeVisible.length).toBeGreaterThan(5_000_000);
+    expect(nativeVisible).not.toContain("REMOVED_STATE_SENTINEL");
+    const oldId = session.getSessionId();
+    const before = readJournal(journal);
+    const result = await s.manager.run({ task: "CURRENT_VISIBLE_ACTIVATION", model: "window-test/offline", actorId: "visible-over-cap-actor",
+      sessionFile: journal, tools: [], extensions: false, transport: "process", timeoutMs: 30_000 });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    const log = fs.readFileSync(result.logFile!, "utf8");
+    expect(log.match(/"type":"fabric_context_reseed"/g)).toHaveLength(1);
+    const dispatches = s.requests.filter(payload => JSON.stringify(payload.messages).includes("CURRENT_VISIBLE_ACTIVATION"));
+    expect(dispatches).toHaveLength(1);
+    const dispatched = JSON.stringify(dispatches[0]);
+    expect(dispatched).toContain("CURRENT_PENDING_WORK");
+    expect(dispatched).not.toContain("REMOVED_STATE_SENTINEL");
+    if (mode === "replace") expect(dispatched).toContain("REPLACED_CURRENT_STATE");
+    const replacement = SessionManager.open(journal);
+    const finalId = replacement.getSessionId();
+    expect(finalId).not.toBe(oldId);
+    expect(result.runnerSessionIds).toEqual([oldId, finalId]);
+    expect(result.runnerSessionId).toBe(finalId);
+    expect(expectBindingProbes(probesFile, `native-visible-${mode}`).at(-1)?.registeredId).toBe(finalId);
+    const note = replacement.getBranch().find(entry => entry.type === "custom" && entry.customType === "fabric-context-reseed");
+    expect(note).toMatchObject({ data: { oldSessionId: oldId, sessionId: finalId } });
+    if (note?.type === "custom") expect(fs.readFileSync((note.data as { archived: string }).archived).subarray(0, before.bytes.length)).toEqual(before.bytes);
+    const evidence = process.env.FABRIC_CONTEXT_ADMISSION_EVIDENCE_DIR;
+    if (evidence) {
+      fs.mkdirSync(evidence, { recursive: true });
+      fs.writeFileSync(path.join(evidence, `native-visible-${mode}-result.json`), JSON.stringify({ oldId, finalId,
+        removedStateDispatched: dispatched.includes("REMOVED_STATE_SENTINEL"), pendingWorkDispatched: dispatched.includes("CURRENT_PENDING_WORK"), result }, null, 2));
+      fs.copyFileSync(result.logFile!, path.join(evidence, `native-visible-${mode}-events.jsonl`));
+    }
+  }, TEST_GUARD_MS);
+
   it.skipIf(!selectedNativeBinary).each(["google-generative-ai", "google-vertex"].flatMap(api =>
     ["stream", "streamSimple"].flatMap(method =>
       ["success", "abort", "snapshot", "late-write", "expand", "shrink", "non-json", "invalid-control"].map(mode => [api, method, mode])),

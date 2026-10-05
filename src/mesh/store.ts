@@ -1554,7 +1554,7 @@ export class MeshStore {
     const generation = randomUUID();
     const unstamped: MeshStateFile = { readGeneration: generation, ...payload };
     const canonical = encodeState(unstamped, reuse);
-    let journal = this.#writeReadJournal ? prepareStateJournal(unstamped, this.#journalBase, keys, canonical.entries) : undefined;
+    let journal = this.#writeReadJournal ? prepareStateJournal(unstamped, this.#journalBase, keys, canonical.entries, canonical.serialized) : undefined;
     let stamped: MeshStateFile = journal
       ? { readGeneration: generation, readJournalHash: journal.hash, ...payload } : unstamped;
     let encoded = journal ? encodeState(stamped, canonical.entries) : canonical;

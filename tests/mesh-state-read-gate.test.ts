@@ -179,13 +179,16 @@ describe("incremental state read journal", () => {
     const first = f.disk(), firstIdentity = stateReadIdentity(f.file)!;
     const firstStamp = stamp();
     const firstOffset = fs.statSync(f.journal).size;
-    await f.writer.put({ key: "field/heartbeat/writer", value: "latest雪😀", identity });
-    const last = f.disk(), lastIdentity = stateReadIdentity(f.file)!;
-    // A writer may append a later record after the reader captured its canonical endpoint.
-    // The helper must not skip that unseen record when returning its incremental cursor.
+    // Sidecar bytes beyond the requested endpoint are not authority, even with a valid
+    // outer checksum. Keep the canonical endpoint present so its payload binding can be
+    // verified; a canonical file already advanced to G2 now correctly requires fallback.
+    fs.appendFileSync(f.journal, fs.readFileSync(f.journal, "utf8"));
     const replay = replayStateJournal(f.root, base, first.readGeneration, firstIdentity, firstStamp, baseIdentity, first.readJournalHash)!;
     expect(replay.state).toEqual(first);
     expect(replay.cursor.offset).toBe(firstOffset);
+    fs.truncateSync(f.journal, firstOffset); // Drop the simulated uncommitted tail.
+    await f.writer.put({ key: "field/heartbeat/writer", value: "latest雪😀", identity });
+    const last = f.disk(), lastIdentity = stateReadIdentity(f.file)!;
     const next = replayStateJournal(f.root, replay.state, last.readGeneration, lastIdentity, stamp(),
       firstIdentity, last.readJournalHash, replay.cursor);
     expect(next?.state).toEqual(last);
@@ -229,6 +232,135 @@ describe("incremental state read journal", () => {
     const f = await fixture(); await f.writer.put({ key: "field/heartbeat/writer", value: 1, identity });
     f.reader.stateToken({ fresh: true }); const state = f.disk(); state.entries["field/heartbeat/writer"].value = 9;
     writeFileAtomic(f.file, JSON.stringify(state)); expect(f.reader.get("field/heartbeat/writer", { fresh: true })?.value).toBe(9);
+  });
+  it.each(["copied-sidecar", "forged-terminal", "forged-payload-hash"])("rejects %s replay after a copied-marker ownership replacement", async attack => {
+    const f = await fixture(), old = f.reader.stateToken();
+    await f.writer.put({ key: "field/heartbeat/writer", value: "journal-old", identity });
+    const state = f.disk(), generation = state.readGeneration, chainHead = state.readJournalHash;
+    const rows = fs.readFileSync(f.journal, "utf8").trimEnd().split("\n").map(line => JSON.parse(line));
+    const terminal = rows[rows.length - 1];
+    state.entries["field/heartbeat/writer"].value = "canonical-new";
+    state.entries["field/heartbeat/writer"].updatedBy = { ...identity, id: "session:new-owner", name: "new-owner" };
+    // Legacy/stale processes can preserve both G1 markers while replacing ownership.
+    writeFileAtomic(f.file, JSON.stringify(state));
+    expect(state.readGeneration).toBe(generation); expect(state.readJournalHash).toBe(chainHead);
+    if (attack !== "copied-sidecar") {
+      const stat = fs.statSync(f.file);
+      terminal.delta.identity = stateReadIdentity(f.file);
+      terminal.delta.stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+      if (attack === "forged-payload-hash") {
+        const { readJournalHash: _hash, ...payload } = state;
+        terminal.delta.canonicalPayloadHash = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+      }
+      terminal.checksum = createHash("sha256").update(JSON.stringify(terminal.delta)).digest("hex");
+    }
+    fs.writeFileSync(f.journal, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+    const before = f.count();
+    expect(f.reader.get("field/heartbeat/writer", { fresh: true })).toMatchObject({
+      value: "canonical-new", updatedBy: { id: "session:new-owner" },
+    });
+    expect(f.count()).toBe(before + 1); // A forged terminal can never certify journal-old.
+    assertMeshStateReadable(f.root); expect(f.count()).toBe(before + 1);
+    expect(f.reader.get("field/heartbeat/writer", { fresh: true })?.updatedBy.id).toBe("session:new-owner");
+    expect(f.reader.get("field/heartbeat/writer", { snapshot: old })?.value).toBe(0);
+  });
+  it("fresh participant ownership rejects an endpoint-only forged journal after a copied-marker replacement", async () => {
+    const f = await fixture(), now = Date.now(), peer = "session:peer";
+    const hash = (id: string) => createHash("sha256").update(id).digest("hex");
+    const participantKey = "topology/participants/" + hash(peer);
+    await f.writer.writeBatch({ identity, ops: [
+      ...["old-host", "new-host"].map(id => ({ kind: "put" as const, key: "topology/hosts/" + hash(id),
+        value: { format: 1, id, rootId: peer, identity, startedAt: 1, updatedAt: now, expiresAt: now + 15000 } })),
+      { kind: "put", key: participantKey, value: { format: 1, id: peer, kind: "root", rootId: peer,
+        ownerHostId: "old-host", ownerIdentityId: identity.id, name: "old-name", status: "idle",
+        runner: "pi", transport: "host", capabilities: ["steer"], controlProtocol: "v1", startedAt: 1, updatedAt: now } },
+    ] });
+    const directory = new ParticipantDirectory(f.reader, { enabled: true, hostId: "observer", rootId: "observer", identity });
+    try {
+      expect(directory.list({ scope: "project", fresh: true }).find(p => p.id === peer)?.ownerHostId).toBe("old-host");
+      await f.writer.put({ key: "field/heartbeat/writer", value: 1, identity });
+      const state = f.disk(), rows = fs.readFileSync(f.journal, "utf8").trimEnd().split("\n").map(line => JSON.parse(line));
+      // Neither the entry revision nor either canonical marker advances for this legacy edit.
+      state.entries[participantKey].value.ownerHostId = "new-host";
+      state.entries[participantKey].value.name = "new-name";
+      writeFileAtomic(f.file, JSON.stringify(state));
+      const terminal = rows[rows.length - 1], stat = fs.statSync(f.file);
+      terminal.delta.identity = stateReadIdentity(f.file);
+      terminal.delta.stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+      terminal.checksum = createHash("sha256").update(JSON.stringify(terminal.delta)).digest("hex");
+      fs.writeFileSync(f.journal, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+      const before = f.count();
+      expect(directory.list({ scope: "project", fresh: true }).find(p => p.id === peer))
+        .toMatchObject({ ownerHostId: "new-host", name: "new-name" });
+      expect(f.count()).toBe(before + 1);
+      assertMeshStateReadable(f.root);
+      expect(directory.list({ scope: "project", fresh: true }).find(p => p.id === peer)?.ownerHostId).toBe("new-host");
+    } finally { await directory.close(); }
+  });
+  it.each(["fresh-first", "strict-first"])("strict readability rejects forged-terminal stale authority (%s)", async order => {
+    const f = await fixture();
+    await f.writer.put({ key: "field/heartbeat/writer", value: "journal-old", identity });
+    const state = f.disk(), rows = fs.readFileSync(f.journal, "utf8").trimEnd().split("\n").map(line => JSON.parse(line));
+    // Keep both canonical markers, but the actual canonical envelope is no longer readable.
+    state.format = 99;
+    state.entries["field/heartbeat/writer"].updatedBy.id = "session:new-owner";
+    writeFileAtomic(f.file, JSON.stringify(state));
+    const stat = fs.statSync(f.file), terminal = rows[rows.length - 1];
+    terminal.delta.identity = stateReadIdentity(f.file);
+    terminal.delta.stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    terminal.checksum = createHash("sha256").update(JSON.stringify(terminal.delta)).digest("hex");
+    fs.writeFileSync(f.journal, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+    const before = f.count();
+    if (order === "strict-first") expect(() => assertMeshStateReadable(f.root)).toThrow("invalid state format");
+    expect(f.reader.get("field/heartbeat/writer", { fresh: true })).toBeUndefined();
+    expect(f.count()).toBeGreaterThan(before);
+    expect(() => assertMeshStateReadable(f.root)).toThrow("invalid state format");
+    expect(() => assertMeshStateReadable(f.root)).toThrow("invalid state format");
+  });
+  it("falls back on a legacy terminal without a canonical payload binding even when its head and endpoint match", async () => {
+    const f = await fixture(); await f.writer.put({ key: "field/heartbeat/writer", value: 1, identity });
+    const state = f.disk(), row = JSON.parse(fs.readFileSync(f.journal, "utf8").trimEnd());
+    delete row.delta.canonicalPayloadHash;
+    const { identity: _identity, stamp: _stamp, ...body } = row.delta;
+    state.readJournalHash = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    writeFileAtomic(f.file, JSON.stringify(state));
+    const stat = fs.statSync(f.file);
+    row.delta.identity = stateReadIdentity(f.file);
+    row.delta.stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    row.checksum = createHash("sha256").update(JSON.stringify(row.delta)).digest("hex");
+    fs.writeFileSync(f.journal, JSON.stringify(row) + "\n");
+    const before = f.count();
+    expect(f.reader.get("field/heartbeat/writer", { fresh: true })?.value).toBe(1);
+    expect(f.count()).toBe(before + 1);
+  });
+  it.each(["short-read", "eio", "replacement"])("falls back when canonical payload verification encounters %s", async failure => {
+    const f = await fixture(); await f.writer.put({ key: "field/bulk/utf8", value: "雪😀".repeat(15000), identity });
+    const state = f.disk(), read = fs.readSync.bind(fs), before = f.count();
+    let injected = false;
+    vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: Buffer, offset: number, length: number, position: number) => {
+      if (!injected && length === 64 * 1024 && fs.fstatSync(fd).ino === fs.statSync(f.file).ino) {
+        injected = true;
+        if (failure === "short-read") return 0;
+        if (failure === "eio") throw Object.assign(new Error("verification EIO"), { code: "EIO" });
+        state.entries["field/heartbeat/writer"].value = "replacement";
+        state.entries["field/heartbeat/writer"].updatedBy.id = "session:new-owner";
+        writeFileAtomic(f.file, JSON.stringify(state));
+      }
+      return read(fd, buffer, offset, length, position);
+    }) as typeof fs.readSync);
+    expect(f.reader.get("field/heartbeat/writer", { fresh: true })).toMatchObject(failure === "replacement"
+      ? { value: "replacement", updatedBy: { id: "session:new-owner" } } : { value: 0, updatedBy: { id: identity.id } });
+    expect(injected).toBe(true); expect(f.count()).toBeGreaterThan(before);
+    assertMeshStateReadable(f.root);
+  });
+  it("an already advanced canonical endpoint cannot verify historical journal bytes", async () => {
+    const f = await fixture(), base = f.disk(), baseIdentity = stateReadIdentity(f.file);
+    await f.writer.put({ key: "field/heartbeat/writer", value: 1, identity });
+    const first = f.disk(), firstIdentity = stateReadIdentity(f.file)!, stat = fs.statSync(f.file);
+    const stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    await f.writer.put({ key: "field/heartbeat/writer", value: 2, identity });
+    expect(replayStateJournal(f.root, base, first.readGeneration, firstIdentity, stamp, baseIdentity, first.readJournalHash)).toBeUndefined();
+    expect(f.reader.get("field/heartbeat/writer", { fresh: true })?.value).toBe(2);
   });
   it("publication failure does not reject a canonical commit", async () => {
     const f = await fixture(); fs.mkdirSync(f.journal);

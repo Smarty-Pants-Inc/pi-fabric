@@ -26,7 +26,10 @@ export interface JournalCursor { inode: string; offset: number }
 const MAX_JOURNAL_BYTES = 2 * 1024 * 1024;
 const MAX_RECORD_BYTES = 256 * 1024;
 const journalPath = (root: string): string => path.join(root, "state.read-journal.jsonl");
-const digest = (text: string): string => createHash("sha256").update(text).digest("hex");
+const digest = (text: string | Buffer): string => createHash("sha256").update(text).digest("hex");
+const identityOf = (stat: fs.BigIntStats): string | undefined =>
+  typeof stat.mtimeNs === "bigint" && typeof stat.ctimeNs === "bigint"
+    ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` : undefined;
 const uuid = (value: unknown): value is string => typeof value === "string" &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
 const record = (value: unknown): value is Record<string, unknown> =>
@@ -37,9 +40,7 @@ const own = (object: object, key: string): boolean => Object.hasOwn(object, key)
  * If the filesystem/adapter cannot supply it, keep the conservative header/payload fallback. */
 export const stateReadIdentity = (file: string): string | undefined => {
   try {
-    const stat = fs.statSync(file, { bigint: true });
-    if (typeof stat.mtimeNs !== "bigint" || typeof stat.ctimeNs !== "bigint") return undefined;
-    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    return identityOf(fs.statSync(file, { bigint: true }));
   } catch { return undefined; }
 };
 
@@ -51,11 +52,44 @@ export const journalBase = (state: JournalState, file: string): JournalBase => (
   tombstoneOrder: JSON.stringify(state.tombstoneOrder),
 });
 
+/** Verify the hash committed in the delta body against canonical bytes, NOT the sidecar's
+ * self-checksum. Only the second-field readJournalHash is excluded to avoid self-reference;
+ * every other byte (including UUID, envelope, entries, ordering and UTF-8) is covered.
+ * Read once per changed physical generation, in bounded chunks without parsing/traversal.
+ * Descriptor and path identities must stay pinned; races/failures only disable acceleration. */
+const verifyCanonicalPayload = (root: string, generation: string, chainHash: string,
+  identity: string, expected: unknown): boolean => {
+  if (typeof expected !== "string" || !/^[0-9a-f]{64}$/.test(expected)) return false;
+  const file = path.join(root, "state.json");
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, "r");
+    const stat = fs.fstatSync(fd, { bigint: true });
+    if (identityOf(stat) !== identity || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) return false;
+    const generationField = `{"readGeneration":"${generation}"`;
+    const prefix = Buffer.from(`${generationField},"readJournalHash":"${chainHash}"`);
+    const header = Buffer.allocUnsafe(prefix.length);
+    if (fs.readSync(fd, header, 0, header.length, 0) !== header.length || !header.equals(prefix)) return false;
+    const hash = createHash("sha256").update(generationField);
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    const size = Number(stat.size);
+    for (let offset = prefix.length; offset < size;) {
+      const length = Math.min(buffer.length, size - offset);
+      if (fs.readSync(fd, buffer, 0, length, offset) !== length) return false;
+      hash.update(buffer.subarray(0, length));
+      offset += length;
+    }
+    return hash.digest("hex") === expected && identityOf(fs.fstatSync(fd, { bigint: true })) === identity &&
+      stateReadIdentity(file) === identity;
+  } catch { return false; }
+  finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ } }
+};
+
 interface PreparedStateJournal { hash: string; text: string }
 /** Prepare a hash chain before the canonical rename. Its hash is committed IN state.json's
  * bounded header, so a forged/self-checksummed sidecar cannot supply fresh authority. */
 export const prepareStateJournal = (state: JournalState, base: JournalBase | undefined,
-  changedKeys: readonly string[], encodedEntries: ReadonlyMap<string, { entry: Buffer }>): PreparedStateJournal | undefined => {
+  changedKeys: readonly string[], encodedEntries: ReadonlyMap<string, { entry: Buffer }>, canonicalPayload: Buffer): PreparedStateJournal | undefined => {
   try {
     if (!base?.generation || !base.identity || !uuid(state.readGeneration)) return undefined;
     // Reuse the exact canonical entry bytes: neither chain hashing nor publication should
@@ -69,7 +103,7 @@ export const prepareStateJournal = (state: JournalState, base: JournalBase | und
     for (const key of base.versionKeys) if (!own(state.versions ?? {}, key)) versions[key] = null;
     const { entries: _entries, versions: _versions, readGeneration: _generation, readJournalHash: _hash, tombstoneOrder, ...envelope } = state;
     const head = JSON.stringify({ format: 1, previous: base.generation, previousIdentity: base.identity, previousHash: base.hash ?? null,
-      generation: state.readGeneration, envelope });
+      generation: state.readGeneration, canonicalPayloadHash: digest(canonicalPayload), envelope });
     const members = Object.keys(entries).map(key => `${JSON.stringify(key)}:${entries[key]}`).join(",");
     const tombstones = JSON.stringify(tombstoneOrder);
     const text = `${head.slice(0, -1)},"entries":{${members}},"versions":${JSON.stringify(versions)}` +
@@ -97,9 +131,9 @@ export const appendStateJournal = (root: string, prepared: PreparedStateJournal 
   } catch { /* A sidecar cannot reject or hide a canonical commit. */ }
 };
 
-/** Incremental replay pinned to the actual canonical commit. The last delta must bind both
- * UUID and physical identity; a legacy copied marker or signal/journal publication gap cannot
- * authorize reuse. Apply to copies: existing opaque snapshots remain immutable. */
+/** Incremental replay pinned to the actual canonical payload. Terminal metadata alone is
+ * untrusted: its chain-bound payload hash must match bytes read from the pinned canonical
+ * descriptor. Missing/failed bindings fall back. Existing opaque snapshots stay immutable. */
 export const replayStateJournal = (root: string, base: JournalState, generation: string, identity: string,
   stamp: string, baseIdentity: string | undefined, canonicalHash: string | undefined, cursor?: JournalCursor): { state: JournalState; cursor: JournalCursor } | undefined => {
   let fd: number | undefined;
@@ -159,6 +193,7 @@ export const replayStateJournal = (root: string, base: JournalState, generation:
       if (state.readGeneration === generation) break;
     }
     if (!last || state.readGeneration !== generation || state.readJournalHash !== canonicalHash || last.identity !== identity || last.stamp !== stamp) return undefined;
+    if (!verifyCanonicalPayload(root, generation, canonicalHash, identity, last.canonicalPayloadHash)) return undefined;
     // The descriptor must still contain exactly the captured prefix (no in-place truncation).
     const after = fs.fstatSync(fd);
     if (after.ino !== stat.ino || after.size < stat.size) return undefined;

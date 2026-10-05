@@ -39,10 +39,20 @@ change. `MeshStoreOptions.writeReadJournal: false` is available for compatibilit
 
 A delta carries changed entries, revision updates/evictions, changed tombstone order and
 the envelope metadata. It binds its predecessor's UUID, physical identity and chain hash.
-Readers replay from their existing snapshot, read only appended bytes after a successful
-replay, and publish a new snapshot only when the final UUID, canonical hash and physical
-identity all match. Recomputed sidecar checksums alone cannot authorize a forged payload.
-Unchanged entry objects survive replay, keeping derived directory indexes inexpensive.
+Its `canonicalPayloadHash` also commits SHA-256 of the exact canonical payload bytes with
+only the second-field `readJournalHash` omitted to avoid a self-referential hash. That payload
+hash is inside the delta body covered by the canonical `readJournalHash`, not merely the
+sidecar's recomputable outer checksum.
+
+Readers replay from their existing snapshot and read only appended **journal** bytes after a
+successful replay. Before publishing a replayed snapshot, they additionally stream/hash the
+actual canonical bytes in 64 KiB chunks and require the chain-bound payload hash to match.
+Descriptor and path physical identities must remain pinned before/after verification, and
+the final UUID, canonical chain hash and endpoint metadata must all match. Missing bindings,
+I/O failures, short reads, concurrent replacements and endpoint-only sidecar forgeries fall
+back to a canonical parse. Recomputing the payload hash in a forged sidecar changes the
+chain head and cannot match a copied canonical marker. Unchanged entry objects survive
+verified replay, keeping derived directory indexes inexpensive.
 Cursors advance only through the consumed UTF-8 prefix, not a later record appended after
 the reader captured its canonical endpoint. Changed entry encodings are reused by the
 canonical payload, namespace signal and journal, rather than traversing values again.
@@ -53,7 +63,9 @@ canonical read. A failed sidecar append cannot fail a committed write or hide a 
 If the optional chain head would exceed the canonical byte budget, omit the head and
 record rather than rejecting an otherwise fitting write.
 Rotation or an older writer can break the chain; the next successful full read reestablishes
-the base. Older writers copying an existing UUID still invalidate the physical endpoint.
+the base. Records from older journal writers without a payload binding also fall back. Older
+writers copying an existing UUID still invalidate the physical endpoint; retargeting terminal
+metadata and recomputing its outer checksum cannot override a changed canonical payload.
 
 The metadata gate assumes cooperating replacements change the physical file identity.
 An external in-place writer reproducing the entire nanosecond identity and UUID is outside
@@ -98,4 +110,8 @@ probe. Rates use `/proc/PID/io` **rchar** (logical bytes, decimal MB), not cache
 foreground, nice-19, isolated-home/root runs after startup warmup. Synthetic observer
 replay is evidence of the bypass, not a claim to reproduce the fleet's unprovided exact
 actor/forward configuration. Mixed older writers without a journal remain on the bounded
-canonical/coalescing fallback and do not inherit the new-writer incremental byte bound.
+canonical/coalescing fallback. The terminal trust-gap fix requires a canonical byte verification
+per consumed physical generation even with new writers: journals save parsing/traversal and
+unchanged-entry invalidation, not the bytes of that verification. The earlier <0.5 MB/s journal
+claim does not apply to this adversarial copied-marker contract. Repeated observations of an
+unchanged verified generation still reuse the shared snapshot without reopening the payload.

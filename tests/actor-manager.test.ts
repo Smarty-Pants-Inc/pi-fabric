@@ -2969,6 +2969,36 @@ describe("ActorManager", () => {
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 2);
   }, 60_000);
 
+  it("5256 excludes a failed streak from routing presence across restart and flags pending effects until a successful probe", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "review-shard", instructions: "Review.", responseMode: "text" });
+    const run = vi.spyOn(s.agents, "run").mockRejectedValue(new Error("real activation failed"));
+    const presence = () => s.mesh.get(`actors/test/${actor.id}`)?.value as { status?: string } | undefined;
+    for (let attempt = 1; attempt <= ACTOR_FAILURE_NOTICE_AFTER; attempt++) {
+      await expect(s.actors.ask(actor.id, "review")).rejects.toThrow("real activation failed");
+      await waitFor(() => !s.actors.status(actor.id).inFlightRun && !s.actors.status(actor.id).preparing);
+      if (attempt < ACTOR_FAILURE_NOTICE_AFTER) expect(s.actors.status(actor.id).status).toBe("idle");
+    }
+    expect(s.actors.status(actor.id).status).toBe("failed");
+    await waitFor(() => presence()?.status === "failed");
+    // Factory review_routing._snapshot admits ONLY idle/running/queued.
+    expect(["idle", "running", "queued"]).not.toContain(presence()?.status);
+    await waitFor(() => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC }).length === 1);
+    expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC })[0]!.data)
+      .toMatchObject({ actorId: actor.id, routingStatus: "failed", pendingEffects: "reconcile-required" });
+    expect(s.deliveries.at(-1)).toContain("Reconcile any prepared external effects");
+    await s.actors.close();
+    const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "actors"), persistent: true,
+    });
+    actorManagers.push(restored);
+    expect(restored.status(actor.id).status).toBe("failed");
+    run.mockRestore();
+    await restored.ask(actor.id, "successful repair probe");
+    await waitFor(() => restored.status(actor.id).status === "idle" && presence()?.status === "idle");
+    expect(restored.status(actor.id).activationBlocked).toBeUndefined();
+  });
+
   it("creates, reconfigures and runs activation actors without a host turn-provenance capability gate", async () => {
     const { actors } = setup();
     const actor = await actors.create({ name: "legacy-host", instructions: "Activate.", inferenceContext: "activation" });
@@ -2994,7 +3024,7 @@ describe("ActorManager", () => {
     const actor = await actors.create({ name: "failed-activation", instructions: "Activate.", inferenceContext: "activation", responseMode: "text" });
     for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
       await expect(actors.ask(actor.id, "activate")).rejects.toThrow(error);
-      await waitFor(() => actors.status(actor.id).status === "idle");
+      await waitFor(() => !actors.status(actor.id).inFlightRun && !actors.status(actor.id).preparing);
     }
     expect(actors.status(actor.id).activationBlocked).toMatchObject({ reason, code, count: ACTOR_FAILURE_NOTICE_AFTER, since: expect.any(Number) });
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
@@ -3015,7 +3045,7 @@ describe("ActorManager", () => {
     await expect(restored.ask(actor.id, "caller")).rejects.toThrow("Activation window lost current activation messages");
     await restored.tell(actor.id, "event-one");
     await restored.tell(actor.id, "event-two");
-    await waitFor(() => restored.status(actor.id).status === "idle");
+    await waitFor(() => restored.status(actor.id).status === "failed" && !restored.status(actor.id).inFlightRun);
     expect(restored.status(actor.id)).toMatchObject({ queued: 0, activationBlocked: { code: "activation-window-lost", count: 3 } });
     expect(restored.messages(actor.id).filter(message => message.direction === "out" && message.error)).toHaveLength(3);
     await restored.close();
@@ -3023,9 +3053,9 @@ describe("ActorManager", () => {
       actorRoot: path.join(s.root, "actors"), persistent: true,
     });
     actorManagers.push(next);
-    expect(next.status(actor.id)).toMatchObject({ status: "idle", queued: 0, activationBlocked: { code: "activation-window-lost", count: 3 } });
+    expect(next.status(actor.id)).toMatchObject({ status: "failed", queued: 0, activationBlocked: { code: "activation-window-lost", count: 3 } });
     await expect(next.ask(actor.id, "next caller")).rejects.toThrow("Activation window lost current activation messages");
-    await waitFor(() => next.status(actor.id).status === "idle");
+    await waitFor(() => next.status(actor.id).status === "failed" && !next.status(actor.id).inFlightRun);
     expect(next.status(actor.id).activationBlocked?.count).toBe(4);
     expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toHaveLength(1);
   });
@@ -3035,7 +3065,7 @@ describe("ActorManager", () => {
     const actor = await s.actors.create({ name: "restart-streak", instructions: "Respond.", responseMode: "text" });
     let manager = s.actors;
     const restart = async () => {
-      await waitFor(() => manager.status(actor.id).status === "idle");
+      await waitFor(() => !manager.status(actor.id).inFlightRun && !manager.status(actor.id).preparing);
       await manager.close();
       manager = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
         actorRoot: path.join(s.root, "actors"), persistent: true,
@@ -3044,7 +3074,7 @@ describe("ActorManager", () => {
     };
     const fail = async () => {
       await expect(manager.ask(actor.id, "FAIL_DIRECTIVE")).rejects.toThrow();
-      await waitFor(() => manager.status(actor.id).status === "idle");
+      await waitFor(() => !manager.status(actor.id).inFlightRun && !manager.status(actor.id).preparing);
     };
     const alarms = () => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 });
     await fail(); await fail();

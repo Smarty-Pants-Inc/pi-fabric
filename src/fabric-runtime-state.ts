@@ -218,6 +218,7 @@ export class FabricRuntimeState {
   #records: Promise<RecordsService> | undefined;
   #openRecords: (() => Promise<RecordsService>) | undefined;
   #mesh: MeshStore | undefined;
+  #actorMeshWrites: AbortController | undefined;
   #backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
   readonly #inboxRetry = new MeshBackgroundRetry("root inbox cursor");
   #identity: MeshIdentity | undefined;
@@ -597,6 +598,7 @@ export class FabricRuntimeState {
         ? path.resolve(projectRoot, configuredMeshRoot)
         : path.join(projectRoot, ".pi", "fabric", "mesh"));
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
+    this.#actorMeshWrites = identity.kind === "actor" ? new AbortController() : undefined;
     this.#mesh = new MeshStore(
       meshRoot,
       this.#config.mesh.maxEventBytes,
@@ -606,6 +608,7 @@ export class FabricRuntimeState {
         readActive: () => !context.isIdle() || context.hasPendingMessages() ||
           (this.#agents?.runningCount() ?? 0) > 0 || (this.#actors?.inFlightCount() ?? 0) > 0,
         lockProtocol: this.#config.mesh.lockProtocol,
+        ...(this.#actorMeshWrites ? { writeSignal: this.#actorMeshWrites.signal } : {}),
       },
     );
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
@@ -1660,6 +1663,11 @@ export class FabricRuntimeState {
   }
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
+    // A disposable actor's result/journal belongs to its worker, not to this
+    // runtime's advisory presence/heartbeat writes. EOF must not convoy behind
+    // the shared mesh lock before local teardown can stop its timers (#5256).
+    // Main/resident custody and reload checkpoints retain their normal joins.
+    if (reason === "exit" || reason === "quit") this.#actorMeshWrites?.abort();
     if (reason === "reload") {
       // Stop admission synchronously, before the first await. In-flight handlers may only journal.
       this.#mainAgent?.prepareReload();

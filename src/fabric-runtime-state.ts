@@ -418,6 +418,10 @@ export class FabricRuntimeState {
     return this.#agentsProvider.routeMessage(targetId, message, undefined, delivery);
   }
 
+  async reportMainProviderError(message: string): Promise<unknown> {
+    return this.#agentsProvider?.reportMainProviderError(message);
+  }
+
   async stopParticipant(targetId: string): Promise<unknown> {
     if (!this.#agentsProvider) throw new Error("Pi Fabric has not initialized");
     return this.#agentsProvider.stopParticipant(targetId);

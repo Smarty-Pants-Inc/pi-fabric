@@ -27,7 +27,7 @@ Ryzen 1 example (the existing fleet launcher, **not executed by the offline test
         "auto",
         "--minutes",
         "{minutes}",
-        "--cwd",
+        "--src",
         "{cwd}",
         "--model",
         "{model}",
@@ -37,13 +37,19 @@ Ryzen 1 example (the existing fleet launcher, **not executed by the offline test
         "{task}"
       ],
       "capabilities": [],
+      "sshAliases": {
+        "ryzen2": "ryzen2-agent",
+        "ryzen3": "forge-agent",
+        "ryzen4": "ryzen4-agent",
+        "ryzen5": "ryzen5-agent"
+      },
       "resultCommand": [
         "/usr/bin/ssh",
         "-o",
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=10",
-        "{host}-agent",
+        "{sshAlias}",
         "python3 -c 'import json, pathlib, sys; p=pathlib.Path(\"/srv/scratch/paul/tasks/direct\")/sys.argv[1]; rc=p/\"rc\"; print(json.dumps({\"rc\":rc.read_text().strip(),\"text\":(p/\"result.md\").read_text(),\"stderr\":(p/\"stderr.log\").read_text() if (p/\"stderr.log\").exists() else \"\"} if rc.exists() else {\"rc\":None}))' {id}"
       ],
       "cancelCommand": [
@@ -60,9 +66,11 @@ Ryzen 1 example (the existing fleet launcher, **not executed by the offline test
 }
 ```
 
-This example uses the fleet's existing host aliases and normal SSH host-key verification, with only read-only result polling added. Verify the aliases and target-local cwd before enabling it. For a target without `python3`, use an equivalent host-owned reader that implements the JSON contract below. The hook itself does not call SSH implicitly or retrieve a remote file as if it were local. The launcher selects the host; its `RYZEN2_TASK_ACCEPTED <id> on <host> ...` line must match the Fabric run ID. `{host}` in polling/cancellation comes from that receipt, not from `auto`.
+The Ryzen 1 Main's cwd (for example `/home/paul/smarty/smarty-pants/pi-fabric`) is a **source** workspace, not a target-local lane: `--src {cwd}` makes the launcher ship tracked and unignored files to the selected task's `OUT/src` and run there. Do not substitute `--cwd`, which the launcher permits only for existing target-local lanes under `/home/paul/lanes`, `/home/paul/repos`, or `/srv/scratch/paul/tasks`. With `--src {cwd}`, home/root or non-Git source directories stay local with audit reason `cwd-not-shippable`.
 
-All commands are **argv arrays**, passed to `execFile` without a shell. Template substitution occurs once; task quotes/newlines/metacharacters remain a single argument. Available placeholders are `{id}`, `{cwd}`, `{task}`, `{minutes}` (rounded up from the run timeout), `{model}`, `{thinking}`; after acceptance, `{host}` and `{resultDir}` (when configured) are available. `{host}`/`{resultDir}` cannot be used on the launch command. Model and effort must be included to preserve the caller's selection. The adapter exports the parent Fabric session as `PI_SESSION_ID` for the launcher's existing completion/inbox binding.
+`sshAliases` copies smarty-dev's `setup/factory/work-hosts.json` mapping: `ryzen2 → ryzen2-agent`, **`ryzen3 → forge-agent`**, `ryzen4 → ryzen4-agent`, `ryzen5 → ryzen5-agent`. Keep this host-owned map synchronized with that file; Fabric does not read smarty-dev files or invent `{host}-agent`. `{sshAlias}` is looked up using the accepted host, and requires a nonempty map of safe host/alias tokens. An unmapped accepted host retains launch custody rather than guessing an alias or starting a local duplicate. This example uses normal SSH host-key verification, with only read-only result polling added. Verify the aliases and shippable source workspace before enabling it. For a target without `python3`, use an equivalent host-owned reader that implements the JSON contract below. The hook itself does not call SSH implicitly or retrieve a remote file as if it were local. The launcher selects the host; its `RYZEN2_TASK_ACCEPTED <id> on <host> ...` line must match the Fabric run ID. `{host}` in polling/cancellation comes from that receipt, not from `auto`.
+
+All commands are **argv arrays**, passed to `execFile` without a shell. Template substitution occurs once; task quotes/newlines/metacharacters remain a single argument. Available placeholders are `{id}`, `{cwd}`, `{task}`, `{minutes}` (rounded up from the run timeout), `{model}`, `{thinking}`; after acceptance, `{host}`, `{sshAlias}` (when mapped), and `{resultDir}` (when configured) are available. `{host}`/`{sshAlias}`/`{resultDir}` cannot be used on the launch command. Model and effort must be included to preserve the caller's selection. The adapter exports the parent Fabric session as `PI_SESSION_ID` for the launcher's existing completion/inbox binding.
 
 Configure exactly one result source:
 
@@ -70,6 +78,8 @@ Configure exactly one result source:
 - `resultCommand`: a bounded read-only argv template whose stdout is only JSON: `{"rc":null}` while pending, or `{"rc":0,"text":"full final result","stderr":"optional"}` after native execution exits. Integer/string exit receipts are supported. Nonzero rc maps to `failed`; 124 or a timeout string maps to `timed_out`. The reader must never emit terminal rc before the remote task/process tree is actually stopped. Poll failures are retried only until the task deadline; they do not relaunch the task.
 
 `cancelCommand` is required and requests cancellation; a successful command alone does not prove exit. The adapter waits up to `min(commandTimeoutMs, 5000)` for the final receipt. Missing receipt retains exit debt and files/admission, and reports the stop/timeout with a warning instead of inventing successful cleanup. Launch errors or mismatched acceptance retain conservative custody (except a missing executable, which is known unlaunched). Remote launches are never automatically retried or replaced by a local spawn.
+
+At extension `session_start`, configured placement gets a filesystem-only startup probe: the first `command` element must resolve to an existing executable regular file (an absolute path, a cwd-relative path, or a name on `PATH`; no dynamic executable placeholders). One clear `[pi-fabric] agents.placement startup probe:` line reports readiness or local fallback. Probe failure preserves the configured policy but keeps eligible tasks local, appending `placement.local` with `placement-probe-failed: command missing or not executable: ...`. Unconfigured placement does not probe or log. Config reload rechecks readiness without repeating an unchanged diagnostic. No launcher is invoked: the fleet launcher has `--dry-run`, not `--probe`, and even a dry run can select hosts/check inputs over SSH. A startup success does not attest remote availability, cwd shipment, or command arguments; post-invocation failures still retain conservative custody.
 
 `pollIntervalMs` defaults to 1000 (range 10–60000). `commandTimeoutMs` defaults to 30000 (range 100–120000). No polling starts during registration or idle lifecycle hooks; the adapter is a stable lazy entry loaded at actual first remote use. The manager owns polling/cancellation, with no extra detached watcher in Fabric. The fleet launcher still has its own existing inbox watcher; this does not replace Fabric's wait result.
 

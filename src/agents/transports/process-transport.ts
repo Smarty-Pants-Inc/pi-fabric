@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { pathToFileURL } from "node:url";
 import type {
   AgentTransportAdapter,
@@ -9,10 +10,11 @@ import type {
 import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/agent-dir.js";
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
-import { findExecutable, spawnDetached } from "./process-utils.js";
+import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
+import { agentPlacementProbe } from "../placement-config.js";
 
 const regularFile = (file: string): boolean => {
   try { return fs.statSync(file).isFile(); } catch { return false; }
@@ -65,8 +67,21 @@ export class ProcessTransport implements AgentTransportAdapter {
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     if (this.placement) {
       const unmet = (request.needs ?? []).filter(need => !this.placement!.capabilities.includes(need));
-      const reason = this.placement.default === "local" ? "placement default is local"
+      let reason = this.placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
+      if (!reason) reason = agentPlacementProbe(this.placement, request.cwd).reason;
+      // --src ships the Main's workspace, unlike --cwd which names a target-local
+      // lane. Home/non-Git directories must never become a fleet source packet.
+      if (!reason && this.placement.command.some((entry, index) => entry === "--src" && this.placement!.command[index + 1] === "{cwd}")) {
+        try {
+          const cwd = fs.realpathSync(request.cwd);
+          if (cwd === path.parse(cwd).root || cwd === fs.realpathSync(os.homedir())) throw new Error("home or root source");
+          const git = await executeFile("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
+            timeoutMs: Math.min(this.placement.commandTimeoutMs, 5_000), killSignal: "SIGKILL",
+          });
+          if (git.stdout.trim() !== "true") throw new Error("not a Git work tree");
+        } catch { reason = "cwd-not-shippable"; }
+      }
       if (!reason) {
         const { launchPlacedTask } = await import("./placement.js");
         return launchPlacedTask(request, this.placement);

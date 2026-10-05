@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG, loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -8,6 +9,7 @@ import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import type { AgentTransportLaunch } from "../src/agents/types.js";
+import { probeAgentPlacement } from "../src/agents/placement-config.js";
 
 const roots: string[] = [], managers: AgentManager[] = [];
 afterEach(async () => {
@@ -24,13 +26,15 @@ if (mode === 'launch') {
  if (task === 'reject') { console.error('launcher rejected'); process.exit(3); }
  if (task === 'malformed') { console.log('no accepted receipt'); process.exit(0); }
  fs.writeFileSync(path.join(dir,'result.md'), task === 'pending' ? 'partial' : 'REMOTE: '+task);
- if (task !== 'pending') fs.writeFileSync(path.join(dir,'rc'), task === 'fail' ? '7' : '0');
- console.log('RYZEN2_TASK_ACCEPTED '+id+' on ryzen2 (unit smarty-task-'+id+').');
+ if (task !== 'pending' && task !== 'forge-pending') fs.writeFileSync(path.join(dir,'rc'), task === 'fail' ? '7' : '0');
+ console.log('RYZEN2_TASK_ACCEPTED '+id+' on '+(task === 'forge' || task === 'forge-pending' ? 'ryzen3' : 'ryzen2')+' (unit smarty-task-'+id+').');
 } else if (mode === 'cancel') {
+ fs.writeFileSync(path.join(dir,'cancel-argv.json'), JSON.stringify(argv));
  fs.writeFileSync(path.join(dir,'cancelled'), 'yes');
  fs.writeFileSync(path.join(dir,'rc'),'124');
 } else if (mode === 'unconfirmed') { console.log('cancel acknowledged without exit');
 } else if (mode === 'poll') {
+ fs.writeFileSync(path.join(dir,'poll-argv.json'), JSON.stringify(argv));
  const rc = path.join(dir,'rc');
  console.log(JSON.stringify(fs.existsSync(rc) ? {rc:fs.readFileSync(rc,'utf8').trim(),text:fs.readFileSync(path.join(dir,'result.md'),'utf8')} : {rc:null}));
 } else if (mode === 'bad-poll') { console.log('not JSON'); }
@@ -63,7 +67,7 @@ describe("host process task placement", () => {
     const f = fixture();
     expect(normalizeFabricConfig({agents:{placement:{...f.raw,default:undefined}}}).agents.placement?.default).toBe("local");
     expect(f.config.placement).toMatchObject({default:"remote",capabilities:[],pollIntervalMs:10});
-    for (const change of [{command:"shell string"},{default:"auto"},{command:["{typo}"]},{cancelCommand:[]},{resultDirectory:undefined},{resultDirectory:"relative/{id}"},{pollIntervalMs:0},{capabilities:[1]}]) {
+    for (const change of [{command:"shell string"},{default:"auto"},{command:["{typo}"]},{cancelCommand:[]},{resultDirectory:undefined},{resultDirectory:"relative/{id}"},{pollIntervalMs:0},{capabilities:[1]},{sshAliases:[]},{sshAliases:{ryzen3:"-oProxyCommand=bad"}},{command:["fake","{sshAlias}"]},{resultCommand:["fake","{sshAlias}"],resultDirectory:undefined}]) {
       expect(() => normalizeFabricConfig({agents:{placement:{...f.raw,...change}}})).toThrow();
     }
   });
@@ -93,6 +97,35 @@ describe("host process task placement", () => {
     const result=await f.manager.wait(h.id);
     expect(result).toMatchObject({status:"completed",text:`REMOTE: ${task}`,exitCode:0});
     expect(JSON.parse(fs.readFileSync(path.join(f.results,h.id,"argv.json"),"utf8"))).toEqual(["--host","auto","--minutes","1","--cwd",f.root,"--model","test/model","--thinking","high","--",task]);
+  });
+  it("ships a Git source cwd with --src rather than the target-only --cwd flag", async () => {
+    const f=fixture(); execFileSync("git",["init","--quiet",f.root]);
+    f.config.placement.command=f.config.placement.command.map(entry=>entry==="--cwd"?"--src":entry);
+    const result=await f.manager.run({task:"source packet",transport:"process",model:"test/model",thinking:"high"});
+    expect(result).toMatchObject({status:"completed",text:"REMOTE: source packet"});
+    const argv=JSON.parse(fs.readFileSync(path.join(f.results,result.id,"argv.json"),"utf8"));
+    expect(argv).toEqual(["--host","auto","--minutes","1","--src",f.root,"--model","test/model","--thinking","high","--","source packet"]);
+  });
+  it("resolves Ryzen 3 polling and cancellation through the configured forge alias", async () => {
+    const f=fixture(true);
+    f.config.placement.sshAliases={ryzen2:"ryzen2-agent",ryzen3:"forge-agent"};
+    f.config.placement.resultCommand!.push("{sshAlias}");
+    f.config.placement.cancelCommand.push("{sshAlias}");
+    const result=await f.manager.run({task:"forge",transport:"process"});
+    expect(result).toMatchObject({status:"completed",text:"REMOTE: forge"});
+    expect(JSON.parse(fs.readFileSync(path.join(f.results,result.id,"poll-argv.json"),"utf8"))).toEqual(["forge-agent"]);
+    const req=launch(f,"forge-pending",5_000); const h=await new ProcessTransport(undefined,f.config.placement).launch(req);
+    await h.stop();
+    expect(JSON.parse(fs.readFileSync(path.join(f.results,req.id,"cancel-argv.json"),"utf8"))).toEqual(["forge-agent"]);
+    expect(h.stopDebt?.()).toBeUndefined();
+  });
+  it("does not guess an SSH alias or fall back locally after unmapped host acceptance", async () => {
+    const f=fixture(true); f.config.placement.sshAliases={ryzen2:"ryzen2-agent"};
+    f.config.placement.resultCommand!.push("{sshAlias}");
+    const req=launch(f,"forge",5_000);
+    await expect(new ProcessTransport(undefined,f.config.placement).launch(req)).rejects.toMatchObject({launchOutcome:"unknown",cleanupPending:true});
+    expect(fs.existsSync(path.join(f.results,req.id,"argv.json"))).toBe(true);
+    expect(fs.existsSync(path.join(f.results,req.id,"poll-argv.json"))).toBe(false);
   });
   it("maps agents.run failures and never retries the remote launch", async () => {
     const f=fixture(true); const result=await f.manager.run({task:"fail",transport:"process"});
@@ -126,9 +159,27 @@ describe("host process task placement", () => {
     await expect(new ProcessTransport(undefined,f.config.placement).launch(req)).rejects.toThrow("authorized");
     expect(fs.existsSync(f.results)).toBe(false);
   });
-  it("reports a missing placement executable as unlaunched, never local fallback", async () => {
+  it("falls back locally with one audit reason when the executable probe fails", async () => {
     const f=fixture(); f.config.placement.command=[path.join(f.root,"missing"),"{id}"];
+    const h=await f.manager.spawn({task:"x",transport:"process"});
+    expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
+    const events=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+    expect(events.filter(line=>line.type==="placement.local")).toEqual([expect.objectContaining({reason:expect.stringContaining("placement-probe-failed:")})]);
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it("does not invent a local retry when an executable disappears after a successful startup probe", async () => {
+    const f=fixture(); const launcher=path.join(f.root,process.platform==="win32"?"removed.exe":"removed");
+    fs.writeFileSync(launcher,"never execute",{mode:0o700}); f.config.placement.command=[launcher,"{id}"];
+    expect(probeAgentPlacement(f.config.placement,f.root).reason).toBeUndefined(); fs.unlinkSync(launcher);
     await expect(f.manager.spawn({task:"x",transport:"process"})).rejects.toThrow("ENOENT");
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it.each(["home","non-git"])("keeps an unshippable %s --src cwd local", async kind => {
+    const f=fixture(); f.config.placement.command=f.config.placement.command.map(entry=>entry==="--cwd"?"--src":entry);
+    if(kind==="home") vi.stubEnv("HOME",f.root);
+    const h=await f.manager.spawn({task:"x",transport:"process"});
+    expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
+    expect(fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8")).toContain('"reason":"cwd-not-shippable"');
     expect(fs.existsSync(f.results)).toBe(false);
   });
   it("keeps actor and durable requests local with a recorded reason", async () => {

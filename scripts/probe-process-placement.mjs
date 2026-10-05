@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { execFileSync } from "node:child_process";
 
 const [piPackage, outputDirectory] = process.argv.slice(2);
 assert(piPackage && outputDirectory, "usage: probe-process-placement.mjs PI_PACKAGE_DIR OUTPUT_DIR");
@@ -15,6 +16,7 @@ fs.chmodSync(root,0o700);
 const profile = path.join(root, "profile");
 const cwd = path.join(root, "cwd");
 fs.mkdirSync(profile, {recursive:true}); fs.mkdirSync(cwd, {recursive:true});
+execFileSync("git", ["init", "--quiet", cwd]);
 process.env.HOME = root;
 process.env.PI_CODING_AGENT_DIR = profile;
 process.env.PI_FABRIC_TMPDIR = path.join(root,"tmp");
@@ -40,7 +42,7 @@ if(mode==='launch') {
 `);
 const placement = {
  default:"remote", capabilities:[],
- command:[process.execPath,launcher,"launch",results,"{id}","--host","auto","--minutes","{minutes}","--cwd","{cwd}","--model","{model}","--thinking","{thinking}","--","{task}"],
+ command:[process.execPath,launcher,"launch",results,"{id}","--host","auto","--minutes","{minutes}","--src","{cwd}","--model","{model}","--thinking","{thinking}","--","{task}"],
  resultCommand:[process.execPath,launcher,"poll",results,"{id}"],
  cancelCommand:[process.execPath,launcher,"cancel",results,"{id}"], pollIntervalMs:10, commandTimeoutMs:1000,
 };
@@ -81,6 +83,8 @@ try {
  assert(fs.existsSync(path.join(results,id,"rc")),"native completion marker must arrive");
  const argv=JSON.parse(fs.readFileSync(path.join(results,id,"argv.json"),"utf8"));
  assert.equal(argv.at(-1),"installed Pi remote task");
+ assert.equal(argv[argv.indexOf("--src")+1],cwd);
+ assert(!argv.includes("--cwd"),"Ryzen 1 sources must use --src");
  const evidence={piPackage,extension,isolatedAgentDir:profile,id,argv,resultText:text,passed:true};
  fs.writeFileSync(path.join(root,"evidence.json"),JSON.stringify(evidence,null,2));
  console.log(JSON.stringify({passed:true,id,result:"PLACEMENT_PROOF_RESULT: installed Pi remote task",evidence:path.join(root,"evidence.json")}));

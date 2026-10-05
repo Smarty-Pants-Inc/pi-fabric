@@ -160,6 +160,10 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
       return handle;
     }
     values.host = accepted[2]!;
+    if (config.sshAliases && Object.hasOwn(config.sshAliases, values.host)) values.sshAlias = config.sshAliases[values.host]!;
+    if ([config.resultDirectory ?? "", ...(config.resultCommand ?? []), ...config.cancelCommand].some(entry => entry.includes("{sshAlias}")) && !values.sshAlias) {
+      throw new Error(`Placement SSH alias unavailable for accepted host: ${values.host}`);
+    }
     if (config.resultDirectory) values.resultDir = render(config.resultDirectory, values);
     writeJsonAtomic(path.join(path.dirname(statusFile), "placement.json"), { id: request.id, host: values.host, output, deadline, ...(values.resultDir ? { resultDirectory: values.resultDir } : {}) });
     audit("placement.remote", { host: values.host, needs: request.needs ?? [], deadline });

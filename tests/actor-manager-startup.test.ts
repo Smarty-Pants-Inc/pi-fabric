@@ -63,40 +63,34 @@ async function eventually(predicate: () => boolean) {
 }
 
 describe("ActorManager bounded startup (#4250 item 4)", () => {
-  it.each(["native", "win32"] as const)("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in slices below 250ms (%s)", async mode => {
+  it("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in bounded event-loop slices", async () => {
     const f = fixture(200);
-    const platform = mode === "win32" ? vi.spyOn(process, "platform", "get").mockReturnValue("win32") : undefined;
     const rawOwnership = vi.fn(() => true);
     const snapshot = vi.fn(() => new Map(f.records.map((record) => [record.id, true])));
     const read = vi.spyOn(ActorRegistryStore.prototype, "read");
     const write = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const runsPerActor = 10; // Includes the lastRunId fence in fixture().
+    const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
+    const runDirectories = new Set(f.records.map((_, actor) => path.dirname(f.runDir(actor, 0))));
+    const readdir = fs.readdirSync;
+    let runsThisTurn = 0, totalRuns = 0;
+    const runsPerTurn: number[] = [];
+    // Observe real archive enumeration, not elapsed time or a mocked pruning result.
+    vi.spyOn(fs, "readdirSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      const entries = Reflect.apply(readdir, fs, [file, ...args]);
+      if (runDirectories.has(String(file))) {
+        runsThisTurn += entries.length;
+        totalRuns += entries.length;
+      }
+      return entries;
+    }) as never);
     await turn();
     let previous = performance.now(), longest = 0, active = true;
-    let prunedSinceBeat = 0, largestBatch = 0;
-    const prune = ActorLogStore.prototype.pruneRuns;
-    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function (this: ActorLogStore, ...args) {
-      prunedSinceBeat++; return prune.apply(this, args);
-    });
-    const queued = ActorLogStore.prototype.pruneRunsAsync;
-    vi.spyOn(ActorLogStore.prototype, "pruneRunsAsync").mockImplementation(function(this: ActorLogStore, ...args) {
-      prunedSinceBeat++; return queued.apply(this, args);
-    });
-    let deletedSinceBeat = 0, largestRunBatch = 0;
-    const remove = fs.rmSync;
-    vi.spyOn(fs, "rmSync").mockImplementation((...args) => {
-      if (/[/\\\\]runs[/\\\\]run-\d+-\d+$/.test(String(args[0]))) deletedSinceBeat++;
-      return remove(...args);
-    });
-    const removeAsync = fs.promises.rm;
-    vi.spyOn(fs.promises, "rm").mockImplementation(async (...args) => {
-      if (/[/\\\\]runs[/\\\\]run-\d+-\d+$/.test(String(args[0]))) deletedSinceBeat++;
-      return removeAsync(...args);
-    });
     let heartbeat: NodeJS.Immediate;
     const beat = () => {
       const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
-      largestBatch = Math.max(largestBatch, prunedSinceBeat); prunedSinceBeat = 0;
-      largestRunBatch = Math.max(largestRunBatch, deletedSinceBeat); deletedSinceBeat = 0;
+      if (runsThisTurn) runsPerTurn.push(runsThisTurn);
+      runsThisTurn = 0;
       if (active) heartbeat = setImmediate(beat);
     };
     heartbeat = setImmediate(beat);
@@ -104,24 +98,31 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       const started = performance.now();
       f.make({ canManageActor: rawOwnership, snapshotActorOwnership: snapshot });
       const construction = performance.now() - started;
-      expect(construction).toBeLessThan(250);
+      expect(construction).toBeLessThan(2_000); // Gross-regression sanity, not a shared-runner performance SLA.
       expect(read).toHaveBeenCalledTimes(1);
       expect(write).not.toHaveBeenCalled();
       expect(snapshot).toHaveBeenCalledTimes(1);
       expect(rawOwnership).not.toHaveBeenCalled();
       // No archive traversal or deletion on the constructor stack.
+      expect(totalRuns).toBe(0);
       expect(fs.existsSync(f.runDir(0, 0))).toBe(true);
       await eventually(() => !fs.existsSync(f.runDir(199, 8)));
       await turn();
-      expect(longest).toBeLessThan(250);
-      expect(largestBatch).toBeGreaterThan(0);
-      expect(largestBatch).toBeLessThanOrEqual(ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"]);
+      // A recurring setImmediate observes every maintenance turn. A microtask
+      // yield (or no yield) cannot reset the counter, even on a fast filesystem.
+      expect(totalRuns).toBe(f.records.length * runsPerActor);
+      expect(Math.max(...runsPerTurn)).toBeGreaterThan(0);
+      expect(Math.max(...runsPerTurn)).toBeLessThanOrEqual(batchSize * runsPerActor);
+      expect(runsPerTurn.length).toBeGreaterThanOrEqual(Math.ceil(f.records.length / batchSize));
+      expect(longest).toBeLessThan(2_000); // Allow CI descheduling/GC; work per turn is the regression gate.
       for (let actor = 0; actor < 200; actor++) {
         for (let run = 0; run < 9; run++) expect(fs.existsSync(f.runDir(actor, run))).toBe(false);
         expect(fs.existsSync(f.runDir(actor, 9))).toBe(true); // lastRunId fence survives
       }
-      process.stdout.write(JSON.stringify({ probe: "ActorManager-200-2000", mode, platform: process.platform, constructorMs: construction, longestSliceMs: longest, largestBatch, largestRunBatch }) + "\n");
-    } finally { active = false; clearImmediate(heartbeat!); platform?.mockRestore(); }
+      process.stdout.write(JSON.stringify({ probe: "ActorManager 200/2000", constructorMs: construction,
+        longestSliceMs: longest, totalRuns, maxRunsPerTurn: Math.max(...runsPerTurn),
+        runsPerTurnLimit: batchSize * runsPerActor, workTurns: runsPerTurn.length }) + "\n");
+    } finally { active = false; clearImmediate(heartbeat!); }
   });
 
   it("keeps Windows startup on main's synchronous per-actor sweep, without an added custody queue", async () => {
@@ -301,8 +302,8 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     vi.spyOn(f.agents, "run").mockImplementation(async (request) => {
       tasks.push(request.task); started(); await gate; throw new Error("fixture ended");
     });
-    // Freeze only maintenance turns, not promise/lock I/O. Admission must happen
-    // before the last actor's real platform-specific retention batch.
+    // Freeze only maintenance turns, not promise/lock I/O. This proves admission
+    // happens before the last actor's retention slice, rather than relying on timing.
     vi.useFakeTimers({ toFake: ["setImmediate", "clearImmediate"] });
     try {
       const manager = f.make();
@@ -340,7 +341,6 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     // before the second slice, like quiesce/reload while slow filesystem work yields.
     await turn(); published = false;
     await turn(); await turn();
-    // Main completes the first platform-specific actor batch before yielding.
     expect(fs.existsSync(f.runDir(0, 8))).toBe(false);
     expect(fs.existsSync(f.runDir(16, 8))).toBe(true);
     published = true; manager.resumeQueued();

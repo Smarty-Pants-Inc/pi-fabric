@@ -38,6 +38,13 @@ export type FabricAgentRunner = "pi" | "claude" | "veda";
 export type FabricUiWidgetMode = "auto" | "always" | "hidden";
 type FabricToolDisplayMode = "full" | "compact";
 export type FabricIncomingMessageMode = "auto" | "collapsed" | "expanded";
+export type FabricPrincipalViewMode = "auto" | "on" | "off";
+
+/** Read the old incoming-only preference until a principal-view preference is saved. */
+const principalViewModeValue = (ui: Record<string, unknown>): FabricPrincipalViewMode =>
+  ui.principalView === "on" || ui.principalView === "off" || ui.principalView === "auto"
+    ? ui.principalView
+    : ui.incomingMessages === "collapsed" ? "on" : ui.incomingMessages === "expanded" ? "off" : "auto";
 export type FabricResultFormat = "auto" | "yaml" | "json" | "text";
 export type FabricPrewalkMode = "in-place" | "trajectory";
 export type FabricExecutorRuntime = "quickjs" | "node-process" | "bun-process";
@@ -231,7 +238,9 @@ interface FabricUiConfig {
   haltOnEscape: boolean;
   showAgentToolPreview: boolean;
   toolDisplay: FabricToolDisplayMode;
+  /** @deprecated Use principalView; retained for incoming-only config compatibility. */
   incomingMessages: FabricIncomingMessageMode;
+  principalView: FabricPrincipalViewMode;
   updateDebounceMs: number;
 }
 
@@ -527,6 +536,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     showAgentToolPreview: true,
     toolDisplay: "compact",
     incomingMessages: "auto",
+    principalView: "auto",
     updateDebounceMs: 100,
   },
   compaction: {
@@ -1218,6 +1228,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ),
       incomingMessages: ui.incomingMessages === "collapsed" || ui.incomingMessages === "expanded"
         ? ui.incomingMessages : "auto",
+      principalView: principalViewModeValue(ui),
       toolDisplay: toolDisplayModeValue(
         ui.toolDisplay,
         DEFAULT_FABRIC_CONFIG.ui.toolDisplay,
@@ -1632,6 +1643,12 @@ const resolveFabricConfig = (
     if (!plan) continue;
     if (plan.changed) writeJsonAtomic(plan.path, plan.document, plan.source);
     const document = { ...plan.document };
+    const ui = objectValue(document.ui);
+    // Translate each persisted layer before merging with defaults, so legacy
+    // project preferences still override global ones without rewriting files.
+    if (ui.principalView === undefined && ui.incomingMessages !== undefined) {
+      document.ui = { ...ui, principalView: principalViewModeValue(ui) };
+    }
     if (plan === projectPlan) {
       const agents = { ...objectValue(document.agents) };
       delete agents.modelPolicy;

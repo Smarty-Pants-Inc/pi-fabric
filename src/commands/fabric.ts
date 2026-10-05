@@ -64,6 +64,7 @@ interface FabricCommandDeps {
   autoArmPrewalk?: (context: ExtensionContext) => Promise<void>;
   refreshCodePreviewSettings?: () => void;
   refreshToolDisplay?: () => void;
+  refreshPrincipalView?: (context: ExtensionContext) => void;
 }
 
 const extractContentText = (content: unknown): string => {
@@ -470,6 +471,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         // initialize() reloads configuration, so an externally edited
         // ui.toolDisplay must re-render existing transcript cards too.
         deps.refreshToolDisplay?.();
+        deps.refreshPrincipalView?.(context);
         return;
       }
       if (command === "settings") {
@@ -483,7 +485,9 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           // refreshToolDisplay re-renders every fabric_exec card, so gating it
           // on the display sections keeps unrelated saves off the transcript.
           onConfigApplied: (id) => {
-            if (id === "ui.incomingMessages" && context.hasUI) {
+            if (id === "ui.principalView") {
+              deps.refreshPrincipalView?.(context);
+            } else if (id === "ui.incomingMessages" && context.hasUI) {
               // Pi rebuilds custom-message components only when expansion changes.
               // Refresh through the host API and restore the tool state unchanged.
               const expanded = context.ui.getToolsExpanded();

@@ -141,6 +141,9 @@ describe("incoming Fabric display projection", () => {
 
   it.each([
     [{}, false], [{ SMARTY_ROLE: "org" }, true], [{ SMARTY_ROLE: "org@abc123456789" }, true],
+    [{ SMARTY_ROLE: "org-agent" }, true], [{ SMARTY_ROLE: "org-agent@abc123456789" }, true],
+    [{ SMARTY_ROLE: "project-agent@abc123456789" }, false],
+    [{ PI_FABRIC_ROLE: "task-agent", SMARTY_ROLE: "org-agent@abc123456789" }, false],
     [{ PI_FABRIC_ROLE: "org", SMARTY_ROLE: "task-agent" }, true],
     [{ PI_FABRIC_ROLE: "project", SMARTY_ROLE: "org" }, false],
     [{ SMARTY_ROLE: "task-agent" }, false], [{ SMARTY_ROLE: "org-kate" }, false],

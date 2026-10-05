@@ -37,7 +37,7 @@ describe("Main replay and route-authority startup boundary", () => {
         return () => handlers.set(name, (handlers.get(name) ?? []).filter(fn => fn !== handler));
       },
       getActiveTools: vi.fn(() => []), getAllTools: vi.fn(() => []), getThinkingLevel: () => "off",
-      registerCommand: vi.fn(), registerMessageRenderer: vi.fn(), registerTool: vi.fn(),
+      registerCommand: vi.fn(), registerShortcut: vi.fn(), registerMessageRenderer: vi.fn(), registerTool: vi.fn(),
       setActiveTools: vi.fn(), sendMessage: vi.fn(),
     } as unknown as ExtensionAPI;
     const context = {
@@ -62,6 +62,8 @@ describe("Main replay and route-authority startup boundary", () => {
       for (const type of ["pi-fabric-agent-message", "pi-fabric-actor", "pi-fabric-inbox", "pi-fabric-inbox-summary"]) {
         expect(pi.registerMessageRenderer).toHaveBeenCalledWith(type, expect.any(Function));
       }
+      expect(pi.registerCommand).toHaveBeenCalledWith("principal-view", expect.objectContaining({ handler: expect.any(Function) }));
+      expect(pi.registerShortcut).toHaveBeenCalledWith("ctrl+alt+p", expect.objectContaining({ handler: expect.any(Function) }));
       for (const name of ["resources_discover", "session_start"]) await emit(name);
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(mainLoaded).not.toHaveBeenCalled();

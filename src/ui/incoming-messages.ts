@@ -33,7 +33,7 @@ export const incomingMessagesCollapsed = (
   mode: FabricIncomingMessageMode,
   environment: NodeJS.ProcessEnv = process.env,
 ): boolean => mode === "collapsed" || (mode === "auto" &&
-  (environment.PI_FABRIC_ROLE ?? environment.SMARTY_ROLE ?? "").split("@")[0]!.trim() === "org");
+  ["org", "org-agent"].includes((environment.PI_FABRIC_ROLE ?? environment.SMARTY_ROLE ?? "").split("@")[0]!.trim()));
 
 const rows = (message: IncomingMessage): Row[] => {
   const text = contentText(message);

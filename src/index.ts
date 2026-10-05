@@ -107,6 +107,7 @@ import { installFabricShellHangKeys } from "./ui/shell-hang-keys.js";
 import { FabricToolDisplayController } from "./ui/tool-display.js";
 import { configureHighlighting } from "./ui/highlight.js";
 import { registerHandoffCompletionRenderer } from "./ui/handoff-completion.js";
+import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
@@ -359,6 +360,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     },
   });
   registerHandoffCompletionRenderer(pi);
+  registerIncomingMessageRenderers(pi, () => state.provisionalConfig().ui.incomingMessages);
   pi.registerTool(fabricTool);
 
   const applyFabricMode = (): void => {

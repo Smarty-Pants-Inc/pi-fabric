@@ -37,6 +37,7 @@ export type FabricAgentTransport =
 export type FabricAgentRunner = "pi" | "claude" | "veda";
 export type FabricUiWidgetMode = "auto" | "always" | "hidden";
 type FabricToolDisplayMode = "full" | "compact";
+export type FabricIncomingMessageMode = "auto" | "collapsed" | "expanded";
 export type FabricResultFormat = "auto" | "yaml" | "json" | "text";
 export type FabricPrewalkMode = "in-place" | "trajectory";
 export type FabricExecutorRuntime = "quickjs" | "node-process" | "bun-process";
@@ -230,6 +231,7 @@ interface FabricUiConfig {
   haltOnEscape: boolean;
   showAgentToolPreview: boolean;
   toolDisplay: FabricToolDisplayMode;
+  incomingMessages: FabricIncomingMessageMode;
   updateDebounceMs: number;
 }
 
@@ -524,6 +526,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     haltOnEscape: true,
     showAgentToolPreview: true,
     toolDisplay: "compact",
+    incomingMessages: "auto",
     updateDebounceMs: 100,
   },
   compaction: {
@@ -1213,6 +1216,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         ui.showAgentToolPreview ?? ui.showNestedToolCalls,
         DEFAULT_FABRIC_CONFIG.ui.showAgentToolPreview,
       ),
+      incomingMessages: ui.incomingMessages === "collapsed" || ui.incomingMessages === "expanded"
+        ? ui.incomingMessages : "auto",
       toolDisplay: toolDisplayModeValue(
         ui.toolDisplay,
         DEFAULT_FABRIC_CONFIG.ui.toolDisplay,

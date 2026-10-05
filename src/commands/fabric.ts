@@ -483,7 +483,13 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           // refreshToolDisplay re-renders every fabric_exec card, so gating it
           // on the display sections keeps unrelated saves off the transcript.
           onConfigApplied: (id) => {
-            if (id.startsWith("codePreview.")) {
+            if (id === "ui.incomingMessages" && context.hasUI) {
+              // Pi rebuilds custom-message components only when expansion changes.
+              // Refresh through the host API and restore the tool state unchanged.
+              const expanded = context.ui.getToolsExpanded();
+              context.ui.setToolsExpanded(!expanded);
+              context.ui.setToolsExpanded(expanded);
+            } else if (id.startsWith("codePreview.")) {
               deps.refreshCodePreviewSettings?.();
               deps.refreshToolDisplay?.();
             } else if (id === "ui.toolDisplay" || id === "ui.showAgentToolPreview") {

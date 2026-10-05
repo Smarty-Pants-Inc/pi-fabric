@@ -181,6 +181,7 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "haltOnEscape": true,
     "showAgentToolPreview": true,
     "toolDisplay": "compact",
+    "incomingMessages": "auto",
     "updateDebounceMs": 100
   },
   "compaction": {
@@ -545,6 +546,7 @@ See the [TypeScript MCP reference](../skillsets/typescript/fabric-exec/reference
 - `ui.maxRows` defaults to `6` and clamps the widget to `1..20` rows. The effective budget is also bounded by half the live terminal height, so a short pane or a tmux split cannot let the animated box fill the viewport and keep pi's scroll region moving under the editor. Rows beyond the budget collapse into a dim `+N` marker on the last line.
 - `ui.showAgentToolPreview` defaults to `true` and controls the child-agent and actor tool rows in both the parent `fabric_exec` card and the widget. Recursive agents render their full descendant tree, bounded by the preview depth/node budget. The version 2 config migration renamed this key from `ui.showNestedToolCalls`.
 - `ui.toolDisplay` is `"compact"` (default) or `"full"`. Compact elevates the declared display name and description and keeps bounded nested tool detail visible; full retains the outer Fabric program transcript. Pi's tool-expand keybinding (`ctrl+o` by default) expands a compact card to the full transcript and collapses it again. Invalid values fall back to `"compact"`. If configuration fails to load, rendering falls back to full so a degraded startup never hides the transcript. Change it under `/fabric settings` → **UI**; successful changes apply immediately to live and completed cards.
+- `ui.incomingMessages` is `"auto"` (default), `"collapsed"`, or `"expanded"`. Auto collapses incoming agent messages (including `mail.inbound` wake notices), actor messages, and inbox chatter for the `org` role, and leaves them fully expanded elsewhere. Role detection uses `PI_FABRIC_ROLE`, else `SMARTY_ROLE`, without its `@stamp` suffix. Change it under `/fabric settings` → **UI** → **Incoming messages**. Collapsed messages show one dim `↳ sender: body preview` line (about 80 body characters); already-delivered inbox shadows are hidden, while unseen inbox work remains visible. **Ctrl+O** (Pi's existing tool-output toggle) temporarily expands collapsed messages and restores their full native rendering; an `expanded` setting keeps them visible regardless of the toggle. This is display-only: the full LLM-facing content and the principal/assistant messages are unchanged.
 - `ui.updateDebounceMs` defaults to `100`. It applies one execution-wide coalescing interval to every live `fabric_exec` card update: nested calls, progress text, and agent tool previews. Continuous streams emit at most once per interval, so a long call no longer postpones every render until completion. Set it to `0` to emit every update. Accepted values clamp to `0..2000`. The version 3 config migration renamed this key from `ui.nestedToolDebounceMs`.
 - The widget renders above the chat, like `pi-supervisor`. Set `ui.enabled` to `false` to disable both the widget and the dashboard controller.
 

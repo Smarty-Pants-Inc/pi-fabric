@@ -418,6 +418,8 @@ describe("FabricSettingsComponent", () => {
     component.handleInput("\r");
     const lines = component.render(80).join("\n");
     expect(lines).toContain("Tool display");
+    expect(lines).toContain("Incoming messages");
+    expect(lines).toContain("auto");
     expect(lines).toContain("compact");
     expect(lines).toContain("Agent tool preview");
     expect(lines).toContain("Update debounce");

@@ -59,6 +59,9 @@ describe("Main replay and route-authority startup boundary", () => {
       expect(mainLoaded).not.toHaveBeenCalled();
       expect(routerLoaded).not.toHaveBeenCalled();
       await register(pi);
+      for (const type of ["pi-fabric-agent-message", "pi-fabric-actor", "pi-fabric-inbox", "pi-fabric-inbox-summary"]) {
+        expect(pi.registerMessageRenderer).toHaveBeenCalledWith(type, expect.any(Function));
+      }
       for (const name of ["resources_discover", "session_start"]) await emit(name);
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(mainLoaded).not.toHaveBeenCalled();

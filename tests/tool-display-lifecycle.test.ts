@@ -150,6 +150,25 @@ const emit = async (handlers: Map<string, ExtensionHandler[]>, event: string, co
 };
 
 describe("Fabric tool display lifecycle", () => {
+  it.each([false, true])("refreshes incoming message settings through the host while preserving tool expansion=%s", async expanded => {
+    const harness = createHarness();
+    await piFabric(harness.pi);
+    const getToolsExpanded = vi.fn(() => expanded);
+    const setToolsExpanded = vi.fn();
+    const context = {
+      mode: "code", cwd: process.cwd(), isProjectTrusted: () => true, hasUI: true,
+      ui: { setStatus: vi.fn(), notify: vi.fn(), getToolsExpanded, setToolsExpanded },
+      sessionManager: { getBranch: () => [], getSessionId: () => "settings-test" },
+    } as unknown as ExtensionContext;
+    settingsSaveId.current = "ui.incomingMessages";
+    try {
+      await commandHandlerOf(harness.pi)("settings", context);
+      expect(getToolsExpanded).toHaveBeenCalledOnce();
+      expect(setToolsExpanded.mock.calls).toEqual([[!expanded], [expanded]]);
+    } finally {
+      settingsSaveId.current = "ui.toolDisplay";
+    }
+  });
   it("drops abandoned-branch invalidators when session_tree rebuilds the transcript", async () => {
     const harness = createHarness();
     await piFabric(harness.pi);

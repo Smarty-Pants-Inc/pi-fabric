@@ -53,7 +53,7 @@ import {
 import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
 import { COMPACTION_FAILED_ALARM, registerCompactionRecovery } from "./compaction/recovery.js";
 import { compactAtConfiguredThreshold } from "./compaction/threshold.js";
-import { recoverCompactResume } from "./core/compact-resume.js";
+import { recoverCompactResume, resumeCompactInput } from "./core/compact-resume.js";
 import {
   createToolOwnershipReassertion,
   FabricToolLifecycle,
@@ -735,7 +735,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       // Hold the lease through activation, actor re-arm and reporting, even on failure.
       releaseSlot?.();
     }
-    recoverCompactResume(pi, context, true);
+    const resume = recoverCompactResume(pi, context, true, "stage");
+    if (resume && context.mode === "rpc" && process.env.PI_FABRIC_PARENT_RUN) {
+      // Announce only: ordinary RPC commands remain blocked until all startup
+      // handlers finish. The worker selects model/effort and admits this exact
+      // context before sending its one initial/resume prompt.
+      writeSync(1, `${JSON.stringify({ type: "fabric_compact_resume_ready", protocol: 1,
+        runId: process.env.PI_FABRIC_PARENT_RUN, message: resume })}\n`);
+    }
   });
 
   // Branch changes move the leaf: emitted echoes and spent reminder budget
@@ -751,12 +758,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("input", async (event, context) => {
-    if (!state.initialized) return;
+    const recovery = resumeCompactInput(pi, context, event.text);
+    if (!state.initialized) return recovery;
     state.prewalk.observeTask(
       context.sessionManager.getSessionId(),
-      event.text,
+      recovery?.text ?? event.text,
     );
-    await state.publishHostLifecycle("pi.input", event);
+    await state.publishHostLifecycle("pi.input", recovery ? { ...event, text: recovery.text } : event);
+    return recovery;
   });
 
   pi.on("agent_start", async (event) => {

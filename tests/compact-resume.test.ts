@@ -4,7 +4,7 @@ import path from "node:path";
 import { AgentSession, SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CompactController } from "../src/core/compact-controller.js";
-import { beginCompactResume, inferCompactResume, recoverCompactResume, settleCompactResume } from "../src/core/compact-resume.js";
+import { beginCompactResume, inferCompactResume, recoverCompactResume, resumeCompactInput, settleCompactResume } from "../src/core/compact-resume.js";
 import { CompactProvider } from "../src/providers/compact-provider.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 
@@ -39,6 +39,59 @@ const harness = (text = "Compact first, then start item X", manager = SessionMan
 };
 
 describe("compaction continuation", () => {
+  it.each(["Compact first, then start item X", "Compact. Then start item X", "Compact\nThen start item X", "Compact and start item X", "Compact afterwards start item X"])("retains explicit sequencing: %s", text => {
+    expect(inferCompactResume(harness(text).context)).toBe("start item X");
+  });
+
+  it("stages committed startup work without inference and consumes the worker's exact admitted prompt once", () => {
+    const h = harness();
+    beginCompactResume(h.pi, h.controller.request({ resume: "Start X" })); h.witness();
+    const text = recoverCompactResume(h.pi, h.context, true, "stage")!;
+    expect(text).toContain("Resume after compaction: Start X");
+    expect(h.sendUserMessage).not.toHaveBeenCalled();
+    expect(resumeCompactInput(h.pi, h.context, text)).toBeUndefined();
+    h.manager.appendMessage({ role: "user", content: text, timestamp: 3 });
+    expect(resumeCompactInput(h.pi, h.context, "another input")).toBeUndefined();
+    expect(recoverCompactResume(h.pi, h.context, true, "stage")).toBeUndefined();
+    recoverCompactResume(h.pi, h.context);
+    expect(h.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("coalesces direct RPC recovery with one input and retries an unadmitted startup after restart", () => {
+    const h = harness();
+    beginCompactResume(h.pi, h.controller.request({ resume: "Start X" })); h.witness();
+    recoverCompactResume(h.pi, h.context, true, "stage");
+    const restarted = harness("", h.manager);
+    recoverCompactResume(restarted.pi, restarted.context, true, "stage");
+    const input = resumeCompactInput(restarted.pi, restarted.context, "Continue the task")!;
+    expect(input.action).toBe("transform");
+    expect(input.text).toContain("Continue the task\n\nResume after compaction: Start X");
+    expect(resumeCompactInput(restarted.pi, restarted.context, "Continue again")).toBeUndefined();
+    expect(restarted.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not inject a startup snapshot after its branch intent is cancelled", () => {
+    const h = harness();
+    const intent = h.controller.request({ resume: "Start X" });
+    beginCompactResume(h.pi, intent); h.witness();
+    recoverCompactResume(h.pi, h.context, true, "stage");
+    settleCompactResume(h.pi, intent, "failed", h.context);
+    expect(resumeCompactInput(h.pi, h.context, "new work")).toBeUndefined();
+  });
+
+  it("recognizes every durable receipt when multiple committed intents share one startup prompt", () => {
+    const h = harness();
+    for (const resume of ["Start X", "Start Y"]) beginCompactResume(h.pi, h.controller.request({ resume }));
+    h.witness();
+    const text = recoverCompactResume(h.pi, h.context, true, "stage")!;
+    expect(text).toContain("Start X"); expect(text).toContain("Start Y");
+    h.manager.appendMessage({ role: "user", content: text, timestamp: 3 });
+    const restarted = harness("", h.manager);
+    expect(recoverCompactResume(restarted.pi, restarted.context, true, "stage")).toBeUndefined();
+    recoverCompactResume(restarted.pi, restarted.context);
+    expect(restarted.sendUserMessage).not.toHaveBeenCalled();
+  });
+
   it("infers pending user work, resumes one user turn in the same session, and never repeats", async () => {
     const h = harness();
     await h.provider.invoke("request", { instructions: "Keep the map" }, h.invocation);
@@ -57,9 +110,9 @@ describe("compaction continuation", () => {
     expect(inferCompactResume(h.context)).toBeUndefined();
   });
 
-  it.each(["Compact", "/compact", "Please compact your context first.", "Implement X", "Compact with instructions: keep the plan"])("plain/manual compaction stays idle: %s", async text => {
+  it.each(["Compact", "/compact", "Please compact your context first.", "Implement X", "Compact with instructions: keep the plan", "Compact. Keep the failing test name in the summary.", "Compact\nKeep the failing test name in the summary.", "Compact first.\nPreserve the plan and test names in the summary."])("plain/manual compaction stays idle: %s", async text => {
     const h = harness(text);
-    await h.provider.invoke("request", {}, h.invocation);
+    await h.provider.invoke("request", { instructions: "Keep the failing test name in the summary" }, h.invocation);
     const committing = h.controller.maybeCommit(h.context); h.complete(); await committing;
     recoverCompactResume(h.pi, h.context);
     expect(h.sendUserMessage).not.toHaveBeenCalled();

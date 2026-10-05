@@ -5,6 +5,10 @@ export const compactResumeMessage = ({ id, resume }: { id: string; resume: strin
 export const compactResumeMessageId = (text: string): string | undefined =>
   /\n\n\[Fabric continuation: ([0-9a-f-]{36})\]$/.exec(text)?.[1];
 
+// Bundled startup recovery can admit more than one committed journal intent
+// in a single user turn. Each exact marker is a durable receipt for its intent.
+export const compactResumeMessageIds = (text: string): string[] =>
+  [...text.matchAll(/\n\n\[Fabric continuation: ([0-9a-f-]{36})\](?=\n\n|$)/g)].map(match => match[1]!);
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown> : undefined;
@@ -30,7 +34,6 @@ export class CompactResumeDelivery {
     if (message?.role !== "user") return;
     const text = typeof message.content === "string" ? message.content : Array.isArray(message.content)
       ? message.content.map(part => record(part)).filter(part => part?.type === "text").map(part => part!.text).join("\n") : "";
-    const id = compactResumeMessageId(text);
-    if (id) this.#pending.delete(id);
+    for (const id of compactResumeMessageIds(text)) this.#pending.delete(id);
   }
 }

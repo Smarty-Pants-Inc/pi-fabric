@@ -690,6 +690,9 @@ const main = async (): Promise<void> => {
   let retainedPiQueues: { steering: string[]; followUp: string[] } | undefined;
   let providerResumeAttempts = 0;
   let resumePrompt = false;
+  let startupCompactResume: string | undefined;
+  const initialPiMessage = (): string => startupCompactResume ?? (resumePrompt
+    ? "Continue the task from the existing session. Do not repeat completed work." : task);
   let providerAborted = false;
   let cancelResumeWait: (() => void) | undefined;
   let stderr = "";
@@ -835,7 +838,7 @@ const main = async (): Promise<void> => {
   let contextAdmission: InstanceType<NonNullable<typeof admissionModule>["ActorContextAdmission"]> | undefined;
   const dispatchPiPrompt = (): void => {
     if (terminalStatus) return;
-    const message = resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task;
+    const message = initialPiMessage();
     if (taskProvenance?.principal) sendPiDelivery(message, taskProvenance, "steer", resumePrompt ? [] : images);
     else child.stdin?.write(`${JSON.stringify({ type: "prompt", message, ...(!resumePrompt && images.length > 0 ? { images } : {}) })}\n`);
     // ctx.isIdle() remains true during asynchronous prompt preflight. Do not
@@ -887,7 +890,7 @@ const main = async (): Promise<void> => {
       }
       if (admissionModule && estimateActorInput) {
         contextAdmission = new admissionModule.ActorContextAdmission(options.id,
-          resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task,
+          initialPiMessage(),
           options.systemPrompt ?? "", estimateActorInput, {
             send(frame) { if (!terminalStatus) child.stdin?.write(`${JSON.stringify(frame)}\n`); },
             ready: dispatchPiPrompt,
@@ -1324,6 +1327,12 @@ const main = async (): Promise<void> => {
         if (!record.runnerSessionIds.includes(sessionId)) record.runnerSessionIds.push(sessionId);
         update();
       }
+      return;
+    }
+    if (event.type === "fabric_compact_resume_ready") {
+      if (event.protocol === 1 && event.runId === options.id && !modelControl.ready &&
+          typeof event.message === "string" && event.message.trim()) startupCompactResume = event.message;
+      else modelControl.fail("compaction recovery readiness arrived outside startup admission");
       return;
     }
     compactControl.observe(event);
@@ -1908,6 +1917,7 @@ const main = async (): Promise<void> => {
     // --session <exact path> is Pi's noninteractive resume selector. --continue
     // alone selects the most recent session, which may belong to another task.
     resumePrompt = true;
+    startupCompactResume = undefined;
     retainedPiQueues = record.pendingMessages ? {
       steering: [...record.pendingMessages.steering], followUp: [...record.pendingMessages.followUp],
     } : undefined;

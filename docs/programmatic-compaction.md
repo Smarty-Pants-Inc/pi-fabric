@@ -85,8 +85,10 @@ own next step when self-requesting compaction. An empty `resume` explicitly
 opts out. When omitted, the provider infers the follow-on part of the latest
 user message (including admitted steer/followUp messages) for an explicit
 compound directive such as `Compact first, then start item X`. It does not
-reuse arbitrary old tasks or plain compaction instructions. For more complex
-wording, pass the next step explicitly.
+reuse arbitrary old tasks or plain compaction instructions. A sentence boundary
+or newline alone is not sequencing: `Compact. Keep the failing test name in the
+summary.` and multiline preservation instructions remain idle. Use an explicit
+`then`, `and`, or `afterwards` connector, or pass the next step explicitly.
 
 Fabric records a non-context continuation entry immediately before compaction.
 The compaction entry witnesses success; the generated user message, including
@@ -95,7 +97,12 @@ all settled handlers finish. The one-shot RPC worker observes that journal
 entry and keeps stdin open across the public settled event and its idle timer
 until the continuation is admitted and its turn settles. Duplicate callbacks
 and settled notifications do not queue another turn. On session restart/reload, a committed continuation
-without a recorded user message is recovered once. A scheduled but not yet
+without a recorded user message is staged without starting inference. For an
+RPC worker, Fabric announces the staged text; the worker selects its model and
+effort, admits the exact recovered context, and sends that text as its **one**
+initial/resume prompt. It never sends a competing generic resume prompt. Direct
+Pi sessions coalesce staged work into their next input, after startup finishes.
+Staging itself is not a receipt. A scheduled but not yet
 admitted message is **not** treated as a durable receipt, so a crash in that
 gap does not lose the continuation. Recovery reads the active branch, not
 abandoned histories. Failed/cancelled compactions do not resume. Plain manual
@@ -143,6 +150,44 @@ validation limits are not a promise that every accepted byte appears inline.
 compaction and is not automatically carried into the next one. Recent dialogue
 has its own protected projection; `state.goal` remains an executable predicate,
 not an automatically inferred conversational objective.
+
+#### Reproducible native acceptance lane
+
+After `bun run build`, run from this checkout (no credentials or network):
+
+```sh
+export COMPACT_PROBE_PI="${PI:-$(command -v pi)}"
+export COMPACT_PROBE_OUT="/absolute/path/to/kept-evidence"
+node scripts/probe-compact-resume.mjs compound
+node scripts/probe-compact-resume.mjs plain
+node scripts/probe-compact-resume.mjs restart
+node scripts/probe-compact-resume.mjs restart-actor
+node scripts/probe-compact-resume.mjs receipt
+```
+
+If the fleet Pi binary is unavailable, omit `COMPACT_PROBE_PI` to use the locally
+installed native Pi CLI. The default lane loads **compiled** `dist/worker.js`
+and `dist/index.js`. `COMPACT_PROBE_SOURCE=1` is only for red-first source
+regressions. Every lane isolates HOME and the Pi profile, uses a keyless local
+provider for inference, and executes the real native Pi/Fabric/RPC/worker path.
+The compound prompt is `Compact first, then start item X`; X executes a real
+`pi.write` to `item-X.txt`, not merely an assistant promise. Compaction itself
+uses the configured Fabric engine through native Pi's compaction lifecycle.
+This is native worker acceptance, not evidence of a deployed Herdr service or
+of a particular remote model's instruction following.
+
+Choose a fresh evidence directory for each run; existing lane output is refused
+so stale files cannot make a later failed X look successful. Keep `result.json`,
+`transcript.jsonl`, `events.jsonl`, `status.json`, and
+`worker-output.log` in each lane's directory, plus Pi version and the hashes of
+`dist/index.js` and `dist/worker.js`. The transcript must show compaction
+completion and the native X tool-call start, with a delta <= 60,000 ms, one
+completed continuation, and `item-X.txt` containing `X completed`. The plain
+lane must finish compaction with only its initial prompt and no X tool call.
+The restart-actor lane adds a delayed startup handler and must complete model,
+effort and actor context admission before one continuation prompt. The receipt
+lane must not replay an already admitted continuation. Each failure exits
+nonzero; these same oracles run in `tests/compact-resume-native.test.ts`.
 
 #### Commit semantics
 
@@ -241,7 +286,7 @@ safety needs no configuration.
 | `src/core/compact-controller.ts` | Pending-intent controller with `request`, `cancel`, `status`, and `maybeCommit`. Uses a single replaceable slot, typed preserve encoding, an in-flight guard, and a quiet clear on benign no-op outcomes (cancelled, already compacted, or session too small). |
 | `src/providers/compact-provider.ts` | Fabric provider that exposes a bounded TypeBox-validated `request` (write, including optional `preserve: string[]`), `status` (read), and `cancel` (write). Registered always, with activity audit. |
 | `src/fabric-state.ts` | Constructs the controller with mesh-publish hooks, registers the provider, and resets on re-init or shutdown. |
-| `src/index.ts` | Invokes `state.compact.maybeCommit(context)` in the existing `agent_settled` handler and recovers undelivered continuations on `session_start`. |
+| `src/index.ts` | Invokes `state.compact.maybeCommit(context)` in the existing `agent_settled` handler and stages undelivered continuations on `session_start` and coalesces the next input without starting inference at startup. |
 | `src/core/compact-resume.ts` | Infers compound compact directives and journals/replays the one-shot follow-up user turn. |
 | `src/compaction/resume-delivery.ts` | Host-free journal/message wire contract and worker shutdown fence. |
 | `src/agents/types.ts` | Extends `AgentSteerEntry["type"]` with `"compact"` and adds the optional `instructions` field. |

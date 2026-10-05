@@ -1,9 +1,25 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { CompactLastCommit, CompactPendingIntent } from "./compact-controller.js";
-import { COMPACT_RESUME_ENTRY_TYPE as ENTRY_TYPE, compactResumeMessage as resumeMessage, compactResumeMessageId } from "../compaction/resume-delivery.js";
+import { COMPACT_RESUME_ENTRY_TYPE as ENTRY_TYPE, compactResumeMessage as resumeMessage, compactResumeMessageIds } from "../compaction/resume-delivery.js";
 
 interface ResumeEntry { id: string; resume: string; state: "pending" | "cancelled" }
 const scheduled = new WeakMap<ExtensionAPI, Set<string>>();
+const staged = new WeakMap<ExtensionAPI, { sessionId: string; text: string }>();
+
+// Startup never starts inference. The next admitted native prompt owns delivery;
+// in a worker this is the initial/resume prompt, not a competing follow-up.
+export const resumeCompactInput = (pi: ExtensionAPI, context: ExtensionContext, text: string):
+  { action: "transform"; text: string } | undefined => {
+  const recovery = staged.get(pi);
+  if (!recovery) return;
+  if (recovery.sessionId !== context.sessionManager.getSessionId()) { staged.delete(pi); return; }
+  // A receipt, cancellation or tree navigation can change the active branch
+  // between startup and input. Never deliver a stale staged snapshot.
+  const current = recoverCompactResume(pi, context, false, "stage");
+  staged.delete(pi);
+  if (!current || text === current) return;
+  return { action: "transform", text: `${text}\n\n${current}` };
+};
 
 // Only an explicit compound compact directive is inferred. Arbitrary old tasks,
 // summary-preservation instructions, and a plain /compact must not wake a turn.
@@ -18,7 +34,7 @@ export const inferCompactResume = (context: ExtensionContext): string | undefine
     // Worker-owned followUps retain their transport ID in the session log.
     // Keep this exact envelope aligned with agents/follow-up-delivery.ts.
     const instruction = text.replace(/^\[fabric-follow-up:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\]\n/, "");
-    const match = instruction.match(/^\s*(?:please\s+)?\/?compact(?:\s+(?:first|now|your context|the context|context|this session))*\s*(?:[,;:]\s*)?(?:(?:and\s+)?then\s+|and\s+|afterwards[,\s]+|[.!]\s+|\n\s*)([\s\S]+)$/i);
+    const match = instruction.match(/^\s*(?:please\s+)?\/?compact(?:\s+(?:first|now|your context|the context|context|this session))*\s*(?:[,;:.!]\s*)?(?:(?:and\s+)?then\s+|and\s+|afterwards[,\s]+)([\s\S]+)$/i);
     const resume = match?.[1]?.trim();
     return resume && resume.length <= 16_384 ? resume : undefined;
   }
@@ -49,8 +65,8 @@ export const settleCompactResume = (
 // could lose the continuation on a crash. The process-local set only closes
 // the gap while Pi defers sendUserMessage past its remaining settled handlers.
 export const recoverCompactResume = (
-  pi: ExtensionAPI, context: ExtensionContext, discardUncommitted = false,
-): void => {
+  pi: ExtensionAPI, context: ExtensionContext, discardUncommitted = false, delivery: "send" | "stage" = "send",
+): string | undefined => {
   const pending = new Map<string, ResumeEntry>();
   const ready = new Set<string>();
   const messages = new Set<string>();
@@ -67,8 +83,7 @@ export const recoverCompactResume = (
       const content = entry.message.content;
       const text = typeof content === "string" ? content : content
         .filter(part => part.type === "text").map(part => part.text).join("\n");
-      const receipt = compactResumeMessageId(text);
-      if (receipt) messages.add(receipt);
+      for (const receipt of compactResumeMessageIds(text)) messages.add(receipt);
     }
   }
   // Startup has no surviving compaction operation. Retire an interrupted
@@ -77,6 +92,12 @@ export const recoverCompactResume = (
     for (const [id, intent] of pending) {
       if (!ready.has(id)) pi.appendEntry<ResumeEntry>(ENTRY_TYPE, { ...intent, state: "cancelled" });
     }
+  }
+  if (delivery === "stage") {
+    staged.delete(pi);
+    const text = [...ready].filter(id => !messages.has(id)).map(id => resumeMessage(pending.get(id)!)).join("\n\n");
+    if (text) staged.set(pi, { sessionId: context.sessionManager.getSessionId(), text });
+    return text || undefined;
   }
   let sent = scheduled.get(pi);
   if (!sent) { sent = new Set(); scheduled.set(pi, sent); }

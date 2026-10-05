@@ -1,5 +1,6 @@
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { spawnDetached } from "../src/agents/transports/process-utils.js";
+import { acquireHostActivation } from "../src/agents/transports/host-activation.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -116,6 +117,27 @@ const args = new Map();`));
       worker: pathToFileURL(path.join(current, "dist/worker.js")).href,
       extension: path.join(current, "dist/index.js"), release: current,
     });
+  });
+
+  it.skipIf(process.platform !== "linux")("selects the current generation after host-token admission, not before waiting", async () => {
+    const f = fixture(); const directory = path.join(f.root, "tokens");
+    const blocker = await acquireHostActivation({ limit: 1, directory }, { id: "block" });
+    const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, hostActivationLimit: 1, hostActivationLimitScope: "all",
+      budgetUsd: 0, deniedModels: [], maxConcurrent: 1, timeoutMs: 4_000 }, {
+      workerPath: path.join(f.parent, "dist/worker.js"), fabricExtensionPath: path.join(f.parent, "dist/index.js"),
+      hostActivationDirectory: directory, runRoot: path.join(f.root, "host-capped-runs"),
+    }); managers.push(manager);
+    let fd: number | undefined = blocker.fd;
+    try {
+      const pending = manager.spawn({ task: "host-queued generation", transport: "process" });
+      await vi.waitFor(() => expect(JSON.parse(fs.readFileSync(path.join(directory, "queue.json"), "utf8"))).toHaveLength(1));
+      const current = f.release("activated-while-host-queued"); f.select(current);
+      fs.closeSync(fd); fd = undefined;
+      const handle = await pending; const result = await manager.wait(handle.id);
+      expect(result.status, result.error).toBe("completed");
+      expect(result.fabricRelease).toBe(current);
+      expect(JSON.parse(result.text)).toMatchObject({ worker: pathToFileURL(path.join(current, "dist/worker.js")).href });
+    } finally { if (fd !== undefined) fs.closeSync(fd); }
   });
 
   it("follows canonical installed roots when the parent's worker is addressed through a symlink", async () => {

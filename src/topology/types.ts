@@ -67,6 +67,8 @@ export interface FabricParticipantRecord {
   actorMessages?: number;
   /** Accepted activation preparation or AgentManager admission receipt, before worker launch. */
   actorPreparing?: FabricActorInfo["preparing"];
+  /** Live host-wide activation admission, not passive registry state. */
+  actorHostQueue?: FabricActorInfo["hostQueue"];
   /** The actor's in-flight run (smarty-dev#2184 item 8). */
   actorRun?: { id: string; startedAt: number };
   /** The actor's removal, pending behind its in-flight run (smarty-dev#2184 item 8). */

@@ -172,6 +172,7 @@ interface ManagedActor {
   lastRunId?: string;
   /** Setup/admission is separate from a launched worker (smarty-dev#3167). */
   preparing?: { phase: string; startedAt: number; attempts: number; runId?: string; queuePosition?: number };
+  hostQueue?: FabricActorInfo["hostQueue"];
   inFlightRun?: { id: string; startedAt: number };
   /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
   removal?: { requestedAt: number; runId?: string; runStartedAt?: number };
@@ -2728,7 +2729,28 @@ export class ActorManager {
                 runId: handle.id, ...(handle.queuePosition !== undefined ? { queuePosition: handle.queuePosition } : {}) };
               void this.#publishPresence(actor).catch(() => undefined);
             },
-            { timeoutMs: this.#preparationTimeoutMs, onPreparing: () => {
+            { timeoutMs: this.#preparationTimeoutMs, onHostQueue: (queue) => {
+              if (queue && (abortController.signal.aborted || actor.status === "stopped" || actor.abortController !== abortController)) return;
+              if (queue) {
+                actor.hostQueue = queue;
+                actor.status = "waiting";
+                actor.preparing = { phase: "host-queue", startedAt: queue.waitingSince, attempts: item.preparationAttempts ?? 0 };
+              } else {
+                delete actor.hostQueue;
+                if (actor.preparing?.phase === "host-queue") {
+                  if (actor.inFlightRun) {
+                    // An AgentManager relaunch keeps the same admitted run. Its
+                    // token wait must not leave the actor stuck in preparation.
+                    delete actor.preparing;
+                    if (actor.status !== "stopped") actor.status = "running";
+                  } else {
+                    actor.preparing.phase = "launch";
+                    if (actor.status !== "stopped") actor.status = "preparing";
+                  }
+                }
+              }
+              void this.#publishPresence(actor).catch(() => undefined);
+            }, onPreparing: () => {
               actor.status = "preparing";
               actor.preparing = { phase: "launch", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
               void this.#publishPresence(actor).catch(() => undefined);
@@ -2928,6 +2950,7 @@ export class ActorManager {
             await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
           }
           delete actor.abortController;
+          delete actor.hostQueue;
           delete actor.preparing;
           delete actor.inFlightRun;
           actor.updatedAt = Date.now();
@@ -4452,7 +4475,8 @@ export class ActorManager {
       instructionsDigest: createHash("sha256").update(actor.instructions).digest("hex"),
       instructionsLength: actor.instructions.length,
       status: actor.status === "stopped" ? "stopped" : actor.preparing
-        ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status,
+        ? actor.preparing.phase === "waiting" || actor.preparing.phase === "host-queue" ? "waiting" : "preparing" : actor.status,
+      ...(actor.hostQueue ? { hostQueue: { ...actor.hostQueue } } : {}),
       ...(actor.preparing ? { preparing: { ...actor.preparing,
         ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),
         ...(actor.preparing.runId ? { queuePosition: this.agents.status(actor.preparing.runId).queuePosition } : {}),

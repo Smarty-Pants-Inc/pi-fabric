@@ -173,6 +173,7 @@ export const effectiveAgentTimeoutMs = (
 export interface AgentLaunchPreparationOptions {
   timeoutMs: number;
   onPreparing?: () => void;
+  onHostQueue?: AgentTransportLaunch["onHostQueue"];
 }
 
 export class AgentLaunchPreparationTimeoutError extends Error {
@@ -351,6 +352,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   relaunchFailure?: AgentRunRecord;
   /** A retry launch owns custody until its exact replacement handle is installed. */
   relaunchPending?: Promise<boolean>;
+  /** Host queue time is not worker runtime, including replacement attempts. */
+  relaunchHostWaitMs?: number;
   /** Terminal results do not discharge execution custody or admission permits. */
   executionExited?: boolean;
   launchCancelled?: boolean;
@@ -747,6 +750,8 @@ export class AgentManager {
     readonly config: FabricAgentConfig,
     options: {
       workerPath?: string;
+      /** Trusted embedding/test storage override; never read from workspace config. */
+      hostActivationDirectory?: string;
       /** The detached temp-root sweep entry (dist/storage/sweep-main.js). */
       sweepPath?: string;
       fabricExtensionPath?: string;
@@ -841,7 +846,11 @@ export class AgentManager {
     this.#budgetOwned =
       !inheritedBudget && this.#currentDepth === 0 && config.budgetUsd > 0;
     const adapters: AgentTransportAdapter[] = [
-      new ProcessTransport(config.processSlice),
+      new ProcessTransport(config.processSlice, config.hostActivationLimit === undefined ? undefined : {
+        limit: config.hostActivationLimit,
+        ...(config.hostActivationLimitScope ? { scope: config.hostActivationLimitScope } : {}),
+        ...(options.hostActivationDirectory ? { directory: options.hostActivationDirectory } : {}),
+      }),
       new TmuxTransport(),
       new ScreenTransport(),
       new LocaltermTransport(),
@@ -1420,6 +1429,7 @@ export class AgentManager {
           workerPath: this.#workerPath,
           workerArguments,
           signal,
+          ...(preparation?.onHostQueue ? { onHostQueue: preparation.onHostQueue } : {}),
           onUnconfirmedExit: (reason) => {
             const managed = this.#runs.get(id);
             if (managed) this.#markLost(managed, reason);
@@ -2879,7 +2889,7 @@ export class AgentManager {
     await delay(retryDelayMs);
     if (managed.settled || this.#closing || managed.abortSignal?.aborted || managed.abandoned) return false;
     managed.startupAttempts++;
-    return this.#relaunch(managed, record);
+    return this.#relaunch(managed, record, deadline);
   }
 
   /**
@@ -2916,7 +2926,7 @@ export class AgentManager {
     if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
     managed.resumeAttempts += 1;
     const { turns, toolCalls, usage } = managed.observedProgress;
-    return this.#relaunch(managed, record, {
+    return this.#relaunch(managed, record, deadline, {
       task: resumeTask(managed.task, record, { turns, toolCalls }, managed.runDirectory),
       carryOver: { turns, toolCalls, usage: { ...usage } },
     });
@@ -2931,10 +2941,11 @@ export class AgentManager {
   async #relaunch(
     managed: ManagedAgent,
     record: AgentRunRecord,
+    deadline: number,
     resume?: { task: string; carryOver: AgentRunCarryOver },
   ): Promise<boolean> {
     // Publish the join before preparation or stop can re-enter public stop().
-    const pending = Promise.resolve().then(() => this.#relaunchAttempt(managed, record, resume));
+    const pending = Promise.resolve().then(() => this.#relaunchAttempt(managed, record, deadline, resume));
     managed.relaunchPending = pending;
     try { return await pending; }
     finally { delete managed.relaunchPending; }
@@ -2943,8 +2954,10 @@ export class AgentManager {
   async #relaunchAttempt(
     managed: ManagedAgent,
     record: AgentRunRecord,
+    deadline: number,
     resume?: { task: string; carryOver: AgentRunCarryOver },
   ): Promise<boolean> {
+    const previousHostWaitMs = managed.relaunchHostWaitMs ?? 0;
     try {
       if (managed.runner === "pi") {
         const model = await this.prepareModelForAdmission(managed.routePin?.model ?? managed.model, managed.runner, undefined, Boolean(managed.routePin));
@@ -3026,7 +3039,27 @@ export class AgentManager {
 
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
-      const transport = await this.#launchTransport(managed.adapter, managed.launch);
+      let hostWaitingSince: number | undefined;
+      const transport = await this.#launchTransport(managed.adapter, {
+        ...managed.launch,
+        onHostQueue: queue => {
+          if (queue && hostWaitingSince === undefined) hostWaitingSince = Date.now();
+          if (!queue && hostWaitingSince !== undefined) {
+            managed.relaunchHostWaitMs = (managed.relaunchHostWaitMs ?? 0) + Date.now() - hostWaitingSince;
+            hostWaitingSince = undefined;
+          }
+          managed.launch.onHostQueue?.(queue);
+        },
+        // Detached task agents ignore caller aborts, but a host token wait
+        // must still end on explicit stop or abandonment. #launchTransport
+        // separately binds every launch to manager shutdown.
+        authorize: () => !managed.settled && !this.#closing && !managed.stopRequested && !managed.abandoned &&
+          // Admission freezes the unspent budget; other retry preparation does
+          // not. Refuse an expired replacement at the native launch boundary.
+          Date.now() < deadline + (managed.relaunchHostWaitMs ?? 0) - previousHostWaitMs +
+            (hostWaitingSince === undefined ? 0 : Date.now() - hostWaitingSince) &&
+          (managed.launch.authorize?.() ?? true),
+      });
       // Stop receipts belong to one transport attempt, not the run id. Install
       // the replacement and its fresh custody together, after launch resolves.
       managed.transport = transport;
@@ -3065,6 +3098,7 @@ export class AgentManager {
       this.#invalidateUiList();
       return true;
     } catch (error) {
+      if (managed.settled || managed.stopRequested || this.#closing || managed.abandoned) return false; // Stop may have settled the run during host admission.
       const retryError = error instanceof Error ? error.message : String(error);
       try {
         fs.appendFileSync(
@@ -3091,7 +3125,8 @@ export class AgentManager {
   }
 
   async #monitor(managed: ManagedAgent, timeoutMs: number): Promise<void> {
-    const deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS;
+    const runtimeDeadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS;
+    const deadline = (): number => runtimeDeadline + (managed.relaunchHostWaitMs ?? 0);
     let firstObservedDeadAt: number | undefined;
     let watchedTransport: AgentTransportHandle | undefined;
     let nativeClosePending = false;
@@ -3132,9 +3167,10 @@ export class AgentManager {
         // A terminal file can race an explicit stop or its tree-helper outcome.
         // Join the bounded stop before settlement can transfer native admission.
         if (managed.stopRequested && managed.transport.kind === "process") await this.#stopManagedTransport(managed);
-        if (await this.#resumeStopped(managed, record, deadline)) continue;
+        if (await this.#resumeStopped(managed, record, deadline())) continue;
         // A relaunch that failed is terminal: no fallback launch may run after it.
-        if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
+        if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline())) continue;
+        if (managed.settled) return; // A stop can settle while a relaunch waits for a host token.
         // Terminal publication may precede a worker's final native-session flush.
         // Give normal process exit a bounded observation window before stop():
         // on Windows SIGTERM is destructive, not a cooperative flush request.
@@ -3148,7 +3184,7 @@ export class AgentManager {
         this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
         return;
       }
-      if (Date.now() >= deadline) {
+      if (Date.now() >= deadline()) {
         managed.stopRequested = true;
         await this.#stopManagedTransport(managed);
         await this.#waitForTransportExit(managed);
@@ -3223,11 +3259,12 @@ export class AgentManager {
                 ? `Agent transport exited without a result; last run log: ${logSummary}`
                 : "Agent transport exited without a result",
             );
-            if (await this.#resumeStopped(managed, failed, deadline)) continue;
-            if (!managed.relaunchFailure && await this.#retryStartup(managed, failed, deadline)) {
+            if (await this.#resumeStopped(managed, failed, deadline())) continue;
+            if (!managed.relaunchFailure && await this.#retryStartup(managed, failed, deadline())) {
               managed.lastRetriedTransportFailure = failed;
               continue;
             }
+            if (managed.settled) return;
             await this.#noteUnconfirmedExit(managed);
             const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
             writeRecord(managed.statusFile, settled);

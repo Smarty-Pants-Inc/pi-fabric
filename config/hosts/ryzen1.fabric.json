@@ -1,0 +1,5 @@
+{
+  "agents": {
+    "hostActivationLimit": 4
+  }
+}

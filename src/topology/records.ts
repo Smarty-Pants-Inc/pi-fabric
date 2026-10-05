@@ -104,6 +104,7 @@ export const actorParticipantRecord = (
   actorQueued: actor.queued,
   actorMessages: actor.messages,
   ...(actor.preparing ? { actorPreparing: { ...actor.preparing } } : {}),
+  ...(actor.hostQueue ? { actorHostQueue: { ...actor.hostQueue } } : {}),
   ...(actor.inFlightRun ? { actorRun: { id: actor.inFlightRun.id, startedAt: actor.inFlightRun.startedAt } } : {}),
   ...(actor.removal
     ? {

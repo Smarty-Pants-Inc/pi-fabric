@@ -340,6 +340,8 @@ export interface FabricActorInfo {
     runId?: string;
     queuePosition?: number;
   };
+  /** Host-wide FIFO admission; mailbox ownership remains held while waiting. */
+  hostQueue?: import("../agents/types.js").HostActivationQueue;
   /** The admitted run with a launched worker, and how long it has run. */
   inFlightRun?: { id: string; startedAt: number; ageS: number };
   /** A removal that returned at once and finishes when the in-flight run ends (smarty-dev#2184). */

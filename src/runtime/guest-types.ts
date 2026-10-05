@@ -212,6 +212,7 @@ interface FabricParticipantInfo {
   actorMessages?: number;
   /** Accepted actor activation without a launched worker. */
   actorPreparing?: FabricActorInfo["preparing"];
+  actorHostQueue?: FabricActorInfo["hostQueue"];
   controlProtocol: "v1" | "legacy";
   /** The remote host of a root mirrored by the mesh bridge; never a local owner. */
   remoteHost?: string;
@@ -838,6 +839,8 @@ interface FabricActorInfo {
     runId?: string;
     queuePosition?: number;
   };
+  /** Host-wide FIFO admission; the activation retains its mailbox claim. */
+  hostQueue?: { position: number; waitingSince: number; limit: number };
   /** Present only when the current execution owner reports an in-flight run. */
   inFlightRun?: { id: string; startedAt: number; ageS: number };
   /** Removal pending behind an in-flight run; state includes a useful progress note. */

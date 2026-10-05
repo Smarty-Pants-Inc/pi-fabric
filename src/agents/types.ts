@@ -361,6 +361,13 @@ export interface AgentRunCarryOver {
   usage: AgentUsage;
 }
 
+export interface HostActivationQueue {
+  /** One-based position among live host waiters. */
+  position: number;
+  waitingSince: number;
+  limit: number;
+}
+
 export interface AgentTransportLaunch {
   id: string;
   name: string;
@@ -373,6 +380,8 @@ export interface AgentTransportLaunch {
   authorize?: () => boolean;
   /** Persist unknown tree/native close before stop returns or a parent-only fallback reports exit. */
   onUnconfirmedExit?: (reason: string) => void;
+  /** Trusted actor owner status callback; not part of the guest run request. */
+  onHostQueue?: (queue: HostActivationQueue | undefined) => void;
 }
 
 export interface AgentTransportObservationOptions {

@@ -286,6 +286,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
+  hostTokenFd?: number,
 ): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   const treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
@@ -304,7 +305,9 @@ export const spawnDetached = async (
     cwd,
     ...(environment ? { env: environment } : {}),
     detached: process.platform !== "win32",
-    stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
+    stdio: (hostTokenFd === undefined && !tracksExecution
+      ? "ignore"
+      : ["ignore", "ignore", "ignore", hostTokenFd ?? "ignore", ...(tracksExecution ? ["ipc"] : [])]) as any,
   });
   let spawnError: Error | undefined;
   child.once("error", error => { spawnError = error; });
@@ -314,7 +317,7 @@ export const spawnDetached = async (
     fs.rmSync(scopeRoot!, { recursive: true, force: true });
     assertTransportLaunchAllowed(authority);
     scope.warn(spawnError?.message ?? "systemd-run did not launch");
-    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
+    return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian, hostTokenFd);
   }
   const pid = child.pid;
   // Exit is latched: after the worker/group empties its numeric id is not identity.
@@ -602,7 +605,7 @@ export const spawnDetached = async (
       assertTransportLaunchAllowed(authority);
       if (fs.existsSync(marker)) return handle; // admitted during teardown: never replay
       scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
-      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
+      return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian, hostTokenFd);
     } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }
   }
   return handle;

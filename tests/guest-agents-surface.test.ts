@@ -182,6 +182,21 @@ describe("guest agents surface", () => {
     );
     expect(result.errors).toEqual([]);
   });
+  it.each([false, true])("#4444 types actorStatus, actor lists and participant host queues (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const actor = await agents.actorStatus({ id: "actor" });
+      const shape: Pick<FabricActorInfo, "hostQueue"> = actor;
+      const position: number | undefined = actor.hostQueue?.position;
+      const waitingSince: number | undefined = actor.hostQueue?.waitingSince;
+      const limit: number | undefined = actor.hostQueue?.limit;
+      const listed: typeof actor.hostQueue = (await agents.actors())[0]?.hostQueue;
+      const participant: Pick<FabricParticipantInfo, "actorHostQueue"> = { actorHostQueue: shape.hostQueue };
+      return { position, waitingSince, limit, listed, participant };`;
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    expect(typeCheckFabricCode(code + '\nconst wrong: string = actor.hostQueue!.position;', declarations, true).errors.map(error => error.message))
+      .toEqual([expect.stringContaining("not assignable to type 'string'")]);
+  });
+
   it.each([false, true])("types retry keys on public durable create/spawn (fullCodeMode=%s)", fullCodeMode => {
     const result = typeCheckFabricCode(
       `await agents.create({ name: "actor", instructions: "work", residency: "durable", idempotencyKey: "actor-retry" });

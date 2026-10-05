@@ -660,6 +660,9 @@ export class FabricExecutionService {
       return dispatch(ref, args, signal).then(value => { checkMainDeadline(); return value; });
     };
     try {
+      if (process.env.PI_FABRIC_HOST_ACTIVATION_LIMIT) {
+        (await import("./agents/transports/host-activation-yield.js")).beginHostActivationProgram(options.parentToolCallId);
+      }
       sandboxResult = await runtime.execute(
         code,
         guardHostCall(async (ref, args, runtimeSignal) => {
@@ -1050,6 +1053,11 @@ export class FabricExecutionService {
       runtimeDeadline?.clear();
       mainBudget?.clear();
       await this.registry.endInvocation(options.parentToolCallId, invocationOutcome);
+      // This is native admission, not a best-effort provider finalizer (which
+      // has a short cleanup ceiling). Never let Pi resume inference slotless.
+      if (process.env.PI_FABRIC_HOST_ACTIVATION_LIMIT) {
+        await (await import("./agents/transports/host-activation-yield.js")).resumeHostActivation(options.parentToolCallId);
+      }
       flushEmit();
     }
 

@@ -677,6 +677,32 @@ export class AgentsProvider implements FabricProvider {
     sessionSeed: AgentSessionSeed,
   ): Promise<Record<string, unknown>> {
     context = snapshotFabricInvocation(context);
+    if (!process.env.PI_FABRIC_HOST_ACTIVATION_LIMIT) {
+      return this.#executeHandoff(args, context, sessionSeed);
+    }
+    // Scheduling agents.handoff yields only until fabric_exec returns. The
+    // actual dependency starts later, at Pi's native message_end boundary (also
+    // used by automatic trajectory handoffs). Give that wait its own custody
+    // owner: no executor admission may depend on a slot held by its caller.
+    const custody = await import("../agents/transports/host-activation-yield.js");
+    const caller = `handoff:${context.parentToolCallId}`;
+    custody.beginHostActivationProgram(caller);
+    try {
+      throwIfExecutionExpired(context);
+      await custody.yieldHostActivation(caller);
+      return await this.#executeHandoff(args, context, sessionSeed);
+    } finally {
+      // Admission is restored even when preparation, spawn or wait fails or is
+      // cancelled. This fence must finish before Pi can infer again.
+      await custody.resumeHostActivation(caller);
+    }
+  }
+
+  async #executeHandoff(
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+    sessionSeed: AgentSessionSeed,
+  ): Promise<Record<string, unknown>> {
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
     const request = runRequest(
@@ -746,6 +772,13 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     context = snapshotFabricInvocation(context);
     try {
+      // Yield for the whole program, not just spawn(): the caller may need to
+      // deliver a message before joining its child. Reacquire at the outer fence.
+      if (process.env.PI_FABRIC_HOST_ACTIVATION_LIMIT &&
+          ["ask", "run", "spawn", "wait", "join", "handoff"].includes(actionName)) {
+        throwIfExecutionExpired(context);
+        await (await import("../agents/transports/host-activation-yield.js")).yieldHostActivation(context.parentToolCallId);
+      }
       return await this.#invoke(actionName, args, context);
     } catch (error) {
       // smarty-dev#2184 item 8: name a pending removal (or a long host request) that these
@@ -1794,7 +1827,7 @@ export class AgentsProvider implements FabricProvider {
     const live = this.participants.get(actor.id, undefined, { fresh: true });
     // Strip passive counts and runs even when an older owner omits its live counters.
     // In particular, an idle owner without actorRun must clear a registry's stale run.
-    const { queued: _queued, messages: _messages, preparing: _preparing, inFlightRun: _run, ...definition } = actor;
+    const { queued: _queued, messages: _messages, preparing: _preparing, hostQueue: _hostQueue, inFlightRun: _run, ...definition } = actor;
     if (!live || live.stale || live.kind !== "actor") return { ...definition, status: "unknown" };
     const now = Date.now();
     const removal = live.actorRemoval ?? actor.removal;
@@ -1809,6 +1842,7 @@ export class AgentsProvider implements FabricProvider {
       status,
       ...(live.actorQueued !== undefined ? { queued: live.actorQueued } : {}),
       ...(live.actorMessages !== undefined ? { messages: live.actorMessages } : {}),
+      ...(live.actorHostQueue ? { hostQueue: { ...live.actorHostQueue } } : {}),
       ...(live.actorPreparing
         ? { preparing: { ...live.actorPreparing, ageS: Math.max(0, Math.round((now - live.actorPreparing.startedAt) / 1_000)) } }
         : {}),

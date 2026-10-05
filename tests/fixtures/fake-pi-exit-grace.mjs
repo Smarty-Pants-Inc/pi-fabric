@@ -64,6 +64,12 @@ process.stdin.on("data", async (chunk) => {
     emit({ type: "message_end", message: { role: "assistant", content: behavior.startsWith("empty-") ? "" : "durable final result", stopReason: "stop" } });
   }
   if (behavior === "crash-before-settle") process.exit(1);
+  if (behavior === "never-settles") {
+    // Recording text and staying alive beyond the exit grace is NOT settlement.
+    // No successful receipt or EOF-disposal request may be inferred from it.
+    setTimeout(() => process.exit(1), 8_000);
+    return;
+  }
   // Both the leader and a descendant refuse TERM, so cleanup must target the
   // owned process group, not just the immediate Pi pid.
   if (["never-exit", "empty-never-exit"].includes(behavior) && process.platform !== "win32") {

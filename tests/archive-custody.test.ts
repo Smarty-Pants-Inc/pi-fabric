@@ -9,7 +9,7 @@ import type { AgentRunResult } from "../src/agents/types.js";
 import { runTreeExitVeto } from "../src/storage/retention.js";
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
-describe("restart archive recovery", () => {
+describe.skipIf(process.platform === "win32")("restart archive recovery (POSIX-only; Windows follow-up smarty-dev#5132)", () => {
   it("changed oversized ancestor input retains its own custody without starving a nested exact result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "archive-changing-")); roots.push(root);
     const parent = path.join(root, "runs", "parent"), child = path.join(parent, "nested", "child");

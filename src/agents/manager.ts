@@ -41,7 +41,7 @@ import { tokenUsagePayloadFromValue } from "../lifecycle/types.js";
 import type { FabricTokenUsagePayload } from "../lifecycle/types.js";
 import { AgentAdmission, assertAgentTask, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, type AgentLifecycleState } from "./lifecycle.js";
 import { removeTree } from "./rm.js";
-import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, parsePendingRunArchives, type PendingRunArchive } from "./archive-custody.js";
+import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, parsePendingRunArchives, type PendingRunArchive } from "./archive-custody.js";
 import { ActorChildCompletionStore } from "../actors/child-completions.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
@@ -100,6 +100,7 @@ import {
   removeEmptyRunRoot,
   type TempRunSweepRequest,
 } from "../storage/retention.js";
+import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { boundedRunTree, RetentionReferenceScan } from "../storage/reference-scan.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
 
@@ -2059,6 +2060,7 @@ export class AgentManager {
    * wildcard veto; terminal status never substitutes for checked worker exit.
    * refresh is for explicit offline verification, not the resident poll. */
   retentionReferences(options: { refresh?: boolean; now?: number; budgetMs?: number; maxEntries?: number } = {}): Set<string> {
+    if (!retentionV2Enabled()) return this.#mainRetentionReferences();
     const now = options.now ?? Date.now();
     if (options.refresh) this.#retentionWatermarkRefresh = 0;
     const generation = this.#retentionGeneration();
@@ -2073,6 +2075,58 @@ export class AgentManager {
     return refs;
   }
 
+  // Windows scope cut: verbatim main 9387af87 implementation.
+  #mainRetentionReferences(): Set<string> {
+    const refs = new Set<string>();
+    const protect = (id: string, actorId?: string) => { refs.add(id); if (actorId) refs.add(actorId); };
+    for (const queued of this.#queued.values()) {
+      if (!queued.terminal || queued.cleanupPending || hasUnresolvedWorker(path.join(this.#runRoot, queued.info.id))) {
+        protect(queued.info.id, queued.info.actorId);
+      }
+    }
+    for (const managed of this.#runs.values()) {
+      const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
+      const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
+      if (!managed.settled || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
+          // Settlement and primary exit do not prove descendant exit. The
+          // persistent tree veto checks every descendant's worker identity too.
+          unconfirmedProcess || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) protect(managed.id, managed.actorId);
+    }
+    // A restarted host does not own handles for the previous host's actor workers.
+    // Reuse offline retention's exit/ownership predicate; a truncated or unknown
+    // tree vetoes all stopped-actor proofs, rather than guessing its association.
+    const started = performance.now();
+    const expired = () => performance.now() - started >= 5;
+    let directory: fs.Dir | undefined;
+    try {
+      try { fs.lstatSync(this.#runRoot); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return refs; throw error; }
+      if (!ownedStat(this.#runRoot)?.isDirectory()) { refs.add("*"); return refs; }
+      directory = fs.opendirSync(this.#runRoot);
+      let entry: fs.Dirent | null;
+      while (!expired() && (entry = directory.readSync())) {
+        if (this.#managedTempRoot && entry.name === ".fabric-owner.json") continue;
+        if (this.#runs.has(entry.name) || this.#queued.has(entry.name)) continue;
+        const run = path.join(this.#runRoot, entry.name);
+        if (!entry.isDirectory()) { refs.add("*"); continue; }
+        const status = ownedStat(path.join(run, "status.json"));
+        const record = status?.isFile() && status.size <= 1024 * 1024 ? readRecord(path.join(run, "status.json")) : undefined;
+        // Without a surviving handle, only a checked process identity can
+        // establish exit; a terminal record with no PID is still uncertain.
+        const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
+          ? Number(record.sessionId) : undefined;
+        if (pid !== undefined && !processAlive(pid) && !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired)) continue;
+        const actorId = record?.actorId;
+        if (typeof actorId === "string" && /^[A-Za-z0-9_-]+$/.test(actorId)) protect(entry.name, actorId);
+        else refs.add("*");
+      }
+      if (expired()) refs.add("*");
+    } catch { refs.add("*"); }
+    finally { try { directory?.closeSync(); } catch { refs.add("*"); } }
+    return refs;
+  }
+
+
   /** Archival never discharges a live manager's result/publication custody,
    * even if its saved status is terminal or its handle has settled. */
   hasRunCustody(id: string): boolean { return this.#runs.has(id) || this.#queued.has(id); }
@@ -2085,6 +2139,7 @@ export class AgentManager {
    * expiring an exchange, re-evaluate the exact writer/tree under a count/time
    * budget. In-place nested/status changes need no run-set mtime. */
   retentionCustodyVeto(id: string): boolean {
+    if (!retentionV2Enabled()) return this.#mainRetentionReferences().has(id);
     const started = performance.now(), expired = () => performance.now() - started >= 2;
     const check = (runId: string): boolean => {
       const queued = this.#queued.get(runId);
@@ -3496,6 +3551,7 @@ export class AgentManager {
 
   /** Retry retained full outcomes after the original manager exited. No worker is relaunched. */
   recoverPendingArchives(runDirectory?: string, expired: () => boolean = () => false): number {
+    if (!retentionV2Enabled()) return this.#mainRecoverPendingArchives(runDirectory);
     if (this.#closing) return 0;
     const root = runDirectory ?? this.#runRoot;
     let walk = this.#archiveRecovery.get(root);
@@ -3514,6 +3570,43 @@ export class AgentManager {
     if (recovered) this.#invalidateUiList();
     return recovered;
   }
+
+  // Windows scope cut: verbatim main 9387af87 implementation.
+  #mainRecoverPendingArchives(runDirectory?: string): number {
+    let recovered = 0;
+    const visit = (directory: string, depth: number): void => {
+      if (depth > 32 || !ownedStat(directory)?.isDirectory()) return;
+      const file = path.join(directory, ARCHIVE_PENDING_FILE);
+      const ageReference = ownedStat(directory);
+      if (ownedStat(file)?.isFile()) {
+        try {
+          for (const archive of readPendingRunArchives(directory)) {
+            if (archive.routePending || archive.result?.id !== path.basename(directory)) continue;
+            if (archive.actorSessionFile && archive.actorOnly && archive.result.spawner?.kind === "actor") {
+              new ActorChildCompletionStore(archive.actorSessionFile).enqueue(archive.result, archive.result.spawner, archive.notify);
+            } else if (archive.kind === "shutdown" && this.#onStoppedAtClose) this.#onStoppedAtClose([archive.result]);
+            else if (archive.kind === "settlement" && this.#onSettled) this.#onSettled(archive.result, archive.recipient);
+            else continue;
+            commitRunArchive(directory, archive.kind);
+            // Replaying an old result is not new worker activity. Removing its
+            // custody marker must not reset the source's retention age and make
+            // an already expired, durably archived run uncollectible at startup.
+            const current = ownedStat(directory);
+            if (ageReference && current?.dev === ageReference.dev && current.ino === ageReference.ino) {
+              fs.utimesSync(directory, ageReference.atime, ageReference.mtime);
+            }
+            recovered++;
+          }
+        } catch { /* The persisted veto remains for the next recovery attempt. */ }
+      }
+      const nested = path.join(directory, "nested");
+      if (ownedStat(nested)?.isDirectory()) for (const name of fs.readdirSync(nested)) visit(path.join(nested, name), depth + 1);
+    };
+    if (runDirectory) visit(runDirectory, 0);
+    else if (ownedStat(this.#runRoot)?.isDirectory()) for (const name of fs.readdirSync(this.#runRoot)) visit(path.join(this.#runRoot, name), 0);
+    return recovered;
+  }
+
 
   *#walkPendingArchives(root: string, children: boolean): Generator<number> {
     const manager = this;

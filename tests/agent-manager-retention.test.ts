@@ -7,7 +7,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 
-it("Windows native-close discharge invalidates cached completed-run custody, not ordinary UI progress", async () => {
+it("Windows native-close discharge preserves main custody; cached invalidation deferred to smarty-dev#5132", async () => {
   const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
   Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "manager-retention-close-"));
@@ -32,18 +32,16 @@ it("Windows native-close discharge invalidates cached completed-run custody, not
     expect(await manager.wait(handle.id)).toMatchObject({ status: "completed", text: "exact saved outcome" });
     const snapshot = () => manager.retentionReferences({ now, budgetMs: 100, maxEntries: 128 });
     expect(snapshot().has(handle.id)).toBe(true);
-    expect(manager.retentionCustodyVeto(handle.id)).toBe(true);
+    // Windows uses main's uncached reference scan, not the V2 targeted veto.
     manager.listForUi(); manager.status(handle.id);
     expect(snapshot().has(handle.id)).toBe(true);
     release();
-    // No artificial 60-second clock advance or forced refresh: the real native
-    // close/debt-discharge transition must invalidate the protective cache.
+    // Main has no retention cache on Windows: each call must observe the real
+    // native close/debt-discharge transition without an artificial clock advance.
     await vi.waitFor(() => {
       expect(snapshot().has(handle.id)).toBe(false);
-      // A fresh bounded proof may veto a transient I/O deadline even after the
-      // cached close hint clears. Join both public outcomes in the same existing
-      // close waiter, rather than asserting a filesystem-speed guarantee.
-      expect(manager.retentionCustodyVeto(handle.id)).toBe(false);
+      // Join the original complete ownership outcome, not V2 bounded custody.
+      expect(snapshot().has("*")).toBe(false);
     });
     expect(fs.existsSync(file)).toBe(true);
   } finally {
@@ -53,9 +51,8 @@ it("Windows native-close discharge invalidates cached completed-run custody, not
   }
 });
 
-it("completed Windows native custody retries a deadline hint without a clock advance", async () => {
+it.skipIf(process.platform === "win32")("POSIX custody retries a deadline hint without a clock advance (Windows: smarty-dev#5132)", async () => {
   const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
-  Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "manager-retention-timeout-"));
   const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockResolvedValue({
     kind: "process", sessionId: "2147483647", isAlive: async () => false,

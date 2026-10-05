@@ -1,5 +1,21 @@
 # Resident runs: bounded references and permanent legacy retirement
 
+## Scope
+
+Windows: unchanged from main in this PR; follow-up Smarty-Pants-Inc/smarty-dev#5132.
+
+All PR #481 behavior changes below are POSIX-only, controlled by the shared
+`retentionV2Enabled()` platform gate. Windows uses main 9387af87's original
+request-poll maintenance, uncached ownership scan, synchronous full-result
+recovery, streaming run collection and compaction proof ordering. It gets no new
+maintenance/retirement timer, polling count/tree/fuel/retry bound, custody hook,
+resampling or audit output. Existing main Windows event retention and request
+expiry remain active and unchanged. Compatibility policy keys are accepted but
+do not activate V2 on Windows. Forced-win32 tests compare tails and counts
+against the pinned main implementation; they are not native Windows CI evidence.
+
+## POSIX bounded references
+
 The 50 ms request/claim loop does not prepare retention references. Independent
 100 ms maintenance ticks advance one persistent ownership cursor, at most 64
 handles/runs and 2 ms per tick. Native custody changes and `runs/` directory
@@ -46,7 +62,8 @@ boundaries and 4,096 predicate checks of fuel; oversized/changed/unknown trees
 still veto. A slow three-file run must not restart its fresh safety proof on every
 5-ms tick and remain over its byte cap forever. Status, reply and saved results
 remain unchanged; the event cap and the shared atomic-write retry path are not
-relaxed. This native compaction remains supported on Windows.
+relaxed. These compaction optimizations are POSIX-only; Windows retains main's
+existing compaction code path unchanged.
 
 ## Scope cut: POSIX-only retirement, no automatic legacy source deletion
 
@@ -114,26 +131,23 @@ The guards are conservative protection for known live/path-based owners, **not**
 a claim that all potential writers are discoverable. Unknown descriptor custody
 is safe for bytes because the inode remains linked.
 
-**Legacy retirement is POSIX-only in this PR. On `win32`, every retirement pass
-is an explicit no-op**, before opening a run cursor, checking candidates,
-creating a destination or moving/deleting bytes. It emits exactly one audit line
-per pass, not one skip line per run:
-
-```text
-[pi-fabric] Legacy run retirement pass: no-op on win32 (POSIX-only; smarty-dev#5132)
-```
+**All retention V2 behavior is POSIX-only in this PR. On `win32`, the host
+never starts retirement or V2 maintenance.** Direct retirement calls are silent
+no-ops before opening a run cursor, checking candidates, creating a destination
+or moving/deleting bytes. Main had no retirement audit, so none is emitted.
 
 The Unix group/other permission-bit privacy checks stay intact on POSIX; native
 Windows mode bits and `mkdir({ mode: 0o700 })` are not that privacy proof. Neither
 a rejected Windows rename nor a simulated platform provides ownership evidence.
 The compatibility policy keys remain accepted on Windows, but enabling them does
-not enable retirement there. Native event compaction and acknowledged request
-expiry are separate and remain cross-platform. No legacy run is automatically
+not enable retention V2 there. Main's native event compaction and acknowledged
+request expiry remain cross-platform and unchanged on Windows. No legacy run is automatically
 deleted on any platform.
 
-Follow-up: Smarty-Pants-Inc/smarty-dev#5132 (P2 items 1 and 2; owner fabric-v2).
-It tracks the actor-specific bounded custody index and native Windows ownership/
-privacy evidence; it does not turn local simulation into native CI validation.
+Follow-up: Smarty-Pants-Inc/smarty-dev#5132 (owner fabric-v2). It tracks the
+actor-specific bounded custody index and the entire Windows V2 half: ownership/
+privacy evidence, polling/recovery bounds, tail compaction and native Windows
+retention verification. Local simulation does not substitute for native CI.
 
 Directory fsync is performed on POSIX. `archive-retention.json`
 keeps checked/archived/skipped counters and the latest error; the historical

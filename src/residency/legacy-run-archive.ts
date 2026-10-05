@@ -3,6 +3,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { setImmediate as yieldTurn } from "node:timers/promises";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { processAlive } from "../storage/scratch.js";
 
 export interface LegacyRunArchivePolicy {
@@ -119,7 +120,7 @@ export class ResidentLegacyRunArchive {
   #enabled(): boolean { return this.policy.legacyRunArchiveEnabled !== false; }
 
   start(): void {
-    if (this.#timer || this.#closed) return;
+    if (!retentionV2Enabled() || this.#timer || this.#closed) return;
     this.#timer = setInterval(() => {
       if (!this.#work) {
         this.#work = this.sweep().catch(error => { this.health.error = String(error); }).finally(() => { this.#work = undefined; });
@@ -139,11 +140,11 @@ export class ResidentLegacyRunArchive {
 
   async sweep(now = Date.now(), maxEntries = 32, budgetMs = 20): Promise<void> {
     if (this.#closed) return;
-    if (process.platform === "win32") {
+    if (!retentionV2Enabled()) {
       // Unix mode bits are not an ownership/privacy proof on native Windows.
       // Explicit platform cut: no discovery, destination creation or mutation.
-      // One audit line per pass, never a per-run skip storm.
-      console.info("[pi-fabric] Legacy run retirement pass: no-op on win32 (POSIX-only; smarty-dev#5132)");
+      // No new timer or audit output on Windows: preserve main's behavior.
+      // All Windows retention changes are deferred to smarty-dev#5132.
       return;
     }
     if (this.#blocked || !this.#enabled() || now < this.#nextScan) return;

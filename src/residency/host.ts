@@ -76,6 +76,7 @@ import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { canRemoveTerminalRun, compactTerminalRunEvents, retainedActorRunIds, runTreeExitVeto, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
 import { ResidentRequestRetention } from "./retention.js";
+import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
 import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
@@ -271,15 +272,16 @@ export class ResidentHost {
     this.#retention = { ...config.retention, retainRuns: config.agents.retainRuns };
     this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
       [...new Set(Object.values(residentActorRoots(config)))], this.#retention,
-      (directory, expired) => {
+      (directory, expired = () => false) => {
+        if (!retentionV2Enabled()) { this.agents.recoverPendingArchives(directory); return; }
         if (!this.agents.hasRunCustody(path.basename(directory)) && this.agents.recoverPendingArchives(directory, expired)) this.#requestRetention.resample();
-      }, {
+      }, retentionV2Enabled() ? {
         // A checked exit clears exchange debt, not the manager's run-directory
         // custody. Deleting a still-managed tree destroys the next fresh exit
         // proof and can pin a deferred stopped-actor exchange indefinitely.
         run: id => this.agents.hasRunCustody(id),
         reference: id => this.agents.retentionCustodyVeto(id),
-      });
+      } : undefined);
   }
 
   #initialize(): void {
@@ -640,12 +642,14 @@ export class ResidentHost {
       this.#ready = true;
       // Retention is not part of request admission/heartbeat/claim. A bounded
       // preparation cursor progresses even between request-retention samples.
-      this.#maintenanceTimer = setInterval(() => this.#maintainRequests(), 100);
-      this.#legacyArchive = new ResidentLegacyRunArchive(this.config.residencyRoot, this.#retention, {
-        actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
-        isRetained: id => this.#closed || !!this.#handover || !this.participants.canConsumeMesh() || this.agents.hasRunCustody(id),
-      });
-      this.#legacyArchive.start();
+      if (retentionV2Enabled()) {
+        this.#maintenanceTimer = setInterval(() => this.#maintainRequests(), 100);
+        this.#legacyArchive = new ResidentLegacyRunArchive(this.config.residencyRoot, this.#retention, {
+          actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
+          isRetained: id => this.#closed || !!this.#handover || !this.participants.canConsumeMesh() || this.agents.hasRunCustody(id),
+        });
+        this.#legacyArchive.start();
+      }
       // Removals a previous host accepted: their runs ended with it.
       if (!this.#staged) {
         this.actors.resumeAfterRelease();
@@ -979,19 +983,21 @@ export class ResidentHost {
       }
     } finally {
       this.#pollingRequests = false;
+      if (!retentionV2Enabled()) this.#maintainRequests();
       this.#checkIdle();
     }
   }
 
   #maintainRequests(): void {
     const now = Date.now();
-    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh()) return;
+    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh() ||
+        (!retentionV2Enabled() && !this.#requestRetention.due(now))) return;
     // ensureHost/syncPiModels already publishes reloads to config.json. Apply
     // only the same-release/root/session overlay at the next existing sweep;
     // actor archives and agent collectors hold this same policy object.
     Object.assign(this.#retention, this.#effectiveConfig?.().retention ?? this.config.retention);
-    const live = this.agents.retentionReferences({ now });
-    if (!this.#requestRetention.due(now)) return;
+    const live = retentionV2Enabled() ? this.agents.retentionReferences({ now }) : this.agents.retentionReferences();
+    if (retentionV2Enabled() && !this.#requestRetention.due(now)) return;
     for (const id of this.actors.inFlightActorIds()) live.add(id);
     const stoppedWritersGone = new Set<string>();
     for (const actor of this.actors.listOwned()) {

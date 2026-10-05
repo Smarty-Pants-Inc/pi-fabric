@@ -277,6 +277,7 @@ export class ResidentHost {
       { readCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
+      renewActorParticipants: true,                            // host fence outlives its Main
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,

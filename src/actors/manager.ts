@@ -843,7 +843,10 @@ export class ActorManager {
     this.#syncActorsFromRegistry();
     this.#refreshOwnership(undefined, false);
     return [...this.#actors.values()]
-      .filter((actor) => this.#canManageCached(actor.id))
+      // A fenced adoption can precede its directory publication. Our old live
+      // participant must not keep advertising a lineage the registry moved.
+      .filter((actor) => this.#canManageCached(actor.id) && (this.#claimResidency === undefined ||
+        (this.#persistedRoots.get(actor.id) ?? actor.rootId) === this.#rootId))
       .map((actor) => this.#publicInfo(actor));
   }
 
